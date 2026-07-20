@@ -1142,6 +1142,8 @@ mod tests {
     ) -> Conversation {
         let now = Utc::now();
         Conversation {
+            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            runtime_role: crate::work_scope::RuntimeRole::User,
             id: id.to_string(),
             slug: Some(format!("slug-{id}")),
             title: Some(format!("Title {id}")),

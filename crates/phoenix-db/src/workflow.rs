@@ -2620,14 +2620,17 @@ mod tests {
     }
 
     async fn setup_repo_schema(pool: &SqlitePool) {
-        sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', cwd TEXT NOT NULL DEFAULT '/tmp', parent_conversation_id TEXT, user_initiated BOOLEAN NOT NULL DEFAULT 1, archived BOOLEAN NOT NULL DEFAULT 0, model TEXT, steering_queue TEXT NOT NULL DEFAULT '[]', state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', created_at TEXT NOT NULL DEFAULT '2025-01-01', updated_at TEXT NOT NULL DEFAULT '2025-01-01')")
+        sqlx::raw_sql(crate::ddl::SCHEMA)
             .execute(pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, conversation_id TEXT NOT NULL, message_type TEXT NOT NULL, content TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '2025-01-01')")
-            .execute(pool)
-            .await
-            .unwrap();
+        crate::Database {
+            pool: pool.clone(),
+            path: String::new(),
+        }
+        .run_migrations()
+        .await
+        .unwrap();
         run_pending_migrations(pool).await.unwrap();
     }
 

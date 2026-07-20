@@ -2,7 +2,7 @@
 //!
 //! REQ-BT-010: Implicit Session Model
 //! REQ-BT-011: State Persistence
-//! REQ-BROWSER-WS-001: Sessions keyed by `WorkScope` so continuations share Chrome.
+//! REQ-BROWSER-WS-001: Sessions keyed by `ResourceScopeKey` so continuations share Chrome.
 
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
@@ -24,9 +24,9 @@ use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 
-/// Derive a Chrome user data dir from a `WorkScope::stable_key()`.
+/// Derive a Chrome user data dir from a `ResourceScopeKey::stable_key()`.
 ///
 /// The `stable_key` embeds the worktree path for `Worktree` scopes, which can
 /// easily exceed Chrome's per-component path length limit (and the `SUN_PATH`
@@ -385,7 +385,7 @@ impl BrowserSession {
     }
 
     /// Build a `BrowserConfig` with optional explicit Chrome executable path.
-    /// `scope_key` is a `WorkScope::stable_key()` value — a string that
+    /// `scope_key` is a `ResourceScopeKey::stable_key()` value — a string that
     /// uniquely identifies the durable owner of this session. The Chrome
     /// user data dir is derived from it so a continuation that resolves to
     /// the same scope reuses the same on-disk profile.
@@ -812,7 +812,7 @@ impl Drop for BrowserSessionGuard<'_> {
 /// archive / abandon / mark-merged / delete drop the Chrome process the same
 /// way they drop bash and tmux (REQ-BROWSER-WS-003).
 ///
-/// `inheritor_scope`: the resolved `WorkScope` of the continuation, if any.
+/// `inheritor_scope`: the resolved `ResourceScopeKey` of the continuation, if any.
 /// Preservation is scope equality — when the inheritor resolves to the
 /// *same* scope, the Chrome window is still in use and we skip the kill.
 /// Different-scope or no inheritor falls through to teardown. The
@@ -824,8 +824,8 @@ impl Drop for BrowserSessionGuard<'_> {
 /// REQ-BROWSER-WS-003, REQ-BROWSER-WS-002.
 pub async fn cascade_browser_on_delete(
     manager: &Arc<BrowserSessionManager>,
-    work_scope: &WorkScope,
-    inheritor_scope: Option<&WorkScope>,
+    work_scope: &ResourceScopeKey,
+    inheritor_scope: Option<&ResourceScopeKey>,
 ) {
     if inheritor_scope == Some(work_scope) {
         tracing::debug!(
@@ -842,13 +842,13 @@ pub async fn cascade_browser_on_delete(
 /// streams so the UI can show "browser session live" state without inferring
 /// it from message history.
 ///
-/// Carries the `WorkScope` rather than a single `conversation_id` because a
+/// Carries the `ResourceScopeKey` rather than a single `conversation_id` because a
 /// `Worktree`-scoped session may be shared across continuation members; the
 /// bridge fans out to every live runtime handle whose conversation resolves
 /// to this scope (REQ-BROWSER-WS-002).
 #[derive(Debug, Clone)]
 pub struct BrowserSessionLifecycleEvent {
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
     /// `true` on session creation, `false` on session removal (kill or
     /// idle cleanup).
     pub active: bool,
@@ -860,7 +860,7 @@ pub struct BrowserSessionLifecycleEvent {
 pub type BrowserSessionLifecycleSink =
     tokio::sync::mpsc::UnboundedSender<BrowserSessionLifecycleEvent>;
 
-/// Predicate answering "does this `WorkScope` still own a live (non-terminal)
+/// Predicate answering "does this `ResourceScopeKey` still own a live (non-terminal)
 /// conversation?". Injected by the runtime after construction (the manager is
 /// built inside `RuntimeManager::new`, before the runtime `Arc` exists, so the
 /// hook cannot be a constructor argument). Async because the only authoritative
@@ -871,12 +871,12 @@ pub type BrowserSessionLifecycleSink =
 /// behavior), so tool-level tests and any caller that never wires a runtime are
 /// unaffected.
 pub type ScopeLivenessHook =
-    Arc<dyn Fn(WorkScope) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+    Arc<dyn Fn(ResourceScopeKey) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
-/// Map entry: the `WorkScope` (carried for idle-cleanup lifecycle emission)
+/// Map entry: the `ResourceScopeKey` (carried for idle-cleanup lifecycle emission)
 /// plus the live session arc.
 struct ScopedSession {
-    scope: WorkScope,
+    scope: ResourceScopeKey,
     session: Arc<RwLock<BrowserSession>>,
     user_data_key: String,
     kill_done: Arc<Notify>,
@@ -891,16 +891,16 @@ enum KillSessionOutcome {
 
 /// Global manager for all browser sessions
 pub struct BrowserSessionManager {
-    /// Keyed by `WorkScope::stable_key()`. Storing the `WorkScope` alongside
+    /// Keyed by `ResourceScopeKey::stable_key()`. Storing the `ResourceScopeKey` alongside
     /// the session lets idle cleanup emit lifecycle events with the original
-    /// scope rather than parsing the string key back into a `WorkScope`.
+    /// scope rather than parsing the string key back into a `ResourceScopeKey`.
     sessions: RwLock<HashMap<String, ScopedSession>>,
     cleanup_task: Option<JoinHandle<()>>,
     /// Optional lifecycle event sink. Populated by [`RuntimeManager::new`]
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
     lifecycle_sink: Option<BrowserSessionLifecycleSink>,
-    /// Set-once predicate gating idle reaping on `WorkScope` liveness. The
+    /// Set-once predicate gating idle reaping on `ResourceScopeKey` liveness. The
     /// runtime installs it via [`Self::set_scope_liveness_hook`] when it wires
     /// the lifecycle bridges. Unset (the test/default case) means idle cleanup
     /// reaps on age alone.
@@ -945,7 +945,7 @@ impl BrowserSessionManager {
         manager
     }
 
-    /// Install the predicate that gates idle reaping on `WorkScope` liveness.
+    /// Install the predicate that gates idle reaping on `ResourceScopeKey` liveness.
     ///
     /// Set-once: a second call is a no-op (returns the supplied hook unused via
     /// the `OnceLock` semantics — the first writer wins). The runtime calls
@@ -960,7 +960,7 @@ impl BrowserSessionManager {
     /// Whether a live session currently exists for `work_scope`.
     /// The `HashMap` is the single source of truth for session liveness —
     /// callers must not maintain a parallel bool.
-    pub async fn is_active(&self, work_scope: &WorkScope) -> bool {
+    pub async fn is_active(&self, work_scope: &ResourceScopeKey) -> bool {
         self.sessions
             .read()
             .await
@@ -970,7 +970,7 @@ impl BrowserSessionManager {
     /// Publish a lifecycle edge if a sink is wired. Best-effort: dropped
     /// receivers / closed channels are logged at `debug` (capability gap)
     /// and do not affect session correctness.
-    fn emit_lifecycle(&self, work_scope: &WorkScope, active: bool) {
+    fn emit_lifecycle(&self, work_scope: &ResourceScopeKey, active: bool) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
         };
@@ -1009,7 +1009,7 @@ impl BrowserSessionManager {
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///
-    /// Sessions are keyed by `WorkScope::stable_key()`: continuations of a
+    /// Sessions are keyed by `ResourceScopeKey::stable_key()`: continuations of a
     /// worktree-backed conversation resolve to the same scope and therefore
     /// inherit the same Chrome window (REQ-BROWSER-WS-001), while Direct
     /// conversations fall back to per-conversation scoping (no shared owner
@@ -1020,7 +1020,7 @@ impl BrowserSessionManager {
     /// not-yet-existing session.
     pub async fn get_session(
         &self,
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
         let key = work_scope.stable_key();
 
@@ -1103,49 +1103,6 @@ impl BrowserSessionManager {
 
         Ok(session_arc)
     }
-
-    /// Move a `work_scope`'s session from `old` to `new`.
-    ///
-    /// Used at an Explore→Work approval, where the conversation's scope flips
-    /// from `WorkScope::Conversation(id)` to `WorkScope::Worktree(path)`: a
-    /// Chrome session opened pre-approval is stored under `old` and must follow
-    /// the scope so the inventory and idle reaper resolve it under `new`. The
-    /// underlying Chrome process (and its on-disk profile dir, which is keyed by
-    /// the old `stable_key`) are untouched — only the in-memory lookup key and
-    /// the `ScopedSession::scope` tag move.
-    ///
-    /// Returns `true` if a session was moved. No-ops (returns `false`) when:
-    /// - `old == new` (nothing to do), or
-    /// - there is no session under `old`, or
-    /// - `new` is already occupied — the pre-existing `new` session is
-    ///   preserved and `old` is left in place (NOT clobbered), with a WARN.
-    ///   At approval `new` is a freshly created worktree scope, so occupancy is
-    ///   not expected.
-    pub async fn rekey_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
-        if old == new {
-            return false;
-        }
-        let old_key = old.stable_key();
-        let new_key = new.stable_key();
-        let mut sessions = self.sessions.write().await;
-        if sessions.contains_key(&new_key) {
-            if sessions.contains_key(&old_key) {
-                tracing::warn!(
-                    old = %old,
-                    new = %new,
-                    "browser: refusing to rekey session — destination scope already occupied; leaving both sessions in place"
-                );
-            }
-            return false;
-        }
-        let Some(mut entry) = sessions.remove(&old_key) else {
-            return false;
-        };
-        entry.scope = new.clone();
-        sessions.insert(new_key, entry);
-        true
-    }
-
     /// Get the session for a `work_scope` **without creating one**.
     ///
     /// Used by the live-view WS endpoint, which deliberately must not spawn
@@ -1157,7 +1114,7 @@ impl BrowserSessionManager {
     /// logging per REQ-BROWSER-WS-004).
     pub async fn get_existing(
         &self,
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
     ) -> Option<Arc<RwLock<BrowserSession>>> {
         let key = work_scope.stable_key();
         let sessions = self.sessions.read().await;
@@ -1187,7 +1144,10 @@ impl BrowserSessionManager {
     /// lock-free so concurrent `get_session` / `get_existing` /
     /// `is_active` calls on unrelated scopes are not blocked for the
     /// duration of fs deletion + Chrome shutdown.
-    async fn spawn_kill_session(self: &Arc<Self>, work_scope: &WorkScope) -> KillSessionOutcome {
+    async fn spawn_kill_session(
+        self: &Arc<Self>,
+        work_scope: &ResourceScopeKey,
+    ) -> KillSessionOutcome {
         let key = work_scope.stable_key();
         let Some((session, kill_requested, kill_done)) = ({
             let sessions = self.sessions.read().await;
@@ -1267,7 +1227,7 @@ impl BrowserSessionManager {
     /// The session remains tracked as live until the spawned teardown task has
     /// actually terminated Chrome, removed the manager entry, and emitted the
     /// lifecycle false edge.
-    pub async fn request_kill_session(self: &Arc<Self>, work_scope: &WorkScope) {
+    pub async fn request_kill_session(self: &Arc<Self>, work_scope: &ResourceScopeKey) {
         let _ = self.spawn_kill_session(work_scope).await;
     }
 
@@ -1277,7 +1237,7 @@ impl BrowserSessionManager {
     /// going away; user-facing Stop browser endpoints use
     /// [`Self::request_kill_session`] so they do not block behind an in-flight
     /// browser tool guard.
-    pub async fn kill_session(self: &Arc<Self>, work_scope: &WorkScope) {
+    pub async fn kill_session(self: &Arc<Self>, work_scope: &ResourceScopeKey) {
         match self.spawn_kill_session(work_scope).await {
             KillSessionOutcome::Absent => {}
             KillSessionOutcome::Started(handle) => {
@@ -1307,7 +1267,10 @@ impl BrowserSessionManager {
     /// hook every idle candidate is reapable — the historical age-only
     /// behavior. Factored out of [`Self::cleanup_idle_sessions`] so the
     /// liveness gate is unit-testable without a live chromium process.
-    async fn filter_reapable(&self, idle_candidates: Vec<(String, WorkScope)>) -> Vec<String> {
+    async fn filter_reapable(
+        &self,
+        idle_candidates: Vec<(String, ResourceScopeKey)>,
+    ) -> Vec<String> {
         let mut to_remove = Vec::new();
         for (key, scope) in idle_candidates {
             if let Some(hook) = self.scope_liveness_hook.get() {
@@ -1328,7 +1291,7 @@ impl BrowserSessionManager {
     ///
     /// Idle age (`last_activity` older than [`IDLE_TIMEOUT`]) is necessary but
     /// not sufficient to reap: when a scope-liveness hook is installed, a scope
-    /// whose `WorkScope` still owns a non-terminal conversation is preserved
+    /// whose `ResourceScopeKey` still owns a non-terminal conversation is preserved
     /// even past the timeout. `last_activity` only resets on a browser
     /// tool-call guard drop, so a conversation that is alive in the UI but has
     /// not issued a browser tool call in 30 minutes would otherwise lose its
@@ -1338,7 +1301,7 @@ impl BrowserSessionManager {
     /// terminal is reaped on the next pass.
     async fn cleanup_idle_sessions(&self) {
         let now = Instant::now();
-        let mut idle_candidates: Vec<(String, WorkScope)> = Vec::new();
+        let mut idle_candidates: Vec<(String, ResourceScopeKey)> = Vec::new();
 
         // Find idle sessions
         {
@@ -1353,7 +1316,7 @@ impl BrowserSessionManager {
         }
 
         // Gate each idle candidate on scope liveness. A live scope (its
-        // `WorkScope` still owns a non-terminal conversation) is skipped — the
+        // `ResourceScopeKey` still owns a non-terminal conversation) is skipped — the
         // timer re-checks it next interval. No hook means reap on age alone.
         let to_remove = self.filter_reapable(idle_candidates).await;
 
@@ -1425,7 +1388,7 @@ mod lifecycle_hook_tests {
         BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleSink,
         BrowserSessionManager,
     };
-    use phoenix_core::work_scope::WorkScope;
+    use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::RwLock;
@@ -1441,12 +1404,8 @@ mod lifecycle_hook_tests {
         (BrowserSessionManager::with_lifecycle_sink(Some(tx)), rx)
     }
 
-    fn scope_conv(id: &str) -> WorkScope {
-        WorkScope::Conversation(id.to_string())
-    }
-
-    fn scope_wt(path: &str) -> WorkScope {
-        WorkScope::Worktree(path.to_string())
+    fn scope(id: &str) -> ResourceScopeKey {
+        ResourceScopeKey::Work(WorkScopeId::parse(id).unwrap())
     }
 
     /// `kill_session` on a manager that never had a session for this scope
@@ -1455,7 +1414,7 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn kill_session_no_op_does_not_emit() {
         let (manager, mut rx) = install_sink();
-        let scope = scope_conv("conv-never-existed");
+        let scope = scope("conv-never-existed");
         manager.kill_session(&scope).await;
         assert!(
             rx.try_recv().is_err(),
@@ -1470,45 +1429,30 @@ mod lifecycle_hook_tests {
     /// bash/tmux registries, which test those branches with constructible
     /// entries; a real `BrowserSession` needs a live chromium, so it cannot be
     /// staged here.)
-    #[tokio::test]
-    async fn rekey_scope_no_session_is_noop() {
-        let (manager, _rx) = install_sink();
-        let old = scope_conv("conv-explore");
-        let new = scope_wt("/tmp/wt-approved");
-        assert!(!manager.rekey_scope(&old, &new).await);
-        assert!(!manager.is_active(&new).await);
-    }
-
-    #[tokio::test]
-    async fn rekey_scope_same_scope_is_noop() {
-        let (manager, _rx) = install_sink();
-        let s = scope_wt("/tmp/wt");
-        assert!(!manager.rekey_scope(&s, &s).await);
-    }
-
     /// `is_active` must reflect the underlying `HashMap`. We can't create a
     /// real `BrowserSession` without chrome, so this just exercises the
     /// "absent" branch for both scope variants.
     #[tokio::test]
     async fn is_active_reflects_hashmap_membership() {
         let (manager, _rx) = install_sink();
-        assert!(!manager.is_active(&scope_conv("conv-1")).await);
-        assert!(!manager.is_active(&scope_wt("/tmp/wt-1")).await);
+        assert!(!manager.is_active(&scope("conv-1")).await);
+        assert!(!manager.is_active(&scope("/tmp/wt-1")).await);
     }
 
-    /// Worktree and Conversation scopes with the same inner string occupy
-    /// disjoint namespaces; a present worktree session must not satisfy an
-    /// `is_active` query for the same-string conversation scope.
+    /// Distinct opaque work IDs and the structurally separate global terminal
+    /// occupy disjoint resource namespaces.
     #[tokio::test]
     async fn is_active_disjoint_namespaces() {
         let (manager, _rx) = install_sink();
-        let conv = scope_conv("/tmp/x");
-        let wt = scope_wt("/tmp/x");
-        assert!(!manager.is_active(&conv).await);
-        assert!(!manager.is_active(&wt).await);
-        // Same string, different scope kinds: their stable_key values must
-        // differ so a hit on one cannot satisfy the other.
-        assert_ne!(conv.stable_key(), wt.stable_key());
+        let first = scope("opaque-a");
+        let second = scope("opaque-b");
+        let global = ResourceScopeKey::GlobalTerminal;
+        assert!(!manager.is_active(&first).await);
+        assert!(!manager.is_active(&second).await);
+        assert!(!manager.is_active(&global).await);
+        assert_ne!(first.stable_key(), second.stable_key());
+        assert_ne!(first.stable_key(), global.stable_key());
+        assert_ne!(second.stable_key(), global.stable_key());
     }
 
     /// Test the full create-emit + kill-emit pair end-to-end using a
@@ -1519,8 +1463,8 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn emit_lifecycle_round_trips_through_sink() {
         let (manager, mut rx) = install_sink();
-        let a = scope_conv("conv-A");
-        let b = scope_conv("conv-B");
+        let a = scope("conv-A");
+        let b = scope("conv-B");
         manager.emit_lifecycle(&a, true);
         manager.emit_lifecycle(&a, false);
         manager.emit_lifecycle(&b, true);
@@ -1542,7 +1486,7 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn emit_lifecycle_without_sink_is_no_op() {
         let manager = BrowserSessionManager::default();
-        let scope = scope_conv("conv-X");
+        let scope = scope("conv-X");
         manager.emit_lifecycle(&scope, true);
         assert!(!manager.is_active(&scope).await);
     }
@@ -1560,8 +1504,8 @@ mod lifecycle_hook_tests {
     async fn filter_reapable_without_hook_reaps_all() {
         let manager = BrowserSessionManager::default();
         let candidates = vec![
-            ("k1".to_string(), scope_conv("conv-1")),
-            ("k2".to_string(), scope_wt("/tmp/wt-2")),
+            ("k1".to_string(), scope("conv-1")),
+            ("k2".to_string(), scope("/tmp/wt-2")),
         ];
         let reap = manager.filter_reapable(candidates).await;
         assert_eq!(reap, vec!["k1".to_string(), "k2".to_string()]);
@@ -1573,12 +1517,12 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn filter_reapable_skips_live_scope_reaps_dead_scope() {
         let manager = BrowserSessionManager::default();
-        let live = scope_conv("alive");
-        let dead = scope_conv("abandoned");
+        let live = scope("alive");
+        let dead = scope("abandoned");
 
         // Stub predicate: only `alive` is live.
         let live_key = live.stable_key();
-        let hook: super::ScopeLivenessHook = Arc::new(move |scope: WorkScope| {
+        let hook: super::ScopeLivenessHook = Arc::new(move |scope: ResourceScopeKey| {
             let is_live = scope.stable_key() == live_key;
             Box::pin(async move { is_live }) as futures::future::BoxFuture<'static, bool>
         });
@@ -1601,17 +1545,17 @@ mod lifecycle_hook_tests {
     async fn scope_liveness_hook_is_set_once() {
         let manager = BrowserSessionManager::default();
         // First hook: everything live (nothing reapable).
-        let first: super::ScopeLivenessHook = Arc::new(|_scope: WorkScope| {
+        let first: super::ScopeLivenessHook = Arc::new(|_scope: ResourceScopeKey| {
             Box::pin(async { true }) as futures::future::BoxFuture<'static, bool>
         });
         manager.set_scope_liveness_hook(first);
         // Second hook would say nothing is live — must be ignored.
-        let second: super::ScopeLivenessHook = Arc::new(|_scope: WorkScope| {
+        let second: super::ScopeLivenessHook = Arc::new(|_scope: ResourceScopeKey| {
             Box::pin(async { false }) as futures::future::BoxFuture<'static, bool>
         });
         manager.set_scope_liveness_hook(second);
 
-        let candidates = vec![("k".to_string(), scope_conv("c"))];
+        let candidates = vec![("k".to_string(), scope("c"))];
         let reap = manager.filter_reapable(candidates).await;
         assert!(
             reap.is_empty(),

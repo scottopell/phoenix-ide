@@ -26,7 +26,7 @@ pub mod work_scope_inventory;
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecycleSink, BashOp, BashTool,
-    BashToolInput, SandboxedBashTool, WorkScopeHandles as BashWorkScopeHandles,
+    BashToolInput, ResourceScopeKeyHandles as BashResourceScopeKeyHandles, SandboxedBashTool,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -63,10 +63,9 @@ use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_core::domain::sm_state::ExploreBashCapability;
 use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::platform::PlatformCapability;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_workflow::wake_profile::{
     WakeCancellationReason, WakeRegistrationIntent, WakeResourceIdentity, WorkScopeIdentity,
-    WorkScopeKind,
 };
 use phoenix_workflow::{Timestamp, WorkflowId};
 
@@ -171,24 +170,17 @@ pub trait WakeRegistrar: Send + Sync {
     async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String>;
 }
 
-/// Converts a runtime scope to a scope that may own a durable wake.
+/// Converts a resource scope to the persisted identity that may own a durable wake.
 ///
 /// # Errors
-/// Returns an error for global scope, which has no durable conversation/worktree owner.
-pub fn work_scope_identity(scope: &WorkScope) -> Result<WorkScopeIdentity, String> {
-    Ok(match scope {
-        WorkScope::Worktree(path) => WorkScopeIdentity {
-            kind: WorkScopeKind::Worktree,
-            stable_key: path.clone(),
-        },
-        WorkScope::Conversation(id) => WorkScopeIdentity {
-            kind: WorkScopeKind::Conversation,
-            stable_key: id.clone(),
-        },
-        WorkScope::Global => {
-            return Err("global work scope cannot own a durable wake".to_string());
+/// Returns an error for the global terminal namespace, which has no durable work owner.
+pub fn work_scope_identity(scope: &ResourceScopeKey) -> Result<WorkScopeIdentity, String> {
+    match scope {
+        ResourceScopeKey::Work(id) => Ok(WorkScopeIdentity(id.as_str().to_string())),
+        ResourceScopeKey::GlobalTerminal => {
+            Err("global terminal scope cannot own a durable wake".to_string())
         }
-    })
+    }
 }
 
 /// Typed image data for LLM consumption.
@@ -365,7 +357,7 @@ pub struct ToolContext {
     browser_sessions: Arc<BrowserSessionManager>,
 
     /// Per-process bash handle registry (access via `bash_handles()` method).
-    /// Owns the per-`WorkScope` handle tables, ring buffers, tombstones,
+    /// Owns the per-`ResourceScopeKey` handle tables, ring buffers, tombstones,
     /// and live-handle cap enforcement (REQ-BASH-005, REQ-BASH-006,
     /// REQ-BASH-014). Reached by tools through `bash_handles()` /
     /// `bash_handle_registry()`.
@@ -401,7 +393,7 @@ pub struct ToolContext {
     /// Worktree-backed conversations scope to the worktree path so resources
     /// survive context-exhaustion continuations; Direct conversations fall
     /// back to the conversation id.
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
 
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
@@ -422,9 +414,10 @@ impl ToolContext {
         terminals: phoenix_terminal::ActiveTerminals,
         tmux_registry: Arc<TmuxRegistry>,
         worktree_path: Option<PathBuf>,
+        work_scope_id: phoenix_core::work_scope::WorkScopeId,
     ) -> Self {
         let root_conversation_id = conversation_id.clone();
-        let work_scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
+        let work_scope = ResourceScopeKey::Work(work_scope_id);
         Self {
             cancel,
             conversation_id,
@@ -484,7 +477,7 @@ impl ToolContext {
     }
 
     /// Get or create the browser session for this conversation's
-    /// `WorkScope`.
+    /// `ResourceScopeKey`.
     ///
     /// Lazily initializes Chrome on first call. Subsequent calls — including
     /// from a continuation that resolves to the same scope — return the
@@ -500,10 +493,10 @@ impl ToolContext {
         self.browser_sessions.get_session(&self.work_scope).await
     }
 
-    /// Get the per-`WorkScope` bash handle table.
+    /// Get the per-`ResourceScopeKey` bash handle table.
     ///
     /// Lazily creates the scope entry on first call; subsequent calls that
-    /// resolve to the same `WorkScope` — including from a continuation that
+    /// resolve to the same `ResourceScopeKey` — including from a continuation that
     /// inherits the same worktree — return the same `Arc<RwLock<...>>`, so a
     /// continuation chain on one worktree shares one handle table
     /// (REQ-BASH-WS-001). Returns a `Result` for shape-parity with
@@ -511,13 +504,15 @@ impl ToolContext {
     /// surface accepts future failure modes (e.g. registry resource
     /// exhaustion) without reshaping every callsite.
     ///
-    /// REQ-BASH-014: Stateless Tool with Per-`WorkScope` Handle Registry.
+    /// REQ-BASH-014: Stateless Tool with Per-`ResourceScopeKey` Handle Registry.
     ///
     /// # Errors
     /// Returns [`BashHandleError`] to keep shape-parity with [`Self::browser`].
     /// `get_or_create` is currently infallible, so this presently always
     /// returns `Ok`.
-    pub async fn bash_handles(&self) -> Result<Arc<RwLock<BashWorkScopeHandles>>, BashHandleError> {
+    pub async fn bash_handles(
+        &self,
+    ) -> Result<Arc<RwLock<BashResourceScopeKeyHandles>>, BashHandleError> {
         Ok(self.bash_handles.get_or_create(&self.work_scope).await)
     }
 
@@ -1458,6 +1453,7 @@ mod wake_registrar_seam_tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
     }
 

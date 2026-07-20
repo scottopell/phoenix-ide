@@ -2207,6 +2207,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             std::sync::Arc::new(crate::TmuxRegistry::new()),
             Some(repo.to_path_buf()),
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
         let err = resolve_target(
             &ctx,
@@ -2256,6 +2257,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             std::sync::Arc::new(crate::TmuxRegistry::new()),
             Some(repo.to_path_buf()),
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
         let target = resolve_target(
             &ctx,
@@ -2311,6 +2313,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             std::sync::Arc::new(crate::TmuxRegistry::new()),
             Some(repo.to_path_buf()),
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
         let target = resolve_target(
             &ctx,

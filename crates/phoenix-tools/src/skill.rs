@@ -86,6 +86,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
     }
 

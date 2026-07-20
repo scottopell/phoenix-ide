@@ -679,7 +679,7 @@ impl WakeRepository {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let row = sqlx::query(
             "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
-                    scope_kind, scope_stable_key, resource_kind, bash_handle_id,
+                    work_scope_id, resource_kind, bash_handle_id,
                     tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
                     expires_at, prepared_fingerprint
              FROM wake_bindings
@@ -2238,7 +2238,7 @@ impl WakeRepository {
                     p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                     p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                     p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                    p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy, b.registering_tool_use_id
+                    p.cancelled_at, b.work_scope_id, b.tmux_completion_policy, b.registering_tool_use_id
              FROM workflow_deliveries d
              JOIN wake_terminal_receipts p
                ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -2595,17 +2595,6 @@ impl WakeRepository {
         .bind(&input.from_conversation_id)
         .execute(&mut *tx.tx)
         .await?;
-
-        if binding.registration_scope.kind == wake_types::WorkScopeKind::Conversation
-            && binding.registration_scope.stable_key
-                == format!("conversation:{}", input.from_conversation_id)
-        {
-            sqlx::query("UPDATE wake_bindings SET scope_stable_key = ?2 WHERE workflow_id = ?1")
-                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-                .bind(format!("conversation:{}", input.to_conversation_id))
-                .execute(&mut *tx.tx)
-                .await?;
-        }
 
         #[cfg(test)]
         maybe_fail_after_transfer_binding_update(self.failpoint_namespace, input.workflow_id)?;
@@ -3399,7 +3388,7 @@ async fn fetch_existing_binding_tx(
 ) -> DbResult<Option<WakeBindingRecord>> {
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
-                scope_kind, scope_stable_key, resource_kind, bash_handle_id,
+                work_scope_id, resource_kind, bash_handle_id,
                 tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
                 expires_at, prepared_fingerprint
          FROM wake_bindings
@@ -3427,7 +3416,7 @@ async fn fetch_binding_by_workflow_tx(
 ) -> DbResult<Option<WakeBindingRecord>> {
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
-                scope_kind, scope_stable_key, resource_kind, bash_handle_id,
+                work_scope_id, resource_kind, bash_handle_id,
                 tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
                 expires_at, prepared_fingerprint
          FROM wake_bindings WHERE workflow_id = ?1",
@@ -3448,17 +3437,16 @@ async fn insert_binding_tx(
     sqlx::query(
         "INSERT INTO wake_bindings (
             workflow_id, conversation_id, contract_id, profile_kind, profile_version,
-            scope_kind, scope_stable_key, resource_kind, bash_handle_id,
+            work_scope_id, resource_kind, bash_handle_id,
             tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
             expires_at, prepared_fingerprint, observe_effect_id, created_at
-         ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )
     .bind(i64::try_from(workflow_id.0).map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(&input.conversation_id)
     .bind(&input.contract_id)
     .bind(i64::from(wake_profile::PROTOCOL_VERSION))
-    .bind(scope_kind_str(&input.registration_scope))
-    .bind(&input.registration_scope.stable_key)
+    .bind(input.registration_scope.as_str())
     .bind(resource_kind_str(&input.resource))
     .bind(bash_handle_id(&input.resource))
     .bind(tmux_server_token(&input.resource))
@@ -3499,18 +3487,7 @@ fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeBindingRecord
             profile_version: u32::try_from(row.get::<i64, _>("profile_version"))
                 .map_err(|e| DbError::Serialization(e.to_string()))?,
         },
-        registration_scope: wake_types::WorkScopeIdentity {
-            kind: match row.get::<String, _>("scope_kind").as_str() {
-                "Conversation" => wake_types::WorkScopeKind::Conversation,
-                "Worktree" => wake_types::WorkScopeKind::Worktree,
-                other => {
-                    return Err(DbError::Serialization(format!(
-                        "unknown scope kind: {other}"
-                    )))
-                }
-            },
-            stable_key: row.get("scope_stable_key"),
-        },
+        registration_scope: wake_types::WorkScopeIdentity(row.get("work_scope_id")),
         resource: resource_from_row(row)?,
         registering_tool_use_id: row.get("registering_tool_use_id"),
         expires_at: Timestamp(
@@ -3525,35 +3502,13 @@ fn resource_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeResourceIden
     match row.get::<String, _>("resource_kind").as_str() {
         "Bash" => Ok(WakeResourceIdentity::Bash(
             wake_types::BashResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: match row.get::<String, _>("scope_kind").as_str() {
-                        "Conversation" => wake_types::WorkScopeKind::Conversation,
-                        "Worktree" => wake_types::WorkScopeKind::Worktree,
-                        other => {
-                            return Err(DbError::Serialization(format!(
-                                "unknown scope kind: {other}"
-                            )))
-                        }
-                    },
-                    stable_key: row.get("scope_stable_key"),
-                },
+                work_scope: wake_types::WorkScopeIdentity(row.get("work_scope_id")),
                 handle_id: row.get::<String, _>("bash_handle_id"),
             },
         )),
         "TmuxWindow" => Ok(WakeResourceIdentity::TmuxWindow(
             wake_types::TmuxResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: match row.get::<String, _>("scope_kind").as_str() {
-                        "Conversation" => wake_types::WorkScopeKind::Conversation,
-                        "Worktree" => wake_types::WorkScopeKind::Worktree,
-                        other => {
-                            return Err(DbError::Serialization(format!(
-                                "unknown scope kind: {other}"
-                            )))
-                        }
-                    },
-                    stable_key: row.get("scope_stable_key"),
-                },
+                work_scope: wake_types::WorkScopeIdentity(row.get("work_scope_id")),
                 server_token: row.get::<String, _>("tmux_server_token"),
                 window_id: row.get::<String, _>("tmux_window_id"),
                 completion_policy: parse_tmux_completion_policy(
@@ -3564,13 +3519,6 @@ fn resource_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeResourceIden
         other => Err(DbError::Serialization(format!(
             "unknown resource kind: {other}"
         ))),
-    }
-}
-
-fn scope_kind_str(scope: &wake_types::WorkScopeIdentity) -> &'static str {
-    match scope.kind {
-        wake_types::WorkScopeKind::Conversation => "Conversation",
-        wake_types::WorkScopeKind::Worktree => "Worktree",
     }
 }
 
@@ -4009,7 +3957,7 @@ async fn fetch_pending_delivery_exact_tx(
                 p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
+                p.cancelled_at, b.work_scope_id, b.tmux_completion_policy
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4050,7 +3998,7 @@ async fn fetch_pending_deliveries_for_conversation_tx(
                 p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
+                p.cancelled_at, b.work_scope_id, b.tmux_completion_policy
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4094,7 +4042,7 @@ async fn fetch_materialized_pending_batches_for_conversation_tx(
                 p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
-                p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy,
+                p.cancelled_reason, p.cancelled_at, b.work_scope_id, b.tmux_completion_policy,
                 l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
                 l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
@@ -4157,7 +4105,7 @@ async fn fetch_materialized_pending_deliveries_tx(
                 p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
-                p.cancelled_reason, p.cancelled_at, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy,
+                p.cancelled_reason, p.cancelled_at, b.work_scope_id, b.tmux_completion_policy,
                 l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
                 l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
@@ -4200,7 +4148,7 @@ async fn fetch_any_terminal_projection_tx(
     workflow_id: WorkflowId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT p.*, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
+        "SELECT p.*, b.work_scope_id, b.tmux_completion_policy
          FROM wake_terminal_receipts p
          JOIN wake_bindings b ON b.workflow_id = p.workflow_id
          WHERE p.workflow_id = ?1
@@ -4251,7 +4199,7 @@ async fn fetch_projection_by_receipt_tx(
     receipt_id: ReceiptId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT p.*, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
+        "SELECT p.*, b.work_scope_id, b.tmux_completion_policy
          FROM wake_terminal_receipts p
          JOIN wake_bindings b ON b.workflow_id = p.workflow_id
          WHERE p.workflow_id = ?1 AND p.receipt_id = ?2",
@@ -4273,7 +4221,7 @@ async fn fetch_projection_for_attempt_tx(
     attempt_id: AttemptId,
 ) -> DbResult<Option<WakeTerminalReceiptProjection>> {
     let row = sqlx::query(
-        "SELECT p.*, b.scope_kind, b.scope_stable_key, b.tmux_completion_policy
+        "SELECT p.*, b.work_scope_id, b.tmux_completion_policy
          FROM wake_terminal_receipts p
          JOIN workflow_receipts r
            ON r.workflow_id = p.workflow_id AND r.receipt_id = p.receipt_id
@@ -4376,32 +4324,17 @@ fn projection_from_row(
 }
 
 fn resource_from_projection_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeResourceIdentity> {
-    let scope_kind = match row.get::<String, _>("scope_kind").as_str() {
-        "Conversation" => wake_types::WorkScopeKind::Conversation,
-        "Worktree" => wake_types::WorkScopeKind::Worktree,
-        other => {
-            return Err(DbError::Serialization(format!(
-                "unknown projection scope kind: {other}"
-            )))
-        }
-    };
-    let scope_stable_key: String = row.get("scope_stable_key");
+    let work_scope = wake_types::WorkScopeIdentity(row.get("work_scope_id"));
     match row.get::<String, _>("resource_kind").as_str() {
         "Bash" => Ok(WakeResourceIdentity::Bash(
             wake_types::BashResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: scope_kind,
-                    stable_key: scope_stable_key,
-                },
+                work_scope: work_scope.clone(),
                 handle_id: row.get("bash_handle_id"),
             },
         )),
         "TmuxWindow" => Ok(WakeResourceIdentity::TmuxWindow(
             wake_types::TmuxResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: scope_kind,
-                    stable_key: scope_stable_key,
-                },
+                work_scope: work_scope.clone(),
                 server_token: row.get("tmux_server_token"),
                 window_id: row.get("tmux_window_id"),
                 completion_policy: parse_tmux_completion_policy(
@@ -4700,13 +4633,36 @@ mod tests {
     use std::str::FromStr;
 
     async fn setup_repo_schema(pool: &sqlx::SqlitePool) {
-        sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', cwd TEXT NOT NULL DEFAULT '/tmp', parent_conversation_id TEXT, user_initiated BOOLEAN NOT NULL DEFAULT 1, archived BOOLEAN NOT NULL DEFAULT 0, model TEXT, steering_queue TEXT NOT NULL DEFAULT '[]', state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', created_at TEXT NOT NULL DEFAULT '2025-01-01', updated_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
-        sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT, created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
-        run_pending_migrations(pool).await.unwrap();
-        sqlx::query("INSERT OR IGNORE INTO conversations (id) VALUES ('conv-1')")
+        sqlx::raw_sql(crate::ddl::SCHEMA)
             .execute(pool)
             .await
             .unwrap();
+        crate::Database {
+            pool: pool.clone(),
+            path: String::new(),
+        }
+        .run_migrations()
+        .await
+        .unwrap();
+        run_pending_migrations(pool).await.unwrap();
+        sqlx::query(
+            "INSERT OR IGNORE INTO work_scopes
+             (id, authority_kind, lifecycle, created_at, updated_at)
+             VALUES ('conv-1', 'restricted_explore', 'active', '2025-01-01', '2025-01-01')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations
+             (id, slug, title, cwd, user_initiated, state_updated_at, created_at, updated_at,
+              runtime_role, work_scope_id)
+             VALUES ('conv-1', 'conv-1', 'conv-1', '/tmp', 1, '2025-01-01', '2025-01-01',
+                     '2025-01-01', 'user', 'conv-1')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn open_repo_pair() -> (tempfile::TempDir, WakeRepository, WakeRepository) {
@@ -4747,15 +4703,9 @@ mod tests {
         WakeRegistrationIntent {
             contract_id: "contract-2".into(),
             conversation_id: "conv-1".into(),
-            registration_scope: wake_types::WorkScopeIdentity {
-                kind: wake_types::WorkScopeKind::Conversation,
-                stable_key: "conv-1".into(),
-            },
+            registration_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             resource: WakeResourceIdentity::TmuxWindow(wake_types::TmuxResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: wake_types::WorkScopeKind::Conversation,
-                    stable_key: "conv-1".into(),
-                },
+                work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
                 server_token: "srv-1".into(),
                 window_id: "win-1".into(),
                 completion_policy: wake_types::TmuxCompletionPolicy::KeepOpen,
@@ -4769,10 +4719,7 @@ mod tests {
     fn bash_evidence(occurred_at: u64) -> WakeTerminalEvidence {
         WakeTerminalEvidence::Bash(BashTerminalEvidence {
             identity: wake_types::BashResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: wake_types::WorkScopeKind::Conversation,
-                    stable_key: "conv-1".into(),
-                },
+                work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
                 handle_id: "b-1".into(),
             },
             status: wake_types::BashTerminalStatus::Exited,
@@ -4788,10 +4735,7 @@ mod tests {
     fn tmux_evidence(occurred_at: u64) -> WakeTerminalEvidence {
         WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
             identity: wake_types::TmuxResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: wake_types::WorkScopeKind::Conversation,
-                    stable_key: "conv-1".into(),
-                },
+                work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
                 server_token: "srv-1".into(),
                 window_id: "win-1".into(),
                 completion_policy: wake_types::TmuxCompletionPolicy::KeepOpen,
@@ -4850,15 +4794,9 @@ mod tests {
         WakeRegistrationIntent {
             contract_id: "contract-1".into(),
             conversation_id: "conv-1".into(),
-            registration_scope: wake_types::WorkScopeIdentity {
-                kind: wake_types::WorkScopeKind::Conversation,
-                stable_key: "conv-1".into(),
-            },
+            registration_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             resource: WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: wake_types::WorkScopeKind::Conversation,
-                    stable_key: "conv-1".into(),
-                },
+                work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
                 handle_id: "b-1".into(),
             }),
             registering_tool_use_id: "tool-1".into(),
@@ -4993,11 +4931,19 @@ mod tests {
     }
 
     async fn insert_conversation(pool: &sqlx::SqlitePool, id: &str) {
-        sqlx::query("INSERT OR IGNORE INTO conversations (id) VALUES (?1)")
-            .bind(id)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT OR IGNORE INTO conversations
+             (id, slug, title, cwd, user_initiated, state_updated_at, created_at, updated_at,
+              runtime_role, work_scope_id)
+             SELECT ?1, ?1, ?1, '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01',
+                    'user', work_scope_id
+             FROM conversations
+             WHERE id = 'conv-1'",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn external_acceptance_identity(
@@ -5901,10 +5847,7 @@ mod tests {
         let mut second_intent = intent();
         second_intent.registering_tool_use_id = "tool-2".into();
         second_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
-            work_scope: wake_types::WorkScopeIdentity {
-                kind: wake_types::WorkScopeKind::Conversation,
-                stable_key: "conv-1".into(),
-            },
+            work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             handle_id: "b-2".into(),
         });
         let second_workflow_id = WorkflowId(806);
@@ -5934,10 +5877,7 @@ mod tests {
                 Timestamp(20),
                 &WakeTerminalEvidence::Bash(BashTerminalEvidence {
                     identity: wake_types::BashResourceIdentity {
-                        work_scope: wake_types::WorkScopeIdentity {
-                            kind: wake_types::WorkScopeKind::Conversation,
-                            stable_key: "conv-1".into(),
-                        },
+                        work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
                         handle_id: "b-2".into(),
                     },
                     status: wake_types::BashTerminalStatus::Exited,
@@ -7336,10 +7276,7 @@ mod tests {
         right_input.contract_id = "contract-2".into();
         right_input.registering_tool_use_id = "tool-2".into();
         right_input.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
-            work_scope: wake_types::WorkScopeIdentity {
-                kind: wake_types::WorkScopeKind::Conversation,
-                stable_key: "conv-1".into(),
-            },
+            work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             handle_id: "b-2".into(),
         });
 
@@ -7451,10 +7388,7 @@ mod tests {
         intent_b.contract_id = "contract-b".into();
         intent_b.registering_tool_use_id = "tool-b".into();
         intent_b.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
-            work_scope: wake_types::WorkScopeIdentity {
-                kind: wake_types::WorkScopeKind::Conversation,
-                stable_key: "conv-1".into(),
-            },
+            work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             handle_id: "b-active-b".into(),
         });
         assert!(matches!(
@@ -7469,15 +7403,9 @@ mod tests {
         let pending_input = WakeRegistrationIntent {
             contract_id: "contract-p".into(),
             conversation_id: pending_conv.into(),
-            registration_scope: wake_types::WorkScopeIdentity {
-                kind: wake_types::WorkScopeKind::Conversation,
-                stable_key: pending_conv.into(),
-            },
+            registration_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             resource: WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
-                work_scope: wake_types::WorkScopeIdentity {
-                    kind: wake_types::WorkScopeKind::Conversation,
-                    stable_key: pending_conv.into(),
-                },
+                work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
                 handle_id: "b-pending".into(),
             }),
             registering_tool_use_id: "tool-p".into(),
@@ -7518,10 +7446,7 @@ mod tests {
         expired_intent.registering_tool_use_id = "tool-e".into();
         expired_intent.expires_at = Timestamp(15);
         expired_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
-            work_scope: wake_types::WorkScopeIdentity {
-                kind: wake_types::WorkScopeKind::Conversation,
-                stable_key: "conv-1".into(),
-            },
+            work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             handle_id: "b-expired".into(),
         });
         assert!(matches!(
@@ -7535,10 +7460,7 @@ mod tests {
         leased_intent.contract_id = "contract-l".into();
         leased_intent.registering_tool_use_id = "tool-l".into();
         leased_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
-            work_scope: wake_types::WorkScopeIdentity {
-                kind: wake_types::WorkScopeKind::Conversation,
-                stable_key: "conv-1".into(),
-            },
+            work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             handle_id: "b-leased".into(),
         });
         assert!(matches!(
@@ -8249,11 +8171,23 @@ mod tests {
         let mut input = intent();
         input.conversation_id = "conv-wt".into();
         insert_conversation(&first.workflow_repo.pool, "conv-wt").await;
+        let opaque_scope = "0196f15d-f1ac-7d4c-a3b2-88d90f414bcc";
+        sqlx::query(
+            "INSERT INTO work_scopes
+             (id, authority_kind, lifecycle, created_at, updated_at)
+             VALUES (?1, 'work', 'active', '2025-01-01', '2025-01-01')",
+        )
+        .bind(opaque_scope)
+        .execute(&first.workflow_repo.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'conv-wt'")
+            .bind(opaque_scope)
+            .execute(&first.workflow_repo.pool)
+            .await
+            .unwrap();
 
-        input.registration_scope = wake_types::WorkScopeIdentity {
-            kind: wake_types::WorkScopeKind::Worktree,
-            stable_key: "worktree:/tmp/demo".into(),
-        };
+        input.registration_scope = wake_types::WorkScopeIdentity(opaque_scope.into());
         input.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
             work_scope: input.registration_scope.clone(),
             handle_id: "b-wt".into(),
@@ -8307,11 +8241,7 @@ mod tests {
                 resource: WakeResourceIdentity::Bash(identity),
                 ..
             } => {
-                assert_eq!(
-                    identity.work_scope.kind,
-                    wake_types::WorkScopeKind::Worktree
-                );
-                assert_eq!(identity.work_scope.stable_key, "worktree:/tmp/demo");
+                assert_eq!(identity.work_scope.as_str(), opaque_scope);
             }
             other @ (WakeTerminalPayload::Fired { .. }
             | WakeTerminalPayload::Cancelled { .. }

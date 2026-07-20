@@ -1149,6 +1149,7 @@ mod tests {
             crate::terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
             None,
+            crate::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
     }
 

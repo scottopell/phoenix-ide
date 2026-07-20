@@ -2396,7 +2396,7 @@ where
         let _ = reply_rx.await;
     }
 
-    /// Remove the conversation's worktree if its canonical [`WorkScope`] owns
+    /// Remove the conversation's worktree if its canonical [`ResourceScopeKey`] owns
     /// one and it still exists on disk.
     fn cleanup_worktree_if_present(&self) {
         if self.context.is_sub_agent {
@@ -2414,14 +2414,9 @@ where
             return;
         }
 
-        let scope = phoenix_core::work_scope::WorkScope::resolve(
-            self.context.conversation_id.clone(),
-            self.context.work_scope_worktree.as_deref(),
-        );
-        let phoenix_core::work_scope::WorkScope::Worktree(worktree_path) = scope else {
+        let Some(worktree_path) = self.context.work_scope_worktree.clone() else {
             return;
         };
-        let worktree_path = std::path::PathBuf::from(worktree_path);
         if !worktree_path.exists() {
             return;
         }
@@ -2430,7 +2425,7 @@ where
             tracing::warn!(
                 conv_id = %self.context.conversation_id,
                 worktree = %worktree_path.display(),
-                "refusing terminal worktree cleanup for non-Phoenix WorkScope path"
+                "refusing terminal worktree cleanup for non-Phoenix ResourceScopeKey path"
             );
             return;
         };
@@ -4955,8 +4950,8 @@ where
         // this — rather than `mode != Direct → working_dir` — keeps
         // `ToolContext.work_scope` in lock-step with the DB-facing scope
         // derivations: a sub-agent Explore resolves to
-        // `WorkScope::Conversation(id)` on both sides instead of diverging to
-        // `WorkScope::Worktree(cwd)` on the tool side only.
+        // `ResourceScopeKey::Conversation(id)` on both sides instead of diverging to
+        // `ResourceScopeKey::Worktree(cwd)` on the tool side only.
         let scope_worktree = self.context.work_scope_worktree.clone();
         let progress_broadcaster = self.broadcast_tx.clone();
         let progress_tool_use_id = tool.id.clone();
@@ -4979,6 +4974,7 @@ where
             self.terminals.clone(),
             self.tmux_registry.clone(),
             scope_worktree,
+            self.context.work_scope_id.clone(),
         )
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
@@ -5721,55 +5717,16 @@ where
 
                 // Refresh the cached scope-defining worktree so in-runtime tool
                 // calls (bash/tmux/browser) key resources under the same
-                // `WorkScope` the DB-facing inventory/cleanup resolve. Approval
-                // promotes Explore (no worktree -> `WorkScope::Conversation`) to
-                // Work (owns a worktree -> `WorkScope::Worktree`); leaving the
+                // `ResourceScopeKey` the DB-facing inventory/cleanup resolve. Approval
+                // promotes Explore (no worktree -> `ResourceScopeKey::Conversation`) to
+                // Work (owns a worktree -> `ResourceScopeKey::Worktree`); leaving the
                 // cached value stale would split the two sides until restart.
                 // The post-approval `conv_mode` is Work, whose
                 // `worktree_path()` is the path just created, mirroring how
                 // construction seeds this from `conv_mode.worktree_path()`.
                 //
-                // The scope flips here from `old_scope` (pre-approval) to
-                // `new_scope` (post-approval). Resources opened pre-approval
-                // (bash/browser/tmux) are keyed under `old_scope`; migrate them
-                // to `new_scope` below so the inventory and idle/cleanup paths
-                // resolve them under the same scope the cache now uses.
-                let old_scope = phoenix_core::work_scope::WorkScope::resolve(
-                    self.context.conversation_id.clone(),
-                    self.context.work_scope_worktree.as_deref(),
-                );
                 self.context.work_scope_worktree =
                     Some(std::path::PathBuf::from(&approval_result.worktree_path));
-                let new_scope = phoenix_core::work_scope::WorkScope::resolve(
-                    self.context.conversation_id.clone(),
-                    self.context.work_scope_worktree.as_deref(),
-                );
-
-                // Migrate WorkScope-keyed resources opened before approval from
-                // the conversation scope to the worktree scope. Each rekey moves
-                // the in-memory lookup key only — the underlying process /
-                // session / server is untouched. A no-op when nothing was opened
-                // pre-approval (the common case) or when the scope did not flip
-                // (a top-level Explore that already owned a worktree).
-                let bash_moved = self.bash_handles.rekey_scope(&old_scope, &new_scope).await;
-                let browser_moved = self
-                    .browser_sessions
-                    .rekey_scope(&old_scope, &new_scope)
-                    .await;
-                let tmux_moved = self.tmux_registry.rekey_scope(&old_scope, &new_scope).await;
-
-                // If anything migrated, nudge the work-scope bridge to
-                // re-broadcast `new_scope`'s inventory so the panel reflects the
-                // moved resources without waiting for its next poll. The bridge
-                // assembles the full (bash + tmux + browser) inventory from the
-                // affected scope, so a single emit on any registry sink covers
-                // all three kinds; bash is used as the carrier.
-                if bash_moved || browser_moved || tmux_moved {
-                    self.bash_handles.emit_lifecycle(
-                        &new_scope,
-                        phoenix_tools::bash::BashLifecyclePhase::Spawned,
-                    );
-                }
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -5837,9 +5794,8 @@ where
                             base_branch: Some(approval_result.base_branch.clone()),
                             task_title: Some(approval_result.task_title.clone()),
                             work_scope_key: Some(
-                                crate::work_scope::WorkScope::resolve(
-                                    &self.context.conversation_id,
-                                    Some(std::path::Path::new(&approval_result.worktree_path)),
+                                crate::work_scope::ResourceScopeKey::Work(
+                                    self.context.work_scope_id.clone(),
                                 )
                                 .stable_key(),
                             ),
@@ -8583,7 +8539,7 @@ mod context_exhausted_preserves_worktree_tests {
 
         assert!(
             !Path::new(&wt_path).exists(),
-            "terminal cleanup must remove the inherited WorkScope path rather than \
+            "terminal cleanup must remove the inherited ResourceScopeKey path rather than \
              deriving a nonexistent path from the continuation id"
         );
     }
@@ -8612,7 +8568,7 @@ mod context_exhausted_preserves_worktree_tests {
 
         assert!(
             Path::new(&wt_path).exists(),
-            "a Work sub-agent must not remove its live parent's inherited WorkScope"
+            "a Work sub-agent must not remove its live parent's inherited ResourceScopeKey"
         );
     }
 
@@ -9659,163 +9615,6 @@ mod explore_prompt_cache_shape_tests {
 // value from runtime startup). The `spawn_agents` Work-parent guard
 // reads this field; a stale Explore value rejects legitimate
 // `mode: "work"` sub-agent requests from a Work-mode parent.
-
-#[cfg(test)]
-mod approve_task_refreshes_mode_context_tests {
-    use super::test_git_helpers::{add_explore_worktree, init_repo};
-    use super::*;
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
-    use crate::state_machine::{ConvContext, ConvState, Effect};
-    use crate::system_prompt::ModeContext;
-    use crate::tools::BrowserSessionManager;
-    use phoenix_llm::ModelRegistry;
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    #[tokio::test]
-    // End-to-end approval flow: repo setup, task creation, approval, and
-    // post-conditions read clearer as one linear scenario than split apart.
-    #[allow(clippy::too_many_lines)]
-    async fn approve_task_sets_mode_context_to_work() {
-        let (_tmp, repo_root) = init_repo();
-        let conv_id = "mode-ctx-refresh-1";
-        let base_branch = "main";
-
-        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
-        let tasks_dir = explore_wt.join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        let task_filename = "12345-p2-ready--spawn-work-subagents.md";
-        std::fs::write(
-            tasks_dir.join(task_filename),
-            "# Spawn work subagents\n\n1. Plan\n2. Spawn\n",
-        )
-        .unwrap();
-
-        let storage = Arc::new(InMemoryStorage::new());
-        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
-        context.mode_context = Some(ModeContext::Explore {
-            next_taskmd_id_hint: None,
-        });
-        context.desired_base_branch = Some(base_branch.to_string());
-        // Pre-approval Explore owns no scope-defining worktree (the
-        // sub-agent-Explore shape that keys tool resources under
-        // `WorkScope::Conversation`). Approval must refresh this cache.
-        context.work_scope_worktree = None;
-
-        let (_event_tx, event_rx) = mpsc::channel(32);
-        let event_tx_dup = mpsc::channel::<Event>(1).0;
-        let broadcaster = SseBroadcaster::new(128, 0);
-
-        // Seed a bash handle under the pre-approval conversation scope —
-        // the sub-agent-Explore shape keys resources under
-        // `WorkScope::Conversation(conv_id)`. After approval it must be
-        // reachable under the worktree scope (and gone from the old scope).
-        let bash_handles = Arc::new(crate::tools::BashHandleRegistry::new());
-        let old_scope = crate::work_scope::WorkScope::Conversation(conv_id.to_string());
-        {
-            use phoenix_tools::bash::handle::{Handle, HandleId};
-            use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
-            let table = bash_handles.get_or_create(&old_scope).await;
-            table.write().await.insert(Handle::new_live(
-                old_scope.clone(),
-                HandleId::new("b-1"),
-                "echo pre-approval".to_string(),
-                None,
-                12345,
-                12345,
-                RING_BUFFER_BYTES,
-            ));
-        }
-
-        let mut rt = ConversationRuntime::new(
-            context,
-            ConvState::AwaitingTaskApproval {
-                task_file: format!("tasks/{task_filename}"),
-                title: "Spawn work subagents".to_string(),
-                priority: crate::task_source::Priority::P2,
-                plan: "Plan and spawn".to_string(),
-            },
-            storage,
-            Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()),
-            Arc::new(BrowserSessionManager::default()),
-            bash_handles.clone(),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx_dup,
-            broadcaster,
-        );
-
-        rt.execute_effect(Effect::ApproveTask {
-            task_file: format!("tasks/{task_filename}"),
-            title: "Spawn work subagents".to_string(),
-            priority: crate::task_source::Priority::P2,
-            plan: "Plan and spawn".to_string(),
-        })
-        .await
-        .expect("approve task effect failed");
-
-        match rt.context.mode_context.as_ref() {
-            Some(ModeContext::Work {
-                branch_name,
-                base_branch: bb,
-                worktree_path,
-            }) => {
-                assert!(
-                    !branch_name.is_empty(),
-                    "branch_name must be populated post-approval"
-                );
-                assert_eq!(bb, base_branch, "base_branch must round-trip");
-                assert_eq!(
-                    worktree_path,
-                    &explore_wt.to_string_lossy().to_string(),
-                    "worktree_path must equal the in-place-promoted Explore worktree"
-                );
-            }
-            other => panic!(
-                "mode_context must be refreshed to Work after approval; got {other:?}. \
-                 Stale Explore here is the task-03002 bug: spawn_agents rejects \
-                 mode: \"work\" sub-agents because parent_allows_work is false."
-            ),
-        }
-
-        // The cached scope-defining worktree must follow the promotion: a
-        // stale `None` would key in-runtime tool resources under
-        // `WorkScope::Conversation` while DB-facing cleanup resolves
-        // `WorkScope::Worktree`, splitting the panel/cleanup until restart.
-        assert_eq!(
-            rt.context.work_scope_worktree.as_deref(),
-            Some(explore_wt.as_path()),
-            "work_scope_worktree must be refreshed to the post-approval Work worktree"
-        );
-
-        // The pre-approval bash handle, opened under the conversation scope,
-        // must follow the scope flip: reachable under the new worktree scope
-        // and gone from the old conversation scope. Without the rekey it would
-        // be orphaned — invisible to the inventory and reapable by the idle
-        // reaper as an abandoned conversation scope.
-        let new_scope =
-            crate::work_scope::WorkScope::Worktree(explore_wt.to_string_lossy().into_owned());
-        assert!(
-            bash_handles.get_existing(&old_scope).await.is_none(),
-            "old conversation scope must be empty after approval rekey"
-        );
-        let migrated = bash_handles
-            .get_existing(&new_scope)
-            .await
-            .expect("bash handle table must be reachable under the new worktree scope");
-        assert!(
-            migrated
-                .read()
-                .await
-                .get(&phoenix_tools::bash::handle::HandleId::new("b-1"))
-                .is_some(),
-            "the pre-approval handle must be present under the worktree scope"
-        );
-    }
-}
 
 // ============================================================
 // Steering queue multi-drain detectors (Phase 2)

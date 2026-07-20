@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
 use super::command_tracker::CommandTracker;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 
 /// Why the current relay should stop.
 ///
@@ -120,10 +120,10 @@ impl std::fmt::Debug for TerminalHandle {
 
 /// Shared registry of active terminal sessions (REQ-TERM-003, REQ-TERM-WS-001).
 ///
-/// Keyed by `WorkScope`: `WorkScope::Worktree(path)` for managed/branch
-/// worktrees, `WorkScope::Conversation(id)` for Direct conversations, and
-/// `WorkScope::Global` for the singleton scope surfaced on the /new page.
-/// Continuation conversations resolving to the same `WorkScope` therefore
+/// Keyed by `ResourceScopeKey`: `ResourceScopeKey::Worktree(path)` for managed/branch
+/// worktrees, `ResourceScopeKey::Conversation(id)` for Direct conversations, and
+/// `ResourceScopeKey::Global` for the singleton scope surfaced on the /new page.
+/// Continuation conversations resolving to the same `ResourceScopeKey` therefore
 /// share a single entry rather than colliding — matching the ownership
 /// pattern of `TmuxRegistry` (REQ-TMUX-WS-001) and `BrowserSessionManager`
 /// (REQ-BROWSER-WS-001).
@@ -132,7 +132,7 @@ impl std::fmt::Debug for TerminalHandle {
 /// `Mutex` provides the atomic check-and-insert needed for the race guard
 /// on the fresh-session path.
 #[derive(Clone, Default)]
-pub struct ActiveTerminals(pub Arc<Mutex<HashMap<WorkScope, Arc<TerminalHandle>>>>);
+pub struct ActiveTerminals(pub Arc<Mutex<HashMap<ResourceScopeKey, Arc<TerminalHandle>>>>);
 
 impl ActiveTerminals {
     #[must_use]
@@ -162,7 +162,7 @@ impl ActiveTerminals {
     #[cfg(test)]
     #[allow(dead_code)]
     #[must_use]
-    pub fn is_active(&self, scope: &WorkScope) -> bool {
+    pub fn is_active(&self, scope: &ResourceScopeKey) -> bool {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.contains_key(scope)
     }
@@ -176,7 +176,7 @@ impl ActiveTerminals {
     #[must_use]
     pub fn try_insert(
         &self,
-        scope: WorkScope,
+        scope: ResourceScopeKey,
         handle: TerminalHandle,
     ) -> Option<Arc<TerminalHandle>> {
         let mut map = self.0.lock().expect("terminal registry poisoned");
@@ -192,7 +192,7 @@ impl ActiveTerminals {
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
-    pub fn remove(&self, scope: &WorkScope) {
+    pub fn remove(&self, scope: &ResourceScopeKey) {
         let mut map = self.0.lock().expect("terminal registry poisoned");
         map.remove(scope);
     }
@@ -202,7 +202,7 @@ impl ActiveTerminals {
     /// # Panics
     /// Panics if the registry mutex is poisoned.
     #[must_use]
-    pub fn get(&self, scope: &WorkScope) -> Option<Arc<TerminalHandle>> {
+    pub fn get(&self, scope: &ResourceScopeKey) -> Option<Arc<TerminalHandle>> {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.get(scope).cloned()
     }
@@ -227,8 +227,8 @@ impl ActiveTerminals {
     /// Panics if the registry mutex is poisoned.
     pub async fn cascade_on_delete(
         &self,
-        work_scope: &WorkScope,
-        inheritor_scope: Option<&WorkScope>,
+        work_scope: &ResourceScopeKey,
+        inheritor_scope: Option<&ResourceScopeKey>,
     ) {
         if inheritor_scope == Some(work_scope) {
             tracing::debug!(
@@ -287,8 +287,8 @@ impl ActiveTerminals {
 /// `cascade_tmux_on_delete` and `cascade_browser_on_delete`.
 pub async fn cascade_terminal_on_delete(
     terminals: &ActiveTerminals,
-    work_scope: &WorkScope,
-    inheritor_scope: Option<&WorkScope>,
+    work_scope: &ResourceScopeKey,
+    inheritor_scope: Option<&ResourceScopeKey>,
 ) {
     terminals
         .cascade_on_delete(work_scope, inheritor_scope)

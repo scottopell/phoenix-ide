@@ -20,16 +20,15 @@ pub const TERMINAL_CODEC_FAMILY: &str = "wake.terminal";
 pub const REGISTRATION_BARRIER_ID: BarrierId = BarrierId(1);
 pub const REGISTRATION_EFFECT_ID: EffectId = EffectId(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum WorkScopeKind {
-    Conversation,
-    Worktree,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WorkScopeIdentity {
-    pub kind: WorkScopeKind,
-    pub stable_key: String,
+#[serde(transparent)]
+pub struct WorkScopeIdentity(pub String);
+
+impl WorkScopeIdentity {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

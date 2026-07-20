@@ -219,7 +219,15 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         started,
     )
     .await;
-    let work_scope = phoenix_core::work_scope::WorkScope::Conversation(conversation_id.clone());
+    let conversation = db
+        .get_conversation(&conversation_id)
+        .await
+        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+    let work_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
+        conversation
+            .work_scope_id
+            .expect("persisted conversation has work scope"),
+    );
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
         manager.tmux_registry(),
         &work_scope,

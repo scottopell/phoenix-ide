@@ -28,7 +28,7 @@ pub mod sandbox;
 pub use reaper::{install_reaper, shutdown_kill_tree};
 pub use registry::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
-    WorkScopeHandles,
+    ResourceScopeKeyHandles,
 };
 // `types` (BashOp, BashToolInput) moved to phoenix-core. Alias the module back
 // as `types` and re-export the items so existing paths resolve unchanged.
@@ -273,10 +273,15 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
     }
 
-    fn ctx_for(conversation_id: &str, registry: Arc<BashHandleRegistry>) -> ToolContext {
+    fn ctx_for(
+        conversation_id: &str,
+        work_scope_id: &str,
+        registry: Arc<BashHandleRegistry>,
+    ) -> ToolContext {
         ToolContext::new(
             CancellationToken::new(),
             conversation_id.to_string(),
@@ -287,6 +292,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse(work_scope_id).unwrap(),
         )
     }
 
@@ -634,8 +640,10 @@ mod tests {
 
         let bash_pid = {
             use crate::bash::handle::HandleId;
-            use phoenix_core::work_scope::WorkScope;
-            let scope = WorkScope::Conversation("test-conv".to_string());
+            use phoenix_core::work_scope::ResourceScopeKey;
+            let scope = ResourceScopeKey::Work(
+                phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
+            );
             let table = registry.get_or_create(&scope).await;
             let h = table
                 .read()
@@ -733,8 +741,8 @@ mod tests {
     async fn cross_conversation_handle_access_returns_handle_not_found() {
         let tool = BashTool;
         let registry = Arc::new(BashHandleRegistry::new());
-        let conv_a = ctx_for("conv-a", registry.clone());
-        let conv_b = ctx_for("conv-b", registry);
+        let conv_a = ctx_for("conv-a", "scope-a", registry.clone());
+        let conv_b = ctx_for("conv-b", "scope-b", registry);
 
         let spawn = tool
             .run(
@@ -1106,6 +1114,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             Arc::new(crate::TmuxRegistry::new()),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
 
         let tool_future = tool.run(

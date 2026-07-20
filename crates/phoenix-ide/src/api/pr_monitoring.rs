@@ -2584,7 +2584,7 @@ mod tests {
     #[test]
     fn stale_primary_response_marks_mismatch_stale_with_primary_timestamp() {
         let primary = WorkScopePrAssociation {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 42,
@@ -2910,7 +2910,7 @@ mod tests {
     #[test]
     fn feedback_freshness_counts_unseen_actionable_identities() {
         let baseline = WorkScopePrFeedbackBaseline {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 7,
@@ -2931,7 +2931,7 @@ mod tests {
     #[test]
     fn coverage_degradation_alone_yields_no_content_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 7,
@@ -2954,7 +2954,7 @@ mod tests {
     #[test]
     fn feedback_freshness_marks_existing_actionable_feedback_edits_as_edited() {
         let baseline = WorkScopePrFeedbackBaseline {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 7,
@@ -2972,7 +2972,7 @@ mod tests {
     #[test]
     fn resolved_only_transition_yields_no_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 7,
@@ -2992,7 +2992,7 @@ mod tests {
     #[test]
     fn resolved_is_excluded_from_actionable_content_fingerprint() {
         let baseline = WorkScopePrFeedbackBaseline {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 7,
@@ -3012,7 +3012,7 @@ mod tests {
     #[test]
     fn legacy_resolution_fingerprint_still_matches_unchanged_actionable_feedback() {
         let baseline = WorkScopePrFeedbackBaseline {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 7,
@@ -3139,7 +3139,7 @@ mod tests {
     #[test]
     fn no_feedback_to_compare_yields_no_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 7,

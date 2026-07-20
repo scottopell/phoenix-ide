@@ -715,9 +715,11 @@ async fn provision_conversation(
                 base_branch: conv_mode.base_branch().map(ToString::to_string),
                 task_title: conv_mode.task_title().map(ToString::to_string),
                 work_scope_key: Some(
-                    crate::work_scope::WorkScope::resolve(
-                        &job.conversation_id,
-                        conv_mode.worktree_path().map(Path::new),
+                    crate::work_scope::ResourceScopeKey::Work(
+                        persisted_conversation
+                            .work_scope_id
+                            .clone()
+                            .expect("persisted conversation has work scope"),
                     )
                     .stable_key(),
                 ),

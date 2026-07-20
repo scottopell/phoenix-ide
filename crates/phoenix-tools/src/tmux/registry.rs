@@ -1,10 +1,10 @@
-//! Per-`WorkScope` tmux server registry.
+//! Per-`ResourceScopeKey` tmux server registry.
 //!
 //! REQ-TMUX-001 (socket isolation), REQ-TMUX-002 (lazy spawn),
 //! REQ-TMUX-005 (Phoenix-restart probe re-use), REQ-TMUX-006
 //! (stale-socket detection), REQ-TMUX-007 (hard-delete cascade),
 //! REQ-TMUX-013 (`ToolContext` accessor shape),
-//! REQ-TMUX-WS-001 (`WorkScope` ownership).
+//! REQ-TMUX-WS-001 (`ResourceScopeKey` ownership).
 //!
 //! Lifetime: registries live in process memory only. The tmux servers
 //! themselves are owned by the OS and survive Phoenix restart; the in-
@@ -12,21 +12,21 @@
 //! restart by probing the socket.
 //!
 //! Registry + socket keying (task 03001, REQ-TMUX-WS-001): both the
-//! `HashMap` entry and the socket path are keyed by `WorkScope` —
-//! `WorkScope::Worktree(path)` for Work/Branch/Explore conversations and
-//! `WorkScope::Conversation(id)` for Direct-mode conversations.
+//! `HashMap` entry and the socket path are keyed by `ResourceScopeKey` —
+//! `ResourceScopeKey::Worktree(path)` for Work/Branch/Explore conversations and
+//! `ResourceScopeKey::Conversation(id)` for Direct-mode conversations.
 //! Continuations resolving to the same scope share the entry and the
 //! socket, so session continuity across context-exhaustion continuations
 //! is correct by construction — the worktree is the logical coding
 //! environment, and the tmux session IS that environment's shell state.
-//! The map key itself is `WorkScope::stable_key()`, which gives
+//! The map key itself is `ResourceScopeKey::stable_key()`, which gives
 //! `worktree:` and `conversation:` disjoint namespaces.
 //!
 //! Lock ordering for `ensure_live`: acquire the registry's
 //! `RwLock<HashMap>` long enough to clone (or insert) the per-scope
 //! `Arc<RwLock<TmuxServer>>`, then drop the outer lock and take that
 //! entry's write lock for the probe + spawn sequence. The write lock
-//! serialises concurrent `ensure_live` calls on the same `WorkScope`;
+//! serialises concurrent `ensure_live` calls on the same `ResourceScopeKey`;
 //! the second caller observes `Live` after the first one finishes.
 
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 
 use thiserror::Error;
 use tokio::sync::{OnceCell, RwLock};
@@ -103,7 +103,7 @@ pub enum TmuxError {
     },
 }
 
-/// Lifecycle state of a per-`WorkScope` tmux server.
+/// Lifecycle state of a per-`ResourceScopeKey` tmux server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // `Gone` is the terminal-transition target; cascade
                     // drops entries rather than setting status=Gone today.
@@ -120,24 +120,24 @@ pub enum ServerStatus {
     Gone,
 }
 
-/// Per-`WorkScope` tmux server entity. One per scope that has ever
+/// Per-`ResourceScopeKey` tmux server entity. One per scope that has ever
 /// performed a tmux operation; scopes that never use tmux have no entry.
 ///
 /// `socket_path` is computed once at entry creation and is stable for
 /// the entry's lifetime (REQ-TMUX-001 / `SocketPathDeterministic`
-/// invariant). For `WorkScope::Worktree(path)` the path is keyed to the
-/// worktree; for `WorkScope::Conversation(id)` it falls back to the
+/// invariant). For `ResourceScopeKey::Worktree(path)` the path is keyed to the
+/// worktree; for `ResourceScopeKey::Conversation(id)` it falls back to the
 /// conversation id (task 03001 / REQ-TMUX-WS-001).
 #[derive(Debug)]
 pub struct TmuxServer {
     /// The scope this server belongs to. Diagnostic field — the
-    /// cleanup cascade derives the lookup key from its own `WorkScope`
+    /// cleanup cascade derives the lookup key from its own `ResourceScopeKey`
     /// arg, not from this field. Replaces the prior `conversation_id:
     /// String` field; for `Worktree`-scoped servers, "one conversation"
     /// was misleading because the chain of continuation members all
     /// share the entry.
     #[allow(dead_code)]
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
     pub socket_path: PathBuf,
     pub server_token: String,
     pub status: ServerStatus,
@@ -151,7 +151,7 @@ pub struct ObservedWindow {
 }
 
 impl TmuxServer {
-    fn new(work_scope: WorkScope, socket_path: PathBuf) -> Self {
+    fn new(work_scope: ResourceScopeKey, socket_path: PathBuf) -> Self {
         Self {
             work_scope,
             socket_path,
@@ -203,16 +203,16 @@ pub fn socket_path_for_global(socket_dir: &Path) -> PathBuf {
     socket_dir.join("global.sock")
 }
 
-/// Signal published when a `TmuxServer` in a `WorkScope` changes state
+/// Signal published when a `TmuxServer` in a `ResourceScopeKey` changes state
 /// (entry created, status transition `NotProbed`→`Live` / →`Gone`, or
 /// removal during the hard-delete cascade). Mirrors the bash
-/// `BashLifecycleEvent` shape: it carries only the affected `WorkScope`,
+/// `BashLifecycleEvent` shape: it carries only the affected `ResourceScopeKey`,
 /// leaving inventory assembly and conversation routing to the runtime's
 /// work-scope bridge. State transitions only — NOT per-probe noops
 /// (REQ-WSUI-007).
 #[derive(Debug, Clone)]
 pub struct TmuxLifecycleEvent {
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
 }
 
 /// Sink the registry publishes [`TmuxLifecycleEvent`]s into. A `mpsc`
@@ -221,11 +221,11 @@ pub struct TmuxLifecycleEvent {
 /// path. Mirrors [`super::super::bash::registry::BashLifecycleSink`].
 pub type TmuxLifecycleSink = tokio::sync::mpsc::UnboundedSender<TmuxLifecycleEvent>;
 
-/// Top-level registry: maps `WorkScope::stable_key()` → per-scope tmux
+/// Top-level registry: maps `ResourceScopeKey::stable_key()` → per-scope tmux
 /// server. One registry instance per Phoenix process.
 #[derive(Debug)]
 pub struct TmuxRegistry {
-    /// Keyed by `WorkScope::stable_key()` so Worktree-scoped continuation
+    /// Keyed by `ResourceScopeKey::stable_key()` so Worktree-scoped continuation
     /// members share an entry, and Worktree vs Conversation namespaces
     /// stay disjoint.
     inner: RwLock<HashMap<String, Arc<RwLock<TmuxServer>>>>,
@@ -273,7 +273,7 @@ impl TmuxRegistry {
     /// Construct a registry (default socket dir) that publishes tmux
     /// state-transition signals into `sink`. The runtime wires this to the
     /// work-scope push bridge, which resolves the scope's conversation and
-    /// broadcasts a `WorkScopeUpdate`. Mirrors
+    /// broadcasts a `ResourceScopeKeyUpdate`. Mirrors
     /// `BashHandleRegistry::with_lifecycle_sink`.
     #[must_use]
     pub fn with_lifecycle_sink(sink: Option<TmuxLifecycleSink>) -> Self {
@@ -286,7 +286,7 @@ impl TmuxRegistry {
     /// wired. Best-effort: a dropped receiver / closed channel is logged at
     /// `debug` (capability gap) and does not affect registry correctness.
     /// Mirrors `BashHandleRegistry::emit_lifecycle`.
-    fn emit_lifecycle(&self, work_scope: &WorkScope) {
+    fn emit_lifecycle(&self, work_scope: &ResourceScopeKey) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
         };
@@ -423,7 +423,7 @@ impl TmuxRegistry {
         Ok(())
     }
 
-    /// Get-or-create the per-`WorkScope` `Arc<RwLock<TmuxServer>>` and
+    /// Get-or-create the per-`ResourceScopeKey` `Arc<RwLock<TmuxServer>>` and
     /// drive the probe-and-act sequence (REQ-TMUX-002 / REQ-TMUX-005 /
     /// REQ-TMUX-006, REQ-TMUX-WS-001).
     ///
@@ -435,10 +435,10 @@ impl TmuxRegistry {
     ///
     /// `work_scope` controls registry keying *and* socket keying (task
     /// 03001, REQ-TMUX-WS-001):
-    /// - `WorkScope::Worktree(path)` — Work/Branch/Explore: registry
+    /// - `ResourceScopeKey::Worktree(path)` — Work/Branch/Explore: registry
     ///   entry and socket keyed to the worktree path so continuations
     ///   resolving to the same scope automatically share the same session.
-    /// - `WorkScope::Conversation(id)` — Direct mode: registry entry and
+    /// - `ResourceScopeKey::Conversation(id)` — Direct mode: registry entry and
     ///   socket keyed to the conversation id.
     ///
     /// On `Live`: no spawn, status=Live.
@@ -457,7 +457,7 @@ impl TmuxRegistry {
     ///   steps fail.
     pub async fn ensure_live(
         &self,
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
         cwd: &Path,
     ) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
         if !self.binary_available {
@@ -466,11 +466,10 @@ impl TmuxRegistry {
         self.ensure_runtime_assets().await?;
 
         let socket_path = match work_scope {
-            WorkScope::Worktree(path) => {
-                socket_path_for_worktree(&self.socket_dir, Path::new(path))
+            ResourceScopeKey::Work(id) => {
+                socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
             }
-            WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
-            WorkScope::Global => socket_path_for_global(&self.socket_dir),
+            ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),
         };
 
         let (server_arc, created) = self.get_or_insert(work_scope, socket_path).await;
@@ -575,7 +574,7 @@ impl TmuxRegistry {
     /// (the loser observes the existing entry and gets `false`).
     async fn get_or_insert(
         &self,
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
         socket_path: PathBuf,
     ) -> (Arc<RwLock<TmuxServer>>, bool) {
         let key = work_scope.stable_key();
@@ -596,54 +595,7 @@ impl TmuxRegistry {
         map.insert(key, entry.clone());
         (entry, true)
     }
-
-    /// Move a `WorkScope`'s tmux server entry from `old` to `new`.
-    ///
-    /// Used at an Explore→Work approval, where the conversation's scope flips
-    /// from `WorkScope::Conversation(id)` to `WorkScope::Worktree(path)`: a tmux
-    /// server spawned pre-approval is stored under `old` and must follow the
-    /// scope so the inventory and cleanup cascade resolve it under `new`.
-    ///
-    /// Only the registry key and the entry's `work_scope` diagnostic field
-    /// move. The `socket_path` is left untouched — the running tmux server
-    /// lives on the socket derived from `old`, and the OS process is not
-    /// re-socketed. The cascade reads the stored `socket_path` (it does not
-    /// re-derive from the scope when an entry is present), so subsequent
-    /// kill/unlink still targets the correct socket.
-    ///
-    /// Returns `true` if an entry was moved. No-ops (returns `false`) when:
-    /// - `old == new` (nothing to do), or
-    /// - there is no entry under `old`, or
-    /// - `new` is already occupied — the pre-existing `new` entry is preserved
-    ///   and `old` is left in place (NOT clobbered), with a WARN. At approval
-    ///   `new` is a freshly created worktree scope, so occupancy is not
-    ///   expected.
-    pub async fn rekey_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
-        if old == new {
-            return false;
-        }
-        let old_key = old.stable_key();
-        let new_key = new.stable_key();
-        let mut map = self.inner.write().await;
-        if map.contains_key(&new_key) {
-            if map.contains_key(&old_key) {
-                tracing::warn!(
-                    old = %old,
-                    new = %new,
-                    "tmux: refusing to rekey server entry — destination scope already occupied; leaving both entries in place"
-                );
-            }
-            return false;
-        }
-        let Some(entry) = map.remove(&old_key) else {
-            return false;
-        };
-        entry.write().await.work_scope = new.clone();
-        map.insert(new_key, entry);
-        true
-    }
-
-    /// Look up a `WorkScope`'s tmux server entry **without creating one or
+    /// Look up a `ResourceScopeKey`'s tmux server entry **without creating one or
     /// probing the socket**.
     ///
     /// Read-only counterpart to the `get_or_insert` + probe path in
@@ -651,7 +603,10 @@ impl TmuxRegistry {
     /// inventory endpoint) that must report the in-memory `status` as-is.
     /// It deliberately does NOT run `tmux ls`: a probe is a process spawn,
     /// and the inventory must not spawn one on every assembly.
-    pub async fn get_existing(&self, work_scope: &WorkScope) -> Option<Arc<RwLock<TmuxServer>>> {
+    pub async fn get_existing(
+        &self,
+        work_scope: &ResourceScopeKey,
+    ) -> Option<Arc<RwLock<TmuxServer>>> {
         let key = work_scope.stable_key();
         self.inner.read().await.get(&key).cloned()
     }
@@ -666,7 +621,7 @@ impl TmuxRegistry {
     /// Returns [`TmuxError`] when invoking the read-only tmux inspection command fails.
     pub async fn inspect_existing_window(
         &self,
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
         expected_server_token: &str,
         window_id: &str,
     ) -> Result<Option<ObservedWindow>, TmuxError> {
@@ -740,7 +695,7 @@ impl TmuxRegistry {
     /// Returns [`TmuxError`] if the registry cannot derive or invoke the scoped tmux server.
     pub async fn kill_exact_window(
         &self,
-        work_scope: &WorkScope,
+        work_scope: &ResourceScopeKey,
         window_id: &str,
     ) -> Result<(), TmuxError> {
         let socket_path = self.derived_socket_path(work_scope);
@@ -748,32 +703,31 @@ impl TmuxRegistry {
         Ok(())
     }
 
-    /// Deterministic socket path for a `WorkScope`, derived the same way
+    /// Deterministic socket path for a `ResourceScopeKey`, derived the same way
     /// `ensure_live` derives it on insertion. Used by the cascade when no
     /// registry entry is present (orphan-socket cleanup) and on the
     /// preserved path where the entry is intentionally left intact.
-    fn derived_socket_path(&self, work_scope: &WorkScope) -> PathBuf {
+    fn derived_socket_path(&self, work_scope: &ResourceScopeKey) -> PathBuf {
         match work_scope {
-            WorkScope::Worktree(path) => {
-                socket_path_for_worktree(&self.socket_dir, Path::new(path))
+            ResourceScopeKey::Work(id) => {
+                socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
             }
-            WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
-            WorkScope::Global => socket_path_for_global(&self.socket_dir),
+            ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),
         }
     }
 
-    /// Best-effort tear-down of a `WorkScope`'s tmux server, called from
+    /// Best-effort tear-down of a `ResourceScopeKey`'s tmux server, called from
     /// the unified `run_resource_cleanup_cascade` (REQ-BED-032 —
     /// archive / abandon / mark-merged / hard-delete all share this
     /// path).
     ///
-    /// The registry is keyed by `WorkScope::stable_key()` (same lookup
+    /// The registry is keyed by `ResourceScopeKey::stable_key()` (same lookup
     /// `ensure_live` uses for insertion). When the registry holds no
     /// entry — orphaned socket from a prior process, or a scope whose
     /// tools never reached `tmux_run` — the deterministic socket path
     /// is derived from the scope so we still attempt the unlink.
     ///
-    /// `inheritor_scope`: the resolved `WorkScope` of the conversation
+    /// `inheritor_scope`: the resolved `ResourceScopeKey` of the conversation
     /// (continuation) that this conversation transfers ownership to, if
     /// any. Preservation is purely scope equality — when the inheritor
     /// resolves to the *same* scope, the tmux session is still in active
@@ -794,12 +748,12 @@ impl TmuxRegistry {
     /// REQ-TMUX-007, REQ-TMUX-WS-001, REQ-TMUX-WS-002.
     pub async fn cascade_on_delete(
         &self,
-        work_scope: &WorkScope,
-        inheritor_scope: Option<&WorkScope>,
+        work_scope: &ResourceScopeKey,
+        inheritor_scope: Option<&ResourceScopeKey>,
     ) -> CascadeReport {
         // Preservation by scope equality: the inheritor (continuation) is
         // still driving the same tmux server iff it resolves to the same
-        // WorkScope. Falls out structurally — Direct continuations
+        // ResourceScopeKey. Falls out structurally — Direct continuations
         // resolve to Conversation(<their own id>), which is never equal
         // to the parent's Conversation(<parent id>), so they take the
         // kill+unlink path automatically.
@@ -922,8 +876,8 @@ pub struct CascadeReport {
 /// `cascade_browser_on_delete`.
 pub async fn cascade_tmux_on_delete(
     registry: &Arc<TmuxRegistry>,
-    work_scope: &WorkScope,
-    inheritor_scope: Option<&WorkScope>,
+    work_scope: &ResourceScopeKey,
+    inheritor_scope: Option<&ResourceScopeKey>,
 ) -> CascadeReport {
     registry
         .cascade_on_delete(work_scope, inheritor_scope)
@@ -1221,6 +1175,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn scope(id: &str) -> ResourceScopeKey {
+        ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
+    }
+
     #[test]
     fn socket_path_for_worktree_is_deterministic() {
         let dir = PathBuf::from("/x/y");
@@ -1289,7 +1247,7 @@ mod tests {
             Some(tx),
         );
 
-        let scope = WorkScope::Conversation("conv-A".to_string());
+        let scope = scope("conv-A");
         let sock = socket_path_for(tmp.path(), "conv-A");
         let (_arc, created) = reg.get_or_insert(&scope, sock).await;
         assert!(created, "first insert must report created");
@@ -1312,7 +1270,7 @@ mod tests {
             false,
             Some(tx),
         );
-        let scope = WorkScope::Conversation("never-existed".to_string());
+        let scope = scope("never-existed");
         let _ = reg.cascade_on_delete(&scope, None).await;
         assert!(rx.try_recv().is_err(), "no entry → no removal event");
     }
@@ -1328,7 +1286,7 @@ mod tests {
             false,
             Some(tx),
         );
-        let wt = WorkScope::Worktree("/tmp/phoenix-tmux-preserve-emit".to_string());
+        let wt = scope("/tmp/phoenix-tmux-preserve-emit");
         let sock =
             socket_path_for_worktree(tmp.path(), Path::new("/tmp/phoenix-tmux-preserve-emit"));
         let _ = reg.get_or_insert(&wt, sock).await;
@@ -1349,7 +1307,7 @@ mod tests {
     async fn cascade_preserve_leaves_registry_entry_intact() {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
-        let wt = WorkScope::Worktree("/tmp/phoenix-tmux-preserve-entry".to_string());
+        let wt = scope("/tmp/phoenix-tmux-preserve-entry");
         let sock =
             socket_path_for_worktree(tmp.path(), Path::new("/tmp/phoenix-tmux-preserve-entry"));
         let _ = reg.get_or_insert(&wt, sock).await;
@@ -1390,7 +1348,7 @@ mod tests {
         let reg =
             TmuxRegistry::with_socket_dir_binary_and_sink(tmp.path().to_path_buf(), true, Some(tx));
 
-        let scope = WorkScope::Conversation("conv-first-ensure".to_string());
+        let scope = scope("conv-first-ensure");
         let arc = reg
             .ensure_live(&scope, tmp.path())
             .await
@@ -1428,7 +1386,7 @@ mod tests {
         }
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
-        let scope = WorkScope::Conversation("conv-rotate-server-token".to_string());
+        let scope = scope("conv-rotate-server-token");
 
         let first = reg
             .ensure_live(&scope, tmp.path())
@@ -1466,7 +1424,7 @@ mod tests {
     async fn emit_lifecycle_without_sink_is_no_op() {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
-        reg.emit_lifecycle(&WorkScope::Conversation("conv-X".to_string()));
+        reg.emit_lifecycle(&scope("conv-X"));
     }
 
     #[tokio::test]
@@ -1474,11 +1432,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         assert!(matches!(
-            reg.ensure_live(
-                &phoenix_core::work_scope::WorkScope::Conversation("conv-x".to_string()),
-                tmp.path()
-            )
-            .await,
+            reg.ensure_live(&scope("conv-x"), tmp.path()).await,
             Err(TmuxError::BinaryUnavailable)
         ));
     }
@@ -1574,85 +1528,12 @@ mod tests {
     /// server lives on the old socket — re-deriving from the new scope would
     /// orphan it). The `work_scope` diagnostic field follows the new scope.
     #[tokio::test]
-    async fn rekey_scope_moves_entry_and_preserves_socket_path() {
-        let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
-        let old = WorkScope::Conversation("conv-explore".to_string());
-        let new = WorkScope::Worktree("/tmp/wt-approved".to_string());
-        let conv_sock = socket_path_for(tmp.path(), "conv-explore");
-        let (before, _) = reg.get_or_insert(&old, conv_sock.clone()).await;
-
-        assert!(
-            reg.rekey_scope(&old, &new).await,
-            "rekey must report a move"
-        );
-
-        assert!(
-            reg.get_existing(&old).await.is_none(),
-            "old key must be gone"
-        );
-        let after = reg
-            .get_existing(&new)
-            .await
-            .expect("entry must be reachable under the new scope");
-        assert!(
-            Arc::ptr_eq(&before, &after),
-            "rekey must move the Arc, not clone"
-        );
-        let server = after.read().await;
-        assert_eq!(
-            server.socket_path, conv_sock,
-            "socket_path must be preserved — the running server is on the old socket"
-        );
-        assert_eq!(
-            server.work_scope, new,
-            "work_scope diagnostic must follow the new scope"
-        );
-    }
-
-    #[tokio::test]
-    async fn rekey_scope_no_entry_is_noop() {
-        let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
-        let old = WorkScope::Conversation("never".to_string());
-        let new = WorkScope::Worktree("/tmp/wt".to_string());
-        assert!(!reg.rekey_scope(&old, &new).await);
-        assert!(reg.get_existing(&new).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn rekey_scope_occupied_destination_does_not_clobber() {
-        let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
-        let old = WorkScope::Conversation("conv".to_string());
-        let new = WorkScope::Worktree("/tmp/wt".to_string());
-        let (old_arc, _) = reg
-            .get_or_insert(&old, socket_path_for(tmp.path(), "conv"))
-            .await;
-        let (new_arc, _) = reg
-            .get_or_insert(
-                &new,
-                socket_path_for_worktree(tmp.path(), Path::new("/tmp/wt")),
-            )
-            .await;
-
-        assert!(
-            !reg.rekey_scope(&old, &new).await,
-            "occupied dest must not move"
-        );
-        let old_after = reg.get_existing(&old).await.expect("old entry preserved");
-        let new_after = reg.get_existing(&new).await.expect("new entry preserved");
-        assert!(Arc::ptr_eq(&old_arc, &old_after));
-        assert!(Arc::ptr_eq(&new_arc, &new_after));
-    }
-
-    #[tokio::test]
     async fn cascade_on_delete_no_entry_attempts_socket_unlink() {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         // No prior entry, no on-disk socket — cascade should be a no-op
         // that returns without errors.
-        let scope = WorkScope::Conversation("never-existed".to_string());
+        let scope = scope("never-existed");
         let report = reg.cascade_on_delete(&scope, None).await;
         assert!(report.kill_server_error.is_none());
         assert!(report.unlink_error.is_none());
@@ -1672,12 +1553,12 @@ mod tests {
         // removal contract, not the tmux subprocess.
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
 
-        let conv_scope = WorkScope::Conversation("conv-direct".to_string());
+        let conv_scope = scope("conv-direct");
         let conv_sock = socket_path_for(tmp.path(), "conv-direct");
         let _ = reg.get_or_insert(&conv_scope, conv_sock).await;
 
         let wt_path = std::path::PathBuf::from("/tmp/phoenix-tmux-cascade-regression-wt");
-        let wt_scope = WorkScope::Worktree(wt_path.to_string_lossy().into_owned());
+        let wt_scope = scope("cascade-regression-wt");
         let wt_sock = socket_path_for_worktree(tmp.path(), &wt_path);
         let _ = reg.get_or_insert(&wt_scope, wt_sock).await;
 
@@ -1719,8 +1600,8 @@ mod tests {
         // Direct conv (Conversation scope) being continued. The
         // continuation has a different scope (its own conversation id),
         // so preservation must NOT trigger — socket should be unlinked.
-        let parent_scope = WorkScope::Conversation("parent-direct".to_string());
-        let child_scope = WorkScope::Conversation("child-conv".to_string());
+        let parent_scope = scope("parent-direct");
+        let child_scope = scope("child-conv");
         let report = reg
             .cascade_on_delete(&parent_scope, Some(&child_scope))
             .await;
@@ -1744,7 +1625,7 @@ mod tests {
         let socket_path = socket_path_for_worktree(tmp.path(), &worktree);
         std::fs::write(&socket_path, b"live").unwrap();
 
-        let parent_scope = WorkScope::Worktree(worktree.to_string_lossy().into_owned());
+        let parent_scope = scope("worktree-preserve");
         let child_scope = parent_scope.clone();
         let report = reg
             .cascade_on_delete(&parent_scope, Some(&child_scope))

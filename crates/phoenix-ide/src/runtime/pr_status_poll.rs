@@ -7,7 +7,6 @@ use rand::RngExt as _;
 
 use super::RuntimeManager;
 use crate::db::{ConvMode, Database};
-use crate::work_scope::WorkScope;
 
 pub(crate) const POLL_BASE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub(crate) const POLL_JITTER: Duration = Duration::from_secs(90);
@@ -20,7 +19,7 @@ struct PrBranchCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PollTarget {
-    work_scope: WorkScope,
+    work_scope: phoenix_core::work_scope::WorkScopeId,
     worktree_path: PathBuf,
     repository_identity: Option<String>,
     candidate_branches: Vec<PrBranchCandidate>,
@@ -166,7 +165,10 @@ async fn collect_targets(db: &Database) -> Result<Vec<PollTarget>, String> {
             }
             _ => continue,
         };
-        let work_scope = WorkScope::resolve(&conv.id, Some(Path::new(&worktree_path)));
+        let work_scope = conv
+            .work_scope_id
+            .clone()
+            .expect("persisted conversation has work scope");
         if !seen.insert(work_scope.clone()) {
             continue;
         }
@@ -296,7 +298,9 @@ async fn poll_target(manager: &Arc<RuntimeManager>, target: PollTarget) {
             return;
         }
         manager
-            .broadcast_work_scope_update(&target.work_scope)
+            .broadcast_work_scope_update(&crate::work_scope::ResourceScopeKey::Work(
+                target.work_scope,
+            ))
             .await;
     }
 }

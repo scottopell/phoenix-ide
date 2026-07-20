@@ -16,6 +16,7 @@ use phoenix_core::domain::creation_protocol::{
     CreationStage, CreationStatus, CreationWorkerId,
 };
 use phoenix_core::domain::db_schema as schema;
+use phoenix_core::work_scope::{AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId};
 
 pub use coordinator_query::{
     execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
@@ -280,7 +281,7 @@ pub struct WorkScopeObservedBranchUpsert {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopePrFeedbackBaseline {
-    pub work_scope_id: i64,
+    pub work_scope_id: phoenix_core::work_scope::WorkScopeId,
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
@@ -305,7 +306,7 @@ type PrFeedbackStatus = phoenix_core::domain::pr_feedback_status::PrFeedbackStat
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopePrAssociation {
-    pub work_scope_id: i64,
+    pub work_scope_id: phoenix_core::work_scope::WorkScopeId,
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
@@ -324,7 +325,7 @@ pub struct WorkScopePrAssociation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopeObservedBranch {
-    pub work_scope_id: i64,
+    pub work_scope_id: phoenix_core::work_scope::WorkScopeId,
     pub repository_identity: String,
     pub branch_name: String,
     pub first_observed_head_oid: String,
@@ -335,7 +336,7 @@ pub struct WorkScopeObservedBranch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopeActivePrSelectionRow {
-    pub work_scope_id: i64,
+    pub work_scope_id: phoenix_core::work_scope::WorkScopeId,
     pub selection: Option<phoenix_core::domain::active_pr_selection::ActivePrSelection>,
     pub latest_observed_branch:
         Option<phoenix_core::domain::active_pr_selection::ActivePrBranchContext>,
@@ -409,7 +410,7 @@ fn pr_feedback_status_from_db(value: &str) -> DbResult<PrFeedbackStatus> {
 
 fn row_to_work_scope_observed_branch(row: &SqliteRow) -> WorkScopeObservedBranch {
     WorkScopeObservedBranch {
-        work_scope_id: row.get("work_scope_id"),
+        work_scope_id: row_work_scope_id(&row),
         repository_identity: row.get("repository_identity"),
         branch_name: row.get("branch_name"),
         first_observed_head_oid: row.get("first_observed_head_oid"),
@@ -666,7 +667,7 @@ fn row_to_work_scope_active_pr_selection(
         }
     };
     Ok(WorkScopeActivePrSelectionRow {
-        work_scope_id: row.get("work_scope_id"),
+        work_scope_id: row_work_scope_id(&row),
         selection,
         latest_observed_branch,
         inference_generation: row.get::<i64, _>("inference_generation").cast_unsigned(),
@@ -703,7 +704,7 @@ pub fn qualifies_observed_branch(
 fn row_to_work_scope_pr(row: &SqliteRow) -> DbResult<WorkScopePrAssociation> {
     let display_state: String = row.get("display_state");
     Ok(WorkScopePrAssociation {
-        work_scope_id: row.get("work_scope_id"),
+        work_scope_id: row_work_scope_id(&row),
         repo_owner: row.get("repo_owner"),
         repo_name: row.get("repo_name"),
         pr_number: row.get::<i64, _>("pr_number").cast_unsigned(),
@@ -849,14 +850,10 @@ fn pr_association_rank(state: &phoenix_core::domain::pr_display_state::PrDisplay
     }
 }
 
-fn work_scope_db_key(scope: &phoenix_core::work_scope::WorkScope) -> (&'static str, &str) {
-    match scope {
-        phoenix_core::work_scope::WorkScope::Worktree(value) => ("Worktree", value.as_str()),
-        phoenix_core::work_scope::WorkScope::Conversation(value) => {
-            ("Conversation", value.as_str())
-        }
-        phoenix_core::work_scope::WorkScope::Global => ("Global", ""),
-    }
+fn row_work_scope_id(row: &SqliteRow) -> phoenix_core::work_scope::WorkScopeId {
+    let raw: String = row.get("work_scope_id");
+    phoenix_core::work_scope::WorkScopeId::parse(raw)
+        .expect("database CHECK enforces non-empty work_scope_id")
 }
 
 /// Thread-safe database handle
@@ -949,56 +946,134 @@ impl Database {
         restrict_db_permissions(&self.path);
     }
 
-    async fn work_scope_id(
-        &self,
-        scope: &phoenix_core::work_scope::WorkScope,
-    ) -> DbResult<Option<i64>> {
-        let (scope_type, scope_value) = work_scope_db_key(scope);
-        let id = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM work_scopes WHERE scope_type = ?1 AND scope_value = ?2",
+    async fn insert_work_scope_environment_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        scope_id: &WorkScopeId,
+        authority_kind: AuthorityKind,
+        context: EnvironmentContext,
+        now: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO work_scopes (id, authority_kind, lifecycle, created_at, updated_at)
+                 VALUES (?1, ?2, 'active', ?3, ?3)",
         )
-        .bind(scope_type)
-        .bind(scope_value)
-        .fetch_optional(&self.pool)
+        .bind(scope_id.as_str())
+        .bind(authority_kind.as_str())
+        .bind(now)
+        .execute(&mut **tx)
         .await?;
-        Ok(id)
+
+        match context {
+            EnvironmentContext::AllocatedWorktree {
+                cwd,
+                worktree_path,
+                branch_name,
+                base_branch,
+            } => {
+                sqlx::query(
+                        "INSERT INTO work_scope_environments (
+                            work_scope_id, environment_kind, cwd, worktree_path, branch_name, base_branch, updated_at
+                         ) VALUES (?1, 'allocated_worktree', ?2, ?3, ?4, ?5, ?6)",
+                    )
+                    .bind(scope_id.as_str())
+                    .bind(cwd)
+                    .bind(worktree_path)
+                    .bind(branch_name)
+                    .bind(base_branch)
+                    .bind(now)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            EnvironmentContext::UnownedCwd { cwd } => {
+                sqlx::query(
+                    "INSERT INTO work_scope_environments (
+                            work_scope_id, environment_kind, cwd, updated_at
+                         ) VALUES (?1, 'unowned_cwd', ?2, ?3)",
+                )
+                .bind(scope_id.as_str())
+                .bind(cwd)
+                .bind(now)
+                .execute(&mut **tx)
+                .await?;
+            }
+            EnvironmentContext::None => {
+                sqlx::query(
+                    "INSERT INTO work_scope_environments (
+                            work_scope_id, environment_kind, updated_at
+                         ) VALUES (?1, 'none', ?2)",
+                )
+                .bind(scope_id.as_str())
+                .bind(now)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn new_scope_for_conversation(
+        cwd: &str,
+        cm: &ConvModeCols<'_>,
+    ) -> (WorkScopeId, AuthorityKind, EnvironmentContext) {
+        let scope_id = WorkScopeId::new();
+        let context = match (cm.kind, cm.worktree_path, cm.branch_name, cm.base_branch) {
+            ("work" | "branch", Some(worktree_path), Some(branch_name), Some(base_branch)) => {
+                EnvironmentContext::AllocatedWorktree {
+                    cwd: cwd.to_string(),
+                    worktree_path: worktree_path.to_string(),
+                    branch_name: branch_name.to_string(),
+                    base_branch: base_branch.to_string(),
+                }
+            }
+            ("explore", Some(worktree_path), _, _) => EnvironmentContext::UnownedCwd {
+                cwd: worktree_path.to_string(),
+            },
+            _ if !cwd.is_empty() => EnvironmentContext::UnownedCwd {
+                cwd: cwd.to_string(),
+            },
+            _ => EnvironmentContext::None,
+        };
+        let authority_kind = match cm.kind {
+            "work" | "branch" => AuthorityKind::Work,
+            _ => AuthorityKind::RestrictedExplore,
+        };
+        (scope_id, authority_kind, context)
+    }
+
+    async fn work_scope_exists(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScopeId,
+    ) -> DbResult<bool> {
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM work_scopes WHERE id = ?1)")
+                .bind(scope.as_str())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(exists != 0)
     }
 
     async fn ensure_work_scope_id(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
-    ) -> DbResult<i64> {
-        let (scope_type, scope_value) = work_scope_db_key(scope);
+        scope: &phoenix_core::work_scope::WorkScopeId,
+    ) -> DbResult<phoenix_core::work_scope::WorkScopeId> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO work_scopes (scope_type, scope_value, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(scope_type, scope_value) DO UPDATE SET updated_at = excluded.updated_at",
+            "INSERT INTO work_scopes (id, authority_kind, lifecycle, created_at, updated_at)
+             VALUES (?1, 'restricted_explore', 'active', ?2, ?2)
+             ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at",
         )
-        .bind(scope_type)
-        .bind(scope_value)
+        .bind(scope.as_str())
         .bind(&now)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
-        let work_scope_id = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM work_scopes WHERE scope_type = ?1 AND scope_value = ?2",
-        )
-        .bind(scope_type)
-        .bind(scope_value)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(work_scope_id)
+        Ok(scope.clone())
     }
 
-    /// # Errors
-    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn upsert_work_scope_pr_observations(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         observations: &[WorkScopePrObservation],
-    ) -> DbResult<i64> {
+    ) -> DbResult<phoenix_core::work_scope::WorkScopeId> {
         let work_scope_id = self.ensure_work_scope_id(scope).await?;
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
@@ -1019,7 +1094,7 @@ impl Database {
                     github_updated_at = excluded.github_updated_at,
                     last_seen_at = excluded.last_seen_at",
             )
-            .bind(work_scope_id)
+            .bind(work_scope_id.as_str())
             .bind(&pr.repo_owner)
             .bind(&pr.repo_name)
             .bind(pr.pr_number.cast_signed())
@@ -1043,18 +1118,19 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_work_scope_pr_associations(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Vec<WorkScopePrAssociation>> {
-        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+        if !self.work_scope_exists(scope).await? {
             return Ok(Vec::new());
         };
+        let work_scope_id = scope;
         let rows = sqlx::query(
             "SELECT work_scope_id, repo_owner, repo_name, pr_number, title, url, state, draft,
                     display_state, base, head, github_updated_at, feedback_status, first_seen_at, last_seen_at
              FROM work_scope_pr_associations
              WHERE work_scope_id = ?1",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -1066,7 +1142,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn primary_work_scope_pr_association(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Option<WorkScopePrAssociation>> {
         let mut prs = self.list_work_scope_pr_associations(scope).await?;
         sort_work_scope_pr_associations(&mut prs);
@@ -1077,89 +1153,59 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn primary_work_scope_pr_associations(
         &self,
-        scopes: &[phoenix_core::work_scope::WorkScope],
+        scopes: &[phoenix_core::work_scope::WorkScopeId],
     ) -> DbResult<std::collections::HashMap<String, WorkScopePrAssociation>> {
         if scopes.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-
-        let mut keys = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for scope in scopes {
-            let (scope_type, scope_value) = work_scope_db_key(scope);
-            let stable_key = scope.stable_key();
-            if seen.insert(stable_key.clone()) {
-                keys.push((stable_key, scope_type.to_string(), scope_value.to_string()));
-            }
-        }
-        if keys.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-
         let mut query = sqlx::QueryBuilder::new(
-            "SELECT s.scope_type, s.scope_value,
-                    p.work_scope_id, p.repo_owner, p.repo_name, p.pr_number, p.title, p.url, p.state, p.draft,
-                    p.display_state, p.base, p.head, p.github_updated_at, p.feedback_status, p.first_seen_at, p.last_seen_at
-             FROM work_scopes s
-             JOIN work_scope_pr_associations p ON p.work_scope_id = s.id
-             WHERE (s.scope_type, s.scope_value) IN ",
+            "SELECT work_scope_id, repo_owner, repo_name, pr_number, title, url, state, draft,
+                    display_state, base, head, github_updated_at, feedback_status, first_seen_at, last_seen_at
+             FROM work_scope_pr_associations
+             WHERE work_scope_id IN ",
         );
-        query.push_tuples(keys.iter(), |mut tuple, (_, scope_type, scope_value)| {
-            tuple.push_bind(scope_type).push_bind(scope_value);
+        query.push_tuples(scopes.iter(), |mut tuple, scope| {
+            tuple.push_bind(scope.as_str());
         });
-
         let rows = query.build().fetch_all(&self.pool).await?;
         let mut grouped: std::collections::HashMap<String, Vec<WorkScopePrAssociation>> =
             std::collections::HashMap::new();
         for row in rows {
-            let scope_type: String = row.get("scope_type");
-            let scope_value: String = row.get("scope_value");
-            let stable_key = match scope_type.as_str() {
-                "Worktree" => {
-                    phoenix_core::work_scope::WorkScope::Worktree(scope_value).stable_key()
-                }
-                "Conversation" => {
-                    phoenix_core::work_scope::WorkScope::Conversation(scope_value).stable_key()
-                }
-                "Global" => phoenix_core::work_scope::WorkScope::Global.stable_key(),
-                _ => continue,
-            };
+            let stable_key: String = row.get("work_scope_id");
             grouped
                 .entry(stable_key)
                 .or_default()
                 .push(row_to_work_scope_pr(&row)?);
         }
-
-        let mut out = std::collections::HashMap::new();
+        let mut result = std::collections::HashMap::new();
         for (stable_key, mut prs) in grouped {
             sort_work_scope_pr_associations(&mut prs);
             if let Some(primary) = prs.into_iter().next() {
-                out.insert(stable_key, primary);
+                result.insert(stable_key, primary);
             }
         }
-        Ok(out)
+        Ok(result)
     }
 
-    /// # Errors
-    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn update_work_scope_pr_feedback_status(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         repo_owner: &str,
         repo_name: &str,
         pr_number: u64,
         status: PrFeedbackStatus,
     ) -> DbResult<()> {
-        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+        if !self.work_scope_exists(scope).await? {
             return Ok(());
         };
+        let work_scope_id = scope;
         sqlx::query(
             "UPDATE work_scope_pr_associations
              SET feedback_status = ?1
              WHERE work_scope_id = ?2 AND repo_owner = ?3 AND repo_name = ?4 AND pr_number = ?5",
         )
         .bind(pr_feedback_status_db(status))
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .bind(repo_owner)
         .bind(repo_name)
         .bind(pr_number.cast_signed())
@@ -1172,9 +1218,9 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn upsert_work_scope_pr_feedback_baseline(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         baseline: &WorkScopePrFeedbackBaselineInput,
-    ) -> DbResult<i64> {
+    ) -> DbResult<phoenix_core::work_scope::WorkScopeId> {
         let work_scope_id = self.ensure_work_scope_id(scope).await?;
         let mut tx = self.pool.begin().await?;
         let mut feedback_identities = baseline.feedback_identities.clone();
@@ -1197,7 +1243,7 @@ impl Database {
                 feedback_identities = excluded.feedback_identities,
                 feedback_fingerprints = excluded.feedback_fingerprints",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .bind(&baseline.repo_owner)
         .bind(&baseline.repo_name)
         .bind(baseline.pr_number.cast_signed())
@@ -1215,9 +1261,9 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn upsert_work_scope_observed_branch(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         observed: &WorkScopeObservedBranchUpsert,
-    ) -> DbResult<i64> {
+    ) -> DbResult<phoenix_core::work_scope::WorkScopeId> {
         let work_scope_id = self.ensure_work_scope_id(scope).await?;
         let now = Utc::now().to_rfc3339();
         sqlx::query(
@@ -1229,7 +1275,7 @@ impl Database {
                 last_observed_head_oid = excluded.last_observed_head_oid,
                 last_observed_at = excluded.last_observed_at",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .bind(&observed.repository_identity)
         .bind(&observed.branch_name)
         .bind(&observed.head_oid)
@@ -1243,11 +1289,12 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_work_scope_observed_branches(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Vec<WorkScopeObservedBranch>> {
-        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+        if !self.work_scope_exists(scope).await? {
             return Ok(Vec::new());
         };
+        let work_scope_id = scope;
         let rows = sqlx::query(
             "SELECT work_scope_id, repository_identity, branch_name, first_observed_head_oid,
                     last_observed_head_oid, first_observed_at, last_observed_at
@@ -1255,7 +1302,7 @@ impl Database {
              WHERE work_scope_id = ?1
              ORDER BY last_observed_at DESC, branch_name ASC",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -1268,11 +1315,12 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn active_work_scope_pr_selection(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
-        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+        if !self.work_scope_exists(scope).await? {
             return Ok(None);
         };
+        let work_scope_id = scope;
         let row = sqlx::query(
             "SELECT work_scope_id, repo_owner, repo_name, pr_number, provenance,
                     latest_observed_repository_identity, latest_observed_branch_name,
@@ -1280,7 +1328,7 @@ impl Database {
              FROM work_scope_active_pr_selection
              WHERE work_scope_id = ?1",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| {
@@ -1298,7 +1346,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn pin_active_work_scope_pr_selection(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         pr: &phoenix_core::domain::active_pr_selection::ActivePrIdentity,
     ) -> DbResult<phoenix_core::domain::active_pr_selection::ActivePrSelectionState> {
         let work_scope_id = self.ensure_work_scope_id(scope).await?;
@@ -1309,7 +1357,7 @@ impl Database {
              FROM work_scope_pr_associations
              WHERE work_scope_id = ?1 AND repo_owner = ?2 AND repo_name = ?3 AND pr_number = ?4",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .bind(&pr.repo_owner)
         .bind(&pr.repo_name)
         .bind(pr.pr_number.cast_signed())
@@ -1322,7 +1370,7 @@ impl Database {
              ORDER BY last_observed_at DESC, branch_name ASC
              LIMIT 1",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_optional(&mut *tx)
         .await?
         .map(
@@ -1347,7 +1395,7 @@ impl Database {
                 inference_generation = work_scope_active_pr_selection.inference_generation + 1,
                 updated_at = excluded.updated_at",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .bind(&pr.repo_owner)
         .bind(&pr.repo_name)
         .bind(pr.pr_number.cast_signed())
@@ -1363,7 +1411,7 @@ impl Database {
              FROM work_scope_active_pr_selection
              WHERE work_scope_id = ?1",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1380,12 +1428,13 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn clear_active_work_scope_pr_pin(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         input: &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput,
     ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
-        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+        if !self.work_scope_exists(scope).await? {
             return Ok(None);
         };
+        let work_scope_id = scope;
         self.clear_active_work_scope_pr_pin_for_scope_id(work_scope_id, input)
             .await
     }
@@ -1394,13 +1443,14 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn derive_active_work_scope_pr_selection(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         input: &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput,
         expected_generation: Option<u64>,
     ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
-        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+        if !self.work_scope_exists(scope).await? {
             return Ok(None);
         };
+        let work_scope_id = scope;
         self.derive_active_work_scope_pr_selection_for_scope_id(
             work_scope_id,
             input,
@@ -1412,7 +1462,7 @@ impl Database {
     }
     async fn clear_active_work_scope_pr_pin_for_scope_id(
         &self,
-        work_scope_id: i64,
+        work_scope_id: &phoenix_core::work_scope::WorkScopeId,
         input: &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput,
     ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
         let mut tx = self.pool.begin().await?;
@@ -1423,7 +1473,7 @@ impl Database {
              FROM work_scope_active_pr_selection
              WHERE work_scope_id = ?1",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_optional(&mut *tx)
         .await?
         .map(|row| row_to_work_scope_active_pr_selection(&row))
@@ -1443,7 +1493,7 @@ impl Database {
                  ORDER BY last_observed_at DESC, branch_name ASC
                  LIMIT 1",
             )
-            .bind(work_scope_id)
+            .bind(work_scope_id.as_str())
             .fetch_optional(&mut *tx)
             .await?;
             phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
@@ -1470,7 +1520,7 @@ impl Database {
 
     async fn active_pr_selection_state_for_scope_id(
         &self,
-        work_scope_id: i64,
+        work_scope_id: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
         let row = sqlx::query(
             "SELECT work_scope_id, repo_owner, repo_name, pr_number, provenance,
@@ -1479,7 +1529,7 @@ impl Database {
              FROM work_scope_active_pr_selection
              WHERE work_scope_id = ?1",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| row_to_work_scope_active_pr_selection(&row))
@@ -1497,7 +1547,7 @@ impl Database {
     #[allow(clippy::too_many_lines)]
     async fn derive_active_work_scope_pr_selection_for_scope_id(
         &self,
-        work_scope_id: i64,
+        work_scope_id: &phoenix_core::work_scope::WorkScopeId,
         input: &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput,
         expected_generation: Option<u64>,
         clear_pin_target: Option<&phoenix_core::domain::active_pr_selection::ActivePrSelection>,
@@ -1511,7 +1561,7 @@ impl Database {
              FROM work_scope_active_pr_selection
              WHERE work_scope_id = ?1",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_optional(&mut *tx)
         .await?
         .map(|row| row_to_work_scope_active_pr_selection(&row))
@@ -1560,7 +1610,7 @@ impl Database {
              FROM work_scope_pr_associations
              WHERE work_scope_id = ?1",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
@@ -1626,7 +1676,7 @@ impl Database {
                 updated_at = excluded.updated_at
              WHERE work_scope_active_pr_selection.inference_generation = ?9",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .bind(inferred.as_ref().map(|pr| pr.repo_owner.as_str()))
         .bind(inferred.as_ref().map(|pr| pr.repo_name.as_str()))
         .bind(inferred.as_ref().map(|pr| pr.pr_number.cast_signed()))
@@ -1667,20 +1717,21 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn work_scope_pr_feedback_baseline(
         &self,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         repo_owner: &str,
         repo_name: &str,
         pr_number: u64,
     ) -> DbResult<Option<WorkScopePrFeedbackBaseline>> {
-        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+        if !self.work_scope_exists(scope).await? {
             return Ok(None);
         };
+        let work_scope_id = scope;
         let row = sqlx::query(
             "SELECT work_scope_id, repo_owner, repo_name, pr_number, captured_at, github_updated_at, feedback_identities, feedback_fingerprints
              FROM work_scope_pr_feedback_baselines
              WHERE work_scope_id = ?1 AND repo_owner = ?2 AND repo_name = ?3 AND pr_number = ?4",
         )
-        .bind(work_scope_id)
+        .bind(work_scope_id.as_str())
         .bind(repo_owner)
         .bind(repo_name)
         .bind(pr_number.cast_signed())
@@ -1694,7 +1745,7 @@ impl Database {
             let feedback_fingerprints = serde_json::from_str(&raw_fingerprints)
                 .map_err(|e| DbError::Serialization(e.to_string()))?;
             Ok(WorkScopePrFeedbackBaseline {
-                work_scope_id: row.get("work_scope_id"),
+                work_scope_id: row_work_scope_id(&row),
                 repo_owner: row.get("repo_owner"),
                 repo_name: row.get("repo_name"),
                 pr_number: row.get::<i64, _>("pr_number").cast_unsigned(),
@@ -2557,15 +2608,52 @@ impl Database {
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
+        let inherited_scope = if let Some(parent_id) = parent_id {
+            sqlx::query_scalar::<_, String>(
+                "SELECT work_scope_id FROM conversations WHERE id = ?1 AND work_scope_id IS NOT NULL",
+            )
+            .bind(parent_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(WorkScopeId::parse)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))?
+        } else {
+            None
+        };
+        let runtime_role = if parent_id.is_some() {
+            RuntimeRole::SubAgent
+        } else {
+            RuntimeRole::User
+        };
 
         // Retry with a random suffix on slug collision (UNIQUE constraint).
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
-        loop {
+        let created_work_scope_id = loop {
             let title_str = schema::title_from_slug(&actual_slug);
+            let generated_scope = inherited_scope.is_none().then(|| {
+                let (scope_id, authority_kind, environment) =
+                    Self::new_scope_for_conversation(cwd, &cm);
+                (scope_id, authority_kind, environment)
+            });
+            let work_scope_id = inherited_scope
+                .clone()
+                .unwrap_or_else(|| generated_scope.as_ref().expect("generated scope").0.clone());
+            let mut tx = self.pool.begin().await?;
+            if let Some((scope_id, authority_kind, environment)) = generated_scope {
+                Self::insert_work_scope_environment_tx(
+                    &mut tx,
+                    &scope_id,
+                    authority_kind,
+                    environment,
+                    &now_str,
+                )
+                .await?;
+            }
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -2588,19 +2676,26 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
-            .execute(&self.pool)
+            .bind(runtime_role.as_str())
+            .bind(work_scope_id.as_str())
+            .execute(&mut *tx)
             .await;
 
             match result {
-                Ok(_) => break,
+                Ok(_) => {
+                    tx.commit().await?;
+                    break work_scope_id;
+                }
                 Err(sqlx::Error::Database(ref e))
                     if (is_sqlite_unique_constraint(e.as_ref())
                         || is_sqlite_primary_key_constraint(e.as_ref()))
                         && e.message().contains("conversations.id") =>
                 {
+                    tx.rollback().await?;
                     return Err(DbError::ConversationAlreadyExists(id.to_string()));
                 }
                 Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
+                    tx.rollback().await?;
                     attempts += 1;
                     if attempts >= 10 {
                         // Last resort: full UUID fragment (UUIDs are ASCII, first 8 bytes always valid)
@@ -2610,9 +2705,12 @@ impl Database {
                         actual_slug = format!("{slug}-{:04x}", rand::random::<u16>());
                     }
                 }
-                Err(e) => return Err(DbError::Sqlx(e)),
+                Err(e) => {
+                    tx.rollback().await?;
+                    return Err(DbError::Sqlx(e));
+                }
             }
-        }
+        };
 
         let title = schema::title_from_slug(&actual_slug);
         Ok(Conversation {
@@ -2630,6 +2728,8 @@ impl Database {
             model: model.map(String::from),
             project_id: project_id.map(String::from),
             conv_mode: conv_mode.clone(),
+            runtime_role,
+            work_scope_id: Some(created_work_scope_id),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
             transcript_generation: 1,
@@ -2658,7 +2758,7 @@ impl Database {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let result: DbResult<String> = async {
             if let Some(id) = sqlx::query_scalar(
-                "SELECT conversation_id FROM coordinator WHERE singleton = 1",
+                "SELECT id FROM conversations WHERE runtime_role = 'coordinator'",
             )
             .fetch_optional(&mut *conn)
             .await?
@@ -2672,8 +2772,8 @@ impl Database {
             let idle = serde_json::to_string(&ConvState::Idle)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind)
-                 VALUES (?1, ?2, 'Coordinator', ?3, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore')",
+                "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, 'Coordinator', ?3, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
             )
             .bind(&id)
             .bind(slug)
@@ -2684,10 +2784,6 @@ impl Database {
             .bind(llm_language.as_str())
             .execute(&mut *conn)
             .await?;
-            sqlx::query("INSERT INTO coordinator (singleton, conversation_id) VALUES (1, ?1)")
-                .bind(&id)
-                .execute(&mut *conn)
-                .await?;
             Ok(id)
         }
         .await;
@@ -2710,7 +2806,7 @@ impl Database {
     /// # Errors
     /// Returns an error when the singleton relation cannot be queried.
     pub async fn coordinator_conversation_id(&self) -> DbResult<Option<String>> {
-        sqlx::query_scalar("SELECT conversation_id FROM coordinator WHERE singleton = 1")
+        sqlx::query_scalar("SELECT id FROM conversations WHERE runtime_role = 'coordinator'")
             .fetch_optional(&self.pool)
             .await
             .map_err(DbError::Sqlx)
@@ -2722,7 +2818,7 @@ impl Database {
     /// Returns an error when the singleton relation cannot be queried.
     pub async fn is_coordinator_conversation(&self, conversation_id: &str) -> DbResult<bool> {
         let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM coordinator WHERE singleton = 1 AND conversation_id = ?1",
+            "SELECT 1 FROM conversations WHERE runtime_role = 'coordinator' AND id = ?1",
         )
         .bind(conversation_id)
         .fetch_optional(&self.pool)
@@ -2775,6 +2871,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -2803,6 +2900,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -2831,12 +2929,13 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
-               AND c.id != COALESCE((SELECT conversation_id FROM coordinator WHERE singleton = 1), '')
+               AND c.runtime_role != 'coordinator'
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
@@ -2863,7 +2962,7 @@ impl Database {
         let rows: Vec<(String, String)> = sqlx::query(
             "SELECT id, state FROM conversations
              WHERE archived = 0
-               AND (user_initiated = 1 OR id = (SELECT conversation_id FROM coordinator WHERE singleton = 1))
+               AND (user_initiated = 1 OR runtime_role = 'coordinator')
                AND json_extract(state, '$.type') = 'error'
                AND json_extract(state, '$.error_kind') = 'usage_limit_reached'
                AND json_extract(state, '$.resets_at') IS NOT NULL",
@@ -2898,7 +2997,7 @@ impl Database {
     pub async fn preview_roots(&self) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, Option<String>>(
             "WITH RECURSIVE coordinator_chain(id) AS (
-                 SELECT conversation_id FROM coordinator WHERE singleton = 1
+                 SELECT id FROM conversations WHERE runtime_role = 'coordinator'
                  UNION
                  SELECT c.id
                  FROM conversations c
@@ -2957,6 +3056,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -2983,6 +3083,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -3005,6 +3106,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -3094,14 +3196,24 @@ impl Database {
         let intent_json = serde_json::to_string(&job.intent)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let mut tx = self.pool.begin().await?;
+        let (created_work_scope_id, authority_kind, environment) =
+            Self::new_scope_for_conversation(cwd, &cm);
+        Self::insert_work_scope_environment_tx(
+            &mut tx,
+            &created_work_scope_id,
+            authority_kind,
+            environment,
+            &now_str,
+        )
+        .await?;
 
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?7, ?7, 0, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?7, ?7, 0, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 'user', ?20)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -3122,6 +3234,7 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
+            .bind(created_work_scope_id.as_str())
             .execute(&mut *tx)
             .await;
 
@@ -3182,6 +3295,8 @@ impl Database {
             model: model.map(String::from),
             project_id: None,
             conv_mode: conv_mode.clone(),
+            runtime_role: RuntimeRole::User,
+            work_scope_id: Some(created_work_scope_id),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
             seed_parent_id: seed_parent_id.map(String::from),
@@ -4574,6 +4689,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -4582,6 +4698,33 @@ impl Database {
                AND c.cm_worktree_path = ?1",
         )
         .bind(worktree_path)
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// List conversations that share one persisted work-scope identity.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_conversations_for_work_scope(
+        &self,
+        work_scope_id: &phoenix_core::work_scope::WorkScopeId,
+    ) -> DbResult<Vec<Conversation>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                    c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c
+             WHERE c.work_scope_id = ?1",
+        )
+        .bind(work_scope_id.as_str())
         .try_map(parse_conversation_row)
         .fetch_all(&self.pool)
         .await?;
@@ -4728,6 +4871,8 @@ impl Database {
                 .expect("approved task title is non-empty"),
         };
         let cm = conv_mode_columns(&work_mode);
+        let (work_scope_id, authority_kind, environment) =
+            Self::new_scope_for_conversation(&approval.worktree_path, &cm);
         let seed_message_id = uuid::Uuid::new_v4().to_string();
         let seeded_state = serde_json::to_string(&ConvState::SeededLlmRequesting {
             seed_message_id: seed_message_id.clone(),
@@ -4743,11 +4888,19 @@ impl Database {
         let handoff_summary_str = serde_json::to_string(&handoff_summary.to_stored_json()).unwrap();
 
         let mut tx = self.pool.begin().await?;
+        Self::insert_work_scope_environment_tx(
+            &mut tx,
+            &work_scope_id,
+            authority_kind,
+            environment,
+            &now_str,
+        )
+        .await?;
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'user', ?18)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -4766,6 +4919,7 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
+            .bind(work_scope_id.as_str())
             .execute(&mut *tx)
             .await;
 
@@ -4890,6 +5044,8 @@ impl Database {
             model: parent.model,
             project_id: parent.project_id,
             conv_mode: work_mode,
+            runtime_role: phoenix_core::work_scope::RuntimeRole::User,
+            work_scope_id: Some(work_scope_id),
             desired_base_branch: parent.desired_base_branch,
             message_count: 1,
             seed_parent_id: None,
@@ -5011,14 +5167,38 @@ impl Database {
         // transaction guard drops and SQLite rolls back.
         let mut tx = self.pool.begin().await?;
 
+        // A coordinator continuation transfers the singleton role. Demote the
+        // exhausted row to an ordinary scoped conversation before inserting
+        // its coordinator successor so both the role/scope trigger and the
+        // singleton index remain true after every statement.
+        if parent.runtime_role == RuntimeRole::Coordinator {
+            let (retired_scope_id, authority_kind, environment) =
+                Self::new_scope_for_conversation(&parent.cwd, &cm);
+            Self::insert_work_scope_environment_tx(
+                &mut tx,
+                &retired_scope_id,
+                authority_kind,
+                environment,
+                &now_str,
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE conversations SET runtime_role = 'user', work_scope_id = ?1 WHERE id = ?2",
+            )
+            .bind(retired_scope_id.as_str())
+            .bind(parent_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         // Retry on slug collision (UNIQUE constraint, SQLite error 2067).
         // Collisions are rare: concurrent continuations racing for the same
         // sequential number, or an unrelated conversation sharing the name.
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5042,6 +5222,8 @@ impl Database {
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
             .bind(parent.user_initiated)
+            .bind(parent.runtime_role.as_str())
+            .bind(parent.work_scope_id.as_ref().map(WorkScopeId::as_str))
             .execute(&mut *tx)
             .await;
 
@@ -5094,14 +5276,6 @@ impl Database {
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
 
-        sqlx::query(
-            "UPDATE coordinator SET conversation_id = ?1 WHERE singleton = 1 AND conversation_id = ?2",
-        )
-        .bind(&new_id)
-        .bind(parent_id)
-        .execute(&mut *tx)
-        .await?;
-
         if let Some(intent) = intent {
             sqlx::query(
                 "INSERT INTO continuation_dispatch_intents (parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -5135,6 +5309,8 @@ impl Database {
             model: parent.model,
             project_id: parent.project_id,
             conv_mode: parent.conv_mode,
+            runtime_role: parent.runtime_role,
+            work_scope_id: parent.work_scope_id,
             desired_base_branch: parent.desired_base_branch,
             message_count: 0,
             seed_parent_id: None,
@@ -5212,6 +5388,7 @@ impl Database {
             SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                    c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -6101,6 +6278,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
+                    c.runtime_role, c.work_scope_id,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -7796,6 +7974,16 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .as_deref()
         .map(phoenix_core::llm_language::LlmLanguage::parse_or_default)
         .unwrap_or_default();
+    let runtime_role = row
+        .try_get::<Option<String>, _>("runtime_role")
+        .unwrap_or(None)
+        .as_deref()
+        .and_then(phoenix_core::work_scope::RuntimeRole::from_db_str)
+        .unwrap_or_default();
+    let work_scope_id = row
+        .try_get::<Option<String>, _>("work_scope_id")
+        .unwrap_or(None)
+        .and_then(|raw| phoenix_core::work_scope::WorkScopeId::parse(raw).ok());
 
     Ok(Conversation {
         id,
@@ -7814,6 +8002,8 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
             .try_get::<Option<String>, _>("project_id")
             .unwrap_or(None),
         conv_mode,
+        runtime_role,
+        work_scope_id,
         desired_base_branch,
         message_count: row.try_get("message_count")?,
         transcript_generation: row
@@ -8109,6 +8299,23 @@ async fn insert_conversation_tx(
     let state_json =
         serde_json::to_string(&conv.state).map_err(|e| DbError::Serialization(e.to_string()))?;
     let cm = conv_mode_columns(&conv.conv_mode);
+    let generated_scope =
+        if conv.runtime_role == RuntimeRole::Coordinator || conv.work_scope_id.is_some() {
+            None
+        } else {
+            let (scope_id, authority_kind, environment) =
+                Database::new_scope_for_conversation(&conv.cwd, &cm);
+            Database::insert_work_scope_environment_tx(
+                tx,
+                &scope_id,
+                authority_kind,
+                environment,
+                &conv.created_at.to_rfc3339(),
+            )
+            .await?;
+            Some(scope_id)
+        };
+    let work_scope_id = conv.work_scope_id.as_ref().or(generated_scope.as_ref());
 
     // A forked/copied conversation starts with an empty steering queue (pending
     // steers are not inherited), so the steering_messages tables are not written
@@ -8121,8 +8328,9 @@ async fn insert_conversation_tx(
             continued_in_conv_id, chain_name, llm_language,
             spawned_from_conversation_id,
             cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch,
-            cm_task_id, cm_task_title, cm_next_taskmd_id_hint
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+            cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
+            runtime_role, work_scope_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -8153,6 +8361,8 @@ async fn insert_conversation_tx(
     .bind(cm.task_id)
     .bind(cm.task_title)
     .bind(cm.next_taskmd_id_hint)
+    .bind(conv.runtime_role.as_str())
+    .bind(work_scope_id.map(WorkScopeId::as_str))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -9949,7 +10159,7 @@ mod tests {
 
     async fn seed_latest_observed_branch(
         db: &Database,
-        scope: &phoenix_core::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScopeId,
         repository_identity: &str,
         branch_name: &str,
         head_oid: &str,
@@ -9985,7 +10195,8 @@ mod tests {
     async fn active_pr_pin_advances_generation_and_stale_derive_cannot_overwrite_newer_pin() {
         let (_dir, writer, reader) = open_test_db_pair().await;
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-pin-cas".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-pin-cas".to_string())
+                .unwrap();
         writer
             .upsert_work_scope_pr_observations(
                 &scope,
@@ -10068,9 +10279,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_stale_clear_pin_cannot_overwrite_newer_pin() {
         let (_dir, first, second) = open_test_db_pair().await;
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-clear-stale-pin".to_string(),
-        );
+        )
+        .unwrap();
         first
             .upsert_work_scope_pr_observations(
                 &scope,
@@ -10118,10 +10330,10 @@ mod tests {
             .await
             .unwrap();
 
-        let work_scope_id = first.work_scope_id(&scope).await.unwrap().unwrap();
+        let work_scope_id = scope.clone();
         let cleared = first
             .derive_active_work_scope_pr_selection_for_scope_id(
-                work_scope_id,
+                &work_scope_id,
                 &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
                     latest_observed_branch: Some(
                         phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
@@ -10145,7 +10357,8 @@ mod tests {
     async fn active_pr_pinned_selection_survives_association_updates() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-pinned".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-pinned".to_string())
+                .unwrap();
         let pr = pr_observation(
             "owner",
             "repo",
@@ -10211,7 +10424,8 @@ mod tests {
     ) {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-local-map".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-local-map".to_string())
+                .unwrap();
         let local_repo = tempfile::tempdir().unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
@@ -10260,9 +10474,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_conflicting_slug_still_uses_sole_actionable_fallback() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-local-slug-conflict".to_string(),
-        );
+        )
+        .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[pr_observation(
@@ -10305,9 +10520,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_does_not_map_local_repository_identity_when_scope_spans_multiple_repos() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-local-ambiguous".to_string(),
-        );
+        )
+        .unwrap();
         let local_repo = tempfile::tempdir().unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
@@ -10357,7 +10573,8 @@ mod tests {
     async fn active_pr_infers_unique_branch_match() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-branch".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-branch".to_string())
+                .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -10403,7 +10620,8 @@ mod tests {
     async fn active_pr_only_actionable_ignores_merged_and_closed() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-actionable".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-actionable".to_string())
+                .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -10451,7 +10669,8 @@ mod tests {
     async fn active_pr_ambiguity_leaves_selection_unset() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-ambiguous".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-ambiguous".to_string())
+                .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -10491,9 +10710,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_unmatched_branch_falls_through_to_sole_actionable_pr() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-unmatched-sole".to_string(),
-        );
+        )
+        .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[pr_observation(
@@ -10529,9 +10749,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_unmatched_branch_keeps_multiple_actionable_prs_ambiguous() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-unmatched-many".to_string(),
-        );
+        )
+        .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -10577,7 +10798,8 @@ mod tests {
     async fn active_pr_retains_prior_inferred_selection_when_still_valid() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-retain".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-retain".to_string())
+                .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -10635,7 +10857,8 @@ mod tests {
     #[tokio::test]
     async fn active_pr_stale_generation_cas_prevents_separate_connection_overwrite() {
         let (_dir, db_a, db_b) = open_test_db_pair().await;
-        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-cas".to_string());
+        let scope =
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-cas".to_string()).unwrap();
         db_a.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -10726,7 +10949,8 @@ mod tests {
     async fn active_pr_stale_generation_protection_returns_current_state() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-generation".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-generation".to_string())
+                .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -10806,9 +11030,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_pin_requires_existing_scope_association() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-pin-membership".to_string(),
-        );
+        )
+        .unwrap();
 
         let err = db
             .pin_active_work_scope_pr_selection(
@@ -10827,9 +11052,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_pin_returns_persisted_generation() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-pin-generation".to_string(),
-        );
+        )
+        .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[pr_observation(
@@ -10911,9 +11137,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_clear_pin_uses_latest_durable_branch_evidence_when_input_missing() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-clear-durable".to_string(),
-        );
+        )
+        .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -10968,9 +11195,10 @@ mod tests {
     #[tokio::test]
     async fn active_pr_clear_pin_respects_compatible_repository_mapping() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+        let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-clear-compatible".to_string(),
-        );
+        )
+        .unwrap();
         let local_repo = tempfile::tempdir().unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
@@ -11034,7 +11262,8 @@ mod tests {
     async fn active_pr_clear_pin_resumes_inference() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
-            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-clear".to_string());
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-clear".to_string())
+                .unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -11093,7 +11322,7 @@ mod tests {
     #[tokio::test]
     async fn work_scope_pr_association_upsert_preserves_first_seen_and_updates_primary() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-pr".to_string());
+        let scope = phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-pr".to_string()).unwrap();
         let closed = WorkScopePrObservation {
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
@@ -11147,16 +11376,13 @@ mod tests {
             .primary_work_scope_pr_associations(&[
                 scope.clone(),
                 scope.clone(),
-                phoenix_core::work_scope::WorkScope::Conversation("missing".to_string()),
+                phoenix_core::work_scope::WorkScopeId::parse("missing".to_string()).unwrap(),
             ])
             .await
             .unwrap();
         assert_eq!(primary_by_scope.len(), 1);
         assert_eq!(
-            primary_by_scope
-                .remove(&scope.stable_key())
-                .unwrap()
-                .pr_number,
+            primary_by_scope.remove(scope.as_str()).unwrap().pr_number,
             2
         );
     }
@@ -11281,7 +11507,8 @@ mod tests {
     #[tokio::test]
     async fn work_scope_observed_branch_upsert_preserves_first_seen_and_updates_last_seen() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-observed".to_string());
+        let scope =
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-observed".to_string()).unwrap();
 
         db.upsert_work_scope_observed_branch(
             &scope,
@@ -11389,7 +11616,8 @@ mod tests {
     #[tokio::test]
     async fn work_scope_pr_feedback_baseline_roundtrips_and_replaces() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-baseline".to_string());
+        let scope =
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-baseline".to_string()).unwrap();
 
         db.upsert_work_scope_pr_feedback_baseline(
             &scope,
@@ -11439,9 +11667,9 @@ mod tests {
     #[tokio::test]
     async fn work_scope_pr_feedback_baselines_are_keyed_by_full_identity() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = phoenix_core::work_scope::WorkScope::Worktree(
-            "/tmp/ws-baseline-identities".to_string(),
-        );
+        let scope =
+            phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-baseline-identities".to_string())
+                .unwrap();
 
         for repo_name in ["repo-a", "repo-b"] {
             db.upsert_work_scope_pr_feedback_baseline(
@@ -11564,17 +11792,12 @@ mod tests {
         assert_eq!(left.id, right.id);
         assert_ne!(left.slug.as_deref(), Some("coordinator"));
 
-        let coordinator_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
         let coordinator_conversation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversations WHERE id = (SELECT conversation_id FROM coordinator WHERE singleton = 1)",
+            "SELECT COUNT(*) FROM conversations WHERE runtime_role = 'coordinator'",
         )
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(coordinator_count, 1);
         assert_eq!(coordinator_conversation_count, 1);
         db.pool().close().await;
         let _ = std::fs::remove_file(path);
@@ -14660,37 +14883,39 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn test_delete_conversation_removes_wake_owned_workflows_and_messages() {
         let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation_with_project(
-            "conv-del",
-            "conv-del",
-            "/tmp",
-            true,
-            None,
-            Some("claude-opus-test"),
-            None,
-            &ConvMode::Direct,
-            None,
-            None,
-            None,
-            phoenix_core::llm_language::LlmLanguage::default(),
-        )
-        .await
-        .unwrap();
+        let conversation = db
+            .create_conversation_with_project(
+                "conv-del",
+                "conv-del",
+                "/tmp",
+                true,
+                None,
+                Some("claude-opus-test"),
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let work_scope_id = conversation
+            .work_scope_id
+            .expect("ordinary conversation scope");
         let wake_repo = crate::workflow::wake::WakeRepository::new(db.pool.clone());
         let workflow_id = phoenix_workflow::WorkflowId(9_101);
         let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
             contract_id: "contract-del".into(),
             conversation_id: "conv-del".into(),
-            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
-                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
-                stable_key: "conv-del".into(),
-            },
+            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
+                work_scope_id.as_str().into(),
+            ),
             resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
                 phoenix_workflow::wake_profile::BashResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
-                        kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
-                        stable_key: "conv-del".into(),
-                    },
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
+                        work_scope_id.as_str().into(),
+                    ),
                     handle_id: "b-del".into(),
                 },
             ),
@@ -14736,10 +14961,9 @@ mod tests {
                 &phoenix_workflow::wake_profile::WakeTerminalEvidence::Bash(
                     phoenix_workflow::wake_profile::BashTerminalEvidence {
                         identity: phoenix_workflow::wake_profile::BashResourceIdentity {
-                            work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
-                                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
-                                stable_key: "conv-del".into(),
-                            },
+                            work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
+                                work_scope_id.as_str().into(),
+                            ),
                             handle_id: "b-del".into(),
                         },
                         status: phoenix_workflow::wake_profile::BashTerminalStatus::Exited,

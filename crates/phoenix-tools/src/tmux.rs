@@ -461,6 +461,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             registry,
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
     }
 
@@ -550,6 +551,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             registry,
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
 
         // First op spawns the session with `-c <cwd>`. Ask tmux for
@@ -746,6 +748,7 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             registry.clone(),
             None,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         );
 
         // Issue a tmux command that will take a moment (the implicit

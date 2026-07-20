@@ -17,7 +17,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use nix::sys::wait::waitpid;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
 use phoenix_terminal::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
 use phoenix_terminal::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
@@ -51,13 +51,15 @@ pub async fn terminal_ws_handler(
     ws.on_upgrade(move |socket| async move {
         let (cwd, scope) = match db.get_conversation(&conversation_id).await {
             Ok(conv) => {
-                // worktree_path drives WorkScope keying (task 03001 / Phase 2):
+                // worktree_path drives ResourceScopeKey keying (task 03001 / Phase 2):
                 // typed on `ConvMode` for Work, Branch, and managed Explore.
                 // Sub-agent Explore returns None and never reaches this code
                 // (no user PTY), so no fallback is needed. Direct returns None
-                // (resolves to WorkScope::Conversation).
-                let wt = conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
-                let scope = WorkScope::resolve(&conversation_id, wt.as_deref());
+                // (resolves to ResourceScopeKey::Conversation).
+                let scope = ResourceScopeKey::Work(
+                    conv.work_scope_id
+                        .expect("persisted conversation has work scope"),
+                );
                 (std::path::PathBuf::from(&conv.cwd), scope)
             }
             Err(e) => {
@@ -81,12 +83,12 @@ pub async fn terminal_ws_global_handler(
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let runtime = Arc::clone(&state.runtime);
-    // cwd per specs/terminal/terminal.allium (WorkScope::Global -> $HOME).
+    // cwd per specs/terminal/terminal.allium (ResourceScopeKey::Global -> $HOME).
     let cwd = state.runtime_env.home().to_path_buf();
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
-            WorkScope::Global,
+            ResourceScopeKey::GlobalTerminal,
             cwd,
             "global".to_string(),
             terminals,
@@ -98,7 +100,7 @@ pub async fn terminal_ws_global_handler(
 #[allow(clippy::too_many_lines)] // inherently dense PTY lifecycle; see relay.rs for the testable core
 async fn handle_socket(
     socket: WebSocket,
-    scope: WorkScope,
+    scope: ResourceScopeKey,
     cwd: std::path::PathBuf,
     id_label: String,
     terminals: ActiveTerminals,
@@ -175,7 +177,7 @@ async fn handle_socket(
     // across conversation continuations and tear down only via the
     // worktree cleanup cascade (REQ-TERM-WS-001, REQ-TMUX-WS-002). Global
     // terminals never tear down on conversation lifecycle.
-    if matches!(scope, WorkScope::Conversation(_)) {
+    if matches!(scope, ResourceScopeKey::Work(_)) {
         let teardown_stop = arc_handle.stop_tx.clone();
         let teardown_conv_id = conversation_id.clone();
         if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
@@ -296,7 +298,7 @@ async fn handle_socket(
 ///      handle is fresh and nobody holds it yet.
 async fn acquire_handle(
     conversation_id: &str,
-    scope: &WorkScope,
+    scope: &ResourceScopeKey,
     terminals: &ActiveTerminals,
     cwd: &std::path::Path,
     initial_dims: Dims,
@@ -373,13 +375,13 @@ async fn acquire_handle(
 /// The caller's already-resolved `scope` is passed in directly so the
 /// tmux socket selection matches the terminal's ownership scope
 /// (REQ-TERM-WS-001). Re-resolving here from `(conversation_id,
-/// worktree_path)` would silently downgrade `WorkScope::Global` to
+/// worktree_path)` would silently downgrade `ResourceScopeKey::Global` to
 /// `Conversation("global")`, breaking the singleton tmux session — and
 /// would also drop the disjointness between Worktree and Conversation
 /// scopes that share an inner string.
 async fn resolve_exec_plan(
     conversation_id: &str,
-    scope: &WorkScope,
+    scope: &ResourceScopeKey,
     cwd: &std::path::Path,
     runtime: &Arc<RuntimeManager>,
 ) -> PtyExecPlan {
@@ -458,7 +460,7 @@ async fn acquire_permit(
 async fn full_teardown(
     terminals: &ActiveTerminals,
     conversation_id: &str,
-    scope: &WorkScope,
+    scope: &ResourceScopeKey,
     arc_handle: Arc<TerminalHandle>,
     child_pid: nix::unistd::Pid,
 ) {

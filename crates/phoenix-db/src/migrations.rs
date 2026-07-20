@@ -273,41 +273,344 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 52,
-        name: "create_llm_request_metrics",
+        name: "opaque_work_scope_identity",
         sql: MIGRATION_052,
     },
 ];
 
-const MIGRATION_052: &str = r"
-CREATE TABLE IF NOT EXISTS llm_request_metrics (
-    request_id TEXT NOT NULL,
-    retry_attempt INTEGER NOT NULL CHECK (retry_attempt >= 1),
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    root_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
-    transport TEXT NOT NULL CHECK (transport IN ('http_sse', 'websocket', 'in_process', 'http_json')),
-    total_duration_ms INTEGER NOT NULL CHECK (total_duration_ms >= 0),
-    dispatch_to_first_provider_event_ms INTEGER CHECK (dispatch_to_first_provider_event_ms IS NULL OR dispatch_to_first_provider_event_ms >= 0),
-    dispatch_to_first_generation_event_ms INTEGER CHECK (dispatch_to_first_generation_event_ms IS NULL OR dispatch_to_first_generation_event_ms >= 0),
-    dispatch_to_first_visible_text_ms INTEGER CHECK (dispatch_to_first_visible_text_ms IS NULL OR dispatch_to_first_visible_text_ms >= 0),
-    provider_event_count INTEGER NOT NULL CHECK (provider_event_count >= 0),
-    generation_event_count INTEGER NOT NULL CHECK (generation_event_count >= 0),
-    visible_text_event_count INTEGER NOT NULL CHECK (visible_text_event_count >= 0),
-    max_provider_gap_ms INTEGER CHECK (max_provider_gap_ms IS NULL OR max_provider_gap_ms >= 0),
-    max_generation_gap_ms INTEGER CHECK (max_generation_gap_ms IS NULL OR max_generation_gap_ms >= 0),
-    output_kind TEXT NOT NULL CHECK (output_kind IN ('none', 'text', 'reasoning', 'tool', 'structured', 'mixed')),
-    stream_completed INTEGER NOT NULL CHECK (stream_completed IN (0, 1)),
-    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'rate_limited', 'usage_limit_reached', 'server_error', 'invalid_response', 'server_overloaded', 'network_error', 'token_budget_exceeded', 'auth_error', 'request_rejected', 'cancelled')),
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (request_id, retry_attempt)
+const MIGRATION_052: &str = r#"
+ALTER TABLE work_scopes RENAME TO work_scopes_old;
+CREATE TEMP TABLE migration_052_scope_map (
+    old_id INTEGER PRIMARY KEY,
+    new_id TEXT NOT NULL UNIQUE
 );
 
-CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_created_at ON llm_request_metrics(created_at);
-CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_provider_model_transport
-    ON llm_request_metrics(provider, model, transport, created_at);
-CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_root ON llm_request_metrics(root_conversation_id, created_at);
-";
+INSERT INTO migration_052_scope_map (old_id, new_id)
+SELECT id, lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-' || '4' || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', 1 + (abs(random()) % 4), 1) || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6)))
+FROM work_scopes_old;
+
+CREATE TABLE work_scopes_new (
+    id TEXT PRIMARY KEY CHECK (id <> ''),
+    authority_kind TEXT NOT NULL CHECK (authority_kind IN ('restricted_explore', 'work')),
+    lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'retired')),
+    retired_at TEXT,
+    retired_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((lifecycle = 'retired') = (retired_at IS NOT NULL)),
+    CHECK (retired_reason IS NULL OR retired_reason <> '')
+);
+
+INSERT INTO work_scopes_new (id, authority_kind, lifecycle, created_at, updated_at)
+SELECT m.new_id,
+       CASE WHEN old.scope_type = 'Conversation' THEN 'restricted_explore' ELSE 'work' END,
+       'active', old.created_at, old.updated_at
+FROM work_scopes_old old
+JOIN migration_052_scope_map m ON m.old_id = old.id;
+
+CREATE TABLE work_scope_environments (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes_new(id) ON DELETE CASCADE,
+    environment_kind TEXT NOT NULL CHECK (environment_kind IN ('allocated_worktree', 'unowned_cwd', 'none')),
+    cwd TEXT,
+    worktree_path TEXT,
+    branch_name TEXT,
+    base_branch TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (environment_kind = 'allocated_worktree' AND cwd IS NOT NULL AND cwd <> '' AND worktree_path IS NOT NULL AND worktree_path <> '' AND branch_name IS NOT NULL AND branch_name <> '' AND base_branch IS NOT NULL AND base_branch <> '')
+        OR (environment_kind = 'unowned_cwd' AND cwd IS NOT NULL AND cwd <> '' AND worktree_path IS NULL AND branch_name IS NULL AND base_branch IS NULL)
+        OR (environment_kind = 'none' AND cwd IS NULL AND worktree_path IS NULL AND branch_name IS NULL AND base_branch IS NULL)
+    )
+);
+
+INSERT OR IGNORE INTO work_scope_environments (work_scope_id, environment_kind, cwd, worktree_path, branch_name, base_branch, updated_at)
+SELECT m.new_id,
+       'allocated_worktree',
+       COALESCE((SELECT c.cwd FROM conversations c WHERE c.cm_worktree_path = old.scope_value ORDER BY c.updated_at DESC LIMIT 1), old.scope_value),
+       old.scope_value,
+       COALESCE((SELECT c.cm_branch_name FROM conversations c WHERE c.cm_worktree_path = old.scope_value AND c.cm_branch_name IS NOT NULL ORDER BY c.updated_at DESC LIMIT 1), 'unknown'),
+       COALESCE((SELECT c.cm_base_branch FROM conversations c WHERE c.cm_worktree_path = old.scope_value AND c.cm_base_branch IS NOT NULL ORDER BY c.updated_at DESC LIMIT 1), 'unknown'),
+       old.updated_at
+FROM work_scopes_old old
+JOIN migration_052_scope_map m ON m.old_id = old.id
+WHERE old.scope_type = 'Worktree' AND old.scope_value <> '';
+
+INSERT OR IGNORE INTO work_scope_environments (work_scope_id, environment_kind, cwd, updated_at)
+SELECT m.new_id, 'unowned_cwd', c.cwd, old.updated_at
+FROM work_scopes_old old
+JOIN migration_052_scope_map m ON m.old_id = old.id
+JOIN conversations c ON c.id = old.scope_value
+WHERE old.scope_type = 'Conversation' AND c.cwd <> '';
+
+ALTER TABLE conversations ADD COLUMN runtime_role TEXT NOT NULL DEFAULT 'user'
+    CHECK (runtime_role IN ('user', 'sub_agent', 'coordinator'));
+ALTER TABLE conversations ADD COLUMN work_scope_id TEXT REFERENCES work_scopes_new(id);
+
+UPDATE conversations
+SET runtime_role = 'sub_agent'
+WHERE parent_conversation_id IS NOT NULL;
+
+UPDATE conversations
+SET runtime_role = 'coordinator'
+WHERE id = (SELECT conversation_id FROM coordinator WHERE singleton = 1);
+
+CREATE TEMP TABLE migration_052_generated_scope_map AS
+SELECT CASE WHEN cm_worktree_path IS NOT NULL AND cm_worktree_path <> '' THEN cm_worktree_path ELSE id END AS group_key,
+       lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-' || '4' || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', 1 + (abs(random()) % 4), 1) || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))) AS new_id,
+       CASE WHEN cm_kind IN ('work', 'branch') THEN 'work' ELSE 'restricted_explore' END AS authority_kind,
+       MIN(created_at) AS created_at,
+       MAX(updated_at) AS updated_at
+FROM conversations
+WHERE runtime_role <> 'coordinator'
+  AND NOT EXISTS (SELECT 1 FROM work_scopes_old old WHERE old.scope_type = 'Worktree' AND old.scope_value = conversations.cm_worktree_path)
+  AND NOT EXISTS (SELECT 1 FROM work_scopes_old old WHERE old.scope_type = 'Conversation' AND old.scope_value = conversations.id)
+GROUP BY CASE WHEN cm_worktree_path IS NOT NULL AND cm_worktree_path <> '' THEN cm_worktree_path ELSE id END;
+
+INSERT INTO work_scopes_new (id, authority_kind, lifecycle, created_at, updated_at)
+SELECT new_id, authority_kind, 'active', created_at, updated_at
+FROM migration_052_generated_scope_map;
+
+CREATE TEMP TABLE migration_052_conversation_scope AS
+SELECT c.id AS conversation_id,
+       COALESCE(
+           (SELECT m.new_id FROM work_scopes_old old JOIN migration_052_scope_map m ON m.old_id = old.id WHERE old.scope_type = 'Worktree' AND old.scope_value = c.cm_worktree_path),
+           (SELECT m.new_id FROM work_scopes_old old JOIN migration_052_scope_map m ON m.old_id = old.id WHERE old.scope_type = 'Conversation' AND old.scope_value = c.id),
+           (SELECT g.new_id FROM migration_052_generated_scope_map g WHERE g.group_key = CASE WHEN c.cm_worktree_path IS NOT NULL AND c.cm_worktree_path <> '' THEN c.cm_worktree_path ELSE c.id END)
+       ) AS work_scope_id
+FROM conversations c
+WHERE c.runtime_role <> 'coordinator';
+
+UPDATE conversations
+SET work_scope_id = (SELECT work_scope_id FROM migration_052_conversation_scope map WHERE map.conversation_id = conversations.id)
+WHERE runtime_role <> 'coordinator';
+
+WITH RECURSIVE inherit(id, scope_id) AS (
+    SELECT id, work_scope_id FROM conversations WHERE runtime_role <> 'coordinator' AND work_scope_id IS NOT NULL
+    UNION
+    SELECT child.id, inherit.scope_id FROM conversations child JOIN inherit ON child.parent_conversation_id = inherit.id
+    UNION
+    SELECT succ.id, inherit.scope_id FROM conversations owner JOIN conversations succ ON owner.continued_in_conv_id = succ.id JOIN inherit ON owner.id = inherit.id
+)
+UPDATE conversations
+SET work_scope_id = (SELECT scope_id FROM inherit WHERE inherit.id = conversations.id LIMIT 1)
+WHERE runtime_role <> 'coordinator';
+
+CREATE INDEX IF NOT EXISTS idx_conversations_work_scope ON conversations(work_scope_id);
+CREATE UNIQUE INDEX one_coordinator_conversation ON conversations(runtime_role) WHERE runtime_role = 'coordinator';
+CREATE TRIGGER conversations_role_scope_insert
+BEFORE INSERT ON conversations
+WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
+  OR ((NEW.runtime_role = 'coordinator') != (NEW.work_scope_id IS NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
+END;
+CREATE TRIGGER conversations_role_scope_update
+BEFORE UPDATE OF runtime_role, work_scope_id ON conversations
+WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
+  OR ((NEW.runtime_role = 'coordinator') != (NEW.work_scope_id IS NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
+END;
+
+ALTER TABLE work_scope_pr_associations RENAME TO work_scope_pr_associations_old;
+CREATE TABLE work_scope_pr_associations (
+    work_scope_id TEXT NOT NULL REFERENCES work_scopes_new(id) ON DELETE CASCADE,
+    repo_owner TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    state TEXT NOT NULL,
+    draft INTEGER NOT NULL,
+    display_state TEXT NOT NULL,
+    base TEXT NOT NULL,
+    head TEXT NOT NULL,
+    github_updated_at TEXT,
+    feedback_status TEXT NOT NULL DEFAULT 'open',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (work_scope_id, repo_owner, repo_name, pr_number)
+);
+INSERT INTO work_scope_pr_associations
+SELECT m.new_id, p.repo_owner, p.repo_name, p.pr_number, p.title, p.url, p.state, p.draft,
+       p.display_state, p.base, p.head, p.github_updated_at, p.feedback_status, p.first_seen_at, p.last_seen_at
+FROM work_scope_pr_associations_old p JOIN migration_052_scope_map m ON m.old_id = p.work_scope_id;
+DROP TABLE work_scope_pr_associations_old;
+CREATE INDEX IF NOT EXISTS idx_work_scope_pr_primary ON work_scope_pr_associations(work_scope_id, display_state, github_updated_at, last_seen_at);
+
+ALTER TABLE work_scope_pr_feedback_baselines RENAME TO work_scope_pr_feedback_baselines_old;
+CREATE TABLE work_scope_pr_feedback_baselines (
+    work_scope_id TEXT NOT NULL REFERENCES work_scopes_new(id) ON DELETE CASCADE,
+    repo_owner TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    captured_at TEXT NOT NULL,
+    github_updated_at TEXT,
+    feedback_identities TEXT NOT NULL DEFAULT '[]',
+    feedback_fingerprints TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (work_scope_id, repo_owner, repo_name, pr_number)
+);
+INSERT INTO work_scope_pr_feedback_baselines
+SELECT m.new_id, b.repo_owner, b.repo_name, b.pr_number, b.captured_at, b.github_updated_at, b.feedback_identities, b.feedback_fingerprints
+FROM work_scope_pr_feedback_baselines_old b JOIN migration_052_scope_map m ON m.old_id = b.work_scope_id;
+DROP TABLE work_scope_pr_feedback_baselines_old;
+
+ALTER TABLE work_scope_observed_branches RENAME TO work_scope_observed_branches_old;
+CREATE TABLE work_scope_observed_branches (
+    work_scope_id TEXT NOT NULL REFERENCES work_scopes_new(id) ON DELETE CASCADE,
+    repository_identity TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    first_observed_head_oid TEXT NOT NULL,
+    last_observed_head_oid TEXT NOT NULL,
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    PRIMARY KEY (work_scope_id, repository_identity, branch_name)
+);
+INSERT INTO work_scope_observed_branches
+SELECT m.new_id, o.repository_identity, o.branch_name, o.first_observed_head_oid, o.last_observed_head_oid, o.first_observed_at, o.last_observed_at
+FROM work_scope_observed_branches_old o JOIN migration_052_scope_map m ON m.old_id = o.work_scope_id;
+DROP TABLE work_scope_observed_branches_old;
+CREATE INDEX IF NOT EXISTS idx_work_scope_observed_branches_last_seen ON work_scope_observed_branches(work_scope_id, last_observed_at);
+
+ALTER TABLE work_scope_active_pr_selection RENAME TO work_scope_active_pr_selection_old;
+CREATE TABLE work_scope_active_pr_selection (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes_new(id) ON DELETE CASCADE,
+    repo_owner TEXT,
+    repo_name TEXT,
+    pr_number INTEGER,
+    provenance TEXT NOT NULL,
+    latest_observed_repository_identity TEXT,
+    latest_observed_branch_name TEXT,
+    inference_generation INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    CHECK ((repo_owner IS NULL AND repo_name IS NULL AND pr_number IS NULL) OR (repo_owner IS NOT NULL AND repo_name IS NOT NULL AND pr_number IS NOT NULL))
+);
+INSERT INTO work_scope_active_pr_selection
+SELECT m.new_id, a.repo_owner, a.repo_name, a.pr_number, a.provenance, a.latest_observed_repository_identity, a.latest_observed_branch_name, a.inference_generation, a.updated_at
+FROM work_scope_active_pr_selection_old a JOIN migration_052_scope_map m ON m.old_id = a.work_scope_id;
+DROP TABLE work_scope_active_pr_selection_old;
+
+ALTER TABLE wake_terminal_receipt_tails RENAME TO wake_terminal_receipt_tails_old;
+ALTER TABLE wake_terminal_receipts RENAME TO wake_terminal_receipts_old;
+ALTER TABLE wake_delivery_messages RENAME TO wake_delivery_messages_old;
+ALTER TABLE wake_bindings RENAME TO wake_bindings_old;
+
+ALTER TABLE work_scopes_new RENAME TO work_scopes;
+
+CREATE TABLE wake_bindings (
+    workflow_id INTEGER PRIMARY KEY REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    contract_id TEXT NOT NULL CHECK (contract_id <> ''),
+    profile_kind TEXT NOT NULL CHECK (profile_kind = 'wake'),
+    profile_version INTEGER NOT NULL CHECK (profile_version >= 1),
+    work_scope_id TEXT NOT NULL REFERENCES work_scopes(id),
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('Bash', 'TmuxWindow')),
+    bash_handle_id TEXT,
+    tmux_server_token TEXT,
+    tmux_window_id TEXT,
+    registering_tool_use_id TEXT NOT NULL CHECK (registering_tool_use_id <> ''),
+    expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+    resolved_at INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),
+    prepared_fingerprint TEXT NOT NULL CHECK (prepared_fingerprint <> ''),
+    observe_effect_id INTEGER NOT NULL CHECK (observe_effect_id >= 1),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    tmux_completion_policy TEXT NOT NULL DEFAULT 'KeepOpen' CHECK (tmux_completion_policy IN ('KeepOpen', 'CloseAfterCompletion')),
+    FOREIGN KEY (workflow_id, observe_effect_id) REFERENCES workflow_effects(workflow_id, effect_id) ON DELETE CASCADE,
+    CHECK ((resource_kind = 'Bash') = (bash_handle_id IS NOT NULL)),
+    CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_token IS NOT NULL AND tmux_window_id IS NOT NULL)),
+    CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_token IS NOT NULL OR tmux_window_id IS NOT NULL)))
+) STRICT;
+INSERT INTO wake_bindings
+SELECT old.workflow_id, old.conversation_id, old.contract_id, old.profile_kind, old.profile_version,
+       COALESCE((SELECT c.work_scope_id FROM conversations c WHERE c.id = old.conversation_id), (SELECT id FROM work_scopes ORDER BY created_at, id LIMIT 1)),
+       old.resource_kind, old.bash_handle_id, old.tmux_server_token, old.tmux_window_id, old.registering_tool_use_id,
+       old.expires_at, old.resolved_at, old.prepared_fingerprint, old.observe_effect_id, old.created_at, old.tmux_completion_policy
+FROM wake_bindings_old old;
+
+CREATE TABLE wake_terminal_receipts (
+    workflow_id INTEGER NOT NULL,
+    receipt_id INTEGER NOT NULL,
+    delivery_id INTEGER NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    contract_id TEXT NOT NULL CHECK (contract_id <> ''),
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('Bash', 'TmuxWindow')),
+    terminal_kind TEXT NOT NULL CHECK (terminal_kind IN ('Fired', 'Cancelled', 'Expired', 'Forgotten')),
+    resolved_at INTEGER NOT NULL CHECK (resolved_at >= 0),
+    bash_handle_id TEXT,
+    tmux_server_token TEXT,
+    tmux_window_id TEXT,
+    bash_status TEXT CHECK (bash_status IN ('Exited', 'Killed', 'KillPendingKernel')),
+    tmux_status TEXT CHECK (tmux_status IN ('ExitMarkerObserved', 'WindowKilled')),
+    occurred_at INTEGER CHECK (occurred_at IS NULL OR occurred_at >= 0),
+    exit_code INTEGER,
+    duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+    signal_number INTEGER,
+    kill_signal_sent TEXT CHECK (kill_signal_sent IS NULL OR kill_signal_sent <> ''),
+    forgotten_reason TEXT CHECK (forgotten_reason IN ('PhoenixRestart', 'CascadeDestroyedHandle', 'TmuxHandleMissing')),
+    cancelled_reason TEXT CHECK (cancelled_reason IN ('ExplicitCancel')),
+    cancelled_at INTEGER CHECK (cancelled_at IS NULL OR cancelled_at >= 0),
+    PRIMARY KEY (workflow_id, receipt_id),
+    FOREIGN KEY (workflow_id, receipt_id) REFERENCES workflow_receipts(workflow_id, receipt_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id, delivery_id) REFERENCES workflow_deliveries(workflow_id, delivery_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id) REFERENCES wake_bindings(workflow_id) ON DELETE CASCADE,
+    CHECK ((resource_kind = 'Bash') = (bash_handle_id IS NOT NULL)),
+    CHECK ((resource_kind = 'TmuxWindow') = (tmux_server_token IS NOT NULL AND tmux_window_id IS NOT NULL)),
+    CHECK (NOT (resource_kind = 'Bash' AND (tmux_server_token IS NOT NULL OR tmux_window_id IS NOT NULL))),
+    CHECK (terminal_kind <> 'Fired' OR resource_kind <> 'Bash' OR bash_status IS NOT NULL),
+    CHECK (terminal_kind <> 'Fired' OR resource_kind <> 'TmuxWindow' OR tmux_status IS NOT NULL),
+    CHECK ((terminal_kind = 'Fired') = (occurred_at IS NOT NULL)),
+    CHECK ((bash_status IS NOT NULL) = (resource_kind = 'Bash' AND terminal_kind = 'Fired')),
+    CHECK ((tmux_status IS NOT NULL) = (resource_kind = 'TmuxWindow' AND terminal_kind = 'Fired')),
+    CHECK ((kill_signal_sent IS NOT NULL) <= (bash_status IS NOT NULL)),
+    CHECK ((forgotten_reason IS NOT NULL) = (terminal_kind = 'Forgotten')),
+    CHECK ((cancelled_reason IS NOT NULL) = (terminal_kind = 'Cancelled')),
+    CHECK ((cancelled_at IS NOT NULL) = (terminal_kind = 'Cancelled'))
+) WITHOUT ROWID;
+INSERT INTO wake_terminal_receipts SELECT * FROM wake_terminal_receipts_old;
+
+CREATE TABLE wake_terminal_receipt_tails (
+    workflow_id INTEGER NOT NULL,
+    receipt_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    line TEXT NOT NULL,
+    PRIMARY KEY (workflow_id, receipt_id, ordinal),
+    FOREIGN KEY (workflow_id, receipt_id) REFERENCES wake_terminal_receipts(workflow_id, receipt_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+INSERT INTO wake_terminal_receipt_tails SELECT * FROM wake_terminal_receipt_tails_old;
+
+CREATE TABLE wake_delivery_messages (
+    workflow_id INTEGER NOT NULL,
+    delivery_id INTEGER NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE,
+    registering_tool_use_id TEXT NOT NULL CHECK (registering_tool_use_id <> ''),
+    terminal_kind TEXT NOT NULL CHECK (terminal_kind IN ('Fired', 'Cancelled', 'Expired', 'Forgotten')),
+    auto_resume INTEGER NOT NULL CHECK (auto_resume IN (0, 1)),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    PRIMARY KEY (workflow_id, delivery_id),
+    FOREIGN KEY (workflow_id, delivery_id) REFERENCES workflow_deliveries(workflow_id, delivery_id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id) REFERENCES wake_bindings(workflow_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+INSERT INTO wake_delivery_messages SELECT * FROM wake_delivery_messages_old;
+DROP TABLE wake_terminal_receipt_tails_old;
+DROP TABLE wake_terminal_receipts_old;
+DROP TABLE wake_delivery_messages_old;
+DROP TABLE wake_bindings_old;
+CREATE UNIQUE INDEX wake_bindings_contract_identity ON wake_bindings(profile_kind, profile_version, conversation_id, contract_id, resource_kind, COALESCE(bash_handle_id, ''), COALESCE(tmux_server_token, ''), COALESCE(tmux_window_id, ''));
+CREATE UNIQUE INDEX wake_bindings_resource_identity ON wake_bindings(profile_kind, profile_version, conversation_id, resource_kind, COALESCE(bash_handle_id, ''), COALESCE(tmux_server_token, ''), COALESCE(tmux_window_id, '')) WHERE resolved_at IS NULL;
+CREATE INDEX wake_bindings_by_conversation ON wake_bindings(conversation_id);
+CREATE INDEX wake_bindings_by_work_scope ON wake_bindings(work_scope_id);
+CREATE INDEX wake_bindings_active_unresolved ON wake_bindings(expires_at, workflow_id);
+CREATE INDEX wake_terminal_receipts_by_conversation ON wake_terminal_receipts(conversation_id, delivery_id);
+CREATE INDEX wake_terminal_receipts_by_workflow_delivery ON wake_terminal_receipts(workflow_id, delivery_id);
+CREATE INDEX wake_delivery_messages_by_conversation ON wake_delivery_messages(conversation_id, delivery_id);
+
+DROP TABLE coordinator;
+DROP TABLE work_scopes_old;
+DROP TABLE migration_052_scope_map;
+DROP TABLE migration_052_generated_scope_map;
+DROP TABLE migration_052_conversation_scope;
+"#;
 
 const MIGRATION_050: &str = r"
 ALTER TABLE wake_bindings
@@ -2076,6 +2379,84 @@ mod tests {
             .unwrap()
     }
 
+    async fn setup_legacy_conversations_table(pool: &SqlitePool) {
+        sqlx::raw_sql(crate::ddl::SCHEMA)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(crate::ddl::MIGRATION_TYPED_STATE)
+            .execute(pool)
+            .await
+            .unwrap();
+        let _ = sqlx::raw_sql("ALTER TABLE conversations DROP COLUMN state_data")
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN model TEXT")
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql(crate::ddl::MIGRATION_RENAME_MESSAGE_ID)
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql(crate::ddl::MIGRATION_REMOVE_UNKNOWN_ERROR_KIND)
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql(crate::ddl::MIGRATION_CREATE_PROJECTS)
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql(
+            "ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN title TEXT")
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN desired_base_branch TEXT")
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN seed_parent_id TEXT")
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN seed_label TEXT")
+            .execute(pool)
+            .await;
+        let _ = sqlx::raw_sql(
+            "ALTER TABLE conversations ADD COLUMN steering_queue TEXT NOT NULL DEFAULT '[]'",
+        )
+        .execute(pool)
+        .await;
+    }
+
+    #[allow(dead_code)]
+    async fn setup_legacy_schema_through(pool: &SqlitePool, version: u32) {
+        setup_legacy_conversations_table(pool).await;
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= version)
+        {
+            sqlx::raw_sql(migration.sql).execute(pool).await.unwrap();
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn stamp_migrations_except(pool: &SqlitePool, excluded_version: u32) {
+        sqlx::query("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')))")
+            .execute(pool)
+            .await
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version != excluded_version)
+        {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
     async fn setup_workflow_only_schema(pool: &SqlitePool) {
         sqlx::raw_sql(
             "CREATE TABLE conversations (\
@@ -2113,42 +2494,8 @@ mod tests {
         }
     }
 
-    /// Create the conversations table with `conv_mode` and state columns
-    /// (minimal schema needed for migration tests).
     async fn setup_conversations_table(pool: &SqlitePool) {
-        sqlx::raw_sql(
-            "CREATE TABLE conversations (\
-                id TEXT PRIMARY KEY, \
-                conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', \
-                state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', \
-                cwd TEXT NOT NULL DEFAULT '/tmp', \
-                parent_conversation_id TEXT, \
-                user_initiated BOOLEAN NOT NULL DEFAULT 1, \
-                archived BOOLEAN NOT NULL DEFAULT 0, \
-                model TEXT, \
-                steering_queue TEXT NOT NULL DEFAULT '[]', \
-                state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
-                created_at TEXT NOT NULL DEFAULT '2025-01-01', \
-                updated_at TEXT NOT NULL DEFAULT '2025-01-01'\
-            )",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::raw_sql(
-            "CREATE TABLE messages (\
-                id INTEGER PRIMARY KEY AUTOINCREMENT, \
-                message_id TEXT UNIQUE, \
-                conversation_id TEXT NOT NULL, \
-                message_type TEXT NOT NULL, \
-                content TEXT NOT NULL, \
-                sequence_id INTEGER NOT NULL DEFAULT 1, \
-                created_at TEXT NOT NULL DEFAULT '2025-01-01'\
-            )",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
+        setup_legacy_conversations_table(pool).await;
     }
 
     #[tokio::test]
@@ -2477,8 +2824,8 @@ mod tests {
         let bare = r#"[{"text":"legacy","llm_text":null,"message_id":"s3","user_agent":null,"images":[],"files":[]}]"#;
         for (id, q) in [("c-env", env), ("c-bare", bare), ("c-empty", "[]")] {
             sqlx::query(
-                "INSERT INTO conversations (id, steering_queue, state_updated_at, created_at, updated_at) \
-                 VALUES (?1, ?2, '2025-01-01', '2025-01-01', '2025-01-01')",
+                "INSERT INTO conversations (id, cwd, user_initiated, steering_queue, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, '/tmp', 1, ?2, '2025-01-01', '2025-01-01', '2025-01-01')",
             )
             .bind(id)
             .bind(q)
@@ -2609,8 +2956,8 @@ mod tests {
             ("c-partial-skill", partial),
         ] {
             sqlx::query(
-                "INSERT INTO conversations (id, steering_queue, state_updated_at, created_at, updated_at) \
-                 VALUES (?1, ?2, '2025-01-01', '2025-01-01', '2025-01-01')",
+                "INSERT INTO conversations (id, cwd, user_initiated, steering_queue, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, '/tmp', 1, ?2, '2025-01-01', '2025-01-01', '2025-01-01')",
             )
             .bind(id)
             .bind(q)
@@ -2691,16 +3038,20 @@ mod tests {
         let skill_content = r#"{"name":"build","body":"b","trigger":"/build","files":[{"original_name":"s.txt","media_type":"text/plain","size_bytes":3,"stored_path":"/p/s"}]}"#;
         // user message with no attachments.
         let plain_content = r#"{"text":"plain","images":[],"files":[]}"#;
-        for (id, mt, content) in [
+        for (sequence_id, (id, mt, content)) in [
             ("m-user", "user", user_content),
             ("m-skill", "skill", skill_content),
             ("m-plain", "user", plain_content),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             sqlx::query(
-                "INSERT INTO messages (message_id, conversation_id, message_type, content) \
-                 VALUES (?1, 'c', ?2, ?3)",
+                "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) \
+                 VALUES (?1, 'c', ?2, ?3, ?4, '2025-01-01')",
             )
             .bind(id)
+            .bind(i64::try_from(sequence_id + 1).unwrap())
             .bind(mt)
             .bind(content)
             .execute(&pool)
@@ -3650,6 +4001,211 @@ mod tests {
             dup.is_err(),
             "second token row for one server must violate the primary key"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_052_normalizes_authority_environment_and_preserves_wakes() {
+        let pool = test_pool().await;
+        setup_legacy_schema_through(&pool, 51).await;
+        sqlx::query("CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')))")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 51)
+        {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        sqlx::query(
+            "INSERT INTO conversations
+             (id, slug, cwd, user_initiated, state, state_updated_at, created_at, updated_at,
+              cm_kind, cm_worktree_path, cm_branch_name, cm_base_branch)
+             VALUES ('migration-wake-conv', 'migration-wake-conv', '/tmp/migration-wake', 1,
+                     '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-01',
+                     'work', '/tmp/migration-wake', 'topic', 'main')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_scopes (scope_type, scope_value, created_at, updated_at)
+             VALUES ('Worktree', '/tmp/migration-wake', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES ('migration-message', 'migration-wake-conv', 1, 'user', 'preserved', '2025-01-01')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (52, 'wake', 1, 1, 0, 1, 0, 'Active', 'wake', 1, X'00', 1, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version, family, kind, intent_codec_family, intent_codec_version, intent_payload, generation, role, capability_kind, status) VALUES (52, 1, 0, 'wake', 'observe', 'wake', 1, X'01', 0, 'Required', 'ReclaimableObservation', 'Receipted')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_attempts (workflow_id, effect_id, attempt_id, ordinal, declared_workflow_version, generation, process_incarnation, status, created_at) VALUES (52, 1, 1, 0, 0, 0, 1, 'ReceiptAccepted', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_receipts (workflow_id, receipt_id, effect_id, generation, declared_workflow_version, process_incarnation, attempt_id, origin, receipt_codec_family, receipt_codec_version, receipt_payload) VALUES (52, 1, 1, 0, 0, 1, 1, 'Execution', 'wake', 1, X'02')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status) VALUES (52, 1, 1, 'conversation', 'wake', 1, 'Receipt', X'03', 1, 'Pending', 'Owed')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO wake_bindings (workflow_id, conversation_id, contract_id, profile_kind, profile_version, scope_kind, scope_stable_key, resource_kind, bash_handle_id, registering_tool_use_id, expires_at, resolved_at, prepared_fingerprint, observe_effect_id, created_at) VALUES (52, 'migration-wake-conv', 'contract', 'wake', 1, 'Worktree', 'worktree:/tmp/migration-wake', 'Bash', 'b-52', 'tool-52', 100, 2, 'fingerprint', 1, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO wake_terminal_receipts (workflow_id, receipt_id, delivery_id, conversation_id, contract_id, resource_kind, terminal_kind, resolved_at, bash_handle_id, bash_status, occurred_at, exit_code, duration_ms) VALUES (52, 1, 1, 'migration-wake-conv', 'contract', 'Bash', 'Fired', 2, 'b-52', 'Exited', 2, 0, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO wake_terminal_receipt_tails (workflow_id, receipt_id, ordinal, line) VALUES (52, 1, 0, 'preserved tail')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO wake_delivery_messages (workflow_id, delivery_id, conversation_id, message_id, registering_tool_use_id, terminal_kind, auto_resume, created_at) VALUES (52, 1, 'migration-wake-conv', 'migration-message', 'tool-52', 'Fired', 1, 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(work_scopes)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(!columns.iter().any(|c| c == "scope_type"));
+        assert!(!columns.iter().any(|c| c == "scope_value"));
+
+        let bad_ids: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scopes WHERE id LIKE 'legacy-%' OR id LIKE '%:%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bad_ids, 0);
+
+        let invalid_authority: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scopes WHERE authority_kind NOT IN ('restricted_explore', 'work')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(invalid_authority, 0);
+
+        let invalid_role: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations WHERE runtime_role NOT IN ('user', 'sub_agent', 'coordinator')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(invalid_role, 0);
+
+        let invalid_scope_nullability: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations WHERE (runtime_role = 'coordinator') != (work_scope_id IS NULL)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(invalid_scope_nullability, 0);
+
+        let binding_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wake_bindings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(binding_count, 1);
+        let preserved_tail: String = sqlx::query_scalar(
+            "SELECT line FROM wake_terminal_receipt_tails WHERE workflow_id = 52 AND receipt_id = 1 AND ordinal = 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved_tail, "preserved tail");
+        let preserved_message: (String, String, i64) = sqlx::query_as(
+            "SELECT message_id, registering_tool_use_id, auto_resume
+             FROM wake_delivery_messages WHERE workflow_id = 52 AND delivery_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            preserved_message,
+            ("migration-message".into(), "tool-52".into(), 1)
+        );
+
+        for (table, foreign_key_sql) in [
+            (
+                "wake_terminal_receipts",
+                "PRAGMA foreign_key_list(wake_terminal_receipts)",
+            ),
+            (
+                "wake_delivery_messages",
+                "PRAGMA foreign_key_list(wake_delivery_messages)",
+            ),
+        ] {
+            let referenced_tables: Vec<String> = sqlx::query(foreign_key_sql)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("table"))
+                .collect();
+            assert!(
+                referenced_tables.iter().any(|name| name == "wake_bindings"),
+                "{table} must reference reconstructed wake_bindings: {referenced_tables:?}"
+            );
+            assert!(
+                referenced_tables
+                    .iter()
+                    .all(|name| name != "wake_bindings_old"),
+                "{table} retains rewritten FK to wake_bindings_old: {referenced_tables:?}"
+            );
+        }
+
+        let tail_references: Vec<String> =
+            sqlx::query("PRAGMA foreign_key_list(wake_terminal_receipt_tails)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("table"))
+                .collect();
+        assert!(tail_references
+            .iter()
+            .any(|name| name == "wake_terminal_receipts"));
+        assert!(tail_references
+            .iter()
+            .all(|name| name != "wake_terminal_receipts_old"));
+
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name IN (
+                 'wake_terminal_receipts_by_conversation',
+                 'wake_terminal_receipts_by_workflow_delivery',
+                 'wake_delivery_messages_by_conversation'
+             )",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexes.len(), 3, "dependent wake indexes must survive");
     }
 
     #[tokio::test]

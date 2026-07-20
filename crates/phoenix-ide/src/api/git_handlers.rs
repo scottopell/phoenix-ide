@@ -653,7 +653,7 @@ fn associated_pr_summary_response(
 
 async fn selection_envelope_for_scope(
     db: &crate::db::Database,
-    work_scope: &crate::work_scope::WorkScope,
+    work_scope: &phoenix_core::work_scope::WorkScopeId,
 ) -> Result<AssociatedPrStatusEnvelope, AppError> {
     Ok(selection_envelope_for_scope_from_snapshot(
         db.list_work_scope_pr_associations(work_scope)
@@ -775,7 +775,7 @@ fn association_for_artifact_baseline<'a>(
 
 async fn active_selection_target_for_scope(
     db: &crate::db::Database,
-    work_scope: &crate::work_scope::WorkScope,
+    work_scope: &phoenix_core::work_scope::WorkScopeId,
 ) -> Result<Option<crate::db::WorkScopePrAssociation>, AppError> {
     let Some(selection) = db
         .active_work_scope_pr_selection(work_scope)
@@ -1253,7 +1253,7 @@ pub(crate) fn summarize_work_change(
 }
 async fn pr_status_response_for_missing_worktree(
     state: &AppState,
-    work_scope: &crate::work_scope::WorkScope,
+    work_scope: &phoenix_core::work_scope::WorkScopeId,
 ) -> Result<PrStatusResponse, AppError> {
     let attempted_at = chrono::Utc::now().to_rfc3339();
     let associated = state
@@ -1355,10 +1355,9 @@ pub(crate) async fn get_conversation_pr_status(
             branch_name.to_string(),
             base_branch.to_string(),
             worktree_path.to_string(),
-            crate::work_scope::WorkScope::resolve(
-                &id,
-                Some(std::path::Path::new(worktree_path.as_str())),
-            ),
+            conv.work_scope_id
+                .clone()
+                .expect("persisted conversation has work scope"),
         ),
         _ => {
             // Not applicable: no branch/worktree to query. Distinct from the
@@ -1635,7 +1634,7 @@ pub(crate) async fn get_conversation_pr_status(
 async fn attach_pr_feedback_freshness(
     mut response: PrStatusResponse,
     db: &crate::db::Database,
-    work_scope: &crate::work_scope::WorkScope,
+    work_scope: &phoenix_core::work_scope::WorkScopeId,
     cwd: &FsPath,
     active_pr: &crate::db::WorkScopePrAssociation,
 ) -> Result<PrStatusResponse, AppError> {
@@ -1776,10 +1775,9 @@ pub(crate) async fn create_pr_auto_fix_context(
         } => (
             branch_name.to_string(),
             worktree_path.to_string(),
-            crate::work_scope::WorkScope::resolve(
-                &id,
-                Some(std::path::Path::new(worktree_path.as_str())),
-            ),
+            conv.work_scope_id
+                .clone()
+                .expect("persisted conversation has work scope"),
         ),
         _ => {
             return Err(AppError::BadRequest(
@@ -1947,15 +1945,16 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
         .get_conversation(conversation_id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-    let work_scope = match &conv.conv_mode {
-        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
-            crate::work_scope::WorkScope::resolve(
-                conversation_id,
-                Some(std::path::Path::new(worktree_path.as_str())),
-            )
-        }
-        _ => return Ok(()),
-    };
+    if !matches!(
+        conv.conv_mode,
+        ConvMode::Work { .. } | ConvMode::Branch { .. }
+    ) {
+        return Ok(());
+    }
+    let work_scope = conv
+        .work_scope_id
+        .clone()
+        .expect("persisted conversation has work scope");
     let artifact = crate::api::pr_monitoring::read_pr_auto_fix_context_artifact(
         &pr_auto_fix_artifact_path(&conv, artifact_path)?,
     )
@@ -1986,12 +1985,10 @@ pub(crate) async fn pin_associated_pr(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let work_scope = match &conv.conv_mode {
-        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
-            crate::work_scope::WorkScope::resolve(
-                &id,
-                Some(std::path::Path::new(worktree_path.as_str())),
-            )
-        }
+        ConvMode::Work { .. } | ConvMode::Branch { .. } => conv
+            .work_scope_id
+            .clone()
+            .expect("persisted conversation has work scope"),
         _ => {
             return Err(AppError::BadRequest(
                 "Conversation is not in Work or Branch mode".to_string(),
@@ -2032,12 +2029,10 @@ pub(crate) async fn resume_associated_pr_inference(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let work_scope = match &conv.conv_mode {
-        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
-            crate::work_scope::WorkScope::resolve(
-                &id,
-                Some(std::path::Path::new(worktree_path.as_str())),
-            )
-        }
+        ConvMode::Work { .. } | ConvMode::Branch { .. } => conv
+            .work_scope_id
+            .clone()
+            .expect("persisted conversation has work scope"),
         _ => {
             return Err(AppError::BadRequest(
                 "Conversation is not in Work or Branch mode".to_string(),
@@ -2107,10 +2102,10 @@ pub(crate) async fn get_active_pr_diff(
             ));
         }
     };
-    let work_scope = crate::work_scope::WorkScope::resolve(
-        &id,
-        Some(std::path::Path::new(worktree_path.as_str())),
-    );
+    let work_scope = conv
+        .work_scope_id
+        .clone()
+        .expect("persisted conversation has work scope");
     let active_pr = active_selection_target_for_scope(state.runtime.db(), &work_scope)
         .await?
         .ok_or_else(|| {
@@ -2326,7 +2321,7 @@ mod tests {
 
     fn association(owner: &str, repo: &str, number: u64) -> crate::db::WorkScopePrAssociation {
         crate::db::WorkScopePrAssociation {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: owner.to_string(),
             repo_name: repo.to_string(),
             pr_number: number,
@@ -2439,6 +2434,8 @@ mod tests {
     ) -> crate::db::Conversation {
         let now = chrono::Utc::now();
         crate::db::Conversation {
+            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            runtime_role: crate::work_scope::RuntimeRole::User,
             id: "conv-test".to_string(),
             slug: None,
             title: None,
@@ -2982,7 +2979,7 @@ mod tests {
     #[tokio::test]
     async fn selection_envelope_reports_active_pr_plural_and_latest_branch() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
-        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-envelope".to_string());
+        let scope = crate::work_scope::WorkScopeId::parse("/tmp/ws-envelope").unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -3049,7 +3046,7 @@ mod tests {
     #[tokio::test]
     async fn missing_worktree_response_retains_full_selection_envelope() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
-        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-missing".to_string());
+        let scope = crate::work_scope::WorkScopeId::parse("/tmp/ws-missing").unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[crate::db::WorkScopePrObservation {
@@ -3119,7 +3116,7 @@ mod tests {
     #[tokio::test]
     async fn active_selection_target_uses_explicit_selection_not_ranked_primary() {
         let db = crate::db::Database::open_in_memory().await.unwrap();
-        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-active-target".to_string());
+        let scope = crate::work_scope::WorkScopeId::parse("/tmp/ws-active-target").unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
             &[
@@ -3552,7 +3549,7 @@ mod tests {
         )
         .unwrap();
         let selected = crate::db::WorkScopePrAssociation {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "fork".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 42,
@@ -3587,7 +3584,7 @@ mod tests {
         init_repo(repo.path());
         run_git(repo.path(), &["checkout", "-q", "-b", "feature/other"]).unwrap();
         let selected = crate::db::WorkScopePrAssociation {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "acme".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 77,
@@ -3626,7 +3623,7 @@ mod tests {
         commit_file(repo.path(), "top.txt", "top", "top commit");
 
         let selected = crate::db::WorkScopePrAssociation {
-            work_scope_id: 1,
+            work_scope_id: crate::work_scope::WorkScopeId::parse("scope-1").unwrap(),
             repo_owner: "acme".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 77,

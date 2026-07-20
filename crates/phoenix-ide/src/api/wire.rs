@@ -393,7 +393,7 @@ pub enum SseWireEvent {
         sequence_id: i64,
         snapshot: phoenix_llm::QuotaDetails,
     },
-    /// A work-affine resource in this conversation's `WorkScope` changed
+    /// A work-affine resource in this conversation's `ResourceScopeKey` changed
     /// state. Carries the full refreshed `WorkScopeInventory` snapshot
     /// (REQ-WSUI-007) — not a delta. `WorkScopeInventory` derives `ts_rs::TS`
     /// in `phoenix-core`, so it is referenced directly here (like

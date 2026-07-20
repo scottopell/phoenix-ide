@@ -1505,6 +1505,8 @@ fn build_child_conversation(
     let slug = format!("fork-{conv_id}");
     Conversation {
         id: conv_id.to_string(),
+        runtime_role: phoenix_core::work_scope::RuntimeRole::User,
+        work_scope_id: None,
         slug: Some(slug.clone()),
         title: Some(phoenix_core::domain::db_schema::title_from_slug(&slug)),
         cwd: worktree_path.to_string(),

@@ -11,13 +11,20 @@ use sha2::{Digest, Sha256};
 
 use super::invoke::{truncate_pair, TMUX_TOOL_MAX_WAIT_SECONDS};
 use super::TmuxError;
-use crate::{Tool, ToolContext, ToolOutput};
+use crate::{
+    work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput,
+};
+use phoenix_workflow::wake_profile::{
+    TmuxCompletionPolicy, TmuxResourceIdentity, WakeResourceIdentity,
+};
 
 use super::parse_last_exit_marker;
+use phoenix_workflow::Timestamp;
 
 const TMUX_RUN_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TMUX_RUN_CAPTURE_START: &str = "-2000";
+const TMUX_WAKE_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24);
 
 pub struct TmuxRunTool;
 
@@ -175,22 +182,23 @@ impl Tool for TmuxRunTool {
             }
             Err(e) => return error_envelope("tmux_server_unavailable", &e.to_string()),
         };
-        let (config_path, socket_path) = {
+        let (config_path, socket_path, server_token) = {
             let server = server.read().await;
             (
                 ctx.tmux_registry().config_path(),
                 server.socket_path.clone(),
+                server.server_token.clone(),
             )
         };
         let wait_for_readiness = matches!(readiness, ValidReadiness::WaitForText { .. });
+        let keep_open_for_observation = parsed.keep_open_on_exit || wait_for_readiness;
         let target = match start_tmux_window(
             &config_path,
             &socket_path,
             &cwd,
             &requested_name,
             cmd,
-            parsed.keep_open_on_exit,
-            wait_for_readiness && !parsed.keep_open_on_exit,
+            keep_open_for_observation,
         )
         .await
         {
@@ -200,13 +208,28 @@ impl Tool for TmuxRunTool {
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
-                return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd).await
+                let response =
+                    return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd)
+                        .await;
+                if parsed.keep_open_on_exit {
+                    register_tmux_wake_if_live(
+                        &ctx,
+                        &server_token,
+                        &target,
+                        TmuxCompletionPolicy::KeepOpen,
+                        response,
+                    )
+                    .await
+                } else {
+                    response
+                }
             }
             ValidReadiness::WaitForText { text, timeout } => {
                 wait_for_text_response(
                     &ctx,
                     &config_path,
                     &socket_path,
+                    &server_token,
                     &target,
                     &cwd,
                     cmd,
@@ -272,9 +295,8 @@ async fn start_tmux_window(
     requested_name: &str,
     cmd: &str,
     keep_open_on_exit: bool,
-    preserve_for_readiness: bool,
 ) -> Result<TmuxRunTarget, ToolOutput> {
-    let wrapper = shell_wrapper(cmd, keep_open_on_exit, preserve_for_readiness);
+    let wrapper = shell_wrapper(cmd, keep_open_on_exit);
     let shell_command = format!("bash -lc {}", shell_quote(&wrapper));
     let start_output = run_tmux_cli(
         config_path,
@@ -378,6 +400,7 @@ async fn wait_for_text_response(
     ctx: &ToolContext,
     config_path: &Path,
     socket_path: &Path,
+    server_token: &str,
     target: &TmuxRunTarget,
     cwd: &Path,
     cmd: &str,
@@ -418,17 +441,30 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            if close_after_completion {
-                if exited || status == "readiness_timed_out" {
-                    let _ = kill_window(config_path, socket_path, &target.window_id).await;
+            let response = if exited || (close_after_completion && status == "readiness_timed_out")
+            {
+                response
+            } else {
+                let completion_policy = if close_after_completion {
+                    TmuxCompletionPolicy::CloseAfterCompletion
                 } else {
-                    match restore_exit_cleanup(config_path, socket_path, &target.window_id).await {
-                        Ok(()) => {}
-                        Err(error) => {
-                            tracing::debug!(window_id = target.window_id, %error, "failed to restore tmux exit cleanup");
-                        }
-                    }
+                    TmuxCompletionPolicy::KeepOpen
+                };
+                match register_tmux_wake_if_live(
+                    ctx,
+                    server_token,
+                    target,
+                    completion_policy,
+                    response,
+                )
+                .await
+                {
+                    ok if ok.is_success() => ok,
+                    err => return err,
                 }
+            };
+            if close_after_completion && (exited || status == "readiness_timed_out") {
+                let _ = kill_window(config_path, socket_path, &target.window_id).await;
             }
             return response;
         }
@@ -485,12 +521,7 @@ fn derived_window_name(cmd: &str) -> String {
     format!("tmux-run-{prefix:08x}")
 }
 
-fn shell_wrapper(cmd: &str, keep_open_on_exit: bool, preserve_for_readiness: bool) -> String {
-    let preserve = if preserve_for_readiness {
-        "tmux set-option -w -t \"$TMUX_PANE\" remain-on-exit on; "
-    } else {
-        ""
-    };
+fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
     let after_exit = if keep_open_on_exit {
         "exec ${SHELL:-/bin/bash} -i"
     } else {
@@ -498,7 +529,7 @@ fn shell_wrapper(cmd: &str, keep_open_on_exit: bool, preserve_for_readiness: boo
     };
     let marker_cmd = "printf '%s000' \"$(date +%s)\"";
     format!(
-        "{preserve}(\n{cmd}\n); code=$?; occurred_at_ms=$({marker_cmd}); echo; printf '%s\\n' \"__PHOENIX_EXIT__ exit_code=$code occurred_at_ms=$occurred_at_ms\"; {after_exit}"
+        "(\n{cmd}\n); code=$?; occurred_at_ms=$({marker_cmd}); echo; printf '%s\\n' \"__PHOENIX_EXIT__ exit_code=$code occurred_at_ms=$occurred_at_ms\"; {after_exit}"
     )
 }
 
@@ -533,35 +564,6 @@ async fn run_tmux_cli(
     .await
     .map_err(|_| "tmux subprocess timed out".to_string())?
     .map_err(|e| format!("failed to spawn tmux subprocess: {e}"))
-}
-
-async fn restore_exit_cleanup(
-    config_path: &Path,
-    socket_path: &Path,
-    target: &str,
-) -> Result<(), String> {
-    let output = run_tmux_cli(
-        config_path,
-        socket_path,
-        &[
-            "if-shell".to_string(),
-            "-F".to_string(),
-            "-t".to_string(),
-            target.to_string(),
-            "#{pane_dead}".to_string(),
-            format!("kill-window -t {}", shell_quote(target)),
-            format!(
-                "set-option -w -t {} remain-on-exit off",
-                shell_quote(target)
-            ),
-        ],
-    )
-    .await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
 }
 
 async fn kill_window(config_path: &Path, socket_path: &Path, target: &str) -> Result<(), String> {
@@ -632,6 +634,162 @@ fn observation_from_bytes(
     }
 }
 
+fn response_keeps_live_inspectable_window(response: &ToolOutput) -> bool {
+    let Some(display) = response.display_data() else {
+        return false;
+    };
+    let Some(status) = display.get("status").and_then(Value::as_str) else {
+        return false;
+    };
+    matches!(status, "started" | "ready" | "readiness_timed_out")
+}
+
+async fn register_tmux_wake_if_live(
+    ctx: &ToolContext,
+    server_token: &str,
+    target: &TmuxRunTarget,
+    completion_policy: TmuxCompletionPolicy,
+    mut response: ToolOutput,
+) -> ToolOutput {
+    if !response_keeps_live_inspectable_window(&response) {
+        return response;
+    }
+    let Some(registrar) = ctx.wake_registrar() else {
+        return response;
+    };
+    let Some(tool_use_id) = ctx.tool_use_id() else {
+        return response;
+    };
+    let registration_scope = match work_scope_identity(&ctx.work_scope) {
+        Ok(scope) => scope,
+        Err(error) => return ToolOutput::error(error),
+    };
+    let resource = WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+        work_scope: registration_scope.clone(),
+        server_token: server_token.to_string(),
+        window_id: target.window_id.clone(),
+        completion_policy,
+    });
+    let contract_id = format!("tmux:{}:{}", tool_use_id, target.window_id);
+    let expires_at = now_timestamp().saturating_add_duration(TMUX_WAKE_EXPIRY);
+    let prepared_fingerprint = prepare_tmux_wake_fingerprint(
+        &ctx.conversation_id,
+        &ctx.root_conversation_id,
+        tool_use_id,
+        &contract_id,
+        &registration_scope,
+        &resource,
+    );
+    if ctx.cancel.is_cancelled() {
+        return response;
+    }
+    let register_input = RegisterWakeInput {
+        contract_id: contract_id.clone(),
+        conversation_id: ctx.conversation_id.clone(),
+        root_conversation_id: ctx.root_conversation_id.clone(),
+        registering_tool_use_id: tool_use_id.to_string(),
+        registration_scope,
+        resource,
+        expires_at,
+        prepared_fingerprint,
+    };
+    let registration = registrar.register(register_input).await;
+    if ctx.cancel.is_cancelled() {
+        if let Ok(registered) = &registration {
+            if let Some(workflow_id) = registered.workflow_id() {
+                let _ = registrar
+                    .cancel(crate::CancelWakeInput {
+                        workflow_id,
+                        timestamp: Timestamp(
+                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                        ),
+                        reason:
+                            phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+                    })
+                    .await;
+            }
+        }
+        return response;
+    }
+    match registration {
+        Ok(
+            RegisteredWake::Registered { workflow_id } | RegisteredWake::Replayed { workflow_id },
+        ) => {
+            if let Some(display) = response.display_data().cloned() {
+                let mut enriched = display;
+                if let Value::Object(obj) = &mut enriched {
+                    obj.entry("wake_registration").or_insert_with(|| {
+                        json!({
+                            "workflow_id": workflow_id.0,
+                            "contract_id": contract_id,
+                        })
+                    });
+                }
+                let provider_output = serde_json::to_string(&enriched)
+                    .unwrap_or_else(|error| format!("failed to serialize tmux response: {error}"));
+                response = response.with_output(provider_output).with_display(enriched);
+            }
+            response
+        }
+        Ok(RegisteredWake::Conflict) => response.clone().with_output(format!(
+            "{}\nWARNING: durable wake registration conflicted; retain this window for manual inspection",
+            response.output()
+        )),
+        Ok(other) => response.clone().with_output(format!(
+            "{}\nWARNING: unexpected durable wake registration outcome: {other:?}",
+            response.output()
+        )),
+        Err(error) => response.clone().with_output(format!(
+            "{}\nWARNING: durable wake registration failed: {error}; retain this window for manual inspection",
+            response.output()
+        )),
+    }
+}
+
+fn prepare_tmux_wake_fingerprint(
+    conversation_id: &str,
+    root_conversation_id: &str,
+    tool_use_id: &str,
+    contract_id: &str,
+    registration_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+    resource: &WakeResourceIdentity,
+) -> String {
+    let canonical = json!({
+        "conversation_id": conversation_id,
+        "root_conversation_id": root_conversation_id,
+        "registering_tool_use_id": tool_use_id,
+        "contract_id": contract_id,
+        "registration_scope": registration_scope,
+        "resource": resource,
+        "profile": {
+            "profile_kind": phoenix_workflow::wake_profile::profile().profile_kind,
+            "profile_version": phoenix_workflow::wake_profile::profile().profile_version,
+        },
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn now_timestamp() -> Timestamp {
+    Timestamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+}
+
+trait TimestampExt {
+    fn saturating_add_duration(self, duration: Duration) -> Self;
+}
+
+impl TimestampExt for Timestamp {
+    fn saturating_add_duration(self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration.as_secs()))
+    }
+}
+
 fn structured_response(
     status: &str,
     target: &TmuxRunTarget,
@@ -676,10 +834,16 @@ mod tests {
     use super::*;
     use crate::tmux::registry::socket_path_for_worktree;
     use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry};
-    use phoenix_core::work_scope::WorkScope;
+    use crate::{RegisterWakeInput, RegisteredWake, WakeRegistrar};
+    use phoenix_core::work_scope::ResourceScopeKey;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
+
+    fn scope(id: &str) -> ResourceScopeKey {
+        ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
+    }
 
     fn skip_unless_tmux() -> bool {
         which::which("tmux").is_err()
@@ -690,6 +854,60 @@ mod tests {
             .cloned()
             .or_else(|| serde_json::from_str(out.output()).ok())
             .expect("response should be JSON")
+    }
+
+    #[derive(Debug, Clone)]
+    enum RegistrarBehavior {
+        Registered(u64),
+        Replayed(u64),
+        Conflict,
+        Error(&'static str),
+    }
+
+    #[derive(Default)]
+    struct MockWakeRegistrar {
+        register_calls: Mutex<Vec<RegisterWakeInput>>,
+        behavior: Mutex<Vec<RegistrarBehavior>>,
+    }
+
+    impl MockWakeRegistrar {
+        fn with_behaviors(behaviors: Vec<RegistrarBehavior>) -> Arc<Self> {
+            Arc::new(Self {
+                register_calls: Mutex::new(Vec::new()),
+                behavior: Mutex::new(behaviors),
+            })
+        }
+
+        fn register_calls(&self) -> Vec<RegisterWakeInput> {
+            self.register_calls
+                .lock()
+                .expect("register_calls lock")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WakeRegistrar for MockWakeRegistrar {
+        async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String> {
+            self.register_calls
+                .lock()
+                .expect("register_calls lock")
+                .push(input);
+            match self.behavior.lock().expect("behavior lock").remove(0) {
+                RegistrarBehavior::Registered(id) => Ok(RegisteredWake::Registered {
+                    workflow_id: phoenix_workflow::WorkflowId(id),
+                }),
+                RegistrarBehavior::Replayed(id) => Ok(RegisteredWake::Replayed {
+                    workflow_id: phoenix_workflow::WorkflowId(id),
+                }),
+                RegistrarBehavior::Conflict => Ok(RegisteredWake::Conflict),
+                RegistrarBehavior::Error(msg) => Err(msg.to_string()),
+            }
+        }
+
+        async fn cancel(&self, _input: crate::CancelWakeInput) -> Result<RegisteredWake, String> {
+            Ok(RegisteredWake::CancelStale)
+        }
     }
 
     fn ctx(
@@ -708,7 +926,24 @@ mod tests {
             phoenix_terminal::ActiveTerminals::new(),
             registry,
             worktree_path,
+            phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
         )
+    }
+
+    fn ctx_with_registrar(
+        conv: &str,
+        working_dir: PathBuf,
+        registry: Arc<TmuxRegistry>,
+        worktree_path: Option<PathBuf>,
+        registrar: Option<Arc<dyn WakeRegistrar>>,
+    ) -> ToolContext {
+        let mut ctx = ctx(conv, working_dir, registry, worktree_path)
+            .with_root_conversation_id("root-tmux-wake".to_string())
+            .with_tool_use_id("tool-tmux-wake");
+        if let Some(registrar) = registrar {
+            ctx = ctx.with_wake_registrar(Some(registrar));
+        }
+        ctx
     }
 
     async fn kill_socket(socket_path: &Path) {
@@ -853,6 +1088,203 @@ mod tests {
         kill_socket(&socket_tmp.path().join("conv-tmux-run-quick-failure.sock")).await;
     }
 
+    #[tokio::test]
+    async fn return_immediately_registers_before_acknowledgment() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(42)]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-wake-immediate",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "sleep 10",
+                    "name": "tmux-run-wake-immediate"
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "started");
+        assert_eq!(v["wake_registration"]["workflow_id"], 42);
+        let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
+        assert_eq!(provider_value["wake_registration"]["workflow_id"], 42);
+        let calls = registrar.register_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].contract_id,
+            format!("tmux:tool-tmux-wake:{}", v["window_id"].as_str().unwrap())
+        );
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-immediate.sock")).await;
+    }
+
+    #[tokio::test]
+    async fn readiness_response_registers_live_window() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(7)]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-wake-ready",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo READY; sleep 10",
+                    "name": "tmux-run-wake-ready",
+                    "readiness": {
+                        "mode": "wait_for_text",
+                        "text": "READY",
+                        "timeout_seconds": 5
+                    }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "ready");
+        assert_eq!(v["wake_registration"]["workflow_id"], 7);
+        assert_eq!(registrar.register_calls().len(), 1);
+        assert!(matches!(
+            registrar.register_calls()[0].resource,
+            WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+                completion_policy: TmuxCompletionPolicy::KeepOpen,
+                ..
+            })
+        ));
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-ready.sock")).await;
+    }
+
+    #[tokio::test]
+    async fn registration_error_returns_no_acknowledgment() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Error("boom")]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-wake-error",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-error" }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success());
+        assert!(result
+            .output()
+            .contains("durable wake registration failed: boom"));
+        assert!(result.output().contains("window_id"));
+        assert_eq!(registrar.register_calls().len(), 1);
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-error.sock")).await;
+    }
+
+    #[tokio::test]
+    async fn replay_is_accepted() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Replayed(77)]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-wake-replay",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-replay" }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["wake_registration"]["workflow_id"], 77);
+        assert_eq!(registrar.register_calls().len(), 1);
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-replay.sock")).await;
+    }
+
+    #[tokio::test]
+    async fn registration_uses_exact_server_token() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(9)]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-wake-generation",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry.clone(),
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-generation" }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let server = registry
+            .get_existing(&scope("test-work"))
+            .await
+            .expect("server entry");
+        let server_token = server.read().await.server_token.clone();
+        let calls = registrar.register_calls();
+        assert_eq!(calls.len(), 1);
+        let WakeResourceIdentity::TmuxWindow(identity) = &calls[0].resource else {
+            panic!("expected tmux resource");
+        };
+        assert_eq!(identity.server_token, server_token);
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-generation.sock")).await;
+    }
+
     #[test]
     fn parse_exit_marker_matches_tmux_run_marker_line() {
         let output = "bash output\n__PHOENIX_EXIT__ exit_code=17 occurred_at_ms=1700000000000\n$ ";
@@ -861,7 +1293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_timeout_response_has_no_wake_registration() {
+    async fn exited_before_registration_skips_unresolved_wake_acknowledgment() {
         if skip_unless_tmux() {
             return;
         }
@@ -870,22 +1302,24 @@ mod tests {
         let registry = Arc::new(TmuxRegistry::with_socket_dir(
             socket_tmp.path().to_path_buf(),
         ));
-        let ctx = ctx(
-            "tmux-run-readiness-timeout",
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(11)]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-wake-exited",
             cwd_tmp.path().canonicalize().unwrap(),
             registry,
             None,
+            Some(registrar.clone()),
         );
 
         let result = TmuxRunTool
             .run(
                 json!({
-                    "cmd": "sleep 10",
-                    "name": "tmux-run-readiness-timeout",
+                    "cmd": "printf done",
+                    "name": "tmux-run-wake-exited",
                     "readiness": {
                         "mode": "wait_for_text",
                         "text": "never-appears",
-                        "timeout_seconds": 1
+                        "timeout_seconds": 2
                     }
                 }),
                 ctx,
@@ -893,20 +1327,14 @@ mod tests {
             .await;
         assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
-        assert_eq!(v["status"], "readiness_timed_out");
+        assert_eq!(v["status"], "exited");
         assert!(v.get("wake_registration").is_none());
-        let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
-        assert!(provider_value.get("wake_registration").is_none());
-        kill_socket(
-            &socket_tmp
-                .path()
-                .join("conv-tmux-run-readiness-timeout.sock"),
-        )
-        .await;
+        assert!(registrar.register_calls().is_empty());
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-exited.sock")).await;
     }
 
     #[tokio::test]
-    async fn wait_for_text_with_keep_closed_observes_then_kills_window_without_wake_registration() {
+    async fn readiness_close_after_exit_registers_until_terminal_marker() {
         if skip_unless_tmux() {
             return;
         }
@@ -915,17 +1343,19 @@ mod tests {
         let registry = Arc::new(TmuxRegistry::with_socket_dir(
             socket_tmp.path().to_path_buf(),
         ));
-        let ctx = ctx(
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(19)]);
+        let ctx = ctx_with_registrar(
             "tmux-run-no-preserve",
             cwd_tmp.path().canonicalize().unwrap(),
             registry,
             None,
+            Some(registrar.clone()),
         );
 
         let result = TmuxRunTool
             .run(
                 json!({
-                    "cmd": "echo READY; sleep 0.2",
+                    "cmd": "echo READY; sleep 10",
                     "name": "tmux-run-no-preserve",
                     "keep_open_on_exit": false,
                     "readiness": {
@@ -940,55 +1370,20 @@ mod tests {
         assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "ready");
-        assert!(v.get("wake_registration").is_none());
-        let provider_value: Value = serde_json::from_str(result.output()).expect("provider JSON");
-        assert!(provider_value.get("wake_registration").is_none());
-
-        let socket_path = socket_tmp.path().join("conv-tmux-run-no-preserve.sock");
-        let window_id = v["window_id"].as_str().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let capture = tokio::process::Command::new("tmux")
-                .args([
-                    "-S",
-                    &socket_path.to_string_lossy(),
-                    "capture-pane",
-                    "-p",
-                    "-t",
-                    window_id,
-                ])
-                .env_remove("TMUX")
-                .status()
-                .await
-                .unwrap();
-            if !capture.success() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "window should close after command completion"
-            );
-            // test-timing-allow: tmux window disappearance is the observable completion behavior
-            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
-        }
-        kill_socket(&socket_path).await;
-    }
-
-    #[test]
-    fn readiness_only_preservation_uses_tmux_native_remain_on_exit() {
-        let wrapper = shell_wrapper("echo READY; sleep 1", false, true);
-        assert!(wrapper.starts_with("tmux set-option -w -t \"$TMUX_PANE\" remain-on-exit on; "));
-        assert!(wrapper.ends_with("exit $code"));
-
-        let ordinary = shell_wrapper("echo READY", false, false);
-        assert!(!ordinary.contains("remain-on-exit"));
-
-        let inspectable = shell_wrapper("echo READY", true, false);
-        assert!(inspectable.ends_with("exec ${SHELL:-/bin/bash} -i"));
+        assert!(v.get("wake_registration").is_some());
+        assert_eq!(registrar.register_calls().len(), 1);
+        assert!(matches!(
+            registrar.register_calls()[0].resource,
+            WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+                completion_policy: TmuxCompletionPolicy::CloseAfterCompletion,
+                ..
+            })
+        ));
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-no-preserve.sock")).await;
     }
 
     #[tokio::test]
-    async fn restoring_exit_cleanup_closes_an_already_dead_readiness_window() {
+    async fn missing_registrar_preserves_behavior() {
         if skip_unless_tmux() {
             return;
         }
@@ -997,67 +1392,97 @@ mod tests {
         let registry = Arc::new(TmuxRegistry::with_socket_dir(
             socket_tmp.path().to_path_buf(),
         ));
-        let server = registry
-            .ensure_live(
-                &WorkScope::Conversation("restore-dead-window".into()),
-                cwd_tmp.path(),
-            )
-            .await
-            .unwrap();
-        let socket_path = server.read().await.socket_path.clone();
-        let config_path = registry.config_path();
-        let target = start_tmux_window(
-            &config_path,
-            &socket_path,
-            cwd_tmp.path(),
-            "restore-dead-window",
-            "true",
-            false,
-            true,
-        )
-        .await
-        .unwrap();
+        let ctx = ctx_with_registrar(
+            "tmux-run-wake-no-registrar",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            None,
+        );
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let output = run_tmux_cli(
-                &config_path,
-                &socket_path,
-                &[
-                    "display-message".into(),
-                    "-p".into(),
-                    "-t".into(),
-                    target.window_id.clone(),
-                    "#{pane_dead}".into(),
-                ],
+        let result = TmuxRunTool
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-no-registrar" }),
+                ctx,
             )
-            .await
-            .unwrap();
-            if output.stdout.starts_with(b"1") {
-                break;
-            }
-            assert!(Instant::now() < deadline, "pane should become dead");
-            // test-timing-allow: pane_dead is the observable tmux process-exit evidence
-            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "started");
+        assert!(v.get("wake_registration").is_none());
+        kill_socket(
+            &socket_tmp
+                .path()
+                .join("conv-tmux-run-wake-no-registrar.sock"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn global_scope_is_rejected() {
+        if skip_unless_tmux() {
+            return;
         }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
+        let mut ctx = ctx_with_registrar(
+            "tmux-run-wake-global",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+        ctx.work_scope = ResourceScopeKey::GlobalTerminal;
 
-        restore_exit_cleanup(&config_path, &socket_path, &target.window_id)
-            .await
-            .unwrap();
-        let capture = run_tmux_cli(
-            &config_path,
-            &socket_path,
-            &[
-                "capture-pane".into(),
-                "-p".into(),
-                "-t".into(),
-                target.window_id,
-            ],
-        )
-        .await
-        .unwrap();
-        assert!(!capture.status.success());
-        kill_socket(&socket_path).await;
+        let result = TmuxRunTool
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-global" }),
+                ctx,
+            )
+            .await;
+        assert!(!result.is_success());
+        assert_eq!(
+            result.output(),
+            "global work scope cannot own a durable wake"
+        );
+        assert!(registrar.register_calls().is_empty());
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-global.sock")).await;
+    }
+
+    #[tokio::test]
+    async fn registration_conflict_returns_error_without_acknowledgment() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Conflict]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-wake-conflict",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({ "cmd": "sleep 10", "name": "tmux-run-wake-conflict" }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success());
+        assert!(result.output().contains("wake registration conflicted"));
+        assert!(result.output().contains("window_id"));
+        assert_eq!(registrar.register_calls().len(), 1);
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-conflict.sock")).await;
     }
 
     #[test]

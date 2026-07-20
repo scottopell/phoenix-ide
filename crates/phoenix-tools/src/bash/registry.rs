@@ -1,9 +1,9 @@
 //! In-memory bash handle registry.
 //!
-//! REQ-BASH-005 (per-`WorkScope` cap), REQ-BASH-006 (in-memory tombstones,
+//! REQ-BASH-005 (per-`ResourceScopeKey` cap), REQ-BASH-006 (in-memory tombstones,
 //! no `SQLite` shadow store), REQ-BASH-014 / REQ-BASH-WS-001 / REQ-BASH-WS-002
-//! (per-`WorkScope` registry — a continuation chain on one worktree shares
-//! its handle table because it resolves to the same `WorkScope`).
+//! (per-`ResourceScopeKey` registry — a continuation chain on one worktree shares
+//! its handle table because it resolves to the same `ResourceScopeKey`).
 //!
 //! Lifetime: registries live in process memory only. A Phoenix restart
 //! drops them and any handles they hold; agents see `handle_not_found` on
@@ -12,7 +12,7 @@
 //!
 //! Lock ordering for cap enforcement and spawn (consumed by `BashTool::run`):
 //! acquire the registry's `RwLock<HashMap>` for read, then the
-//! `WorkScope`'s `RwLock<WorkScopeHandles>` for write. The per-scope lock
+//! `ResourceScopeKey`'s `RwLock<ResourceScopeKeyHandles>` for write. The per-scope lock
 //! holds for the duration of cap-check + handle insert to prevent two
 //! concurrent spawns from both observing `count == cap - 1` and racing past
 //! the cap.
@@ -21,14 +21,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
 use super::handle::{Handle, HandleId};
 use super::ring::RING_BUFFER_BYTES;
 
-/// Per-`WorkScope` cap on `running` handles (REQ-BASH-005:
+/// Per-`ResourceScopeKey` cap on `running` handles (REQ-BASH-005:
 /// `LIVE_HANDLE_CAP`).
 pub const LIVE_HANDLE_CAP: usize = 8;
 
@@ -58,12 +58,12 @@ pub struct LiveHandleSummary {
 /// resource-observation projections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveHandleProcessGroup {
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
     pub handle_id: HandleId,
     pub pgid: i32,
 }
 
-/// Per-`WorkScope` handle table. Tracks live handles (for cap enforcement
+/// Per-`ResourceScopeKey` handle table. Tracks live handles (for cap enforcement
 /// and lookup) and tombstones (so peek/wait/kill on an exited handle still
 /// resolves until the scope is hard-deleted with no inheritor or Phoenix
 /// restarts).
@@ -74,14 +74,14 @@ pub struct LiveHandleProcessGroup {
 /// from `Live` to `Tombstoned` is the SAME `Arc<Handle>` (its `state`
 /// field swaps), and lookup never has to "follow" between two maps.
 #[derive(Debug, Default)]
-pub struct WorkScopeHandles {
+pub struct ResourceScopeKeyHandles {
     /// Next sequential handle index for this work scope (`b-1`, `b-2`, ...).
     next_id: u64,
     /// All handles, by id. Live and tombstoned alike.
     handles: HashMap<HandleId, Arc<Handle>>,
 }
 
-impl WorkScopeHandles {
+impl ResourceScopeKeyHandles {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -148,7 +148,7 @@ impl WorkScopeHandles {
 
     /// Remove a handle entirely (live or tombstoned). Granular complement
     /// to `BashHandleRegistry::remove`; not currently used by the
-    /// hard-delete cascade (which removes the whole `WorkScope` table) but
+    /// hard-delete cascade (which removes the whole `ResourceScopeKey` table) but
     /// kept on the API surface for surgical removal flows.
     #[allow(dead_code)]
     pub fn remove(&mut self, id: &HandleId) -> Option<Arc<Handle>> {
@@ -174,10 +174,10 @@ impl WorkScopeHandles {
     }
 }
 
-/// Signal published when a bash handle in a `WorkScope` changes state
+/// Signal published when a bash handle in a `ResourceScopeKey` changes state
 /// (spawned, transitioned to terminal, or killed). Mirrors the browser
 /// `BrowserSessionLifecycleEvent` shape: it carries only the affected
-/// `WorkScope`, leaving inventory assembly and conversation routing to the
+/// `ResourceScopeKey`, leaving inventory assembly and conversation routing to the
 /// runtime's work-scope bridge. State transitions only — NOT per output line
 /// (REQ-WSUI-007).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,7 +196,7 @@ impl BashLifecyclePhase {
 
 #[derive(Debug, Clone)]
 pub struct BashLifecycleEvent {
-    pub work_scope: WorkScope,
+    pub work_scope: ResourceScopeKey,
     pub phase: BashLifecyclePhase,
 }
 
@@ -206,20 +206,20 @@ pub struct BashLifecycleEvent {
 /// path.
 pub type BashLifecycleSink = tokio::sync::mpsc::UnboundedSender<BashLifecycleEvent>;
 
-/// Top-level registry: maps `WorkScope` -> per-`WorkScope` handle table.
+/// Top-level registry: maps `ResourceScopeKey` -> per-`ResourceScopeKey` handle table.
 ///
 /// One registry instance per Phoenix process. Owned by the runtime layer
 /// and reached by tools through `ToolContext::bash_handles()`. Keying by
-/// `WorkScope` (rather than `conversation_id`) is what lets a continuation
+/// `ResourceScopeKey` (rather than `conversation_id`) is what lets a continuation
 /// chain on one worktree share its handle table — both members resolve to
-/// the same `WorkScope::Worktree(path)` (REQ-BASH-WS-001).
+/// the same `ResourceScopeKey::Worktree(path)` (REQ-BASH-WS-001).
 #[derive(Debug, Default)]
 pub struct BashHandleRegistry {
-    inner: RwLock<HashMap<WorkScope, Arc<RwLock<WorkScopeHandles>>>>,
+    inner: RwLock<HashMap<ResourceScopeKey, Arc<RwLock<ResourceScopeKeyHandles>>>>,
     /// Per-handle ring byte cap. Defaults to [`RING_BUFFER_BYTES`]; tests
     /// override to small values to exercise eviction.
     ring_bytes_cap: usize,
-    /// Per-`WorkScope` live-handle cap. Defaults to [`LIVE_HANDLE_CAP`];
+    /// Per-`ResourceScopeKey` live-handle cap. Defaults to [`LIVE_HANDLE_CAP`];
     /// tests override to small values to exercise rejection.
     live_handle_cap: usize,
     /// Optional sink for bash state-transition signals (spawn / terminal /
@@ -243,7 +243,7 @@ impl BashHandleRegistry {
 
     /// Create a registry that publishes bash state-transition signals into
     /// `sink`. The runtime wires this to the work-scope push bridge, which
-    /// resolves the scope's conversation and broadcasts a `WorkScopeUpdate`.
+    /// resolves the scope's conversation and broadcasts a `ResourceScopeKeyUpdate`.
     /// Mirrors `BrowserSessionManager::with_lifecycle_sink`.
     #[must_use]
     pub fn with_lifecycle_sink(sink: Option<BashLifecycleSink>) -> Self {
@@ -271,7 +271,7 @@ impl BashHandleRegistry {
     /// wired. Best-effort: a dropped receiver / closed channel is logged at
     /// `debug` (capability gap) and does not affect handle correctness.
     /// Mirrors `BrowserSessionManager::emit_lifecycle`.
-    pub fn emit_lifecycle(&self, work_scope: &WorkScope, phase: BashLifecyclePhase) {
+    pub fn emit_lifecycle(&self, work_scope: &ResourceScopeKey, phase: BashLifecyclePhase) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
         };
@@ -306,12 +306,15 @@ impl BashHandleRegistry {
         self.live_handle_cap
     }
 
-    /// Get-or-create the per-`WorkScope` handle table. Matches the
+    /// Get-or-create the per-`ResourceScopeKey` handle table. Matches the
     /// `BrowserSessionManager::get_session` pattern — returns the same
-    /// `Arc<RwLock<WorkScopeHandles>>` for repeated calls with the
-    /// same `WorkScope`, so a continuation chain on one worktree shares
+    /// `Arc<RwLock<ResourceScopeKeyHandles>>` for repeated calls with the
+    /// same `ResourceScopeKey`, so a continuation chain on one worktree shares
     /// one table (REQ-BASH-WS-001).
-    pub async fn get_or_create(&self, work_scope: &WorkScope) -> Arc<RwLock<WorkScopeHandles>> {
+    pub async fn get_or_create(
+        &self,
+        work_scope: &ResourceScopeKey,
+    ) -> Arc<RwLock<ResourceScopeKeyHandles>> {
         // Fast path: read-lock and return existing entry.
         {
             let map = self.inner.read().await;
@@ -325,49 +328,11 @@ impl BashHandleRegistry {
         if let Some(entry) = map.get(work_scope) {
             return entry.clone();
         }
-        let entry = Arc::new(RwLock::new(WorkScopeHandles::new()));
+        let entry = Arc::new(RwLock::new(ResourceScopeKeyHandles::new()));
         map.insert(work_scope.clone(), entry.clone());
         entry
     }
-
-    /// Move a `WorkScope`'s handle table from `old` to `new`.
-    ///
-    /// Used at an Explore→Work approval, where the conversation's scope flips
-    /// from `WorkScope::Conversation(id)` to `WorkScope::Worktree(path)`: bash
-    /// handles opened pre-approval are stored under `old` and must follow the
-    /// scope so the inventory and idle/cleanup paths resolve them under `new`.
-    /// The underlying processes are untouched — only the lookup key moves.
-    ///
-    /// Returns `true` if an entry was moved. No-ops (returns `false`) when:
-    /// - `old == new` (nothing to do), or
-    /// - there is no entry under `old`, or
-    /// - `new` is already occupied — in that case the pre-existing `new` entry
-    ///   is preserved and the `old` entry is left in place (NOT clobbered), and
-    ///   the collision is logged at WARN. At approval `new` is a freshly created
-    ///   worktree scope, so occupancy is not expected.
-    pub async fn rekey_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
-        if old == new {
-            return false;
-        }
-        let mut map = self.inner.write().await;
-        if map.contains_key(new) {
-            if map.contains_key(old) {
-                tracing::warn!(
-                    old = %old,
-                    new = %new,
-                    "bash: refusing to rekey handle table — destination scope already occupied; leaving both entries in place"
-                );
-            }
-            return false;
-        }
-        let Some(entry) = map.remove(old) else {
-            return false;
-        };
-        map.insert(new.clone(), entry);
-        true
-    }
-
-    /// Look up a `WorkScope`'s handle table **without creating one**.
+    /// Look up a `ResourceScopeKey`'s handle table **without creating one**.
     ///
     /// Read-only counterpart to [`Self::get_or_create`], for observability
     /// surfaces (the work-scope inventory endpoint) that must reflect the
@@ -375,8 +340,8 @@ impl BashHandleRegistry {
     /// never spawned a bash handle.
     pub async fn get_existing(
         &self,
-        work_scope: &WorkScope,
-    ) -> Option<Arc<RwLock<WorkScopeHandles>>> {
+        work_scope: &ResourceScopeKey,
+    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
         self.inner.read().await.get(work_scope).cloned()
     }
 
@@ -419,10 +384,13 @@ impl BashHandleRegistry {
         out
     }
 
-    /// Remove a `WorkScope`'s handle table outright. Used by the
+    /// Remove a `ResourceScopeKey`'s handle table outright. Used by the
     /// hard-delete cascade (REQ-BASH-006). Returns the removed entry so
     /// the caller can SIGKILL its live process groups synchronously.
-    pub async fn remove(&self, work_scope: &WorkScope) -> Option<Arc<RwLock<WorkScopeHandles>>> {
+    pub async fn remove(
+        &self,
+        work_scope: &ResourceScopeKey,
+    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
         let mut map = self.inner.write().await;
         map.remove(work_scope)
     }
@@ -438,7 +406,7 @@ impl BashHandleRegistry {
 /// (REQ-BASH-006). Failure surfaces as a structured record the
 /// orchestrator logs at WARN; nothing here is fatal — the conversation
 /// row is removed regardless. The orchestrator already knows the
-/// `WorkScope` (it's an argument), so it is not duplicated here.
+/// `ResourceScopeKey` (it's an argument), so it is not duplicated here.
 #[derive(Debug, Clone, Default)]
 pub struct CascadeBashReport {
     /// pids that were live at snapshot time (informational; kills target
@@ -460,8 +428,8 @@ pub struct CascadeBashReport {
 /// (REQ-BASH-006, REQ-BASH-WS-002). Mirrors the tmux/browser cascades'
 /// `(work_scope, inheritor_scope)` signature.
 ///
-/// A continuation that inherits the same `WorkScope` keeps the live
-/// processes and tombstones — they belong to the `WorkScope`, not the
+/// A continuation that inherits the same `ResourceScopeKey` keeps the live
+/// processes and tombstones — they belong to the `ResourceScopeKey`, not the
 /// deleted conversation. When `inheritor_scope == Some(work_scope)` the
 /// teardown is skipped entirely and the handle table is left in place
 /// (early return, empty report).
@@ -469,7 +437,7 @@ pub struct CascadeBashReport {
 /// Otherwise, atomically:
 ///
 ///   1. Removes the scope's handle table from the registry — any
-///      subsequent tool call for this `WorkScope` will see "no handle
+///      subsequent tool call for this `ResourceScopeKey` will see "no handle
 ///      table" and produce `handle_not_found`, which is the correct
 ///      behaviour once no inheritor survives.
 ///   2. Snapshots live pgid / pid / `kill_pending_kernel` state across the
@@ -488,13 +456,13 @@ pub struct CascadeBashReport {
 /// rationale as `shutdown_kill_tree` in [`super::reaper`].
 pub async fn cascade_bash_on_delete(
     registry: &Arc<BashHandleRegistry>,
-    work_scope: &WorkScope,
-    inheritor_scope: Option<&WorkScope>,
+    work_scope: &ResourceScopeKey,
+    inheritor_scope: Option<&ResourceScopeKey>,
 ) -> CascadeBashReport {
     let mut report = CascadeBashReport::default();
 
     // A continuation inheriting the same scope keeps the live processes and
-    // tombstones — they belong to the WorkScope, not the deleted conversation.
+    // tombstones — they belong to the ResourceScopeKey, not the deleted conversation.
     if inheritor_scope == Some(work_scope) {
         tracing::debug!(
             work_scope = %work_scope,
@@ -572,8 +540,8 @@ mod tests {
     use super::*;
     use crate::bash::handle::{FinalCause, Handle};
 
-    fn scope(name: &str) -> WorkScope {
-        WorkScope::Conversation(name.to_string())
+    fn scope(name: &str) -> ResourceScopeKey {
+        ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(name).unwrap())
     }
 
     fn make_handle(scope_name: &str, id: &str, ring_bytes_cap: usize) -> Arc<Handle> {
@@ -619,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn allocate_handle_id_is_sequential_per_scope() {
-        let mut handles = WorkScopeHandles::new();
+        let mut handles = ResourceScopeKeyHandles::new();
         assert_eq!(handles.allocate_handle_id().as_str(), "b-1");
         assert_eq!(handles.allocate_handle_id().as_str(), "b-2");
         assert_eq!(handles.allocate_handle_id().as_str(), "b-3");
@@ -716,20 +684,18 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
     }
 
-    /// A worktree-backed continuation chain shares one handle table: both
-    /// members resolve to the same `WorkScope::Worktree(path)`, so
-    /// `get_or_create` hands back the same `Arc` (REQ-BASH-WS-001).
+    /// Conversations assigned the same durable work scope share one handle
+    /// table, while a distinct opaque scope remains isolated (REQ-BASH-WS-001).
     #[tokio::test]
-    async fn get_or_create_shares_table_across_worktree_scope() {
+    async fn get_or_create_shares_table_across_work_scope() {
         let registry = BashHandleRegistry::new();
-        let wt = WorkScope::Worktree("/tmp/wt-shared".to_string());
-        let a = registry.get_or_create(&wt).await;
-        let b = registry.get_or_create(&wt).await;
+        let shared = scope("opaque-shared");
+        let a = registry.get_or_create(&shared).await;
+        let b = registry.get_or_create(&shared).await;
         assert!(Arc::ptr_eq(&a, &b));
-        // A different scope (Conversation with same inner string) is a
-        // disjoint table — no leakage across the namespace boundary.
-        let conv = WorkScope::Conversation("/tmp/wt-shared".to_string());
-        let c = registry.get_or_create(&conv).await;
+
+        let distinct = scope("opaque-distinct");
+        let c = registry.get_or_create(&distinct).await;
         assert!(!Arc::ptr_eq(&a, &c));
     }
 
@@ -737,81 +703,8 @@ mod tests {
     /// scope is reachable under the worktree scope after a rekey, and the old
     /// scope is empty. The moved table is the SAME `Arc` (the live process is
     /// untouched — only the lookup key changed).
-    #[tokio::test]
-    async fn rekey_scope_moves_table_from_conversation_to_worktree() {
-        let registry = BashHandleRegistry::new();
-        let old = WorkScope::Conversation("conv-explore".to_string());
-        let new = WorkScope::Worktree("/tmp/wt-approved".to_string());
-
-        let before = registry.get_or_create(&old).await;
-        {
-            let mut g = before.write().await;
-            g.insert(make_handle("conv-explore", "b-1", RING_BUFFER_BYTES));
-        }
-
-        assert!(
-            registry.rekey_scope(&old, &new).await,
-            "rekey must report a move"
-        );
-
-        // Old scope is now empty; new scope holds the same Arc and the handle.
-        assert!(registry.get_existing(&old).await.is_none());
-        let after = registry
-            .get_existing(&new)
-            .await
-            .expect("handle table must be reachable under the new scope");
-        assert!(
-            Arc::ptr_eq(&before, &after),
-            "rekey must move the Arc, not clone"
-        );
-        assert!(after.read().await.get(&HandleId::new("b-1")).is_some());
-    }
-
-    #[tokio::test]
-    async fn rekey_scope_no_entry_is_noop() {
-        let registry = BashHandleRegistry::new();
-        let old = WorkScope::Conversation("never".to_string());
-        let new = WorkScope::Worktree("/tmp/wt".to_string());
-        assert!(!registry.rekey_scope(&old, &new).await);
-        assert!(registry.get_existing(&new).await.is_none());
-    }
-
     /// Occupied destination: the pre-existing `new` entry is preserved and the
     /// `old` entry is left in place — neither is clobbered.
-    #[tokio::test]
-    async fn rekey_scope_occupied_destination_does_not_clobber() {
-        let registry = BashHandleRegistry::new();
-        let old = WorkScope::Conversation("conv".to_string());
-        let new = WorkScope::Worktree("/tmp/wt".to_string());
-        let old_table = registry.get_or_create(&old).await;
-        let new_table = registry.get_or_create(&new).await;
-
-        assert!(
-            !registry.rekey_scope(&old, &new).await,
-            "occupied dest must not move"
-        );
-
-        let old_after = registry
-            .get_existing(&old)
-            .await
-            .expect("old entry preserved");
-        let new_after = registry
-            .get_existing(&new)
-            .await
-            .expect("new entry preserved");
-        assert!(Arc::ptr_eq(&old_table, &old_after));
-        assert!(Arc::ptr_eq(&new_table, &new_after));
-    }
-
-    #[tokio::test]
-    async fn rekey_scope_same_scope_is_noop() {
-        let registry = BashHandleRegistry::new();
-        let s = WorkScope::Worktree("/tmp/wt".to_string());
-        let _ = registry.get_or_create(&s).await;
-        assert!(!registry.rekey_scope(&s, &s).await);
-        assert!(registry.get_existing(&s).await.is_some());
-    }
-
     #[tokio::test]
     async fn snapshot_live_pgids_collects_across_scopes() {
         let registry = BashHandleRegistry::new();
@@ -901,13 +794,13 @@ mod tests {
         assert_eq!(registry.scope_count().await, 0);
     }
 
-    /// REQ-BASH-WS-002: when the continuation inherits the SAME `WorkScope`,
+    /// REQ-BASH-WS-002: when the continuation inherits the SAME `ResourceScopeKey`,
     /// the cascade is a no-op — the handle table and any live processes
     /// survive for the inheritor to peek/wait/kill.
     #[tokio::test]
     async fn cascade_bash_on_delete_skips_when_inheritor_shares_scope() {
         let registry = Arc::new(BashHandleRegistry::new());
-        let wt = WorkScope::Worktree("/tmp/wt-inherit".to_string());
+        let wt = scope("/tmp/wt-inherit");
         let handles_arc = registry.get_or_create(&wt).await;
         {
             let mut g = handles_arc.write().await;
@@ -937,8 +830,8 @@ mod tests {
     #[tokio::test]
     async fn cascade_bash_on_delete_tears_down_when_inheritor_differs() {
         let registry = Arc::new(BashHandleRegistry::new());
-        let wt = WorkScope::Worktree("/tmp/wt-deleted".to_string());
-        let other = WorkScope::Conversation("conv-other".to_string());
+        let wt = scope("/tmp/wt-deleted");
+        let other = scope("conv-other");
         let _ = registry.get_or_create(&wt).await;
 
         let report = cascade_bash_on_delete(&registry, &wt, Some(&other)).await;
@@ -976,7 +869,7 @@ mod tests {
     async fn cascade_bash_on_delete_no_lifecycle_on_preserved_path() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let registry = Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(tx)));
-        let wt = WorkScope::Worktree("/tmp/wt-preserve-no-emit".to_string());
+        let wt = scope("/tmp/wt-preserve-no-emit");
         let _ = registry.get_or_create(&wt).await;
 
         let _ = cascade_bash_on_delete(&registry, &wt, Some(&wt)).await;

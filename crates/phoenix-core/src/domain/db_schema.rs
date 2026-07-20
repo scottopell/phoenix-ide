@@ -3,6 +3,7 @@
 use crate::domain::llm_types::ContentBlock;
 use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
 pub use crate::domain::sm_state::ConvState;
+use crate::work_scope::{RuntimeRole, WorkScopeId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -439,6 +440,10 @@ pub struct Conversation {
     /// Conversation mode — determines tool availability. Default: Explore.
     #[serde(default)]
     pub conv_mode: ConvMode,
+    #[serde(default)]
+    pub runtime_role: RuntimeRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_scope_id: Option<WorkScopeId>,
     /// Desired base branch for Managed mode (set at creation, consumed at task approval).
     /// `#[serde(default)]` handles old DB rows that predate this column.
     #[serde(default)]
@@ -1934,6 +1939,8 @@ mod conversation_serde_tests {
                 worktree_path: None,
                 next_taskmd_id_hint: None,
             },
+            runtime_role: RuntimeRole::User,
+            work_scope_id: None,
             desired_base_branch: None,
             message_count: 0,
             seed_parent_id: None,

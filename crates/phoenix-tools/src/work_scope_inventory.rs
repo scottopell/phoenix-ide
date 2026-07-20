@@ -15,7 +15,7 @@ use phoenix_core::domain::work_scope_inventory::{
     BashHandleInventory, BashHandleState, BrowserInventory, BrowserSessionLiveness, TmuxInventory,
     TmuxServerStatus, WorkScopeInventory,
 };
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 
 use crate::bash::handle::{Handle, HandleState};
 use crate::bash::registry::BashHandleRegistry;
@@ -29,7 +29,7 @@ use crate::tmux::registry::{ServerStatus, TmuxRegistry};
 /// never used a resource produces empty/`None` sections rather than
 /// materialising one.
 pub async fn assemble_inventory(
-    work_scope: &WorkScope,
+    work_scope: &ResourceScopeKey,
     bash_handles: &Arc<BashHandleRegistry>,
     tmux_registry: &Arc<TmuxRegistry>,
     browser_sessions: &Arc<BrowserSessionManager>,
@@ -47,7 +47,7 @@ pub async fn assemble_inventory(
 /// Project every handle in the scope's table (live and tombstoned) into a
 /// [`BashHandleInventory`]. Empty when the scope has no handle table.
 async fn assemble_bash(
-    work_scope: &WorkScope,
+    work_scope: &ResourceScopeKey,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Vec<BashHandleInventory> {
     let Some(table) = bash_handles.get_existing(work_scope).await else {
@@ -112,7 +112,7 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
 /// Read the scope's tmux server entry (in-memory status only — no `tmux ls`
 /// probe). `None` when no entry exists.
 async fn assemble_tmux(
-    work_scope: &WorkScope,
+    work_scope: &ResourceScopeKey,
     tmux_registry: &Arc<TmuxRegistry>,
 ) -> Option<TmuxInventory> {
     let entry = tmux_registry.get_existing(work_scope).await?;
@@ -134,7 +134,7 @@ fn project_tmux_status(status: ServerStatus) -> TmuxServerStatus {
 /// the scope. `idle_ms` is derived from the session's monotonic last-activity
 /// `Instant` at assembly time.
 async fn assemble_browser(
-    work_scope: &WorkScope,
+    work_scope: &ResourceScopeKey,
     browser_sessions: &Arc<BrowserSessionManager>,
 ) -> Option<BrowserInventory> {
     let session = browser_sessions.get_existing(work_scope).await?;
@@ -153,8 +153,8 @@ mod tests {
     use crate::bash::ring::RING_BUFFER_BYTES;
     use std::time::SystemTime;
 
-    fn scope() -> WorkScope {
-        WorkScope::Conversation("conv-inv".into())
+    fn scope() -> ResourceScopeKey {
+        ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse("conv-inv").unwrap())
     }
 
     #[tokio::test]

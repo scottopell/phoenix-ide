@@ -3,7 +3,7 @@
 //!
 //! Parallels [`crate::work_scope_inventory::assemble_inventory`]: it is a
 //! read-only path over the in-memory bash handle registry. It resolves a
-//! single handle by `(WorkScope, handle_id)`, projects its identity, state,
+//! single handle by `(ResourceScopeKey, handle_id)`, projects its identity, state,
 //! and an output window (delegating to the existing ring/tombstone read
 //! helpers the bash tool uses), and reports the live `pgid` so the caller can
 //! attach a request-time resource sample.
@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 
 use phoenix_core::domain::process_inspection::BashHandleInspection;
 use phoenix_core::domain::work_scope_inventory::BashHandleState;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 
 use crate::bash::handle::{Handle, HandleId, HandleState};
 use crate::bash::operations::{
@@ -49,7 +49,7 @@ pub struct InspectionAssembly {
 /// allocates a handle table. Returns `None` when the scope has no handle
 /// table or the handle id is absent — a not-found condition (REQ-PINSP-001).
 pub async fn assemble_inspection(
-    work_scope: &WorkScope,
+    work_scope: &ResourceScopeKey,
     handle_id: &str,
     since: Option<u64>,
     bash_handles: &Arc<BashHandleRegistry>,
@@ -137,8 +137,10 @@ mod tests {
     use crate::bash::ring::RING_BUFFER_BYTES;
     use std::time::{Duration, SystemTime};
 
-    fn scope() -> WorkScope {
-        WorkScope::Conversation("conv-inspect".into())
+    fn scope() -> ResourceScopeKey {
+        ResourceScopeKey::Work(
+            phoenix_core::work_scope::WorkScopeId::parse("conv-inspect").unwrap(),
+        )
     }
 
     #[tokio::test]

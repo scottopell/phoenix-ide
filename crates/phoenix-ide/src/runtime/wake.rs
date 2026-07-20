@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::runtime::RuntimeManager;
-use phoenix_core::work_scope::WorkScope;
+use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_db::workflow::wake::{
     MaterializePendingDeliveryMessageInput, MaterializePendingDeliveryMessageOutcome,
     WakeAdoptMaterializedPendingOutcome, WakeCancelIfUnresolvedInput, WakeCancellationOutcome,
@@ -703,15 +703,11 @@ impl TerminalInspector for RuntimeRegistryInspector {
 
 fn work_scope_from_identity(
     scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-) -> WorkScope {
-    match scope.kind {
-        phoenix_workflow::wake_profile::WorkScopeKind::Conversation => {
-            WorkScope::Conversation(scope.stable_key.clone())
-        }
-        phoenix_workflow::wake_profile::WorkScopeKind::Worktree => {
-            WorkScope::Worktree(scope.stable_key.clone())
-        }
-    }
+) -> ResourceScopeKey {
+    ResourceScopeKey::Work(
+        phoenix_core::work_scope::WorkScopeId::parse(scope.as_str())
+            .expect("persisted wake identity has a non-empty work scope id"),
+    )
 }
 
 #[cfg(test)]
@@ -721,7 +717,6 @@ mod tests {
     use phoenix_db::Database;
     use phoenix_workflow::wake_profile::{
         BashResourceIdentity, TmuxResourceIdentity, WakeRegistrationIntent, WorkScopeIdentity,
-        WorkScopeKind,
     };
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -852,28 +847,34 @@ mod tests {
         }
     }
 
-    async fn open_repo() -> (Database, WakeRepository) {
+    async fn open_repo() -> (Database, WakeRepository, WorkScopeIdentity) {
         let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("conv", "conv", "/tmp", true, None, None)
+        let conversation = db
+            .create_conversation("conv", "conv", "/tmp", true, None, None)
             .await
             .unwrap();
-        (db.clone(), WakeRepository::new(db.pool().clone()))
+        let scope = WorkScopeIdentity(
+            conversation
+                .work_scope_id
+                .expect("created conversation has work scope")
+                .as_str()
+                .to_string(),
+        );
+        (db.clone(), WakeRepository::new(db.pool().clone()), scope)
     }
 
-    fn conv_scope() -> WorkScopeIdentity {
-        WorkScopeIdentity {
-            kind: WorkScopeKind::Conversation,
-            stable_key: "conv".to_string(),
-        }
-    }
-
-    async fn register_bash(repo: &WakeRepository, handle: &str, expires_at: u64) -> u64 {
+    async fn register_bash(
+        repo: &WakeRepository,
+        scope: &WorkScopeIdentity,
+        handle: &str,
+        expires_at: u64,
+    ) -> u64 {
         let intent = WakeRegistrationIntent {
             contract_id: format!("contract-{handle}"),
             conversation_id: "conv".to_string(),
-            registration_scope: conv_scope(),
+            registration_scope: scope.clone(),
             resource: WakeResourceIdentity::Bash(BashResourceIdentity {
-                work_scope: conv_scope(),
+                work_scope: scope.clone(),
                 handle_id: handle.to_string(),
             }),
             registering_tool_use_id: "tool-use".to_string(),
@@ -889,6 +890,7 @@ mod tests {
 
     async fn register_tmux(
         repo: &WakeRepository,
+        scope: &WorkScopeIdentity,
         generation: &str,
         window_id: &str,
         expires_at: u64,
@@ -896,9 +898,9 @@ mod tests {
         let intent = WakeRegistrationIntent {
             contract_id: format!("contract-{window_id}"),
             conversation_id: "conv".to_string(),
-            registration_scope: conv_scope(),
+            registration_scope: scope.clone(),
             resource: WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
-                work_scope: conv_scope(),
+                work_scope: scope.clone(),
                 server_token: generation.to_string(),
                 window_id: window_id.to_string(),
                 completion_policy: TmuxCompletionPolicy::KeepOpen,
@@ -924,8 +926,8 @@ mod tests {
 
     #[tokio::test]
     async fn due_expiry_first_projects_terminal() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "b-1", 5).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 5).await;
         let worker = WakeWorker::new(
             repo.clone(),
             Arc::new(MockInspector::new()),
@@ -938,14 +940,14 @@ mod tests {
 
     #[tokio::test]
     async fn fired_bash_via_mock_inspector_records_terminal() {
-        let (_db, repo) = open_repo().await;
-        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             workflow_id,
             InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                 identity: BashResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
                 status: BashTerminalStatus::Exited,
@@ -969,14 +971,14 @@ mod tests {
 
     #[tokio::test]
     async fn fired_tmux_via_mock_inspector_records_terminal() {
-        let (_db, repo) = open_repo().await;
-        let workflow_id = register_tmux(&repo, "g1", "w1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_tmux(&repo, &scope, "g1", "w1", 50).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             workflow_id,
             InspectionOutcome::Terminal(WakeTerminalEvidence::TmuxWindow(TmuxTerminalEvidence {
                 identity: TmuxResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     server_token: "g1".to_string(),
                     window_id: "w1".to_string(),
                     completion_policy: TmuxCompletionPolicy::KeepOpen,
@@ -1001,8 +1003,8 @@ mod tests {
 
     #[tokio::test]
     async fn forgotten_records_forgotten_terminal() {
-        let (_db, repo) = open_repo().await;
-        let workflow_id = register_tmux(&repo, "g1", "w1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_tmux(&repo, &scope, "g1", "w1", 50).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             workflow_id,
@@ -1020,8 +1022,8 @@ mod tests {
 
     #[tokio::test]
     async fn live_retry_leaves_unresolved_and_waits_for_lease() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "b-1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 50).await;
         let worker = WakeWorker::new(
             repo.clone(),
             Arc::new(MockInspector::new()),
@@ -1035,8 +1037,8 @@ mod tests {
 
     #[tokio::test]
     async fn startup_restart_discovery_marks_missing_bash_forgotten() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "missing", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "missing", 50).await;
         let inspector = RuntimeRegistryInspector::new(
             Arc::new(phoenix_tools::BashHandleRegistry::new()),
             Arc::new(phoenix_tools::TmuxRegistry::new()),
@@ -1056,14 +1058,19 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let (_db, repo) = open_repo().await;
+        let (_db, repo, scope) = open_repo().await;
         let socket_tmp = tempfile::TempDir::new().unwrap();
         let cwd_tmp = tempfile::TempDir::new().unwrap();
         let tmux = Arc::new(phoenix_tools::TmuxRegistry::with_socket_dir(
             socket_tmp.path().to_path_buf(),
         ));
-        let scope = WorkScope::Conversation("conv".to_string());
-        let server = tmux.ensure_live(&scope, cwd_tmp.path()).await.unwrap();
+        let resource_scope = crate::work_scope::ResourceScopeKey::Work(
+            crate::work_scope::WorkScopeId::parse(&scope.0).unwrap(),
+        );
+        let server = tmux
+            .ensure_live(&resource_scope, cwd_tmp.path())
+            .await
+            .unwrap();
         let socket_path = server.read().await.socket_path.clone();
         let server_token = server.read().await.server_token.clone();
         let output = tokio::process::Command::new("tmux")
@@ -1088,7 +1095,7 @@ mod tests {
         let fresh_registry = Arc::new(phoenix_tools::TmuxRegistry::with_socket_dir(
             socket_tmp.path().to_path_buf(),
         ));
-        let workflow_id = register_tmux(&repo, &server_token, &window_id, 50).await;
+        let workflow_id = register_tmux(&repo, &scope, &server_token, &window_id, 50).await;
         let inspector = Arc::new(RuntimeRegistryInspector::new(
             Arc::new(phoenix_tools::BashHandleRegistry::new()),
             fresh_registry,
@@ -1114,14 +1121,14 @@ mod tests {
 
     #[tokio::test]
     async fn stale_process_fencing_prevents_duplicate_projection() {
-        let (_db, repo) = open_repo().await;
-        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             workflow_id,
             InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                 identity: BashResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
                 status: BashTerminalStatus::Exited,
@@ -1150,15 +1157,20 @@ mod tests {
         assert_eq!(pending_count(&repo).await, 1);
     }
 
-    fn register_input(handle: &str, fingerprint: &str, expires_at: u64) -> RegisterWakeInput {
+    fn register_input(
+        scope: &WorkScopeIdentity,
+        handle: &str,
+        fingerprint: &str,
+        expires_at: u64,
+    ) -> RegisterWakeInput {
         RegisterWakeInput {
             contract_id: format!("contract-{handle}"),
             conversation_id: "conv".to_string(),
             root_conversation_id: "root".to_string(),
             registering_tool_use_id: "tool-use".to_string(),
-            registration_scope: conv_scope(),
+            registration_scope: scope.clone(),
             resource: WakeResourceIdentity::Bash(BashResourceIdentity {
-                work_scope: conv_scope(),
+                work_scope: scope.clone(),
                 handle_id: handle.to_string(),
             }),
             expires_at: Timestamp(expires_at),
@@ -1168,20 +1180,20 @@ mod tests {
 
     #[tokio::test]
     async fn production_registrar_replays_and_conflicts_exactly() {
-        let (_db, repo) = open_repo().await;
+        let (_db, repo, scope) = open_repo().await;
         let (kick_tx, kick_rx) = watch::channel(0u64);
         let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
 
         let first = registrar
-            .register(register_input("b-1", "fp-1", 50))
+            .register(register_input(&scope, "b-1", "fp-1", 50))
             .await
             .unwrap();
         let replay = registrar
-            .register(register_input("b-1", "fp-1", 50))
+            .register(register_input(&scope, "b-1", "fp-1", 50))
             .await
             .unwrap();
         let conflict = registrar
-            .register(register_input("b-1", "fp-2", 50))
+            .register(register_input(&scope, "b-1", "fp-2", 50))
             .await
             .unwrap();
 
@@ -1200,8 +1212,8 @@ mod tests {
 
     #[tokio::test]
     async fn production_registrar_cancel_kicks_and_replays() {
-        let (_db, repo) = open_repo().await;
-        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
         let (kick_tx, kick_rx) = watch::channel(0u64);
         let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
 
@@ -1229,8 +1241,8 @@ mod tests {
 
     #[tokio::test]
     async fn kick_preempts_deadline_wait() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "b-1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 50).await;
         let clock = Arc::new(TestClock::new(10));
         let sleep_rx = clock.expect_sleep();
         let worker = WakeWorker::new(
@@ -1249,8 +1261,8 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_advances_to_expiry() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "b-1", 12).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 12).await;
         let clock = Arc::new(TestClock::new(10));
         let worker = WakeWorker::new(
             repo.clone(),
@@ -1266,14 +1278,14 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_inspection_wins_over_same_tick_expiry() {
-        let (_db, repo) = open_repo().await;
-        let workflow_id = register_bash(&repo, "b-1", 12).await;
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 12).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             workflow_id,
             InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                 identity: BashResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
                 status: BashTerminalStatus::Exited,
@@ -1303,8 +1315,8 @@ mod tests {
     }
     #[tokio::test]
     async fn worker_retries_after_transient_inspection_error() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "b-1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 50).await;
         let clock = Arc::new(TestClock::new(10));
         let sleep_rx = clock.expect_sleep();
         let worker = WakeWorker::new(
@@ -1324,14 +1336,14 @@ mod tests {
     #[tokio::test]
     async fn recover_pending_deliveries_preallocates_broadcaster_sequence_for_materialized_message()
     {
-        let (db, repo) = open_repo().await;
-        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let (db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             workflow_id,
             InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                 identity: BashResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
                 status: BashTerminalStatus::Exited,
@@ -1380,14 +1392,14 @@ mod tests {
 
     #[tokio::test]
     async fn already_materialized_wake_does_not_reset_newer_replay_events() {
-        let (db, repo) = open_repo().await;
-        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let (db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             workflow_id,
             InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                 identity: BashResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
                 status: BashTerminalStatus::Exited,

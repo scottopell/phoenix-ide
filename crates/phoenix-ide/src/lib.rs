@@ -33,6 +33,11 @@ mod tls;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::{llm_language, platform, task_source, work_scope};
 
+#[cfg(test)]
+fn scope(id: &str) -> work_scope::ResourceScopeKey {
+    work_scope::ResourceScopeKey::Work(work_scope::WorkScopeId::parse(id).unwrap())
+}
+
 // Terminal-core (PTY spawn, relay, command tracking, session registry) now
 // lives in the `phoenix-terminal` crate. Re-export it at its historical
 // `crate::terminal::…` path so existing call sites resolve unchanged

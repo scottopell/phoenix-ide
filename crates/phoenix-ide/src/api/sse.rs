@@ -362,6 +362,8 @@ mod tests {
 
     fn fixture_conversation() -> Conversation {
         Conversation {
+            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            runtime_role: crate::work_scope::RuntimeRole::User,
             id: "conv-1".to_string(),
             slug: Some("test-conv".to_string()),
             title: Some("Test Conversation".to_string()),

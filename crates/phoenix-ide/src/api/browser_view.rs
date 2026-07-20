@@ -51,7 +51,10 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
     // tell the client and close — they can reconnect later when the agent
     // does something browser-related.
     let manager = state.runtime.browser_sessions().clone();
-    let work_scope = resolve_viewer_work_scope(&state, &conversation_id).await;
+    let Some(work_scope) = resolve_viewer_work_scope(&state, &conversation_id).await else {
+        let _ = ws_sender.send(Message::Close(None)).await;
+        return;
+    };
 
     let Some(session_arc) = session_if_exists(&manager, &work_scope).await else {
         tracing::debug!(
@@ -174,31 +177,27 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
 
 async fn session_if_exists(
     manager: &Arc<crate::tools::browser::BrowserSessionManager>,
-    work_scope: &crate::work_scope::WorkScope,
+    work_scope: &crate::work_scope::ResourceScopeKey,
 ) -> Option<Arc<tokio::sync::RwLock<crate::tools::browser::session::BrowserSession>>> {
     manager.get_existing(work_scope).await
 }
 
-/// Resolve the conversation to its `WorkScope` so a continuation viewer
-/// attaches to the same Chrome window the agent has been driving since
-/// the predecessor (REQ-BROWSER-WS-001). A DB miss falls back to
-/// `Conversation`-scope, mirroring the safe default elsewhere in the cascade.
 async fn resolve_viewer_work_scope(
     state: &AppState,
     conversation_id: &str,
-) -> crate::work_scope::WorkScope {
+) -> Option<crate::work_scope::ResourceScopeKey> {
     match state.runtime.db().get_conversation(conversation_id).await {
-        Ok(conv) => crate::work_scope::WorkScope::resolve(
-            &conv.id,
-            conv.conv_mode.worktree_path().map(std::path::Path::new),
-        ),
+        Ok(conv) => Some(crate::work_scope::ResourceScopeKey::Work(
+            conv.work_scope_id
+                .expect("persisted conversation has work scope"),
+        )),
         Err(e) => {
             tracing::debug!(
                 conv_id = %conversation_id,
                 error = %e,
-                "browser-view: db lookup failed; falling back to Conversation scope"
+                "browser-view: db lookup failed; no resource scope available"
             );
-            crate::work_scope::WorkScope::Conversation(conversation_id.to_string())
+            None
         }
     }
 }

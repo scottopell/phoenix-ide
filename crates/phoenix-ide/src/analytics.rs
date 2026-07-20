@@ -617,6 +617,8 @@ mod tests {
     #[test]
     fn session_last_seen_includes_message_activity_after_usage() {
         let root = Conversation {
+            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            runtime_role: crate::work_scope::RuntimeRole::User,
             id: "root".to_string(),
             slug: Some("root".to_string()),
             title: Some("root".to_string()),
