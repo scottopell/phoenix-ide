@@ -1625,6 +1625,7 @@ fn handle_core_continuation(
             .with_effect(Effect::RequestContinuation {
                 request: ContinuationSummaryRequest {
                     rejected_tool_calls: rejected_tool_calls.clone(),
+                    attempt: *attempt,
                 },
             }))
         }
@@ -1640,6 +1641,7 @@ fn handle_core_continuation(
             .with_effect(Effect::RequestContinuation {
                 request: ContinuationSummaryRequest {
                     rejected_tool_calls: vec![],
+                    attempt: 1,
                 },
             }))
         }
@@ -2037,7 +2039,7 @@ pub fn transition_parent(
             RecoveryResumeTarget::ContinuationSummary { request } => Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::AwaitingContinuation {
                     rejected_tool_calls: request.rejected_tool_calls.clone(),
-                    attempt: 1,
+                    attempt: request.attempt,
                 }))
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::RequestContinuation {
@@ -2800,7 +2802,7 @@ pub fn transition_parent(
         (
             ParentState::Core(CoreState::AwaitingContinuation {
                 rejected_tool_calls,
-                ..
+                attempt,
             }),
             ParentEvent::Core(CoreEvent::LlmError {
                 message,
@@ -2816,6 +2818,7 @@ pub fn transition_parent(
                 resume: RecoveryResumeTarget::ContinuationSummary {
                     request: ContinuationSummaryRequest {
                         rejected_tool_calls: rejected_tool_calls.clone(),
+                        attempt: *attempt,
                     },
                 },
             })
@@ -3560,6 +3563,7 @@ fn handle_context_exhaustion(
             .with_effect(Effect::RequestContinuation {
                 request: ContinuationSummaryRequest {
                     rejected_tool_calls: tool_calls,
+                    attempt: 1,
                 },
             })
         }
@@ -3882,10 +3886,14 @@ mod tests {
                         request:
                             ContinuationSummaryRequest {
                                 rejected_tool_calls: carried,
+                                attempt: carried_attempt,
                             },
                     },
                 ..
-            } => assert_eq!(carried, rejected_tool_calls),
+            } => {
+                assert_eq!(carried, rejected_tool_calls);
+                assert_eq!(carried_attempt, 1);
+            }
             other @ (ConvState::Idle
             | ConvState::LlmRequesting { .. }
             | ConvState::SeededLlmRequesting { .. }
@@ -3935,6 +3943,7 @@ mod tests {
             resume: RecoveryResumeTarget::ContinuationSummary {
                 request: ContinuationSummaryRequest {
                     rejected_tool_calls: rejected_tool_calls.clone(),
+                    attempt: 2,
                 },
             },
         };
@@ -3943,12 +3952,15 @@ mod tests {
 
         assert!(matches!(
             result.new_state,
-            ConvState::AwaitingContinuation { attempt: 1, .. }
+            ConvState::AwaitingContinuation { attempt: 2, .. }
         ));
         assert!(result.effects.iter().any(|effect| matches!(
             effect,
             Effect::RequestContinuation {
-                request: ContinuationSummaryRequest { rejected_tool_calls: carried }
+                request: ContinuationSummaryRequest {
+                    rejected_tool_calls: carried,
+                    attempt: 2,
+                }
             } if *carried == rejected_tool_calls
         )));
     }
@@ -3962,6 +3974,7 @@ mod tests {
             resume: RecoveryResumeTarget::ContinuationSummary {
                 request: ContinuationSummaryRequest {
                     rejected_tool_calls: vec![test_tool_call("tool-1")],
+                    attempt: 1,
                 },
             },
         };

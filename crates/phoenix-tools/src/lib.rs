@@ -376,6 +376,11 @@ pub struct ToolContext {
     /// `ModelRegistry`, so tools depend only on the completion capability.
     llm_selector: Arc<dyn LlmSelector>,
 
+    /// Sink for finalized provider-attempt metrics emitted by internal tool LLM calls.
+    llm_metrics_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>,
+    >,
+
     /// Active PTY terminal sessions — used by the terminal-command tools
     /// (`terminal_last_command`, `terminal_command_history`).
     pub terminals: phoenix_terminal::ActiveTerminals,
@@ -428,6 +433,7 @@ impl ToolContext {
             browser_sessions,
             bash_handles,
             llm_selector,
+            llm_metrics_tx: None,
             terminals,
             tmux_registry,
             worktree_path,
@@ -460,6 +466,21 @@ impl ToolContext {
     pub fn with_wake_registrar(mut self, wake_registrar: Option<Arc<dyn WakeRegistrar>>) -> Self {
         self.wake_registrar = wake_registrar;
         self
+    }
+
+    #[must_use]
+    pub fn with_llm_metrics_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>,
+    ) -> Self {
+        self.llm_metrics_tx = Some(tx);
+        self
+    }
+
+    pub fn record_llm_attempt(&self, capture: &phoenix_core::domain::llm_types::LlmAttemptCapture) {
+        if let (Some(tx), Some(metrics)) = (&self.llm_metrics_tx, capture.finalized()) {
+            let _ = tx.send(metrics);
+        }
     }
 
     /// Get or create the browser session for this conversation's

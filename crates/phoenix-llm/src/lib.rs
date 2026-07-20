@@ -274,30 +274,24 @@ impl LoggingService {
     }
 
     fn record_stream_telemetry(span: &tracing::Span, telemetry: &ProviderStreamTelemetry) {
-        span.record(
-            "stream.first_provider_event_ms",
-            tracing::field::display(
-                telemetry
-                    .dispatch_to_first_provider_event_ms
-                    .map_or_else(String::new, |v| v.to_string()),
-            ),
-        );
-        span.record(
-            "stream.first_generation_event_ms",
-            tracing::field::display(
-                telemetry
-                    .dispatch_to_first_generation_event_ms
-                    .map_or_else(String::new, |v| v.to_string()),
-            ),
-        );
-        span.record(
-            "stream.first_visible_text_ms",
-            tracing::field::display(
-                telemetry
-                    .dispatch_to_first_visible_text_ms
-                    .map_or_else(String::new, |v| v.to_string()),
-            ),
-        );
+        if let Some(value) = telemetry.dispatch_to_first_provider_event_ms {
+            span.record(
+                "stream.first_provider_event_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
+        if let Some(value) = telemetry.dispatch_to_first_generation_event_ms {
+            span.record(
+                "stream.first_generation_event_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
+        if let Some(value) = telemetry.dispatch_to_first_visible_text_ms {
+            span.record(
+                "stream.first_visible_text_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
         span.record(
             "stream.provider_event_count",
             telemetry.provider_event_count,
@@ -310,22 +304,18 @@ impl LoggingService {
             "stream.visible_text_event_count",
             telemetry.visible_text_event_count,
         );
-        span.record(
-            "stream.max_provider_gap_ms",
-            tracing::field::display(
-                telemetry
-                    .max_provider_gap_ms
-                    .map_or_else(String::new, |v| v.to_string()),
-            ),
-        );
-        span.record(
-            "stream.max_generation_gap_ms",
-            tracing::field::display(
-                telemetry
-                    .max_generation_gap_ms
-                    .map_or_else(String::new, |v| v.to_string()),
-            ),
-        );
+        if let Some(value) = telemetry.max_provider_gap_ms {
+            span.record(
+                "stream.max_provider_gap_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
+        if let Some(value) = telemetry.max_generation_gap_ms {
+            span.record(
+                "stream.max_generation_gap_ms",
+                i64::try_from(value).unwrap_or(i64::MAX),
+            );
+        }
         span.record("stream.output_kind", format!("{:?}", telemetry.output_kind));
         span.record("stream.completed", telemetry.completed);
     }

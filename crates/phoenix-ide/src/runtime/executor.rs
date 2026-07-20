@@ -4175,7 +4175,7 @@ where
             } => self.persist_sub_agent_results(results, spawn_tool_id).await,
 
             Effect::RequestContinuation { request } => {
-                self.request_continuation(request.rejected_tool_calls);
+                self.request_continuation(request.rejected_tool_calls, request.attempt);
                 Ok(None)
             }
 
@@ -4909,6 +4909,7 @@ where
                     progress,
                 });
         });
+        let (llm_metrics_tx, mut llm_metrics_rx) = tokio::sync::mpsc::unbounded_channel();
         let tool_ctx = ToolContext::new(
             cancel_token,
             self.context.conversation_id.clone(),
@@ -4923,12 +4924,21 @@ where
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())
-        .with_wake_registrar(self.wake_registrar.clone());
+        .with_wake_registrar(self.wake_registrar.clone())
+        .with_llm_metrics_tx(llm_metrics_tx);
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
         let storage = self.storage.clone();
         let tool_executor = self.tool_executor.clone();
+        let metrics_storage = storage.clone();
+        tokio::spawn(async move {
+            while let Some(metrics) = llm_metrics_rx.recv().await {
+                if let Err(error) = metrics_storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "failed to persist tool-internal LLM metrics");
+                }
+            }
+        });
         let tool_use_id = tool.id.clone();
         // Retained for the outcome forwarder so a dropped sender (panicked or
         // aborted tool task) still produces a typed outcome for this tool_use.
@@ -5318,7 +5328,7 @@ where
 
     /// Request continuation summary from LLM (REQ-BED-020)
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
-    fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>) {
+    fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>, retry_attempt: u32) {
         let llm_client = Arc::clone(&self.llm_client);
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
@@ -5410,7 +5420,7 @@ where
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id,
                     request_id,
-                    retry_attempt: 1,
+                    retry_attempt,
                     attempt_capture: attempt_capture.clone(),
                 }),
                 // Same conversation as the main loop — different system

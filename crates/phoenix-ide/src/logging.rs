@@ -440,7 +440,9 @@ mod tests {
                 request_id = "request-123",
                 conv_id = "conversation-123",
                 retry_attempt = 2_u64,
+                stream.first_generation_event_ms = tracing::field::Empty,
             );
+            llm.record("stream.first_generation_event_ms", 1_234_i64);
             let _guard = llm.enter();
             tracing::debug!(target: "tokio_tungstenite", frame = "PAYLOAD_SENTINEL", "frame");
             tracing::info!(delta = "DELTA_SENTINEL", "response delta");
@@ -491,6 +493,16 @@ mod tests {
             .find(|span| span.name == "llm.request")
             .expect("LLM span exported");
         let attributes = format!("{:?}", llm_span.attributes);
+        let ttft = llm_span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "stream.first_generation_event_ms")
+            .expect("numeric TTFT attribute exported");
+        assert!(
+            matches!(ttft.value, opentelemetry::Value::I64(1_234)),
+            "TTFT must remain numeric for TraceQL comparisons: {:?}",
+            ttft.value
+        );
         for required in [
             "gpt-test",
             "openai",

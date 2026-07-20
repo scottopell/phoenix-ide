@@ -904,6 +904,7 @@ pub enum RecoveryKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContinuationSummaryRequest {
     pub rejected_tool_calls: Vec<ToolCall>,
+    pub attempt: u32,
 }
 
 /// LLM operation suspended while an external recovery mechanism runs.

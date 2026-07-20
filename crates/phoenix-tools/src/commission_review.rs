@@ -435,6 +435,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 },
             ));
         }
+        let attempt_capture = phoenix_core::domain::llm_types::LlmAttemptCapture::new();
         let request = LlmRequest {
             system: vec![SystemContent::new(REVIEW_SYSTEM)],
             messages: vec![LlmMessage {
@@ -455,7 +456,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 root_conversation_id: ctx.root_conversation_id.clone(),
                 request_id: uuid::Uuid::new_v4().to_string(),
                 retry_attempt: 1,
-                attempt_capture: phoenix_core::domain::llm_types::LlmAttemptCapture::new(),
+                attempt_capture: attempt_capture.clone(),
             }),
             cache_key: PromptCacheKey::stable(format!(
                 "commission-review:{}:{index}",
@@ -465,6 +466,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
 
         let response = tokio::select! {
             () = ctx.cancel.cancelled() => {
+                let _ = attempt_capture.finalize_cancelled();
+                ctx.record_llm_attempt(&attempt_capture);
                 return Ok(interrupted_review_output(
                     started,
                     target.summary.clone(),
@@ -484,10 +487,12 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                     },
                 ));
             }
-            response = service.complete(&request) => match response {
-                Ok(response) => response,
-                Err(e) => {
-                    return Ok(interrupted_review_output(
+            response = service.complete(&request) => {
+                ctx.record_llm_attempt(&attempt_capture);
+                match response {
+                    Ok(response) => response,
+                    Err(e) => {
+                        return Ok(interrupted_review_output(
                         started,
                         target.summary.clone(),
                         &collection,
@@ -504,7 +509,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                             reason: format!("commission_review LLM review failed: {e}"),
                             interruption: classify_llm_error(&e),
                         },
-                    ));
+                        ));
+                    }
                 }
             },
         };
