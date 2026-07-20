@@ -765,7 +765,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
       timer = setTimeout(async () => {
         if (cancelled) return;
         await refreshVisibleTree();
-        if (!cancelled) onRefreshTick?.();
+        if (!cancelled && document.visibilityState === 'visible') onRefreshTick?.();
         if (!cancelled) scheduleRefresh();
       }, 10000 + jitter);
     }

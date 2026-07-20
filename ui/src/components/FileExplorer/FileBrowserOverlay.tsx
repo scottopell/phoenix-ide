@@ -16,6 +16,7 @@ interface Props {
   conversationId: string;
   onClose: () => void;
   onFileSelect: (filePath: string, rootDir: string) => void;
+  canOpenWorkspaceDiff?: boolean | undefined;
 }
 
 function mobileGitSummary(status: ConversationGitStatusResponse | null): string {
@@ -28,7 +29,7 @@ function mobileGitSummary(status: ConversationGitStatusResponse | null): string 
   return `${checkout} · ${status.counts.changed_paths === 0 ? 'clean' : `${status.counts.changed_paths} changes`}`;
 }
 
-export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, onFileSelect }: Props) {
+export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, onFileSelect, canOpenWorkspaceDiff = false }: Props) {
   const [gitStatus, setGitStatus] = useState<ConversationGitStatusResponse | null>(null);
   const requestRef = useRef<AbortController | null>(null);
   const { openDiffFullscreen } = useViewerSlotCommands();
@@ -66,7 +67,7 @@ export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, 
         <div className="file-browser-header">
           <div className="file-browser-heading">
             <div className="file-browser-path" title={rootPath}>{displayPath}</div>
-            <button
+            {canOpenWorkspaceDiff ? <button
               type="button"
               className="file-browser-git-summary"
               onClick={() => {
@@ -77,7 +78,12 @@ export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, 
             >
               <GitBranch size={14} aria-hidden="true" />
               <span>{mobileGitSummary(gitStatus)}</span>
-            </button>
+            </button> : (
+              <div className="file-browser-git-summary" aria-label={mobileGitSummary(gitStatus)}>
+                <GitBranch size={14} aria-hidden="true" />
+                <span>{mobileGitSummary(gitStatus)}</span>
+              </div>
+            )}
           </div>
           <button className="file-browser-btn" onClick={onClose} aria-label="Close">
             <X size={20} />

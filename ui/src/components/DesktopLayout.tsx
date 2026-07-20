@@ -291,6 +291,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
             workScopeKey={activeWorkScopeKey}
             liveWorkScope={activeLiveWorkScope}
+            canOpenWorkspaceDiff={activeConversation?.conv_mode_label === 'Work' || activeConversation?.conv_mode_label === 'Branch'}
           />
         )}
         {isDesktop && activeSlug && (

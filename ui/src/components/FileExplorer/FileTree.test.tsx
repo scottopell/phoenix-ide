@@ -457,6 +457,21 @@ describe('FileTree — reveal active file', () => {
     expect(await screen.findByText('src')).toBeInTheDocument();
   });
 
+  it('does not refresh git status while the document is hidden', async () => {
+    vi.useFakeTimers();
+    const onRefreshTick = vi.fn();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+
+    render(<FileTree rootPath="/proj" onFileSelect={vi.fn()} onRefreshTick={onRefreshTick} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+
+    expect(onRefreshTick).not.toHaveBeenCalled();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    vi.useRealTimers();
+  });
+
   it('decorates changed files and collapsed ancestor folders from one git snapshot', async () => {
     render(
       <FileTree

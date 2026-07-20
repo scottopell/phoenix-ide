@@ -32,6 +32,7 @@ interface Props {
   width?: number | undefined;
   workScopeKey?: string | null | undefined;
   liveWorkScope?: WorkScopeInventory | null | undefined;
+  canOpenWorkspaceDiff?: boolean | undefined;
 }
 
 function extractTaskId(branchName: string | null | undefined): string | undefined {
@@ -107,7 +108,7 @@ function GitStatusDetails({ status }: { status: Extract<ConversationGitStatusRes
   );
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope, canOpenWorkspaceDiff = false }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const { openDiffFullscreen } = useViewerSlotCommands();
   const [refreshKey, setRefreshKey] = useState(0);
@@ -267,7 +268,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
               attention={gitSummary.attention}
               expanded={gitExpanded}
               onToggle={() => setGitExpanded((value) => !value)}
-              action={(
+              action={canOpenWorkspaceDiff ? (
                 <button
                   type="button"
                   className="git-grounding-open-diff"
@@ -280,7 +281,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
                 >
                   Open diff
                 </button>
-              )}
+              ) : undefined}
             >
               {gitStatus?.kind === 'snapshot' ? (
                 <GitStatusDetails status={gitStatus} />

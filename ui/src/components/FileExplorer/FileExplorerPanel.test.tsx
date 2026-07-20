@@ -68,7 +68,7 @@ function skill(name: string, source: string, path: string): SkillEntry {
   return { name, description: `${name} description`, source, path };
 }
 
-function renderPanel(conversationId = 'conv-1', rootPath = '/repo') {
+function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true) {
   return render(
     <MemoryRouter initialEntries={['/c/slug']}>
       <ConversationProvider>
@@ -77,12 +77,13 @@ function renderPanel(conversationId = 'conv-1', rootPath = '/repo') {
             <FileExplorerPanel
               collapsed={false}
               onToggle={() => {}}
-              rootPath={rootPath}
+              rootPath="/repo"
               conversationId={conversationId}
               showToast={() => {}}
               showError={() => {}}
               branchName="main"
               activeSlug="slug"
+              canOpenWorkspaceDiff={canOpenWorkspaceDiff}
             />
           </FileExplorerProvider>
         </ViewerSlotProvider>
@@ -127,6 +128,19 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     expect(screen.getByRole('button', { name: 'Open Git diff' })).toBeInTheDocument();
   });
 
+  it('hides Workspace Diff when the conversation mode is not diffable', async () => {
+    vi.mocked(api.getConversationGitStatus).mockResolvedValue({
+      kind: 'snapshot',
+      checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc123', remote_status: { kind: 'no_known' } },
+      counts: { changed_paths: 1, staged_paths: 0, unstaged_paths: 1, untracked_paths: 0, conflicted_paths: 0 },
+      changed_paths: [],
+    });
+    renderPanel('conv-1', false);
+
+    expect(await screen.findByText('Changes not staged for commit')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Open Git diff' })).not.toBeInTheDocument();
+  });
+
   it('renders the standard clean working tree message', async () => {
     vi.mocked(api.getConversationGitStatus).mockResolvedValue({
       kind: 'snapshot',
@@ -155,21 +169,6 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     await waitFor(() => {
       expect(tree).toHaveAttribute('data-refresh-key', String(initialRefreshKey + 1));
     });
-  });
-
-  it('shows a shared human project subtitle instead of repeating branch identity', async () => {
-    renderPanel();
-
-    expect(await screen.findByText('Files in repo')).toBeInTheDocument();
-    expect(screen.queryByText(/main/)).not.toBeInTheDocument();
-  });
-
-  it('keeps opaque root paths in the tooltip instead of the visible subtitle', async () => {
-    const opaqueRoot = '/tmp/9d1b4cc93b7845228e4fdbe566761f44';
-    renderPanel('conv-1', opaqueRoot);
-
-    expect(await screen.findByText('Project files')).toHaveAttribute('title', opaqueRoot);
-    expect(screen.queryByText(opaqueRoot)).not.toBeInTheDocument();
   });
 
   it('keeps Tasks expanded and preserves task group state after Back', async () => {

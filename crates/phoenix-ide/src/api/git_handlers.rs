@@ -379,14 +379,33 @@ fn parse_git_status_porcelain_v2(output: &[u8]) -> Result<GitStatusSnapshot, Str
 }
 
 fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapshot, String> {
+    let repo_root = run_git(worktree_path, &["rev-parse", "--show-toplevel"])
+        .map_err(|error| format!("git status failed: {error}"))?;
+    let repo_root = std::fs::canonicalize(repo_root.trim())
+        .map_err(|error| format!("git status repository root is unavailable: {error}"))?;
+    let worktree_path = std::fs::canonicalize(worktree_path)
+        .map_err(|error| format!("git status root is unavailable: {error}"))?;
+    let pathspec = worktree_path
+        .strip_prefix(&repo_root)
+        .map_err(|_| "git status root is outside repository".to_string())?;
+    let pathspec = if pathspec.as_os_str().is_empty() {
+        "."
+    } else {
+        pathspec
+            .to_str()
+            .ok_or_else(|| "git status root is not valid UTF-8".to_string())?
+    };
+
     let mut cmd = crate::git_ops::git_command();
-    cmd.current_dir(worktree_path)
+    cmd.current_dir(&repo_root)
         .args([
             "status",
             "--porcelain=v2",
             "-z",
             "--untracked-files=all",
             "--ignore-submodules=none",
+            "--",
+            pathspec,
         ])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(std::process::Stdio::piped())
@@ -406,7 +425,32 @@ fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapsh
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!("git status failed: {stderr}"));
     }
-    parse_git_status_porcelain_v2(&stdout)
+    let mut snapshot = parse_git_status_porcelain_v2(&stdout)?;
+    if pathspec != "." {
+        let prefix = format!("{pathspec}/");
+        for changed_path in &mut snapshot.changed_paths {
+            let path = match changed_path {
+                GitChangedPath::Ordinary { path, .. }
+                | GitChangedPath::Unmerged { path, .. }
+                | GitChangedPath::Untracked { path } => path,
+                GitChangedPath::Renamed {
+                    path,
+                    previous_path,
+                    ..
+                } => {
+                    if let Some(stripped) = previous_path.strip_prefix(&prefix) {
+                        *previous_path = stripped.to_string();
+                    }
+                    path
+                }
+            };
+            *path = path
+                .strip_prefix(&prefix)
+                .ok_or_else(|| "git status returned a path outside the requested root".to_string())?
+                .to_string();
+        }
+    }
+    Ok(snapshot)
 }
 
 fn checkout_status_from_live_observation(worktree_path: &FsPath) -> CheckoutStatus {
@@ -2150,9 +2194,10 @@ pub(crate) async fn get_conversation_git_status(
                 file_root.display()
             )));
         }
-        let checkout_status = checkout_status_from_live_observation(&file_root);
-        match capture_git_status_snapshot(&file_root) {
-            Ok(snapshot) => match checkout_status {
+        match capture_with_stable_checkout(&file_root, || {
+            capture_git_status_snapshot(&file_root).map_err(AppError::Internal)
+        }) {
+            Ok((snapshot, checkout_status)) => match checkout_status {
                 CheckoutStatus::NamedBranch { .. }
                 | CheckoutStatus::Detached { .. }
                 | CheckoutStatus::Unborn { .. } => Ok(ConversationGitStatusResponse::Snapshot {
@@ -2168,6 +2213,10 @@ pub(crate) async fn get_conversation_git_status(
                 }
             },
             Err(error) => {
+                let error = match error {
+                    AppError::Internal(message) => message,
+                    other => format!("{other:?}"),
+                };
                 let lower = error.to_ascii_lowercase();
                 if lower.contains("not a git repository") || lower.contains("outside repository") {
                     Ok(ConversationGitStatusResponse::NonGit)
@@ -2175,7 +2224,7 @@ pub(crate) async fn get_conversation_git_status(
                     tracing::warn!(%error, path = %file_root.display(), "failed to capture git status snapshot");
                     Ok(ConversationGitStatusResponse::Unavailable {
                         reason: "Git status is unavailable.".to_string(),
-                        checkout_status: Some(checkout_status),
+                        checkout_status: None,
                     })
                 }
             }
@@ -2475,6 +2524,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["untracked-dir/a.txt", "untracked-dir/b.txt"]
         );
+    }
+
+    #[test]
+    fn snapshot_scopes_paths_to_a_conversation_subdirectory() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("sub/nested")).unwrap();
+        std::fs::create_dir_all(repo.path().join("other")).unwrap();
+        std::fs::write(repo.path().join("sub/nested/in-scope.txt"), "scope\n").unwrap();
+        std::fs::write(repo.path().join("other/out-of-scope.txt"), "other\n").unwrap();
+
+        let snapshot = capture_git_status_snapshot(&repo.path().join("sub")).unwrap();
+        assert_eq!(snapshot.counts.changed_paths, 1);
+        assert!(matches!(
+            snapshot.changed_paths.as_slice(),
+            [GitChangedPath::Untracked { path }] if path == "nested/in-scope.txt"
+        ));
     }
 
     #[test]
