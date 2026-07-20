@@ -196,9 +196,9 @@ jobs:
         with:
           package_json_file: ui/package.json
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: lts/*
+          node-version: 24
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - name: Upgrade corepack
