@@ -135,6 +135,17 @@ impl AppState {
             mcp_manager.clone(),
             credential_helper.clone(),
         ));
+        let retired_wakes = phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone())
+            .retire_all_registrations(phoenix_workflow::Timestamp(
+                u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+            ))
+            .await?;
+        if retired_wakes > 0 {
+            tracing::warn!(
+                retired = retired_wakes,
+                "retired automatic wake obligations before runtime startup"
+            );
+        }
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;

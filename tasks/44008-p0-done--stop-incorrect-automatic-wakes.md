@@ -64,8 +64,8 @@ Likely starting symbols:
 Define and implement rollout behavior for wake obligations created by the old automatic path:
 
 - Because no explicit agent-facing registration path exists, do not start the wake worker.
-- Preserve persisted bindings as audit history; do not delete or rewrite workflow rows.
-- Do not add registration provenance, reconciliation, or a schema migration solely for a future explicit tool; that tool will define its activation and rollout boundary when implemented.
+- Retire and suppress all persisted automatic bindings through canonical workflow transitions before runtime bridges start, preserving workflow and message audit records while clearing owed-work gates.
+- Do not add registration provenance or a schema migration solely for a future explicit tool; that tool will define its activation boundary when implemented.
 
 ### 3. Preserve the substrate for the intended agent-facing tool
 
@@ -80,9 +80,9 @@ Update wake-contract executive/current-reality documentation and tests to state 
 - An ordinary `bash op=run` that returns `still_running` creates a handle but no durable wake binding and no `wake_registration` payload.
 - The equivalent ordinary tmux live-handle path creates no durable wake binding.
 - Foreground `wait`/inspection returns terminal evidence normally and cannot cause a later synthetic wake message or auto-resumed LLM request.
-- Persisted old-path obligations cannot produce terminal messages or resume turns because the wake worker is not started.
+- Persisted old-path obligations are non-owed and cannot produce terminal messages or resume turns; their audit records remain intact.
 - The durable wake persistence/observation/delivery substrate retains its focused restart and idempotency coverage without claiming an agent-facing explicit contract exists.
-- Regression tests cover bash/tmux no-registration behavior and the dormant worker startup boundary.
+- Regression tests cover bash/tmux no-registration behavior, legacy owed-work retirement, audit preservation, and the dormant worker startup boundary.
 - A production-style journey reproducing the cited sequence yields one terminal delivery and no turn-end replay.
 - `./dev.py check` passes.
 

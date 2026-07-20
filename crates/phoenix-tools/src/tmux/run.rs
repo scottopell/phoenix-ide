@@ -183,14 +183,14 @@ impl Tool for TmuxRunTool {
             )
         };
         let wait_for_readiness = matches!(readiness, ValidReadiness::WaitForText { .. });
-        let keep_open_for_observation = parsed.keep_open_on_exit || wait_for_readiness;
         let target = match start_tmux_window(
             &config_path,
             &socket_path,
             &cwd,
             &requested_name,
             cmd,
-            keep_open_for_observation,
+            parsed.keep_open_on_exit,
+            wait_for_readiness && !parsed.keep_open_on_exit,
         )
         .await
         {
@@ -272,8 +272,9 @@ async fn start_tmux_window(
     requested_name: &str,
     cmd: &str,
     keep_open_on_exit: bool,
+    preserve_for_readiness: bool,
 ) -> Result<TmuxRunTarget, ToolOutput> {
-    let wrapper = shell_wrapper(cmd, keep_open_on_exit);
+    let wrapper = shell_wrapper(cmd, keep_open_on_exit, preserve_for_readiness);
     let shell_command = format!("bash -lc {}", shell_quote(&wrapper));
     let start_output = run_tmux_cli(
         config_path,
@@ -420,12 +421,10 @@ async fn wait_for_text_response(
             if close_after_completion {
                 if exited || status == "readiness_timed_out" {
                     let _ = kill_window(config_path, socket_path, &target.window_id).await;
-                } else {
-                    spawn_close_after_completion(
-                        config_path.to_path_buf(),
-                        socket_path.to_path_buf(),
-                        target.window_id.clone(),
-                    );
+                } else if let Err(error) =
+                    set_remain_on_exit(config_path, socket_path, &target.window_id, false).await
+                {
+                    tracing::debug!(window_id = target.window_id, %error, "failed to restore tmux exit cleanup");
                 }
             }
             return response;
@@ -451,27 +450,6 @@ async fn wait_for_text_response(
             () = tokio::time::sleep(READINESS_POLL_INTERVAL) => {}
         }
     }
-}
-
-fn spawn_close_after_completion(config_path: PathBuf, socket_path: PathBuf, window_id: String) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
-            match observe_window(&config_path, &socket_path, &window_id, None).await {
-                Ok(observation) if observation.exit_code.is_none() => {}
-                Ok(_) => {
-                    if let Err(error) = kill_window(&config_path, &socket_path, &window_id).await {
-                        tracing::debug!(window_id, %error, "failed to close completed tmux window");
-                    }
-                    return;
-                }
-                Err(error) => {
-                    tracing::debug!(window_id, %error, "stopped observing tmux window completion");
-                    return;
-                }
-            }
-        }
-    });
 }
 
 #[allow(clippy::result_large_err)]
@@ -504,7 +482,12 @@ fn derived_window_name(cmd: &str) -> String {
     format!("tmux-run-{prefix:08x}")
 }
 
-fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
+fn shell_wrapper(cmd: &str, keep_open_on_exit: bool, preserve_for_readiness: bool) -> String {
+    let preserve = if preserve_for_readiness {
+        "tmux set-option -p remain-on-exit on; "
+    } else {
+        ""
+    };
     let after_exit = if keep_open_on_exit {
         "exec ${SHELL:-/bin/bash} -i"
     } else {
@@ -512,7 +495,7 @@ fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
     };
     let marker_cmd = "printf '%s000' \"$(date +%s)\"";
     format!(
-        "(\n{cmd}\n); code=$?; occurred_at_ms=$({marker_cmd}); echo; printf '%s\\n' \"__PHOENIX_EXIT__ exit_code=$code occurred_at_ms=$occurred_at_ms\"; {after_exit}"
+        "{preserve}(\n{cmd}\n); code=$?; occurred_at_ms=$({marker_cmd}); echo; printf '%s\\n' \"__PHOENIX_EXIT__ exit_code=$code occurred_at_ms=$occurred_at_ms\"; {after_exit}"
     )
 }
 
@@ -547,6 +530,33 @@ async fn run_tmux_cli(
     .await
     .map_err(|_| "tmux subprocess timed out".to_string())?
     .map_err(|e| format!("failed to spawn tmux subprocess: {e}"))
+}
+
+async fn set_remain_on_exit(
+    config_path: &Path,
+    socket_path: &Path,
+    target: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let value = if enabled { "on" } else { "off" };
+    let output = run_tmux_cli(
+        config_path,
+        socket_path,
+        &[
+            "set-option".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            target.to_string(),
+            "remain-on-exit".to_string(),
+            value.to_string(),
+        ],
+    )
+    .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 async fn kill_window(config_path: &Path, socket_path: &Path, target: &str) -> Result<(), String> {
@@ -952,9 +962,23 @@ mod tests {
                 Instant::now() < deadline,
                 "window should close after command completion"
             );
+            // test-timing-allow: tmux window disappearance is the observable completion behavior
             tokio::time::sleep(READINESS_POLL_INTERVAL).await;
         }
         kill_socket(&socket_path).await;
+    }
+
+    #[test]
+    fn readiness_only_preservation_uses_tmux_native_remain_on_exit() {
+        let wrapper = shell_wrapper("echo READY; sleep 1", false, true);
+        assert!(wrapper.starts_with("tmux set-option -p remain-on-exit on; "));
+        assert!(wrapper.ends_with("exit $code"));
+
+        let ordinary = shell_wrapper("echo READY", false, false);
+        assert!(!ordinary.contains("remain-on-exit"));
+
+        let inspectable = shell_wrapper("echo READY", true, false);
+        assert!(inspectable.ends_with("exec ${SHELL:-/bin/bash} -i"));
     }
 
     #[test]

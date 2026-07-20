@@ -98,9 +98,10 @@ tmux handle creation registers a wake obligation. The substrate is intentionally
 dormant until an explicit registration surface owns that lifecycle.
 
 Because no explicit agent-facing registration surface exists, the wake worker is
-not started. Persisted bindings from the automatic-registration implementation
-remain as audit history and cannot produce another model turn. The explicit wait
-surface will define its activation and rollout boundary when it is implemented.
+not started. Startup retires and suppresses persisted automatic bindings through
+canonical workflow transitions so they neither resume turns nor remain owed work;
+message and workflow audit records remain intact. The explicit wait surface will
+define its activation boundary when it is implemented.
 
 ## Status Summary
 

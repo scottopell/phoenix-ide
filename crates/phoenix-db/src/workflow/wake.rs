@@ -1800,6 +1800,100 @@ impl WakeRepository {
         })
     }
 
+    /// Retires every wake created by the removed automatic registration path.
+    ///
+    /// No agent-facing registration surface exists, so all persisted bindings are
+    /// legacy. Startup calls this before runtime bridges or the wake worker can
+    /// mutate wake workflows.
+    pub async fn retire_all_registrations(&self, now: Timestamp) -> DbResult<usize> {
+        let unresolved = sqlx::query(
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id
+             FROM wake_bindings b
+             JOIN workflows w ON w.workflow_id = b.workflow_id
+             WHERE w.status = 'Active'
+               AND NOT EXISTS (
+                   SELECT 1 FROM wake_terminal_receipts r
+                   WHERE r.workflow_id = b.workflow_id
+               )
+             ORDER BY b.workflow_id",
+        )
+        .fetch_all(&self.workflow_repo.pool)
+        .await?;
+
+        let mut retired = std::collections::BTreeSet::new();
+        for row in unresolved {
+            let workflow_id = WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?);
+            if matches!(
+                self.cancel_allocated(&WakeCancelIfUnresolvedInput {
+                    workflow_id,
+                    expected_conversation_id: Some(row.get("conversation_id")),
+                    expected_contract_id: Some(row.get("contract_id")),
+                    timestamp: now,
+                    reason: WakeCancellationReason::ExplicitCancel,
+                })
+                .await?,
+                WakeCancellationOutcome::Cancelled { .. }
+            ) {
+                retired.insert(workflow_id);
+            }
+        }
+
+        let pending = sqlx::query(
+            "SELECT d.workflow_id, d.delivery_id
+             FROM workflow_deliveries d
+             JOIN wake_bindings b ON b.workflow_id = d.workflow_id
+             WHERE d.status = 'Pending'
+             ORDER BY d.workflow_id, d.delivery_id",
+        )
+        .fetch_all(&self.workflow_repo.pool)
+        .await?;
+        let mut by_workflow = std::collections::BTreeMap::<WorkflowId, Vec<DeliveryId>>::new();
+        for row in pending {
+            by_workflow
+                .entry(WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?))
+                .or_default()
+                .push(DeliveryId(to_u64(row.get("delivery_id"), "delivery_id")?));
+        }
+
+        for (workflow_id, delivery_ids) in by_workflow {
+            let head = self
+                .workflow_repo
+                .fetch_workflow_head(workflow_id)
+                .await?
+                .ok_or_else(|| {
+                    DbError::Serialization(format!(
+                        "wake workflow {} disappeared during startup retirement",
+                        workflow_id.0
+                    ))
+                })?;
+            match self
+                .resolve_pending_exact(&WakeResolvePendingInput {
+                    workflow_id,
+                    expected_version: head.version,
+                    delivery_ids,
+                    decision: WakeResolveDecision::Suppress,
+                    transition_id: TransitionId(head.version.next().0),
+                    timestamp: now,
+                })
+                .await?
+            {
+                WakeResolvePendingOutcome::Resolved => {
+                    retired.insert(workflow_id);
+                }
+                WakeResolvePendingOutcome::AlreadyResolved => {}
+                WakeResolvePendingOutcome::VersionConflict
+                | WakeResolvePendingOutcome::SetMismatch => {
+                    return Err(DbError::Serialization(format!(
+                        "wake workflow {} changed during startup retirement",
+                        workflow_id.0
+                    )));
+                }
+            }
+        }
+
+        Ok(retired.len())
+    }
+
     pub async fn list_pending_global(
         &self,
         after: Option<WakePendingGlobalCursor>,
@@ -7558,6 +7652,93 @@ mod tests {
         assert!(pending_original.is_empty());
         let pending_original_restarted = restarted.list_pending("conv-1").await.unwrap();
         assert!(pending_original_restarted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retire_all_registrations_clears_owed_work_and_preserves_audit() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let unresolved = WorkflowId(9000);
+        let pending = WorkflowId(9001);
+
+        let mut unresolved_intent = intent();
+        unresolved_intent.contract_id = "contract-unresolved".into();
+        unresolved_intent.registering_tool_use_id = "tool-unresolved".into();
+        unresolved_intent.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: unresolved_intent.registration_scope.clone(),
+            handle_id: "b-unresolved".into(),
+        });
+        assert!(matches!(
+            repo.register_allocated(
+                unresolved,
+                &unresolved_intent,
+                "fp-unresolved",
+                Timestamp(10)
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        let pending_delivery = create_pending_terminal_delivery(&repo, pending).await;
+        let link = materialized_outcome_link(
+            materialize_pending(
+                &repo,
+                &pending_delivery,
+                "terminal before upgrade",
+                None,
+                false,
+                Timestamp(25),
+            )
+            .await,
+        );
+
+        assert_eq!(
+            repo.retire_all_registrations(Timestamp(40)).await.unwrap(),
+            2
+        );
+        assert_eq!(
+            restarted
+                .retire_all_registrations(Timestamp(41))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!repo.has_owed_work_for_conversation("conv-1").await.unwrap());
+        assert!(repo
+            .list_active_unresolved_for_conversation("conv-1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+
+        let (_, unresolved_snapshot) = head_snapshot(&repo, unresolved).await;
+        assert!(matches!(
+            unresolved_snapshot.terminal,
+            Some(WakeTerminalPayload::Cancelled { .. })
+        ));
+        assert_eq!(
+            unresolved_snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Suppressed
+        );
+        let (_, pending_snapshot) = head_snapshot(&repo, pending).await;
+        assert!(matches!(
+            pending_snapshot.terminal,
+            Some(WakeTerminalPayload::Fired { .. })
+        ));
+        assert_eq!(
+            pending_snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Suppressed
+        );
+        let preserved = restarted
+            .get_delivery_message_link(pending, link.delivery_id)
+            .await
+            .unwrap()
+            .expect("materialized audit link remains after suppression");
+        assert_eq!(
+            preserved.linked_message.message.message_id,
+            link.linked_message.message.message_id
+        );
+        assert_eq!(count_conversation_messages(&repo, "conv-1").await, 1);
     }
 
     #[tokio::test]
