@@ -210,9 +210,8 @@ pub type BashLifecycleSink = tokio::sync::mpsc::UnboundedSender<BashLifecycleEve
 ///
 /// One registry instance per Phoenix process. Owned by the runtime layer
 /// and reached by tools through `ToolContext::bash_handles()`. Keying by
-/// `ResourceScopeKey` (rather than `conversation_id`) is what lets a continuation
-/// chain on one worktree share its handle table — both members resolve to
-/// the same `ResourceScopeKey::Worktree(path)` (REQ-BASH-WS-001).
+/// durable work-scope identity (rather than `conversation_id`) is what lets a
+/// continuation chain share its handle table (REQ-BASH-WS-001).
 #[derive(Debug, Default)]
 pub struct BashHandleRegistry {
     inner: RwLock<HashMap<ResourceScopeKey, Arc<RwLock<ResourceScopeKeyHandles>>>>,

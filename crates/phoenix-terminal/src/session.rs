@@ -120,10 +120,9 @@ impl std::fmt::Debug for TerminalHandle {
 
 /// Shared registry of active terminal sessions (REQ-TERM-003, REQ-TERM-WS-001).
 ///
-/// Keyed by `ResourceScopeKey`: `ResourceScopeKey::Worktree(path)` for managed/branch
-/// worktrees, `ResourceScopeKey::Conversation(id)` for Direct conversations, and
-/// `ResourceScopeKey::Global` for the singleton scope surfaced on the /new page.
-/// Continuation conversations resolving to the same `ResourceScopeKey` therefore
+/// Conversation terminals are keyed by durable work-scope identity;
+/// `ResourceScopeKey::GlobalTerminal` is structurally separate for `/new`.
+/// Continuation conversations in the same work scope therefore
 /// share a single entry rather than colliding — matching the ownership
 /// pattern of `TmuxRegistry` (REQ-TMUX-WS-001) and `BrowserSessionManager`
 /// (REQ-BROWSER-WS-001).

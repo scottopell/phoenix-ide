@@ -465,6 +465,10 @@ mod tests {
         )
     }
 
+    fn test_work_scope_socket(socket_dir: &std::path::Path) -> std::path::PathBuf {
+        registry::socket_path_for_worktree(socket_dir, std::path::Path::new("test-work"))
+    }
+
     fn skip_unless_tmux() -> bool {
         which::which("tmux").is_err()
     }
@@ -571,7 +575,7 @@ mod tests {
         assert_eq!(actual, cwd, "pane should start in {cwd:?}, got {stdout:?}");
 
         // Cleanup.
-        let sock = socket_tmp.path().join("conv-conv-cwd-test.sock");
+        let sock = test_work_scope_socket(socket_tmp.path());
         let _ = tokio::process::Command::new("tmux")
             .args(["-S", &sock.to_string_lossy(), "kill-server"])
             .env_remove("TMUX")
@@ -600,8 +604,8 @@ mod tests {
             "expected `main` session in stdout, got: {stdout}"
         );
 
-        // Socket file must live under the registry's socket dir.
-        let sock = socket_dir.join("conv-conv-fresh.sock");
+        // The durable work-scope socket must live under the registry's socket dir.
+        let sock = test_work_scope_socket(&socket_dir);
         assert!(sock.exists(), "socket file should exist at {sock:?}");
 
         // Cleanup: kill the spawned tmux server.
@@ -638,7 +642,7 @@ mod tests {
         assert!(v["stdout"].as_str().unwrap().contains("main"));
 
         // Cleanup.
-        let sock = tmp.path().join("conv-conv-reuse.sock");
+        let sock = test_work_scope_socket(tmp.path());
         let _ = tokio::process::Command::new("tmux")
             .args(["-S", &sock.to_string_lossy(), "kill-server"])
             .env_remove("TMUX")
@@ -654,9 +658,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let socket_dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&socket_dir).unwrap();
-        // Pre-create a stale, non-tmux file at the conversation's
+        // Pre-create a stale, non-tmux file at the durable work-scope
         // socket path. `tmux ls` against it will fail.
-        let stale = socket_dir.join("conv-conv-stale.sock");
+        let stale = test_work_scope_socket(&socket_dir);
         std::fs::write(&stale, b"junk").unwrap();
 
         let registry = Arc::new(TmuxRegistry::with_socket_dir(socket_dir.clone()));
@@ -691,7 +695,7 @@ mod tests {
         // specific: some versions reject with a usage error, some let
         // the first flag win (Phoenix's `-S`), some let the last flag
         // win. The structural property we verify here is that the
-        // conversation's socket — at the path Phoenix chose — is the
+        // work scope's socket — at the path Phoenix chose — is the
         // ONLY socket that ever gets created. The agent cannot escape
         // to a `weird`-labeled socket regardless of tmux's CLI parser
         // behaviour.
@@ -699,9 +703,10 @@ mod tests {
             .run(json!({"args": ["-L", "weird", "list-sessions"]}), ctx)
             .await;
 
-        let conv_sock = socket_dir.join("conv-conv-dashL.sock");
-        // Permitted entries in the socket dir: the conversation's own
-        // socket and the Phoenix-shipped tmux config file. Anything
+        let scope_sock = test_work_scope_socket(&socket_dir);
+        let scope_socket_name = scope_sock.file_name().unwrap().to_string_lossy();
+        // Permitted entries in the socket dir: the work scope's own socket
+        // and the Phoenix-shipped tmux config file. Anything
         // else (e.g. a `weird`-labeled socket the agent tried to coerce
         // tmux into creating) is a structural escape and fails the
         // test.
@@ -711,20 +716,20 @@ mod tests {
             .filter(|entry| {
                 let name = entry.file_name();
                 let s = name.to_string_lossy();
-                !(s == "_phoenix.tmux.conf" || s.starts_with("conv-conv-dashL.sock"))
+                !(s == "_phoenix.tmux.conf" || s.starts_with(scope_socket_name.as_ref()))
             })
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(
             unexpected.is_empty(),
-            "only the conv socket + Phoenix tmux config should appear under {socket_dir:?}; \
+            "only the work-scope socket + Phoenix tmux config should appear under {socket_dir:?}; \
              unexpected entries: {unexpected:?}"
         );
 
         // The cleanup applies to whichever socket actually got
-        // created — the conv's path, never an agent-controlled one.
+        // created — the scope's path, never an agent-controlled one.
         let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &conv_sock.to_string_lossy(), "kill-server"])
+            .args(["-S", &scope_sock.to_string_lossy(), "kill-server"])
             .env_remove("TMUX")
             .status()
             .await;
@@ -778,7 +783,7 @@ mod tests {
         assert_eq!(v["status"], "cancelled", "got: {v}");
 
         // Cleanup.
-        let sock = tmp.path().join("conv-conv-cancel.sock");
+        let sock = test_work_scope_socket(tmp.path());
         let _ = tokio::process::Command::new("tmux")
             .args(["-S", &sock.to_string_lossy(), "kill-server"])
             .env_remove("TMUX")
@@ -836,7 +841,7 @@ mod tests {
         let _ = v["truncated"];
 
         // Cleanup.
-        let sock = socket_dir.join("conv-conv-trunc.sock");
+        let sock = test_work_scope_socket(&socket_dir);
         let _ = tokio::process::Command::new("tmux")
             .args(["-S", &sock.to_string_lossy(), "kill-server"])
             .env_remove("TMUX")

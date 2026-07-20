@@ -3104,13 +3104,9 @@ setTimeout(function () {
     shutdown_test(manager, server).await;
 }
 
-// ============================================================================
-// ResourceScopeKey ownership tests (REQ-BROWSER-WS-001 / REQ-BROWSER-WS-002)
-// ============================================================================
-
-/// Worktree-scoped sessions are shared across continuations: two
-/// `get_session` calls with the same `ResourceScopeKey::Worktree` return the
-/// same `Arc<RwLock<BrowserSession>>`. This is the structural backing
+/// Sessions are shared across continuations in one durable work scope: two
+/// `get_session` calls with the same key return the same
+/// `Arc<RwLock<BrowserSession>>`. This is the structural backing
 /// for REQ-BROWSER-WS-002 inheritance — agents driving a continuation
 /// see the predecessor's tabs and cookies because they're literally the
 /// same Chrome instance.
@@ -3132,18 +3128,14 @@ async fn worktree_scope_shared_across_continuations() {
 
     assert!(
         Arc::ptr_eq(&first, &second),
-        "ResourceScopeKey::Worktree sessions must share the same Arc — \
+        "sessions in one durable work scope must share the same Arc — \
          continuation inheritance depends on it"
     );
 
     manager.shutdown_all().await;
 }
 
-/// Conversation-scoped sessions are isolated per conversation id:
-/// `ResourceScopeKey::Conversation("a")` and `ResourceScopeKey::Conversation("b")`
-/// resolve to different Chrome instances. Direct continuations always
-/// fall here (they each have their own scope), so this proves
-/// per-conversation isolation for the Direct-mode case.
+/// Distinct durable work scopes resolve to different Chrome instances.
 #[tokio::test]
 async fn conversation_scope_isolated_per_id() {
     require_chrome!();
@@ -3157,7 +3149,7 @@ async fn conversation_scope_isolated_per_id() {
 
     assert!(
         !Arc::ptr_eq(&a, &b),
-        "different Conversation scopes must produce isolated sessions"
+        "different durable work scopes must produce isolated sessions"
     );
 
     manager.shutdown_all().await;

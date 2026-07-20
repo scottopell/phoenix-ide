@@ -1535,10 +1535,9 @@ impl RuntimeManager {
     ///
     /// On each signal for `ResourceScopeKey` W it assembles W's full inventory from
     /// the three live registries (the same `assemble_inventory` the pull
-    /// endpoint uses) and broadcasts it to W's conversation(s) using the
-    /// identical scope-resolution the browser lifecycle bridge applies:
-    /// enumerate live runtime handles, resolve each conversation's scope via
-    /// `ResourceScopeKey::resolve`, match against W. REQ-PROJ-025 guarantees at most
+    /// endpoint uses) and broadcasts it to W's conversation(s) by matching each
+    /// live runtime handle's persisted work-scope identity against W.
+    /// REQ-PROJ-025 guarantees at most
     /// one non-terminal conversation per scope, so this lands on the one live
     /// member.
     pub async fn start_work_scope_bridge(self: &Arc<Self>) {
@@ -1877,12 +1876,9 @@ impl RuntimeManager {
     ///
     /// Authority is the DATABASE, not the live-runtime-handle set: a
     /// conversation can be non-terminal in the DB yet carry no runtime handle
-    /// (after a server restart, or runtime eviction). For a
-    /// `ResourceScopeKey::Worktree(path)` we query the conversations whose
-    /// `conv_mode.worktree_path` is that path; for a `ResourceScopeKey::Conversation`
-    /// only that conversation resolves to the scope. Each candidate's scope is
-    /// resolved via `ResourceScopeKey::resolve` and matched against `work_scope`. A
-    /// match counts as live only when its conversation is neither terminal
+    /// (after a server restart, or runtime eviction). Conversations are queried
+    /// by durable work-scope identity. A match counts as live only when it is
+    /// neither terminal
     /// (`ConvState::is_terminal`) nor archived. REQ-PROJ-025 guarantees at
     /// most one non-terminal conversation per scope, so the first match is
     /// decisive.
@@ -2251,11 +2247,6 @@ impl RuntimeManager {
             ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        // Scope keying derives from the persisted conv_mode's worktree path,
-        // the same authority every DB-facing path uses. An Explore sub-agent
-        // has `worktree_path: None`, so it scopes to its own
-        // `ResourceScopeKey::Conversation(id)` — isolated from the parent, matching
-        // the inventory / cleanup / SSE derivations.
         conv_context.work_scope_worktree = sub_conv_mode.worktree_path().map(PathBuf::from);
         // Sub-agent inherits parent's worktree cwd; discover the project's
         // tasks directory the same way the parent did.
@@ -2529,10 +2520,6 @@ impl RuntimeManager {
             ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
-        // Scope keying derives from the persisted conv_mode's worktree path,
-        // the single authority every DB-facing path uses for
-        // `ResourceScopeKey::resolve`. Keeps `ToolContext.work_scope` in lock-step
-        // with the inventory / cleanup / SSE scope derivations.
         context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
         // Discover the project's tasks directory once at conversation
         // startup; cached for the lifetime of this runtime so state machine,
@@ -4661,8 +4648,8 @@ mod scope_liveness_tests {
         );
     }
 
-    /// A `ResourceScopeKey::Conversation(id)` whose row is genuinely absent
-    /// (`DbError::ConversationNotFound`) is `Ok(false)` — a definitive
+    /// A genuinely absent work-scope row (`DbError::ConversationNotFound`) is
+    /// `Ok(false)` — a definitive
     /// "not live", not an error. A non-NotFound DB error propagates as
     /// `Err` instead, leaving each caller to pick its policy (idle reaper
     /// preserves, cleanup cascade fails the operation). That error path

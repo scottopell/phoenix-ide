@@ -11535,9 +11535,8 @@ pub(crate) mod hard_delete_cascade_tests {
         );
     }
 
-    /// Create a single Work-mode conversation bound to `worktree`, so it
-    /// resolves to `ResourceScopeKey::Worktree(worktree)`. No continuation, no
-    /// parent — the caller wires those up as the scenario needs. Returns
+    /// Create a single Work-mode conversation bound to `worktree`. No
+    /// continuation or parent is set here; the caller wires those up as needed. Returns
     /// once the row exists.
     async fn create_workmode_conv_on_worktree(
         state: &AppState,
@@ -11710,9 +11709,8 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     /// Build a real git repo + shared worktree with a parent + sub-agent
-    /// pair of Work-mode conversations bound to it. Both resolve to
-    /// `ResourceScopeKey::Worktree(worktree)`; the sub-agent points at the parent
-    /// via `parent_conversation_id` and inherits the same `worktree_path`.
+    /// pair of Work-mode conversations bound to it. The sub-agent points at the
+    /// parent via `parent_conversation_id` and shares its durable work scope.
     /// Returns the temp dir (kept alive by the caller), repo root, worktree
     /// path, and branch name.
     async fn build_parent_subagent_on_shared_worktree(
@@ -11913,9 +11911,8 @@ pub(crate) mod hard_delete_cascade_tests {
         // the row by value and never re-reads it.
         let conv = state.db.get_conversation("leaf").await.expect("get conv");
 
-        // Fault injection: closing the pool makes the ResourceScopeKey::Worktree
-        // sibling-liveness query (`list_conversations_for_worktree`) return a
-        // non-NotFound DbError — the exact transient-failure shape the fix
+        // Fault injection: closing the pool makes the work-scope liveness query
+        // return a non-NotFound DbError — the exact transient-failure shape the fix
         // must propagate rather than swallow to "assume live".
         state.db.pool().close().await;
 

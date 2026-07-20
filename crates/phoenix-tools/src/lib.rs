@@ -609,12 +609,6 @@ impl ToolContext {
         // `new-session -c` when a fresh server is spawned so the pane
         // shell starts in the conversation's project. Ignored on
         // re-attach (see `ensure_live` doc).
-        //
-        // `worktree_path` controls socket keying: worktree-scoped for
-        // Work/Branch/Explore, conv-scoped for Direct (task 03001). The
-        // ToolContext computes `work_scope` from this at construction time;
-        // tmux ownership is keyed off the scope rather than re-deciding
-        // the worktree-vs-conversation fallback at each callsite.
         self.tmux_registry
             .ensure_live(&self.work_scope, &self.working_dir)
             .await

@@ -11,16 +11,10 @@
 //! memory `TmuxServer` entry is rebuilt on the first operation after
 //! restart by probing the socket.
 //!
-//! Registry + socket keying (task 03001, REQ-TMUX-WS-001): both the
-//! `HashMap` entry and the socket path are keyed by `ResourceScopeKey` —
-//! `ResourceScopeKey::Worktree(path)` for Work/Branch/Explore conversations and
-//! `ResourceScopeKey::Conversation(id)` for Direct-mode conversations.
-//! Continuations resolving to the same scope share the entry and the
-//! socket, so session continuity across context-exhaustion continuations
-//! is correct by construction — the worktree is the logical coding
-//! environment, and the tmux session IS that environment's shell state.
-//! The map key itself is `ResourceScopeKey::stable_key()`, which gives
-//! `worktree:` and `conversation:` disjoint namespaces.
+//! Both the `HashMap` entry and socket path are keyed by `ResourceScopeKey`.
+//! Conversation resources use their persisted durable work-scope ID, so every
+//! continuation in that scope shares the same tmux session. The global terminal
+//! occupies a structurally separate namespace.
 //!
 //! Lock ordering for `ensure_live`: acquire the registry's
 //! `RwLock<HashMap>` long enough to clone (or insert) the per-scope
@@ -124,10 +118,7 @@ pub enum ServerStatus {
 /// performed a tmux operation; scopes that never use tmux have no entry.
 ///
 /// `socket_path` is computed once at entry creation and is stable for
-/// the entry's lifetime (REQ-TMUX-001 / `SocketPathDeterministic`
-/// invariant). For `ResourceScopeKey::Worktree(path)` the path is keyed to the
-/// worktree; for `ResourceScopeKey::Conversation(id)` it falls back to the
-/// conversation id (task 03001 / REQ-TMUX-WS-001).
+/// the entry's lifetime (REQ-TMUX-001 / `SocketPathDeterministic` invariant).
 #[derive(Debug)]
 pub struct TmuxServer {
     /// The scope this server belongs to. Diagnostic field — the
@@ -433,13 +424,8 @@ impl TmuxRegistry {
     /// when the probe sees `Live` — re-attaching to an existing server
     /// uses whatever start directory was set when it was first spawned.
     ///
-    /// `work_scope` controls registry keying *and* socket keying (task
-    /// 03001, REQ-TMUX-WS-001):
-    /// - `ResourceScopeKey::Worktree(path)` — Work/Branch/Explore: registry
-    ///   entry and socket keyed to the worktree path so continuations
-    ///   resolving to the same scope automatically share the same session.
-    /// - `ResourceScopeKey::Conversation(id)` — Direct mode: registry entry and
-    ///   socket keyed to the conversation id.
+    /// `work_scope` controls registry and socket keying. Conversation resources
+    /// use the durable work-scope ID; the global terminal uses its separate key.
     ///
     /// On `Live`: no spawn, status=Live.
     /// On `NoSocket`: spawn `main` session in `cwd`, status=Live.
@@ -1583,7 +1569,7 @@ mod tests {
         );
     }
 
-    /// Every continuation retains its parent's durable WorkScopeId. Cascade
+    /// Every continuation retains its parent's durable `WorkScopeId`. Cascade
     /// must therefore skip kill/unlink when a successor inherits the scope.
     #[tokio::test]
     async fn cascade_on_delete_continuation_preserves_socket() {

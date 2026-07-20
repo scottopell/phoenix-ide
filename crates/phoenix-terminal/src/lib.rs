@@ -1,7 +1,7 @@
 //! PTY-backed terminal sessions — REQ-TERM-001 through REQ-TERM-014.
 //!
 //! Sessions are keyed by `ResourceScopeKey`, so at most one terminal is active per
-//! scope (REQ-TERM-003 generalised). `ResourceScopeKey::Global` provides the
+//! scope (REQ-TERM-003 generalised). `ResourceScopeKey::GlobalTerminal` provides the
 //! singleton terminal surfaced on `/new`. Sessions spawn on WebSocket
 //! upgrade and tear down per the scope's lifecycle (REQ-TERM-012).
 //!

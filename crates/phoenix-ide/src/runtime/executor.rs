@@ -4894,16 +4894,7 @@ where
         self.tool_cancel_token = Some(cancel_token.clone());
         let cancel_token_check = cancel_token.clone();
 
-        // Create ToolContext for this invocation. The scope-defining worktree
-        // path is the persisted `conv_mode.worktree_path()`, cached on the
-        // context at construction (`work_scope_worktree`). It is `Some` for
-        // Work/Branch and top-level Explore (which own a worktree) and `None`
-        // for Direct and sub-agent Explore (no worktree of their own). Using
-        // this — rather than `mode != Direct → working_dir` — keeps
-        // `ToolContext.work_scope` in lock-step with the DB-facing scope
-        // derivations: a sub-agent Explore resolves to
-        // `ResourceScopeKey::Conversation(id)` on both sides instead of diverging to
-        // `ResourceScopeKey::Worktree(cwd)` on the tool side only.
+        // Use the normalized environment cached at runtime construction.
         let scope_worktree = self.context.work_scope_worktree.clone();
         let progress_broadcaster = self.broadcast_tx.clone();
         let progress_tool_use_id = tool.id.clone();
@@ -5657,12 +5648,7 @@ where
                     worktree_path: approval_result.worktree_path.clone(),
                 });
 
-                // Refresh the cached scope-defining worktree so in-runtime tool
-                // calls (bash/tmux/browser) key resources under the same
-                // `ResourceScopeKey` the DB-facing inventory/cleanup resolve. Approval
-                // promotes Explore (no worktree -> `ResourceScopeKey::Conversation`) to
-                // Work (owns a worktree -> `ResourceScopeKey::Worktree`); leaving the
-                // cached value stale would split the two sides until restart.
+                // Refresh the cached environment after approval creates a worktree.
                 // The post-approval `conv_mode` is Work, whose
                 // `worktree_path()` is the path just created, mirroring how
                 // construction seeds this from `conv_mode.worktree_path()`.

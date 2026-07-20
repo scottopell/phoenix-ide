@@ -61,11 +61,7 @@ pub async fn terminal_ws_handler(
                     );
                     return;
                 }
-                // worktree_path drives ResourceScopeKey keying (task 03001 / Phase 2):
-                // typed on `ConvMode` for Work, Branch, and managed Explore.
-                // Sub-agent Explore returns None and never reaches this code
-                // (no user PTY), so no fallback is needed. Direct returns None
-                // (resolves to ResourceScopeKey::Conversation).
+                // Scope comes from the conversation's persisted durable identity.
                 let scope = ResourceScopeKey::Work(
                     conv.work_scope_id
                         .expect("persisted conversation has work scope"),
@@ -93,7 +89,7 @@ pub async fn terminal_ws_global_handler(
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let runtime = Arc::clone(&state.runtime);
-    // cwd per specs/terminal/terminal.allium (ResourceScopeKey::Global -> $HOME).
+    // The global terminal starts in the home directory.
     let cwd = state.runtime_env.home().to_path_buf();
     ws.on_upgrade(move |socket| {
         handle_socket(
@@ -382,13 +378,9 @@ async fn acquire_handle(
 /// (REQ-TMUX-002), reuses it after Phoenix restart (REQ-TMUX-005), and
 /// recreates over a stale socket (REQ-TMUX-006).
 ///
-/// The caller's already-resolved `scope` is passed in directly so the
-/// tmux socket selection matches the terminal's ownership scope
-/// (REQ-TERM-WS-001). Re-resolving here from `(conversation_id,
-/// worktree_path)` would silently downgrade `ResourceScopeKey::Global` to
-/// `Conversation("global")`, breaking the singleton tmux session — and
-/// would also drop the disjointness between Worktree and Conversation
-/// scopes that share an inner string.
+/// The caller's persisted `scope` is passed in directly so tmux socket
+/// selection matches terminal ownership (REQ-TERM-WS-001). The global terminal
+/// remains structurally separate from durable conversation work scopes.
 async fn resolve_exec_plan(
     conversation_id: &str,
     scope: &ResourceScopeKey,
