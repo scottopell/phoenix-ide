@@ -87,8 +87,10 @@ export function BrowserViewPanel({
 
   const stopBrowserSession = useCallback(async () => {
     if (stopping) return;
-    stoppingRef.current = true;
-    setStopping(true);
+    const terminalBeforeRequest = statusRef.current.kind === 'no-session'
+      || statusRef.current.kind === 'ended';
+    stoppingRef.current = !terminalBeforeRequest;
+    setStopping(!terminalBeforeRequest);
     if (reconnectTimerRef.current !== null) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;

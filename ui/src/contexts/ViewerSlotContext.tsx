@@ -371,9 +371,11 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   // excluded by design (D1): the URL is authoritative there. A URL that already
   // carries viewer params is left alone (browser back/forward, shared link).
   const enteredScopeRef = useRef<string | undefined | typeof UNSET_SCOPE>(UNSET_SCOPE);
+  const restorationScheduledForScopeRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     const isEntry = enteredScopeRef.current !== scopeKey;
     if (!isEntry) return;
+    restorationScheduledForScopeRef.current = undefined;
     if (!scopeKey) {
       enteredScopeRef.current = scopeKey;
       return;
@@ -409,6 +411,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       }
     }
     enteredScopeRef.current = scopeKey;
+    restorationScheduledForScopeRef.current = scopeKey;
     setSearchParams(storedParams, { replace: true });
   }, [scopeKey, browserSessionActive, location.key, searchParams, setSearchParams]);
 
@@ -436,7 +439,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     const prev = prevActiveRef.current;
     prevActiveRef.current = browserSessionActive;
     if (prev !== true && browserSessionActive === true && slotKind === 'none') {
-      openBrowser();
+      if (restorationScheduledForScopeRef.current !== scopeKey) openBrowser();
     } else if (prev === true && browserSessionActive === false && slotKind === 'browser') {
       // Browser snapshots are only useful while their server-owned session is
       // live. Keeping one here would restore a dead full-screen viewer on the

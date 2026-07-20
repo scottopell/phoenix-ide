@@ -402,6 +402,38 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(getLastViewer('conv-A')).toBeNull();
   });
 
+  it('restores a durable viewer instead of auto-opening an already-active browser', () => {
+    setLastViewer('conv-A', 'viewer=prose&file=%2Frepo%2FREADME.md&root=%2Frepo');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean | undefined) => void) | null = null;
+    function Destination() {
+      const [active, setActiveState] = useState<boolean | undefined>(undefined);
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={<Destination />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+    act(() => { setActive!(true); });
+
+    expect(latest!.slot.kind).toBe('prose');
+  });
+
   it('restores a stored browser viewer only after loaded session truth is active', () => {
     setLastViewer('conv-A', 'viewer=browser');
     let latest: ViewerSlotValue | null = null;

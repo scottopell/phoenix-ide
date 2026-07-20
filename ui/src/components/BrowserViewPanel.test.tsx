@@ -106,6 +106,21 @@ describe('BrowserViewPanel stop-session control', () => {
     expect(screen.queryByText('Stopping browser…')).toBeNull();
   });
 
+  it.each(['no-session', 'ended'])('does not enter pending stop from an already-%s state', async (terminalStatus) => {
+    stopBrowser.mockResolvedValue({ success: true });
+    render(<BrowserViewPanel conversationId="conv-1" />);
+    act(() => { sockets[0]!.onmessage?.(statusMessage(terminalStatus)); });
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Stop browser session'));
+      await Promise.resolve();
+    });
+
+    expect(stopBrowser).toHaveBeenCalledWith('conv-1');
+    expect(screen.getByLabelText('Stop browser session')).not.toBeDisabled();
+    expect(screen.queryByText('Stopping browser…')).toBeNull();
+  });
+
   it('back to conversation remains available while teardown is pending', async () => {
     const onClose = vi.fn();
     stopBrowser.mockResolvedValue({ success: true });
