@@ -339,41 +339,48 @@ describe('InputArea cancellation affordance', () => {
     expect(onSend).toHaveBeenCalledWith('hello', [], []);
   });
 
-  it('renders continuation progress without a Stop button', () => {
-    const onCancel = vi.fn();
+  it('replaces the composer with continuation progress', () => {
     renderInput({
       cwd: 'conv-continuation',
       convState: { type: 'awaiting_continuation', attempt: 1 },
-      onCancel,
     });
 
     expect(screen.getByRole('status')).toHaveTextContent('Compacting conversation...');
     expect(screen.getByText(/preserve context for a new conversation/i)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /stop/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /stop|send|queue/i })).not.toBeInTheDocument();
   });
 
-  it('does not send from click or Enter while awaiting continuation', () => {
+  it('restores the retained draft after continuation completes', () => {
     const onSend = vi.fn();
-    render(
+    const commonProps = {
+      cwd: 'conv-continuation',
+      scopeKey: 'conv-continuation',
+      images: [],
+      setImages: () => {},
+      isOffline: false,
+      failedMessages: [],
+      draft: 'retained follow-up',
+      onDraftChange: () => {},
+      onSend,
+      onCancel: () => {},
+      onRetry: () => {},
+    };
+    const { rerender } = render(<InputArea {...commonProps} convState={idleState} />);
+
+    expect(screen.getByRole('textbox')).toHaveValue('retained follow-up');
+
+    rerender(
       <InputArea
-        cwd="conv-continuation"
-        scopeKey="conv-continuation"
+        {...commonProps}
         convState={{ type: 'awaiting_continuation', attempt: 1 }}
-        images={[]}
-        setImages={() => {}}
-        isOffline={false}
-        failedMessages={[]}
-        draft="queued follow-up"
-        onDraftChange={() => {}}
-        onSend={onSend}
-        onCancel={() => {}}
-        onRetry={() => {}}
       />,
     );
-
-    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
-    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     expect(onSend).not.toHaveBeenCalled();
+
+    rerender(<InputArea {...commonProps} convState={idleState} />);
+    expect(screen.getByRole('textbox')).toHaveValue('retained follow-up');
   });
 
   it('keeps Stopping disabled while allowing a queued follow-up during tool cancellation', () => {
@@ -445,7 +452,7 @@ describe('InputArea cancellation affordance', () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it('does not call onCancel for Escape while awaiting continuation', () => {
+  it('does not expose a cancellation control while awaiting continuation', () => {
     const onCancel = vi.fn();
     renderInput({
       cwd: 'conv-continuation',
@@ -453,7 +460,8 @@ describe('InputArea cancellation affordance', () => {
       onCancel,
     });
 
-    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Escape' });
+    fireEvent.keyDown(screen.getByRole('status'), { key: 'Escape' });
+    expect(screen.queryByRole('button', { name: /stop/i })).not.toBeInTheDocument();
     expect(onCancel).not.toHaveBeenCalled();
   });
 });

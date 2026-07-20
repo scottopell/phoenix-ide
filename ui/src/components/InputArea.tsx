@@ -576,15 +576,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     : 'Type a message...';
   const placeholder = isOffline
     ? 'Type a message (will send when back online)...'
-    : convState.type === 'awaiting_continuation'
-      ? 'Compacting conversation...'
-      : isCancelling
-        ? 'Stopping...'
-        : convState.type === 'awaiting_llm'
-          ? 'Preparing request...'
-          : agentWorking
-            ? 'Agent working... send to queue a follow-up'
-            : hint ? `${baseText} (${hint})` : baseText;
+    : isCancelling
+      ? 'Stopping...'
+      : convState.type === 'awaiting_llm'
+        ? 'Preparing request...'
+        : agentWorking
+          ? 'Agent working... send to queue a follow-up'
+          : hint ? `${baseText} (${hint})` : baseText;
 
   // =========================================================================
   // Render
@@ -627,19 +625,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               )}
             </div>
           ))}
-        </div>
-      )}
-
-      {convState.type === 'awaiting_continuation' && (
-        <div className="continuation-progress" role="status" aria-live="polite">
-          <div className="continuation-progress-header">
-            <span>Compacting conversation...</span>
-            <span className="continuation-progress-caption">Preparing a continuation</span>
-          </div>
-          <div className="continuation-progress-bar" aria-hidden="true">
-            <div className="continuation-progress-bar-fill" />
-          </div>
-          <p className="continuation-progress-text">Phoenix is generating a continuation summary to preserve context for a new conversation.</p>
         </div>
       )}
 
@@ -734,63 +719,76 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         </div>
       )}
 
-      <form
-        className={`input-textarea-wrap${agentWorking ? ' input-textarea-wrap--working' : ''}`}
-        onSubmit={(event) => {
-          event.preventDefault();
-          handleSend();
-        }}
-      >
-        <textarea
-          ref={textareaRef}
-          id="message-input"
-          placeholder={placeholder}
-          rows={2}
-          enterKeyHint="send"
-          value={voiceBase !== null
-            ? (voiceBase.trim()
-                ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')
-                : voiceInterim)
-            : draft}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-          onSelect={ir.onSelectionChange}
-        />
-        <div className="input-inline-actions">
-          {!agentWorking && voiceSupported && (
-            <VoiceRecorder
-              onStart={handleVoiceStart}
-              onEnd={handleVoiceEnd}
-              onSpeech={handleVoiceFinal}
-              onInterim={handleVoiceInterim}
-              disabled={agentWorking}
-            />
-          )}
-          {(canCancel || isCancelling) && (
-            <button
-              type="button"
-              className="input-stop-btn"
-              onClick={onCancel}
-              disabled={isCancelling || isOffline}
-              title="Stop agent (Esc)"
-            >
-              {isCancelling ? 'Stopping...' : 'Stop'}
-            </button>
-          )}
-          {acceptsChatMessage && (
-            <button
-              type="submit"
-              className="input-send-btn"
-              disabled={!sendEnabled}
-              title={agentWorking ? 'Queue follow-up (Enter)' : 'Send message (Enter)'}
-              aria-label={agentWorking ? 'Queue follow-up' : 'Send message'}
-            >
-              {agentWorking ? 'Queue' : 'Send'}
-            </button>
-          )}
+      {convState.type === 'awaiting_continuation' ? (
+        <div className="continuation-progress" role="status" aria-live="polite">
+          <div className="continuation-progress-header">
+            <span>Compacting conversation...</span>
+            <span className="continuation-progress-caption">Preparing a continuation</span>
+          </div>
+          <div className="continuation-progress-bar" aria-hidden="true">
+            <div className="continuation-progress-bar-fill" />
+          </div>
+          <p className="continuation-progress-text">Phoenix is generating a continuation summary to preserve context for a new conversation.</p>
         </div>
-      </form>
+      ) : (
+        <form
+          className={`input-textarea-wrap${agentWorking ? ' input-textarea-wrap--working' : ''}`}
+          onSubmit={(event) => {
+            event.preventDefault();
+            handleSend();
+          }}
+        >
+          <textarea
+            ref={textareaRef}
+            id="message-input"
+            placeholder={placeholder}
+            rows={2}
+            enterKeyHint="send"
+            value={voiceBase !== null
+              ? (voiceBase.trim()
+                  ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')
+                  : voiceInterim)
+              : draft}
+            onChange={handleChange}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            onSelect={ir.onSelectionChange}
+          />
+          <div className="input-inline-actions">
+            {!agentWorking && voiceSupported && (
+              <VoiceRecorder
+                onStart={handleVoiceStart}
+                onEnd={handleVoiceEnd}
+                onSpeech={handleVoiceFinal}
+                onInterim={handleVoiceInterim}
+                disabled={agentWorking}
+              />
+            )}
+            {(canCancel || isCancelling) && (
+              <button
+                type="button"
+                className="input-stop-btn"
+                onClick={onCancel}
+                disabled={isCancelling || isOffline}
+                title="Stop agent (Esc)"
+              >
+                {isCancelling ? 'Stopping...' : 'Stop'}
+              </button>
+            )}
+            {acceptsChatMessage && (
+              <button
+                type="submit"
+                className="input-send-btn"
+                disabled={!sendEnabled}
+                title={agentWorking ? 'Queue follow-up (Enter)' : 'Send message (Enter)'}
+                aria-label={agentWorking ? 'Queue follow-up' : 'Send message'}
+              >
+                {agentWorking ? 'Queue' : 'Send'}
+              </button>
+            )}
+          </div>
+        </form>
+      )}
     </footer>
   );
 });
