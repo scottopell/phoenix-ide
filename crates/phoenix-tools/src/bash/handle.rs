@@ -24,7 +24,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use phoenix_core::work_scope::ResourceScopeKey;
+use phoenix_core::work_scope::{ResourceAuthority, ResourceScopeKey};
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
 
@@ -180,6 +180,8 @@ pub enum ExitState {
 pub struct Handle {
     pub work_scope: ResourceScopeKey,
     pub handle_id: HandleId,
+    pub creator_conversation_id: String,
+    pub authority: ResourceAuthority,
     pub cmd: String,
     /// Optional human-readable annotation supplied at run-time. Echoed on
     /// every response carrying the handle and on each `live_handles[]`
@@ -233,6 +235,32 @@ impl Handle {
         pid: u32,
         ring_bytes_cap: usize,
     ) -> Arc<Self> {
+        Self::new_live_for_actor(
+            work_scope,
+            handle_id,
+            "system".to_string(),
+            ResourceAuthority::Work,
+            cmd,
+            label,
+            pgid,
+            pid,
+            ring_bytes_cap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    #[must_use]
+    pub fn new_live_for_actor(
+        work_scope: ResourceScopeKey,
+        handle_id: HandleId,
+        creator_conversation_id: String,
+        authority: ResourceAuthority,
+        cmd: String,
+        label: Option<String>,
+        pgid: i32,
+        pid: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Self> {
         let live = LiveData {
             pgid,
             pid,
@@ -242,6 +270,8 @@ impl Handle {
         Arc::new(Self {
             work_scope,
             handle_id,
+            creator_conversation_id,
+            authority,
             cmd,
             label,
             started_at: SystemTime::now(),

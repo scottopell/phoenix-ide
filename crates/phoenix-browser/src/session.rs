@@ -24,7 +24,7 @@ use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use phoenix_core::work_scope::ResourceScopeKey;
+use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
 
 /// Derive a Chrome user data dir from a `ResourceScopeKey::stable_key()`.
 ///
@@ -101,6 +101,9 @@ pub enum BrowserError {
 
     #[error("Browser session init timed out after {0:?}")]
     InitTimeout(Duration),
+
+    #[error("browser session access denied for this actor")]
+    AccessDenied,
 }
 
 impl From<chromiumoxide::error::CdpError> for BrowserError {
@@ -877,6 +880,8 @@ pub type ScopeLivenessHook =
 /// plus the live session arc.
 struct ScopedSession {
     scope: ResourceScopeKey,
+    creator_conversation_id: String,
+    authority: ResourceAuthority,
     session: Arc<RwLock<BrowserSession>>,
     user_data_key: String,
     kill_done: Arc<Notify>,
@@ -1006,6 +1011,23 @@ impl BrowserSessionManager {
         }
     }
 
+    /// Actor-authorized session access. A restricted actor cannot attach to a
+    /// Work session merely because it shares the scope. Work actors retain the
+    /// one-session-per-scope semantics and may control either authority kind.
+    pub async fn get_session_for_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
+        let key = work_scope.stable_key();
+        if let Some(entry) = self.sessions.read().await.get(&key) {
+            if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+                return Err(BrowserError::AccessDenied);
+            }
+        }
+        self.get_session_with_creator(work_scope, actor).await
+    }
+
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///
@@ -1022,6 +1044,15 @@ impl BrowserSessionManager {
         &self,
         work_scope: &ResourceScopeKey,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
+        let system = EffectiveResourceAccess::new("browser-manager", ResourceAuthority::Work);
+        self.get_session_with_creator(work_scope, &system).await
+    }
+
+    async fn get_session_with_creator(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
         let key = work_scope.stable_key();
 
         let mut sessions = loop {
@@ -1034,6 +1065,9 @@ impl BrowserSessionManager {
                         self.wait_for_kill_completion(&key, kill_done).await;
                         continue;
                     }
+                    if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+                        return Err(BrowserError::AccessDenied);
+                    }
                     return Ok(entry.session.clone());
                 }
             }
@@ -1045,6 +1079,9 @@ impl BrowserSessionManager {
                     drop(sessions);
                     self.wait_for_kill_completion(&key, kill_done).await;
                     continue;
+                }
+                if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+                    return Err(BrowserError::AccessDenied);
                 }
                 return Ok(entry.session.clone());
             }
@@ -1089,6 +1126,8 @@ impl BrowserSessionManager {
             key.clone(),
             ScopedSession {
                 scope: work_scope.clone(),
+                creator_conversation_id: actor.conversation_id().to_string(),
+                authority: actor.authority(),
                 session: session_arc.clone(),
                 user_data_key: key.clone(),
                 kill_done: Arc::new(Notify::new()),
@@ -1103,6 +1142,22 @@ impl BrowserSessionManager {
 
         Ok(session_arc)
     }
+    pub async fn get_existing_for_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) -> Result<Option<Arc<RwLock<BrowserSession>>>, BrowserError> {
+        let key = work_scope.stable_key();
+        let sessions = self.sessions.read().await;
+        let Some(entry) = sessions.get(&key) else {
+            return Ok(None);
+        };
+        if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+            return Err(BrowserError::AccessDenied);
+        }
+        Ok(Some(entry.session.clone()))
+    }
+
     /// Get the session for a `work_scope` **without creating one**.
     ///
     /// Used by the live-view WS endpoint, which deliberately must not spawn
@@ -1385,10 +1440,12 @@ mod lifecycle_hook_tests {
     //! tests in `super::tests`.
 
     use super::{
-        BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleSink,
+        BrowserError, BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleSink,
         BrowserSessionManager,
     };
-    use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+    use phoenix_core::work_scope::{
+        EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey, WorkScopeId,
+    };
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::RwLock;
@@ -1453,6 +1510,22 @@ mod lifecycle_hook_tests {
         assert_ne!(first.stable_key(), second.stable_key());
         assert_ne!(first.stable_key(), global.stable_key());
         assert_ne!(second.stable_key(), global.stable_key());
+    }
+
+    #[tokio::test]
+    async fn restricted_actor_cannot_attach_to_work_session_in_shared_scope() {
+        let (manager, _rx) = install_sink();
+        let shared = scope("shared-work-scope");
+        let work = EffectiveResourceAccess::new("work-parent", ResourceAuthority::Work);
+        let restricted =
+            EffectiveResourceAccess::new("explore-child", ResourceAuthority::Restricted);
+
+        let _session = manager
+            .get_session_for_actor(&shared, &work)
+            .await
+            .expect("work parent creates session");
+        let denied = manager.get_session_for_actor(&shared, &restricted).await;
+        assert!(matches!(denied, Err(BrowserError::AccessDenied)));
     }
 
     /// Test the full create-emit + kill-emit pair end-to-end using a

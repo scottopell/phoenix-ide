@@ -17,6 +17,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use nix::sys::wait::waitpid;
+use phoenix_core::domain::db_schema::ConvMode;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
 use phoenix_terminal::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
@@ -51,6 +52,15 @@ pub async fn terminal_ws_handler(
     ws.on_upgrade(move |socket| async move {
         let (cwd, scope) = match db.get_conversation(&conversation_id).await {
             Ok(conv) => {
+                if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent
+                    && matches!(conv.conv_mode, ConvMode::Explore { .. })
+                {
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        "Terminal: restricted sub-agent denied conversation terminal access"
+                    );
+                    return;
+                }
                 // worktree_path drives ResourceScopeKey keying (task 03001 / Phase 2):
                 // typed on `ConvMode` for Work, Branch, and managed Explore.
                 // Sub-agent Explore returns None and never reaches this code

@@ -147,6 +147,60 @@ impl AuthorityKind {
     }
 }
 
+/// Authority stamped onto same-scope process and browser resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceAuthority {
+    Restricted,
+    Work,
+}
+
+/// The actor identity and effective authority presented to a resource manager.
+/// Scope routing remains independent: this value only decides whether an actor
+/// may control the resource found at that scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveResourceAccess {
+    conversation_id: String,
+    authority: ResourceAuthority,
+}
+
+impl EffectiveResourceAccess {
+    #[must_use]
+    pub fn new(conversation_id: impl Into<String>, authority: ResourceAuthority) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            authority,
+        }
+    }
+
+    #[must_use]
+    pub fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> ResourceAuthority {
+        self.authority
+    }
+
+    /// Work actors control resources in their scope. Restricted actors may
+    /// control only restricted resources they created themselves.
+    #[must_use]
+    pub fn can_control(
+        &self,
+        creator_conversation_id: &str,
+        resource_authority: ResourceAuthority,
+    ) -> bool {
+        self.authority == ResourceAuthority::Work
+            || (resource_authority == ResourceAuthority::Restricted
+                && self.conversation_id == creator_conversation_id)
+    }
+
+    #[must_use]
+    pub fn with_authority(&self, authority: ResourceAuthority) -> Self {
+        Self::new(self.conversation_id.clone(), authority)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkScopeLifecycle {

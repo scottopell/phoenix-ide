@@ -347,6 +347,9 @@ pub struct ToolContext {
     /// The conversation this tool is executing within
     pub conversation_id: String,
 
+    /// Actor identity and effective authority for same-scope resources.
+    pub resource_access: phoenix_core::work_scope::EffectiveResourceAccess,
+
     /// Root conversation for trace correlation across sub-agents.
     pub root_conversation_id: String,
 
@@ -416,11 +419,45 @@ impl ToolContext {
         worktree_path: Option<PathBuf>,
         work_scope_id: phoenix_core::work_scope::WorkScopeId,
     ) -> Self {
+        Self::new_with_resource_access(
+            cancel,
+            conversation_id,
+            working_dir,
+            browser_sessions,
+            bash_handles,
+            llm_selector,
+            terminals,
+            tmux_registry,
+            worktree_path,
+            work_scope_id,
+            phoenix_core::work_scope::ResourceAuthority::Work,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_resource_access(
+        cancel: CancellationToken,
+        conversation_id: String,
+        working_dir: PathBuf,
+        browser_sessions: Arc<BrowserSessionManager>,
+        bash_handles: Arc<BashHandleRegistry>,
+        llm_selector: Arc<dyn LlmSelector>,
+        terminals: phoenix_terminal::ActiveTerminals,
+        tmux_registry: Arc<TmuxRegistry>,
+        worktree_path: Option<PathBuf>,
+        work_scope_id: phoenix_core::work_scope::WorkScopeId,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> Self {
         let root_conversation_id = conversation_id.clone();
         let work_scope = ResourceScopeKey::Work(work_scope_id);
+        let resource_access = phoenix_core::work_scope::EffectiveResourceAccess::new(
+            conversation_id.clone(),
+            authority,
+        );
         Self {
             cancel,
             conversation_id,
+            resource_access,
             root_conversation_id,
             working_dir,
             browser_sessions,
@@ -490,7 +527,18 @@ impl ToolContext {
     /// Returns [`BrowserError`] when Chrome cannot be launched or the
     /// session fails to initialize on first use.
     pub async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
-        self.browser_sessions.get_session(&self.work_scope).await
+        self.browser_sessions
+            .get_session_for_actor(&self.work_scope, &self.resource_access)
+            .await
+    }
+
+    #[must_use]
+    pub fn with_resource_authority(
+        mut self,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> Self {
+        self.resource_access = self.resource_access.with_authority(authority);
+        self
     }
 
     /// Get the per-`ResourceScopeKey` bash handle table.

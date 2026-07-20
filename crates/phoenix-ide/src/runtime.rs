@@ -2236,6 +2236,14 @@ impl RuntimeManager {
             root_conversation_id,
         );
         conv_context.max_turns = spec.max_turns;
+        conv_context.work_scope_id = conv
+            .work_scope_id
+            .clone()
+            .expect("sub-agent conversations always have a work scope");
+        conv_context.resource_authority = match spec.mode {
+            SubAgentMode::Explore => crate::work_scope::ResourceAuthority::Restricted,
+            SubAgentMode::Work => crate::work_scope::ResourceAuthority::Work,
+        };
         conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
         conv_context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         conv_context.mode = match &sub_conv_mode {
@@ -2502,6 +2510,16 @@ impl RuntimeManager {
             )
         } else {
             ConvContext::new(&conv.id, conv_cwd.path_buf(), &model_id, context_window)
+        };
+        context.work_scope_id = conv
+            .work_scope_id
+            .clone()
+            .expect("ordinary conversations always have a work scope");
+        context.resource_authority = match conv.conv_mode {
+            ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                crate::work_scope::ResourceAuthority::Work
+            }
         };
         context.mode_context = Some(mode_context);
         context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();

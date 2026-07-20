@@ -1699,10 +1699,8 @@ where
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
-    /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection.
+    /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection
     llm_task_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Active provider attempt retained outside the task for cancellation metrics.
-    active_llm_attempt: Option<phoenix_llm::LlmAttemptCapture>,
     /// Abort handle for the in-flight retry-backoff timer spawned by
     /// `Effect::ScheduleRetry`. Kept so a transition out of the
     /// retry-scheduling state can proactively abort the timer task before it
@@ -1956,7 +1954,6 @@ where
             broadcast_tx,
             tool_cancel_token: None,
             llm_task_handle: None,
-            active_llm_attempt: None,
             retry_timer_handle: None,
             turn_span: None,
             turn_trigger: super::TurnTriggerSlot::default(),
@@ -2208,8 +2205,24 @@ where
                     }
                 }
                 Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
-                    self.process_generation_tagged_llm_outcome(generation, llm_outcome)
-                        .await;
+                    // Generation guard for the LLM request, mirroring the
+                    // `RetryTimeout` guard above. A `forward_llm_outcome` send
+                    // whose generation has been superseded (by a later dispatch
+                    // or an intentional `Effect::AbortLlm`) is stale: its
+                    // synthetic NetworkError must not be applied to the current,
+                    // unrelated `LlmRequesting` turn. Drop it.
+                    if self.llm_outcome_is_stale(generation) {
+                        tracing::debug!(
+                            outcome_generation = generation,
+                            current_generation = self.llm_request_generation,
+                            state = self.state.variant_name(),
+                            "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
+                        );
+                    } else if let Err(e) =
+                        self.process_outcome(EffectOutcome::Llm(llm_outcome)).await
+                    {
+                        tracing::warn!(error = %e, "Outcome rejected by state machine");
+                    }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -2445,33 +2458,17 @@ where
         }
     }
 
-    /// Accept a forwarded LLM outcome only when its generation is current.
+    /// Process a typed effect outcome from a background task.
     ///
-    /// A later dispatch or abort supersedes the generation. Its stale outcome
-    /// cannot clear the current request's task handle or metrics capture;
-    /// current outcomes consume both before entering the state machine.
-    async fn process_generation_tagged_llm_outcome(
-        &mut self,
-        generation: u64,
-        llm_outcome: LlmOutcome,
-    ) {
-        if self.llm_outcome_is_stale(generation) {
-            tracing::debug!(
-                outcome_generation = generation,
-                current_generation = self.llm_request_generation,
-                state = self.state.variant_name(),
-                "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
-            );
-            return;
-        }
-
-        self.llm_task_handle = None;
-        self.active_llm_attempt = None;
-        if let Err(error) = self.process_outcome(EffectOutcome::Llm(llm_outcome)).await {
-            tracing::warn!(%error, "Outcome rejected by state machine");
-        }
-    }
-
+    /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
+    /// are logged and discarded — state unchanged.
+    /// Whether a forwarded LLM outcome stamped with `generation` belongs to a
+    /// superseded request. An outcome is stale when its generation no longer
+    /// matches the current in-flight generation — either a later
+    /// `Effect::RequestLlm` opened a newer generation, or an intentional
+    /// `Effect::AbortLlm` bumped it. Stale outcomes (including the synthetic
+    /// `NetworkError` produced when an aborted task drops its sender) are
+    /// discarded so they cannot misfire on a subsequent unrelated turn.
     fn llm_outcome_is_stale(&self, generation: u64) -> bool {
         generation != self.llm_request_generation
     }
@@ -2497,10 +2494,6 @@ where
         generation != self.retry_generation
     }
 
-    /// Process a typed effect outcome from a background task.
-    ///
-    /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
-    /// are logged and discarded — state unchanged.
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
@@ -4137,14 +4130,6 @@ where
                 if let Some(handle) = self.llm_task_handle.take() {
                     handle.abort();
                 }
-                if let Some(capture) = self.active_llm_attempt.take() {
-                    if let Some(metrics) = capture.finalize_cancelled() {
-                        if let Err(error) = self.storage.upsert_llm_request_metrics(&metrics).await
-                        {
-                            tracing::warn!(%error, "failed to persist cancelled LLM attempt metrics");
-                        }
-                    }
-                }
                 Ok(None)
             }
 
@@ -4210,7 +4195,7 @@ where
             } => self.persist_sub_agent_results(results, spawn_tool_id).await,
 
             Effect::RequestContinuation { request } => {
-                self.request_continuation(request.rejected_tool_calls, request.attempt);
+                self.request_continuation(request.rejected_tool_calls);
                 Ok(None)
             }
 
@@ -4567,8 +4552,6 @@ where
             }
         });
 
-        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
-        let task_attempt_capture = attempt_capture.clone();
         let forwarder_abort = forwarder_handle.abort_handle();
         let handle = tokio::spawn(async move {
             // Tokio cancellation is not recursive. Aborting the request must
@@ -4655,16 +4638,15 @@ where
             let mut system = vec![SystemContent::cached(&system_prompt)];
             if is_coordinator {
                 let capsule = match coordinator_read_service {
-                    Some(service) => service.coordinator_snapshot().await.unwrap_or_else(|error| {
-                        tracing::warn!(%error, "Failed to build Coordinator relational snapshot");
-                        "# Conversation activity snapshot unavailable\nPhoenix could not execute the bounded snapshot query for this turn. Use query_database to inspect current relational facts directly.".to_string()
+                    Some(service) => service.current_work_capsule().await.unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Failed to build Coordinator current-work capsule");
+                        format!("# Current work — projection unavailable\nPhoenix could not build the deterministic current-state projection for this turn: {error}\nUse list_open_work to retry. This is not transcript evidence or an exact delta.")
                     }),
-                    None => "# Conversation activity snapshot unavailable\nThe bounded snapshot query is unavailable for this turn. Use query_database to inspect current relational facts directly.".to_string(),
+                    None => "# Current work — projection unavailable\nThe deterministic current-state projection is unavailable for this turn. Use list_open_work to retry. This is not transcript evidence or an exact delta.".to_string(),
                 };
                 system.push(SystemContent::new(capsule));
             }
 
-            let attempt_capture = task_attempt_capture;
             let request = LlmRequest {
                 system,
                 messages,
@@ -4675,7 +4657,6 @@ where
                     root_conversation_id: root_conv_id.clone(),
                     request_id: request_id.clone(),
                     retry_attempt,
-                    attempt_capture: attempt_capture.clone(),
                 }),
                 // Every turn in a conversation reuses the same prefix
                 // (system prompt + earlier turns), so all turns share one key.
@@ -4722,18 +4703,6 @@ where
                 }
                 Err(e) => llm_error_to_outcome(e),
             };
-
-            if let Some(metrics) = attempt_capture.finalized() {
-                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
-                    tracing::warn!(%error, "failed to write llm_request_metrics row");
-                }
-            } else {
-                tracing::warn!(
-                    request_id,
-                    retry_attempt,
-                    "LLM attempt completed without finalized metrics"
-                );
-            }
 
             // Task 67004: a terminal UsageLimitReached carries the
             // structured QuotaDetails parsed from the 429 response
@@ -4791,7 +4760,6 @@ where
 
             let _ = llm_tx.send(llm_outcome);
         }.instrument(turn_span));
-        self.active_llm_attempt = Some(attempt_capture);
         self.llm_task_handle = Some(handle);
 
         // Forward the typed outcome, generation-tagged — a dropped sender
@@ -4882,22 +4850,6 @@ where
         });
     }
 
-    fn create_tool_llm_metrics_sink(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>
-    {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let storage = self.storage.clone();
-        tokio::spawn(async move {
-            while let Some(metrics) = rx.recv().await {
-                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
-                    tracing::warn!(%error, "failed to persist tool-internal LLM metrics");
-                }
-            }
-        });
-        tx
-    }
-
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
@@ -4963,8 +4915,7 @@ where
                     progress,
                 });
         });
-        let llm_metrics_tx = self.create_tool_llm_metrics_sink();
-        let tool_ctx = ToolContext::new(
+        let tool_ctx = ToolContext::new_with_resource_access(
             cancel_token,
             self.context.conversation_id.clone(),
             self.context.working_dir.clone(),
@@ -4975,12 +4926,12 @@ where
             self.tmux_registry.clone(),
             scope_worktree,
             self.context.work_scope_id.clone(),
+            self.context.resource_authority,
         )
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())
-        .with_wake_registrar(self.wake_registrar.clone())
-        .with_llm_metrics_tx(llm_metrics_tx);
+        .with_wake_registrar(self.wake_registrar.clone());
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -5375,7 +5326,7 @@ where
 
     /// Request continuation summary from LLM (REQ-BED-020)
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
-    fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>, retry_attempt: u32) {
+    fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>) {
         let llm_client = Arc::clone(&self.llm_client);
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
@@ -5454,7 +5405,6 @@ where
                 content: vec![ContentBlock::text(&continuation_prompt)],
             });
 
-            let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
             // Build a tool-less request
             let request = LlmRequest {
                 messages,
@@ -5467,8 +5417,7 @@ where
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id,
                     request_id,
-                    retry_attempt,
-                    attempt_capture: attempt_capture.clone(),
+                    retry_attempt: 1,
                 }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
@@ -5476,14 +5425,7 @@ where
                 cache_key: PromptCacheKey::stable(&conv_id),
             };
 
-            let result = llm_client.complete(&request).await;
-            if let Some(metrics) = attempt_capture.finalized() {
-                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
-                    tracing::warn!(%error, "continuation: failed to write llm_request_metrics row");
-                }
-            }
-
-            match result {
+            match llm_client.complete(&request).await {
                 Ok(response) => {
                     // Extract the text content as summary
                     let summary = response
@@ -9534,13 +9476,11 @@ mod explore_prompt_cache_shape_tests {
             }],
             end_turn: false,
             usage: Usage::default(),
-            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
         llm.queue_response(LlmResponse {
             content: vec![ContentBlock::text("ready to propose")],
             end_turn: true,
             usage: Usage::default(),
-            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let (event_tx, runtime_event_rx) = mpsc::channel(32);
@@ -9899,7 +9839,6 @@ mod steer_drain_detector_tests {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },
-            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
         });
 
         let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
@@ -12912,32 +12851,6 @@ mod llm_generation_guard_tests {
             state_before,
             "a stale aborted outcome must not move state — no spurious retry/error"
         );
-    }
-
-    #[tokio::test]
-    async fn stale_generation_preserves_current_request_handle_and_metrics() {
-        let mut rt = runtime_requesting();
-        rt.llm_request_generation = 2;
-        rt.llm_task_handle = Some(tokio::spawn(std::future::pending()));
-        rt.active_llm_attempt = Some(phoenix_llm::LlmAttemptCapture::new());
-
-        rt.process_generation_tagged_llm_outcome(
-            1,
-            LlmOutcome::NetworkError {
-                message: "stale aborted request".to_string(),
-            },
-        )
-        .await;
-
-        assert!(
-            rt.llm_task_handle.is_some(),
-            "a stale outcome must not clear the current request task handle"
-        );
-        assert!(
-            rt.active_llm_attempt.is_some(),
-            "a stale outcome must not clear the current request metrics capture"
-        );
-        rt.llm_task_handle.take().expect("test task handle").abort();
     }
 
     /// The current-generation outcome is honoured: not stale, so it flows into

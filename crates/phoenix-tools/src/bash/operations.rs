@@ -422,6 +422,15 @@ pub enum BashSpawnMode {
     ExploreReadOnly,
 }
 
+impl BashSpawnMode {
+    fn authority(self) -> phoenix_core::work_scope::ResourceAuthority {
+        match self {
+            Self::Direct => phoenix_core::work_scope::ResourceAuthority::Work,
+            Self::ExploreReadOnly => phoenix_core::work_scope::ResourceAuthority::Restricted,
+        }
+    }
+}
+
 /// Run a bash request end-to-end and produce the `ToolOutput`.
 pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
     dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct).await
@@ -436,6 +445,8 @@ async fn dispatch_with_spawn_mode(
     ctx: ToolContext,
     spawn_mode: BashSpawnMode,
 ) -> ToolOutput {
+    // Dispatch kind, not caller convention, selects effective Bash authority.
+    let ctx = ctx.with_resource_authority(spawn_mode.authority());
     let request = match parse_request(input) {
         Ok(r) => r,
         Err(e) => return e.into_tool_output(),
@@ -643,9 +654,11 @@ fn spawn_child(
     // pgid == pid because we made the child a process group leader.
     let pgid = i32::try_from(pid).unwrap_or(0);
 
-    let handle = Handle::new_live(
+    let handle = Handle::new_live_for_actor(
         ctx.work_scope.clone(),
         handle_id,
+        ctx.resource_access.conversation_id().to_string(),
+        ctx.resource_access.authority(),
         cmd.to_string(),
         label,
         pgid,
@@ -1286,11 +1299,20 @@ async fn lookup_handle(ctx: &ToolContext, handle_id: &str) -> Result<Arc<Handle>
             }
         })?;
     let handles = handles_arc.read().await;
-    handles
+    let handle = handles
         .get(&HandleId::new(handle_id.to_string()))
         .ok_or_else(|| BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
-        })
+        })?;
+    if !ctx
+        .resource_access
+        .can_control(&handle.creator_conversation_id, handle.authority)
+    {
+        return Err(BashError::HandleNotFound {
+            handle_id: handle_id.to_string(),
+        });
+    }
+    Ok(handle)
 }
 
 // ---------------------------------------------------------------------------

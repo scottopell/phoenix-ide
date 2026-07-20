@@ -24,6 +24,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
+use phoenix_core::domain::db_schema::ConvMode;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -51,12 +52,13 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
     // tell the client and close — they can reconnect later when the agent
     // does something browser-related.
     let manager = state.runtime.browser_sessions().clone();
-    let Some(work_scope) = resolve_viewer_work_scope(&state, &conversation_id).await else {
+    let Some((work_scope, actor)) = resolve_viewer_work_scope(&state, &conversation_id).await
+    else {
         let _ = ws_sender.send(Message::Close(None)).await;
         return;
     };
 
-    let Some(session_arc) = session_if_exists(&manager, &work_scope).await else {
+    let Some(session_arc) = session_if_exists(&manager, &work_scope, &actor).await else {
         tracing::debug!(
             conv_id = %conversation_id,
             work_scope = %work_scope,
@@ -178,19 +180,40 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
 async fn session_if_exists(
     manager: &Arc<crate::tools::browser::BrowserSessionManager>,
     work_scope: &crate::work_scope::ResourceScopeKey,
+    actor: &crate::work_scope::EffectiveResourceAccess,
 ) -> Option<Arc<tokio::sync::RwLock<crate::tools::browser::session::BrowserSession>>> {
-    manager.get_existing(work_scope).await
+    match manager.get_existing_for_actor(work_scope, actor).await {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::debug!(%error, "browser-view access denied for conversation actor");
+            None
+        }
+    }
 }
 
 async fn resolve_viewer_work_scope(
     state: &AppState,
     conversation_id: &str,
-) -> Option<crate::work_scope::ResourceScopeKey> {
+) -> Option<(
+    crate::work_scope::ResourceScopeKey,
+    crate::work_scope::EffectiveResourceAccess,
+)> {
     match state.runtime.db().get_conversation(conversation_id).await {
-        Ok(conv) => Some(crate::work_scope::ResourceScopeKey::Work(
-            conv.work_scope_id
-                .expect("persisted conversation has work scope"),
-        )),
+        Ok(conv) => {
+            let authority = match conv.conv_mode {
+                ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+                ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                    crate::work_scope::ResourceAuthority::Work
+                }
+            };
+            Some((
+                crate::work_scope::ResourceScopeKey::Work(
+                    conv.work_scope_id
+                        .expect("persisted conversation has work scope"),
+                ),
+                crate::work_scope::EffectiveResourceAccess::new(conversation_id, authority),
+            ))
+        }
         Err(e) => {
             tracing::debug!(
                 conv_id = %conversation_id,

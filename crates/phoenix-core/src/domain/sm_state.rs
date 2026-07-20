@@ -2144,6 +2144,8 @@ pub struct ConvContext {
     pub mode: ModeKind,
     /// Persisted opaque owner of all ordinary conversation resources.
     pub work_scope_id: crate::work_scope::WorkScopeId,
+    /// Effective authority used for same-scope runtime resources.
+    pub resource_authority: crate::work_scope::ResourceAuthority,
     /// Persisted worktree location, if this conversation has one. This is
     /// environment context only and never participates in resource identity.
     pub work_scope_worktree: Option<PathBuf>,
@@ -2191,6 +2193,7 @@ impl ConvContext {
             desired_base_branch: None,
             mode: ModeKind::Managed,
             work_scope_id: crate::work_scope::WorkScopeId::new(),
+            resource_authority: crate::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),
@@ -2222,6 +2225,7 @@ impl ConvContext {
             desired_base_branch: None,
             mode: ModeKind::Managed,
             work_scope_id: crate::work_scope::WorkScopeId::new(),
+            resource_authority: crate::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),

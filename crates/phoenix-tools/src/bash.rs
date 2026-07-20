@@ -296,6 +296,26 @@ mod tests {
         )
     }
 
+    fn restricted_ctx_for(
+        conversation_id: &str,
+        work_scope_id: &str,
+        registry: Arc<BashHandleRegistry>,
+    ) -> ToolContext {
+        ToolContext::new_with_resource_access(
+            CancellationToken::new(),
+            conversation_id.to_string(),
+            temp_dir(),
+            Arc::new(BrowserSessionManager::default()),
+            registry,
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::TmuxRegistry::new()),
+            None,
+            phoenix_core::work_scope::WorkScopeId::parse(work_scope_id).unwrap(),
+            phoenix_core::work_scope::ResourceAuthority::Restricted,
+        )
+    }
+
     // -----------------------------------------------------------------
     // Happy paths (REQ-BASH-002, REQ-BASH-003 integration)
     // -----------------------------------------------------------------
@@ -768,6 +788,45 @@ mod tests {
             .run(
                 json!({"op": "kill", "handle": handle, "signal": "KILL"}),
                 conv_a,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn restricted_child_cannot_control_work_handle_in_shared_scope() {
+        let work_tool = BashTool;
+        let restricted_tool = SandboxedBashTool;
+        let registry = Arc::new(BashHandleRegistry::new());
+        let work_parent = ctx_for("work-parent", "shared-scope", registry.clone());
+        let restricted_child =
+            restricted_ctx_for("explore-child", "shared-scope", registry.clone());
+
+        let spawn = work_tool
+            .run(
+                json!({"op": "run", "cmd": "sleep 10", "wait_seconds": 0}),
+                work_parent.clone(),
+            )
+            .await;
+        let handle = parse_response(&spawn)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for op in ["peek", "wait", "kill"] {
+            let input = if op == "kill" {
+                json!({"op": op, "handle": handle, "signal": "KILL"})
+            } else {
+                json!({"op": op, "handle": handle})
+            };
+            let denied = restricted_tool.run(input, restricted_child.clone()).await;
+            assert!(!denied.is_success(), "{op} unexpectedly succeeded");
+            assert_eq!(parse_response(&denied)["error"], "handle_not_found");
+        }
+
+        let _ = work_tool
+            .run(
+                json!({"op": "kill", "handle": handle, "signal": "KILL"}),
+                work_parent,
             )
             .await;
     }
