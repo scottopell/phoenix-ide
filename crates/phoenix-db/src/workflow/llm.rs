@@ -183,6 +183,24 @@ pub struct ToolIntentRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolIntentTransitionInput {
+    pub workflow_id: WorkflowId,
+    pub receipt_id: ReceiptId,
+    pub intent_ordinal: u32,
+    pub generation: Generation,
+    pub from: ToolIntentStatus,
+    pub to: ToolIntentStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolIntentTransitionOutcome {
+    Committed,
+    ExactReplay,
+    Conflict,
+    RetryablePersistence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwedTopLevelLlmReceipt {
     pub workflow: TopLevelLlmWorkflowRecord,
     pub prepared_request: TopLevelLlmPreparedRequestRecord,
@@ -812,6 +830,70 @@ impl WorkflowRepository {
         Ok(out)
     }
 
+    pub async fn transition_top_level_llm_tool_intent(
+        &self,
+        input: &ToolIntentTransitionInput,
+    ) -> DbResult<ToolIntentTransitionOutcome> {
+        if !valid_tool_intent_transition(input.from, input.to) {
+            return Ok(ToolIntentTransitionOutcome::Conflict);
+        }
+        match self.transition_top_level_llm_tool_intent_once(input).await {
+            Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                if is_sqlite_busy_retryable(error.as_ref()) =>
+            {
+                Ok(ToolIntentTransitionOutcome::RetryablePersistence)
+            }
+            result => result,
+        }
+    }
+
+    async fn transition_top_level_llm_tool_intent_once(
+        &self,
+        input: &ToolIntentTransitionInput,
+    ) -> DbResult<ToolIntentTransitionOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let updated = sqlx::query(
+            "UPDATE top_level_llm_tool_intents
+             SET status = ?6
+             WHERE workflow_id = ?1 AND receipt_id = ?2 AND intent_ordinal = ?3
+               AND status = ?5
+               AND EXISTS (
+                   SELECT 1 FROM workflow_receipts r
+                   WHERE r.workflow_id = top_level_llm_tool_intents.workflow_id
+                     AND r.receipt_id = top_level_llm_tool_intents.receipt_id
+                     AND r.generation = ?4
+               )",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.receipt_id.0, "receipt_id")?)
+        .bind(i64::from(input.intent_ordinal))
+        .bind(to_i64(input.generation.0, "generation")?)
+        .bind(tool_intent_status_to_str(input.from))
+        .bind(tool_intent_status_to_str(input.to))
+        .execute(&mut *tx.tx)
+        .await?;
+        if updated.rows_affected() == 1 {
+            tx.commit().await?;
+            return Ok(ToolIntentTransitionOutcome::Committed);
+        }
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM top_level_llm_tool_intents WHERE workflow_id = ?1 AND receipt_id = ?2 AND intent_ordinal = ?3",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.receipt_id.0, "receipt_id")?)
+        .bind(i64::from(input.intent_ordinal))
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+        tx.rollback().await?;
+        Ok(
+            if status.as_deref() == Some(tool_intent_status_to_str(input.to)) {
+                ToolIntentTransitionOutcome::ExactReplay
+            } else {
+                ToolIntentTransitionOutcome::Conflict
+            },
+        )
+    }
+
     pub async fn stop_top_level_llm_and_suppress_pending_delivery(
         &self,
         input: &StopTopLevelLlmInput,
@@ -861,6 +943,10 @@ impl WorkflowRepository {
             .bind(to_i64(input.stopped_at.0, "stopped_at")?)
             .execute(&mut *tx.tx)
             .await?;
+            sqlx::query("UPDATE top_level_llm_tool_intents SET status = 'Suppressed' WHERE workflow_id = ?1 AND status IN ('PendingAcceptance', 'Owed')")
+                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+                .execute(&mut *tx.tx)
+                .await?;
             tx.commit().await?;
             return Ok(CommitOutcome::Committed);
         }
@@ -893,6 +979,10 @@ impl WorkflowRepository {
         sqlx::query("UPDATE top_level_llm_workflows SET stopped_at = ?2 WHERE workflow_id = ?1")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.stopped_at.0, "stopped_at")?)
+            .execute(&mut *tx.tx)
+            .await?;
+        sqlx::query("UPDATE top_level_llm_tool_intents SET status = 'Suppressed' WHERE workflow_id = ?1 AND status IN ('PendingAcceptance', 'Owed')")
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .execute(&mut *tx.tx)
             .await?;
         tx.commit().await?;
@@ -1113,6 +1203,33 @@ fn parse_direct_turn_outcome(value: &str) -> DbResult<DirectTurnCommittedOutcome
         other => Err(DbError::Serialization(format!(
             "unknown direct-turn outcome: {other}"
         ))),
+    }
+}
+
+fn valid_tool_intent_transition(from: ToolIntentStatus, to: ToolIntentStatus) -> bool {
+    matches!(
+        (from, to),
+        (
+            ToolIntentStatus::PendingAcceptance,
+            ToolIntentStatus::Owed | ToolIntentStatus::Suppressed
+        ) | (
+            ToolIntentStatus::Owed,
+            ToolIntentStatus::ExecutionMayHaveBegun | ToolIntentStatus::Suppressed
+        ) | (
+            ToolIntentStatus::ExecutionMayHaveBegun,
+            ToolIntentStatus::Completed | ToolIntentStatus::Interrupted
+        )
+    )
+}
+
+fn tool_intent_status_to_str(value: ToolIntentStatus) -> &'static str {
+    match value {
+        ToolIntentStatus::PendingAcceptance => "PendingAcceptance",
+        ToolIntentStatus::Owed => "Owed",
+        ToolIntentStatus::ExecutionMayHaveBegun => "ExecutionMayHaveBegun",
+        ToolIntentStatus::Completed => "Completed",
+        ToolIntentStatus::Interrupted => "Interrupted",
+        ToolIntentStatus::Suppressed => "Suppressed",
     }
 }
 
@@ -1517,6 +1634,46 @@ mod tests {
         assert_eq!(
             repo.load_owed_top_level_llm_receipts().await.unwrap().len(),
             1
+        );
+        let tool_transition = ToolIntentTransitionInput {
+            workflow_id: WorkflowId(1),
+            receipt_id: ReceiptId(1),
+            intent_ordinal: 0,
+            generation: Generation(0),
+            from: ToolIntentStatus::PendingAcceptance,
+            to: ToolIntentStatus::Owed,
+        };
+        assert_eq!(
+            repo.transition_top_level_llm_tool_intent(&tool_transition)
+                .await
+                .unwrap(),
+            ToolIntentTransitionOutcome::Committed
+        );
+        assert_eq!(
+            repo.transition_top_level_llm_tool_intent(&tool_transition)
+                .await
+                .unwrap(),
+            ToolIntentTransitionOutcome::ExactReplay
+        );
+        assert_eq!(
+            repo.transition_top_level_llm_tool_intent(&ToolIntentTransitionInput {
+                from: ToolIntentStatus::Owed,
+                to: ToolIntentStatus::ExecutionMayHaveBegun,
+                ..tool_transition.clone()
+            })
+            .await
+            .unwrap(),
+            ToolIntentTransitionOutcome::Committed
+        );
+        assert_eq!(
+            repo.transition_top_level_llm_tool_intent(&ToolIntentTransitionInput {
+                from: ToolIntentStatus::ExecutionMayHaveBegun,
+                to: ToolIntentStatus::Completed,
+                ..tool_transition
+            })
+            .await
+            .unwrap(),
+            ToolIntentTransitionOutcome::Committed
         );
         assert_eq!(
             repo.accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
