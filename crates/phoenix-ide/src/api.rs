@@ -99,6 +99,12 @@ pub struct AppState {
     pub resource_monitor: Arc<resource_monitor::ResourceMonitor>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentFacingWakeRegistrationAvailable(bool);
+
+const AGENT_FACING_WAKE_REGISTRATION: AgentFacingWakeRegistrationAvailable =
+    AgentFacingWakeRegistrationAvailable(false);
+
 impl AppState {
     /// Create new application state and start the sub-agent handler
     // Each argument is a distinct startup-resolved dependency (db, registry,
@@ -132,22 +138,12 @@ impl AppState {
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
-        let retired_implicit_wakes =
-            phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone())
-                .retire_implicit_tool_return_registrations(phoenix_workflow::Timestamp(
-                    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                ))
-                .await?;
-        if retired_implicit_wakes > 0 {
-            tracing::warn!(
-                retired = retired_implicit_wakes,
-                "retired legacy implicit wake obligations before starting wake worker"
-            );
+        if AGENT_FACING_WAKE_REGISTRATION.0 {
+            runtime
+                .start_wake_worker()
+                .await
+                .map_err(std::io::Error::other)?;
         }
-        runtime
-            .start_wake_worker()
-            .await
-            .map_err(std::io::Error::other)?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
         handlers::start_attachment_cleanup_task(db.clone());

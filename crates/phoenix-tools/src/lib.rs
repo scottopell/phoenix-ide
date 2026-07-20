@@ -65,8 +65,8 @@ use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::platform::PlatformCapability;
 use phoenix_core::work_scope::WorkScope;
 use phoenix_workflow::wake_profile::{
-    WakeCancellationReason, WakeRegistrationIntent, WakeRegistrationOrigin, WakeResourceIdentity,
-    WorkScopeIdentity, WorkScopeKind,
+    WakeCancellationReason, WakeRegistrationIntent, WakeResourceIdentity, WorkScopeIdentity,
+    WorkScopeKind,
 };
 use phoenix_workflow::{Timestamp, WorkflowId};
 
@@ -119,7 +119,6 @@ pub struct RegisterWakeInput {
     pub registering_tool_use_id: String,
     pub registration_scope: WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
-    pub origin: WakeRegistrationOrigin,
     pub expires_at: Timestamp,
     pub prepared_fingerprint: String,
 }
@@ -133,7 +132,6 @@ impl RegisterWakeInput {
             registration_scope: self.registration_scope,
             resource: self.resource,
             registering_tool_use_id: self.registering_tool_use_id,
-            origin: self.origin,
             registered_at,
             expires_at: self.expires_at,
         }

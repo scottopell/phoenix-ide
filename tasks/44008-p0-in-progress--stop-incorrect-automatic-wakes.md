@@ -63,12 +63,9 @@ Likely starting symbols:
 
 Define and implement rollout behavior for wake obligations created by the old automatic path:
 
-- Do not allow a newly deployed server to keep forcing replay turns for an obligation whose terminal outcome was already consumed through a foreground terminal tool result.
-- Preserve durable audit evidence and workflow consistency; do not delete workflow rows or infer consumption from arbitrary output text.
-- Prefer a typed suppression/cancellation path keyed by the durable workflow/handle identity when foreground terminal consumption is observed.
-- Treat races among foreground consumption, worker terminal projection, message materialization, and Idle adoption idempotently. At most one semantic model delivery may win.
-
-If safely identifying pre-deploy historical consumption requires a bounded migration/reconciliation step, keep it narrowly keyed to structured message/tool fields and existing wake identities. Do not use substring matching as product logic.
+- Because no explicit agent-facing registration path exists, do not start the wake worker.
+- Preserve persisted bindings as audit history; do not delete or rewrite workflow rows.
+- Do not add registration provenance, reconciliation, or a schema migration solely for a future explicit tool; that tool will define its activation and rollout boundary when implemented.
 
 ### 3. Preserve the substrate for the intended agent-facing tool
 
@@ -83,9 +80,9 @@ Update wake-contract executive/current-reality documentation and tests to state 
 - An ordinary `bash op=run` that returns `still_running` creates a handle but no durable wake binding and no `wake_registration` payload.
 - The equivalent ordinary tmux live-handle path creates no durable wake binding.
 - Foreground `wait`/inspection returns terminal evidence normally and cannot cause a later synthetic wake message or auto-resumed LLM request.
-- Existing old-path obligations are suppressed when structured foreground terminal consumption has already occurred, including terminalization/materialization/adoption races.
+- Persisted old-path obligations cannot produce terminal messages or resume turns because the wake worker is not started.
 - The durable wake persistence/observation/delivery substrate retains its focused restart and idempotency coverage without claiming an agent-facing explicit contract exists.
-- Regression tests cover bash, tmux, old-obligation rollout, concurrent worker/foreground resolution, and persisted message ordering.
+- Regression tests cover bash/tmux no-registration behavior and the dormant worker startup boundary.
 - A production-style journey reproducing the cited sequence yields one terminal delivery and no turn-end replay.
 - `./dev.py check` passes.
 

@@ -271,18 +271,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "index_message_fts_row_locations",
         sql: MIGRATION_051,
     },
-    Migration {
-        version: 52,
-        name: "retire_legacy_implicit_wakes",
-        sql: MIGRATION_052,
-    },
 ];
-
-const MIGRATION_052: &str = r"
-ALTER TABLE wake_bindings
-ADD COLUMN registration_origin TEXT NOT NULL DEFAULT 'ImplicitToolReturn'
-CHECK (registration_origin IN ('ImplicitToolReturn', 'AgentExplicit'));
-";
 
 const MIGRATION_050: &str = r"
 ALTER TABLE wake_bindings
@@ -2165,83 +2154,6 @@ mod tests {
                 "hash-1".into()
             )
         );
-    }
-    #[tokio::test]
-    async fn migration_052_marks_existing_wake_bindings_as_implicit_tool_return() {
-        let pool = test_pool().await;
-        setup_conversations_table(&pool).await;
-        for migration in MIGRATIONS.iter().filter(|migration| migration.version < 52) {
-            sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
-        }
-
-        sqlx::query("INSERT INTO conversations (id) VALUES ('conv-legacy')")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO workflows (
-                workflow_id, profile_kind, profile_version,
-                runtime_acceptance_enabled, external_acceptance_enabled,
-                version, generation, status,
-                snapshot_codec_family, snapshot_codec_version, snapshot_payload,
-                created_at, updated_at
-             ) VALUES (
-                ?1, 'wake', 1,
-                1, 0,
-                0, 0, 'Active',
-                'wake.snapshot', 1, x'7b7d',
-                10, 10
-             )",
-        )
-        .bind(1_i64)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO workflow_effects (
-                workflow_id, effect_id, declared_workflow_version, family, kind,
-                intent_codec_family, intent_codec_version, intent_payload,
-                generation, role, capability_kind, stable_command_id,
-                next_eligible_at, destructive_resource, status, pending_reconciliation
-             ) VALUES (
-                1, 1, 0, 'wake.observe', 'observe',
-                'wake.intent', 1, x'7b7d',
-                0, 'Required', 'ReclaimableObservation', NULL,
-                NULL, NULL, 'Eligible', 0
-             )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO wake_bindings (
-                workflow_id, conversation_id, contract_id, profile_kind, profile_version,
-                scope_kind, scope_stable_key, resource_kind, bash_handle_id,
-                tmux_server_token, tmux_window_id, tmux_completion_policy,
-                registering_tool_use_id, expires_at, resolved_at,
-                prepared_fingerprint, observe_effect_id, created_at
-             ) VALUES (
-                ?1, 'conv-legacy', 'contract-legacy', 'wake', 1,
-                'Conversation', 'conv-legacy', 'Bash', 'b-legacy',
-                NULL, NULL, 'KeepOpen',
-                'tool-legacy', 100, NULL,
-                'fp-legacy', 1, 10
-             )",
-        )
-        .bind(1_i64)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::raw_sql(MIGRATION_052).execute(&pool).await.unwrap();
-
-        let origin: String = sqlx::query_scalar(
-            "SELECT registration_origin FROM wake_bindings WHERE workflow_id = 1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(origin, "ImplicitToolReturn");
     }
 
     #[tokio::test]

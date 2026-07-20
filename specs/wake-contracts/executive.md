@@ -97,11 +97,10 @@ not expose the specified agent-facing `wait_until` tool, so no ordinary bash or
 tmux handle creation registers a wake obligation. The substrate is intentionally
 dormant until an explicit registration surface owns that lifecycle.
 
-Databases upgraded from the automatic-registration implementation classify its
-bindings as `ImplicitToolReturn`. Startup retires and suppresses those bindings
-before the wake worker starts, preserving workflow and message audit records
-without producing another model turn. Future agent-facing registrations use the
-distinct `AgentExplicit` origin and are not eligible for that reconciliation.
+Because no explicit agent-facing registration surface exists, the wake worker is
+not started. Persisted bindings from the automatic-registration implementation
+remain as audit history and cannot produce another model turn. The explicit wait
+surface will define its activation and rollout boundary when it is implemented.
 
 ## Status Summary
 
