@@ -20,8 +20,10 @@ use sqlx::{error::DatabaseError, Row, SqlitePool};
 use std::collections::BTreeSet;
 
 pub mod wake;
+pub mod llm;
 
 use phoenix_workflow::wake_profile;
+pub use llm::*;
 use sqlx::{Sqlite, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
