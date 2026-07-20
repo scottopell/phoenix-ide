@@ -499,6 +499,7 @@ impl WorkflowRepository {
              JOIN workflow_attempts a ON a.workflow_id = e.workflow_id AND a.effect_id = e.effect_id
              LEFT JOIN workflow_reclaimable_leases l ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
              WHERE a.status IN ('Begun', 'ObservationRecorded')
+               AND w.stopped_at IS NULL
              ORDER BY w.workflow_id, a.attempt_id"
         )
         .fetch_all(&self.pool)
@@ -943,10 +944,7 @@ impl WorkflowRepository {
             .bind(to_i64(input.stopped_at.0, "stopped_at")?)
             .execute(&mut *tx.tx)
             .await?;
-            sqlx::query("UPDATE top_level_llm_tool_intents SET status = 'Suppressed' WHERE workflow_id = ?1 AND status IN ('PendingAcceptance', 'Owed')")
-                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-                .execute(&mut *tx.tx)
-                .await?;
+            fence_tool_intents_for_stop(&mut tx, input.workflow_id).await?;
             tx.commit().await?;
             return Ok(CommitOutcome::Committed);
         }
@@ -981,10 +979,7 @@ impl WorkflowRepository {
             .bind(to_i64(input.stopped_at.0, "stopped_at")?)
             .execute(&mut *tx.tx)
             .await?;
-        sqlx::query("UPDATE top_level_llm_tool_intents SET status = 'Suppressed' WHERE workflow_id = ?1 AND status IN ('PendingAcceptance', 'Owed')")
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .execute(&mut *tx.tx)
-            .await?;
+        fence_tool_intents_for_stop(&mut tx, input.workflow_id).await?;
         tx.commit().await?;
         Ok(CommitOutcome::Committed)
     }
@@ -1038,6 +1033,25 @@ impl WorkflowRepository {
     }
 }
 
+async fn fence_tool_intents_for_stop(
+    tx: &mut WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE top_level_llm_tool_intents
+         SET status = CASE
+             WHEN status = 'ExecutionMayHaveBegun' THEN 'Interrupted'
+             ELSE 'Suppressed'
+         END
+         WHERE workflow_id = ?1
+           AND status IN ('PendingAcceptance', 'Owed', 'ExecutionMayHaveBegun')",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .execute(&mut *tx.tx)
+    .await?;
+    Ok(())
+}
+
 impl WorkflowTx<'_> {
     async fn fetch_direct_turn_acceptance(
         &mut self,
@@ -1070,9 +1084,7 @@ fn classify_direct_turn_replay(
     existing: DirectTurnAcceptanceRecord,
     input: &DirectTurnAcceptanceInput,
 ) -> DirectTurnAcceptanceOutcome {
-    if existing.prepared_fingerprint == input.prepared_fingerprint
-        && existing.prepared_payload == input.prepared_payload
-    {
+    if existing.prepared_fingerprint == input.prepared_fingerprint {
         DirectTurnAcceptanceOutcome::Replayed(existing)
     } else {
         DirectTurnAcceptanceOutcome::Conflict
@@ -1362,6 +1374,12 @@ mod tests {
         ));
         assert!(matches!(
             repo.accept_direct_turn(&input).await.unwrap(),
+            DirectTurnAcceptanceOutcome::Replayed(_)
+        ));
+        let mut equivalent_encoding = input.clone();
+        equivalent_encoding.prepared_payload = "{ \"same\": true }".to_string();
+        assert!(matches!(
+            repo.accept_direct_turn(&equivalent_encoding).await.unwrap(),
             DirectTurnAcceptanceOutcome::Replayed(_)
         ));
         let pending = repo.load_pending_direct_turns().await.unwrap();
@@ -1666,16 +1684,6 @@ mod tests {
             ToolIntentTransitionOutcome::Committed
         );
         assert_eq!(
-            repo.transition_top_level_llm_tool_intent(&ToolIntentTransitionInput {
-                from: ToolIntentStatus::ExecutionMayHaveBegun,
-                to: ToolIntentStatus::Completed,
-                ..tool_transition
-            })
-            .await
-            .unwrap(),
-            ToolIntentTransitionOutcome::Committed
-        );
-        assert_eq!(
             repo.accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
                 authority: LocalAttemptAuthority {
                     workflow_id: WorkflowId(1),
@@ -1704,7 +1712,7 @@ mod tests {
             .stop_top_level_llm_and_suppress_pending_delivery(&StopTopLevelLlmInput {
                 workflow_id: WorkflowId(1),
                 stopped_at: Timestamp(10),
-                expected_version: Version(999),
+                expected_version: Version(1),
                 transition_id: TransitionId(2),
                 generation: Generation(0),
                 next_status: WorkflowStatus::Cancelled,
@@ -1727,6 +1735,18 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(stopped, CommitOutcome::VersionConflict);
+        assert_eq!(stopped, CommitOutcome::Committed);
+        assert!(repo
+            .recover_top_level_llm_attempts()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repo.load_tool_intents(WorkflowId(1), ReceiptId(1))
+                .await
+                .unwrap()[0]
+                .status,
+            ToolIntentStatus::Interrupted
+        );
     }
 }
