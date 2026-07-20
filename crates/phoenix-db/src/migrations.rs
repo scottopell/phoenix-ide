@@ -328,14 +328,11 @@ CREATE TABLE direct_turn_acceptances (
 ) WITHOUT ROWID;
 
 CREATE TABLE top_level_llm_workflows (
-    workflow_id INTEGER PRIMARY KEY REFERENCES workflows(workflow_id) ON DELETE CASCADE,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    accepted_turn_id TEXT NOT NULL CHECK (accepted_turn_id <> ''),
+    workflow_id INTEGER PRIMARY KEY REFERENCES direct_turn_acceptances(workflow_id) ON DELETE CASCADE,
     turn_generation INTEGER NOT NULL CHECK (turn_generation >= 0),
     next_call_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (next_call_ordinal >= 0),
     accepted_assistant_message_id TEXT,
     stopped_at INTEGER CHECK (stopped_at IS NULL OR stopped_at >= 0),
-    UNIQUE (conversation_id, accepted_turn_id, turn_generation),
     CHECK (accepted_assistant_message_id IS NULL OR accepted_assistant_message_id <> '')
 ) STRICT;
 
@@ -2529,10 +2526,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO top_level_llm_workflows (workflow_id, conversation_id, accepted_turn_id, turn_generation) VALUES (101, 'conv-llm', 'turn-1', 4)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO top_level_llm_workflows (workflow_id, turn_generation) VALUES (101, 4)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version, family, kind, intent_codec_family, intent_codec_version, intent_payload, generation, role, capability_kind, status) VALUES (101, 1, 0, 'llm.call', 'top_level_call', 'llm.intent', 1, X'01', 4, 'Required', 'SafelyRepeatable', 'Eligible')")
             .execute(&pool)
             .await
@@ -2565,10 +2564,12 @@ mod tests {
         .unwrap();
         assert_eq!(tool_intents, 1);
 
-        assert!(sqlx::query("INSERT INTO top_level_llm_workflows (workflow_id, conversation_id, accepted_turn_id, turn_generation) VALUES (101, 'conv-llm', 'turn-2', 4)")
-            .execute(&pool)
-            .await
-            .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO top_level_llm_workflows (workflow_id, turn_generation) VALUES (101, 4)"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
         assert!(sqlx::query("INSERT INTO top_level_llm_effects (workflow_id, effect_id, call_ordinal) VALUES (101, 1, 3)")
             .execute(&pool)
             .await

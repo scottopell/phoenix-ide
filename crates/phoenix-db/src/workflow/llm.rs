@@ -92,7 +92,6 @@ pub struct PrepareTopLevelLlmRequestInput {
     pub generation: Generation,
     pub committed_at: Timestamp,
     pub snapshot: TopLevelLlmSnapshot,
-    pub key: LlmEffectKey,
     pub prepared_request: PreparedLlmRequest,
 }
 
@@ -193,16 +192,7 @@ impl WorkflowRepository {
             .await?;
         if let Some(existing) = existing {
             tx.commit().await?;
-            return Ok(
-                if existing.prepared_fingerprint == input.prepared_fingerprint
-                    && existing.prepared_payload == input.prepared_payload
-                    && existing.committed_outcome == input.committed_outcome
-                {
-                    DirectTurnAcceptanceOutcome::Replayed(existing)
-                } else {
-                    DirectTurnAcceptanceOutcome::Conflict
-                },
-            );
+            return Ok(classify_direct_turn_replay(existing, input));
         }
 
         let workflow_id = allocate_global_workflow_id(&mut tx).await?;
@@ -228,7 +218,7 @@ impl WorkflowRepository {
             now: input.accepted_at,
         };
         tx.insert_workflow(&create).await?;
-        sqlx::query("INSERT INTO direct_turn_acceptances (conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+        let acceptance_insert = sqlx::query("INSERT INTO direct_turn_acceptances (conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
             .bind(&input.conversation_id)
             .bind(&input.client_message_id)
             .bind(to_i64(workflow_id.0, "workflow_id")?)
@@ -237,11 +227,24 @@ impl WorkflowRepository {
             .bind(direct_turn_outcome_to_str(&input.committed_outcome))
             .bind(to_i64(input.accepted_at.0, "accepted_at")?)
             .execute(&mut *tx.tx)
-            .await?;
-        sqlx::query("INSERT INTO top_level_llm_workflows (workflow_id, conversation_id, accepted_turn_id, turn_generation, accepted_assistant_message_id, stopped_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+            .await;
+        if let Err(error) = acceptance_insert {
+            tx.rollback().await?;
+            if error.as_database_error().is_some() {
+                if let Some(existing) = load_direct_turn_acceptance(
+                    &self.pool,
+                    &input.conversation_id,
+                    &input.client_message_id,
+                )
+                .await?
+                {
+                    return Ok(classify_direct_turn_replay(existing, input));
+                }
+            }
+            return Err(error.into());
+        }
+        sqlx::query("INSERT INTO top_level_llm_workflows (workflow_id, turn_generation, accepted_assistant_message_id, stopped_at) VALUES (?1, ?2, ?3, ?4)")
             .bind(to_i64(workflow_id.0, "workflow_id")?)
-            .bind(&input.conversation_id)
-            .bind(&input.client_message_id)
             .bind(to_i64(input.snapshot.turn_ref.generation, "turn_generation")?)
             .bind(input.snapshot.accepted_assistant_message_id.as_deref())
             .bind(input.snapshot.stopped_at.map(|v| i64::try_from(v).unwrap()))
@@ -287,34 +290,35 @@ impl WorkflowRepository {
             .collect()
     }
 
-    pub async fn allocate_top_level_llm_call_ordinal(
-        &self,
-        workflow_id: WorkflowId,
-    ) -> DbResult<u64> {
-        let mut tx = self.begin_tx().await?;
-        let ordinal = sqlx::query_scalar::<_, i64>(
-            "UPDATE top_level_llm_workflows SET next_call_ordinal = next_call_ordinal + 1 WHERE workflow_id = ?1 AND stopped_at IS NULL RETURNING next_call_ordinal - 1",
-        )
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .fetch_optional(&mut *tx.tx)
-        .await?
-        .ok_or_else(|| DbError::Serialization("top-level LLM turn is stopped or missing".to_string()))?;
-        tx.commit().await?;
-        to_u64(ordinal, "call_ordinal")
-    }
-
     pub async fn prepare_top_level_llm_request(
         &self,
         input: &PrepareTopLevelLlmRequestInput,
     ) -> DbResult<CommitOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let call_ordinal = sqlx::query_scalar::<_, i64>(
+            "UPDATE top_level_llm_workflows SET next_call_ordinal = next_call_ordinal + 1 WHERE workflow_id = ?1 AND stopped_at IS NULL RETURNING next_call_ordinal - 1",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        .ok_or_else(|| DbError::Serialization("top-level LLM turn is stopped or missing".to_string()))?;
+        let call_ordinal = to_u64(call_ordinal, "call_ordinal")?;
+        let turn = sqlx::query(
+            "SELECT dta.client_message_id, w.turn_generation FROM top_level_llm_workflows w JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id WHERE w.workflow_id = ?1",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        let key = LlmEffectKey {
+            accepted_turn_id: turn.get("client_message_id"),
+            generation: to_u64(turn.get::<i64, _>("turn_generation"), "turn_generation")?,
+            call_ordinal,
+        };
         let intent = llm_profile::LlmIntent {
-            key: input.key.clone(),
+            key: key.clone(),
             prepared_request: input.prepared_request.clone(),
         };
-        let event = llm_profile::TopLevelLlmEvent::Prepared {
-            key: input.key.clone(),
-        };
-        let mut tx = self.begin_tx().await?;
+        let event = llm_profile::TopLevelLlmEvent::Prepared { key };
         let outcome = tx
             .commit_transition_plan(&CommitTransitionPlanCas {
                 workflow_id: input.workflow_id,
@@ -358,7 +362,7 @@ impl WorkflowRepository {
         sqlx::query("INSERT INTO top_level_llm_effects (workflow_id, effect_id, call_ordinal) VALUES (?1, ?2, ?3)")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.effect_id.0, "effect_id")?)
-            .bind(to_i64(input.key.call_ordinal, "call_ordinal")?)
+            .bind(to_i64(call_ordinal, "call_ordinal")?)
             .execute(&mut *tx.tx)
             .await?;
         sqlx::query("INSERT INTO top_level_llm_prepared_requests (workflow_id, effect_id, codec_version, request_fingerprint, provider, model, backend, request_aggregate) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
@@ -385,13 +389,14 @@ impl WorkflowRepository {
 
     pub async fn recover_top_level_llm_attempts(&self) -> DbResult<Vec<RecoverTopLevelLlmAttempt>> {
         let rows = sqlx::query(
-            "SELECT w.workflow_id, w.conversation_id, w.accepted_turn_id, w.turn_generation,
+            "SELECT w.workflow_id, dta.conversation_id, dta.client_message_id AS accepted_turn_id, w.turn_generation,
                     w.accepted_assistant_message_id, w.stopped_at,
                     p.codec_version, p.request_fingerprint, p.provider, p.model, p.backend, p.request_aggregate,
                     e.effect_id, e.call_ordinal,
                     a.attempt_id, a.ordinal, a.declared_workflow_version, a.generation,
                     a.process_incarnation, a.status, l.lease_until
              FROM top_level_llm_workflows w
+             JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id
              JOIN top_level_llm_effects e ON e.workflow_id = w.workflow_id
              JOIN top_level_llm_prepared_requests p ON p.workflow_id = e.workflow_id AND p.effect_id = e.effect_id
              JOIN workflow_attempts a ON a.workflow_id = e.workflow_id AND a.effect_id = e.effect_id
@@ -503,6 +508,17 @@ impl WorkflowRepository {
                 .load_llm_response_receipt(input.authority.workflow_id, input.authority.effect_id)
                 .await?;
             if let Some(llm_receipt) = existing {
+                if llm_receipt.response_fingerprint != input.response.response_fingerprint
+                    || llm_receipt.response_aggregate != input.response.response_aggregate
+                {
+                    return Ok(AcceptCompleteLlmResponseResult {
+                        outcome: generic.outcome,
+                        receipt: None,
+                        delivery: None,
+                        llm_receipt: Some(llm_receipt),
+                        tool_intents: vec![],
+                    });
+                }
                 let intents = self
                     .load_tool_intents(input.authority.workflow_id, llm_receipt.receipt_id)
                     .await?;
@@ -575,7 +591,7 @@ impl WorkflowRepository {
 
     pub async fn load_owed_top_level_llm_receipts(&self) -> DbResult<Vec<OwedTopLevelLlmReceipt>> {
         let rows = sqlx::query(
-            "SELECT w.workflow_id, w.conversation_id, w.accepted_turn_id, w.turn_generation,
+            "SELECT w.workflow_id, dta.conversation_id, dta.client_message_id AS accepted_turn_id, w.turn_generation,
                     w.accepted_assistant_message_id, w.stopped_at,
                     pr.effect_id, e.call_ordinal,
                     pr.codec_version AS request_codec_version, pr.request_fingerprint, pr.provider, pr.model, pr.backend, pr.request_aggregate,
@@ -590,6 +606,7 @@ impl WorkflowRepository {
              JOIN top_level_llm_prepared_requests pr ON pr.workflow_id = wr.workflow_id AND pr.effect_id = wr.effect_id
              JOIN top_level_llm_effects e ON e.workflow_id = pr.workflow_id AND e.effect_id = pr.effect_id
              JOIN top_level_llm_workflows w ON w.workflow_id = wr.workflow_id
+             JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id
              JOIN workflow_receipts r ON r.workflow_id = wr.workflow_id AND r.receipt_id = wr.receipt_id
              WHERE d.runtime_acceptance_status = 'Owed'
              ORDER BY w.workflow_id, wr.receipt_id"
@@ -857,6 +874,35 @@ impl WorkflowTx<'_> {
     }
 }
 
+fn classify_direct_turn_replay(
+    existing: DirectTurnAcceptanceRecord,
+    input: &DirectTurnAcceptanceInput,
+) -> DirectTurnAcceptanceOutcome {
+    if existing.prepared_fingerprint == input.prepared_fingerprint
+        && existing.prepared_payload == input.prepared_payload
+        && existing.committed_outcome == input.committed_outcome
+    {
+        DirectTurnAcceptanceOutcome::Replayed(existing)
+    } else {
+        DirectTurnAcceptanceOutcome::Conflict
+    }
+}
+
+async fn load_direct_turn_acceptance(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    client_message_id: &str,
+) -> DbResult<Option<DirectTurnAcceptanceRecord>> {
+    let row = sqlx::query(
+        "SELECT conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at FROM direct_turn_acceptances WHERE conversation_id = ?1 AND client_message_id = ?2",
+    )
+    .bind(conversation_id)
+    .bind(client_message_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| direct_turn_record_from_row(&row)).transpose()
+}
+
 async fn allocate_global_workflow_id(tx: &mut WorkflowTx<'_>) -> DbResult<WorkflowId> {
     sqlx::query(
         "INSERT INTO workflow_global_sequences (sequence_name, next_value) VALUES ('workflow', 2) ON CONFLICT(sequence_name) DO UPDATE SET next_value = workflow_global_sequences.next_value + 1",
@@ -913,7 +959,7 @@ fn prepared_row_from_row(
 
 async fn load_accepted_turn_id(pool: &SqlitePool, workflow_id: WorkflowId) -> DbResult<String> {
     sqlx::query_scalar::<_, String>(
-        "SELECT accepted_turn_id FROM top_level_llm_workflows WHERE workflow_id = ?1",
+        "SELECT client_message_id FROM direct_turn_acceptances WHERE workflow_id = ?1",
     )
     .bind(to_i64(workflow_id.0, "workflow_id")?)
     .fetch_one(pool)
@@ -1104,15 +1150,6 @@ mod tests {
         repo.mark_direct_turn_runtime_accepted("conv-1", "msg-1")
             .await
             .unwrap();
-        let first_ordinal = repo
-            .allocate_top_level_llm_call_ordinal(WorkflowId(1))
-            .await
-            .unwrap();
-        let second_ordinal = repo
-            .allocate_top_level_llm_call_ordinal(WorkflowId(1))
-            .await
-            .unwrap();
-        assert_eq!((first_ordinal, second_ordinal), (0, 1));
         assert_eq!(
             repo.prepare_top_level_llm_request(&PrepareTopLevelLlmRequestInput {
                 workflow_id: WorkflowId(1),
@@ -1122,11 +1159,6 @@ mod tests {
                 generation: Generation(0),
                 committed_at: Timestamp(2),
                 snapshot: snapshot(),
-                key: LlmEffectKey {
-                    accepted_turn_id: "msg-1".to_string(),
-                    generation: 4,
-                    call_ordinal: 2
-                },
                 prepared_request: PreparedLlmRequest {
                     codec_version: 1,
                     request_fingerprint: "req-1".to_string(),
