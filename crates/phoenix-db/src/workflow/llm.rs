@@ -1,8 +1,26 @@
-use super::*;
+use super::{
+    local_codec, parse_attempt_status, parse_delivery_payload_kind, parse_delivery_status,
+    parse_receipt_origin, parse_runtime_acceptance_status, parse_suppression_reason, to_i64,
+    to_u32, to_u64, AcceptReceiptInput, AttemptId, AuthorityOutcome, BeginAttemptInput,
+    BeginAttemptResult, CommitOutcome, CommitTransitionPlanCas,
+    CreateWorkflowWithExternalAcceptance, DbError, DbResult, DeliveryId,
+    DeliveryResolutionDecision, DeliveryResolutionPlan, EffectId, Generation, LeaseExpiry,
+    LocalAttemptAuthority, LocalAttemptRecord, LocalCodec, LocalDeliveryRecord, LocalEffectDecl,
+    LocalReceiptRecord, LocalReclaimableLease, ProcessIncarnation, ReceiptId, ReceiptOrigin,
+    SuppressionReason, Timestamp, TransitionId, Version, WorkflowId, WorkflowRepository,
+    WorkflowStatus, WorkflowTx,
+};
 use phoenix_workflow::llm_profile;
 use phoenix_workflow::llm_profile::{
-    CompleteLlmResponse, LlmEffectKey, PreparedLlmRequest, TopLevelLlmSnapshot, TopLevelTurnRef,
+    CompleteLlmResponse, LlmEffectKey, PreparedLlmRequest, TopLevelLlmSnapshot,
 };
+use phoenix_workflow::{CodecRef, EffectRole, EffectStatus, ExecutionCapability};
+use sqlx::SqlitePool;
+
+#[cfg(test)]
+use phoenix_workflow::llm_profile::TopLevelTurnRef;
+#[cfg(test)]
+use phoenix_workflow::ClaimOutcome;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -304,10 +322,10 @@ impl WorkflowRepository {
                 transition_id: input.transition_id,
                 generation: input.generation,
                 next_status: WorkflowStatus::Active,
-                event_codec: local_codec_ref_to_owned(llm_profile::event_codec()),
+                event_codec: local_codec_ref_to_owned(&llm_profile::event_codec()),
                 event_payload: serde_json::to_vec(&event)
                     .map_err(|e| DbError::Serialization(e.to_string()))?,
-                next_snapshot_codec: local_codec_ref_to_owned(llm_profile::snapshot_codec()),
+                next_snapshot_codec: local_codec_ref_to_owned(&llm_profile::snapshot_codec()),
                 next_snapshot_payload: serde_json::to_vec(&input.snapshot)
                     .map_err(|e| DbError::Serialization(e.to_string()))?,
                 committed_at: input.committed_at,
@@ -316,7 +334,7 @@ impl WorkflowRepository {
                     declared_workflow_version: input.expected_version.next(),
                     family: "llm.call".to_string(),
                     kind: "top_level_call".to_string(),
-                    intent_codec: local_codec_ref_to_owned(llm_profile::intent_codec()),
+                    intent_codec: local_codec_ref_to_owned(&llm_profile::intent_codec()),
                     intent_payload: serde_json::to_vec(&intent)
                         .map_err(|e| DbError::Serialization(e.to_string()))?,
                     generation: input.generation,
@@ -452,9 +470,9 @@ impl WorkflowRepository {
             delivery_id: input.delivery_id,
             attempt_id: Some(input.authority.attempt_id),
             origin: ReceiptOrigin::Execution,
-            receipt_codec: local_codec_ref_to_owned(llm_profile::receipt_codec()),
+            receipt_codec: local_codec_ref_to_owned(&llm_profile::receipt_codec()),
             receipt_payload,
-            receipt_event_codec: local_codec_ref_to_owned(llm_profile::receipt_codec()),
+            receipt_event_codec: local_codec_ref_to_owned(&llm_profile::receipt_codec()),
             receipt_event_payload: serde_json::to_vec(&llm_profile::LlmResponseReceipt {
                 key: LlmEffectKey {
                     accepted_turn_id: load_accepted_turn_id(
@@ -690,8 +708,8 @@ impl WorkflowRepository {
         .map(|v| to_u64(v, "delivery_id").map(DeliveryId))
         .collect::<DbResult<Vec<_>>>()?;
         if deliveries.is_empty() {
-            let event_codec = local_codec_ref_to_owned(llm_profile::event_codec());
-            let snapshot_codec = local_codec_ref_to_owned(llm_profile::snapshot_codec());
+            let event_codec = local_codec_ref_to_owned(&llm_profile::event_codec());
+            let snapshot_codec = local_codec_ref_to_owned(&llm_profile::snapshot_codec());
             let snapshot_payload = serde_json::to_vec(&input.next_snapshot)
                 .map_err(|e| DbError::Serialization(e.to_string()))?;
             let committed = tx
@@ -727,8 +745,8 @@ impl WorkflowRepository {
             tx.commit().await?;
             return Ok(CommitOutcome::Committed);
         }
-        let event_codec = local_codec_ref_to_owned(llm_profile::event_codec());
-        let snapshot_codec = local_codec_ref_to_owned(llm_profile::snapshot_codec());
+        let event_codec = local_codec_ref_to_owned(&llm_profile::event_codec());
+        let snapshot_codec = local_codec_ref_to_owned(&llm_profile::snapshot_codec());
         let snapshot_payload = serde_json::to_vec(&input.next_snapshot)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let outcome = tx
@@ -811,7 +829,7 @@ impl WorkflowRepository {
     }
 }
 
-impl<'a> WorkflowTx<'a> {
+impl WorkflowTx<'_> {
     async fn fetch_direct_turn_acceptance(
         &mut self,
         conversation_id: &str,
@@ -853,7 +871,7 @@ async fn allocate_global_workflow_id(tx: &mut WorkflowTx<'_>) -> DbResult<Workfl
     Ok(WorkflowId(to_u64(allocated, "workflow_id")?))
 }
 
-fn local_codec_ref_to_owned(codec: CodecRef) -> LocalCodec {
+fn local_codec_ref_to_owned(codec: &CodecRef) -> LocalCodec {
     LocalCodec {
         family: codec.family.to_string(),
         version: codec.version,
