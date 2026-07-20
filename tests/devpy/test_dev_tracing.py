@@ -38,14 +38,28 @@ class FakeProcess:
     def __init__(self, lines, returncode=0):
         self.stderr = io.StringIO("".join(lines))
         self.returncode = returncode
+        self.terminated = False
+        self.killed = False
 
-    def wait(self):
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
         return self.returncode
 
 
 class DevTracingTests(unittest.TestCase):
     def setUp(self):
         self.dev = load_devpy()
+        self.dev._DEV_TRACE_AVAILABLE = None
 
     def test_trace_endpoint_defaults_locally_and_is_off_in_ci(self):
         self.assertEqual(
@@ -65,6 +79,50 @@ class DevTracingTests(unittest.TestCase):
                 self.assertIsNone(self.dev._dev_trace_endpoint({
                     "PHOENIX_DEV_TRACE_ENDPOINT": value,
                 }))
+
+    def test_disabled_tracing_never_attempts_dependency_bootstrap(self):
+        with (
+            mock.patch.object(self.dev, "_dev_tracing_importable") as importable,
+            mock.patch.object(self.dev.subprocess, "run") as run,
+        ):
+            self.dev._bootstrap_dev_tracing({"PHOENIX_DEV_TRACE_ENDPOINT": "off"})
+
+        importable.assert_not_called()
+        run.assert_not_called()
+        self.assertFalse(self.dev._DEV_TRACE_AVAILABLE)
+
+    def test_missing_offline_tracing_deps_continue_without_exec(self):
+        with (
+            mock.patch.object(self.dev, "_dev_tracing_importable", return_value=False),
+            mock.patch.object(
+                self.dev.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=1),
+            ) as run,
+            mock.patch.object(self.dev.os, "execvpe") as execvpe,
+        ):
+            self.dev._bootstrap_dev_tracing({})
+
+        self.assertIn("--offline", run.call_args.args[0])
+        execvpe.assert_not_called()
+        self.assertFalse(self.dev._DEV_TRACE_AVAILABLE)
+
+    def test_cached_tracing_deps_reexec_offline(self):
+        with (
+            mock.patch.object(self.dev, "_dev_tracing_importable", return_value=False),
+            mock.patch.object(
+                self.dev.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0),
+            ),
+            mock.patch.object(self.dev.os, "execvpe") as execvpe,
+        ):
+            self.dev._bootstrap_dev_tracing({})
+
+        command = execvpe.call_args.args[1]
+        environment = execvpe.call_args.args[2]
+        self.assertIn("--offline", command)
+        self.assertEqual("1", environment["_PHOENIX_DEV_TRACE_BOOTSTRAP"])
 
     def test_cargo_lock_timer_accumulates_multiple_intervals(self):
         timer = self.dev.CargoLockWaitTimer(started_at=10.0)
@@ -110,6 +168,31 @@ class DevTracingTests(unittest.TestCase):
         self.assertEqual(6.0, attributes["build.elapsed_seconds"])
         self.assertEqual(2.0, attributes["cargo.lock_wait_seconds"])
         self.assertEqual(0, attributes["process.exit_code"])
+
+    def test_cargo_build_interrupt_terminates_and_waits_for_child(self):
+        class InterruptingStream:
+            def __iter__(self):
+                raise KeyboardInterrupt
+
+            def close(self):
+                pass
+
+        tracing = FakeTracing()
+        process = FakeProcess([])
+        process.stderr = InterruptingStream()
+        process.returncode = None
+        self.dev._DEV_TRACING = tracing
+
+        with (
+            mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev.time, "monotonic", side_effect=[10.0, 11.0]),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.dev._run_cargo_build(["cargo", "build"], ROOT, "debug")
+
+        self.assertTrue(process.terminated)
+        self.assertEqual(-15, process.returncode)
+        self.assertEqual(-15, tracing.finished[0][1]["process.exit_code"])
 
     def test_cargo_build_failure_preserves_exit_and_marks_span_failed(self):
         tracing = FakeTracing()

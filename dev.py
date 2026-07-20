@@ -2,8 +2,6 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "opentelemetry-exporter-otlp-proto-http>=1.39,<2",
-#   "opentelemetry-sdk>=1.39,<2",
 #   "taskmd>=1.0,<2",
 # ]
 # ///
@@ -52,6 +50,11 @@ _DEFAULT_DEV_TRACE_ENDPOINT = (
     "http://127.0.0.1:10428/insert/opentelemetry/v1/traces"
 )
 _DEV_TRACING = None
+_DEV_TRACE_AVAILABLE = None
+_DEV_TRACE_PACKAGES = (
+    "opentelemetry-sdk>=1.39,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.39,<2",
+)
 
 
 class _NoopSpan:
@@ -105,9 +108,64 @@ def _dev_trace_endpoint(environ: dict[str, str] | None = None) -> str | None:
     return _DEFAULT_DEV_TRACE_ENDPOINT
 
 
+def _dev_tracing_importable() -> bool:
+    try:
+        import opentelemetry.sdk  # noqa: F401
+        from opentelemetry.exporter.otlp.proto.http import trace_exporter  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _dev_trace_uv_args() -> list[str]:
+    return [
+        item
+        for package in _DEV_TRACE_PACKAGES
+        for item in ("--with", package)
+    ]
+
+
+def _bootstrap_dev_tracing(environ: dict[str, str] | None = None) -> None:
+    global _DEV_TRACE_AVAILABLE
+    env = os.environ if environ is None else environ
+    if _dev_trace_endpoint(env) is None:
+        _DEV_TRACE_AVAILABLE = False
+        return
+    if _dev_tracing_importable():
+        _DEV_TRACE_AVAILABLE = True
+        return
+    if env.get("_PHOENIX_DEV_TRACE_BOOTSTRAP") == "1":
+        _DEV_TRACE_AVAILABLE = False
+        return
+
+    probe = subprocess.run(
+        [
+            "uv", "run", "--offline", *_dev_trace_uv_args(),
+            "python", "-c",
+            "import opentelemetry.sdk; "
+            "import opentelemetry.exporter.otlp.proto.http.trace_exporter",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if probe.returncode != 0:
+        _DEV_TRACE_AVAILABLE = False
+        return
+    bootstrap_env = dict(env, _PHOENIX_DEV_TRACE_BOOTSTRAP="1")
+    os.execvpe(
+        "uv",
+        [
+            "uv", "run", "--offline", *_dev_trace_uv_args(),
+            str(Path(__file__).resolve()), *sys.argv[1:],
+        ],
+        bootstrap_env,
+    )
+
+
 def _init_dev_tracing(environ: dict[str, str] | None = None):
     endpoint = _dev_trace_endpoint(environ)
-    if endpoint is None:
+    if endpoint is None or _DEV_TRACE_AVAILABLE is False:
         return None
     try:
         from opentelemetry import trace
@@ -1280,6 +1338,7 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
     lock_timer = CargoLockWaitTimer(started_at)
     span = _begin_dev_span("dev.build", {"build.profile": profile})
     returncode = 1
+    proc = None
     try:
         proc = subprocess.Popen(
             args,
@@ -1296,6 +1355,17 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
         returncode = proc.wait()
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, args)
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc is not None and proc.returncode is not None:
+            returncode = proc.returncode
+        raise
     finally:
         finished_at = time.monotonic()
         lock_wait = lock_timer.finish(finished_at)
@@ -8899,6 +8969,7 @@ def main():
     if pretty:
         _bootstrap_rich()
 
+    _bootstrap_dev_tracing()
     _start_dev_command_tracing(args.command)
 
     if args.command == "up":
