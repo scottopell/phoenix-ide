@@ -415,6 +415,12 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     setSearchParams(storedParams, { replace: true });
   }, [scopeKey, browserSessionActive, location.key, searchParams, setSearchParams]);
 
+  useEffect(() => {
+    if (restorationScheduledForScopeRef.current === scopeKey && slot.kind !== 'none') {
+      restorationScheduledForScopeRef.current = undefined;
+    }
+  }, [scopeKey, slot.kind]);
+
   // REQ-VS-008 / REQ-VS-009: browser-session edges. Rising edge auto-opens the
   // browser viewer only when the slot is empty (never steals prose/diff);
   // falling edge auto-closes only when the browser viewer is showing and

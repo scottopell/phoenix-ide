@@ -432,6 +432,11 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     act(() => { setActive!(true); });
 
     expect(latest!.slot.kind).toBe('prose');
+
+    act(() => { latest!.close(); });
+    act(() => { setActive!(false); });
+    act(() => { setActive!(true); });
+    expect(latest!.slot.kind).toBe('browser');
   });
 
   it('restores a stored browser viewer only after loaded session truth is active', () => {

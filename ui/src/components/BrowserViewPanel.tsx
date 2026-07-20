@@ -77,10 +77,14 @@ export function BrowserViewPanel({
   const [reconnectNonce, setReconnectNonce] = useState(0);
   const [stopping, setStopping] = useState(false);
   const stoppingRef = useRef(false);
+  const liveFrameSuppressedDuringStopRef = useRef(false);
+  const reconnectSuppressedDuringStopRef = useRef(false);
   const [stopError, setStopError] = useState<string | null>(null);
 
   useEffect(() => {
     stoppingRef.current = false;
+    liveFrameSuppressedDuringStopRef.current = false;
+    reconnectSuppressedDuringStopRef.current = false;
     setStopping(false);
     setStopError(null);
   }, [conversationId]);
@@ -90,6 +94,8 @@ export function BrowserViewPanel({
     const terminalBeforeRequest = statusRef.current.kind === 'no-session'
       || statusRef.current.kind === 'ended';
     stoppingRef.current = !terminalBeforeRequest;
+    liveFrameSuppressedDuringStopRef.current = false;
+    reconnectSuppressedDuringStopRef.current = false;
     setStopping(!terminalBeforeRequest);
     if (reconnectTimerRef.current !== null) {
       window.clearTimeout(reconnectTimerRef.current);
@@ -103,6 +109,13 @@ export function BrowserViewPanel({
     } catch (err) {
       stoppingRef.current = false;
       setStopping(false);
+      if (reconnectSuppressedDuringStopRef.current) {
+        setReconnectNonce((nonce) => nonce + 1);
+      } else if (liveFrameSuppressedDuringStopRef.current) {
+        setStatus({ kind: 'live' });
+      }
+      liveFrameSuppressedDuringStopRef.current = false;
+      reconnectSuppressedDuringStopRef.current = false;
       setStopError(err instanceof Error ? err.message : 'Failed to stop browser session');
     }
   }, [conversationId, stopping]);
@@ -167,7 +180,9 @@ export function BrowserViewPanel({
         drawJpeg(jpeg);
         // Receiving a frame implies the screencast is live, regardless of
         // what status arrived earlier (or didn't).
-        if (!stoppingRef.current) {
+        if (stoppingRef.current) {
+          liveFrameSuppressedDuringStopRef.current = true;
+        } else {
           setStatus((prev) => (prev.kind === 'live' ? prev : { kind: 'live' }));
         }
       } else if (tag === TAG_URL) {
@@ -177,12 +192,16 @@ export function BrowserViewPanel({
         const text = new TextDecoder('utf-8').decode(data.subarray(1));
         if (text === 'no-session') {
           stoppingRef.current = false;
+          liveFrameSuppressedDuringStopRef.current = false;
+          reconnectSuppressedDuringStopRef.current = false;
           setStopping(false);
           setStatus({ kind: 'no-session' });
         } else if (text === 'started') {
           setStatus({ kind: 'live' });
         } else if (text === 'ended') {
           stoppingRef.current = false;
+          liveFrameSuppressedDuringStopRef.current = false;
+          reconnectSuppressedDuringStopRef.current = false;
           setStopping(false);
           setStatus({ kind: 'ended' });
         } else if (text.startsWith('error:')) {
@@ -205,7 +224,9 @@ export function BrowserViewPanel({
       // race against that signal. Status stays at whatever the WS last
       // reported so the overlay doesn't flicker back to "Connecting…".
       const wasLive = statusRef.current.kind === 'live';
-      if (wasLive && !stoppingRef.current) {
+      if (wasLive && stoppingRef.current) {
+        reconnectSuppressedDuringStopRef.current = true;
+      } else if (wasLive) {
         setStatus({ kind: 'ended' });
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;

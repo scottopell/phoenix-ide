@@ -23,6 +23,16 @@ function statusMessage(status: string): MessageEvent<ArrayBuffer> {
   return { data: payload.buffer } as MessageEvent<ArrayBuffer>;
 }
 
+function frameMessage(): MessageEvent<ArrayBuffer> {
+  return { data: new Uint8Array([0x00, 0, 0, 0, 0]).buffer } as MessageEvent<ArrayBuffer>;
+}
+
+const bitmap = {
+  width: 1,
+  height: 1,
+  close: vi.fn(),
+} as unknown as ImageBitmap;
+
 class MockWebSocket {
   binaryType = 'arraybuffer';
   onopen: (() => void) | null = null;
@@ -41,15 +51,18 @@ class MockWebSocket {
 
 describe('BrowserViewPanel stop-session control', () => {
   const originalWebSocket = globalThis.WebSocket;
+  const originalCreateImageBitmap = globalThis.createImageBitmap;
 
   beforeEach(() => {
     stopBrowser.mockReset();
     sockets.length = 0;
     globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+    globalThis.createImageBitmap = vi.fn().mockResolvedValue(bitmap);
   });
 
   afterEach(() => {
     globalThis.WebSocket = originalWebSocket;
+    globalThis.createImageBitmap = originalCreateImageBitmap;
   });
 
   it('renders mobile back-to-conversation and stop-session as separate controls', () => {
@@ -133,6 +146,33 @@ describe('BrowserViewPanel stop-session control', () => {
     fireEvent.click(screen.getByLabelText('Back to conversation'));
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('restores live status when a frame was suppressed before stop failed', async () => {
+    let rejectStop: (error: Error) => void = () => {};
+    stopBrowser.mockReturnValue(new Promise((_, reject) => { rejectStop = reject; }));
+    render(<BrowserViewPanel conversationId="conv-1" />);
+
+    fireEvent.click(screen.getByLabelText('Stop browser session'));
+    act(() => { sockets[0]!.onmessage?.(frameMessage()); });
+    await act(async () => { rejectStop(new Error('stop failed')); await Promise.resolve(); });
+
+    expect(screen.getByLabelText('Browser view status: live')).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('stop failed');
+  });
+
+  it('reconnects when socket closure was suppressed before stop failed', async () => {
+    let rejectStop: (error: Error) => void = () => {};
+    stopBrowser.mockReturnValue(new Promise((_, reject) => { rejectStop = reject; }));
+    render(<BrowserViewPanel conversationId="conv-1" />);
+    act(() => { sockets[0]!.onmessage?.(statusMessage('started')); });
+
+    fireEvent.click(screen.getByLabelText('Stop browser session'));
+    act(() => { sockets[0]!.onclose?.(); });
+    await act(async () => { rejectStop(new Error('stop failed')); await Promise.resolve(); });
+
+    expect(sockets).toHaveLength(2);
+    expect(screen.getByRole('alert').textContent).toContain('stop failed');
   });
 
   it('stop failure is rendered visibly and allows retry', async () => {
