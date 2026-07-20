@@ -68,6 +68,7 @@ pub struct TopLevelLlmPreparedRequestRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareTopLevelLlmRequestInput {
     pub workflow_id: WorkflowId,
+    pub effect_id: EffectId,
     pub expected_version: Version,
     pub transition_id: TransitionId,
     pub generation: Generation,
@@ -122,8 +123,6 @@ pub enum ToolKindRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolIntentRecord {
-    pub workflow_id: WorkflowId,
-    pub receipt_id: ReceiptId,
     pub intent_ordinal: u32,
     pub tool_name: String,
     pub tool_kind: ToolKindRecord,
@@ -165,15 +164,17 @@ impl WorkflowRepository {
             .await?;
         if let Some(existing) = existing {
             tx.commit().await?;
-            return Ok(if existing.workflow_id == input.workflow_id
-                && existing.prepared_fingerprint == input.prepared_fingerprint
-                && existing.prepared_payload == input.prepared_payload
-                && existing.committed_outcome == input.committed_outcome
-            {
-                DirectTurnAcceptanceOutcome::Replayed(existing)
-            } else {
-                DirectTurnAcceptanceOutcome::Conflict
-            });
+            return Ok(
+                if existing.workflow_id == input.workflow_id
+                    && existing.prepared_fingerprint == input.prepared_fingerprint
+                    && existing.prepared_payload == input.prepared_payload
+                    && existing.committed_outcome == input.committed_outcome
+                {
+                    DirectTurnAcceptanceOutcome::Replayed(existing)
+                } else {
+                    DirectTurnAcceptanceOutcome::Conflict
+                },
+            );
         }
 
         let create = CreateWorkflowWithExternalAcceptance {
@@ -218,15 +219,17 @@ impl WorkflowRepository {
             .execute(&mut *tx.tx)
             .await?;
         tx.commit().await?;
-        Ok(DirectTurnAcceptanceOutcome::Created(DirectTurnAcceptanceRecord {
-            workflow_id: input.workflow_id,
-            conversation_id: input.conversation_id.clone(),
-            client_message_id: input.client_message_id.clone(),
-            prepared_fingerprint: input.prepared_fingerprint.clone(),
-            prepared_payload: input.prepared_payload.clone(),
-            committed_outcome: input.committed_outcome.clone(),
-            accepted_at: input.accepted_at,
-        }))
+        Ok(DirectTurnAcceptanceOutcome::Created(
+            DirectTurnAcceptanceRecord {
+                workflow_id: input.workflow_id,
+                conversation_id: input.conversation_id.clone(),
+                client_message_id: input.client_message_id.clone(),
+                prepared_fingerprint: input.prepared_fingerprint.clone(),
+                prepared_payload: input.prepared_payload.clone(),
+                committed_outcome: input.committed_outcome.clone(),
+                accepted_at: input.accepted_at,
+            },
+        ))
     }
 
     pub async fn prepare_top_level_llm_request(
@@ -240,7 +243,8 @@ impl WorkflowRepository {
         let event = llm_profile::TopLevelLlmEvent::Prepared {
             key: input.key.clone(),
         };
-        let outcome = self
+        let mut tx = self.begin_tx().await?;
+        let outcome = tx
             .commit_transition_plan(&CommitTransitionPlanCas {
                 workflow_id: input.workflow_id,
                 expected_version: input.expected_version,
@@ -255,7 +259,7 @@ impl WorkflowRepository {
                     .map_err(|e| DbError::Serialization(e.to_string()))?,
                 committed_at: input.committed_at,
                 effects: vec![LocalEffectDecl {
-                    effect_id: llm_profile::EFFECT_ID,
+                    effect_id: input.effect_id,
                     declared_workflow_version: input.expected_version.next(),
                     family: "llm.call".to_string(),
                     kind: "top_level_call".to_string(),
@@ -277,18 +281,18 @@ impl WorkflowRepository {
             })
             .await?;
         if outcome != CommitOutcome::Committed {
+            tx.rollback().await?;
             return Ok(outcome);
         }
-        let mut tx = self.begin_tx().await?;
         sqlx::query("INSERT INTO top_level_llm_effects (workflow_id, effect_id, call_ordinal) VALUES (?1, ?2, ?3)")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(llm_profile::EFFECT_ID.0, "effect_id")?)
+            .bind(to_i64(input.effect_id.0, "effect_id")?)
             .bind(to_i64(input.key.call_ordinal, "call_ordinal")?)
             .execute(&mut *tx.tx)
             .await?;
         sqlx::query("INSERT INTO top_level_llm_prepared_requests (workflow_id, effect_id, codec_version, request_fingerprint, provider, model, backend, request_aggregate) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(llm_profile::EFFECT_ID.0, "effect_id")?)
+            .bind(to_i64(input.effect_id.0, "effect_id")?)
             .bind(i64::from(input.prepared_request.codec_version))
             .bind(&input.prepared_request.request_fingerprint)
             .bind(&input.prepared_request.provider)
@@ -326,38 +330,47 @@ impl WorkflowRepository {
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(|row| {
-            let workflow_id = WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?);
-            let effect_id = EffectId(to_u64(row.get::<i64, _>("effect_id"), "effect_id")?);
-            let attempt_id = AttemptId(to_u64(row.get::<i64, _>("attempt_id"), "attempt_id")?);
-            let authority = LocalAttemptAuthority {
-                workflow_id,
-                declared_workflow_version: Version(to_u64(row.get::<i64, _>("declared_workflow_version"), "declared_workflow_version")?),
-                generation: Generation(to_u64(row.get::<i64, _>("generation"), "generation")?),
-                effect_id,
-                attempt_id,
-                process_incarnation: ProcessIncarnation(to_u64(row.get::<i64, _>("process_incarnation"), "process_incarnation")?),
-            };
-            Ok(RecoverTopLevelLlmAttempt {
-                workflow: workflow_row_from_row(&row)?,
-                prepared_request: prepared_row_from_row(&row)?,
-                attempt: LocalAttemptRecord {
-                    id: attempt_id,
-                    ordinal: to_u32(row.get::<i64, _>("ordinal"), "ordinal")?,
-                    authority: authority.clone(),
-                    status: parse_attempt_status(&row.get::<String, _>("status"))?,
-                    lease: row
-                        .get::<Option<i64>, _>("lease_until")
-                        .map(|v| {
-                            to_u64(v, "lease_until").map(|lease_until| LocalReclaimableLease {
-                                attempt_id,
-                                lease_until: LeaseExpiry(lease_until),
+        rows.into_iter()
+            .map(|row| {
+                let workflow_id =
+                    WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?);
+                let effect_id = EffectId(to_u64(row.get::<i64, _>("effect_id"), "effect_id")?);
+                let attempt_id = AttemptId(to_u64(row.get::<i64, _>("attempt_id"), "attempt_id")?);
+                let authority = LocalAttemptAuthority {
+                    workflow_id,
+                    declared_workflow_version: Version(to_u64(
+                        row.get::<i64, _>("declared_workflow_version"),
+                        "declared_workflow_version",
+                    )?),
+                    generation: Generation(to_u64(row.get::<i64, _>("generation"), "generation")?),
+                    effect_id,
+                    attempt_id,
+                    process_incarnation: ProcessIncarnation(to_u64(
+                        row.get::<i64, _>("process_incarnation"),
+                        "process_incarnation",
+                    )?),
+                };
+                Ok(RecoverTopLevelLlmAttempt {
+                    workflow: workflow_row_from_row(&row)?,
+                    prepared_request: prepared_row_from_row(&row)?,
+                    attempt: LocalAttemptRecord {
+                        id: attempt_id,
+                        ordinal: to_u32(row.get::<i64, _>("ordinal"), "ordinal")?,
+                        authority: authority.clone(),
+                        status: parse_attempt_status(&row.get::<String, _>("status"))?,
+                        lease: row
+                            .get::<Option<i64>, _>("lease_until")
+                            .map(|v| {
+                                to_u64(v, "lease_until").map(|lease_until| LocalReclaimableLease {
+                                    attempt_id,
+                                    lease_until: LeaseExpiry(lease_until),
+                                })
                             })
-                        })
-                        .transpose()?,
-                },
+                            .transpose()?,
+                    },
+                })
             })
-        }).collect()
+            .collect()
     }
 
     pub async fn accept_complete_top_level_llm_response(
@@ -366,9 +379,15 @@ impl WorkflowRepository {
     ) -> DbResult<AcceptCompleteLlmResponseResult> {
         let receipt_payload = serde_json::to_vec(&llm_profile::LlmResponseReceipt {
             key: LlmEffectKey {
-                accepted_turn_id: load_accepted_turn_id(&self.pool, input.authority.workflow_id).await?,
+                accepted_turn_id: load_accepted_turn_id(&self.pool, input.authority.workflow_id)
+                    .await?,
                 generation: input.authority.generation.0,
-                call_ordinal: load_call_ordinal(&self.pool, input.authority.workflow_id, input.authority.effect_id).await?,
+                call_ordinal: load_call_ordinal(
+                    &self.pool,
+                    input.authority.workflow_id,
+                    input.authority.effect_id,
+                )
+                .await?,
             },
             response: input.response.clone(),
             generation: input.authority.generation.0,
@@ -385,9 +404,18 @@ impl WorkflowRepository {
             receipt_event_codec: local_codec_ref_to_owned(llm_profile::receipt_codec()),
             receipt_event_payload: serde_json::to_vec(&llm_profile::LlmResponseReceipt {
                 key: LlmEffectKey {
-                    accepted_turn_id: load_accepted_turn_id(&self.pool, input.authority.workflow_id).await?,
+                    accepted_turn_id: load_accepted_turn_id(
+                        &self.pool,
+                        input.authority.workflow_id,
+                    )
+                    .await?,
                     generation: input.authority.generation.0,
-                    call_ordinal: load_call_ordinal(&self.pool, input.authority.workflow_id, input.authority.effect_id).await?,
+                    call_ordinal: load_call_ordinal(
+                        &self.pool,
+                        input.authority.workflow_id,
+                        input.authority.effect_id,
+                    )
+                    .await?,
                 },
                 response: input.response.clone(),
                 generation: input.authority.generation.0,
@@ -396,9 +424,13 @@ impl WorkflowRepository {
             receipt_event_requires_runtime_acceptance: true,
             request_runtime_acceptance_for_cancellation: false,
         };
-        let generic = self.accept_receipt(&receipt_input).await?;
+        let mut tx = self.begin_tx().await?;
+        let generic = tx.accept_receipt_and_delivery(&receipt_input).await?;
         if generic.outcome != AuthorityOutcome::Authorized {
-            let existing = self.load_llm_response_receipt(input.authority.workflow_id, input.authority.effect_id).await?;
+            tx.rollback().await?;
+            let existing = self
+                .load_llm_response_receipt(input.authority.workflow_id, input.authority.effect_id)
+                .await?;
             if let Some(llm_receipt) = existing {
                 let intents = self
                     .load_tool_intents(input.authority.workflow_id, llm_receipt.receipt_id)
@@ -414,7 +446,10 @@ impl WorkflowRepository {
                         .list_deliveries(input.authority.workflow_id)
                         .await?
                         .into_iter()
-                        .find(|d| d.delivery_id == input.delivery_id || d.effect_id == Some(input.authority.effect_id)),
+                        .find(|d| {
+                            d.delivery_id == input.delivery_id
+                                || d.effect_id == Some(input.authority.effect_id)
+                        }),
                     llm_receipt: Some(llm_receipt),
                     tool_intents: intents,
                 });
@@ -427,7 +462,6 @@ impl WorkflowRepository {
                 tool_intents: vec![],
             });
         }
-        let mut tx = self.begin_tx().await?;
         sqlx::query("INSERT INTO top_level_llm_response_receipts (workflow_id, receipt_id, effect_id, codec_version, response_fingerprint, response_aggregate, provider_request_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
             .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.receipt_id.0, "receipt_id")?)
@@ -440,8 +474,8 @@ impl WorkflowRepository {
             .await?;
         for intent in &input.tool_intents {
             sqlx::query("INSERT INTO top_level_llm_tool_intents (workflow_id, receipt_id, intent_ordinal, tool_name, tool_kind, tool_use_id, arguments_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
-                .bind(to_i64(intent.workflow_id.0, "workflow_id")?)
-                .bind(to_i64(intent.receipt_id.0, "receipt_id")?)
+                .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+                .bind(to_i64(input.receipt_id.0, "receipt_id")?)
                 .bind(i64::from(intent.intent_ordinal))
                 .bind(&intent.tool_name)
                 .bind(tool_kind_to_str(&intent.tool_kind))
@@ -501,7 +535,10 @@ impl WorkflowRepository {
                     workflow_id,
                     effect_id: EffectId(to_u64(row.get::<i64, _>("effect_id"), "effect_id")?),
                     call_ordinal: to_u64(row.get::<i64, _>("call_ordinal"), "call_ordinal")?,
-                    codec_version: to_u32(row.get::<i64, _>("request_codec_version"), "request_codec_version")?,
+                    codec_version: to_u32(
+                        row.get::<i64, _>("request_codec_version"),
+                        "request_codec_version",
+                    )?,
                     request_fingerprint: row.get("request_fingerprint"),
                     provider: row.get("provider"),
                     model: row.get("model"),
@@ -513,36 +550,71 @@ impl WorkflowRepository {
                     workflow_id,
                     effect_id: EffectId(to_u64(row.get::<i64, _>("effect_id"), "effect_id")?),
                     generation: Generation(to_u64(row.get::<i64, _>("generation"), "generation")?),
-                    declared_workflow_version: Version(to_u64(row.get::<i64, _>("declared_workflow_version"), "declared_workflow_version")?),
-                    process_incarnation: ProcessIncarnation(to_u64(row.get::<i64, _>("process_incarnation"), "process_incarnation")?),
-                    attempt_id: row.get::<Option<i64>, _>("attempt_id").map(|v| to_u64(v, "attempt_id").map(AttemptId)).transpose()?,
+                    declared_workflow_version: Version(to_u64(
+                        row.get::<i64, _>("declared_workflow_version"),
+                        "declared_workflow_version",
+                    )?),
+                    process_incarnation: ProcessIncarnation(to_u64(
+                        row.get::<i64, _>("process_incarnation"),
+                        "process_incarnation",
+                    )?),
+                    attempt_id: row
+                        .get::<Option<i64>, _>("attempt_id")
+                        .map(|v| to_u64(v, "attempt_id").map(AttemptId))
+                        .transpose()?,
                     origin: parse_receipt_origin(&row.get::<String, _>("origin"))?,
-                    receipt_codec: local_codec(row.get("receipt_codec_family"), row.get("receipt_codec_version"), "receipt_codec_version")?,
+                    receipt_codec: local_codec(
+                        row.get("receipt_codec_family"),
+                        row.get("receipt_codec_version"),
+                        "receipt_codec_version",
+                    )?,
                     receipt_payload: row.get("receipt_payload"),
                 },
                 llm_receipt: LlmResponseReceiptRecord {
                     workflow_id,
                     receipt_id,
                     effect_id: EffectId(to_u64(row.get::<i64, _>("effect_id"), "effect_id")?),
-                    codec_version: to_u32(row.get::<i64, _>("response_codec_version"), "response_codec_version")?,
+                    codec_version: to_u32(
+                        row.get::<i64, _>("response_codec_version"),
+                        "response_codec_version",
+                    )?,
                     response_fingerprint: row.get("response_fingerprint"),
                     response_aggregate: row.get("response_aggregate"),
                     provider_request_id: row.get("provider_request_id"),
                 },
                 delivery: LocalDeliveryRecord {
-                    delivery_id: DeliveryId(to_u64(row.get::<i64, _>("delivery_id"), "delivery_id")?),
+                    delivery_id: DeliveryId(to_u64(
+                        row.get::<i64, _>("delivery_id"),
+                        "delivery_id",
+                    )?),
                     workflow_id,
-                    effect_id: row.get::<Option<i64>, _>("effect_id").map(|v| to_u64(v, "effect_id").map(EffectId)).transpose()?,
+                    effect_id: row
+                        .get::<Option<i64>, _>("effect_id")
+                        .map(|v| to_u64(v, "effect_id").map(EffectId))
+                        .transpose()?,
                     barrier_id: None,
                     consumer_kind: row.get("consumer_kind"),
-                    event_codec: local_codec(row.get("event_codec_family"), row.get("event_codec_version"), "event_codec_version")?,
-                    payload_kind: parse_delivery_payload_kind(&row.get::<String, _>("payload_kind"))?,
+                    event_codec: local_codec(
+                        row.get("event_codec_family"),
+                        row.get("event_codec_version"),
+                        "event_codec_version",
+                    )?,
+                    payload_kind: parse_delivery_payload_kind(
+                        &row.get::<String, _>("payload_kind"),
+                    )?,
                     payload_blob: row.get("payload_blob"),
                     requires_runtime_acceptance: row.get("requires_runtime_acceptance"),
                     status: parse_delivery_status(&row.get::<String, _>("status"))?,
-                    runtime_acceptance_status: parse_runtime_acceptance_status(row.get::<Option<String>, _>("runtime_acceptance_status"))?,
-                    suppression_reason: parse_suppression_reason(row.get::<Option<String>, _>("suppression_reason"))?,
-                    accepted_by_transition_id: row.get::<Option<i64>, _>("accepted_by_transition_id").map(|v| to_u64(v, "accepted_by_transition_id").map(TransitionId)).transpose()?,
+                    runtime_acceptance_status: parse_runtime_acceptance_status(
+                        row.get::<Option<String>, _>("runtime_acceptance_status"),
+                    )?,
+                    suppression_reason: parse_suppression_reason(
+                        row.get::<Option<String>, _>("suppression_reason"),
+                    )?,
+                    accepted_by_transition_id: row
+                        .get::<Option<i64>, _>("accepted_by_transition_id")
+                        .map(|v| to_u64(v, "accepted_by_transition_id").map(TransitionId))
+                        .transpose()?,
                 },
                 tool_intents: self.load_tool_intents(workflow_id, receipt_id).await?,
             });
@@ -554,65 +626,86 @@ impl WorkflowRepository {
         &self,
         input: &StopTopLevelLlmInput,
     ) -> DbResult<CommitOutcome> {
+        let mut tx = self.begin_tx().await?;
         let deliveries = sqlx::query_scalar::<_, i64>(
             "SELECT delivery_id FROM workflow_deliveries WHERE workflow_id = ?1 AND status = 'Pending' ORDER BY delivery_id"
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx.tx)
         .await?
         .into_iter()
         .map(|v| to_u64(v, "delivery_id").map(DeliveryId))
         .collect::<DbResult<Vec<_>>>()?;
         if deliveries.is_empty() {
-            let outcome = self
-                .commit_transition_head_cas(&CommitTransitionHeadCas {
-                    workflow_id: input.workflow_id,
-                    expected_version: input.expected_version,
-                    transition_id: input.transition_id,
-                    generation: input.generation,
-                    next_status: input.next_status,
-                    event_codec: llm_profile::event_codec(),
-                    event_payload: input.event_payload.clone(),
-                    next_snapshot_codec: llm_profile::snapshot_codec(),
-                    next_snapshot_payload: serde_json::to_vec(&input.next_snapshot)
-                        .map_err(|e| DbError::Serialization(e.to_string()))?,
-                    committed_at: input.stopped_at,
-                })
+            let event_codec = local_codec_ref_to_owned(llm_profile::event_codec());
+            let snapshot_codec = local_codec_ref_to_owned(llm_profile::snapshot_codec());
+            let snapshot_payload = serde_json::to_vec(&input.next_snapshot)
+                .map_err(|e| DbError::Serialization(e.to_string()))?;
+            let committed = tx
+                .commit_transition_head_cas(
+                    input.workflow_id,
+                    input.expected_version,
+                    input.generation,
+                    input.next_status,
+                    &event_codec,
+                    &input.event_payload,
+                    &snapshot_codec,
+                    &snapshot_payload,
+                    input.transition_id,
+                    input.stopped_at,
+                )
                 .await?;
+            let outcome = if committed {
+                CommitOutcome::Committed
+            } else {
+                CommitOutcome::VersionConflict
+            };
             if outcome != CommitOutcome::Committed {
+                tx.rollback().await?;
                 return Ok(outcome);
             }
-            sqlx::query("UPDATE top_level_llm_workflows SET stopped_at = ?2 WHERE workflow_id = ?1")
-                .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-                .bind(to_i64(input.stopped_at.0, "stopped_at")?)
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "UPDATE top_level_llm_workflows SET stopped_at = ?2 WHERE workflow_id = ?1",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.stopped_at.0, "stopped_at")?)
+            .execute(&mut *tx.tx)
+            .await?;
+            tx.commit().await?;
             return Ok(CommitOutcome::Committed);
         }
-        let outcome = self.accept_or_suppress_deliveries_exact(&AcceptOrSuppressDeliveryInput {
-            workflow_id: input.workflow_id,
-            expected_version: input.expected_version,
-            transition_id: input.transition_id,
-            generation: input.generation,
-            next_status: input.next_status,
-            event_codec: local_codec_ref_to_owned(llm_profile::event_codec()),
-            event_payload: input.event_payload.clone(),
-            next_snapshot_codec: local_codec_ref_to_owned(llm_profile::snapshot_codec()),
-            next_snapshot_payload: serde_json::to_vec(&input.next_snapshot)
-                .map_err(|e| DbError::Serialization(e.to_string()))?,
-            committed_at: input.stopped_at,
-            accept_delivery_ids: vec![],
-            suppress_delivery_ids: deliveries,
-            suppression_reason: input.suppression_reason,
-        }).await?;
+        let event_codec = local_codec_ref_to_owned(llm_profile::event_codec());
+        let snapshot_codec = local_codec_ref_to_owned(llm_profile::snapshot_codec());
+        let snapshot_payload = serde_json::to_vec(&input.next_snapshot)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let outcome = tx
+            .resolve_deliveries_exact(DeliveryResolutionPlan {
+                workflow_id: input.workflow_id,
+                expected_version: input.expected_version,
+                transition_id: input.transition_id,
+                generation: input.generation,
+                next_status: input.next_status,
+                event_codec: &event_codec,
+                event_payload: &input.event_payload,
+                next_snapshot_codec: &snapshot_codec,
+                next_snapshot_payload: &snapshot_payload,
+                committed_at: input.stopped_at,
+                exact_delivery_ids: &deliveries,
+                decision: DeliveryResolutionDecision::Suppress {
+                    reason: input.suppression_reason,
+                },
+            })
+            .await?;
         if outcome != CommitOutcome::Committed {
+            tx.rollback().await?;
             return Ok(outcome);
         }
         sqlx::query("UPDATE top_level_llm_workflows SET stopped_at = ?2 WHERE workflow_id = ?1")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.stopped_at.0, "stopped_at")?)
-            .execute(&self.pool)
+            .execute(&mut *tx.tx)
             .await?;
+        tx.commit().await?;
         Ok(CommitOutcome::Committed)
     }
 
@@ -626,15 +719,18 @@ impl WorkflowRepository {
             .bind(to_i64(effect_id.0, "effect_id")?)
             .fetch_optional(&self.pool)
             .await?;
-        row.map(|row| Ok(LlmResponseReceiptRecord {
-            workflow_id,
-            receipt_id: ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?),
-            effect_id,
-            codec_version: to_u32(row.get::<i64, _>("codec_version"), "codec_version")?,
-            response_fingerprint: row.get("response_fingerprint"),
-            response_aggregate: row.get("response_aggregate"),
-            provider_request_id: row.get("provider_request_id"),
-        })).transpose()
+        row.map(|row| {
+            Ok(LlmResponseReceiptRecord {
+                workflow_id,
+                receipt_id: ReceiptId(to_u64(row.get::<i64, _>("receipt_id"), "receipt_id")?),
+                effect_id,
+                codec_version: to_u32(row.get::<i64, _>("codec_version"), "codec_version")?,
+                response_fingerprint: row.get("response_fingerprint"),
+                response_aggregate: row.get("response_aggregate"),
+                provider_request_id: row.get("provider_request_id"),
+            })
+        })
+        .transpose()
     }
 
     async fn load_tool_intents(
@@ -647,15 +743,17 @@ impl WorkflowRepository {
             .bind(to_i64(receipt_id.0, "receipt_id")?)
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter().map(|row| Ok(ToolIntentRecord {
-            workflow_id,
-            receipt_id,
-            intent_ordinal: to_u32(row.get::<i64, _>("intent_ordinal"), "intent_ordinal")?,
-            tool_name: row.get("tool_name"),
-            tool_kind: parse_tool_kind(&row.get::<String, _>("tool_kind"))?,
-            tool_use_id: row.get("tool_use_id"),
-            arguments_json: row.get("arguments_json"),
-        })).collect()
+        rows.into_iter()
+            .map(|row| {
+                Ok(ToolIntentRecord {
+                    intent_ordinal: to_u32(row.get::<i64, _>("intent_ordinal"), "intent_ordinal")?,
+                    tool_name: row.get("tool_name"),
+                    tool_kind: parse_tool_kind(&row.get::<String, _>("tool_kind"))?,
+                    tool_use_id: row.get("tool_use_id"),
+                    arguments_json: row.get("arguments_json"),
+                })
+            })
+            .collect()
     }
 }
 
@@ -670,20 +768,28 @@ impl<'a> WorkflowTx<'a> {
             .bind(client_message_id)
             .fetch_optional(&mut *self.tx)
             .await?;
-        row.map(|row| Ok(DirectTurnAcceptanceRecord {
-            workflow_id: WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?),
-            conversation_id: conversation_id.to_string(),
-            client_message_id: client_message_id.to_string(),
-            prepared_fingerprint: row.get("prepared_fingerprint"),
-            prepared_payload: row.get("prepared_payload"),
-            committed_outcome: parse_direct_turn_outcome(&row.get::<String, _>("committed_outcome"))?,
-            accepted_at: Timestamp(to_u64(row.get::<i64, _>("accepted_at"), "accepted_at")?),
-        })).transpose()
+        row.map(|row| {
+            Ok(DirectTurnAcceptanceRecord {
+                workflow_id: WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?),
+                conversation_id: conversation_id.to_string(),
+                client_message_id: client_message_id.to_string(),
+                prepared_fingerprint: row.get("prepared_fingerprint"),
+                prepared_payload: row.get("prepared_payload"),
+                committed_outcome: parse_direct_turn_outcome(
+                    &row.get::<String, _>("committed_outcome"),
+                )?,
+                accepted_at: Timestamp(to_u64(row.get::<i64, _>("accepted_at"), "accepted_at")?),
+            })
+        })
+        .transpose()
     }
 }
 
 fn local_codec_ref_to_owned(codec: CodecRef) -> LocalCodec {
-    LocalCodec { family: codec.family.to_string(), version: codec.version }
+    LocalCodec {
+        family: codec.family.to_string(),
+        version: codec.version,
+    }
 }
 
 fn workflow_row_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<TopLevelLlmWorkflowRecord> {
@@ -691,13 +797,21 @@ fn workflow_row_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<TopLevelLlmW
         workflow_id: WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?),
         conversation_id: row.get("conversation_id"),
         accepted_turn_id: row.get("accepted_turn_id"),
-        turn_generation: Generation(to_u64(row.get::<i64, _>("turn_generation"), "turn_generation")?),
+        turn_generation: Generation(to_u64(
+            row.get::<i64, _>("turn_generation"),
+            "turn_generation",
+        )?),
         accepted_assistant_message_id: row.get("accepted_assistant_message_id"),
-        stopped_at: row.get::<Option<i64>, _>("stopped_at").map(|v| to_u64(v, "stopped_at").map(Timestamp)).transpose()?,
+        stopped_at: row
+            .get::<Option<i64>, _>("stopped_at")
+            .map(|v| to_u64(v, "stopped_at").map(Timestamp))
+            .transpose()?,
     })
 }
 
-fn prepared_row_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<TopLevelLlmPreparedRequestRecord> {
+fn prepared_row_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<TopLevelLlmPreparedRequestRecord> {
     Ok(TopLevelLlmPreparedRequestRecord {
         workflow_id: WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?),
         effect_id: EffectId(to_u64(row.get::<i64, _>("effect_id"), "effect_id")?),
@@ -712,19 +826,27 @@ fn prepared_row_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<TopLevelLlmP
 }
 
 async fn load_accepted_turn_id(pool: &SqlitePool, workflow_id: WorkflowId) -> DbResult<String> {
-    sqlx::query_scalar::<_, String>("SELECT accepted_turn_id FROM top_level_llm_workflows WHERE workflow_id = ?1")
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .fetch_one(pool)
-        .await
-        .map_err(DbError::from)
+    sqlx::query_scalar::<_, String>(
+        "SELECT accepted_turn_id FROM top_level_llm_workflows WHERE workflow_id = ?1",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::from)
 }
 
-async fn load_call_ordinal(pool: &SqlitePool, workflow_id: WorkflowId, effect_id: EffectId) -> DbResult<u64> {
-    let value = sqlx::query_scalar::<_, i64>("SELECT call_ordinal FROM top_level_llm_effects WHERE workflow_id = ?1 AND effect_id = ?2")
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .bind(to_i64(effect_id.0, "effect_id")?)
-        .fetch_one(pool)
-        .await?;
+async fn load_call_ordinal(
+    pool: &SqlitePool,
+    workflow_id: WorkflowId,
+    effect_id: EffectId,
+) -> DbResult<u64> {
+    let value = sqlx::query_scalar::<_, i64>(
+        "SELECT call_ordinal FROM top_level_llm_effects WHERE workflow_id = ?1 AND effect_id = ?2",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(to_i64(effect_id.0, "effect_id")?)
+    .fetch_one(pool)
+    .await?;
     to_u64(value, "call_ordinal")
 }
 
@@ -739,7 +861,9 @@ fn parse_direct_turn_outcome(value: &str) -> DbResult<DirectTurnCommittedOutcome
     match value {
         "RuntimeAccepted" => Ok(DirectTurnCommittedOutcome::RuntimeAccepted),
         "QueuedSteering" => Ok(DirectTurnCommittedOutcome::QueuedSteering),
-        other => Err(DbError::Serialization(format!("unknown direct-turn outcome: {other}"))),
+        other => Err(DbError::Serialization(format!(
+            "unknown direct-turn outcome: {other}"
+        ))),
     }
 }
 
@@ -754,7 +878,9 @@ fn parse_tool_kind(value: &str) -> DbResult<ToolKindRecord> {
     match value {
         "Function" => Ok(ToolKindRecord::Function),
         "Custom" => Ok(ToolKindRecord::Custom),
-        other => Err(DbError::Serialization(format!("unknown tool kind: {other}"))),
+        other => Err(DbError::Serialization(format!(
+            "unknown tool kind: {other}"
+        ))),
     }
 }
 
@@ -768,7 +894,10 @@ mod tests {
     async fn setup_repo_schema(pool: &SqlitePool) {
         sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', cwd TEXT NOT NULL DEFAULT '/tmp', parent_conversation_id TEXT, user_initiated BOOLEAN NOT NULL DEFAULT 1, archived BOOLEAN NOT NULL DEFAULT 0, model TEXT, steering_queue TEXT NOT NULL DEFAULT '[]', state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', created_at TEXT NOT NULL DEFAULT '2025-01-01', updated_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE, conversation_id TEXT NOT NULL, message_type TEXT NOT NULL, content TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
-        sqlx::query("INSERT INTO conversations (id) VALUES ('conv-1')").execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations (id) VALUES ('conv-1')")
+            .execute(pool)
+            .await
+            .unwrap();
         run_pending_migrations(pool).await.unwrap();
     }
 
@@ -776,9 +905,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workflow.db");
         let url = format!("sqlite://{}", path.display());
-        let opts = SqliteConnectOptions::from_str(&url).unwrap().create_if_missing(true).journal_mode(SqliteJournalMode::Wal).busy_timeout(std::time::Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
-        sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.unwrap();
+        let opts = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
         setup_repo_schema(&pool).await;
         std::mem::forget(dir);
         WorkflowRepository::new(pool)
@@ -809,12 +949,21 @@ mod tests {
             accepted_at: Timestamp(1),
             snapshot: snapshot(),
         };
-        assert!(matches!(repo.accept_direct_turn(&input).await.unwrap(), DirectTurnAcceptanceOutcome::Created(_)));
-        assert!(matches!(repo.accept_direct_turn(&input).await.unwrap(), DirectTurnAcceptanceOutcome::Replayed(_)));
+        assert!(matches!(
+            repo.accept_direct_turn(&input).await.unwrap(),
+            DirectTurnAcceptanceOutcome::Created(_)
+        ));
+        assert!(matches!(
+            repo.accept_direct_turn(&input).await.unwrap(),
+            DirectTurnAcceptanceOutcome::Replayed(_)
+        ));
         let mut conflict = input.clone();
         conflict.workflow_id = WorkflowId(102);
         conflict.prepared_fingerprint = "fp-2".to_string();
-        assert_eq!(repo.accept_direct_turn(&conflict).await.unwrap(), DirectTurnAcceptanceOutcome::Conflict);
+        assert_eq!(
+            repo.accept_direct_turn(&conflict).await.unwrap(),
+            DirectTurnAcceptanceOutcome::Conflict
+        );
     }
 
     #[tokio::test]
@@ -829,56 +978,130 @@ mod tests {
             committed_outcome: DirectTurnCommittedOutcome::RuntimeAccepted,
             accepted_at: Timestamp(1),
             snapshot: snapshot(),
-        }).await.unwrap();
-        assert_eq!(repo.prepare_top_level_llm_request(&PrepareTopLevelLlmRequestInput {
-            workflow_id: WorkflowId(201),
-            expected_version: Version(0),
-            transition_id: TransitionId(1),
-            generation: Generation(0),
-            committed_at: Timestamp(2),
-            snapshot: snapshot(),
-            key: LlmEffectKey { accepted_turn_id: "msg-1".to_string(), generation: 4, call_ordinal: 2 },
-            prepared_request: PreparedLlmRequest { codec_version: 1, request_fingerprint: "req-1".to_string(), provider: "openai".to_string(), model: "gpt-5".to_string(), backend: "responses".to_string(), request_aggregate: "{\"messages\":[]}".to_string() },
-        }).await.unwrap(), CommitOutcome::Committed);
-        let begun = repo.begin_top_level_llm_attempt(&BeginAttemptInput {
-            workflow_id: WorkflowId(201),
-            effect_id: llm_profile::EFFECT_ID,
-            attempt_id: AttemptId(1),
-            process_incarnation: ProcessIncarnation(7),
-            now: Timestamp(3),
-            lease_until: None,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.prepare_top_level_llm_request(&PrepareTopLevelLlmRequestInput {
+                workflow_id: WorkflowId(201),
+                effect_id: EffectId(2),
+                expected_version: Version(0),
+                transition_id: TransitionId(1),
+                generation: Generation(0),
+                committed_at: Timestamp(2),
+                snapshot: snapshot(),
+                key: LlmEffectKey {
+                    accepted_turn_id: "msg-1".to_string(),
+                    generation: 4,
+                    call_ordinal: 2
+                },
+                prepared_request: PreparedLlmRequest {
+                    codec_version: 1,
+                    request_fingerprint: "req-1".to_string(),
+                    provider: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    backend: "responses".to_string(),
+                    request_aggregate: "{\"messages\":[]}".to_string()
+                },
+            })
+            .await
+            .unwrap(),
+            CommitOutcome::Committed
+        );
+        let begun = repo
+            .begin_top_level_llm_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(201),
+                effect_id: EffectId(2),
+                attempt_id: AttemptId(1),
+                process_incarnation: ProcessIncarnation(7),
+                now: Timestamp(3),
+                lease_until: None,
+            })
+            .await
+            .unwrap();
         assert_eq!(begun.outcome, ClaimOutcome::Started);
-        assert_eq!(repo.recover_top_level_llm_attempts().await.unwrap().len(), 1);
-        let result = repo.accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
-            authority: begun.authority.unwrap(),
-            delivery_id: DeliveryId(1),
-            receipt_id: ReceiptId(1),
-            response: CompleteLlmResponse { codec_version: 1, response_fingerprint: "resp-1".to_string(), response_aggregate: "{\"output\":[]}".to_string() },
-            provider_request_id: Some("provider-1".to_string()),
-            tool_intents: vec![ToolIntentRecord { workflow_id: WorkflowId(201), receipt_id: ReceiptId(1), intent_ordinal: 0, tool_name: "submit_result".to_string(), tool_kind: ToolKindRecord::Function, tool_use_id: "tool-1".to_string(), arguments_json: "{\"result\":\"ok\"}".to_string() }],
-        }).await.unwrap();
+        assert_eq!(
+            repo.recover_top_level_llm_attempts().await.unwrap().len(),
+            1
+        );
+        let result = repo
+            .accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
+                authority: begun.authority.unwrap(),
+                delivery_id: DeliveryId(1),
+                receipt_id: ReceiptId(1),
+                response: CompleteLlmResponse {
+                    codec_version: 1,
+                    response_fingerprint: "resp-1".to_string(),
+                    response_aggregate: "{\"output\":[]}".to_string(),
+                },
+                provider_request_id: Some("provider-1".to_string()),
+                tool_intents: vec![ToolIntentRecord {
+                    intent_ordinal: 0,
+                    tool_name: "submit_result".to_string(),
+                    tool_kind: ToolKindRecord::Function,
+                    tool_use_id: "tool-1".to_string(),
+                    arguments_json: "{\"result\":\"ok\"}".to_string(),
+                }],
+            })
+            .await
+            .unwrap();
         assert_eq!(result.outcome, AuthorityOutcome::Authorized);
-        assert_eq!(repo.load_owed_top_level_llm_receipts().await.unwrap().len(), 1);
-        assert_eq!(repo.accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
-            authority: LocalAttemptAuthority { workflow_id: WorkflowId(201), declared_workflow_version: Version(1), generation: Generation(0), effect_id: llm_profile::EFFECT_ID, attempt_id: AttemptId(1), process_incarnation: ProcessIncarnation(7) },
-            delivery_id: DeliveryId(1),
-            receipt_id: ReceiptId(1),
-            response: CompleteLlmResponse { codec_version: 1, response_fingerprint: "resp-1".to_string(), response_aggregate: "{\"output\":[]}".to_string() },
-            provider_request_id: Some("provider-1".to_string()),
-            tool_intents: vec![],
-        }).await.unwrap().outcome, AuthorityOutcome::Authorized);
-        let stopped = repo.stop_top_level_llm_and_suppress_pending_delivery(&StopTopLevelLlmInput {
-            workflow_id: WorkflowId(201),
-            stopped_at: Timestamp(10),
-            expected_version: Version(999),
-            transition_id: TransitionId(2),
-            generation: Generation(0),
-            next_status: WorkflowStatus::Cancelled,
-            event_payload: serde_json::to_vec(&llm_profile::TopLevelLlmEvent::ResponseCancelled { key: LlmEffectKey { accepted_turn_id: "msg-1".to_string(), generation: 4, call_ordinal: 2 }, reason: "stop".to_string() }).unwrap(),
-            next_snapshot: TopLevelLlmSnapshot { stopped_at: Some(10), ..snapshot() },
-            suppression_reason: SuppressionReason::Cancelled,
-        }).await.unwrap();
+        assert_eq!(
+            repo.load_owed_top_level_llm_receipts().await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            repo.accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
+                authority: LocalAttemptAuthority {
+                    workflow_id: WorkflowId(201),
+                    declared_workflow_version: Version(1),
+                    generation: Generation(0),
+                    effect_id: EffectId(2),
+                    attempt_id: AttemptId(1),
+                    process_incarnation: ProcessIncarnation(7)
+                },
+                delivery_id: DeliveryId(1),
+                receipt_id: ReceiptId(1),
+                response: CompleteLlmResponse {
+                    codec_version: 1,
+                    response_fingerprint: "resp-1".to_string(),
+                    response_aggregate: "{\"output\":[]}".to_string()
+                },
+                provider_request_id: Some("provider-1".to_string()),
+                tool_intents: vec![],
+            })
+            .await
+            .unwrap()
+            .outcome,
+            AuthorityOutcome::Authorized
+        );
+        let stopped = repo
+            .stop_top_level_llm_and_suppress_pending_delivery(&StopTopLevelLlmInput {
+                workflow_id: WorkflowId(201),
+                stopped_at: Timestamp(10),
+                expected_version: Version(999),
+                transition_id: TransitionId(2),
+                generation: Generation(0),
+                next_status: WorkflowStatus::Cancelled,
+                event_payload: serde_json::to_vec(
+                    &llm_profile::TopLevelLlmEvent::ResponseCancelled {
+                        key: LlmEffectKey {
+                            accepted_turn_id: "msg-1".to_string(),
+                            generation: 4,
+                            call_ordinal: 2,
+                        },
+                        reason: "stop".to_string(),
+                    },
+                )
+                .unwrap(),
+                next_snapshot: TopLevelLlmSnapshot {
+                    stopped_at: Some(10),
+                    ..snapshot()
+                },
+                suppression_reason: SuppressionReason::Cancelled,
+            })
+            .await
+            .unwrap();
         assert_eq!(stopped, CommitOutcome::VersionConflict);
     }
 }
