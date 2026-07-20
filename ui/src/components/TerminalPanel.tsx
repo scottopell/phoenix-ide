@@ -1112,7 +1112,7 @@ export function TerminalPanel({
       // Shell integration not detected. Show the static conversation cwd
       // so the user has a useful anchor. Hover the dot for the hint.
       return (
-        <span className="terminal-panel-prompt">
+        <span className="terminal-panel-prompt terminal-panel-prompt--cwd-only">
           <span className="terminal-hud-cwd terminal-hud-cwd--dim">
             {formatCwdPlain(cwd ?? '') || '❯_ Terminal'}
           </span>
@@ -1170,7 +1170,7 @@ export function TerminalPanel({
     }
     // Idle
     return (
-      <span className="terminal-panel-prompt">
+      <span className="terminal-panel-prompt terminal-panel-prompt--cwd-only">
         <span className="terminal-hud-cwd">{formatCwdPlain(effectiveCwd)}</span>
       </span>
     );

@@ -508,7 +508,219 @@
   flex-shrink: 0;
 }
 
+.statebar-files-btn {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  margin-left: 4px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.statebar-files-btn::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+}
+
+.statebar-files-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.statebar-files-btn:active {
+  background: var(--bg-primary);
+}
+
+.statebar-files-btn:focus-visible {
+  outline: 2px solid var(--accent-blue, currentColor);
+  outline-offset: 2px;
+}
+
 @media (width <= 768px) {
+  #state-bar.statebar-mobile {
+    height: auto;
+    min-height: 44px;
+    padding: 0;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .statebar-mobile-primary {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px;
+    min-width: 0;
+  }
+
+  #state-bar.statebar-mobile-collapsed {
+    cursor: pointer;
+  }
+
+  .statebar-mobile-slug {
+    flex: 1 1 auto;
+    max-width: none;
+    font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  .statebar-mobile-status,
+  .statebar-mobile-runtime {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .statebar-mobile-status {
+    flex: 0 1 auto;
+    max-width: 34vw;
+  }
+
+  .statebar-mobile-status .state-text,
+  .statebar-mobile-runtime .state-text {
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .statebar-mobile-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  .statebar-chevron {
+    width: 44px;
+    height: 44px;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    color: var(--text-muted);
+    font-size: 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+
+  .statebar-chevron:hover {
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+  }
+
+  .statebar-chevron:focus-visible {
+    outline: 2px solid var(--accent-blue, currentColor);
+    outline-offset: -2px;
+  }
+
+  .statebar-mobile-details {
+    width: 100%;
+    padding: 8px;
+    border-top: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .statebar-mobile-section {
+    min-width: 0;
+    padding: 8px;
+    border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--bg-primary) 45%, transparent);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .statebar-mobile-section[aria-label="Conversation identity"],
+  .statebar-mobile-section--runtime {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .statebar-mobile-row {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .statebar-mobile-label {
+    flex: 0 0 48px;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .statebar-mobile-value,
+  .statebar-mobile-help {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-size: 12px;
+  }
+
+  .statebar-mobile-help {
+    color: var(--text-muted);
+  }
+
+  .statebar-mobile-path,
+  .statebar-mobile-branch {
+    font-family: var(--font-mono);
+  }
+
+  .statebar-mobile-copy {
+    min-height: 36px;
+    margin-left: auto;
+    padding: 0 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .statebar-mobile-copy:hover {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+  }
+
+  .conv-model-wrapper--mobile {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .conv-model-wrapper--mobile .conv-model {
+    max-width: calc(100vw - 92px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .active-pr-selector,
   .statebar-mobile-pr {
     width: 100%;

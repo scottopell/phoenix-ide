@@ -6686,23 +6686,7 @@ html * {
     margin-bottom: 10px;
   }
 
-  /* StateBar mobile layout moved to components/StateBar.css */
-}
-
-/* StateBar file action moved to components/StateBar.css */
-
-.statebar-files-btn:hover {
-  color: var(--text-primary);
-  background: var(--bg-tertiary);
-}
-
-.statebar-files-btn:active {
-  background: var(--bg-primary);
-}
-
-.statebar-files-btn:focus-visible {
-  outline: 2px solid var(--accent-blue, currentColor);
-  outline-offset: 2px;
+  /* StateBar mobile layout is owned by components/StateBar.css. */
 }
 
 /* IndexedDB init error state */
@@ -9873,6 +9857,9 @@ html * {
 /* Rich HUD (OSC 133 detected) — inline spans inside .terminal-panel-prompt */
 .terminal-hud-cwd {
   color: var(--accent-blue, #58a6ff);
+}
+
+.terminal-panel-prompt--cwd-only .terminal-hud-cwd {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -274,7 +274,7 @@ describe('StateBar PR badge', () => {
   it('does not fetch PR status itself for conversations without a branch', async () => {
     renderStateBar({ conversation: makeConversation({ branch_name: null, base_branch: null }) });
 
-    await waitFor(() => expect(screen.getByText('track-pr-status')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getAllByText('track-pr-status')).not.toHaveLength(0));
     expect(api.getPrStatus).not.toHaveBeenCalled();
   });
 
@@ -983,7 +983,7 @@ describe('StateBar desktop identity layout', () => {
     expect(screen.getByText('from')).toBeInTheDocument();
     expect(screen.getByText('main')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /#12 checks ✓/i })).toBeInTheDocument();
-    expect(screen.getByText('track-pr-status')).toBeInTheDocument();
+    expect(screen.getAllByText('track-pr-status')).not.toHaveLength(0);
   });
 
   it('normalizes mode and model casing for desktop branch conversations', () => {
@@ -1059,6 +1059,22 @@ describe('StateBar mobile layout', () => {
     expect(screen.getByRole('button', { name: /copy full working directory .*phoenix-ide/i })).toBeInTheDocument();
     expect(screen.queryByText('Phoenix IDE')).not.toBeInTheDocument();
     expect(screen.queryByText('main')).not.toBeInTheDocument();
+  });
+
+  it('uses the displayed worktree path for mobile tooltip and copy action', () => {
+    const { container } = renderStateBar({
+      conversation: makeConversation({
+        cwd: '/repo/original',
+        worktree_path: '/repo/.phoenix/worktrees/worktree-1',
+      }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    const copy = screen.getByRole('button', { name: /copy full working directory .*worktree-1/i });
+    expect(container.querySelector('.statebar-mobile-path')).toHaveAttribute('title', '/repo/.phoenix/worktrees/worktree-1');
+    expect(container.querySelector('.statebar-mobile-path')).toHaveTextContent('…/worktrees/worktree-1');
+    fireEvent.click(copy);
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('/repo/.phoenix/worktrees/worktree-1');
   });
 
   it('renders work task, branch, PR, context, cwd copy, model, and file action without base branch', () => {

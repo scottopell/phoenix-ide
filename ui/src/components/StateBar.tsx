@@ -939,6 +939,7 @@ export function StateBar({
   );
 
   const cwdSummary = identity?.path.summary ?? '—';
+  const displayedPath = identity?.path.full ?? null;
   const modeHelp = identity?.mode.title ?? 'Full access';
   const modeDetail = identity?.mode.detail ?? 'Full access';
 
@@ -1137,19 +1138,19 @@ export function StateBar({
                 <span className="statebar-mobile-label">Path</span>
                 <code
                   className="statebar-mobile-value statebar-mobile-path"
-                  title={conversation.cwd}
+                  title={displayedPath ?? undefined}
                 >
                   {cwdSummary}
                 </code>
-                {conversation.cwd && (
+                {displayedPath && (
                   <button
                     type="button"
                     className="statebar-mobile-copy"
                     onClick={() =>
-                      void navigator.clipboard?.writeText(conversation.cwd)
+                      void navigator.clipboard?.writeText(displayedPath)
                     }
-                    aria-label={`Copy full working directory ${conversation.cwd}`}
-                    title={conversation.cwd}
+                    aria-label={`Copy full working directory ${displayedPath}`}
+                    title={displayedPath}
                   >
                     Copy cwd
                   </button>

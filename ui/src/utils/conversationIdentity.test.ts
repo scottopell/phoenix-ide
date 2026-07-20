@@ -84,9 +84,11 @@ describe('conversationIdentity', () => {
 
   it('keeps meaningful titles that contain UUIDs or long hashes', () => {
     expect(getConversationDisplayTitle(makeConversation({
+      slug: '123e4567-e89b-12d3-a456-426614174000',
       task_title: 'Investigate 123e4567-e89b-12d3-a456-426614174000 failure',
     }))).toBe('Investigate 123e4567-e89b-12d3-a456-426614174000 failure');
     expect(getConversationDisplayTitle(makeConversation({
+      slug: '123e4567-e89b-12d3-a456-426614174000',
       task_title: 'Review commit 9d1b4cc93b7845228e4fdbe566761f44',
     }))).toBe('Review commit 9d1b4cc93b7845228e4fdbe566761f44');
   });
@@ -102,6 +104,18 @@ describe('conversationIdentity', () => {
       task_title: null,
       branch_name: 'scott/readable-branch',
     }))).toBe('scott/readable-branch');
+  });
+
+  it('rejects generated prefixed UUID slugs but honors renamed slugs before task titles', () => {
+    expect(getConversationDisplayTitle(makeConversation({
+      slug: 'fork-123e4567-e89b-12d3-a456-426614174000',
+      task_title: 'Readable task title',
+    }))).toBe('Readable task title');
+
+    expect(getConversationDisplayTitle(makeConversation({
+      slug: 'renamed-work-conversation',
+      task_title: 'Original task title',
+    }))).toBe('renamed-work-conversation');
   });
 
   it('returns a shared typed identity display payload', () => {

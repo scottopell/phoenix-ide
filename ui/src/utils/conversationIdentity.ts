@@ -38,6 +38,7 @@ export interface ConversationIdentity {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const GENERATED_UUID_LABEL_PATTERN = /^(?:fork|conversation|conv|worktree|project)[-_][0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const LONG_HEX_TOKEN_PATTERN = /^[0-9a-f]{24,}$/i;
 const GENERATED_PATH_LEAF_PATTERN = /(?:^|[-_])[0-9a-f]{24,}$/i;
 const PHOENIX_WORKTREE_SEGMENT = '/.phoenix/worktrees/';
@@ -95,6 +96,11 @@ export function isLowValueIdentifier(value: string | null | undefined): boolean 
   const normalized = value?.trim();
   if (!normalized) return true;
   return UUID_PATTERN.test(normalized) || LONG_HEX_TOKEN_PATTERN.test(normalized);
+}
+
+function isLowValueConversationLabel(value: string | null | undefined): boolean {
+  const normalized = value?.trim();
+  return isLowValueIdentifier(normalized) || Boolean(normalized && GENERATED_UUID_LABEL_PATTERN.test(normalized));
 }
 
 export function getPathDisplayLabel(path: string | null | undefined): string | null {
@@ -166,9 +172,11 @@ export function getConversationDisplayTitle(
   conversation: Pick<Conversation, 'slug' | 'task_title' | 'branch_name' | 'project_name' | 'worktree_path' | 'cwd'>,
   fallback = 'Untitled conversation',
 ): string {
+  const slug = conversation.slug?.trim();
+  if (!isLowValueConversationLabel(slug)) return slug!;
+
   const candidates = [
     conversation.task_title,
-    conversation.slug,
     conversation.branch_name,
     getConversationProjectLabel(conversation),
   ];
