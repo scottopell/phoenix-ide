@@ -9727,6 +9727,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creation_metadata_mode_and_normalized_environment_commit_together() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-mode-environment", "conv-mode-environment").await;
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-environment".into()),
+                &CreationClaimToken("token-environment".into()),
+                Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        let mode = ConvMode::Branch {
+            branch_name: NonEmptyString::new("feature/environment").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/worktree-environment").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+
+        let outcome = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-mode-environment",
+                &claim,
+                "conv-mode-environment",
+                &ConversationCreationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: Some("/tmp/worktree-environment".into()),
+                    project_id: None,
+                    desired_base_branch: None,
+                },
+                &mode,
+                "test-model",
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreationCasOutcome::Applied);
+
+        let persisted: (String, String, String, String, String, String) = sqlx::query_as(
+            "SELECT c.cm_kind, c.cwd, e.environment_kind, e.worktree_path,
+                    e.branch_name, e.base_branch
+             FROM conversations c
+             JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
+             WHERE c.id = 'conv-mode-environment'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "branch".into(),
+                "/tmp/worktree-environment".into(),
+                "allocated_worktree".into(),
+                "/tmp/worktree-environment".into(),
+                "feature/environment".into(),
+                "main".into(),
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn stale_claim_cannot_commit_creation_metadata() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-stale-metadata", "conv-stale-metadata").await;
