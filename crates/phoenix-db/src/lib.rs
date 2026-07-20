@@ -16,7 +16,10 @@ use phoenix_core::domain::creation_protocol::{
     CreationStage, CreationStatus, CreationWorkerId,
 };
 use phoenix_core::domain::db_schema as schema;
-use phoenix_core::work_scope::{AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId};
+use phoenix_core::work_scope::{
+    AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeRetirementBlocker,
+    WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
+};
 
 pub use coordinator_query::{
     execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
@@ -1011,28 +1014,81 @@ impl Database {
         Ok(())
     }
 
-    fn new_scope_for_conversation(
-        cwd: &str,
-        cm: &ConvModeCols<'_>,
-    ) -> (WorkScopeId, AuthorityKind, EnvironmentContext) {
-        let scope_id = WorkScopeId::new();
-        let context = match (cm.kind, cm.worktree_path, cm.branch_name, cm.base_branch) {
+    async fn update_work_scope_environment_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        scope_id: &WorkScopeId,
+        context: EnvironmentContext,
+        now: &str,
+    ) -> DbResult<()> {
+        let (kind, cwd, worktree_path, branch_name, base_branch) = match context {
+            EnvironmentContext::AllocatedWorktree {
+                cwd,
+                worktree_path,
+                branch_name,
+                base_branch,
+            } => (
+                "allocated_worktree",
+                Some(cwd),
+                Some(worktree_path),
+                branch_name,
+                base_branch,
+            ),
+            EnvironmentContext::UnownedCwd { cwd } => ("unowned_cwd", Some(cwd), None, None, None),
+            EnvironmentContext::None => ("none", None, None, None, None),
+        };
+        let result = sqlx::query(
+            "UPDATE work_scope_environments
+             SET environment_kind = ?1, cwd = ?2, worktree_path = ?3,
+                 branch_name = ?4, base_branch = ?5, updated_at = ?6
+             WHERE work_scope_id = ?7",
+        )
+        .bind(kind)
+        .bind(cwd)
+        .bind(worktree_path)
+        .bind(branch_name)
+        .bind(base_branch)
+        .bind(now)
+        .bind(scope_id.as_str())
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(DbError::Serialization(format!(
+                "work scope {} has no normalized environment",
+                scope_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn environment_for_mode(cwd: &str, cm: &ConvModeCols<'_>) -> EnvironmentContext {
+        match (cm.kind, cm.worktree_path, cm.branch_name, cm.base_branch) {
             ("work" | "branch", Some(worktree_path), Some(branch_name), Some(base_branch)) => {
                 EnvironmentContext::AllocatedWorktree {
                     cwd: cwd.to_string(),
                     worktree_path: worktree_path.to_string(),
-                    branch_name: branch_name.to_string(),
-                    base_branch: base_branch.to_string(),
+                    branch_name: Some(branch_name.to_string()),
+                    base_branch: Some(base_branch.to_string()),
                 }
             }
-            ("explore", Some(worktree_path), _, _) => EnvironmentContext::UnownedCwd {
+            ("explore", Some(worktree_path), _, _) => EnvironmentContext::AllocatedWorktree {
                 cwd: worktree_path.to_string(),
+                worktree_path: worktree_path.to_string(),
+                branch_name: None,
+                base_branch: None,
             },
             _ if !cwd.is_empty() => EnvironmentContext::UnownedCwd {
                 cwd: cwd.to_string(),
             },
             _ => EnvironmentContext::None,
-        };
+        }
+    }
+
+    fn new_scope_for_conversation(
+        cwd: &str,
+        cm: &ConvModeCols<'_>,
+    ) -> (WorkScopeId, AuthorityKind, EnvironmentContext) {
+        let scope_id = WorkScopeId::new();
+        let context = Self::environment_for_mode(cwd, cm);
         let authority_kind = match cm.kind {
             "work" | "branch" => AuthorityKind::Work,
             _ => AuthorityKind::RestrictedExplore,
@@ -1050,6 +1106,112 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(exists != 0)
+    }
+
+    /// Retire a scope only when both runtime and durable ownership inventories
+    /// prove that no obligation remains. Conversation history and scope-owned
+    /// observations are preserved; retirement changes lifecycle only.
+    pub async fn retire_work_scope(
+        &self,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+    ) -> DbResult<WorkScopeRetirementOutcome> {
+        if reason.trim().is_empty() {
+            return Err(DbError::Serialization(
+                "work scope retirement reason must not be empty".to_string(),
+            ));
+        }
+        let scope_id = precondition.scope_id();
+        let mut tx = self.pool.begin().await?;
+        let lifecycle =
+            sqlx::query_scalar::<_, String>("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| DbError::Serialization(format!("unknown work scope {scope_id}")))?;
+        if lifecycle == "retired" {
+            tx.rollback().await?;
+            return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
+        }
+
+        let blockers = [
+            (
+                WorkScopeRetirementBlocker::CurrentUserOwner,
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversations c
+                    WHERE c.work_scope_id = ?1 AND c.runtime_role = 'user' AND c.archived = 0
+                      AND (
+                        json_extract(c.state, '$.type') NOT IN
+                          ('completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal', 'context_exhausted')
+                        OR (json_extract(c.state, '$.type') = 'context_exhausted' AND c.continued_in_conv_id IS NULL)
+                      )
+                 )",
+            ),
+            (
+                WorkScopeRetirementBlocker::UserSuccessor,
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversations successor
+                    JOIN conversations predecessor ON predecessor.continued_in_conv_id = successor.id
+                    WHERE successor.work_scope_id = ?1 AND successor.runtime_role = 'user'
+                      AND successor.archived = 0
+                 )",
+            ),
+            (
+                WorkScopeRetirementBlocker::ActiveSubAgent,
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversations c
+                    WHERE c.work_scope_id = ?1 AND c.runtime_role = 'sub_agent' AND c.archived = 0
+                      AND json_extract(c.state, '$.type') NOT IN
+                        ('completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal', 'context_exhausted')
+                 )",
+            ),
+            (
+                WorkScopeRetirementBlocker::PendingWakeOrWorkflow,
+                "SELECT EXISTS(
+                    SELECT 1 FROM wake_bindings b
+                    JOIN workflows w ON w.workflow_id = b.workflow_id
+                    WHERE b.work_scope_id = ?1
+                      AND (
+                        b.resolved_at IS NULL
+                        OR w.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending')
+                        OR EXISTS (
+                            SELECT 1 FROM workflow_deliveries d
+                            WHERE d.workflow_id = b.workflow_id
+                              AND (d.status IN ('Pending', 'Deferred') OR d.runtime_acceptance_status = 'Owed')
+                        )
+                      )
+                 )",
+            ),
+        ];
+        for (blocker, query) in blockers {
+            if sqlx::query_scalar::<_, i64>(query)
+                .bind(scope_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?
+                != 0
+            {
+                tx.rollback().await?;
+                return Ok(WorkScopeRetirementOutcome::Blocked(blocker));
+            }
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE work_scopes
+             SET lifecycle = 'retired', retired_at = ?1, retired_reason = ?2, updated_at = ?1
+             WHERE id = ?3 AND lifecycle = 'active'",
+        )
+        .bind(&now)
+        .bind(reason)
+        .bind(scope_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
+        }
+        tx.commit().await?;
+        Ok(WorkScopeRetirementOutcome::Retired)
     }
 
     async fn ensure_work_scope_id(
@@ -2872,10 +3034,10 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-             FROM conversations c WHERE c.id = ?1",
+             FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.id = ?1",
         )
         .bind(id)
         .try_map(parse_conversation_row)
@@ -2901,10 +3063,10 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
-             FROM conversations c WHERE c.slug = ?1",
+             FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.slug = ?1",
         )
         .bind(slug)
         .try_map(parse_conversation_row)
@@ -2930,10 +3092,11 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
+             LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.archived = 0 AND c.user_initiated = 1
                AND c.runtime_role != 'coordinator'
              ORDER BY c.updated_at DESC",
@@ -3012,10 +3175,11 @@ impl Database {
                WHERE cwd IS NOT NULL AND cwd != ''
                  AND id NOT IN (SELECT id FROM coordinator_chain)
              UNION
-             SELECT cm_worktree_path FROM conversations
-               WHERE cm_worktree_path IS NOT NULL
-                 AND cm_worktree_path != ''
-                 AND id NOT IN (SELECT id FROM coordinator_chain)",
+             SELECT e.worktree_path
+             FROM work_scope_environments e
+             JOIN conversations c ON c.work_scope_id = e.work_scope_id
+               WHERE e.environment_kind = 'allocated_worktree'
+                 AND c.id NOT IN (SELECT id FROM coordinator_chain)",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -3035,10 +3199,9 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn managed_worktree_paths(&self) -> DbResult<Vec<String>> {
         sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT cm_worktree_path FROM conversations
-              WHERE cm_worktree_path IS NOT NULL
-                AND cm_worktree_path != ''
-              ORDER BY cm_worktree_path",
+            "SELECT worktree_path FROM work_scope_environments
+              WHERE environment_kind = 'allocated_worktree'
+              ORDER BY worktree_path",
         )
         .fetch_all(&self.pool)
         .await
@@ -3057,13 +3220,13 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
-             WHERE c.cm_worktree_path IS NOT NULL
-               AND c.cm_worktree_path != ''
-             ORDER BY c.cm_worktree_path, c.updated_at DESC",
+             JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
+             WHERE e.environment_kind = 'allocated_worktree'
+             ORDER BY e.worktree_path, c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
         .fetch_all(&self.pool)
@@ -3084,10 +3247,11 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
+             LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
@@ -3107,10 +3271,11 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
+             LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.archived = 1 AND c.user_initiated = 1
                AND NOT EXISTS (
                    SELECT 1 FROM conversation_creation_jobs j
@@ -4618,14 +4783,23 @@ impl Database {
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
     pub async fn update_conversation_mode(&self, id: &str, mode: &ConvMode) -> DbResult<()> {
-        let now = Utc::now();
+        let now = Utc::now().to_rfc3339();
         let cm = conv_mode_columns(mode);
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT cwd, work_scope_id FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(id.to_string()))?;
+        let cwd: String = row.get("cwd");
+        let scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
 
         let result = sqlx::query(
             "UPDATE conversations
              SET cm_kind = ?1, cm_branch_name = ?2, cm_worktree_path = ?3, cm_base_branch = ?4,
                  cm_task_id = ?5, cm_task_title = ?6, cm_next_taskmd_id_hint = ?7, updated_at = ?8
-             WHERE id = ?9",
+             WHERE id = ?9 AND work_scope_id = ?10",
         )
         .bind(cm.kind)
         .bind(cm.branch_name)
@@ -4634,14 +4808,23 @@ impl Database {
         .bind(cm.task_id)
         .bind(cm.task_title)
         .bind(cm.next_taskmd_id_hint)
-        .bind(now.to_rfc3339())
+        .bind(&now)
         .bind(id)
-        .execute(&self.pool)
+        .bind(scope_id.as_str())
+        .execute(&mut *tx)
         .await?;
-
-        if result.rows_affected() == 0 {
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        Self::update_work_scope_environment_tx(
+            &mut tx,
+            &scope_id,
+            Self::environment_for_mode(&cwd, &cm),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4690,12 +4873,14 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
+             JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.archived = 0
-               AND c.cm_worktree_path = ?1",
+               AND e.environment_kind = 'allocated_worktree'
+               AND e.worktree_path = ?1",
         )
         .bind(worktree_path)
         .try_map(parse_conversation_row)
@@ -4718,10 +4903,11 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
+             LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.work_scope_id = ?1",
         )
         .bind(work_scope_id.as_str())
@@ -5389,11 +5575,12 @@ impl Database {
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
             FROM conversations c
             JOIN chain ON c.id = chain.id
+            LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
             ORDER BY chain.depth",
         )
         .bind(root_id)
@@ -6228,6 +6415,23 @@ impl Database {
                         tx.rollback().await?;
                         return Ok(CreationCasOutcome::ClaimLost);
                     }
+                    let environment_row =
+                        sqlx::query("SELECT cwd, work_scope_id FROM conversations WHERE id = ?1")
+                            .bind(id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    let environment_cwd: String = environment_row.get("cwd");
+                    let environment_scope =
+                        WorkScopeId::parse(environment_row.get::<String, _>("work_scope_id"))
+                            .map_err(|error| DbError::Serialization(error.to_string()))?;
+                    Self::update_work_scope_environment_tx(
+                        &mut tx,
+                        &environment_scope,
+                        Self::environment_for_mode(&environment_cwd, &cm),
+                        &now,
+                    )
+                    .await?;
+
                     let stage_updated = sqlx::query(
                         "UPDATE conversation_creation_jobs SET stage = ?1, updated_at = ?2
                          WHERE id = ?3 AND status = 'claimed' AND generation = ?4
@@ -6279,10 +6483,11 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS cm_branch_name, e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
+             LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.archived = 0
                AND c.cm_kind IN ('work', 'branch')",
         )
@@ -7646,7 +7851,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT tu.root_conversation_id AS rid, tu.model AS model, \
              c.slug AS slug, c.title AS title, c.project_id AS project_id, \
-             c.cm_worktree_path AS worktree_path, MIN(tu.created_at) AS started_at, \
+             e.worktree_path AS worktree_path, MIN(tu.created_at) AS started_at, \
              COALESCE(SUM(tu.input_tokens), 0) AS input_tokens, \
              COALESCE(SUM(tu.output_tokens), 0) AS output_tokens, \
              COALESCE(SUM(tu.cache_creation_tokens), 0) AS cache_creation_tokens, \
@@ -7654,6 +7859,7 @@ impl Database {
              COUNT(*) AS turns \
              FROM turn_usage tu \
              LEFT JOIN conversations c ON c.id = tu.root_conversation_id \
+             LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id \
              GROUP BY tu.root_conversation_id, tu.model",
         )
         .fetch_all(&self.pool)
@@ -15836,6 +16042,188 @@ mod tests {
         assert_eq!(p.status, ForkProposalStatus::Dismissed);
         assert!(p.fork_conversation_id.is_none());
         assert!(p.refinement_conversation_id.is_none());
+    }
+
+    async fn retirement_fixture(
+        db: &Database,
+        id: &str,
+        role: RuntimeRole,
+        state: &ConvState,
+    ) -> WorkScopeId {
+        let conv = db
+            .create_conversation_with_project(
+                id,
+                id,
+                "/tmp/retirement",
+                true,
+                None,
+                None,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        db.update_conversation_state(id, state).await.unwrap();
+        if role != RuntimeRole::User {
+            sqlx::query("UPDATE conversations SET runtime_role = ?1 WHERE id = ?2")
+                .bind(role.as_str())
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        conv.work_scope_id.unwrap()
+    }
+
+    fn no_live_resource(scope: WorkScopeId) -> WorkScopeRetirementPrecondition {
+        WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(scope)
+    }
+
+    #[tokio::test]
+    async fn retirement_blocks_current_user_owner() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = retirement_fixture(&db, "owner", RuntimeRole::User, &ConvState::Idle).await;
+        assert_eq!(
+            db.retire_work_scope(no_live_resource(scope), "cleanup")
+                .await
+                .unwrap(),
+            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::CurrentUserOwner)
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_blocks_user_successor() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            retirement_fixture(&db, "predecessor", RuntimeRole::User, &ConvState::Terminal).await;
+        retirement_fixture(&db, "successor", RuntimeRole::User, &ConvState::Terminal).await;
+        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'successor'")
+            .bind(scope.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET continued_in_conv_id = 'successor' WHERE id = 'predecessor'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            db.retire_work_scope(no_live_resource(scope), "cleanup")
+                .await
+                .unwrap(),
+            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::UserSuccessor)
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_blocks_active_subagent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = retirement_fixture(
+            &db,
+            "terminal-user",
+            RuntimeRole::User,
+            &ConvState::Terminal,
+        )
+        .await;
+        retirement_fixture(&db, "active-child", RuntimeRole::SubAgent, &ConvState::Idle).await;
+        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'active-child'")
+            .bind(scope.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.retire_work_scope(no_live_resource(scope), "cleanup")
+                .await
+                .unwrap(),
+            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::ActiveSubAgent)
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_blocks_pending_wake_workflow() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            retirement_fixture(&db, "wake-owner", RuntimeRole::User, &ConvState::Terminal).await;
+        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (900, 'wake', 1, 1, 0, 0, 0, 'Active', 'wake', 1, X'00', 1, 1)")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO workflow_effects (workflow_id, effect_id, declared_workflow_version, family, kind, intent_codec_family, intent_codec_version, intent_payload, generation, role, capability_kind, status) VALUES (900, 1, 0, 'wake', 'observe', 'wake', 1, X'00', 0, 'Required', 'ReclaimableObservation', 'Eligible')")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO wake_bindings (workflow_id, conversation_id, contract_id, profile_kind, profile_version, work_scope_id, resource_kind, bash_handle_id, registering_tool_use_id, expires_at, prepared_fingerprint, observe_effect_id, created_at) VALUES (900, 'wake-owner', 'contract', 'wake', 1, ?1, 'Bash', 'b-900', 'tool', 100, 'fingerprint', 1, 1)")
+            .bind(scope.as_str()).execute(db.pool()).await.unwrap();
+        assert_eq!(
+            db.retire_work_scope(no_live_resource(scope), "cleanup")
+                .await
+                .unwrap(),
+            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::PendingWakeOrWorkflow)
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_retirement_preserves_conversation_and_scope_history() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = retirement_fixture(
+            &db,
+            "history-owner",
+            RuntimeRole::User,
+            &ConvState::Terminal,
+        )
+        .await;
+        sqlx::query("INSERT INTO work_scope_observed_branches (work_scope_id, repository_identity, branch_name, first_observed_head_oid, last_observed_head_oid, first_observed_at, last_observed_at) VALUES (?1, 'repo', 'topic', 'a', 'b', '1', '2')")
+            .bind(scope.as_str()).execute(db.pool()).await.unwrap();
+        assert_eq!(
+            db.retire_work_scope(no_live_resource(scope.clone()), "resources removed")
+                .await
+                .unwrap(),
+            WorkScopeRetirementOutcome::Retired
+        );
+        assert!(db.get_conversation("history-owner").await.is_ok());
+        let lifecycle: String =
+            sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                .bind(scope.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(lifecycle, "retired");
+        let history: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scope_observed_branches WHERE work_scope_id = ?1",
+        )
+        .bind(scope.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(history, 1);
+    }
+
+    #[tokio::test]
+    async fn normalized_environment_is_authoritative_for_reads_and_mode_updates() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mode = ConvMode::Work {
+            branch_name: NonEmptyString::new("topic").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/normalized-worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("24703").unwrap(),
+            task_title: NonEmptyString::new("normalized").unwrap(),
+        };
+        retirement_fixture(&db, "normalized", RuntimeRole::User, &ConvState::Idle).await;
+        db.update_conversation_mode("normalized", &mode)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET cm_worktree_path = '/tmp/stale-shadow', cm_branch_name = 'stale'")
+            .execute(db.pool()).await.unwrap();
+        let conv = db.get_conversation("normalized").await.unwrap();
+        assert_eq!(
+            conv.conv_mode.worktree_path(),
+            Some("/tmp/normalized-worktree")
+        );
+        assert_eq!(
+            db.managed_worktree_paths().await.unwrap(),
+            vec!["/tmp/normalized-worktree"]
+        );
     }
 
     /// Task 02667: a fresh DB's `conversations` table must not carry the

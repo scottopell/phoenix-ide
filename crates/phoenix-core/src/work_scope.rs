@@ -170,8 +170,8 @@ pub enum EnvironmentContext {
     AllocatedWorktree {
         cwd: String,
         worktree_path: String,
-        branch_name: String,
-        base_branch: String,
+        branch_name: Option<String>,
+        base_branch: Option<String>,
     },
     UnownedCwd {
         cwd: String,
@@ -190,6 +190,43 @@ pub struct WorkScopeRecord {
 pub struct WorkScopeEnvironmentRecord {
     pub work_scope_id: WorkScopeId,
     pub context: EnvironmentContext,
+}
+
+/// Proof that the runtime inspected every in-memory resource registry for one
+/// scope and found no live resource. Its private field prevents database-only
+/// callers from manufacturing retirement authority from durable state alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkScopeRetirementPrecondition {
+    scope_id: WorkScopeId,
+}
+
+impl WorkScopeRetirementPrecondition {
+    /// Construct the proof after the runtime has inventoried bash, tmux,
+    /// terminal, and browser registries and established that none is live.
+    #[must_use]
+    pub fn after_runtime_inventory_found_no_live_resource(scope_id: WorkScopeId) -> Self {
+        Self { scope_id }
+    }
+
+    #[must_use]
+    pub fn scope_id(&self) -> &WorkScopeId {
+        &self.scope_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkScopeRetirementOutcome {
+    Retired,
+    AlreadyRetired,
+    Blocked(WorkScopeRetirementBlocker),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkScopeRetirementBlocker {
+    CurrentUserOwner,
+    UserSuccessor,
+    ActiveSubAgent,
+    PendingWakeOrWorkflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

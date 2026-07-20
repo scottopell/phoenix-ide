@@ -4605,11 +4605,62 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         .await
         .map_err(|e| AppError::Internal(format!("Failed to delete conversation row: {e}")))?;
 
+    // Scope retirement belongs to explicit scope cleanup, not to a terminal
+    // transcript transition. The row deletion above removes this conversation's
+    // ownership claim; runtime inventory and the database CAS independently
+    // recheck the remaining in-memory and durable obligations.
+    retire_work_scope_after_hard_delete(state, &conv).await;
+
     delete_conversation_attachments(id).await;
 
     broadcast_conversation_hard_deleted(state, id).await;
 
     Ok(())
+}
+
+async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::db::Conversation) {
+    use phoenix_core::domain::work_scope_inventory::{BrowserSessionLiveness, TmuxServerStatus};
+
+    let Some(scope_id) = deleted.work_scope_id.clone() else {
+        return;
+    };
+    let scope = crate::work_scope::ResourceScopeKey::Work(scope_id.clone());
+    let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
+        &scope,
+        state.runtime.bash_handles(),
+        state.runtime.tmux_registry(),
+        state.runtime.browser_sessions(),
+    )
+    .await;
+    let live_resource = inventory.bash.iter().any(|handle| handle.state.is_live())
+        || inventory
+            .tmux
+            .is_some_and(|tmux| tmux.status != TmuxServerStatus::Gone)
+        || inventory
+            .browser
+            .is_some_and(|browser| browser.state == BrowserSessionLiveness::Live)
+        || state.terminals.get(&scope).is_some();
+    if live_resource {
+        tracing::debug!(work_scope = %scope_id, "work scope retirement blocked by live runtime resource");
+        return;
+    }
+
+    let proof = phoenix_core::work_scope::WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(scope_id.clone());
+    match state
+        .db
+        .retire_work_scope(proof, "last owner hard-deleted after resource teardown")
+        .await
+    {
+        Ok(phoenix_core::work_scope::WorkScopeRetirementOutcome::Retired) => {
+            tracing::debug!(work_scope = %scope_id, "retired unowned work scope");
+        }
+        Ok(outcome) => {
+            tracing::debug!(work_scope = %scope_id, ?outcome, "work scope retirement CAS declined");
+        }
+        Err(error) => {
+            tracing::warn!(work_scope = %scope_id, %error, "work scope retirement CAS failed");
+        }
+    }
 }
 
 async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {

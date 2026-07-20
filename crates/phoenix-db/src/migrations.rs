@@ -317,7 +317,7 @@ CREATE TABLE work_scope_environments (
     base_branch TEXT,
     updated_at TEXT NOT NULL,
     CHECK (
-        (environment_kind = 'allocated_worktree' AND cwd IS NOT NULL AND cwd <> '' AND worktree_path IS NOT NULL AND worktree_path <> '' AND branch_name IS NOT NULL AND branch_name <> '' AND base_branch IS NOT NULL AND base_branch <> '')
+        (environment_kind = 'allocated_worktree' AND cwd IS NOT NULL AND cwd <> '' AND worktree_path IS NOT NULL AND worktree_path <> '' AND (branch_name IS NULL OR branch_name <> '') AND (base_branch IS NULL OR base_branch <> ''))
         OR (environment_kind = 'unowned_cwd' AND cwd IS NOT NULL AND cwd <> '' AND worktree_path IS NULL AND branch_name IS NULL AND base_branch IS NULL)
         OR (environment_kind = 'none' AND cwd IS NULL AND worktree_path IS NULL AND branch_name IS NULL AND base_branch IS NULL)
     )
