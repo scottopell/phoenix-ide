@@ -129,6 +129,23 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     expect(screen.getByRole('button', { name: 'Open Git diff' })).toBeInTheDocument();
   });
 
+  it('shows the locally known upstream relationship', async () => {
+    vi.mocked(api.getConversationGitStatus).mockResolvedValue({
+      kind: 'snapshot',
+      checkout_status: {
+        kind: 'named_branch',
+        branch_name: 'feature',
+        head_oid: 'abc123',
+        remote_status: { kind: 'tracked', remote_ref: 'origin/feature', ahead: 2, behind: 1 },
+      },
+      counts: { changed_paths: 0, staged_paths: 0, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
+      changed_paths: [],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('feature · origin/feature · ↑2 ↓1')).toBeInTheDocument();
+  });
+
   it('hides Workspace Diff when the conversation mode is not diffable', async () => {
     vi.mocked(api.getConversationGitStatus).mockResolvedValue({
       kind: 'snapshot',

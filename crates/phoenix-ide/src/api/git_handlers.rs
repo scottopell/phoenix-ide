@@ -367,7 +367,6 @@ fn parse_git_status_porcelain_v2(output: &[u8]) -> Result<GitStatusSnapshot, Str
             GitChangedPath::Untracked { .. } => {
                 counts.changed_paths += 1;
                 counts.untracked_paths += 1;
-                counts.unstaged_paths += 1;
             }
         }
         changed_paths.push(changed_path);
@@ -388,12 +387,13 @@ fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapsh
     let pathspec = worktree_path
         .strip_prefix(&repo_root)
         .map_err(|_| "git status root is outside repository".to_string())?;
-    let pathspec = if pathspec.as_os_str().is_empty() {
-        "."
+    let relative_path = pathspec
+        .to_str()
+        .ok_or_else(|| "git status root is not valid UTF-8".to_string())?;
+    let pathspec = if relative_path.is_empty() {
+        ":(literal).".to_string()
     } else {
-        pathspec
-            .to_str()
-            .ok_or_else(|| "git status root is not valid UTF-8".to_string())?
+        format!(":(literal){relative_path}")
     };
 
     let mut cmd = crate::git_ops::git_command();
@@ -406,7 +406,7 @@ fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapsh
             "--ignore-submodules=none",
             "--renames",
             "--",
-            pathspec,
+            &pathspec,
         ])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(std::process::Stdio::piped())
@@ -427,8 +427,8 @@ fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapsh
         return Err(format!("git status failed: {stderr}"));
     }
     let mut snapshot = parse_git_status_porcelain_v2(&stdout)?;
-    if pathspec != "." {
-        let prefix = format!("{pathspec}/");
+    if !relative_path.is_empty() {
+        let prefix = format!("{relative_path}/");
         for changed_path in &mut snapshot.changed_paths {
             let path = match changed_path {
                 GitChangedPath::Ordinary { path, .. }
@@ -2479,7 +2479,7 @@ mod tests {
         let parsed = parse_git_status_porcelain_v2(output).unwrap();
         assert_eq!(parsed.counts.changed_paths, 5);
         assert_eq!(parsed.counts.staged_paths, 4);
-        assert_eq!(parsed.counts.unstaged_paths, 3);
+        assert_eq!(parsed.counts.unstaged_paths, 2);
         assert_eq!(parsed.counts.untracked_paths, 1);
         assert_eq!(parsed.counts.conflicted_paths, 1);
         assert!(matches!(
@@ -2525,6 +2525,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["untracked-dir/a.txt", "untracked-dir/b.txt"]
         );
+    }
+
+    #[test]
+    fn snapshot_treats_scoped_pathspec_metacharacters_as_literals() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("scope*literal")).unwrap();
+        std::fs::create_dir_all(repo.path().join("scope-other")).unwrap();
+        std::fs::write(repo.path().join("scope*literal/in-scope.txt"), "scope\n").unwrap();
+        std::fs::write(repo.path().join("scope-other/out.txt"), "other\n").unwrap();
+
+        let snapshot = capture_git_status_snapshot(&repo.path().join("scope*literal")).unwrap();
+        assert_eq!(snapshot.counts.changed_paths, 1);
+        assert_eq!(snapshot.counts.untracked_paths, 1);
+        assert_eq!(snapshot.counts.unstaged_paths, 0);
+        assert!(matches!(
+            snapshot.changed_paths.as_slice(),
+            [GitChangedPath::Untracked { path }] if path == "in-scope.txt"
+        ));
     }
 
     #[test]

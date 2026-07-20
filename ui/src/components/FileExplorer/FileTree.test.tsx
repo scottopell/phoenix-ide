@@ -490,8 +490,35 @@ describe('FileTree — reveal active file', () => {
     );
 
     expect(await screen.findByText('README.md')).toBeInTheDocument();
-    expect(screen.getAllByLabelText('Git status modified')).toHaveLength(2);
+    expect(screen.getByLabelText('Git status modified')).toBeInTheDocument();
     expect(screen.getByLabelText('1 changed descendant')).toBeInTheDocument();
+    expect(screen.getByText('ui').closest('.ft-item')?.querySelector('.ft-git-status')).toBeNull();
+  });
+
+  it('keys git decorations in the canonical file-list namespace', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async () => ({
+      ok: true,
+      json: async () => ({ items: [
+        { name: 'changed.ts', path: '/canonical/project/changed.ts', is_directory: false, viewer: TEXT('typescript'), is_gitignored: false },
+      ] }),
+    } as Response));
+
+    render(
+      <FileTree
+        rootPath="/symlink/project"
+        onFileSelect={vi.fn()}
+        gitStatus={{
+          kind: 'snapshot',
+          checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc123', remote_status: { kind: 'no_known' } },
+          counts: { changed_paths: 1, staged_paths: 0, unstaged_paths: 1, untracked_paths: 0, conflicted_paths: 0 },
+          changed_paths: [{ kind: 'ordinary', path: 'changed.ts', index_status: 'unmodified', worktree_status: 'modified' }],
+        }}
+      />,
+    );
+
+    expect(await screen.findByText('changed.ts')).toBeInTheDocument();
+    expect(screen.getByLabelText('Git status modified')).toBeInTheDocument();
   });
 
   it('counts both source and destination ancestors for cross-directory renames', async () => {

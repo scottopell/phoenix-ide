@@ -66,7 +66,7 @@ function treeRowIndentPx(depth: number): number {
   return TREE_ROW_BASE_INDENT_PX + depth * TREE_ROW_DEPTH_STEP_PX;
 }
 
-type GitDecoration = { status: GitFileStatus | 'untracked' | 'unmerged'; descendants: number };
+type GitDecoration = { status: GitFileStatus | 'untracked' | 'unmerged' | null; descendants: number };
 
 function gitStatusLabel(status: GitDecoration['status'] | null): string | null {
   switch (status) {
@@ -88,17 +88,17 @@ function changedPathStatus(entry: GitChangedPath): GitDecoration['status'] {
   return entry.worktree_status !== 'unmodified' ? entry.worktree_status : entry.index_status;
 }
 
-function gitDecorations(rootPath: string, status: ConversationGitStatusResponse | null | undefined): Map<string, GitDecoration> {
+function gitDecorations(canonicalRootPath: string | null, status: ConversationGitStatusResponse | null | undefined): Map<string, GitDecoration> {
   const result = new Map<string, GitDecoration>();
-  if (status?.kind !== 'snapshot') return result;
-  const root = rootPath.replace(/\/$/, '');
+  if (status?.kind !== 'snapshot' || !canonicalRootPath) return result;
+  const root = canonicalRootPath.replace(/\/$/, '');
   function incrementAncestors(path: string) {
     const segments = path.split('/');
     for (let index = 1; index < segments.length; index += 1) {
       const ancestor = `${root}/${segments.slice(0, index).join('/')}`;
       const current = result.get(ancestor);
       result.set(ancestor, {
-        status: current?.status ?? 'modified',
+        status: current?.status ?? null,
         descendants: (current?.descendants ?? 0) + 1,
       });
     }
@@ -848,7 +848,10 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   const dirLabel = useMemo(() => computeDirLabel(rootPath), [rootPath]);
 
 
-  const decorations = useMemo(() => gitDecorations(rootPath, gitStatus), [rootPath, gitStatus]);
+  const canonicalRootPath = items[0]?.path
+    ? items[0].path.slice(0, Math.max(0, items[0].path.length - items[0].name.length)).replace(/\/$/, '')
+    : null;
+  const decorations = useMemo(() => gitDecorations(canonicalRootPath, gitStatus), [canonicalRootPath, gitStatus]);
 
   if (loading) {
     return (
