@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptanceProfile, CodecRef, DeliveryItem, DeliveryPayload, EffectDecl, EffectId,
-    EffectRole, ExecutionCapability, ExternalAcceptanceDisabled, Generation, ProfileRef,
+    AcceptanceProfile, CodecRef, DeliveryItem, DeliveryPayload, EffectDecl, EffectId, EffectRole,
+    ExecutionCapability, ExternalAcceptanceDisabled, Generation, ProfileRef,
     RuntimeAcceptanceEnabled, SupportedCodecRegistry, TransitionPlan, WorkflowProfile,
     WorkflowStatus,
 };
@@ -47,73 +47,24 @@ pub struct CompleteLlmResponse {
     pub response_aggregate: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LlmEffectStatus {
-    Prepared,
-    Attempting,
-    Receipted,
-    Accepted,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LlmAttemptStatus {
-    Begun,
-    ResponseReady,
-    ReceiptCommitted,
-    OutcomeUnknown,
-    Fenced,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolIntentStatus {
-    Owed,
-    ExecutionMayHaveBegun,
-    Completed,
-    Interrupted,
-    Suppressed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StreamStatus {
-    Active,
-    Superseded,
-    Completed,
-    Fenced,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LlmConsumerKind {
-    TopLevelConversation,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopLevelLlmSnapshot {
     pub turn_ref: TopLevelTurnRef,
-    pub key: LlmEffectKey,
-    pub prepared_request: PreparedLlmRequest,
-    pub status: LlmEffectStatus,
     pub accepted_assistant_message_id: Option<String>,
     pub stopped_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TopLevelLlmEvent {
-    Prepared,
-    AttemptStarted {
-        attempt_ordinal: u64,
-        process_incarnation: String,
-    },
-    ResponseReceipted {
-        response: Box<CompleteLlmResponse>,
-        generation: u64,
+    Prepared {
+        key: LlmEffectKey,
     },
     ResponseAccepted {
-        response: Box<CompleteLlmResponse>,
+        key: LlmEffectKey,
         assistant_message_id: String,
     },
     ResponseCancelled {
-        response: Box<CompleteLlmResponse>,
+        key: LlmEffectKey,
         reason: String,
     },
 }
@@ -129,7 +80,7 @@ pub struct LlmObservation {
     pub key: LlmEffectKey,
     pub attempt_ordinal: u64,
     pub process_incarnation: String,
-    pub status: LlmAttemptStatus,
+    pub provider_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,7 +116,7 @@ impl WorkflowProfile for LlmProfile {
     type ManualPayload = LlmManualPayload;
 
     fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool {
-        matches!(snapshot.status, LlmEffectStatus::Accepted)
+        snapshot.stopped_at.is_none()
     }
 
     fn receipt_requires_runtime_acceptance(_event: &Self::ReceiptReducerEvent) -> bool {
@@ -177,8 +128,9 @@ impl WorkflowProfile for LlmProfile {
             (&item.payload, decision_event),
             (
                 DeliveryPayload::Receipt(receipt),
-                TopLevelLlmEvent::ResponseReceipted { response, generation }
-            ) if receipt.response == **response && receipt.generation == *generation
+                TopLevelLlmEvent::ResponseAccepted { key, .. }
+                    | TopLevelLlmEvent::ResponseCancelled { key, .. }
+            ) if receipt.key == *key
         )
     }
 
@@ -190,8 +142,8 @@ impl WorkflowProfile for LlmProfile {
             (&item.payload, decision_event),
             (
                 DeliveryPayload::Receipt(receipt),
-                TopLevelLlmEvent::ResponseAccepted { response, .. }
-            ) if receipt.response == **response
+                TopLevelLlmEvent::ResponseAccepted { key, .. }
+            ) if receipt.key == *key
         )
     }
 
@@ -203,8 +155,8 @@ impl WorkflowProfile for LlmProfile {
             (&item.payload, decision_event),
             (
                 DeliveryPayload::Receipt(receipt),
-                TopLevelLlmEvent::ResponseCancelled { response, .. }
-            ) if receipt.response == **response
+                TopLevelLlmEvent::ResponseCancelled { key, .. }
+            ) if receipt.key == *key
         )
     }
 }

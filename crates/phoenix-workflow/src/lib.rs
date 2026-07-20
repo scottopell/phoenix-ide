@@ -1,10 +1,10 @@
 pub mod engine;
+pub mod llm_profile;
 pub mod simulator;
 #[cfg(test)]
 mod tests;
 pub mod types;
 pub mod validation;
-pub mod llm_profile;
 pub mod wake_profile;
 
 pub use simulator::*;

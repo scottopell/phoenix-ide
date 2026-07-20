@@ -27,13 +27,6 @@ fn sample_snapshot() -> TopLevelLlmSnapshot {
             accepted_turn_id: "turn-1".into(),
             generation: 4,
         },
-        key: LlmEffectKey {
-            accepted_turn_id: "turn-1".into(),
-            generation: 4,
-            call_ordinal: 2,
-        },
-        prepared_request: sample_request(),
-        status: LlmEffectStatus::Prepared,
         accepted_assistant_message_id: None,
         stopped_at: None,
     }
@@ -66,15 +59,28 @@ fn acceptance_profile_exposes_llm_codec_support() {
 fn prepared_plan_declares_safely_repeatable_llm_effect() {
     let snapshot = sample_snapshot();
     let intent = LlmIntent {
-        key: snapshot.key.clone(),
-        prepared_request: snapshot.prepared_request.clone(),
+        key: LlmEffectKey {
+            accepted_turn_id: snapshot.turn_ref.accepted_turn_id.clone(),
+            generation: snapshot.turn_ref.generation,
+            call_ordinal: 2,
+        },
+        prepared_request: sample_request(),
     };
-    let plan = prepared_plan(snapshot.clone(), TopLevelLlmEvent::Prepared, intent.clone());
+    let plan = prepared_plan(
+        snapshot.clone(),
+        TopLevelLlmEvent::Prepared {
+            key: intent.key.clone(),
+        },
+        intent.clone(),
+    );
 
     assert_eq!(plan.snapshot, snapshot);
     assert_eq!(plan.effects.len(), 1);
     assert_eq!(plan.effects[0].effect_id, EFFECT_ID);
-    assert_eq!(plan.effects[0].capability, ExecutionCapability::SafelyRepeatable);
+    assert_eq!(
+        plan.effects[0].capability,
+        ExecutionCapability::SafelyRepeatable
+    );
     assert_eq!(plan.effects[0].intent, intent);
 }
 
@@ -95,24 +101,18 @@ fn receipt_delivery_and_runtime_mapping_matches_events() {
         accepted_by: None,
     };
 
-    assert!(LlmProfile::decision_handles_delivery(
-        &item,
-        &TopLevelLlmEvent::ResponseReceipted {
-            response: Box::new(receipt.response.clone()),
-            generation: receipt.generation,
-        }
-    ));
+    let accepted = TopLevelLlmEvent::ResponseAccepted {
+        key: receipt.key.clone(),
+        assistant_message_id: "msg-1".into(),
+    };
+    assert!(LlmProfile::decision_handles_delivery(&item, &accepted));
     assert!(LlmProfile::decision_handles_runtime_acceptance(
-        &item,
-        &TopLevelLlmEvent::ResponseAccepted {
-            response: Box::new(receipt.response.clone()),
-            assistant_message_id: "msg-1".into(),
-        }
+        &item, &accepted
     ));
     assert!(LlmProfile::decision_handles_runtime_suppression(
         &item,
         &TopLevelLlmEvent::ResponseCancelled {
-            response: Box::new(receipt.response.clone()),
+            key: receipt.key.clone(),
             reason: "stop won".into(),
         }
     ));
