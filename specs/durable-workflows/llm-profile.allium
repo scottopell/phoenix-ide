@@ -15,7 +15,7 @@ use "./durable-workflows.allium" as dwf
 
 enum LlmEffectStatus { prepared | attempting | receipted | accepted | cancelled }
 enum LlmAttemptStatus { begun | response_ready | receipt_committed | outcome_unknown | fenced }
-enum ToolIntentStatus { owed | execution_may_have_begun | completed | interrupted | suppressed }
+enum ToolIntentStatus { pending_acceptance | owed | execution_may_have_begun | completed | interrupted | suppressed }
 enum StreamStatus { active | superseded | completed | fenced }
 enum LlmConsumerKind { top_level_conversation }
 
@@ -116,6 +116,8 @@ entity LlmToolIntent {
     status: ToolIntentStatus
 
     transitions status {
+        pending_acceptance -> owed
+        pending_acceptance -> suppressed
         owed -> execution_may_have_begun
         owed -> suppressed
         execution_may_have_begun -> completed

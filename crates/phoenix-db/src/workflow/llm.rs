@@ -8,13 +8,13 @@ use sqlx::Row;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectTurnCommittedOutcome {
+    PendingRuntime,
     RuntimeAccepted,
     QueuedSteering,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectTurnAcceptanceInput {
-    pub workflow_id: WorkflowId,
     pub conversation_id: String,
     pub client_message_id: String,
     pub prepared_fingerprint: String,
@@ -121,9 +121,20 @@ pub enum ToolKindRecord {
     Custom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolIntentStatus {
+    PendingAcceptance,
+    Owed,
+    ExecutionMayHaveBegun,
+    Completed,
+    Interrupted,
+    Suppressed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolIntentRecord {
     pub intent_ordinal: u32,
+    pub status: ToolIntentStatus,
     pub tool_name: String,
     pub tool_kind: ToolKindRecord,
     pub tool_use_id: String,
@@ -165,8 +176,7 @@ impl WorkflowRepository {
         if let Some(existing) = existing {
             tx.commit().await?;
             return Ok(
-                if existing.workflow_id == input.workflow_id
-                    && existing.prepared_fingerprint == input.prepared_fingerprint
+                if existing.prepared_fingerprint == input.prepared_fingerprint
                     && existing.prepared_payload == input.prepared_payload
                     && existing.committed_outcome == input.committed_outcome
                 {
@@ -177,8 +187,9 @@ impl WorkflowRepository {
             );
         }
 
+        let workflow_id = allocate_global_workflow_id(&mut tx).await?;
         let create = CreateWorkflowWithExternalAcceptance {
-            workflow_id: input.workflow_id,
+            workflow_id,
             profile: llm_profile::profile(),
             acceptance: llm_profile::acceptance_profile().erase(),
             target_scope: phoenix_workflow::ScopeId::new(format!(
@@ -202,7 +213,7 @@ impl WorkflowRepository {
         sqlx::query("INSERT INTO direct_turn_acceptances (conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
             .bind(&input.conversation_id)
             .bind(&input.client_message_id)
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
             .bind(&input.prepared_fingerprint)
             .bind(&input.prepared_payload)
             .bind(direct_turn_outcome_to_str(&input.committed_outcome))
@@ -210,7 +221,7 @@ impl WorkflowRepository {
             .execute(&mut *tx.tx)
             .await?;
         sqlx::query("INSERT INTO top_level_llm_workflows (workflow_id, conversation_id, accepted_turn_id, turn_generation, accepted_assistant_message_id, stopped_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
             .bind(&input.conversation_id)
             .bind(&input.client_message_id)
             .bind(to_i64(input.snapshot.turn_ref.generation, "turn_generation")?)
@@ -221,7 +232,7 @@ impl WorkflowRepository {
         tx.commit().await?;
         Ok(DirectTurnAcceptanceOutcome::Created(
             DirectTurnAcceptanceRecord {
-                workflow_id: input.workflow_id,
+                workflow_id,
                 conversation_id: input.conversation_id.clone(),
                 client_message_id: input.client_message_id.clone(),
                 prepared_fingerprint: input.prepared_fingerprint.clone(),
@@ -230,6 +241,48 @@ impl WorkflowRepository {
                 accepted_at: input.accepted_at,
             },
         ))
+    }
+
+    pub async fn mark_direct_turn_runtime_accepted(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+    ) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE direct_turn_acceptances SET committed_outcome = 'RuntimeAccepted' WHERE conversation_id = ?1 AND client_message_id = ?2 AND committed_outcome = 'PendingRuntime'",
+        )
+        .bind(conversation_id)
+        .bind(client_message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn load_pending_direct_turns(&self) -> DbResult<Vec<DirectTurnAcceptanceRecord>> {
+        let rows = sqlx::query(
+            "SELECT conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at FROM direct_turn_acceptances WHERE committed_outcome = 'PendingRuntime' ORDER BY accepted_at, conversation_id, client_message_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| direct_turn_record_from_row(&row))
+            .collect()
+    }
+
+    pub async fn allocate_top_level_llm_call_ordinal(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> DbResult<u64> {
+        let mut tx = self.begin_tx().await?;
+        let ordinal = sqlx::query_scalar::<_, i64>(
+            "UPDATE top_level_llm_workflows SET next_call_ordinal = next_call_ordinal + 1 WHERE workflow_id = ?1 AND stopped_at IS NULL RETURNING next_call_ordinal - 1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        .ok_or_else(|| DbError::Serialization("top-level LLM turn is stopped or missing".to_string()))?;
+        tx.commit().await?;
+        to_u64(ordinal, "call_ordinal")
     }
 
     pub async fn prepare_top_level_llm_request(
@@ -738,7 +791,7 @@ impl WorkflowRepository {
         workflow_id: WorkflowId,
         receipt_id: ReceiptId,
     ) -> DbResult<Vec<ToolIntentRecord>> {
-        let rows = sqlx::query("SELECT intent_ordinal, tool_name, tool_kind, tool_use_id, arguments_json FROM top_level_llm_tool_intents WHERE workflow_id = ?1 AND receipt_id = ?2 ORDER BY intent_ordinal")
+        let rows = sqlx::query("SELECT intent_ordinal, tool_name, tool_kind, tool_use_id, arguments_json, status FROM top_level_llm_tool_intents WHERE workflow_id = ?1 AND receipt_id = ?2 ORDER BY intent_ordinal")
             .bind(to_i64(workflow_id.0, "workflow_id")?)
             .bind(to_i64(receipt_id.0, "receipt_id")?)
             .fetch_all(&self.pool)
@@ -747,6 +800,7 @@ impl WorkflowRepository {
             .map(|row| {
                 Ok(ToolIntentRecord {
                     intent_ordinal: to_u32(row.get::<i64, _>("intent_ordinal"), "intent_ordinal")?,
+                    status: parse_tool_intent_status(&row.get::<String, _>("status"))?,
                     tool_name: row.get("tool_name"),
                     tool_kind: parse_tool_kind(&row.get::<String, _>("tool_kind"))?,
                     tool_use_id: row.get("tool_use_id"),
@@ -783,6 +837,20 @@ impl<'a> WorkflowTx<'a> {
         })
         .transpose()
     }
+}
+
+async fn allocate_global_workflow_id(tx: &mut WorkflowTx<'_>) -> DbResult<WorkflowId> {
+    sqlx::query(
+        "INSERT INTO workflow_global_sequences (sequence_name, next_value) VALUES ('workflow', 2) ON CONFLICT(sequence_name) DO UPDATE SET next_value = workflow_global_sequences.next_value + 1",
+    )
+    .execute(&mut *tx.tx)
+    .await?;
+    let allocated = sqlx::query_scalar::<_, i64>(
+        "SELECT next_value - 1 FROM workflow_global_sequences WHERE sequence_name = 'workflow'",
+    )
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    Ok(WorkflowId(to_u64(allocated, "workflow_id")?))
 }
 
 fn local_codec_ref_to_owned(codec: CodecRef) -> LocalCodec {
@@ -850,8 +918,23 @@ async fn load_call_ordinal(
     to_u64(value, "call_ordinal")
 }
 
+fn direct_turn_record_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<DirectTurnAcceptanceRecord> {
+    Ok(DirectTurnAcceptanceRecord {
+        workflow_id: WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?),
+        conversation_id: row.get("conversation_id"),
+        client_message_id: row.get("client_message_id"),
+        prepared_fingerprint: row.get("prepared_fingerprint"),
+        prepared_payload: row.get("prepared_payload"),
+        committed_outcome: parse_direct_turn_outcome(&row.get::<String, _>("committed_outcome"))?,
+        accepted_at: Timestamp(to_u64(row.get::<i64, _>("accepted_at"), "accepted_at")?),
+    })
+}
+
 fn direct_turn_outcome_to_str(value: &DirectTurnCommittedOutcome) -> &'static str {
     match value {
+        DirectTurnCommittedOutcome::PendingRuntime => "PendingRuntime",
         DirectTurnCommittedOutcome::RuntimeAccepted => "RuntimeAccepted",
         DirectTurnCommittedOutcome::QueuedSteering => "QueuedSteering",
     }
@@ -859,10 +942,25 @@ fn direct_turn_outcome_to_str(value: &DirectTurnCommittedOutcome) -> &'static st
 
 fn parse_direct_turn_outcome(value: &str) -> DbResult<DirectTurnCommittedOutcome> {
     match value {
+        "PendingRuntime" => Ok(DirectTurnCommittedOutcome::PendingRuntime),
         "RuntimeAccepted" => Ok(DirectTurnCommittedOutcome::RuntimeAccepted),
         "QueuedSteering" => Ok(DirectTurnCommittedOutcome::QueuedSteering),
         other => Err(DbError::Serialization(format!(
             "unknown direct-turn outcome: {other}"
+        ))),
+    }
+}
+
+fn parse_tool_intent_status(value: &str) -> DbResult<ToolIntentStatus> {
+    match value {
+        "PendingAcceptance" => Ok(ToolIntentStatus::PendingAcceptance),
+        "Owed" => Ok(ToolIntentStatus::Owed),
+        "ExecutionMayHaveBegun" => Ok(ToolIntentStatus::ExecutionMayHaveBegun),
+        "Completed" => Ok(ToolIntentStatus::Completed),
+        "Interrupted" => Ok(ToolIntentStatus::Interrupted),
+        "Suppressed" => Ok(ToolIntentStatus::Suppressed),
+        other => Err(DbError::Serialization(format!(
+            "unknown tool intent status: {other}"
         ))),
     }
 }
@@ -940,12 +1038,11 @@ mod tests {
     async fn direct_turn_accept_replay_conflict() {
         let repo = open_repo().await;
         let input = DirectTurnAcceptanceInput {
-            workflow_id: WorkflowId(101),
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
             prepared_payload: "{}".to_string(),
-            committed_outcome: DirectTurnCommittedOutcome::RuntimeAccepted,
+            committed_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             accepted_at: Timestamp(1),
             snapshot: snapshot(),
         };
@@ -957,8 +1054,14 @@ mod tests {
             repo.accept_direct_turn(&input).await.unwrap(),
             DirectTurnAcceptanceOutcome::Replayed(_)
         ));
+        let pending = repo.load_pending_direct_turns().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(repo
+            .mark_direct_turn_runtime_accepted("conv-1", "msg-1")
+            .await
+            .unwrap());
+        assert!(repo.load_pending_direct_turns().await.unwrap().is_empty());
         let mut conflict = input.clone();
-        conflict.workflow_id = WorkflowId(102);
         conflict.prepared_fingerprint = "fp-2".to_string();
         assert_eq!(
             repo.accept_direct_turn(&conflict).await.unwrap(),
@@ -970,20 +1073,31 @@ mod tests {
     async fn prepare_begin_recover_accept_owed_and_stop_flow() {
         let repo = open_repo().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
-            workflow_id: WorkflowId(201),
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
             prepared_payload: "{}".to_string(),
-            committed_outcome: DirectTurnCommittedOutcome::RuntimeAccepted,
+            committed_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             accepted_at: Timestamp(1),
             snapshot: snapshot(),
         })
         .await
         .unwrap();
+        repo.mark_direct_turn_runtime_accepted("conv-1", "msg-1")
+            .await
+            .unwrap();
+        let first_ordinal = repo
+            .allocate_top_level_llm_call_ordinal(WorkflowId(1))
+            .await
+            .unwrap();
+        let second_ordinal = repo
+            .allocate_top_level_llm_call_ordinal(WorkflowId(1))
+            .await
+            .unwrap();
+        assert_eq!((first_ordinal, second_ordinal), (0, 1));
         assert_eq!(
             repo.prepare_top_level_llm_request(&PrepareTopLevelLlmRequestInput {
-                workflow_id: WorkflowId(201),
+                workflow_id: WorkflowId(1),
                 effect_id: EffectId(2),
                 expected_version: Version(0),
                 transition_id: TransitionId(1),
@@ -1010,7 +1124,7 @@ mod tests {
         );
         let begun = repo
             .begin_top_level_llm_attempt(&BeginAttemptInput {
-                workflow_id: WorkflowId(201),
+                workflow_id: WorkflowId(1),
                 effect_id: EffectId(2),
                 attempt_id: AttemptId(1),
                 process_incarnation: ProcessIncarnation(7),
@@ -1037,6 +1151,7 @@ mod tests {
                 provider_request_id: Some("provider-1".to_string()),
                 tool_intents: vec![ToolIntentRecord {
                     intent_ordinal: 0,
+                    status: ToolIntentStatus::PendingAcceptance,
                     tool_name: "submit_result".to_string(),
                     tool_kind: ToolKindRecord::Function,
                     tool_use_id: "tool-1".to_string(),
@@ -1053,7 +1168,7 @@ mod tests {
         assert_eq!(
             repo.accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
                 authority: LocalAttemptAuthority {
-                    workflow_id: WorkflowId(201),
+                    workflow_id: WorkflowId(1),
                     declared_workflow_version: Version(1),
                     generation: Generation(0),
                     effect_id: EffectId(2),
@@ -1077,7 +1192,7 @@ mod tests {
         );
         let stopped = repo
             .stop_top_level_llm_and_suppress_pending_delivery(&StopTopLevelLlmInput {
-                workflow_id: WorkflowId(201),
+                workflow_id: WorkflowId(1),
                 stopped_at: Timestamp(10),
                 expected_version: Version(999),
                 transition_id: TransitionId(2),

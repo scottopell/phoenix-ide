@@ -322,7 +322,7 @@ CREATE TABLE direct_turn_acceptances (
     workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE CASCADE,
     prepared_fingerprint TEXT NOT NULL CHECK (prepared_fingerprint <> ''),
     prepared_payload TEXT NOT NULL CHECK (prepared_payload <> ''),
-    committed_outcome TEXT NOT NULL CHECK (committed_outcome IN ('RuntimeAccepted', 'QueuedSteering')),
+    committed_outcome TEXT NOT NULL CHECK (committed_outcome IN ('PendingRuntime', 'RuntimeAccepted', 'QueuedSteering')),
     accepted_at INTEGER NOT NULL CHECK (accepted_at >= 0),
     PRIMARY KEY (conversation_id, client_message_id)
 ) WITHOUT ROWID;
@@ -332,6 +332,7 @@ CREATE TABLE top_level_llm_workflows (
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     accepted_turn_id TEXT NOT NULL CHECK (accepted_turn_id <> ''),
     turn_generation INTEGER NOT NULL CHECK (turn_generation >= 0),
+    next_call_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (next_call_ordinal >= 0),
     accepted_assistant_message_id TEXT,
     stopped_at INTEGER CHECK (stopped_at IS NULL OR stopped_at >= 0),
     UNIQUE (conversation_id, accepted_turn_id, turn_generation),
@@ -383,6 +384,7 @@ CREATE TABLE top_level_llm_tool_intents (
     tool_kind TEXT NOT NULL CHECK (tool_kind IN ('Function', 'Custom')),
     tool_use_id TEXT NOT NULL CHECK (tool_use_id <> ''),
     arguments_json TEXT NOT NULL CHECK (arguments_json <> ''),
+    status TEXT NOT NULL DEFAULT 'PendingAcceptance' CHECK (status IN ('PendingAcceptance', 'Owed', 'ExecutionMayHaveBegun', 'Completed', 'Interrupted', 'Suppressed')),
     PRIMARY KEY (workflow_id, receipt_id, intent_ordinal),
     UNIQUE (workflow_id, receipt_id, tool_use_id),
     FOREIGN KEY (workflow_id, receipt_id) REFERENCES top_level_llm_response_receipts(workflow_id, receipt_id) ON DELETE CASCADE
