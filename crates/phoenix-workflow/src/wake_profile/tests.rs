@@ -14,6 +14,7 @@ fn registration_plan_declares_reclaimable_observation_effect() {
         contract_id: "contract".into(),
         resource: intent.resource.clone(),
         registered: false,
+        origin: WakeRegistrationOrigin::AgentExplicit,
         terminal: None,
         runtime_availability: RuntimeAvailability::Idle,
     };
@@ -76,6 +77,7 @@ fn cancellation_request_invalidates_registration_effect() {
             child_conversation_id: "child".into(),
         }),
         registered: true,
+        origin: WakeRegistrationOrigin::AgentExplicit,
         terminal: None,
         runtime_availability: RuntimeAvailability::Pending,
     };
