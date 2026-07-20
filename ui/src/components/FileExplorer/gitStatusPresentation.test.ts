@@ -1,0 +1,18 @@
+import { describe, expect, it } from 'vitest';
+import { checkoutLabel } from './gitStatusPresentation';
+
+describe('checkoutLabel', () => {
+  it('includes upstream relationship for tracked branches', () => {
+    expect(checkoutLabel({
+      kind: 'named_branch',
+      branch_name: 'feature',
+      head_oid: 'abc',
+      remote_status: { kind: 'tracked', remote_ref: 'origin/feature', ahead: 2, behind: 1 },
+    })).toBe('feature · origin/feature · ↑2 ↓1');
+  });
+
+  it('shows detached checkout identity', () => {
+    expect(checkoutLabel({ kind: 'detached', head_oid: 'abcdef123456', pointing_refs: [] }))
+      .toBe('detached @ abcdef1');
+  });
+});

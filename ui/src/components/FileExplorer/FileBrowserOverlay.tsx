@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { GitBranch, X } from 'lucide-react';
 import { FileTree } from './FileTree';
+import { checkoutLabel } from './gitStatusPresentation';
 import { api, type ConversationGitStatusResponse } from '../../api';
 import { useViewerSlotCommands } from '../../contexts/ViewerSlotContext';
 import './FileBrowserOverlay.css';
@@ -23,10 +24,7 @@ function mobileGitSummary(status: ConversationGitStatusResponse | null): string 
   if (!status) return 'Checking Git…';
   if (status.kind === 'non_git') return 'Not a Git workspace';
   if (status.kind === 'unavailable') return 'Git unavailable';
-  const checkout = status.checkout_status.kind === 'named_branch'
-    ? status.checkout_status.branch_name
-    : status.checkout_status.kind.replace('_', ' ');
-  return `${checkout} · ${status.counts.changed_paths === 0 ? 'clean' : `${status.counts.changed_paths} changes`}`;
+  return `${checkoutLabel(status.checkout_status)} · ${status.counts.changed_paths === 0 ? 'clean' : `${status.counts.changed_paths} changes`}`;
 }
 
 export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, onFileSelect, canOpenWorkspaceDiff = false }: Props) {

@@ -19,6 +19,7 @@ import { GroundingSection, GroundingState } from '../GroundingPanel';
 import { useViewerSlotCommands } from '../../contexts/ViewerSlotContext';
 import { api, type ConversationGitStatusResponse, type SkillEntry, type TaskEntry, type WorkScopeInventory } from '../../api';
 import './FileExplorerPanel.css';
+import { checkoutLabel } from './gitStatusPresentation';
 
 interface Props {
   collapsed: boolean;
@@ -70,24 +71,6 @@ function describeGitSummary(status: ConversationGitStatusResponse | null | undef
       return { summary: status.reason, attention: true };
     default:
       return { summary: 'Git status unavailable', attention: true };
-  }
-}
-
-function checkoutLabel(status: Extract<ConversationGitStatusResponse, { kind: 'snapshot' }>['checkout_status']): string {
-  switch (status.kind) {
-    case 'named_branch': {
-      const remote = status.remote_status;
-      if (remote.kind === 'tracked' || remote.kind === 'matching') {
-        const relationship = remote.ahead === 0 && remote.behind === 0
-          ? 'up to date'
-          : [remote.ahead > 0 ? `↑${remote.ahead}` : '', remote.behind > 0 ? `↓${remote.behind}` : ''].filter(Boolean).join(' ');
-        return `${status.branch_name} · ${remote.remote_ref} · ${relationship}`;
-      }
-      return status.branch_name;
-    }
-    case 'detached': return `detached @ ${status.head_oid.slice(0, 7)}`;
-    case 'unborn': return `${status.branch_name} · no commits`;
-    case 'unavailable': return 'checkout unavailable';
   }
 }
 
@@ -188,6 +171,12 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
     void loadGitStatus();
     return () => gitRequestRef.current?.abort();
   }, [loadGitStatus]);
+
+  const wasCollapsedRef = useRef(collapsed);
+  useEffect(() => {
+    if (wasCollapsedRef.current && !collapsed) void loadGitStatus();
+    wasCollapsedRef.current = collapsed;
+  }, [collapsed, loadGitStatus]);
 
   const handleRefresh = useCallback(() => {
     setRefreshKey(k => k + 1);

@@ -347,11 +347,6 @@ fn parse_git_status_porcelain_v2(output: &[u8]) -> Result<GitStatusSnapshot, Str
                 index_status,
                 worktree_status,
                 ..
-            }
-            | GitChangedPath::Unmerged {
-                index_status,
-                worktree_status,
-                ..
             } => {
                 counts.changed_paths += 1;
                 if *index_status != GitFileStatus::Unmodified {
@@ -360,9 +355,10 @@ fn parse_git_status_porcelain_v2(output: &[u8]) -> Result<GitStatusSnapshot, Str
                 if *worktree_status != GitFileStatus::Unmodified {
                     counts.unstaged_paths += 1;
                 }
-                if matches!(changed_path, GitChangedPath::Unmerged { .. }) {
-                    counts.conflicted_paths += 1;
-                }
+            }
+            GitChangedPath::Unmerged { .. } => {
+                counts.changed_paths += 1;
+                counts.conflicted_paths += 1;
             }
             GitChangedPath::Untracked { .. } => {
                 counts.changed_paths += 1;
@@ -399,12 +395,13 @@ fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapsh
     let mut cmd = crate::git_ops::git_command();
     cmd.current_dir(&repo_root)
         .args([
+            "-c",
+            "status.renames=copies",
             "status",
             "--porcelain=v2",
             "-z",
             "--untracked-files=all",
             "--ignore-submodules=none",
-            "--renames",
             "--",
             &pathspec,
         ])
@@ -2478,8 +2475,8 @@ mod tests {
 
         let parsed = parse_git_status_porcelain_v2(output).unwrap();
         assert_eq!(parsed.counts.changed_paths, 5);
-        assert_eq!(parsed.counts.staged_paths, 4);
-        assert_eq!(parsed.counts.unstaged_paths, 2);
+        assert_eq!(parsed.counts.staged_paths, 3);
+        assert_eq!(parsed.counts.unstaged_paths, 1);
         assert_eq!(parsed.counts.untracked_paths, 1);
         assert_eq!(parsed.counts.conflicted_paths, 1);
         assert!(matches!(
@@ -2564,6 +2561,26 @@ mod tests {
             [GitChangedPath::Renamed { path, previous_path, .. }]
                 if path == "new.txt" && previous_path == "old.txt"
         ));
+    }
+
+    #[test]
+    fn snapshot_preserves_copy_detection_over_repository_config() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::write(repo.path().join("source.txt"), "copy me\n").unwrap();
+        run_git(repo.path(), &["add", "source.txt"]).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-m", "base"]).unwrap();
+        run_git(repo.path(), &["config", "status.renames", "false"]).unwrap();
+        std::fs::copy(repo.path().join("source.txt"), repo.path().join("copy.txt")).unwrap();
+        std::fs::write(repo.path().join("source.txt"), "changed source\n").unwrap();
+        run_git(repo.path(), &["add", "source.txt", "copy.txt"]).unwrap();
+
+        let snapshot = capture_git_status_snapshot(repo.path()).unwrap();
+        assert!(snapshot.changed_paths.iter().any(|path| matches!(
+            path,
+            GitChangedPath::Renamed { path, previous_path, index_status: GitFileStatus::Copied, .. }
+                if path == "copy.txt" && previous_path == "source.txt"
+        )));
     }
 
     #[test]

@@ -68,14 +68,14 @@ function skill(name: string, source: string, path: string): SkillEntry {
   return { name, description: `${name} description`, source, path };
 }
 
-function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true) {
+function renderPanel(conversationId = 'conv-1', canOpenWorkspaceDiff = true, collapsed = false) {
   return render(
     <MemoryRouter initialEntries={['/c/slug']}>
       <ConversationProvider>
         <ViewerSlotProvider scopeKey={conversationId} browserSessionActive={false}>
           <FileExplorerProvider>
             <FileExplorerPanel
-              collapsed={false}
+              collapsed={collapsed}
               onToggle={() => {}}
               rootPath="/repo"
               conversationId={conversationId}
@@ -183,6 +183,36 @@ describe('FileExplorerPanel grounding detail navigation', () => {
 
     expect(await screen.findByText('nothing to commit, working tree clean')).toBeInTheDocument();
     expect(screen.queryByText('Untracked files')).not.toBeInTheDocument();
+  });
+
+  it('reloads Git status when the desktop panel expands', async () => {
+    vi.mocked(api.getConversationGitStatus).mockResolvedValue({ kind: 'non_git' });
+    const view = renderPanel('conv-1', true, true);
+    await waitFor(() => expect(api.getConversationGitStatus).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <MemoryRouter initialEntries={['/c/slug']}>
+        <ConversationProvider>
+          <ViewerSlotProvider scopeKey="conv-1" browserSessionActive={false}>
+            <FileExplorerProvider>
+              <FileExplorerPanel
+                collapsed={false}
+                onToggle={() => {}}
+                rootPath="/repo"
+                conversationId="conv-1"
+                showToast={() => {}}
+                showError={() => {}}
+                branchName="main"
+                activeSlug="slug"
+                canOpenWorkspaceDiff
+              />
+            </FileExplorerProvider>
+          </ViewerSlotProvider>
+        </ConversationProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(api.getConversationGitStatus).toHaveBeenCalledTimes(2));
   });
 
   it('advances the file-tree refresh signal when Refresh is clicked', async () => {
