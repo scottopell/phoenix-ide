@@ -92,10 +92,8 @@ function gitDecorations(rootPath: string, status: ConversationGitStatusResponse 
   const result = new Map<string, GitDecoration>();
   if (status?.kind !== 'snapshot') return result;
   const root = rootPath.replace(/\/$/, '');
-  for (const entry of status.changed_paths) {
-    const path = `${root}/${entry.path}`;
-    result.set(path, { status: changedPathStatus(entry), descendants: 0 });
-    const segments = entry.path.split('/');
+  function incrementAncestors(path: string) {
+    const segments = path.split('/');
     for (let index = 1; index < segments.length; index += 1) {
       const ancestor = `${root}/${segments.slice(0, index).join('/')}`;
       const current = result.get(ancestor);
@@ -103,6 +101,15 @@ function gitDecorations(rootPath: string, status: ConversationGitStatusResponse 
         status: current?.status ?? 'modified',
         descendants: (current?.descendants ?? 0) + 1,
       });
+    }
+  }
+
+  for (const entry of status.changed_paths) {
+    const path = `${root}/${entry.path}`;
+    result.set(path, { status: changedPathStatus(entry), descendants: 0 });
+    incrementAncestors(entry.path);
+    if (entry.kind === 'renamed' && entry.previous_path !== entry.path) {
+      incrementAncestors(entry.previous_path);
     }
   }
   return result;

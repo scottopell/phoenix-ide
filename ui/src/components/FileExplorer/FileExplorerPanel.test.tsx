@@ -119,6 +119,7 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     renderPanel();
 
     expect(await screen.findByText('Changes not staged for commit')).toBeInTheDocument();
+    expect(screen.getByText('feature')).toBeInTheDocument();
     expect(screen.queryByText('On branch feature')).not.toBeInTheDocument();
     expect(screen.getByText('Untracked files')).toBeInTheDocument();
     expect(screen.queryByText('Changes to be committed')).not.toBeInTheDocument();
@@ -139,6 +140,19 @@ describe('FileExplorerPanel grounding detail navigation', () => {
 
     expect(await screen.findByText('Changes not staged for commit')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Open Git diff' })).not.toBeInTheDocument();
+  });
+
+  it('renders detached live checkout identity without crowding the header', async () => {
+    vi.mocked(api.getConversationGitStatus).mockResolvedValue({
+      kind: 'snapshot',
+      checkout_status: { kind: 'detached', head_oid: 'abcdef1234567890', pointing_refs: [] },
+      counts: { changed_paths: 0, staged_paths: 0, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
+      changed_paths: [],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('detached @ abcdef1')).toBeInTheDocument();
+    expect(screen.getByText('Git').closest('button')).not.toHaveTextContent('detached');
   });
 
   it('renders the standard clean working tree message', async () => {

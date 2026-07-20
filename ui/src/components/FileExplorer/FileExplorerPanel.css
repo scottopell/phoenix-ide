@@ -21,6 +21,14 @@
   font-size: 11px;
 }
 
+.git-status-checkout {
+  overflow: hidden;
+  margin-bottom: 7px;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .git-status-clean {
   color: var(--accent-green);
 }

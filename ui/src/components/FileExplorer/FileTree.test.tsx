@@ -494,6 +494,44 @@ describe('FileTree — reveal active file', () => {
     expect(screen.getByLabelText('1 changed descendant')).toBeInTheDocument();
   });
 
+  it('counts both source and destination ancestors for cross-directory renames', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const u = new URL(String(url), 'http://localhost');
+      if (u.pathname === '/api/files/list' && u.searchParams.get('path') === '/proj') {
+        return {
+          ok: true,
+          json: async () => ({ items: [
+            ...(FS['/proj'] ?? []),
+            { name: 'src', path: '/proj/src', is_directory: true, viewer: DIR, is_gitignored: false },
+          ] }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({ items: FS[u.searchParams.get('path') || ''] ?? [] }) } as Response;
+    });
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={vi.fn()}
+        gitStatus={{
+          kind: 'snapshot',
+          checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc123', remote_status: { kind: 'no_known' } },
+          counts: { changed_paths: 1, staged_paths: 1, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
+          changed_paths: [{
+            kind: 'renamed',
+            path: 'ui/moved.ts',
+            previous_path: 'src/moved.ts',
+            index_status: 'renamed',
+            worktree_status: 'unmodified',
+          }],
+        }}
+      />,
+    );
+
+    await screen.findByText('README.md');
+    expect(screen.getAllByLabelText('1 changed descendant')).toHaveLength(2);
+  });
+
   it('opens image files and disables only non-viewable (opaque) files', async () => {
     const onFileSelect = vi.fn();
     render(

@@ -1,6 +1,6 @@
 .fe-tree-scroll {
   flex: 1 1 auto;
-  min-height: 280px;
+  min-height: 0;
   overflow-y: auto;
   border-top: 1px solid var(--border-color);
   border-bottom: 1px solid var(--border-color);

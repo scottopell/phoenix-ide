@@ -404,6 +404,7 @@ fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapsh
             "-z",
             "--untracked-files=all",
             "--ignore-submodules=none",
+            "--renames",
             "--",
             pathspec,
         ])
@@ -2524,6 +2525,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["untracked-dir/a.txt", "untracked-dir/b.txt"]
         );
+    }
+
+    #[test]
+    fn snapshot_forces_rename_detection_over_repository_config() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::write(repo.path().join("old.txt"), "rename me\n").unwrap();
+        run_git(repo.path(), &["add", "old.txt"]).unwrap();
+        run_git(repo.path(), &["commit", "-q", "-m", "base"]).unwrap();
+        run_git(repo.path(), &["config", "status.renames", "false"]).unwrap();
+        std::fs::rename(repo.path().join("old.txt"), repo.path().join("new.txt")).unwrap();
+        run_git(repo.path(), &["add", "old.txt", "new.txt"]).unwrap();
+
+        let snapshot = capture_git_status_snapshot(repo.path()).unwrap();
+        assert_eq!(snapshot.counts.changed_paths, 1);
+        assert!(matches!(
+            snapshot.changed_paths.as_slice(),
+            [GitChangedPath::Renamed { path, previous_path, .. }]
+                if path == "new.txt" && previous_path == "old.txt"
+        ));
     }
 
     #[test]

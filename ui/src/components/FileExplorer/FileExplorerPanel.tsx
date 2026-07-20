@@ -73,11 +73,23 @@ function describeGitSummary(status: ConversationGitStatusResponse | null | undef
   }
 }
 
+function checkoutLabel(status: Extract<ConversationGitStatusResponse, { kind: 'snapshot' }>['checkout_status']): string {
+  switch (status.kind) {
+    case 'named_branch': return status.branch_name;
+    case 'detached': return `detached @ ${status.head_oid.slice(0, 7)}`;
+    case 'unborn': return `${status.branch_name} · no commits`;
+    case 'unavailable': return 'checkout unavailable';
+  }
+}
+
 function GitStatusDetails({ status }: { status: Extract<ConversationGitStatusResponse, { kind: 'snapshot' }> }) {
   const { counts } = status;
 
   return (
     <div className="git-status-details" aria-label="Git grounding details">
+      <div className="git-status-checkout" title={checkoutLabel(status.checkout_status)}>
+        {checkoutLabel(status.checkout_status)}
+      </div>
       {counts.changed_paths === 0 ? (
         <div className="git-status-clean">nothing to commit, working tree clean</div>
       ) : (
