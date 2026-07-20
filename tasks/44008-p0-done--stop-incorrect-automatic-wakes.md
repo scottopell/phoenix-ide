@@ -50,7 +50,7 @@ Automatic background execution and explicit durable waiting are separate capabil
 
 Stop bash/tmux run-timeout/background response helpers from automatically registering durable wake obligations merely because they return a live handle. Preserve the handle, output, and normal foreground `peek`/`wait`/`kill` behavior.
 
-Registration must be reachable only through an explicit typed durable-wait request. The separate follow-up task 44007 owns parking the LLM tool round on that explicit registration; this P0 must not implement or depend on parking.
+Registration must be reachable only through an explicit typed durable-wait request. The separate follow-up task 44009 owns parking the LLM tool round on that explicit registration; this P0 must not implement or depend on parking.
 
 Likely starting symbols:
 
@@ -74,7 +74,7 @@ If safely identifying pre-deploy historical consumption requires a bounded migra
 
 The intended agent-facing `wait_until` tool did **not** land. Repository search finds it only in specs; `specs/wake-contracts/executive.md` still marks REQ-WAKE-016 as Proposed. Production registrations currently originate from implicit bash/tmux helper behavior, not from an explicit model call. Therefore this task has no shipped explicit wake-tool journey to preserve.
 
-Remove the incorrect implicit producers without dismantling the reusable durable wake substrate: typed workflow profile, persistence, observation, terminal projection, restart recovery, continuation transfer, materialization, and acceptance idempotency. Task 44007 will connect that substrate to an explicit agent-facing wait and park behavior for bash handles and future tmux command-completion waits.
+Remove the incorrect implicit producers without dismantling the reusable durable wake substrate: typed workflow profile, persistence, observation, terminal projection, restart recovery, continuation transfer, materialization, and acceptance idempotency. Task 44009 will connect that substrate to an explicit agent-facing wait and park behavior for bash handles and future tmux command-completion waits.
 
 Update wake-contract executive/current-reality documentation and tests to state this boundary accurately: durable infrastructure exists, the implicit producer is removed, and the specified agent-facing tool remains unimplemented. Run the spec-authoring preflight for touched specs.
 
@@ -91,7 +91,7 @@ Update wake-contract executive/current-reality documentation and tests to state 
 
 ## Risks and non-goals
 
-- Do not implement park-on-wake behavior here; task 44007 owns that separate feature.
+- Do not implement park-on-wake behavior here; task 44009 owns that separate feature.
 - Do not add `AwaitingWake`, alter generic `ConvState::is_busy()`, or redesign the durable workflow engine.
 - Do not solve this by hiding all wake messages at turn end; preserve delivery machinery for the future explicit agent-facing wait surface.
 - Do not delete audit records to make the duplicate disappear.
