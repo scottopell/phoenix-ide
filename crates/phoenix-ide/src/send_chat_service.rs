@@ -186,15 +186,62 @@ impl SendChatApplicationService {
 
         let validated_files = validate_files(&req).await?;
         let expanded = expand_request(&self.db, &conversation, &req).await?;
+        let images = map_images(req.images);
+        let prepared = phoenix_core::domain::sm_event::PreparedDirectTurn {
+            codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            text: expanded.display_text.clone(),
+            llm_text: expanded.llm_text.clone(),
+            images: images.clone(),
+            files: validated_files.clone(),
+            message_id: req.message_id.clone(),
+            user_agent: req.user_agent.clone(),
+            skill_invocation: expanded.skill_invocation.clone(),
+        };
+        let prepared_payload = serde_json::to_string(&prepared)
+            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+        let prepared_fingerprint = sha256_hex(prepared_payload.as_bytes());
         let event = Event::UserMessage {
             text: expanded.display_text.clone(),
             llm_text: expanded.llm_text,
-            images: map_images(req.images),
+            images,
             files: validated_files,
             message_id: req.message_id.clone(),
             user_agent: req.user_agent,
             skill_invocation: expanded.skill_invocation,
         };
+        let acceptance = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+                conversation_id: conversation.id.clone(),
+                client_message_id: req.message_id.clone(),
+                prepared_fingerprint,
+                prepared_payload,
+                accepted_at: phoenix_workflow::Timestamp(
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                ),
+                snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                    turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                        conversation_id: conversation.id.clone(),
+                        accepted_turn_id: req.message_id.clone(),
+                        generation: 0,
+                    },
+                    accepted_assistant_message_id: None,
+                    stopped_at: None,
+                },
+            })
+            .await
+            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+        match acceptance {
+            phoenix_db::DirectTurnAcceptanceOutcome::Created(_)
+            | phoenix_db::DirectTurnAcceptanceOutcome::Replayed(_) => {}
+            phoenix_db::DirectTurnAcceptanceOutcome::RetryablePersistence => {
+                return Err(SendChatServiceError::Dispatch(
+                    "direct turn persistence is temporarily busy".to_string(),
+                ));
+            }
+            phoenix_db::DirectTurnAcceptanceOutcome::Conflict => {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
+        }
         self.runtime
             .send_event(&conversation.id, event)
             .await
@@ -443,8 +490,6 @@ fn persisted_skill_matches(
 }
 
 fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceError> {
-    use sha2::Digest as _;
-
     let canonical = serde_json::to_vec(&serde_json::json!({
         "conversation_id": req.conversation_id,
         "text": req.text,
@@ -460,13 +505,17 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
         },
     }))
     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-    Ok(sha2::Sha256::digest(canonical).iter().fold(
-        String::with_capacity(64),
-        |mut output, byte| {
+    Ok(sha256_hex(&canonical))
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(value)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
             write!(output, "{byte:02x}").expect("writing to String cannot fail");
             output
-        },
-    ))
+        })
 }
 
 fn replay_receipt(

@@ -70,6 +70,21 @@ pub trait MessageStore: Send + Sync {
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Message, String>;
 
+    async fn pending_direct_turn(
+        &self,
+        _conversation_id: &str,
+        _message_id: &str,
+    ) -> Result<Option<phoenix_db::PendingDirectTurnRuntimeAdmission>, String> {
+        Ok(None)
+    }
+
+    async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        _input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> Result<phoenix_db::DirectTurnRuntimeAdmissionOutcome, String> {
+        Ok(phoenix_db::DirectTurnRuntimeAdmissionOutcome::Conflict)
+    }
+
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
@@ -627,6 +642,27 @@ impl MessageStore for DatabaseStorage {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn pending_direct_turn(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<phoenix_db::PendingDirectTurnRuntimeAdmission>, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .load_pending_direct_turn_runtime_admission(conversation_id, message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> Result<phoenix_db::DirectTurnRuntimeAdmissionOutcome, String> {
+        self.db
+            .persist_direct_turn_runtime_acceptance(input)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -56,6 +56,7 @@ pub struct DirectTurnAcceptanceRecord {
 pub enum DirectTurnAcceptanceOutcome {
     Created(DirectTurnAcceptanceRecord),
     Replayed(DirectTurnAcceptanceRecord),
+    RetryablePersistence,
     Conflict,
 }
 
@@ -74,6 +75,14 @@ pub enum DirectTurnRuntimeAdmissionOutcome {
     ExactReplay,
     Conflict,
     RetryablePersistence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDirectTurnRuntimeAdmission {
+    pub workflow_id: WorkflowId,
+    pub conversation_id: String,
+    pub client_message_id: String,
+    pub generation: Generation,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +245,20 @@ impl WorkflowRepository {
         &self,
         input: &DirectTurnAcceptanceInput,
     ) -> DbResult<DirectTurnAcceptanceOutcome> {
+        match self.accept_direct_turn_once(input).await {
+            Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                if is_sqlite_busy_retryable(error.as_ref()) =>
+            {
+                Ok(DirectTurnAcceptanceOutcome::RetryablePersistence)
+            }
+            result => result,
+        }
+    }
+
+    async fn accept_direct_turn_once(
+        &self,
+        input: &DirectTurnAcceptanceInput,
+    ) -> DbResult<DirectTurnAcceptanceOutcome> {
         let mut tx = self.begin_tx().await?;
         let existing = tx
             .fetch_direct_turn_acceptance(&input.conversation_id, &input.client_message_id)
@@ -382,6 +405,33 @@ impl WorkflowRepository {
         } else {
             DirectTurnRuntimeAdmissionOutcome::Conflict
         })
+    }
+
+    pub async fn load_pending_direct_turn_runtime_admission(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+    ) -> DbResult<Option<PendingDirectTurnRuntimeAdmission>> {
+        let row = sqlx::query(
+            "SELECT a.workflow_id, a.conversation_id, a.client_message_id, w.turn_generation
+             FROM direct_turn_acceptances a
+             JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
+             WHERE a.conversation_id = ?1 AND a.client_message_id = ?2
+               AND a.committed_outcome = 'PendingRuntime' AND w.stopped_at IS NULL",
+        )
+        .bind(conversation_id)
+        .bind(client_message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(PendingDirectTurnRuntimeAdmission {
+                workflow_id: WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
+                conversation_id: row.get("conversation_id"),
+                client_message_id: row.get("client_message_id"),
+                generation: Generation(to_u64(row.get("turn_generation"), "turn_generation")?),
+            })
+        })
+        .transpose()
     }
 
     pub async fn load_pending_direct_turns(&self) -> DbResult<Vec<DirectTurnAcceptanceRecord>> {

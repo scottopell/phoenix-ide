@@ -2573,13 +2573,23 @@ where
         self.execute_effect(Effect::RequestLlm).await.map(|_| ())
     }
 
+    async fn pending_direct_turn_for_event(
+        &self,
+        event: &Event,
+    ) -> Result<Option<phoenix_db::PendingDirectTurnRuntimeAdmission>, String> {
+        let Event::UserMessage { message_id, .. } = event else {
+            return Ok(None);
+        };
+        self.storage
+            .pending_direct_turn(&self.context.conversation_id, message_id)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        // A fresh user turn always resets the parent tool-cycle counter
-        // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
         if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;
         }
-
         // Steering messages are buffered rather than fed to the state machine.
         // They are delivered as `UserMessage` when the conversation next enters `Idle`.
         if let Event::SteerMessage {
@@ -2667,6 +2677,8 @@ where
                 }
             }
 
+            let pending_direct_turn = self.pending_direct_turn_for_event(&current_event).await?;
+
             // Pure state transition
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
@@ -2688,7 +2700,11 @@ where
                 }
             };
 
-            let generated_events = self.apply_transition_result(result).await?;
+            let generated_events = if let Some(pending) = pending_direct_turn {
+                self.apply_direct_turn_transition(result, pending).await?
+            } else {
+                self.apply_transition_result(result).await?
+            };
             events_to_process.extend(generated_events);
         }
 
@@ -2761,6 +2777,85 @@ where
             );
         }
         to_drain
+    }
+
+    async fn apply_direct_turn_transition(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+        pending: phoenix_db::PendingDirectTurnRuntimeAdmission,
+    ) -> Result<Vec<Event>, String> {
+        let mut effects = result.effects.into_iter();
+        let Some(Effect::PersistMessage {
+            content,
+            display_data,
+            usage_data,
+            message_id,
+            idempotent: false,
+        }) = effects.next()
+        else {
+            return Err(
+                "direct turn transition did not begin with user-message persistence".to_string(),
+            );
+        };
+        if !matches!(effects.next(), Some(Effect::PersistState)) {
+            return Err(
+                "direct turn transition did not pair message and state persistence".to_string(),
+            );
+        }
+        let old_state = self.state.clone();
+        let next_state = result.new_state;
+        let next_state_updated_at = if next_state == old_state {
+            self.state_updated_at
+        } else {
+            Utc::now()
+        };
+        let sequence_id = self.broadcast_tx.next_seq();
+        let message = crate::db::Message {
+            message_id: message_id.clone(),
+            conversation_id: self.context.conversation_id.clone(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data,
+            usage_data,
+            created_at: Utc::now(),
+        };
+        let acceptance = phoenix_db::PersistDirectTurnRuntimeAcceptanceInput {
+            admission: phoenix_db::DirectTurnRuntimeAdmissionInput {
+                workflow_id: pending.workflow_id,
+                conversation_id: pending.conversation_id,
+                client_message_id: pending.client_message_id,
+                generation: pending.generation,
+                disposition: phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted,
+            },
+            message: message.clone(),
+            next_state: next_state.clone(),
+            state_updated_at: next_state_updated_at,
+        };
+        let outcome = self
+            .storage
+            .persist_direct_turn_runtime_acceptance(&acceptance)
+            .await?;
+        if outcome == phoenix_db::DirectTurnRuntimeAdmissionOutcome::ExactReplay {
+            return Ok(vec![]);
+        }
+        if outcome != phoenix_db::DirectTurnRuntimeAdmissionOutcome::Committed {
+            return Err(format!("durable direct turn admission failed: {outcome:?}"));
+        }
+        self.state = next_state;
+        self.state_updated_at = next_state_updated_at;
+        self.manage_deadline(&old_state);
+        if let Some(tx) = &self.state_watcher {
+            let _ = tx.send(self.state.clone());
+        }
+        let _ = self.broadcast_tx.send_message(message);
+        let mut generated = Vec::new();
+        for effect in effects {
+            if let Some(event) = self.execute_effect(effect).await? {
+                generated.push(event);
+            }
+        }
+        Ok(generated)
     }
 
     /// Apply a `TransitionResult` from either `transition()` or `handle_outcome()`.

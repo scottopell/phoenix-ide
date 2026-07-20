@@ -25,6 +25,35 @@ use crate::domain::sm_state::{
 };
 use std::collections::HashMap;
 
+pub const PREPARED_DIRECT_TURN_CODEC_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreparedDirectTurn {
+    pub codec_version: u32,
+    pub text: String,
+    pub llm_text: Option<String>,
+    pub images: Vec<ImageData>,
+    pub files: Vec<FileAttachment>,
+    pub message_id: String,
+    pub user_agent: Option<String>,
+    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+}
+
+impl PreparedDirectTurn {
+    #[must_use]
+    pub fn into_event(self) -> Event {
+        Event::UserMessage {
+            text: self.text,
+            llm_text: self.llm_text,
+            images: self.images,
+            files: self.files,
+            message_id: self.message_id,
+            user_agent: self.user_agent,
+            skill_invocation: self.skill_invocation,
+        }
+    }
+}
+
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -821,5 +850,31 @@ mod spec_runtime_name_alignment_tests {
         };
         let parent_event = ParentEvent::Parent(parent_only);
         assert_eq!(parent_event.variant_name(), "TaskApprovalDecided");
+    }
+}
+
+#[cfg(test)]
+mod prepared_direct_turn_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_direct_turn_round_trips_and_rebuilds_user_event() {
+        let prepared = PreparedDirectTurn {
+            codec_version: PREPARED_DIRECT_TURN_CODEC_VERSION,
+            text: "hello".to_string(),
+            llm_text: Some("expanded hello".to_string()),
+            images: vec![],
+            files: vec![],
+            message_id: "message-1".to_string(),
+            user_agent: Some("test".to_string()),
+            skill_invocation: None,
+        };
+        let encoded = serde_json::to_vec(&prepared).unwrap();
+        let decoded: PreparedDirectTurn = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, prepared);
+        assert!(matches!(
+            decoded.into_event(),
+            Event::UserMessage { message_id, .. } if message_id == "message-1"
+        ));
     }
 }
