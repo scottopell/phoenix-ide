@@ -1,9 +1,9 @@
 use super::{
-    local_codec, parse_attempt_status, parse_delivery_payload_kind, parse_delivery_status,
-    parse_receipt_origin, parse_runtime_acceptance_status, parse_suppression_reason, to_i64,
-    to_u32, to_u64, AcceptReceiptInput, AttemptId, AuthorityOutcome, BeginAttemptInput,
-    BeginAttemptResult, CommitOutcome, CommitTransitionPlanCas,
-    CreateWorkflowWithExternalAcceptance, DbError, DbResult, DeliveryId,
+    is_sqlite_busy_retryable, local_codec, parse_attempt_status, parse_delivery_payload_kind,
+    parse_delivery_status, parse_receipt_origin, parse_runtime_acceptance_status,
+    parse_suppression_reason, to_i64, to_u32, to_u64, AcceptReceiptInput, AttemptId,
+    AuthorityOutcome, BeginAttemptInput, BeginAttemptResult, CommitOutcome,
+    CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, DbError, DbResult, DeliveryId,
     DeliveryResolutionDecision, DeliveryResolutionPlan, EffectId, Generation, LeaseExpiry,
     LocalAttemptAuthority, LocalAttemptRecord, LocalCodec, LocalDeliveryRecord, LocalEffectDecl,
     LocalReceiptRecord, LocalReclaimableLease, ProcessIncarnation, ReceiptId, ReceiptOrigin,
@@ -123,9 +123,17 @@ pub struct LlmResponseReceiptRecord {
     pub provider_request_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteLlmResponsePersistenceOutcome {
+    Accepted,
+    ExactReplay,
+    StaleAuthority,
+    RetryablePersistence,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptCompleteLlmResponseResult {
-    pub outcome: AuthorityOutcome,
+    pub outcome: CompleteLlmResponsePersistenceOutcome,
     pub receipt: Option<LocalReceiptRecord>,
     pub delivery: Option<LocalDeliveryRecord>,
     pub llm_receipt: Option<LlmResponseReceiptRecord>,
@@ -453,6 +461,29 @@ impl WorkflowRepository {
         &self,
         input: &AcceptCompleteLlmResponseInput,
     ) -> DbResult<AcceptCompleteLlmResponseResult> {
+        match self
+            .accept_complete_top_level_llm_response_once(input)
+            .await
+        {
+            Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                if is_sqlite_busy_retryable(error.as_ref()) =>
+            {
+                Ok(AcceptCompleteLlmResponseResult {
+                    outcome: CompleteLlmResponsePersistenceOutcome::RetryablePersistence,
+                    receipt: None,
+                    delivery: None,
+                    llm_receipt: None,
+                    tool_intents: vec![],
+                })
+            }
+            result => result,
+        }
+    }
+
+    async fn accept_complete_top_level_llm_response_once(
+        &self,
+        input: &AcceptCompleteLlmResponseInput,
+    ) -> DbResult<AcceptCompleteLlmResponseResult> {
         let receipt_payload = serde_json::to_vec(&llm_profile::LlmResponseReceipt {
             key: LlmEffectKey {
                 accepted_turn_id: load_accepted_turn_id(&self.pool, input.authority.workflow_id)
@@ -512,7 +543,7 @@ impl WorkflowRepository {
                     || llm_receipt.response_aggregate != input.response.response_aggregate
                 {
                     return Ok(AcceptCompleteLlmResponseResult {
-                        outcome: generic.outcome,
+                        outcome: CompleteLlmResponsePersistenceOutcome::StaleAuthority,
                         receipt: None,
                         delivery: None,
                         llm_receipt: Some(llm_receipt),
@@ -523,7 +554,7 @@ impl WorkflowRepository {
                     .load_tool_intents(input.authority.workflow_id, llm_receipt.receipt_id)
                     .await?;
                 return Ok(AcceptCompleteLlmResponseResult {
-                    outcome: AuthorityOutcome::Authorized,
+                    outcome: CompleteLlmResponsePersistenceOutcome::ExactReplay,
                     receipt: self
                         .list_receipts(input.authority.workflow_id)
                         .await?
@@ -542,7 +573,7 @@ impl WorkflowRepository {
                 });
             }
             return Ok(AcceptCompleteLlmResponseResult {
-                outcome: generic.outcome,
+                outcome: CompleteLlmResponsePersistenceOutcome::StaleAuthority,
                 receipt: None,
                 delivery: None,
                 llm_receipt: None,
@@ -573,7 +604,7 @@ impl WorkflowRepository {
         }
         tx.commit().await?;
         Ok(AcceptCompleteLlmResponseResult {
-            outcome: AuthorityOutcome::Authorized,
+            outcome: CompleteLlmResponsePersistenceOutcome::Accepted,
             receipt: generic.receipt,
             delivery: generic.delivery,
             llm_receipt: Some(LlmResponseReceiptRecord {
@@ -1086,6 +1117,35 @@ mod tests {
         WorkflowRepository::new(pool)
     }
 
+    async fn open_repo_with_lock_pool() -> (tempfile::TempDir, WorkflowRepository, SqlitePool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let url = format!("sqlite://{}", path.display());
+        let options = || {
+            SqliteConnectOptions::from_str(&url)
+                .unwrap()
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_millis(1))
+        };
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options())
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        setup_repo_schema(&pool).await;
+        let lock_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options())
+            .await
+            .unwrap();
+        (dir, WorkflowRepository::new(pool), lock_pool)
+    }
+
     fn snapshot() -> TopLevelLlmSnapshot {
         TopLevelLlmSnapshot {
             turn_ref: TopLevelTurnRef {
@@ -1131,6 +1191,92 @@ mod tests {
             repo.accept_direct_turn(&conflict).await.unwrap(),
             DirectTurnAcceptanceOutcome::Conflict
         );
+    }
+
+    #[tokio::test]
+    async fn completed_response_reports_retryable_persistence_while_writer_is_locked() {
+        let (_dir, repo, lock_pool) = open_repo_with_lock_pool().await;
+        repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-1".to_string(),
+            prepared_fingerprint: "fp-1".to_string(),
+            prepared_payload: "{}".to_string(),
+            committed_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        })
+        .await
+        .unwrap();
+        repo.prepare_top_level_llm_request(&PrepareTopLevelLlmRequestInput {
+            workflow_id: WorkflowId(1),
+            effect_id: EffectId(2),
+            expected_version: Version(0),
+            transition_id: TransitionId(1),
+            generation: Generation(0),
+            committed_at: Timestamp(2),
+            snapshot: snapshot(),
+            prepared_request: PreparedLlmRequest {
+                codec_version: 1,
+                request_fingerprint: "req-1".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                backend: "responses".to_string(),
+                request_aggregate: "{\"messages\":[]}".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+        let authority = repo
+            .begin_top_level_llm_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(1),
+                effect_id: EffectId(2),
+                attempt_id: AttemptId(1),
+                process_incarnation: ProcessIncarnation(7),
+                now: Timestamp(3),
+                lease_until: None,
+            })
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        let input = AcceptCompleteLlmResponseInput {
+            authority,
+            delivery_id: DeliveryId(1),
+            receipt_id: ReceiptId(1),
+            response: CompleteLlmResponse {
+                codec_version: 1,
+                response_fingerprint: "resp-1".to_string(),
+                response_aggregate: "{\"output\":[]}".to_string(),
+            },
+            provider_request_id: Some("provider-1".to_string()),
+            tool_intents: vec![],
+        };
+
+        let mut writer = lock_pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let locked = repo
+            .accept_complete_top_level_llm_response(&input)
+            .await
+            .unwrap();
+        assert_eq!(
+            locked.outcome,
+            CompleteLlmResponsePersistenceOutcome::RetryablePersistence
+        );
+        assert!(repo.list_receipts(WorkflowId(1)).await.unwrap().is_empty());
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+
+        let accepted = repo
+            .accept_complete_top_level_llm_response(&input)
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.outcome,
+            CompleteLlmResponsePersistenceOutcome::Accepted
+        );
+        assert_eq!(repo.list_receipts(WorkflowId(1)).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1210,7 +1356,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(result.outcome, AuthorityOutcome::Authorized);
+        assert_eq!(
+            result.outcome,
+            CompleteLlmResponsePersistenceOutcome::Accepted
+        );
         assert_eq!(
             repo.load_owed_top_level_llm_receipts().await.unwrap().len(),
             1
@@ -1238,7 +1387,7 @@ mod tests {
             .await
             .unwrap()
             .outcome,
-            AuthorityOutcome::Authorized
+            CompleteLlmResponsePersistenceOutcome::ExactReplay
         );
         let stopped = repo
             .stop_top_level_llm_and_suppress_pending_delivery(&StopTopLevelLlmInput {

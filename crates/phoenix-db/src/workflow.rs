@@ -1018,8 +1018,7 @@ impl<'a> WorkflowTx<'a> {
         match receipt_insert {
             Ok(_) => {}
             Err(sqlx::Error::Database(error))
-                if is_sqlite_busy_retryable(error.as_ref())
-                    || is_sqlite_unique_constraint(error.as_ref())
+                if is_sqlite_unique_constraint(error.as_ref())
                     || is_sqlite_primary_key_constraint(error.as_ref()) =>
             {
                 return Ok(ReceiptAcceptanceResult {
@@ -1230,6 +1229,14 @@ fn is_sqlite_primary_key_constraint(error: &dyn DatabaseError) -> bool {
 
 fn is_sqlite_busy_retryable(error: &dyn DatabaseError) -> bool {
     sqlite_error_code_is(error, SQLITE_BUSY) || error.code().as_deref() == Some("517")
+}
+
+fn db_error_is_sqlite_busy_retryable(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Sqlx(sqlx::Error::Database(database_error))
+            if is_sqlite_busy_retryable(database_error.as_ref())
+    )
 }
 
 impl WorkflowRepository {
@@ -1656,21 +1663,18 @@ impl WorkflowRepository {
         &self,
         input: &AcceptReceiptInput,
     ) -> DbResult<ReceiptAcceptanceResult> {
-        for _ in 0..5 {
+        for attempt in 0..5 {
             match self.accept_receipt_once(input).await {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if is_sqlite_busy_retryable(error.as_ref()) =>
-                {
-                    std::thread::yield_now();
+                Err(error) if db_error_is_sqlite_busy_retryable(&error) => {
+                    if attempt == 4 {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 result => return result,
             }
         }
-        Ok(ReceiptAcceptanceResult {
-            outcome: AuthorityOutcome::StaleAuthority,
-            receipt: None,
-            delivery: None,
-        })
+        unreachable!("receipt persistence retry loop always returns")
     }
 
     async fn accept_receipt_once(
