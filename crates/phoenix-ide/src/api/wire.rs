@@ -305,6 +305,14 @@ pub enum SseWireEvent {
         #[ts(optional)]
         error: Option<ErrorPresentation>,
     },
+    LlmStreamStarted {
+        sequence_id: i64,
+        request_id: String,
+        workflow_id: u64,
+        effect_id: u64,
+        attempt_id: u64,
+        generation: u64,
+    },
     /// First-byte marker: emitted exactly once per LLM request,
     /// immediately before the first `Token` event for the same
     /// `request_id`. Drives the `StateBar`'s `awaiting LLM response Ns`
@@ -353,9 +361,6 @@ pub enum SseWireEvent {
     Error {
         sequence_id: i64,
         message: String,
-        /// Generated as `unknown` — the existing UI reads only the flat
-        /// `message` field. Kind-aware consumers can narrow against
-        /// `UserFacingError` (also exported by ts-rs for future use).
         #[ts(type = "unknown")]
         error: UserFacingError,
     },
@@ -413,6 +418,7 @@ impl SseWireEvent {
             SseWireEvent::Message { .. } => "message",
             SseWireEvent::MessageUpdated { .. } => "message_updated",
             SseWireEvent::StateChange { .. } => "state_change",
+            SseWireEvent::LlmStreamStarted { .. } => "llm_stream_started",
             SseWireEvent::LlmFirstByte { .. } => "llm_first_byte",
             SseWireEvent::LlmAttempt { .. } => "llm_attempt",
             SseWireEvent::Token { .. } => "token",
@@ -506,6 +512,21 @@ impl From<SseEvent> for SseWireEvent {
                     error,
                 }
             }
+            SseEvent::LlmStreamStarted {
+                sequence_id,
+                request_id,
+                workflow_id,
+                effect_id,
+                attempt_id,
+                generation,
+            } => SseWireEvent::LlmStreamStarted {
+                sequence_id,
+                request_id,
+                workflow_id,
+                effect_id,
+                attempt_id,
+                generation,
+            },
             SseEvent::LlmFirstByte {
                 sequence_id,
                 request_id,

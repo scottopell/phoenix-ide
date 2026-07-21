@@ -213,6 +213,22 @@ mod tests {
                 }
                 obj
             }
+            SseEvent::LlmStreamStarted {
+                sequence_id,
+                request_id,
+                workflow_id,
+                effect_id,
+                attempt_id,
+                generation,
+            } => json!({
+                "type": "llm_stream_started",
+                "sequence_id": sequence_id,
+                "request_id": request_id,
+                "workflow_id": workflow_id,
+                "effect_id": effect_id,
+                "attempt_id": attempt_id,
+                "generation": generation,
+            }),
             SseEvent::LlmFirstByte {
                 sequence_id,
                 request_id,
@@ -710,6 +726,19 @@ mod tests {
             sequence_id: 15,
             text: "Hel".to_string(),
             request_id: "req-42".to_string(),
+        };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_llm_stream_started() {
+        let event = SseEvent::LlmStreamStarted {
+            sequence_id: 16,
+            request_id: "req-42".to_string(),
+            workflow_id: 7,
+            effect_id: 3,
+            attempt_id: 2,
+            generation: 4,
         };
         assert_parity(&event);
     }

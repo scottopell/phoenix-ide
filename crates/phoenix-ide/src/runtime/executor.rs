@@ -4792,6 +4792,7 @@ where
         let request_id = uuid::Uuid::new_v4().to_string();
 
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
+        let broadcast_tx_for_stream = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
         let first_byte_at = Arc::new(tokio::sync::Mutex::new(None));
         let first_byte_at_for_fwd = first_byte_at.clone();
@@ -4992,6 +4993,21 @@ where
             } else {
                 None
             };
+
+            if let Some(attempt) = durable_attempt.as_ref() {
+                let authority = &attempt.authority;
+                let stream_request_id = request_id.clone();
+                let _ = broadcast_tx_for_stream.send_seq(|sequence_id| {
+                    SseEvent::LlmStreamStarted {
+                        sequence_id,
+                        request_id: stream_request_id,
+                        workflow_id: authority.workflow_id.0,
+                        effect_id: authority.effect_id.0,
+                        attempt_id: authority.attempt_id.0,
+                        generation: authority.generation.0,
+                    }
+                });
+            }
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {

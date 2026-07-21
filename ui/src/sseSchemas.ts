@@ -34,6 +34,7 @@ import type {
   SseBashToolProgressData as WireBashToolProgressData,
   SseStateChangeData as WireStateChangeData,
   SseTokenData as WireTokenData,
+  SseLlmStreamStartedData as WireLlmStreamStartedData,
   SseLlmFirstByteData as WireLlmFirstByteData,
   SseLlmAttemptData as WireLlmAttemptData,
   SseAgentDoneData as WireAgentDoneData,
@@ -285,6 +286,16 @@ export const SseTokenDataSchema = v.looseObject({
   request_id: v.string(),
 }) satisfies v.GenericSchema<unknown, WireTokenData>;
 
+/** `llm_stream_started`: exact durable attempt identity for ephemeral output. */
+export const SseLlmStreamStartedDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  request_id: v.string(),
+  workflow_id: v.number(),
+  effect_id: v.number(),
+  attempt_id: v.number(),
+  generation: v.number(),
+}) satisfies v.GenericSchema<unknown, WireLlmStreamStartedData>;
+
 /** `llm_first_byte`: marker emitted exactly once per LLM request,
  *  immediately before the first `Token` event for the same `request_id`.
  *  Drives the StateBar's `awaiting LLM response Ns` → `streaming` transition.
@@ -487,6 +498,7 @@ export type SseInitData = v.InferOutput<typeof SseInitDataSchema>;
 export type SseMessageData = v.InferOutput<typeof SseMessageDataSchema>;
 export type SseMessageUpdatedData = v.InferOutput<typeof SseMessageUpdatedDataSchema>;
 export type SseStateChangeData = v.InferOutput<typeof SseStateChangeDataSchema>;
+export type SseLlmStreamStartedData = v.InferOutput<typeof SseLlmStreamStartedDataSchema>;
 export type SseTokenData = v.InferOutput<typeof SseTokenDataSchema>;
 export type SseConversationUpdateData = v.InferOutput<typeof SseConversationUpdateDataSchema>;
 export type SseAgentDoneData = v.InferOutput<typeof SseAgentDoneDataSchema>;

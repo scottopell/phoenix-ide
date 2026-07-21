@@ -1077,6 +1077,16 @@ pub enum SseEvent {
         text: String,
         request_id: String,
     },
+    /// Opens an ephemeral stream for one exact durable provider attempt.
+    /// A later marker supersedes any partial output from the prior attempt.
+    LlmStreamStarted {
+        sequence_id: i64,
+        request_id: String,
+        workflow_id: u64,
+        effect_id: u64,
+        attempt_id: u64,
+        generation: u64,
+    },
     /// Emitted exactly once per LLM request immediately before the first
     /// `Token` event for that request, so the client can transition the
     /// `StateBar`'s base reason from `awaiting LLM response Ns` (pre-first-byte)

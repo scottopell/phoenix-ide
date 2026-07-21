@@ -1639,6 +1639,52 @@ describe('conversationReducer', () => {
       expect(next.streamingBuffer?.startedAt).not.toBe(startedAt);
     });
 
+    it('supersedes partial output and drops late tokens from the abandoned attempt', () => {
+      let atom = llmRequestingAtom();
+      atom = dispatch(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: 1,
+        requestId: 'attempt-1',
+        workflowId: 7,
+        effectId: 2,
+        attemptId: 1,
+        generation: 0,
+      });
+      atom = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 2,
+        delta: 'abandoned partial',
+        requestId: 'attempt-1',
+      });
+      atom = dispatch(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: 3,
+        requestId: 'attempt-2',
+        workflowId: 7,
+        effectId: 2,
+        attemptId: 2,
+        generation: 0,
+      });
+      expect(atom.streamingBuffer).toBeNull();
+
+      atom = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 4,
+        delta: 'late old token',
+        requestId: 'attempt-1',
+      });
+      expect(atom.streamingBuffer).toBeNull();
+
+      atom = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 5,
+        delta: 'replacement',
+        requestId: 'attempt-2',
+      });
+      expect(atom.streamingBuffer?.text).toBe('replacement');
+      expect(atom.streamingBuffer?.requestId).toBe('attempt-2');
+    });
+
     // Task 24683 regression: tokens arriving after the phase has left
     // `llm_requesting` must be dropped. Otherwise a late token from a
     // previous turn creates a phantom streaming buffer below the

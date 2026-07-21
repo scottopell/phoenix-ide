@@ -12,6 +12,7 @@ import {
   SseBashToolProgressDataSchema,
   SseStateChangeDataSchema,
   SseTokenDataSchema,
+  SseLlmStreamStartedDataSchema,
   SseLlmFirstByteDataSchema,
   SseLlmAttemptDataSchema,
   SseConversationUpdateDataSchema,
@@ -464,6 +465,25 @@ export function useConnection({
               type: 'sse_conversation_update',
               sequenceId: res.data.sequence_id,
               updates,
+            });
+          });
+
+          on('llm_stream_started', (e) => {
+            const res = parseEvent(
+              SseLlmStreamStartedDataSchema,
+              e,
+              'llm_stream_started',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_llm_stream_started',
+              sequenceId: res.data.sequence_id,
+              requestId: res.data.request_id,
+              workflowId: res.data.workflow_id,
+              effectId: res.data.effect_id,
+              attemptId: res.data.attempt_id,
+              generation: res.data.generation,
             });
           });
 

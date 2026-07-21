@@ -5,6 +5,7 @@ import type { BashToolProgress } from '../generated/sse';
 import type { WorkScopeInventory } from '../generated/sse';
 import {
   SseTokenDataSchema,
+  SseLlmStreamStartedDataSchema,
   SseStateChangeDataSchema,
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
@@ -125,6 +126,8 @@ export interface ConversationAtom {
    *  pending bubble's spec-level `placeholder → streaming` edge
    *  (REQ-WPV-006). */
   firstByteRequestId: string | null;
+  /** Durable stream currently authorized to contribute partial output. */
+  activeLlmStreamRequestId: string | null;
   /** Per-turn retry context: most recent `LlmAttempt` for the current
    *  turn (specs/llm-retry-visibility/ REQ-LRV-001 / REQ-WPV-003). The
    *  StateBar composes "(retry K/N <reason>)" from these fields and
@@ -254,6 +257,16 @@ export type SSEAction =
     }
   | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
   | { type: 'sse_token'; sequenceId: number; delta: string; requestId: string; epoch?: number }
+  | {
+      type: 'sse_llm_stream_started';
+      sequenceId: number;
+      requestId: string;
+      workflowId: number;
+      effectId: number;
+      attemptId: number;
+      generation: number;
+      epoch?: number;
+    }
   | {
       // REQ-WPV-007: first-byte marker for the LLM request identified by
       // `requestId`. The reducer stamps this on the atom so the StateBar
@@ -400,6 +413,7 @@ export function createInitialAtom(): ConversationAtom {
     phaseStateUpdatedAt: null,
     lastSseEventAt: Date.now(),
     firstByteRequestId: null,
+    activeLlmStreamRequestId: null,
     turnRetryContext: null,
     connectionEpoch: null,
     connectionState: 'connecting',
@@ -710,6 +724,8 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         phaseLastAppliedEventSeq: action.sequenceId,
         phaseStateUpdatedAt: action.stateUpdatedAt,
         firstByteRequestId: null,
+        activeLlmStreamRequestId:
+          action.phase.type === 'llm_requesting' ? atom.activeLlmStreamRequestId : null,
         toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
       };
     }
@@ -720,8 +736,16 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         phaseLastAppliedEventSeq: action.sequenceId,
         streamingBuffer: null,
         firstByteRequestId: null,
+        activeLlmStreamRequestId: null,
         turnRetryContext: null,
         liveBashProgress: {},
+      };
+    case 'sse_llm_stream_started':
+      return {
+        ...atom,
+        activeLlmStreamRequestId: action.requestId,
+        streamingBuffer: null,
+        firstByteRequestId: null,
       };
     case 'sse_llm_first_byte':
       return { ...atom, firstByteRequestId: action.requestId };
@@ -741,6 +765,12 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       return atom;
     case 'sse_token': {
       if (atom.phase.type !== 'llm_requesting') return atom;
+      if (
+        atom.activeLlmStreamRequestId !== null &&
+        atom.activeLlmStreamRequestId !== action.requestId
+      ) {
+        return atom;
+      }
       const sameRequest = atom.streamingBuffer?.requestId === action.requestId;
       return {
         ...atom,
@@ -911,6 +941,19 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
   const obj = entry as Record<string, unknown>;
   const type = obj['type'];
   switch (type) {
+    case 'llm_stream_started': {
+      const res = v.safeParse(SseLlmStreamStartedDataSchema, entry);
+      if (!res.success) return atom;
+      return conversationReducer(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: res.output.sequence_id,
+        requestId: res.output.request_id,
+        workflowId: res.output.workflow_id,
+        effectId: res.output.effect_id,
+        attemptId: res.output.attempt_id,
+        generation: res.output.generation,
+      });
+    }
     case 'token': {
       const res = v.safeParse(SseTokenDataSchema, entry);
       if (!res.success) {
@@ -1294,6 +1337,7 @@ export function conversationReducer(
     case 'sse_bash_tool_progress':
     case 'sse_state_change':
     case 'sse_agent_done':
+    case 'sse_llm_stream_started':
     case 'sse_llm_first_byte':
     case 'sse_llm_attempt':
     case 'sse_token':
