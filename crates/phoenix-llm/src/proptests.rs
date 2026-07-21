@@ -321,6 +321,7 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
         messages,
         tools: vec![],
         max_tokens: None,
+        effort: None,
         telemetry: None,
         cache_key: super::types::PromptCacheKey::stable("proptest"),
     }
@@ -612,6 +613,7 @@ proptest! {
             super::types::Usage {
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },

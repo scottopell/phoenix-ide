@@ -552,7 +552,6 @@ impl ModelRegistry {
             "gpt-5.6-luna",
             "gpt-5.6-terra",
             "gpt-5.5",
-            "gpt-5.3-codex",
             "gpt-5.4",
             "gpt-5.4-mini",
             "mock",
@@ -900,6 +899,7 @@ impl ModelRegistry {
                     description: spec.description.clone(),
                     context_window: spec.context_window_for(service.as_ref()),
                     recommended: spec.recommended,
+                    effort_capabilities: spec.effort_capabilities_for(service.as_ref()),
                 });
             }
         }

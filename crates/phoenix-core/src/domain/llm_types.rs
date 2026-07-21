@@ -3,6 +3,8 @@
 pub const LLM_SOURCE_HEADER: &str = "phoenix-ide";
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 /// Identifier for `OpenAI`'s `prompt_cache_key` Responses-API field. Required
@@ -56,7 +58,72 @@ impl PromptCacheKey {
     }
 }
 
-/// Content-free correlation fields attached to one provider attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ModelEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ModelEffort {
+    pub const ALL: [Self; 7] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
+    #[must_use]
+    pub const fn needs_extended_output_headroom(self) -> bool {
+        matches!(self, Self::Xhigh | Self::Max)
+    }
+
+    #[must_use]
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl fmt::Display for ModelEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_name())
+    }
+}
+
+impl FromStr for ModelEffort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            other => Err(format!("unknown effort level '{other}'")),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmRequestTelemetry {
     pub conversation_id: String,
@@ -305,12 +372,29 @@ pub struct LlmRequest {
     pub messages: Vec<LlmMessage>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
+    pub effort: Option<ModelEffort>,
     pub telemetry: Option<LlmRequestTelemetry>,
     /// Required cache key. See [`PromptCacheKey`] for how to pick one — the
     /// choice is the caller's because only the caller knows its caching
     /// cohort. Used as `prompt_cache_key` on the `OpenAI` Responses path,
     /// ignored by `Anthropic`.
     pub cache_key: PromptCacheKey,
+}
+
+impl LlmRequest {
+    #[must_use]
+    pub fn raised_output_token_ceiling(&self) -> Option<u32> {
+        self.max_tokens.map(|current| {
+            if self
+                .effort
+                .is_some_and(ModelEffort::needs_extended_output_headroom)
+            {
+                current.max(64_000)
+            } else {
+                current
+            }
+        })
+    }
 }
 
 /// System prompt content
@@ -648,6 +732,8 @@ impl LlmResponse {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     #[serde(default)]
     pub cache_creation_tokens: u64,
     #[serde(default)]

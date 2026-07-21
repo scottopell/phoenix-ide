@@ -4,7 +4,7 @@ use super::headers::apply_source_header;
 use super::models::ModelSpec;
 use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
 use super::types::{
-    ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage,
+    ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, ModelEffort, Usage,
 };
 use super::LlmError;
 use reqwest::Client;
@@ -625,10 +625,13 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
 
     AnthropicRequest {
         model: spec.api_name.clone(),
-        max_tokens: request.max_tokens.unwrap_or(16_384),
+        max_tokens: request
+            .raised_output_token_ceiling()
+            .unwrap_or_else(|| default_output_headroom(request.effort)),
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
+        output_config: request.effort.and_then(explicit_anthropic_effort),
         stream: None,
         tags: None,
     }
@@ -964,10 +967,23 @@ fn normalize_response_with_diagnostics(
         Usage {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
+            reasoning_tokens: 0,
             cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
             cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
         },
     ))
+}
+
+fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
+    if effort.is_some_and(ModelEffort::needs_extended_output_headroom) {
+        64_000
+    } else {
+        16_384
+    }
+}
+
+fn explicit_anthropic_effort(effort: ModelEffort) -> Option<AnthropicOutputConfig> {
+    Some(AnthropicOutputConfig { effort })
 }
 
 // Anthropic API types
@@ -981,6 +997,8 @@ struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicToolEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     /// Free-form metadata forwarded to the gateway/proxy in front of the
     /// model. Phoenix does not interpret these — they're a pass-through
@@ -990,6 +1008,11 @@ struct AnthropicRequest {
     /// configured; the field is omitted from the wire when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    effort: ModelEffort,
 }
 
 #[derive(Debug, Serialize)]
@@ -1154,6 +1177,7 @@ mod tests {
             recommended: false,
             supports_tool_search,
             source: crate::models::ModelSource::BuiltIn,
+            effort_capabilities: crate::models::EffortCapabilities::unknown(),
         }
     }
 
@@ -1176,6 +1200,7 @@ mod tests {
                 },
             ],
             max_tokens: None,
+            effort: None,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
@@ -1187,9 +1212,26 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: None,
+            effort: None,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
+    }
+
+    #[test]
+    fn explicit_effort_serializes_and_native_default_omits_output_config() {
+        let spec = test_spec(false);
+        let mut request = test_request_with_tools();
+
+        let native = serde_json::to_value(translate_request(&spec, &request)).unwrap();
+        assert!(native.get("output_config").is_none());
+        assert_eq!(native["max_tokens"], 16_384);
+
+        request.effort = Some(ModelEffort::Xhigh);
+        request.max_tokens = Some(16_384);
+        let explicit = serde_json::to_value(translate_request(&spec, &request)).unwrap();
+        assert_eq!(explicit["output_config"]["effort"], "xhigh");
+        assert_eq!(explicit["max_tokens"], 64_000);
     }
 
     #[tokio::test]
@@ -1293,6 +1335,7 @@ mod tests {
             }],
             tools: vec![],
             max_tokens: None,
+            effort: None,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };

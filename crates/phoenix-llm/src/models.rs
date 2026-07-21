@@ -2,6 +2,115 @@
 //!
 use std::collections::HashSet;
 
+use phoenix_core::domain::llm_types::ModelEffort;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "support")]
+pub enum EffortCapabilities {
+    Unsupported,
+    Unknown,
+    Supported {
+        levels: Vec<ModelEffort>,
+        native_default: NativeDefault,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeDefault {
+    Known(ModelEffort),
+    Unknown,
+}
+
+impl EffortCapabilities {
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self::Unsupported
+    }
+
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self::Unknown
+    }
+
+    #[must_use]
+    pub fn supported(levels: &[ModelEffort], native_default: NativeDefault) -> Self {
+        assert!(
+            !levels.is_empty(),
+            "supported effort levels must be non-empty"
+        );
+        if let NativeDefault::Known(level) = native_default {
+            assert!(
+                levels.contains(&level),
+                "native effort default must be a supported level"
+            );
+        }
+        Self::Supported {
+            levels: levels.to_vec(),
+            native_default,
+        }
+    }
+
+    #[must_use]
+    pub fn supported_known(levels: &[ModelEffort], native_default: ModelEffort) -> Self {
+        Self::supported(levels, NativeDefault::Known(native_default))
+    }
+
+    #[must_use]
+    pub fn supported_unknown(levels: &[ModelEffort]) -> Self {
+        Self::supported(levels, NativeDefault::Unknown)
+    }
+
+    #[must_use]
+    pub fn supports(&self, effort: ModelEffort) -> bool {
+        matches!(self, Self::Supported { levels, .. } if levels.contains(&effort))
+    }
+}
+
+const EFFORT_LEVELS_ANTHROPIC_BASE: &[ModelEffort] = &[
+    ModelEffort::Low,
+    ModelEffort::Medium,
+    ModelEffort::High,
+    ModelEffort::Max,
+];
+const EFFORT_LEVELS_ANTHROPIC_XHIGH: &[ModelEffort] = &[
+    ModelEffort::Low,
+    ModelEffort::Medium,
+    ModelEffort::High,
+    ModelEffort::Xhigh,
+    ModelEffort::Max,
+];
+const EFFORT_LEVELS_GPT_55_PLUS: &[ModelEffort] = &[
+    ModelEffort::None,
+    ModelEffort::Low,
+    ModelEffort::Medium,
+    ModelEffort::High,
+    ModelEffort::Xhigh,
+    ModelEffort::Max,
+];
+const EFFORT_LEVELS_GPT_54: &[ModelEffort] = &[
+    ModelEffort::None,
+    ModelEffort::Low,
+    ModelEffort::Medium,
+    ModelEffort::High,
+    ModelEffort::Xhigh,
+];
+fn effort_anthropic_base() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_ANTHROPIC_BASE, ModelEffort::High)
+}
+
+fn effort_anthropic_xhigh() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_ANTHROPIC_XHIGH, ModelEffort::High)
+}
+
+fn effort_gpt_55_plus() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_55_PLUS, ModelEffort::Medium)
+}
+
+fn effort_gpt_54() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_54, ModelEffort::None)
+}
+
 /// Per-model metadata surfaced to API consumers (the `/api/models` response and
 /// the model picker). Built by [`super::ModelRegistry::available_model_info`]
 /// from a [`ModelSpec`] plus the live service's effective context window.
@@ -12,6 +121,7 @@ pub struct ModelInfo {
     pub description: String,
     pub context_window: usize,
     pub recommended: bool,
+    pub effort_capabilities: EffortCapabilities,
 }
 
 /// Backend route + wire protocol used for a model.
@@ -91,6 +201,18 @@ struct ExternalModelSpec {
     context_window: usize,
     recommended: bool,
     supports_tool_search: bool,
+    effort_capabilities: Option<ExternalEffortCapabilities>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "support")]
+enum ExternalEffortCapabilities {
+    Unsupported,
+    Unknown,
+    Supported {
+        levels: Vec<ModelEffort>,
+        native_default: Option<ModelEffort>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +247,12 @@ pub struct ModelSpec {
     /// specs bypass the Codex bridge because their endpoint is operator-configured,
     /// not `ChatGPT`'s backend.
     pub source: ModelSource,
+    /// Route-aware effort capabilities. Built-in specs describe the native
+    /// provider defaults, while external specs carry validated optional metadata
+    /// when an operator knows the target route's support. When absent on an
+    /// external model, Phoenix represents that absence honestly instead of
+    /// fabricating unsupported/optional/native.
+    pub effort_capabilities: EffortCapabilities,
 }
 
 impl ModelSpec {
@@ -140,6 +268,11 @@ impl ModelSpec {
         } else {
             self.context_window
         }
+    }
+
+    #[must_use]
+    pub fn effort_capabilities_for(&self, _service: &dyn crate::LlmService) -> EffortCapabilities {
+        self.effort_capabilities.clone()
     }
 }
 
@@ -170,6 +303,42 @@ pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
     Ok(parsed)
 }
 
+fn validate_external_effort_capabilities(
+    spec: &ExternalModelSpec,
+) -> Result<EffortCapabilities, String> {
+    let Some(caps) = spec.effort_capabilities.as_ref() else {
+        return Ok(EffortCapabilities::unknown());
+    };
+    match caps {
+        ExternalEffortCapabilities::Unsupported => Ok(EffortCapabilities::unsupported()),
+        ExternalEffortCapabilities::Unknown => Ok(EffortCapabilities::unknown()),
+        ExternalEffortCapabilities::Supported {
+            levels,
+            native_default,
+        } => {
+            if levels.is_empty() {
+                return Err(format!(
+                    "model '{}' must declare at least one supported effort level",
+                    spec.id
+                ));
+            }
+            let native_default = match native_default {
+                Some(level) => {
+                    if !levels.contains(level) {
+                        return Err(format!(
+                            "model '{}' effort native_default must be included in supported levels",
+                            spec.id
+                        ));
+                    }
+                    NativeDefault::Known(*level)
+                }
+                None => NativeDefault::Unknown,
+            };
+            Ok(EffortCapabilities::supported(levels, native_default))
+        }
+    }
+}
+
 fn external_model_spec_from_config(
     index: usize,
     spec: ExternalModelSpec,
@@ -180,6 +349,7 @@ fn external_model_spec_from_config(
     }
     let api_name = spec
         .api_name
+        .as_ref()
         .map_or_else(|| id.clone(), |name| name.trim().to_string());
     if api_name.is_empty() {
         return Err(format!("model '{id}' has an empty api_name"));
@@ -191,6 +361,7 @@ fn external_model_spec_from_config(
     if spec.context_window == 0 {
         return Err(format!("model '{id}' has invalid context_window 0"));
     }
+    let effort_capabilities = validate_external_effort_capabilities(&spec)?;
     Ok(ModelSpec {
         id,
         api_name,
@@ -200,6 +371,7 @@ fn external_model_spec_from_config(
         recommended: spec.recommended,
         supports_tool_search: spec.supports_tool_search,
         source: ModelSource::External,
+        effort_capabilities,
     })
 }
 
@@ -243,6 +415,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_xhigh(),
         },
         ModelSpec {
             id: "claude-opus-4-7".into(),
@@ -253,6 +426,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_xhigh(),
         },
         ModelSpec {
             id: "claude-opus-4-6".into(),
@@ -263,6 +437,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_base(),
         },
         ModelSpec {
             id: "claude-sonnet-5".into(),
@@ -273,6 +448,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_xhigh(),
         },
         ModelSpec {
             id: "claude-sonnet-4-6".into(),
@@ -283,6 +459,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_anthropic_base(),
         },
         ModelSpec {
             id: "claude-haiku-4-5".into(),
@@ -293,6 +470,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::unsupported(),
         },
         // OpenAI models
         // Context windows here are the platform-API ceilings. The codex bridge
@@ -309,6 +487,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_55_plus(),
         },
         ModelSpec {
             id: "gpt-5.6-luna".into(),
@@ -319,6 +498,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_55_plus(),
         },
         ModelSpec {
             id: "gpt-5.6-terra".into(),
@@ -329,6 +509,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_55_plus(),
         },
         ModelSpec {
             id: "gpt-5.5".into(),
@@ -339,6 +520,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_55_plus(),
         },
         ModelSpec {
             id: "gpt-5.4".into(),
@@ -349,6 +531,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_54(),
         },
         ModelSpec {
             id: "gpt-5.4-mini".into(),
@@ -359,17 +542,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
-        },
-        // GPT-5 Codex models (responses API)
-        ModelSpec {
-            id: "gpt-5.3-codex".into(),
-            api_name: "gpt-5.3-codex".into(),
-            backend: ModelBackend::OpenAIResponses,
-            description: "GPT-5.3 Codex (latest code model)".into(),
-            context_window: 200_000,
-            recommended: true,
-            supports_tool_search: false,
-            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_54(),
         },
         // Mock model for frontend development without API keys
         ModelSpec {
@@ -381,6 +554,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::unknown(),
         },
     ]
 }
@@ -415,6 +589,74 @@ mod tests {
 
         assert_eq!(models[0].backend, ModelBackend::OpenAIResponses);
         assert_eq!(models[0].backend.api_format(), ApiFormat::OpenAIResponses);
+    }
+
+    #[test]
+    fn built_in_effort_capabilities_match_model_contracts() {
+        let models = all_models();
+        let by_id = |id: &str| {
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .unwrap_or_else(|| panic!("missing built-in model {id}"))
+        };
+
+        assert_eq!(
+            by_id("claude-sonnet-5").effort_capabilities,
+            effort_anthropic_xhigh()
+        );
+        assert_eq!(
+            by_id("claude-sonnet-4-6").effort_capabilities,
+            effort_anthropic_base()
+        );
+        assert_eq!(
+            by_id("claude-haiku-4-5").effort_capabilities,
+            EffortCapabilities::Unsupported
+        );
+        assert_eq!(
+            by_id("gpt-5.6-sol").effort_capabilities,
+            effort_gpt_55_plus()
+        );
+        assert_eq!(by_id("gpt-5.4-mini").effort_capabilities, effort_gpt_54());
+        assert!(by_id("gpt-5.6-sol")
+            .effort_capabilities
+            .supports(ModelEffort::Max));
+        assert!(!by_id("gpt-5.4-mini")
+            .effort_capabilities
+            .supports(ModelEffort::Max));
+        assert!(models.iter().all(|model| model.id != "gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn external_effort_metadata_distinguishes_unknown_unsupported_and_supported() {
+        let models = parse_external_models(
+            r#"[
+                {"id":"absent","backend":"openai_responses","description":"Absent metadata","context_window":128000,"recommended":false,"supports_tool_search":false},
+                {"id":"unsupported","backend":"anthropic","description":"Unsupported","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"unsupported"}},
+                {"id":"known-levels","backend":"openai_responses","description":"Known levels","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low","high"]}}
+            ]"#,
+        )
+        .expect("external models parse");
+
+        assert_eq!(models[0].effort_capabilities, EffortCapabilities::Unknown);
+        assert_eq!(
+            models[1].effort_capabilities,
+            EffortCapabilities::Unsupported
+        );
+        assert_eq!(
+            models[2].effort_capabilities,
+            EffortCapabilities::supported_unknown(&[ModelEffort::Low, ModelEffort::High])
+        );
+    }
+
+    #[test]
+    fn external_native_default_must_be_supported() {
+        let models = parse_external_models(
+            r#"[{"id":"bad","backend":"openai_responses","description":"Bad metadata","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["low"],"native_default":"high"}}]"#,
+        )
+        .expect("top-level external model array parses");
+
+        assert!(models.is_empty());
     }
 
     #[test]
