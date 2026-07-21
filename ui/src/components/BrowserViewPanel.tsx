@@ -92,7 +92,7 @@ export function BrowserViewPanel({
   const stopBrowserSession = useCallback(async () => {
     if (stopping) return;
     const terminalBeforeRequest = statusRef.current.kind === 'no-session'
-      || statusRef.current.kind === 'ended';
+      || (statusRef.current.kind === 'ended' && reconnectTimerRef.current === null);
     stoppingRef.current = !terminalBeforeRequest;
     liveFrameSuppressedDuringStopRef.current = false;
     reconnectSuppressedDuringStopRef.current = false;
@@ -100,6 +100,7 @@ export function BrowserViewPanel({
     if (!terminalBeforeRequest && reconnectTimerRef.current !== null) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
+      reconnectSuppressedDuringStopRef.current = true;
     }
     setStopError(null);
     try {

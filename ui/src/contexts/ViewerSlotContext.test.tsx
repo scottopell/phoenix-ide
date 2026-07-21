@@ -519,6 +519,38 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(getLastViewer('conv-A')).toContain('viewer=prose');
   });
 
+  it('preserves a durable snapshot when readiness resolves on the browser fall', () => {
+    setLastViewer('conv-A', 'viewer=prose&file=%2Frepo%2FREADME.md&root=%2Frepo');
+    let latest: ViewerSlotValue | null = null;
+    let setState: ((state: { active: boolean; loaded: boolean }) => void) | null = null;
+    function Harness() {
+      const [state, setStateValue] = useState({ active: false, loaded: false });
+      setState = setStateValue;
+      return (
+        <ViewerSlotProvider
+          scopeKey="conv-A"
+          browserSessionActive={state.active}
+          browserSessionStateLoaded={state.loaded}
+        >
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes><Route path="/c/:slug" element={<Harness />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { setState!({ active: true, loaded: false }); });
+    expect(latest!.slot.kind).toBe('browser');
+    expect(getLastViewer('conv-A')).toContain('viewer=prose');
+    act(() => { setState!({ active: false, loaded: true }); });
+
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=prose');
+  });
+
   it('invalidates an unchanged browser snapshot when a pending fall is confirmed', () => {
     setLastViewer('conv-A', 'viewer=browser');
     let latest: ViewerSlotValue | null = null;

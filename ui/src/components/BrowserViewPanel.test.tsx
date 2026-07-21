@@ -200,7 +200,7 @@ describe('BrowserViewPanel stop-session control', () => {
     expect(screen.getByRole('alert').textContent).toContain('stop failed');
   });
 
-  it('preserves a reconnect scheduled before a terminal-state stop attempt', async () => {
+  it('treats ended-with-reconnect as pending and restores reconnect when stop fails', async () => {
     vi.useFakeTimers();
     stopBrowser.mockRejectedValue(new Error('stop failed'));
     render(<BrowserViewPanel conversationId="conv-1" />);
@@ -211,10 +211,24 @@ describe('BrowserViewPanel stop-session control', () => {
     await act(async () => {
       fireEvent.click(screen.getByLabelText('Stop browser session'));
       await Promise.resolve();
-      vi.advanceTimersByTime(1500);
     });
-
+    expect(screen.getByRole('alert').textContent).toContain('stop failed');
     expect(sockets).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
+  it('suppresses reconnect while stop from ended-with-reconnect is pending', () => {
+    vi.useFakeTimers();
+    stopBrowser.mockReturnValue(new Promise(() => {}));
+    render(<BrowserViewPanel conversationId="conv-1" />);
+    act(() => { sockets[0]!.onmessage?.(statusMessage('started')); });
+    act(() => { sockets[0]!.onclose?.(); });
+
+    fireEvent.click(screen.getByLabelText('Stop browser session'));
+    expect(screen.getByLabelText('Stop browser session')).toBeDisabled();
+    act(() => { vi.advanceTimersByTime(1500); });
+
+    expect(sockets).toHaveLength(1);
     vi.useRealTimers();
   });
 

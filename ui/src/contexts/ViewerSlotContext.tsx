@@ -442,6 +442,13 @@ export function ViewerSlotProvider({
   // prior conversation's flag would be misread as an edge on entry.
   const prevActiveRef = useRef(browserSessionActive);
   const edgeScopeRef = useRef(scopeKey);
+  const clearStoredBrowserSnapshot = useCallback((key: string | undefined) => {
+    if (!key) return;
+    const stored = getLastViewer(key);
+    if (stored && new URLSearchParams(stored).get(VIEWER_PARAM) === 'browser') {
+      clearLastViewer(key);
+    }
+  }, []);
   const pendingBrowserFallScopeRef = useRef<string | undefined>(undefined);
   const slotKind = slot.kind;
   useEffect(() => {
@@ -461,7 +468,8 @@ export function ViewerSlotProvider({
       // row cannot erase a valid browser snapshot.
       if (browserSessionStateLoaded) {
         pendingBrowserFallScopeRef.current = undefined;
-        clearSlot(true);
+        clearSlot(false);
+        clearStoredBrowserSnapshot(scopeKey);
       } else {
         pendingBrowserFallScopeRef.current = scopeKey;
         clearSlot(false);
@@ -471,15 +479,18 @@ export function ViewerSlotProvider({
       && browserSessionStateLoaded
       && browserSessionActive === false
     ) {
-      if (scopeKey) {
-        const stored = getLastViewer(scopeKey);
-        if (stored && new URLSearchParams(stored).get(VIEWER_PARAM) === 'browser') {
-          clearLastViewer(scopeKey);
-        }
-      }
+      clearStoredBrowserSnapshot(scopeKey);
       pendingBrowserFallScopeRef.current = undefined;
     }
-  }, [scopeKey, browserSessionActive, browserSessionStateLoaded, slotKind, openBrowser, clearSlot]);
+  }, [
+    scopeKey,
+    browserSessionActive,
+    browserSessionStateLoaded,
+    slotKind,
+    openBrowser,
+    clearSlot,
+    clearStoredBrowserSnapshot,
+  ]);
 
   const commands = useMemo<ViewerSlotCommands>(
     () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close }),
