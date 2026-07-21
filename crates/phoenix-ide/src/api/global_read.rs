@@ -2,10 +2,7 @@ use super::AppState;
 use crate::db::MessageContent;
 use crate::db::{ConvMode, Conversation, DbError, MessageType, RetrievalScope};
 use crate::state_machine::ConvState;
-use axum::{
-    extract::{Query, State},
-    Json,
-};
+use axum::{extract::State, Json};
 use chrono::{DateTime, Utc};
 use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
@@ -88,16 +85,6 @@ pub struct ResolveGlobalReferenceResponse {
     pub title: Option<String>,
     pub summary: String,
 }
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-pub struct OpenWorkQuery {
-    #[serde(default)]
-    pub offset: usize,
-    #[serde(default)]
-    pub query: Option<String>,
-}
-
-pub type OpenWorkPageQuery = OpenWorkQuery;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GlobalMessageTarget {
@@ -298,17 +285,6 @@ impl GlobalReadService {
     ) -> Result<ResolveGlobalReferenceResponse, AppError> {
         resolve_reference_impl(self, reference).await
     }
-}
-
-pub async fn open_work(
-    State(state): State<AppState>,
-    Query(page): Query<OpenWorkPageQuery>,
-) -> Result<Json<GlobalOpenWorkResponse>, AppError> {
-    let filter = OpenWorkFilter::from_query(page.query.as_deref());
-    let view = GlobalReadService::from_state(&state)
-        .open_work(&filter)
-        .await?;
-    Ok(Json(paginate_open_work(view, page.offset, OPEN_WORK_PAGE)))
 }
 
 pub async fn resolve_reference(

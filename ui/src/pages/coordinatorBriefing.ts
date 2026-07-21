@@ -6,5 +6,4 @@ export const COORDINATOR_QUICK_ACTION: ComposerQuickAction = {
   label: 'Brief me on current work',
   compactLabel: 'Brief me',
   prompt: COORDINATOR_BRIEFING_PROMPT,
-  context: 'Current work context is attached to each Coordinator message.',
 };

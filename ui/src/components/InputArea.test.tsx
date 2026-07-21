@@ -186,7 +186,6 @@ describe('InputArea quick action', () => {
         label: 'Brief me on current work',
         compactLabel: 'Brief me',
         prompt,
-        context: 'Current work context is attached to each Coordinator message.',
       },
     });
 
@@ -195,7 +194,9 @@ describe('InputArea quick action', () => {
     expect(onSend).toHaveBeenCalledOnce();
     expect(onSend).toHaveBeenCalledWith(prompt, [], []);
     expect(screen.getByRole('textbox')).toHaveValue('keep my draft');
-    expect(screen.getByText('Current work context is attached to each Coordinator message.')).toBeInTheDocument();
+    const actionGroup = document.querySelector('.input-inline-actions');
+    expect(actionGroup).toContainElement(screen.getByRole('button', { name: 'Brief me on current work' }));
+    expect(screen.getByRole('button', { name: 'Brief me on current work' })).toHaveTextContent('Brief me');
   });
 });
 

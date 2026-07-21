@@ -29,9 +29,8 @@ export interface InputAreaHandle {
 
 export interface ComposerQuickAction {
   label: string;
-  compactLabel?: string;
+  compactLabel: string;
   prompt: string;
-  context: string;
 }
 
 interface InputAreaProps {
@@ -694,31 +693,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         </div>
       )}
 
-      {quickAction && (
-        <div className="input-context-action">
-          <span className="input-context-note">{quickAction.context}</span>
-          <button
-            type="button"
-            className="input-quick-action"
-            disabled={!acceptsChatMessage || isUploadingFiles || quickActionSending}
-            aria-label={quickAction.label}
-            onClick={async () => {
-              setQuickActionSending(true);
-              try {
-                await onSend(quickAction.prompt, [], []);
-              } finally {
-                setQuickActionSending(false);
-              }
-            }}
-          >
-            <span className="input-quick-action-full">{quickAction.label}</span>
-            <span className="input-quick-action-compact" aria-hidden="true">
-              {quickAction.compactLabel ?? quickAction.label}
-            </span>
-          </button>
-        </div>
-      )}
-
       {convState.type === 'awaiting_continuation' ? (
         <div className="continuation-progress" role="status" aria-live="polite">
           <div className="continuation-progress-header">
@@ -755,6 +729,24 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             onSelect={ir.onSelectionChange}
           />
           <div className="input-inline-actions">
+            {quickAction && (
+              <button
+                type="button"
+                className="input-quick-action"
+                disabled={!acceptsChatMessage || isUploadingFiles || quickActionSending}
+                aria-label={quickAction.label}
+                onClick={async () => {
+                  setQuickActionSending(true);
+                  try {
+                    await onSend(quickAction.prompt, [], []);
+                  } finally {
+                    setQuickActionSending(false);
+                  }
+                }}
+              >
+                {quickAction.compactLabel}
+              </button>
+            )}
             {!agentWorking && voiceSupported && (
               <VoiceRecorder
                 onStart={handleVoiceStart}

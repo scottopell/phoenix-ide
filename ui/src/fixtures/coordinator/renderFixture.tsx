@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import type { Conversation, GlobalOpenWorkResponse, ImageData } from '../../api';
+import type { Conversation, ImageData } from '../../api';
 import { InputArea } from '../../components/InputArea';
 import { MessageList } from '../../components/MessageList';
 import { StateBar } from '../../components/StateBar';
@@ -40,9 +40,6 @@ export function CoordinatorFixture({ scenario }: Props) {
             <CoordinatorPage
               fixtureData={{
                 coordinatorId,
-                openWork: fixtureOpenWork,
-                initialView: scenario.initialView,
-                ...(scenario.fleetError ? { workError: 'projection unavailable' } : {}),
                 conversation: <FixtureConversation working={scenario.working} />,
               }}
             />
@@ -129,36 +126,3 @@ function FixtureConversation({ working }: { working: boolean }) {
     </ConversationContext.Provider>
   );
 }
-
-const fixtureOpenWork: GlobalOpenWorkResponse = {
-  generated_at: '2026-01-01T00:00:00Z',
-  has_more: false,
-  groups: [{
-    project_id: 'phoenix',
-    project_name: 'Phoenix',
-    canonical_path: '/work/phoenix',
-    items: [{
-      id: 'mobile-first-coordinator',
-      source: 'chain',
-      title: 'Restore mobile Coordinator transcript',
-      project_id: 'phoenix',
-      current_conversation_id: 'a27dd240-2fb9-426e-835c-3cc48cd84c24',
-      current_conversation_slug: 'mobile-first-coordinator',
-      root_conversation_id: '86f2ce14-durable-coordinator',
-      root_conversation_slug: 'durable-coordinator',
-      updated_at: '2026-01-01T12:00:00Z',
-      mode: 'WORK',
-      state: 'working',
-      task_id: '44006',
-      task_title: 'Make Coordinator mobile-first',
-      task_status: 'in-progress',
-      branch_name: 'task-44006-mobile-first-coordinator',
-      base_branch: 'main',
-      worktree_path: '/phoenix/worktrees/mobile-first-coordinator',
-      member_count: 2,
-      signals: ['needs action', 'task open'],
-      href: '/c/mobile-first-coordinator',
-      reference: '@work:mobile-first-coordinator',
-    }],
-  }],
-};

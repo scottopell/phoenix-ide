@@ -1,17 +1,3 @@
-.input-context-action {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 6px;
-}
-
-.input-context-note {
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.35;
-}
-
 .input-quick-action {
   flex: 0 0 auto;
   min-height: 34px;
@@ -32,10 +18,6 @@
 
 .input-quick-action:hover:not(:disabled) {
   border-color: var(--accent-blue);
-}
-
-.input-quick-action-compact {
-  display: none;
 }
 
 .continuation-progress {
@@ -209,25 +191,8 @@
 }
 
 @media (width <= 480px) {
-  .input-context-action {
-    align-items: flex-end;
-    gap: 8px;
-  }
-
-  .input-context-note {
-    font-size: 11px;
-  }
-
   .input-quick-action {
     min-height: 44px;
-  }
-
-  .input-quick-action-full {
-    display: none;
-  }
-
-  .input-quick-action-compact {
-    display: inline;
   }
 
   .input-textarea-wrap {

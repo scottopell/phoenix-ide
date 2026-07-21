@@ -22,32 +22,28 @@ runSurfaceCapture({
         transcript: measure('#messages'),
         row: measure('[data-render-unit-key]'),
         input: measure('#input-area'),
+        conversation: measure('.coordinator-conversation'),
+        brief: measure('.input-quick-action'),
+        duplicateHeader: measure('.coordinator-header'),
         mobileNav: measure('.coordinator-mobile-nav'),
-        work: measure('.coordinator-work-pane:not([hidden])'),
-        workItem: measure('.coordinator-item'),
-        retry: measure('.coordinator-work-error button'),
+        work: measure('.coordinator-work-pane'),
         overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
       };
     });
     if (geometry.overflow > 1) {
       throw new Error(`${id}/${viewport.name}: horizontal overflow: ${JSON.stringify(geometry)}`);
     }
-    if (viewport.width <= 1024 && (!geometry.mobileNav || geometry.mobileNav.bottom > viewport.height + 1)) {
-      throw new Error(`${id}/${viewport.name}: mobile navigation is outside the viewport: ${JSON.stringify(geometry)}`);
+    if (geometry.duplicateHeader || geometry.mobileNav || geometry.work) {
+      throw new Error(`${id}/${viewport.name}: obsolete Coordinator chrome is mounted: ${JSON.stringify(geometry)}`);
     }
-    if (viewport.width <= 1024 && geometry.input && geometry.mobileNav && geometry.input.bottom > geometry.mobileNav.top + 1) {
-      throw new Error(`${id}/${viewport.name}: mobile navigation overlaps the composer: ${JSON.stringify(geometry)}`);
+    if (!geometry.conversation || geometry.conversation.height < viewport.height - 1) {
+      throw new Error(`${id}/${viewport.name}: conversation does not fill the viewport: ${JSON.stringify(geometry)}`);
     }
-    if (id.startsWith('conversation-')) {
-      if (!geometry.transcript || geometry.transcript.height <= 0 || !geometry.row || geometry.row.height <= 0 || !geometry.input || geometry.input.height <= 0) {
-        throw new Error(`${id}/${viewport.name}: conversation geometry collapsed: ${JSON.stringify(geometry)}`);
-      }
-    } else if (!geometry.work || geometry.work.height <= 0 || geometry.work.right > viewport.width + 1) {
-      throw new Error(`${id}/${viewport.name}: Work pane geometry collapsed: ${JSON.stringify(geometry)}`);
-    } else if (!id.endsWith('error') && (!geometry.workItem || geometry.workItem.width <= 0)) {
-      throw new Error(`${id}/${viewport.name}: Work item geometry collapsed: ${JSON.stringify(geometry)}`);
-    } else if (id === 'fleet-error' && (!geometry.retry || geometry.retry.height < 32)) {
-      throw new Error(`${id}/${viewport.name}: Work retry is not usable: ${JSON.stringify(geometry)}`);
+    if (!geometry.transcript || geometry.transcript.height <= 0 || !geometry.row || geometry.row.height <= 0 || !geometry.input || geometry.input.height <= 0) {
+      throw new Error(`${id}/${viewport.name}: conversation geometry collapsed: ${JSON.stringify(geometry)}`);
+    }
+    if (!geometry.brief || geometry.brief.height < 32 || geometry.brief.bottom > viewport.height + 1) {
+      throw new Error(`${id}/${viewport.name}: inline Brief me action is not usable: ${JSON.stringify(geometry)}`);
     }
     await page.screenshot({ path: `${outDir}/${id}--${viewport.name}.png`, fullPage: false });
     return true;

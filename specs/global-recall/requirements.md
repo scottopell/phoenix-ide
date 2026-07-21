@@ -28,12 +28,13 @@ The user must be able to answer:
 
 ## Requirements
 
-### REQ-GR-001: Present Deterministic Current Work
+### REQ-GR-001: Provide Deterministic Current Work
+
+WHEN the Coordinator evaluates current Phoenix work
+THE SYSTEM SHALL provide a deterministic projection through its turn-current context and bounded global read tools
 
 WHEN a user opens the Coordinator surface
-THE SYSTEM SHALL present a deterministic projection of current Phoenix work without requiring an LLM request
-
-THE surface SHALL prioritize the normal Coordinator conversation and SHALL provide a smaller utility for current attention and deterministic work finding
+THE surface SHALL present only the normal Coordinator conversation
 
 THE projection SHALL describe current state and SHALL NOT represent an event history, unread inbox, acknowledgement ledger, resolution ledger, or exact delta from a prior observation
 
@@ -156,21 +157,16 @@ THE SYSTEM SHALL return a clear error instead of guessing
 
 ---
 
-### REQ-GR-010: Provide Current Attention and Find Work
+### REQ-GR-010: Keep the Coordinator Surface Chat-Only
 
 WHEN a user opens `/global`
-THE SYSTEM SHALL keep the Coordinator transcript and composer visually dominant
+THE SYSTEM SHALL present only the normal Coordinator transcript, composer, conversation status, and conversation navigation
 
-THE SYSTEM SHALL present a smaller current-attention utility whose items derive solely from current open-work states and signals for questions, approvals, errors, recovery, or other attention needs
+THE SYSTEM SHALL NOT present a separate current-attention pane, open-work list, deterministic work search, or Conversation/Work view selector
 
-THE utility SHALL provide deterministic text filtering over current open work and compact results containing title, project, state, recency, and stable navigation to the owning current conversation
+THE composer SHALL provide a compact action that submits a normal read-only Coordinator message requesting a current-work briefing
 
-THE utility SHALL expose freshness and explicit refresh controls and SHALL refresh on page entry, window focus, and completion of a Coordinator turn without timer polling
-
-WHEN a user selects an attention or find-work result
-THE SYSTEM SHALL navigate to the owning conversation where native question, approval, retry, cancellation, and error controls remain authoritative
-
-THE utility SHALL NOT reproduce those controls or persist read, seen, acknowledgement, dismissal, resolution, or outcome history
+THE briefing action SHALL preserve the user's draft and SHALL NOT create a separate message, streaming, persistence, or cancellation path
 
 ---
 

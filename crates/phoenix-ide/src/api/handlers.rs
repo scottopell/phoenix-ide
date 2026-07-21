@@ -116,7 +116,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/preview/*filepath", get(serve_preview_file))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
-        .route("/api/global/open-work", get(global_read::open_work))
         .route(
             "/api/global/coordinator",
             get(get_existing_coordinator).post(ensure_coordinator),

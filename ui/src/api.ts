@@ -944,45 +944,6 @@ export interface LlmLanguageCatalogEntry {
   prompts: LlmLanguagePrompts;
 }
 
-export type GlobalOpenWorkSource = 'chain' | 'conversation';
-
-export interface GlobalOpenWorkItem {
-  id: string;
-  source: GlobalOpenWorkSource;
-  title: string;
-  project_id: string | null;
-  current_conversation_id: string;
-  current_conversation_slug: string | null;
-  root_conversation_id: string;
-  root_conversation_slug: string | null;
-  updated_at: string;
-  mode: string;
-  state: string;
-  task_id: string | null;
-  task_title: string | null;
-  task_status: string | null;
-  branch_name: string | null;
-  base_branch: string | null;
-  worktree_path: string | null;
-  member_count: number;
-  signals: string[];
-  href: string;
-  reference: string;
-}
-
-export interface GlobalOpenWorkProject {
-  project_id: string | null;
-  project_name: string;
-  canonical_path: string | null;
-  items: GlobalOpenWorkItem[];
-}
-
-export interface GlobalOpenWorkResponse {
-  generated_at: string;
-  groups: GlobalOpenWorkProject[];
-  has_more: boolean;
-}
-
 export interface GlobalCoordinatorResponse {
   conversation: Conversation;
 }
@@ -1322,14 +1283,6 @@ export const api = {
       body: JSON.stringify(settings),
     });
     if (!resp.ok) throw new Error('Failed to save notification settings');
-    return resp.json();
-  },
-
-  async getGlobalOpenWork(offset = 0, query = ''): Promise<GlobalOpenWorkResponse> {
-    const params = new URLSearchParams({ offset: String(offset) });
-    if (query) params.set('query', query);
-    const resp = await fetch(`/api/global/open-work?${params.toString()}`);
-    if (!resp.ok) throw new Error('Failed to load Global Open Work');
     return resp.json();
   },
 
