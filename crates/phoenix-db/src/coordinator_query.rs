@@ -19,7 +19,6 @@ const ALLOWED_SCHEMA: &[&str] = &[
     "fork_proposals",
     "message_files",
     "message_images",
-    "messages",
     "projects",
     "steering_messages",
     "sub_agent_personas",
@@ -57,9 +56,15 @@ const ALLOWED_SCHEMA: &[&str] = &[
 const DENIED_COLUMNS: &[(&str, &str)] = &[
     ("conversation_creation_jobs", "claim_token"),
     ("conversation_creation_jobs", "cleanup_token"),
+    ("message_images", "data"),
     ("wake_bindings", "tmux_server_token"),
     ("wake_terminal_receipts", "tmux_server_token"),
     ("workflow_external_acceptance_bindings", "idempotency_key"),
+    ("workflow_external_acceptance_bindings", "receipt_handle"),
+    (
+        "workflow_external_acceptance_bindings",
+        "disposition_handle",
+    ),
 ];
 
 const DENIED_TABLES: &[&str] = &[
@@ -488,7 +493,7 @@ mod tests {
         let path = dir.path().join("query.db");
         let db = rusqlite_for_test(&path);
         db.execute_batch(
-            "CREATE TABLE conversations(id TEXT, state TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             CREATE TABLE workflow_external_acceptance_bindings(id TEXT, idempotency_key TEXT, status TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_executing\"}', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
+            "CREATE TABLE conversations(id TEXT, state TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             CREATE TABLE workflow_external_acceptance_bindings(id TEXT, idempotency_key TEXT, receipt_handle BLOB, disposition_handle BLOB, status TEXT);\n             CREATE TABLE messages(message_id TEXT, content TEXT, display_data TEXT);\n             CREATE TABLE message_images(message_id TEXT, ordinal INTEGER, media_type TEXT, data TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_executing\"}', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
         )
         .unwrap();
         (dir, path)
@@ -560,6 +565,10 @@ mod tests {
             "SELECT * FROM future_secret_store",
             "SELECT claim_token FROM conversation_creation_jobs",
             "SELECT idempotency_key FROM workflow_external_acceptance_bindings",
+            "SELECT CAST(receipt_handle AS TEXT) FROM workflow_external_acceptance_bindings",
+            "SELECT CAST(disposition_handle AS TEXT) FROM workflow_external_acceptance_bindings",
+            "SELECT content FROM messages",
+            "SELECT data FROM message_images",
             "UPDATE conversations SET id = 'changed'",
             "ATTACH DATABASE '/tmp/other.db' AS other",
             "PRAGMA query_only",
@@ -581,12 +590,13 @@ mod tests {
     #[test]
     fn allows_non_secret_columns_in_partially_sensitive_tables() {
         let (_dir, path) = fixture();
-        let result = execute_coordinator_query(
-            path.to_str().unwrap(),
+        for sql in [
             "SELECT status FROM conversation_creation_jobs",
-        )
-        .unwrap();
-        assert_eq!(result.columns, ["status"]);
+            "SELECT status FROM workflow_external_acceptance_bindings",
+            "SELECT media_type FROM message_images",
+        ] {
+            execute_coordinator_query(path.to_str().unwrap(), sql).unwrap();
+        }
     }
 
     #[test]
