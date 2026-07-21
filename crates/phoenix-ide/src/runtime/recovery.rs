@@ -37,6 +37,8 @@ pub enum RecoveryReason {
     InterruptedMidTurn,
     /// Too many consecutive auto-continue restarts (liveness bound)
     RestartLoopDetected,
+    /// Durable wake work is still owed; the wake worker owns resumption.
+    WakeDeliveryPending,
 }
 
 /// Sentinel text embedded in the system message injected on auto-continue.
@@ -63,6 +65,17 @@ impl RecoveryDecision {
             needs_auto_continue: true,
             reason: RecoveryReason::InterruptedMidTurn,
         }
+    }
+}
+
+pub fn suppress_auto_continue_for_owed_wake(
+    decision: RecoveryDecision,
+    has_owed_wake_work: bool,
+) -> RecoveryDecision {
+    if has_owed_wake_work && decision.needs_auto_continue {
+        RecoveryDecision::idle(RecoveryReason::WakeDeliveryPending)
+    } else {
+        decision
     }
 }
 
@@ -971,10 +984,33 @@ mod proptests {
                 RecoveryReason::InterruptedMidTurn => {
                     prop_assert!(decision.needs_auto_continue);
                 }
-                RecoveryReason::RestartLoopDetected => {
+                RecoveryReason::RestartLoopDetected | RecoveryReason::WakeDeliveryPending => {
                     prop_assert!(!decision.needs_auto_continue);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod owed_wake_tests {
+    use super::*;
+
+    #[test]
+    fn owed_wake_work_suppresses_restart_auto_continue() {
+        let decision =
+            suppress_auto_continue_for_owed_wake(RecoveryDecision::auto_continue(), true);
+        assert_eq!(decision.state, ConvState::Idle);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::WakeDeliveryPending);
+    }
+
+    #[test]
+    fn no_owed_wake_preserves_restart_auto_continue() {
+        let decision = RecoveryDecision::auto_continue();
+        assert_eq!(
+            suppress_auto_continue_for_owed_wake(decision.clone(), false),
+            decision
+        );
     }
 }

@@ -48,8 +48,8 @@ Today three tools spawn potentially-long work:
 The subagent path proves the runtime *can* resume a conversation on an
 external signal. Wake contracts generalize only that terminal-wait capability in
 v1: a conversation registers a wait on a bash, tmux, or sub-agent handle, returns
-to Idle, and receives a synthetic tool result when the handle reaches a terminal,
-expired, cancelled, or forgotten outcome.
+to Idle, and receives a durable runtime observation when the handle reaches a
+terminal, expired, cancelled, or forgotten outcome.
 
 **No new conversation state.** Wake contracts do *not* introduce an
 `AwaitingWake` conv state. The conversation stays in `Idle` (or
@@ -74,7 +74,7 @@ outcome* — its durability does not depend on the underlying handle's durabilit
 
 **Scope:** wake contracts are conversation-scoped, not WorkScope-scoped.
 A contract belongs to the conversation that registered it; resolution
-delivers a synthetic tool result into that conversation. The handles a
+delivers a durable runtime observation into that conversation. The handles a
 contract can watch fall into two keying classes. Bash and tmux handles
 are WorkScope-keyed: when a conversation continues into a successor that
 inherits the same WorkScope, the underlying handle transfers to the
@@ -258,18 +258,18 @@ would create a parallel scheduler inside the handle-wake plane.
 ### REQ-WAKE-006: Wake Event Delivery
 
 WHEN a contract fires
-THE SYSTEM SHALL deliver to the conversation a synthetic tool result
-shaped as the tool result the equivalent successful synchronous wait would have
-returned, but wake delivery SHALL enter the conversation only through the durable
-observation / owed-acceptance path rather than an immediate direct-to-LLM wake-up.
+THE SYSTEM SHALL deliver to the conversation a durable runtime observation shaped
+as the result the equivalent successful synchronous wait would have returned, and
+wake delivery SHALL enter the conversation only through the durable observation /
+owed-acceptance path rather than an immediate direct-to-LLM wake-up.
 
-For `HandleTerminal/Bash`, the tool result MUST carry the handle's terminal
+For `HandleTerminal/Bash`, the observation MUST carry the handle's terminal
 status (`exited` / `killed` / `kill_pending_kernel` / `forgotten` and any other
 status exposed by `bash op=wait`), `exit_code`, `duration_ms`, and a final tail
 window per REQ-BASH-004. The final tail is reconstructed from normalized
 wake-tail child rows, not from `terminal_payload`.
 
-For `HandleTerminal/TmuxPane`, the delivered tool result MUST identify the
+For `HandleTerminal/TmuxPane`, the delivered observation MUST identify the
 watched `window_id` from the contract's `handle_id` and carry terminal status,
 exit information when available, and a final captured tail window equivalent to
 the information the LLM would gather by inspecting the window after exit. The
@@ -278,20 +278,23 @@ an empty list, not an absent field. Persisted captured tail lines live in
 normalized wake-tail child rows. The persisted terminal payload body MUST NOT
 repeat `window_id`; replay derives the delivered identity from the contract row.
 
-For `HandleTerminal/SubAgent`, the delivered tool result MUST identify the child
+For `HandleTerminal/SubAgent`, the delivered observation MUST identify the child
 conversation / agent id from the contract's `handle_id` and carry the spawned
 task text, an optional label, and the structured sub-agent terminal payload
 defined by REQ-WAKE-017. The persisted terminal payload body MUST NOT repeat the
 handle identity and MUST NOT persist separate agent-id and conversation-id fields
 for the same handle identity.
 
-THE delivered tool result SHALL be addressable back to the original
-tool call that registered the contract (via `tool_use_id`)
+THE delivered observation SHALL carry the registration `contract_id` and SHALL
+retain the original registering `tool_use_id` in durable wake bookkeeping for
+audit and UI correlation without emitting a delayed tool result into provider
+history.
 
-**Rationale:** Pit-of-success: the LLM sees the same shape whether it
-synchronously waited or registered a wake contract. The decision between the two
-is "should I block this turn or not"; the response shape is the same whenever a
-synchronous analogue exists. Sub-agent waits have no existing synchronous
+**Rationale:** Pit-of-success: the LLM sees the same terminal payload shape whether
+it synchronously waited or registered a wake contract, while the immediate
+registration receipt keeps provider history valid. The decision between the two
+is "should I block this turn or not"; the terminal response shape is the same
+whenever a synchronous analogue exists. Sub-agent waits have no existing synchronous
 `op=wait` tool, so REQ-WAKE-017 defines the equivalent terminal payload.
 
 ---

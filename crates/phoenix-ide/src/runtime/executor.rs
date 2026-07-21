@@ -2567,7 +2567,7 @@ where
     ///
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
     /// are logged and discarded — state unchanged.
-    async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+    async fn process_outcome(&mut self, mut outcome: EffectOutcome) -> Result<(), String> {
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
         // is the live timer firing. Its task has run to completion, leaving the
@@ -2578,6 +2578,41 @@ where
         // from the generation match, not from this handle bookkeeping.
         if matches!(outcome, EffectOutcome::RetryTimeout { .. }) {
             self.retry_timer_handle = None;
+        }
+
+        if let (
+            ConvState::CancellingTool { tool_use_id, .. },
+            EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark {
+                result,
+                registration,
+            }),
+        ) = (&self.state, &outcome)
+        {
+            if &result.tool_use_id == tool_use_id {
+                let registrar = self
+                    .wake_registrar
+                    .as_ref()
+                    .ok_or_else(|| "parked wake completed without a wake registrar".to_string())?;
+                let timestamp = phoenix_workflow::types::Timestamp(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                );
+                registrar
+                    .cancel(crate::tools::CancelWakeInput {
+                        workflow_id: phoenix_workflow::types::WorkflowId(registration.workflow_id),
+                        timestamp,
+                        reason:
+                            phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+                    })
+                    .await?;
+                if let EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark { result, .. }) =
+                    outcome
+                {
+                    outcome = EffectOutcome::Tool(ToolExecOutcome::Completed(result));
+                }
+            }
         }
 
         refresh_commission_review_approval_for_outcome(&mut self.context, &outcome);
@@ -10563,6 +10598,7 @@ mod steer_drain_detector_tests {
                 mode: SubAgentMode::Work,
             }],
             completed_results: vec![],
+            park_after_tool_round: false,
             spawn_tool_id: None,
         }
     }
@@ -10978,6 +11014,7 @@ mod steer_drain_detector_tests {
                 mode: SubAgentMode::Work,
             }],
             completed_results: vec![],
+            park_after_tool_round: false,
             spawn_tool_id: None,
         }
     }

@@ -1630,6 +1630,7 @@ proptest! {
     let mut state = ConvState::AwaitingSubAgents {
         pending: initial_pending,
         completed_results: vec![],
+        park_after_tool_round: false,
         spawn_tool_id: None,
     };
 
@@ -1679,6 +1680,7 @@ proptest! {
     let mut state = ConvState::AwaitingSubAgents {
         pending: initial_pending,
         completed_results: vec![],
+        park_after_tool_round: false,
         spawn_tool_id: None,
     };
     let mut prev_pending = initial_ids.len();
@@ -1712,6 +1714,7 @@ proptest! {
     let state = ConvState::AwaitingSubAgents {
         pending,
         completed_results: vec![],
+        park_after_tool_round: false,
         spawn_tool_id: None,
     };
 
@@ -1738,6 +1741,7 @@ proptest! {
     let mut state = ConvState::AwaitingSubAgents {
         pending,
         completed_results: vec![],
+        park_after_tool_round: false,
         spawn_tool_id: None,
     };
 
@@ -1772,6 +1776,7 @@ proptest! {
     let state = ConvState::AwaitingSubAgents {
         pending: pending.clone(),
         completed_results: vec![],
+        park_after_tool_round: false,
         spawn_tool_id: None,
     };
 

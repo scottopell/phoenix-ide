@@ -3163,6 +3163,7 @@ mod tests {
                 },
             ],
             completed_results: vec![],
+            park_after_tool_round: false,
             spawn_tool_id: None,
         };
         let one = ConvState::AwaitingSubAgents {
@@ -3172,6 +3173,7 @@ mod tests {
                 mode: SubAgentMode::Work,
             }],
             completed_results: vec![],
+            park_after_tool_round: false,
             spawn_tool_id: None,
         };
 

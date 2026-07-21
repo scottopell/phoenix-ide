@@ -1060,6 +1060,7 @@ fn handle_core_tool_complete(
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: pending_sub_agents.clone(),
                 completed_results: vec![],
+                park_after_tool_round: *park_after_tool_round || event_requests_park,
                 spawn_tool_id: None,
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -1114,6 +1115,7 @@ fn handle_core_tool_complete(
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: all_pending.clone(),
                 completed_results: vec![],
+                park_after_tool_round: *park_after_tool_round,
                 spawn_tool_id: Some(spawn_id),
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -1156,6 +1158,7 @@ fn handle_core_cancellation(
             CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round: _,
                 spawn_tool_id,
             },
             CoreEvent::UserCancel { cause, .. },
@@ -1378,6 +1381,7 @@ fn handle_core_sub_agents(
             CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round,
                 spawn_tool_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
@@ -1404,6 +1408,7 @@ fn handle_core_sub_agents(
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: new_pending,
                 completed_results: new_results,
+                park_after_tool_round: *park_after_tool_round,
                 spawn_tool_id: spawn_tool_id.clone(),
             })
             .with_effect(Effect::PersistState)
@@ -1415,6 +1420,7 @@ fn handle_core_sub_agents(
             CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round,
                 spawn_tool_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
@@ -1431,16 +1437,22 @@ fn handle_core_sub_agents(
                 outcome,
             });
 
-            Ok(
-                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                    .with_effect(Effect::PersistSubAgentResults {
-                        results: new_results,
-                        spawn_tool_id: spawn_tool_id.clone(),
-                    })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm),
-            )
+            let result = CoreTransitionResult::new(if *park_after_tool_round {
+                CoreState::Idle
+            } else {
+                CoreState::LlmRequesting { attempt: 1 }
+            })
+            .with_effect(Effect::PersistSubAgentResults {
+                results: new_results,
+                spawn_tool_id: spawn_tool_id.clone(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change());
+            Ok(if *park_after_tool_round {
+                result.with_effect(Effect::NotifyAgentDone)
+            } else {
+                result.with_effect(Effect::RequestLlm)
+            })
         }
 
         // CancellingSubAgents + SubAgentResult (more pending)
@@ -5378,6 +5390,82 @@ mod tests {
     }
 
     #[test]
+    fn tool_complete_and_park_survives_sub_agent_fan_in() {
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::{
+            db_schema::ToolResult,
+            llm_types::ContentBlock,
+            sm_state::{PendingSubAgent, SubAgentOutcome},
+        };
+
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::tool_use(
+                "tool-1",
+                "bash",
+                serde_json::json!({"op": "run", "cmd": "echo park"}),
+            )],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "tool-1",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    "echo park",
+                )),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            park_after_tool_round: false,
+            pending_sub_agents: vec![PendingSubAgent {
+                agent_id: "agent-1".to_string(),
+                task: "finish".to_string(),
+                mode: phoenix_core::domain::sm_state::SubAgentMode::Explore,
+            }],
+            assistant_message,
+        };
+
+        let awaiting = transition(
+            &state,
+            &test_context(),
+            Event::ToolCompleteAndPark {
+                tool_use_id: "tool-1".to_string(),
+                result: ToolResult::success("tool-1".to_string(), "done".to_string()),
+            },
+        )
+        .expect("parking completion should enter fan-in");
+        assert!(matches!(
+            awaiting.new_state,
+            ConvState::AwaitingSubAgents {
+                park_after_tool_round: true,
+                ..
+            }
+        ));
+
+        let completed = transition(
+            &awaiting.new_state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "agent-1".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "finished".to_string(),
+                },
+            },
+        )
+        .expect("last fan-in result should honor park");
+        assert!(matches!(completed.new_state, ConvState::Idle));
+        assert!(completed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyAgentDone)));
+        assert!(!completed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
     fn tool_complete_and_park_accumulates_across_serial_siblings() {
         use crate::state::{AssistantMessage, ToolCall, ToolInput};
         use phoenix_core::domain::{db_schema::ToolResult, llm_types::ContentBlock};
@@ -7927,6 +8015,7 @@ mod teardown_tests {
         let state = ConvState::AwaitingSubAgents {
             pending: vec![pending("a"), pending("b")],
             completed_results: vec![],
+            park_after_tool_round: false,
             spawn_tool_id: None,
         };
         let result = transition(
@@ -7989,6 +8078,7 @@ mod teardown_tests {
         let awaiting = ConvState::AwaitingSubAgents {
             pending: vec![pending("a")],
             completed_results: vec![],
+            park_after_tool_round: false,
             spawn_tool_id: None,
         };
         let cancelling = transition(

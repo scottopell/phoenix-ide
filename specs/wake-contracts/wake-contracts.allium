@@ -243,9 +243,9 @@ entity Contract {
     -- When the agent registered the contract.
     registered_at: Timestamp
 
-    -- Tool call id of the registering tool invocation. The delivered
-    -- synthetic tool result MUST carry this id so the LLM's
-    -- conversation history threads correctly.
+    -- Tool call id of the registering tool invocation. Durable wake
+    -- bookkeeping retains this id for audit and UI correlation; provider
+    -- history receives an immediate registration receipt, not a delayed result.
     registering_tool_use_id: String
 
     -- Lifecycle status. Set to terminal exactly once.
@@ -441,7 +441,7 @@ rule WakeRouterFiresOnConditionHold {
         -- WakeRouterForgetsMissingSubAgentHandle and resolves with cause = forgotten.
         -- Each terminal observation is durable independently. Observations that
         -- commit before the next runtime acceptance are delivered as one bounded,
-        -- committed-order batch of normal tool results. Siblings remain pending
+        -- committed-order batch of durable runtime observations. Siblings remain pending
         -- unless they independently terminalize or are explicitly cancelled.
 }
 
@@ -459,7 +459,7 @@ rule WakeRouterForgetsMissingSubAgentHandle {
     let payload = FirePayload(cause: forgotten, forgotten_reason: subagent_handle_missing)
 
     ensures: ContractTransitionsToTerminal(contract, forgotten, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
+    ensures: WakeTerminalObservationQueued(
         conversation:   contract.conversation,
         tool_use_id:    contract.registering_tool_use_id,
         payload:        payload
@@ -483,7 +483,7 @@ rule WakeRouterForgetsMissingTmuxHandle {
     let payload = FirePayload(cause: forgotten, forgotten_reason: tmux_handle_missing)
 
     ensures: ContractTransitionsToTerminal(contract, forgotten, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
+    ensures: WakeTerminalObservationQueued(
         conversation:   contract.conversation,
         tool_use_id:    contract.registering_tool_use_id,
         payload:        payload
@@ -505,7 +505,7 @@ rule WakeRouterFiresOnExpiry {
     let payload = FirePayload(cause: expired)
 
     ensures: ContractTransitionsToTerminal(contract, expired, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
+    ensures: WakeTerminalObservationQueued(
         conversation:   contract.conversation,
         tool_use_id:    contract.registering_tool_use_id,
         payload:        payload
@@ -530,7 +530,7 @@ rule UserCancelsContract {
     let payload = FirePayload(cause: cancelled)
 
     ensures: ContractTransitionsToTerminal(contract_id, cancelled, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
+    ensures: WakeTerminalObservationQueued(
         conversation:   Contract{id: contract_id}.conversation,
         tool_use_id:    Contract{id: contract_id}.registering_tool_use_id,
         payload:        payload
@@ -653,7 +653,7 @@ rule PhoenixStartupResyncsContracts {
         -- durable handle state. The router must deliver exactly one accountable
         -- outcome for every accepted contract. Terminal startup branches use
         -- ContractTransitionsToTerminalAndQueuesDelivery so a restart-resolved
-        -- contract still appends the synthetic tool result and triggers the parent
+        -- contract still appends the durable runtime observation and triggers the parent
         -- LLM turn on first load. A sub-agent child is read before forgetting the
         -- contract; if tmux or a child sub-agent persisted terminal evidence
         -- before the deadline, the wake delivers that tagged terminal payload even

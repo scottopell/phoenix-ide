@@ -847,6 +847,7 @@ mod tests {
             ConvState::AwaitingSubAgents {
                 pending: vec![],
                 completed_results: vec![],
+                park_after_tool_round: false,
                 spawn_tool_id: None,
             },
             ConvState::CancellingSubAgents {
@@ -1170,6 +1171,8 @@ pub enum ConvState {
         /// Sub-agents still running (id + task co-located)
         pending: Vec<PendingSubAgent>,
         completed_results: Vec<SubAgentResult>,
+        /// Whether the completed tool round requested parking after fan-in.
+        park_after_tool_round: bool,
         /// `tool_use_id` of the `spawn_agents` call (to update `display_data` when done)
         spawn_tool_id: Option<String>,
     },
@@ -1330,6 +1333,7 @@ pub enum CoreState {
     AwaitingSubAgents {
         pending: Vec<PendingSubAgent>,
         completed_results: Vec<SubAgentResult>,
+        park_after_tool_round: bool,
         spawn_tool_id: Option<String>,
     },
     CancellingSubAgents {
@@ -1510,10 +1514,12 @@ impl From<CoreState> for ConvState {
             CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round,
                 spawn_tool_id,
             } => ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round,
                 spawn_tool_id,
             },
             CoreState::CancellingSubAgents {
@@ -1609,10 +1615,12 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round,
                 spawn_tool_id,
             } => Ok(ParentState::Core(CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round,
                 spawn_tool_id,
             })),
             ConvState::CancellingSubAgents {
@@ -1745,10 +1753,12 @@ impl TryFrom<ConvState> for SubAgentState {
             ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round,
                 spawn_tool_id,
             } => Ok(SubAgentState::Core(CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
+                park_after_tool_round,
                 spawn_tool_id,
             })),
             ConvState::CancellingSubAgents {

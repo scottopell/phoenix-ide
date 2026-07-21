@@ -6843,7 +6843,7 @@ impl Database {
         .await?;
 
         for (conv_id, state_json) in conv_rows {
-            let state: ConvState = match serde_json::from_str(&state_json) {
+            let state: ConvState = match deserialize_in_flight_round(&state_json) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(
@@ -8835,6 +8835,16 @@ struct NormalizedRound {
 /// state — the materialization caller filters to these two states via SQL, so
 /// `None` is unreachable there, but keeping this total (rather than panicking)
 /// means a future caller can't trip an `unwrap`.
+fn deserialize_in_flight_round(state_json: &str) -> serde_json::Result<ConvState> {
+    let mut value: serde_json::Value = serde_json::from_str(state_json)?;
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("tool_executing")
+        && value.get("park_after_tool_round").is_none()
+    {
+        value["park_after_tool_round"] = serde_json::Value::Bool(false);
+    }
+    serde_json::from_value(value)
+}
+
 fn normalize_in_flight_round(
     state: phoenix_core::domain::sm_state::ConvState,
 ) -> Option<NormalizedRound> {
@@ -13536,6 +13546,14 @@ mod tests {
         db.update_conversation_state("conv-1", &state)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE conversations
+             SET state = json_remove(state, '$.park_after_tool_round')
+             WHERE id = 'conv-1'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         // Only the user message is in `messages` so far.
         assert_eq!(db.get_messages("conv-1").await.unwrap().len(), 1);
