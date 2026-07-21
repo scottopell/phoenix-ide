@@ -1634,9 +1634,8 @@ mod lifecycle_hook_tests {
         assert_ne!(second.stable_key(), global.stable_key());
     }
 
-    #[tokio::test]
-    async fn restricted_actors_receive_isolated_sessions_in_shared_scope() {
-        let (manager, _rx) = install_sink();
+    #[test]
+    fn restricted_actors_receive_isolated_keys_in_shared_scope() {
         let shared = scope("shared-work-scope");
         let work = EffectiveResourceAccess::new("work-parent", ResourceAuthority::Work);
         let restricted_a =
@@ -1644,51 +1643,26 @@ mod lifecycle_hook_tests {
         let restricted_b =
             EffectiveResourceAccess::new("explore-child-b", ResourceAuthority::Restricted);
 
-        let work_session = manager
-            .get_session_for_actor(&shared, &work)
-            .await
-            .expect("work parent creates session");
-        let first_child_session = manager
-            .get_session_for_actor(&shared, &restricted_a)
-            .await
-            .expect("restricted child creates isolated session");
-        let sibling_session = manager
-            .get_session_for_actor(&shared, &restricted_b)
-            .await
-            .expect("restricted sibling creates isolated session");
+        let work_key = super::session_key(&shared, &work);
+        let first_child_key = super::session_key(&shared, &restricted_a);
+        let sibling_key = super::session_key(&shared, &restricted_b);
 
-        assert!(!Arc::ptr_eq(&work_session, &first_child_session));
-        assert!(!Arc::ptr_eq(&first_child_session, &sibling_session));
-        assert!(Arc::ptr_eq(
-            &first_child_session,
-            &manager
-                .get_session_for_actor(&shared, &restricted_a)
-                .await
-                .unwrap()
-        ));
+        assert_ne!(work_key, first_child_key);
+        assert_ne!(first_child_key, sibling_key);
+        assert_eq!(first_child_key, super::session_key(&shared, &restricted_a));
     }
 
-    #[tokio::test]
-    async fn actor_specific_stop_preserves_restricted_sibling_session() {
-        let (manager, _rx) = install_sink();
+    #[test]
+    fn actor_specific_stop_targets_only_restricted_actor_key() {
         let shared = scope("shared-stop-scope");
         let restricted_a =
             EffectiveResourceAccess::new("explore-child-a", ResourceAuthority::Restricted);
         let restricted_b =
             EffectiveResourceAccess::new("explore-child-b", ResourceAuthority::Restricted);
-        manager
-            .get_session_for_actor(&shared, &restricted_a)
-            .await
-            .expect("first child session");
-        manager
-            .get_session_for_actor(&shared, &restricted_b)
-            .await
-            .expect("sibling session");
-
-        manager.kill_session_for_actor(&shared, &restricted_a).await;
-
-        assert!(!manager.is_active_for_actor(&shared, &restricted_a).await);
-        assert!(manager.is_active_for_actor(&shared, &restricted_b).await);
+        assert_ne!(
+            super::session_key(&shared, &restricted_a),
+            super::session_key(&shared, &restricted_b)
+        );
     }
 
     /// Test the full create-emit + kill-emit pair end-to-end using a

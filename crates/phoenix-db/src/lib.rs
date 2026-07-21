@@ -1107,6 +1107,43 @@ impl Database {
         Ok(exists != 0)
     }
 
+    async fn conversation_retirement_blocker(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        scope_id: &WorkScopeId,
+    ) -> DbResult<Option<WorkScopeRetirementBlocker>> {
+        let owners = sqlx::query(
+            "SELECT runtime_role, state, continued_in_conv_id
+             FROM conversations
+             WHERE work_scope_id = ?1 AND archived = 0",
+        )
+        .bind(scope_id.as_str())
+        .fetch_all(&mut **tx)
+        .await?;
+        for owner in owners {
+            let role_value: String = owner.try_get("runtime_role")?;
+            let runtime_role = RuntimeRole::from_db_str(&role_value).ok_or_else(|| {
+                DbError::Serialization(format!("unknown runtime role {role_value}"))
+            })?;
+            let state: ConvState = serde_json::from_str(&owner.try_get::<String, _>("state")?)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let continued_in_conv_id: Option<String> = owner.try_get("continued_in_conv_id")?;
+            match runtime_role {
+                RuntimeRole::User
+                    if !state.is_terminal()
+                        || (matches!(state, ConvState::ContextExhausted { .. })
+                            && continued_in_conv_id.is_none()) =>
+                {
+                    return Ok(Some(WorkScopeRetirementBlocker::CurrentUserOwner));
+                }
+                RuntimeRole::SubAgent if !state.is_terminal() => {
+                    return Ok(Some(WorkScopeRetirementBlocker::ActiveSubAgent));
+                }
+                RuntimeRole::User | RuntimeRole::SubAgent | RuntimeRole::Coordinator => {}
+            }
+        }
+        Ok(None)
+    }
+
     /// Retire a scope only when both runtime and durable ownership inventories
     /// prove that no obligation remains. Conversation history and scope-owned
     /// observations are preserved; retirement changes lifecycle only.
@@ -1136,19 +1173,12 @@ impl Database {
             return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
         }
 
+        if let Some(blocker) = Self::conversation_retirement_blocker(&mut tx, scope_id).await? {
+            tx.rollback().await?;
+            return Ok(WorkScopeRetirementOutcome::Blocked(blocker));
+        }
+
         let blockers = [
-            (
-                WorkScopeRetirementBlocker::CurrentUserOwner,
-                "SELECT EXISTS(
-                    SELECT 1 FROM conversations c
-                    WHERE c.work_scope_id = ?1 AND c.runtime_role = 'user' AND c.archived = 0
-                      AND (
-                        json_extract(c.state, '$.type') NOT IN
-                          ('completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal', 'context_exhausted')
-                        OR (json_extract(c.state, '$.type') = 'context_exhausted' AND c.continued_in_conv_id IS NULL)
-                      )
-                 )",
-            ),
             (
                 WorkScopeRetirementBlocker::UserSuccessor,
                 "SELECT EXISTS(
@@ -1156,15 +1186,6 @@ impl Database {
                     JOIN conversations predecessor ON predecessor.continued_in_conv_id = successor.id
                     WHERE successor.work_scope_id = ?1 AND successor.runtime_role = 'user'
                       AND successor.archived = 0
-                 )",
-            ),
-            (
-                WorkScopeRetirementBlocker::ActiveSubAgent,
-                "SELECT EXISTS(
-                    SELECT 1 FROM conversations c
-                    WHERE c.work_scope_id = ?1 AND c.runtime_role = 'sub_agent' AND c.archived = 0
-                      AND json_extract(c.state, '$.type') NOT IN
-                        ('completed', 'failed', 'handed_off', 'creation_failed', 'creation_cancelled', 'terminal', 'context_exhausted')
                  )",
             ),
             (

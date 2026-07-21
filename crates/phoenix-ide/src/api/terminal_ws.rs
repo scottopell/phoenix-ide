@@ -60,12 +60,10 @@ pub async fn terminal_ws_handler(
                     );
                     return;
                 }
-                if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent
-                    && matches!(conv.conv_mode, ConvMode::Explore { .. })
-                {
+                if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent {
                     tracing::warn!(
                         conv_id = %conversation_id,
-                        "Terminal: restricted sub-agent denied conversation terminal access"
+                        "Terminal: sub-agent denied conversation terminal access"
                     );
                     return;
                 }
