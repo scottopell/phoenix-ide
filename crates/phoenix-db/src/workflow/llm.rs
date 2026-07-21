@@ -143,6 +143,13 @@ pub struct PreparedTopLevelLlmAttempt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordTopLevelLlmFailureInput {
+    pub authority: LocalAttemptAuthority,
+    pub observed_at: Timestamp,
+    pub outcome_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoverTopLevelLlmAttempt {
     pub workflow: TopLevelLlmWorkflowRecord,
     pub prepared_request: TopLevelLlmPreparedRequestRecord,
@@ -571,6 +578,47 @@ impl WorkflowRepository {
         input: &BeginAttemptInput,
     ) -> DbResult<BeginAttemptResult> {
         self.begin_attempt(input).await
+    }
+
+    pub async fn record_top_level_llm_failure(
+        &self,
+        input: &RecordTopLevelLlmFailureInput,
+    ) -> DbResult<AuthorityOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let observation_id = tx
+            .allocate_sequence_value(
+                input.authority.workflow_id,
+                WorkflowSequenceName::Observation,
+            )
+            .await?;
+        let result = tx
+            .record_observation(&super::RecordObservationInput {
+                authority: input.authority.clone(),
+                observation_id,
+                now: input.observed_at,
+                observed_at: input.observed_at,
+                observation_codec: LocalCodec {
+                    family: "llm.failure".to_string(),
+                    version: 1,
+                },
+                observation_payload: input.outcome_payload.clone(),
+            })
+            .await?;
+        if result.outcome == AuthorityOutcome::Authorized {
+            sqlx::query(
+                "UPDATE workflow_attempts SET status = 'ReceiptAccepted'
+                 WHERE workflow_id = ?1 AND attempt_id = ?2
+                   AND status = 'ObservationRecorded'",
+            )
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(result.outcome)
     }
 
     pub async fn recover_top_level_llm_attempts(&self) -> DbResult<Vec<RecoverTopLevelLlmAttempt>> {
@@ -1672,13 +1720,21 @@ mod tests {
         assert_eq!(prepared.prepared_request.effect_id, EffectId(1));
         assert_eq!(prepared.prepared_request.call_ordinal, 0);
         assert_eq!(prepared.authority.attempt_id, AttemptId(1));
-        let recovered = repo.recover_top_level_llm_attempts().await.unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].attempt.authority.attempt_id, AttemptId(1));
         assert_eq!(
-            recovered[0].prepared_request.request_fingerprint,
-            "request-fp"
+            repo.record_top_level_llm_failure(&RecordTopLevelLlmFailureInput {
+                authority: prepared.authority,
+                observed_at: Timestamp(3),
+                outcome_payload: b"network error".to_vec(),
+            })
+            .await
+            .unwrap(),
+            AuthorityOutcome::Authorized
         );
+        assert!(repo
+            .recover_top_level_llm_attempts()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

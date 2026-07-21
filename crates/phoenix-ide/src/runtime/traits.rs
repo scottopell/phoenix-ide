@@ -99,6 +99,13 @@ pub trait MessageStore: Send + Sync {
         Err("durable top-level LLM attempts are unsupported by this storage".to_string())
     }
 
+    async fn record_top_level_llm_failure(
+        &self,
+        _input: &phoenix_db::RecordTopLevelLlmFailureInput,
+    ) -> Result<phoenix_workflow::AuthorityOutcome, String> {
+        Err("durable top-level LLM failures are unsupported by this storage".to_string())
+    }
+
     async fn accept_complete_top_level_llm_response(
         &self,
         _input: &phoenix_db::AcceptCompleteLlmResponseInput,
@@ -681,6 +688,16 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<phoenix_db::PreparedTopLevelLlmAttempt, String> {
         phoenix_db::WorkflowRepository::new(self.db.pool().clone())
             .prepare_and_begin_top_level_llm_attempt(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn record_top_level_llm_failure(
+        &self,
+        input: &phoenix_db::RecordTopLevelLlmFailureInput,
+    ) -> Result<phoenix_workflow::AuthorityOutcome, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .record_top_level_llm_failure(input)
             .await
             .map_err(|error| error.to_string())
     }

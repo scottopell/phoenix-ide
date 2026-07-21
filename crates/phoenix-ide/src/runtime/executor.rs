@@ -4915,6 +4915,29 @@ where
                 );
             }
 
+            if let Some(attempt) = durable_attempt.as_ref() {
+                if !matches!(llm_outcome, LlmOutcome::Response { .. }) {
+                    let failure = phoenix_db::RecordTopLevelLlmFailureInput {
+                        authority: attempt.authority.clone(),
+                        observed_at: phoenix_workflow::Timestamp(
+                            u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                        ),
+                        outcome_payload: format!("{llm_outcome:?}").into_bytes(),
+                    };
+                    match storage.record_top_level_llm_failure(&failure).await {
+                        Ok(phoenix_workflow::AuthorityOutcome::Authorized) => {}
+                        Ok(outcome) => {
+                            tracing::warn!(?outcome, "durable LLM failure lost authority");
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to persist durable LLM failure");
+                            return;
+                        }
+                    }
+                }
+            }
+
             // Task 67004: a terminal UsageLimitReached carries the
             // structured QuotaDetails parsed from the 429 response
             // headers. Replay it through the chunk channel as a
