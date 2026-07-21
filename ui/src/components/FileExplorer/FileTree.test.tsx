@@ -253,6 +253,23 @@ describe('FileTree — reveal active file', () => {
     }
   });
 
+  it('uses one abortable root request per explicit refresh', async () => {
+    const fetchMock = vi.mocked(fetch);
+    const { rerender } = render(
+      <FileTree rootPath="/proj" onFileSelect={vi.fn()} refreshKey={0} />,
+    );
+    await screen.findByText('README.md');
+    fetchMock.mockClear();
+
+    rerender(<FileTree rootPath="/proj" onFileSelect={vi.fn()} refreshKey={1} />);
+    await waitFor(() => {
+      const rootRequests = fetchMock.mock.calls.filter(([url]) => (
+        new URL(String(url), 'http://localhost').searchParams.get('path') === '/proj'
+      ));
+      expect(rootRequests).toHaveLength(1);
+    });
+  });
+
   it('does not automatically retry a failed expanded directory load', async () => {
     const fetchMock = vi.mocked(fetch);
     let uiRequestCount = 0;

@@ -790,13 +790,13 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     };
   }, [rootPath]);
 
-  // An explicit refresh now routes through the shared panel owner. The tree
-  // still tracks refreshKey so legacy callers continue to trigger a refresh.
   useEffect(() => {
     if (previousRefreshKeyRef.current === refreshKey) return;
     previousRefreshKeyRef.current = refreshKey;
-    void refreshVisibleTree();
-  }, [refreshKey, refreshVisibleTree]);
+    for (const path of visibleExpandedDirectories(items, childItems, expandedPaths)) {
+      void loadChildren(path);
+    }
+  }, [refreshKey, items, childItems, expandedPaths, loadChildren]);
 
   // Auto-load children for restored expanded paths. The request registry
   // deduplicates in-flight loads without making request completion an effect
