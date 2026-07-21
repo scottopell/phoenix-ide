@@ -215,8 +215,8 @@ interface ViewerSlotProviderProps {
   scopeKey?: string | undefined;
   /** Latest browser-session state from the conversation snapshot. */
   browserSessionActive: boolean | undefined;
-  /** Whether the snapshot is live enough to authorize restoring or deleting
-   *  browser convenience storage. Defaults true for isolated consumers. */
+  /** Whether the snapshot is live enough to authorize browser storage and
+   *  public active-state affordances. Defaults true for isolated consumers. */
   browserSessionStateLoaded?: boolean;
 }
 
@@ -471,7 +471,12 @@ export function ViewerSlotProvider({
       && browserSessionStateLoaded
       && browserSessionActive === false
     ) {
-      if (scopeKey) clearLastViewer(scopeKey);
+      if (scopeKey) {
+        const stored = getLastViewer(scopeKey);
+        if (stored && new URLSearchParams(stored).get(VIEWER_PARAM) === 'browser') {
+          clearLastViewer(scopeKey);
+        }
+      }
       pendingBrowserFallScopeRef.current = undefined;
     }
   }, [scopeKey, browserSessionActive, browserSessionStateLoaded, slotKind, openBrowser, clearSlot]);
@@ -484,7 +489,7 @@ export function ViewerSlotProvider({
   return (
     <ViewerSlotCommandsContext.Provider value={commands}>
       <ViewerSlotDataContext.Provider value={slot}>
-        <ViewerSlotBrowserActiveContext.Provider value={browserSessionActive === true}>
+        <ViewerSlotBrowserActiveContext.Provider value={browserSessionStateLoaded && browserSessionActive === true}>
           {children}
         </ViewerSlotBrowserActiveContext.Provider>
       </ViewerSlotDataContext.Provider>

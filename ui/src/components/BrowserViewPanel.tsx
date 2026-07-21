@@ -97,7 +97,7 @@ export function BrowserViewPanel({
     liveFrameSuppressedDuringStopRef.current = false;
     reconnectSuppressedDuringStopRef.current = false;
     setStopping(!terminalBeforeRequest);
-    if (reconnectTimerRef.current !== null) {
+    if (!terminalBeforeRequest && reconnectTimerRef.current !== null) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
@@ -205,6 +205,10 @@ export function BrowserViewPanel({
           setStopping(false);
           setStatus({ kind: 'ended' });
         } else if (text.startsWith('error:')) {
+          stoppingRef.current = false;
+          liveFrameSuppressedDuringStopRef.current = false;
+          reconnectSuppressedDuringStopRef.current = false;
+          setStopping(false);
           setStatus({ kind: 'error', message: text.slice(6).trim() });
         }
       }
@@ -212,6 +216,10 @@ export function BrowserViewPanel({
 
     ws.onerror = () => {
       if (cancelled) return;
+      stoppingRef.current = false;
+      liveFrameSuppressedDuringStopRef.current = false;
+      reconnectSuppressedDuringStopRef.current = false;
+      setStopping(false);
       setStatus({ kind: 'error', message: 'connection error' });
     };
 

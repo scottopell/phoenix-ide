@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { render, act, waitFor, fireEvent } from '@testing-library/react';
 import { useEffect, useState } from 'react';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
-import { ViewerSlotProvider, useViewerSlot } from './ViewerSlotContext';
+import { ViewerSlotProvider, useBrowserSessionActive, useViewerSlot } from './ViewerSlotContext';
 import type { ViewerSlotValue } from './ViewerSlotContext';
 import { getLastViewer, setLastViewer } from '../storage/lastViewerStorage';
 
@@ -17,6 +17,12 @@ beforeEach(() => { localStorage.clear(); });
 function Capture({ onCtx }: { onCtx: (ctx: ViewerSlotValue) => void }) {
   const ctx = useViewerSlot();
   useEffect(() => { onCtx(ctx); }, [ctx, onCtx]);
+  return null;
+}
+
+function BrowserActiveCapture({ onActive }: { onActive: (active: boolean) => void }) {
+  const active = useBrowserSessionActive();
+  useEffect(() => { onActive(active); }, [active, onActive]);
   return null;
 }
 
@@ -507,8 +513,67 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(latest!.slot.kind).toBe('none');
     expect(getLastViewer('conv-A')).toContain('viewer=browser');
 
+    act(() => { latest!.openProse('/repo/README.md', '/repo'); });
+    expect(getLastViewer('conv-A')).toContain('viewer=prose');
+    act(() => { setLoaded!(true); });
+    expect(getLastViewer('conv-A')).toContain('viewer=prose');
+  });
+
+  it('invalidates an unchanged browser snapshot when a pending fall is confirmed', () => {
+    setLastViewer('conv-A', 'viewer=browser');
+    let latest: ViewerSlotValue | null = null;
+    let setActive: ((active: boolean) => void) | null = null;
+    let setLoaded: ((loaded: boolean) => void) | null = null;
+    function Harness() {
+      const [active, setActiveState] = useState(false);
+      const [loaded, setLoadedState] = useState(false);
+      setActive = setActiveState;
+      setLoaded = setLoadedState;
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active} browserSessionStateLoaded={loaded}>
+          <Capture onCtx={(ctx) => { latest = ctx; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes><Route path="/c/:slug" element={<Harness />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { setActive!(true); });
+    act(() => { setActive!(false); });
+    expect(latest!.slot.kind).toBe('none');
+    expect(getLastViewer('conv-A')).toContain('viewer=browser');
     act(() => { setLoaded!(true); });
     expect(getLastViewer('conv-A')).toBeNull();
+  });
+
+  it('hides cached browser activity from public affordances until readiness confirms it', () => {
+    let publicActive = true;
+    let setLoaded: ((loaded: boolean) => void) | null = null;
+    function Harness() {
+      const [loaded, setLoadedState] = useState(false);
+      setLoaded = setLoadedState;
+      return (
+        <ViewerSlotProvider
+          scopeKey="conv-A"
+          browserSessionActive={true}
+          browserSessionStateLoaded={loaded}
+        >
+          <BrowserActiveCapture onActive={(active) => { publicActive = active; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes><Route path="/c/:slug" element={<Harness />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(publicActive).toBe(false);
+    act(() => { setLoaded!(true); });
+    expect(publicActive).toBe(true);
   });
 
   it('does not auto-open when readiness confirms a browser that was already active on entry', () => {
