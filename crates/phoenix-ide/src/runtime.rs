@@ -1412,29 +1412,35 @@ impl RuntimeManager {
         // alive; if the runtime is gone the scope is by definition not live.
         let weak = Arc::downgrade(self);
         self.browser_sessions()
-            .set_scope_liveness_hook(Arc::new(move |scope: ResourceScopeKey| {
-                let weak = weak.clone();
-                Box::pin(async move {
-                    match weak.upgrade() {
-                        Some(manager) => match manager.scope_has_live_conversation(&scope).await {
-                            Ok(live) => live,
-                            // The idle reaper fails closed: an unreadable DB
-                            // (transient lock contention during cleanup) must
-                            // not reap a still-live session, so treat the scope
-                            // as live and try again on the next idle sweep.
-                            Err(e) => {
-                                tracing::warn!(
-                                    work_scope = %scope,
-                                    error = %e,
-                                    "scope liveness query failed; preserving scope to avoid reaping a live browser session"
-                                );
-                                true
+            .set_scope_liveness_hook(Arc::new(
+                move |scope: ResourceScopeKey, restricted_creator: Option<String>| {
+                    let weak = weak.clone();
+                    Box::pin(async move {
+                        match weak.upgrade() {
+                            Some(manager) => {
+                                let live = match restricted_creator {
+                                    Some(conversation_id) => manager
+                                        .conversation_is_live_in_scope(&conversation_id, &scope)
+                                        .await,
+                                    None => manager.scope_has_live_conversation(&scope).await,
+                                };
+                                match live {
+                                    Ok(live) => live,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            work_scope = %scope,
+                                            error = %e,
+                                            "scope liveness query failed; preserving scope to avoid reaping a live browser session"
+                                        );
+                                        true
+                                    }
+                                }
                             }
-                        },
-                        None => false,
-                    }
-                }) as futures::future::BoxFuture<'static, bool>
-            }));
+                            None => false,
+                        }
+                    }) as futures::future::BoxFuture<'static, bool>
+                },
+            ));
 
         let rx = self.browser_lifecycle_rx.write().await.take();
         let Some(mut rx) = rx else {
@@ -1908,6 +1914,19 @@ impl RuntimeManager {
     /// caller picks its own policy (the idle reaper maps `Err` to "live" to
     /// avoid premature teardown; the cleanup cascade fails the operation
     /// rather than archive while skipping resource teardown).
+    async fn conversation_is_live_in_scope(
+        &self,
+        conversation_id: &str,
+        work_scope: &ResourceScopeKey,
+    ) -> Result<bool, crate::db::DbError> {
+        let Some(work_scope_id) = work_scope.work_scope_id() else {
+            return Ok(false);
+        };
+        let conversation = self.db().get_conversation(conversation_id).await?;
+        Ok(conversation.work_scope_id.as_ref() == Some(work_scope_id)
+            && conversation_owns_work_scope(&conversation))
+    }
+
     pub(crate) async fn scope_has_live_conversation(
         &self,
         work_scope: &ResourceScopeKey,

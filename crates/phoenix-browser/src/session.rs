@@ -881,8 +881,11 @@ pub type BrowserSessionLifecycleSink =
 /// When unset, idle cleanup reaps purely on `last_activity` age (the historical
 /// behavior), so tool-level tests and any caller that never wires a runtime are
 /// unaffected.
-pub type ScopeLivenessHook =
-    Arc<dyn Fn(ResourceScopeKey) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+pub type ScopeLivenessHook = Arc<
+    dyn Fn(ResourceScopeKey, Option<String>) -> futures::future::BoxFuture<'static, bool>
+        + Send
+        + Sync,
+>;
 
 /// Map entry: the `ResourceScopeKey` (carried for idle-cleanup lifecycle emission)
 /// plus the live session arc.
@@ -1430,12 +1433,12 @@ impl BrowserSessionManager {
     /// liveness gate is unit-testable without a live chromium process.
     async fn filter_reapable(
         &self,
-        idle_candidates: Vec<(String, ResourceScopeKey)>,
+        idle_candidates: Vec<(String, ResourceScopeKey, Option<String>)>,
     ) -> Vec<String> {
         let mut to_remove = Vec::new();
-        for (key, scope) in idle_candidates {
+        for (key, scope, restricted_creator) in idle_candidates {
             if let Some(hook) = self.scope_liveness_hook.get() {
-                if hook(scope.clone()).await {
+                if hook(scope.clone(), restricted_creator).await {
                     tracing::debug!(
                         work_scope = %scope,
                         "browser: skipping idle reap — scope still owns a live conversation"
@@ -1462,7 +1465,7 @@ impl BrowserSessionManager {
     /// terminal is reaped on the next pass.
     async fn cleanup_idle_sessions(&self) {
         let now = Instant::now();
-        let mut idle_candidates: Vec<(String, ResourceScopeKey)> = Vec::new();
+        let mut idle_candidates: Vec<(String, ResourceScopeKey, Option<String>)> = Vec::new();
 
         // Find idle sessions
         {
@@ -1470,7 +1473,14 @@ impl BrowserSessionManager {
             for (key, entry) in sessions.iter() {
                 if let Ok(guard) = entry.session.try_read() {
                     if now.duration_since(guard.last_activity) > IDLE_TIMEOUT {
-                        idle_candidates.push((key.clone(), entry.scope.clone()));
+                        let restricted_creator =
+                            matches!(entry.authority, ResourceAuthority::Restricted)
+                                .then(|| entry.creator_conversation_id.clone());
+                        idle_candidates.push((
+                            key.clone(),
+                            entry.scope.clone(),
+                            restricted_creator,
+                        ));
                     }
                 }
             }
@@ -1730,8 +1740,8 @@ mod lifecycle_hook_tests {
     async fn filter_reapable_without_hook_reaps_all() {
         let manager = BrowserSessionManager::default();
         let candidates = vec![
-            ("k1".to_string(), scope("conv-1")),
-            ("k2".to_string(), scope("/tmp/wt-2")),
+            ("k1".to_string(), scope("conv-1"), None),
+            ("k2".to_string(), scope("/tmp/wt-2"), None),
         ];
         let reap = manager.filter_reapable(candidates).await;
         assert_eq!(reap, vec!["k1".to_string(), "k2".to_string()]);
@@ -1748,13 +1758,18 @@ mod lifecycle_hook_tests {
 
         // Stub predicate: only `alive` is live.
         let live_key = live.stable_key();
-        let hook: super::ScopeLivenessHook = Arc::new(move |scope: ResourceScopeKey| {
-            let is_live = scope.stable_key() == live_key;
-            Box::pin(async move { is_live }) as futures::future::BoxFuture<'static, bool>
-        });
+        let hook: super::ScopeLivenessHook = Arc::new(
+            move |scope: ResourceScopeKey, _restricted_creator: Option<String>| {
+                let is_live = scope.stable_key() == live_key;
+                Box::pin(async move { is_live }) as futures::future::BoxFuture<'static, bool>
+            },
+        );
         manager.set_scope_liveness_hook(hook);
 
-        let candidates = vec![("k-alive".to_string(), live), ("k-dead".to_string(), dead)];
+        let candidates = vec![
+            ("k-alive".to_string(), live, None),
+            ("k-dead".to_string(), dead, None),
+        ];
         let reap = manager.filter_reapable(candidates).await;
 
         // Live scope preserved, dead scope reaped.
@@ -1765,23 +1780,47 @@ mod lifecycle_hook_tests {
         );
     }
 
+    #[tokio::test]
+    async fn filter_reapable_checks_restricted_creator_not_shared_scope() {
+        let manager = BrowserSessionManager::default();
+        let shared = scope("shared");
+        let hook: super::ScopeLivenessHook = Arc::new(
+            |_scope: ResourceScopeKey, restricted_creator: Option<String>| {
+                Box::pin(async move { restricted_creator.as_deref() == Some("live-child") })
+                    as futures::future::BoxFuture<'static, bool>
+            },
+        );
+        manager.set_scope_liveness_hook(hook);
+
+        let candidates = vec![
+            ("live".into(), shared.clone(), Some("live-child".into())),
+            ("done".into(), shared, Some("done-child".into())),
+        ];
+
+        assert_eq!(manager.filter_reapable(candidates).await, vec!["done"]);
+    }
+
     /// `set_scope_liveness_hook` is set-once: the first install wins and a
     /// second call is a silent no-op (does not panic, does not replace).
     #[tokio::test]
     async fn scope_liveness_hook_is_set_once() {
         let manager = BrowserSessionManager::default();
         // First hook: everything live (nothing reapable).
-        let first: super::ScopeLivenessHook = Arc::new(|_scope: ResourceScopeKey| {
-            Box::pin(async { true }) as futures::future::BoxFuture<'static, bool>
-        });
+        let first: super::ScopeLivenessHook = Arc::new(
+            |_scope: ResourceScopeKey, _restricted_creator: Option<String>| {
+                Box::pin(async { true }) as futures::future::BoxFuture<'static, bool>
+            },
+        );
         manager.set_scope_liveness_hook(first);
         // Second hook would say nothing is live — must be ignored.
-        let second: super::ScopeLivenessHook = Arc::new(|_scope: ResourceScopeKey| {
-            Box::pin(async { false }) as futures::future::BoxFuture<'static, bool>
-        });
+        let second: super::ScopeLivenessHook = Arc::new(
+            |_scope: ResourceScopeKey, _restricted_creator: Option<String>| {
+                Box::pin(async { false }) as futures::future::BoxFuture<'static, bool>
+            },
+        );
         manager.set_scope_liveness_hook(second);
 
-        let candidates = vec![("k".to_string(), scope("c"))];
+        let candidates = vec![("k".to_string(), scope("c"), None)];
         let reap = manager.filter_reapable(candidates).await;
         assert!(
             reap.is_empty(),

@@ -361,6 +361,15 @@ BEGIN
     SELECT RAISE(ABORT, 'invalid work scope environment');
 END;
 
+ALTER TABLE conversations ADD COLUMN sub_agent_cwd_override TEXT;
+UPDATE conversations
+SET sub_agent_cwd_override = cwd
+WHERE runtime_role = 'sub_agent'
+  AND cwd <> COALESCE(
+      (SELECT cwd FROM work_scopes WHERE id = conversations.work_scope_id),
+      cwd
+  );
+
 ALTER TABLE conversations ADD COLUMN coordinator_head INTEGER NOT NULL DEFAULT 0 CHECK (coordinator_head IN (0, 1));
 UPDATE conversations SET coordinator_head = 1
 WHERE runtime_role = 'coordinator' AND continued_in_conv_id IS NULL;
@@ -502,6 +511,7 @@ SELECT root.id,
        root.updated_at
 FROM conversations root
 WHERE EXISTS (SELECT 1 FROM migration_052_lineage l WHERE l.root_id = root.id)
+  AND root.cm_kind <> 'direct'
   AND NOT EXISTS (
       SELECT 1 FROM work_scopes_old old
       WHERE old.scope_type = 'Worktree' AND old.scope_value = root.cm_worktree_path
@@ -514,6 +524,29 @@ WHERE EXISTS (SELECT 1 FROM migration_052_lineage l WHERE l.root_id = root.id)
 INSERT INTO work_scopes_new (id, authority_kind, lifecycle, created_at, updated_at)
 SELECT new_id, authority_kind, 'active', created_at, updated_at
 FROM migration_052_generated_scope_map;
+
+CREATE TEMP TABLE migration_052_generated_direct_scope_map (
+    conversation_id TEXT PRIMARY KEY,
+    new_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO migration_052_generated_direct_scope_map
+SELECT c.id,
+       lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-' || '4' || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', 1 + (abs(random()) % 4), 1) || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))),
+       c.created_at,
+       c.updated_at
+FROM conversations c
+WHERE c.runtime_role = 'user'
+  AND c.cm_kind = 'direct'
+  AND NOT EXISTS (
+      SELECT 1 FROM work_scopes_old old
+      WHERE old.scope_type = 'Conversation' AND old.scope_value = c.id
+  );
+
+INSERT INTO work_scopes_new (id, authority_kind, lifecycle, created_at, updated_at)
+SELECT new_id, 'work', 'active', created_at, updated_at
+FROM migration_052_generated_direct_scope_map;
 
 CREATE TEMP TABLE migration_052_root_scope (
     root_id TEXT PRIMARY KEY,
@@ -530,6 +563,7 @@ SELECT root.id,
             FROM work_scopes_old old
             JOIN migration_052_scope_map m ON m.old_id = old.id
             WHERE old.scope_type = 'Conversation' AND old.scope_value = root.id),
+           (SELECT direct.new_id FROM migration_052_generated_direct_scope_map direct WHERE direct.conversation_id = root.id),
            (SELECT g.new_id FROM migration_052_generated_scope_map g WHERE g.root_id = root.id)
        )
 FROM conversations root
@@ -540,8 +574,21 @@ CREATE TEMP TABLE migration_052_conversation_scope (
     work_scope_id TEXT NOT NULL
 );
 INSERT INTO migration_052_conversation_scope
-SELECT lineage.conversation_id, root_scope.work_scope_id
+SELECT lineage.conversation_id,
+       CASE
+           WHEN c.runtime_role = 'user' AND c.cm_kind = 'direct' THEN COALESCE(
+               (SELECT m.new_id
+                FROM work_scopes_old old
+                JOIN migration_052_scope_map m ON m.old_id = old.id
+                WHERE old.scope_type = 'Conversation' AND old.scope_value = c.id),
+               (SELECT generated.new_id
+                FROM migration_052_generated_direct_scope_map generated
+                WHERE generated.conversation_id = c.id)
+           )
+           ELSE root_scope.work_scope_id
+       END
 FROM migration_052_lineage lineage
+JOIN conversations c ON c.id = lineage.conversation_id
 JOIN migration_052_root_scope root_scope ON root_scope.root_id = lineage.root_id;
 
 UPDATE conversations
@@ -4415,6 +4462,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(invalid_scope_nullability, 0);
+
+        let direct_scope_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT work_scope_id) FROM conversations
+             WHERE id IN ('direct-cwd', 'direct-none', 'inherit-root')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(direct_scope_count, 3);
 
         let invalid_lifecycle: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM work_scopes

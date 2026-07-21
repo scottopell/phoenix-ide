@@ -50,7 +50,8 @@ pub async fn terminal_ws_handler(
     let db = state.db.clone();
     let runtime = Arc::clone(&state.runtime);
     ws.on_upgrade(move |socket| async move {
-        let (cwd, scope, teardown_on_terminal) = match db.get_conversation(&conversation_id).await {
+        let (cwd, scope, teardown_on_terminal, legacy_worktree_path) =
+            match db.get_conversation(&conversation_id).await {
             Ok(conv) => {
                 if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
                     tracing::warn!(
@@ -73,10 +74,15 @@ pub async fn terminal_ws_handler(
                     conv.work_scope_id
                         .expect("persisted conversation has work scope"),
                 );
+                let legacy_worktree_path = conv
+                    .conv_mode
+                    .worktree_path()
+                    .map(std::path::PathBuf::from);
                 (
                     std::path::PathBuf::from(&conv.cwd),
                     scope,
                     matches!(conv.conv_mode, ConvMode::Direct),
+                    legacy_worktree_path,
                 )
             }
             Err(e) => {
@@ -90,6 +96,7 @@ pub async fn terminal_ws_handler(
             cwd,
             conversation_id,
             teardown_on_terminal,
+            legacy_worktree_path,
             terminals,
             runtime,
         )
@@ -118,6 +125,7 @@ pub async fn terminal_ws_global_handler(
             cwd,
             "global".to_string(),
             false,
+            None,
             terminals,
             runtime,
         )
@@ -125,12 +133,14 @@ pub async fn terminal_ws_global_handler(
 }
 
 #[allow(clippy::too_many_lines)] // inherently dense PTY lifecycle; see relay.rs for the testable core
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     scope: ResourceScopeKey,
     cwd: std::path::PathBuf,
     id_label: String,
     teardown_on_terminal: bool,
+    legacy_worktree_path: Option<std::path::PathBuf>,
     terminals: ActiveTerminals,
     runtime: Arc<RuntimeManager>,
 ) {
@@ -156,6 +166,7 @@ async fn handle_socket(
         &scope,
         &terminals,
         &cwd,
+        legacy_worktree_path.as_deref(),
         initial_dims,
         &mut ws_sender,
         &runtime,
@@ -319,11 +330,13 @@ async fn handle_socket(
 ///      winner so the caller still gets an attached session.
 ///   3. `acquire_owned()` the permit — available immediately since the
 ///      handle is fresh and nobody holds it yet.
+#[allow(clippy::too_many_arguments)]
 async fn acquire_handle(
     conversation_id: &str,
     scope: &ResourceScopeKey,
     terminals: &ActiveTerminals,
     cwd: &std::path::Path,
+    legacy_worktree_path: Option<&std::path::Path>,
     initial_dims: Dims,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     runtime: &Arc<RuntimeManager>,
@@ -340,7 +353,7 @@ async fn acquire_handle(
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
     // conversation's project directory rather than Phoenix's own CWD.
-    let plan = resolve_exec_plan(conversation_id, scope, cwd, runtime).await;
+    let plan = resolve_exec_plan(conversation_id, scope, cwd, legacy_worktree_path, runtime).await;
 
     let cwd_owned = cwd.to_path_buf();
     let handle = match tokio::task::spawn_blocking(move || {
@@ -402,6 +415,7 @@ async fn resolve_exec_plan(
     conversation_id: &str,
     scope: &ResourceScopeKey,
     cwd: &std::path::Path,
+    legacy_worktree_path: Option<&std::path::Path>,
     runtime: &Arc<RuntimeManager>,
 ) -> PtyExecPlan {
     let registry = runtime.tmux_registry();
@@ -409,7 +423,7 @@ async fn resolve_exec_plan(
         return PtyExecPlan::Shell;
     }
     match registry
-        .ensure_live(scope, cwd, Some(cwd), Some(conversation_id))
+        .ensure_live(scope, cwd, legacy_worktree_path, Some(conversation_id))
         .await
     {
         Ok(server_arc) => {

@@ -2824,8 +2824,8 @@ impl Database {
                 .await?;
             }
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -2849,6 +2849,7 @@ impl Database {
             .bind(cm.next_taskmd_id_hint)
             .bind(runtime_role.as_str())
             .bind(work_scope_id.as_str())
+            .bind(parent_id.map(|_| cwd))
             .execute(&mut *tx)
             .await;
 
@@ -3037,7 +3038,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3066,7 +3067,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3095,7 +3096,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3225,7 +3226,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn managed_worktree_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3252,7 +3253,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_all_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3276,7 +3277,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4919,7 +4920,7 @@ impl Database {
         worktree_path: &str,
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4949,7 +4950,7 @@ impl Database {
         work_scope_id: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -5647,7 +5648,7 @@ impl Database {
                 FROM conversations c
                 JOIN chain ON c.id = chain.next_id
             )
-            SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -6573,7 +6574,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -8601,22 +8602,30 @@ async fn insert_conversation_tx(
     let state_json =
         serde_json::to_string(&conv.state).map_err(|e| DbError::Serialization(e.to_string()))?;
     let cm = conv_mode_columns(&conv.conv_mode);
-    let generated_scope =
-        if conv.runtime_role == RuntimeRole::Coordinator || conv.work_scope_id.is_some() {
-            None
-        } else {
-            let (scope_id, authority_kind, environment) =
-                Database::new_scope_for_conversation(&conv.cwd, &cm);
-            Database::insert_work_scope_environment_tx(
-                tx,
-                &scope_id,
-                authority_kind,
-                environment,
-                &conv.created_at.to_rfc3339(),
-            )
-            .await?;
-            Some(scope_id)
-        };
+    let conversation_exists =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)")
+            .bind(&conv.id)
+            .fetch_one(&mut **tx)
+            .await?
+            != 0;
+    let generated_scope = if conv.runtime_role == RuntimeRole::Coordinator
+        || conv.work_scope_id.is_some()
+        || conversation_exists
+    {
+        None
+    } else {
+        let (scope_id, authority_kind, environment) =
+            Database::new_scope_for_conversation(&conv.cwd, &cm);
+        Database::insert_work_scope_environment_tx(
+            tx,
+            &scope_id,
+            authority_kind,
+            environment,
+            &conv.created_at.to_rfc3339(),
+        )
+        .await?;
+        Some(scope_id)
+    };
     let work_scope_id = conv.work_scope_id.as_ref().or(generated_scope.as_ref());
 
     // A forked/copied conversation starts with an empty steering queue (pending
@@ -15884,6 +15893,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sub_agent_cwd_override_survives_hydration() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = db
+            .create_conversation(
+                "parent-override",
+                "parent",
+                "/tmp/worktree",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let child = db
+            .create_conversation_with_project(
+                "child-override",
+                "child",
+                "/tmp/worktree/subdir",
+                false,
+                Some(&parent.id),
+                None,
+                None,
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(child.cwd, "/tmp/worktree/subdir");
+        assert_eq!(
+            db.get_conversation(&child.id).await.unwrap().cwd,
+            "/tmp/worktree/subdir"
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_spawned_happy_path_and_idempotent_retry() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("origin-7", "o7", "/tmp", true, None, None)
@@ -15921,6 +15972,16 @@ mod tests {
         let p2 = db.get_fork_proposal("fp-s").await.unwrap().unwrap();
         assert_eq!(p2.status, ForkProposalStatus::Spawned);
         assert_eq!(db.get_messages("fork-7").await.unwrap().len(), 1);
+        let orphan_scopes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scopes ws
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM conversations c WHERE c.work_scope_id = ws.id
+             )",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(orphan_scopes, 0);
     }
 
     #[tokio::test]
