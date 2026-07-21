@@ -449,6 +449,7 @@ impl KeywordSearchTool {
             }],
             tools: vec![],
             max_tokens: Some(4096),
+            effort: None,
             telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
                 conversation_id: ctx.conversation_id.clone(),
                 root_conversation_id: ctx.root_conversation_id.clone(),

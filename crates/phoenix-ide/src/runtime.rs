@@ -2866,6 +2866,7 @@ impl RuntimeManager {
             }
         };
         context.mode_context = Some(mode_context);
+        context.effort = if is_sub_agent { None } else { conv.effort };
         context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         context.desired_base_branch = conv.desired_base_branch.clone();
         context.mode = match &conv.conv_mode {

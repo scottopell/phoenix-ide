@@ -8,7 +8,7 @@ import { api } from '../api';
 const originalFetch = globalThis.fetch;
 
 const modelResponse = {
-  models: [{ id: 'claude-3-5-sonnet', provider: 'anthropic', recommended: true }],
+  models: [{ id: 'claude-3-5-sonnet', provider: 'anthropic', recommended: true, description: '', context_window: 200_000, effort_capabilities: { support: 'supported', levels: ['low', 'high'], native_default: { known: 'high' } } }],
   default: 'claude-3-5-sonnet',
   llm_configured: true,
   credential_status: 'valid',
@@ -184,6 +184,47 @@ describe('/new workflow modes', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     vi.clearAllMocks();
+  });
+
+  it('submits selected effort when creating a conversation', async () => {
+    renderPage();
+    await settleValidation();
+
+    const effortSelect = screen.getAllByText('Effort').map((node) => node.parentElement?.querySelector('select')).find(Boolean) as HTMLSelectElement;
+    fireEvent.change(effortSelect, { target: { value: 'low' } });
+
+    const textarea = screen.getAllByPlaceholderText('What would you like to work on?')[0]!;
+    fireEvent.change(textarea, { target: { value: 'Ship it' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+
+    await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
+    expect(vi.mocked(api.createConversation).mock.calls.at(-1)?.[4]).toBe('low');
+  });
+
+  it('clears incompatible effort when the model changes', async () => {
+    vi.mocked(api.listModels).mockResolvedValue({
+      ...modelResponse,
+      models: [
+        modelResponse.models[0],
+        { id: 'gpt-5', provider: 'openai', recommended: true, description: '', context_window: 200_000, effort_capabilities: { support: 'unsupported' } },
+      ],
+      default: 'claude-3-5-sonnet',
+    } as never);
+
+    renderPage();
+    await settleValidation();
+
+    const effortSelect = screen.getAllByText('Effort').map((node) => node.parentElement?.querySelector('select')).find(Boolean) as HTMLSelectElement;
+    fireEvent.change(effortSelect, { target: { value: 'low' } });
+    expect(effortSelect.value).toBe('low');
+
+    const modelSelect = screen.getAllByText('Model').map((node) => node.parentElement?.querySelector('select')).find(Boolean) as HTMLSelectElement;
+    fireEvent.change(modelSelect, { target: { value: 'gpt-5' } });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Model default')).not.toHaveLength(0);
+      expect(screen.queryAllByRole('option', { name: 'Low' })).toHaveLength(0);
+    });
   });
 
   it('waits for the authoritative branch root before showing project skills', async () => {
@@ -390,6 +431,7 @@ describe('/new workflow modes', () => {
       'hello',
       expect.any(String),
       'claude-3-5-sonnet',
+      null,
       [],
       'direct',
       null,
@@ -419,6 +461,7 @@ describe('/new workflow modes', () => {
       'wake up default',
       expect.any(String),
       'claude-3-5-sonnet',
+      null,
       [],
       'managed',
       'main',
@@ -448,6 +491,7 @@ describe('/new workflow modes', () => {
       'please plan',
       expect.any(String),
       'claude-3-5-sonnet',
+      null,
       [],
       'managed',
       'main',
@@ -476,6 +520,7 @@ describe('/new workflow modes', () => {
       'continue it',
       expect.any(String),
       'claude-3-5-sonnet',
+      null,
       [],
       'branch',
       'feature/demo',
@@ -520,6 +565,7 @@ describe('/new workflow modes', () => {
       'after switch',
       expect.any(String),
       'claude-3-5-sonnet',
+      null,
       [],
       'managed',
       'trunk',
@@ -561,6 +607,7 @@ describe('/new workflow modes', () => {
       'fresh repo',
       expect.any(String),
       'claude-3-5-sonnet',
+      null,
       [],
       'managed',
       'trunk',
@@ -693,7 +740,7 @@ describe('/new workflow modes', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
 
     await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
-    const [, text,,,, mode, baseBranch,,,, checkoutRef] = vi.mocked(api.createConversation).mock.calls[0]!;
+    const [, text,,,,, mode, baseBranch,,,, checkoutRef] = vi.mocked(api.createConversation).mock.calls[0]!;
     expect(mode).toBe('managed');
     expect(baseBranch).toBe('main');
     expect(checkoutRef).toBe('origin/main');

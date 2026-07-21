@@ -273,6 +273,7 @@ pub trait StateStore: Send + Sync {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
+        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String>;
@@ -604,6 +605,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
+        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -612,6 +614,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 conversation_id,
                 root_conversation_id,
                 model,
+                effective_effort,
                 usage,
                 first_byte_at,
             )
@@ -1099,6 +1102,7 @@ impl StateStore for DatabaseStorage {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
+        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
         usage: &phoenix_llm::Usage,
         first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
@@ -1107,6 +1111,7 @@ impl StateStore for DatabaseStorage {
                 conversation_id,
                 root_conversation_id,
                 model,
+                effective_effort,
                 usage,
                 first_byte_at,
             )

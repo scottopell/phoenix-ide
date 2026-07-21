@@ -1,6 +1,28 @@
-import type { ModelsResponse, ModelInfo } from '../api';
+import type { EffortCapabilities, ModelEffort, ModelsResponse, ModelInfo } from '../api';
 import { DirectoryPicker } from './DirectoryPicker';
 
+const EFFORT_LABELS: Record<ModelEffort, string> = {
+  none: 'None',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'X-High',
+  max: 'Max',
+};
+
+function effortOptionLabel(level: ModelEffort): string {
+  return EFFORT_LABELS[level];
+}
+
+function defaultEffortLabel(capabilities: EffortCapabilities | undefined): string {
+  if (!capabilities || capabilities.support !== 'supported') return 'Model default';
+  const nativeDefault = capabilities.native_default;
+  if (nativeDefault && typeof nativeDefault === 'object' && 'known' in nativeDefault) {
+    return `Model default (${effortOptionLabel(nativeDefault.known)})`;
+  }
+  return 'Model default';
+}
 export type DirStatus = 'checking' | 'exists' | 'will-create' | 'invalid';
 
 export const DIR_STATUS_CONFIG = {
@@ -12,7 +34,7 @@ export const DIR_STATUS_CONFIG = {
 
 export function SettingsFields({
   cwd, setCwd, onDirStatusChange, onGitStatusChange,
-  selectedModel, setSelectedModel, models,
+  selectedModel, setSelectedModel, selectedEffort, setSelectedEffort, models,
   showAllModels, setShowAllModels
 }: {
   cwd: string;
@@ -21,6 +43,8 @@ export function SettingsFields({
   onGitStatusChange?: (isGit: boolean | null) => void;
   selectedModel: string | null;
   setSelectedModel: (v: string) => void;
+  selectedEffort: ModelEffort | null;
+  setSelectedEffort: (v: ModelEffort | null) => void;
   models: ModelsResponse | null;
   showAllModels: boolean;
   setShowAllModels: (v: boolean) => void;
@@ -29,6 +53,8 @@ export function SettingsFields({
   const filteredModels = models?.models.filter(m => showAllModels || m.recommended) || [];
   const totalCount = models?.models.length || 0;
   const recommendedCount = models?.models.filter(m => m.recommended).length || 0;
+  const selectedModelInfo = models?.models.find((m) => m.id === selectedModel) ?? null;
+  const effortCapabilities = selectedModelInfo?.effort_capabilities;
 
   // Group by provider when showing all
   const groupedModels: Record<string, ModelInfo[]> = {};
@@ -97,6 +123,24 @@ export function SettingsFields({
           </span>
         </label>
       </label>
+      {effortCapabilities?.support !== 'unsupported' && (
+        <label className="settings-field">
+          <span className="settings-field-label">Effort</span>
+          <select
+            className="settings-select"
+            value={selectedEffort ?? ''}
+            onChange={(e) => setSelectedEffort((e.target.value || null) as ModelEffort | null)}
+            disabled={!models || effortCapabilities?.support === 'unknown'}
+          >
+            <option value="">{defaultEffortLabel(effortCapabilities)}</option>
+            {effortCapabilities?.support === 'supported' && effortCapabilities.levels.map((level) => (
+              <option key={level} value={level}>
+                {effortOptionLabel(level)}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
     </>
   );
 }

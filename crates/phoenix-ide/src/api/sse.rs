@@ -431,6 +431,7 @@ mod tests {
             archived: false,
             transcript_generation: 1,
             model: Some("claude-sonnet-4-5".to_string()),
+            effort: None,
             project_id: None,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,
@@ -505,6 +506,7 @@ mod tests {
             usage_data: Some(UsageData {
                 input_tokens: 10,
                 output_tokens: 5,
+                reasoning_tokens: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             }),

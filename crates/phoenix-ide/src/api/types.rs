@@ -11,6 +11,8 @@ pub struct CreateConversationRequest {
     pub conversation_id: Option<String>,
     pub cwd: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
     /// Initial message text (required)
     pub text: String,
     /// Client-generated message ID for idempotency
@@ -79,6 +81,9 @@ impl From<NotificationSettingsRequest> for crate::db::NotificationSettings {
 pub struct UpgradeModelRequest {
     /// Target model ID (e.g., "claude-opus-4-7").
     pub model: String,
+    /// Omitted/null resets to the target model's native default.
+    #[serde(default)]
+    pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
 }
 
 /// Request to send a chat message

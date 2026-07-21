@@ -2449,6 +2449,7 @@ mod tests {
             archived: false,
             transcript_generation: 1,
             model: None,
+            effort: None,
             project_id: None,
             conv_mode,
             desired_base_branch: None,

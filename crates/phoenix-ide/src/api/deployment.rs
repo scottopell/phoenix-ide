@@ -1154,6 +1154,7 @@ mod tests {
             archived: false,
             transcript_generation: 1,
             model: None,
+            effort: None,
             project_id: None,
             conv_mode: ConvMode::Work {
                 branch_name: NonEmptyString::new(format!("branch-{id}")).unwrap(),

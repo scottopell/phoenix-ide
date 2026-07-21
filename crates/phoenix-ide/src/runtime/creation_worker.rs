@@ -1038,6 +1038,7 @@ mod temporary_creation_branch_tests {
             intent: phoenix_core::domain::db_schema::ConversationCreationIntent {
                 cwd: "/tmp".to_string(),
                 model: None,
+                effort: None,
                 text: String::new(),
                 expansion_preflighted: false,
                 llm_text: None,

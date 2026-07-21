@@ -1625,13 +1625,13 @@ function ConversationPageContent({
     }
   }, [conversationId, isArchived, dispatch]);
 
-  const handleUpgradeModel = useCallback(async (newModelId: string) => {
+  const handleUpgradeModel = useCallback(async (newModelId: string, effort?: import('../api').ModelEffort | null) => {
     if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
 
     try {
-      await api.upgradeModel(conversationId, newModelId);
+      await api.upgradeModel(conversationId, newModelId, effort);
       showInfo(`Switched to ${newModelId}`);
-      dispatch({ type: 'local_conversation_update', updates: { model: newModelId }, expectedConversationId: conversationId });
+      dispatch({ type: 'local_conversation_update', updates: { model: newModelId, effort: effort ?? null }, expectedConversationId: conversationId });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }

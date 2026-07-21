@@ -5,7 +5,7 @@ import { LlmStatusBanner } from './LlmStatusBanner';
 import { getDisambiguatedPathLabels } from '../utils/conversationIdentity';
 import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
-import type { GitBranchEntry, ModelsResponse, TaskEntry } from '../api';
+import type { GitBranchEntry, ModelEffort, ModelsResponse, TaskEntry } from '../api';
 import type { NewConversationWorkflow } from '../hooks/useCreateConversation';
 
 interface ConversationSettingsProps {
@@ -16,6 +16,8 @@ interface ConversationSettingsProps {
   onGitStatusChange?: (isGit: boolean | null) => void;
   selectedModel: string | null;
   setSelectedModel: (v: string) => void;
+  selectedEffort: ModelEffort | null;
+  setSelectedEffort: (v: ModelEffort | null) => void;
   models: ModelsResponse | null;
   showAllModels: boolean;
   setShowAllModels: (v: boolean) => void;
@@ -74,6 +76,8 @@ export function ConversationSettings({
   onGitStatusChange,
   selectedModel,
   setSelectedModel,
+  selectedEffort,
+  setSelectedEffort,
   models,
   showAllModels,
   setShowAllModels,
@@ -247,6 +251,8 @@ export function ConversationSettings({
         {...(onGitStatusChange ? { onGitStatusChange } : {})}
         selectedModel={selectedModel}
         setSelectedModel={setSelectedModel}
+        selectedEffort={selectedEffort}
+        setSelectedEffort={setSelectedEffort}
         models={models}
         showAllModels={showAllModels}
         setShowAllModels={setShowAllModels}

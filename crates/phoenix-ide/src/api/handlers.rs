@@ -1782,6 +1782,17 @@ async fn create_conversation_with_id(
             )));
         }
     }
+    let selected_model = req
+        .model
+        .as_deref()
+        .unwrap_or_else(|| state.llm_registry.default_model_id());
+    if let Some(effort) = req.effort {
+        if !state.llm_registry.supports_effort(selected_model, effort) {
+            return Err(AppError::BadRequest(format!(
+                "Effort '{effort}' is not supported by model '{selected_model}'"
+            )));
+        }
+    }
 
     if let Ok(conv) = state.runtime.db().get_conversation(&id).await {
         if let Some(existing_job) = state
@@ -1929,6 +1940,7 @@ async fn create_conversation_with_id(
     let intent = crate::db::ConversationCreationIntent {
         cwd: effective_cwd.clone(),
         model: intent_model,
+        effort: req.effort,
         text: persisted_prompt_text,
         expansion_preflighted: false,
         llm_text: None,
@@ -1967,6 +1979,7 @@ async fn create_conversation_with_id(
             &effective_cwd,
             true,
             Some(shell_model.as_str()),
+            req.effort,
             &conv_mode,
             desired_base_branch,
             req.seed_parent_id.as_deref(),
@@ -4170,6 +4183,14 @@ async fn upgrade_conversation_model(
             state.llm_registry.available_models()
         )));
     }
+    if let Some(effort) = req.effort {
+        if !state.llm_registry.supports_effort(&req.model, effort) {
+            return Err(AppError::BadRequest(format!(
+                "Effort '{effort}' is not supported by model '{}'",
+                req.model
+            )));
+        }
+    }
 
     // Validate conversation exists and is in a state that allows model change
     let conv = state
@@ -4190,7 +4211,7 @@ async fn upgrade_conversation_model(
     state
         .runtime
         .db()
-        .update_conversation_model(&id, &req.model)
+        .update_conversation_model_and_effort(&id, &req.model, req.effort)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -7602,6 +7623,7 @@ mod conversation_cwd_validation_tests {
             conversation_id: None,
             cwd,
             model: None,
+            effort: None,
             text: "hello".to_string(),
             message_id: uuid::Uuid::new_v4().to_string(),
             images: Vec::new(),
@@ -7781,6 +7803,7 @@ mod conversation_cwd_validation_tests {
                 intent: crate::db::ConversationCreationIntent {
                     cwd: tmp.path().to_string_lossy().to_string(),
                     model: None,
+                    effort: None,
                     text: "retry".to_string(),
                     expansion_preflighted: false,
                     llm_text: None,
@@ -7882,6 +7905,7 @@ mod conversation_cwd_validation_tests {
                 intent: crate::db::ConversationCreationIntent {
                     cwd: "/tmp".to_string(),
                     model: None,
+                    effort: None,
                     text: "original".to_string(),
                     expansion_preflighted: false,
                     llm_text: None,
@@ -13406,6 +13430,7 @@ mod upgrade_model_state_guard_tests {
             Path(id.to_string()),
             Json(UpgradeModelRequest {
                 model: model.to_string(),
+                effort: None,
             }),
         )
         .await
@@ -13421,7 +13446,7 @@ mod upgrade_model_state_guard_tests {
         // Start from a non-default model so a successful switch is observable.
         state
             .db
-            .update_conversation_model(id, "claude-opus-4-7")
+            .update_conversation_model_and_effort(id, "claude-opus-4-7", None)
             .await
             .expect("seed model");
     }
@@ -14195,6 +14220,7 @@ mod attachment_storage_tests {
         let intent = crate::db::ConversationCreationIntent {
             cwd: "/tmp".to_string(),
             model: None,
+            effort: None,
             text: "with attachment".to_string(),
             expansion_preflighted: false,
             llm_text: None,

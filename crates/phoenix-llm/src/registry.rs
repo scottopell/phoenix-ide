@@ -872,6 +872,62 @@ impl ModelRegistry {
         }
     }
 
+    #[must_use]
+    pub fn effort_capabilities(&self, model_id: &str) -> Option<super::EffortCapabilities> {
+        let specs = self.specs.read().ok()?;
+        let services = self.services.read().ok()?;
+        let (spec, service) = specs.get(model_id).zip(services.get(model_id))?;
+        Some(spec.effort_capabilities_for(service.as_ref()))
+    }
+
+    #[must_use]
+    pub fn supports_effort(
+        &self,
+        model_id: &str,
+        effort: phoenix_core::domain::llm_types::ModelEffort,
+    ) -> bool {
+        self.effort_capabilities(model_id)
+            .is_some_and(|capabilities| capabilities.supports(effort))
+    }
+
+    #[must_use]
+    pub fn effective_effort(
+        &self,
+        model_id: &str,
+        explicit: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    ) -> phoenix_core::domain::llm_types::EffectiveEffort {
+        use phoenix_core::domain::llm_types::{EffectiveEffort, EffortSource};
+
+        if let Some(level) = explicit {
+            return EffectiveEffort {
+                source: EffortSource::Explicit,
+                level: Some(level),
+            };
+        }
+        match self.effort_capabilities(model_id) {
+            Some(super::EffortCapabilities::Unsupported) => EffectiveEffort {
+                source: EffortSource::Unsupported,
+                level: None,
+            },
+            Some(super::EffortCapabilities::Supported {
+                native_default: super::NativeDefault::Known(level),
+                ..
+            }) => EffectiveEffort {
+                source: EffortSource::NativeKnown,
+                level: Some(level),
+            },
+            Some(super::EffortCapabilities::Unknown)
+            | Some(super::EffortCapabilities::Supported {
+                native_default: super::NativeDefault::Unknown,
+                ..
+            })
+            | None => EffectiveEffort {
+                source: EffortSource::NativeUnknown,
+                level: None,
+            },
+        }
+    }
+
     /// List all available model IDs
     ///
     /// # Panics

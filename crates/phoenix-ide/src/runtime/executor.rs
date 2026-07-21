@@ -866,7 +866,17 @@ where
     } else if let Some(mut out) = output {
         if let Some(llm_usage) = out.take_llm_usage() {
             let _ = storage
-                .insert_turn_usage(&conv_id, &root_conv_id, &llm_usage.model, &llm_usage.usage, None)
+                .insert_turn_usage(
+                    &conv_id,
+                    &root_conv_id,
+                    &llm_usage.model,
+                    phoenix_core::domain::llm_types::EffectiveEffort {
+                        source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
+                        level: None,
+                    },
+                    &llm_usage.usage,
+                    None,
+                )
                 .await
                 .map_err(|e| {
                     tracing::warn!(conv_id = %conv_id, error = %e, "failed to record tool LLM usage");
@@ -4707,6 +4717,10 @@ where
         let context_window = self.context.context_window;
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
+        let explicit_effort = self.context.effort;
+        let effective_effort = self
+            .llm_registry
+            .effective_effort(&model_id, explicit_effort);
         let working_dir = self
             .context
             .execution_environment
@@ -4893,6 +4907,7 @@ where
                 messages,
                 tools,
                 max_tokens: Some(16_384),
+                effort: explicit_effort,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id.clone(),
@@ -4996,6 +5011,7 @@ where
                 let conv_id_for_usage = conv_id.clone();
                 let root_id_for_usage = root_conv_id.clone();
                 let model_for_usage = model_id.clone();
+                let effort_for_usage = effective_effort;
                 let usage_for_insert = usage.clone();
                 let first_byte_for_insert = *first_byte_at.lock().await;
                 tokio::spawn(async move {
@@ -5004,6 +5020,7 @@ where
                             &conv_id_for_usage,
                             &root_id_for_usage,
                             &model_for_usage,
+                            effort_for_usage,
                             &usage_for_insert,
                             first_byte_for_insert,
                         )
@@ -5708,6 +5725,7 @@ where
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
                 max_tokens: Some(4096),
+                effort: None,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id,
@@ -10730,6 +10748,7 @@ mod steer_drain_detector_tests {
             usage: phoenix_llm::Usage {
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },

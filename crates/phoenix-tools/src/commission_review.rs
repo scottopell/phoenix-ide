@@ -427,6 +427,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                     usage: phoenix_core::domain::llm_types::Usage {
                         input_tokens,
                         output_tokens,
+                        reasoning_tokens: 0,
                         cache_creation_tokens,
                         cache_read_tokens,
                     },
@@ -451,6 +452,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             }],
             tools: vec![],
             max_tokens: Some(4096),
+            effort: None,
             telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
                 conversation_id: ctx.conversation_id.clone(),
                 root_conversation_id: ctx.root_conversation_id.clone(),
@@ -479,6 +481,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                         usage: phoenix_core::domain::llm_types::Usage {
                             input_tokens,
                             output_tokens,
+                            reasoning_tokens: 0,
                             cache_creation_tokens,
                             cache_read_tokens,
                         },
@@ -503,6 +506,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                             usage: phoenix_core::domain::llm_types::Usage {
                                 input_tokens,
                                 output_tokens,
+                                reasoning_tokens: 0,
                                 cache_creation_tokens,
                                 cache_read_tokens,
                             },
@@ -538,6 +542,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         usage: phoenix_core::domain::llm_types::Usage {
             input_tokens,
             output_tokens,
+            reasoning_tokens: 0,
             cache_creation_tokens,
             cache_read_tokens,
         },

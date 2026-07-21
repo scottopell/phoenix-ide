@@ -199,9 +199,9 @@ function setMobileViewport(matches = true) {
 }
 
 const pickerModels: ModelInfo[] = [
-  { id: 'claude-sonnet-5', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true },
-  { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: false },
-  { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true },
+  { id: 'claude-sonnet-5', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true, effort_capabilities: { support: 'supported', levels: ['low', 'medium', 'high'], native_default: { known: 'high' } } },
+  { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: false, effort_capabilities: { support: 'unsupported' } },
+  { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true, effort_capabilities: { support: 'unknown' } },
 ];
 
 function makeSelection(overrides: Partial<AssociatedPrStatusEnvelope> = {}): AssociatedPrStatusEnvelope {
@@ -1268,5 +1268,36 @@ describe('StateBar mobile layout', () => {
 
     fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
     expect(screen.getByRole('listbox', { name: /select model/i })).toBeInTheDocument();
+    expect(screen.getByRole('listbox', { name: /select effort/i })).toBeInTheDocument();
+  });
+
+  it('sends explicit effort changes from the state bar', () => {
+    const onUpgradeModel = vi.fn();
+    renderStateBar({
+      availableModels: pickerModels,
+      onUpgradeModel,
+      conversation: makeConversation({ effort: null }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
+    fireEvent.click(screen.getByRole('option', { name: 'High' }));
+
+    expect(onUpgradeModel).toHaveBeenCalledWith('claude-sonnet-5', 'high');
+  });
+
+  it('resets effort to model default when switching models', () => {
+    const onUpgradeModel = vi.fn();
+    renderStateBar({
+      availableModels: pickerModels,
+      onUpgradeModel,
+      conversation: makeConversation({ effort: 'high' }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
+    fireEvent.click(screen.getByRole('option', { name: /claude-opus-4-7/i }));
+
+    expect(onUpgradeModel).toHaveBeenCalledWith('claude-opus-4-7', null);
   });
 });

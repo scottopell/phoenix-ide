@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
 import { subscribeModels } from '../modelsPoller';
-import type { GitBranchEntry, ImageData, ModelsResponse, Project, TaskEntry } from '../api';
+import type { GitBranchEntry, ImageData, ModelEffort, ModelsResponse, Project, TaskEntry } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
@@ -12,6 +12,13 @@ const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
 const MAX_PROJECT_SUGGESTIONS = 5;
+
+function effortSupportedByModel(models: ModelsResponse | null, modelId: string | null, effort: ModelEffort | null): boolean {
+  if (!effort) return true;
+  const capabilities = models?.models.find((model) => model.id === modelId)?.effort_capabilities;
+  return capabilities?.support === 'supported' && capabilities.levels.includes(effort);
+}
+
 
 function readNewConversationDraft(): string {
   try {
@@ -153,6 +160,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [isGitDir, setIsGitDir] = useState<boolean | null>(null);
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
+  const [selectedEffort, setSelectedEffort] = useState<ModelEffort | null>(null);
   const [showAllModels, setShowAllModels] = useState(false);
   const [draft, setDraft] = useState(readNewConversationDraft);
   const [images, setImages] = useState<ImageData[]>([]);
@@ -209,6 +217,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
           ? prev
           : modelsData.default;
       });
+      setSelectedEffort(prev => effortSupportedByModel(modelsData, selectedModel, prev) ? prev : null);
     });
     api.getEnv().then(env => {
       setHomeDir(env.home_dir);
@@ -225,6 +234,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
   // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
+  useEffect(() => {
+    if (!effortSupportedByModel(models, selectedModel, selectedEffort)) {
+      setSelectedEffort(null);
+    }
+  }, [models, selectedModel, selectedEffort]);
   useEffect(() => { writeNewConversationDraft(draft); }, [draft]);
 
   // A new directory drops any prior workflow choice; the active workflow then
@@ -515,6 +529,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         submitText,
         messageId,
         selectedModel || undefined,
+        selectedEffort,
         images,
         submission.mode,
         submission.baseBranch,
@@ -556,6 +571,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
     models,
     selectedModel,
     setSelectedModel,
+    selectedEffort,
+    setSelectedEffort,
     showAllModels,
     setShowAllModels,
     draft,

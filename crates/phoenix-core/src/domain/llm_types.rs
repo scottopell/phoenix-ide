@@ -124,6 +124,49 @@ impl FromStr for ModelEffort {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum EffortSource {
+    NativeKnown,
+    NativeUnknown,
+    Explicit,
+    Unsupported,
+}
+
+impl EffortSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeKnown => "native_known",
+            Self::NativeUnknown => "native_unknown",
+            Self::Explicit => "explicit",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl FromStr for EffortSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "native_known" => Ok(Self::NativeKnown),
+            "native_unknown" => Ok(Self::NativeUnknown),
+            "explicit" => Ok(Self::Explicit),
+            "unsupported" => Ok(Self::Unsupported),
+            other => Err(format!("unknown effort source '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct EffectiveEffort {
+    pub source: EffortSource,
+    pub level: Option<ModelEffort>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmRequestTelemetry {
     pub conversation_id: String,

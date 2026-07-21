@@ -1520,6 +1520,7 @@ fn build_child_conversation(
         transcript_generation: 1,
         model: None,
         project_id: Some(project_id.to_string()),
+        effort: None,
         conv_mode,
         desired_base_branch: Some(base.to_string()),
         message_count: 0,

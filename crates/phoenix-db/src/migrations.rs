@@ -301,7 +301,22 @@ const MIGRATIONS: &[Migration] = &[
         name: "normalize_direct_turn_attachments",
         sql: MIGRATION_057,
     },
+    Migration {
+        version: 58,
+        name: "add_model_effort",
+        sql: MIGRATION_058,
+    },
 ];
+
+const MIGRATION_058: &str = r"
+ALTER TABLE conversations ADD COLUMN effort TEXT
+CHECK (effort IS NULL OR effort IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
+ALTER TABLE turn_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turn_usage ADD COLUMN effort_source TEXT NOT NULL DEFAULT 'native_unknown'
+CHECK (effort_source IN ('native_known', 'native_unknown', 'explicit', 'unsupported'));
+ALTER TABLE turn_usage ADD COLUMN effort_level TEXT
+CHECK (effort_level IS NULL OR effort_level IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
+";
 
 const MIGRATION_057: &str = r"
 CREATE TABLE IF NOT EXISTS durable_turn_submitted_images (

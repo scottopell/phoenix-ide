@@ -632,6 +632,7 @@ mod tests {
             archived: false,
             transcript_generation: 1,
             model: Some("mock".to_string()),
+            effort: None,
             project_id: None,
             conv_mode: ConvMode::Direct,
             desired_base_branch: None,

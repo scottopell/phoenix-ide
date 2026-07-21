@@ -79,11 +79,27 @@ export type { BashRingWindow } from './generated/BashRingWindow';
 export type { BashRingLine } from './generated/BashRingLine';
 import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
 
+export type ModelEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export type NativeDefaultCapability =
+  | { known: ModelEffort }
+  | 'unknown';
+
+export type EffortCapabilities =
+  | { support: 'unsupported' }
+  | { support: 'unknown' }
+  | {
+    support: 'supported';
+    levels: ModelEffort[];
+    native_default?: NativeDefaultCapability;
+  };
+
 export interface Conversation {
   id: string;
   slug: string;
   title?: string | null;
   model: string;
+  effort?: ModelEffort | null;
   cwd: string;
   created_at: string;
   updated_at: string;
@@ -703,6 +719,7 @@ export interface ModelInfo {
   description: string;
   context_window: number;
   recommended: boolean;
+  effort_capabilities?: EffortCapabilities;
 }
 
 export type CredentialStatus = 'not_configured' | 'valid' | 'required' | 'running' | 'failed';
@@ -1498,6 +1515,7 @@ export const api = {
     text: string,
     messageId: string,
     model?: string,
+    effort?: ModelEffort | null,
     images: ImageData[] = [],
     mode?: 'direct' | 'managed' | 'branch' | 'auto',
     baseBranch?: string | null,
@@ -1507,7 +1525,7 @@ export const api = {
     checkoutRef?: string | null,
     conversationId?: string,
   ): Promise<Conversation> {
-    const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
+    const body: Record<string, unknown> = { cwd, model, effort, text, message_id: messageId, images, mode };
     if (conversationId) {
       body['conversation_id'] = conversationId;
     }
@@ -2280,11 +2298,11 @@ export const api = {
     return resp.json();
   },
 
-  async upgradeModel(conversationId: string, model: string): Promise<void> {
+  async upgradeModel(conversationId: string, model: string, effort?: ModelEffort | null): Promise<void> {
     const resp = await fetch(`/api/conversations/${conversationId}/upgrade-model`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model }),
+      body: JSON.stringify({ model, effort }),
     });
     if (!resp.ok) {
       const err = await resp.json();
