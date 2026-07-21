@@ -241,6 +241,41 @@ function renderFindFragments(
   return fragments;
 }
 
+function renderedInlineTextLength(node: React.ReactNode): number {
+  let length = 0;
+  Children.forEach(node, (child) => {
+    if (typeof child === 'string' || typeof child === 'number') {
+      length += String(child).length;
+      return;
+    }
+    if (isValidElement<{ children?: React.ReactNode }>(child)) {
+      length += renderedInlineTextLength(child.props.children);
+    }
+  });
+  return length;
+}
+
+function isReactMarkdownInlineElement(
+  element: React.ReactElement<{
+    children?: React.ReactNode;
+    node?: { tagName?: string; type?: string };
+  }>,
+): boolean {
+  return ['a', 'code', 'strong', 'em', 'del', 'span'].includes(element.props.node?.tagName ?? '');
+}
+
+function isDecoratableInlineElement(
+  element: React.ReactElement<{
+    children?: React.ReactNode;
+    node?: { tagName?: string; type?: string };
+  }>,
+): boolean {
+  if (element.type === 'mark') return false;
+  if (isReactMarkdownInlineElement(element)) return true;
+  return typeof element.type === 'string'
+    && ['a', 'code', 'strong', 'em', 'del', 'span'].includes(element.type);
+}
+
 function decorateFindChildren(
   children: React.ReactNode,
   matches: readonly { start: number; end: number; occurrenceIndex: number }[],
@@ -248,19 +283,24 @@ function decorateFindChildren(
 ): React.ReactNode {
   let cursor = 0;
   const decorate = (node: React.ReactNode): React.ReactNode => Children.map(node, (child) => {
-    if (typeof child === 'string') {
+    if (typeof child === 'string' || typeof child === 'number') {
+      const text = String(child);
       const start = cursor;
-      cursor += child.length;
+      cursor += text.length;
       const localMatches = matches
         .filter((match) => match.start < cursor && match.end > start)
         .map((match) => ({
           ...match,
           start: Math.max(0, match.start - start),
-          end: Math.min(child.length, match.end - start),
+          end: Math.min(text.length, match.end - start),
         }));
-      return localMatches.length > 0 ? renderFindFragments(child, localMatches, activeOccurrence) : child;
+      return localMatches.length > 0 ? renderFindFragments(text, localMatches, activeOccurrence) : child;
     }
-    if (!isValidElement<{ children?: React.ReactNode }>(child)) return child;
+    if (!isValidElement<{ children?: React.ReactNode; node?: { tagName?: string; type?: string } }>(child)) return child;
+    if (!isDecoratableInlineElement(child)) {
+      cursor += renderedInlineTextLength(child.props.children);
+      return child;
+    }
     return cloneElement(child, {}, decorate(child.props.children));
   });
   return decorate(children);

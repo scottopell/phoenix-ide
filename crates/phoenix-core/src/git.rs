@@ -7,12 +7,31 @@
 
 use std::path::Path;
 
+const NONINTERACTIVE_GIT_CONFIG: &[(&str, &str)] = &[
+    ("commit.gpgsign", "false"),
+    ("tag.gpgSign", "false"),
+    ("core.editor", "true"),
+    ("core.pager", "cat"),
+];
+
+const NONINTERACTIVE_GIT_ENV: &[(&str, &str)] = &[
+    ("GIT_EDITOR", "true"),
+    ("VISUAL", "true"),
+    ("EDITOR", "true"),
+    ("GIT_PAGER", "cat"),
+    ("PAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+];
+
+const REMOVED_INTERACTIVE_GIT_ENV: &[&str] = &["GIT_ASKPASS", "SSH_ASKPASS"];
+
 /// Construct a Git subprocess with Phoenix's process-level safety defaults.
 ///
-/// The environment override takes precedence over system, global, and local
-/// Git configuration without modifying any of them. Every statically spawned
-/// Git process in Phoenix goes through this constructor so even repository
-/// setup in tests cannot invoke an interactive signing agent.
+/// The environment and command-line configuration overrides take precedence over
+/// system, global, local, and inherited process configuration without modifying
+/// any of them. Every statically spawned Git process in Phoenix goes through this
+/// constructor so repository setup in tests and production Git probes cannot
+/// invoke an interactive editor, pager, prompt, or signing agent.
 #[must_use]
 pub fn command() -> std::process::Command {
     command_with_config(&[])
@@ -20,10 +39,11 @@ pub fn command() -> std::process::Command {
 
 /// Construct a safe Git subprocess with additional process-level configuration.
 ///
-/// Valid inherited `GIT_CONFIG_*` entries are preserved. Additional entries and
-/// `commit.gpgsign=false` are applied as command-line `-c` arguments, which take
-/// precedence over inherited `GIT_CONFIG_PARAMETERS` without discarding unrelated
-/// parameters. Malformed inherited indexed configuration is discarded as a unit.
+/// Valid inherited `GIT_CONFIG_*` entries are preserved. Additional entries are
+/// applied before Phoenix's noninteractive defaults as command-line `-c`
+/// arguments, which take precedence over inherited `GIT_CONFIG_PARAMETERS`
+/// without discarding unrelated parameters. Malformed inherited indexed
+/// configuration is discarded as a unit.
 #[must_use]
 pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
     let mut command = std::process::Command::new("git");
@@ -36,10 +56,14 @@ pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
     if let Some(count) = inherited.filter(|count| *count > 0) {
         command.env("GIT_CONFIG_COUNT", count.to_string());
     }
-    for &(key, value) in config
-        .iter()
-        .chain(std::iter::once(&("commit.gpgsign", "false")))
-    {
+    for &(key, value) in NONINTERACTIVE_GIT_ENV {
+        command.env(key, value);
+    }
+    for &key in REMOVED_INTERACTIVE_GIT_ENV {
+        command.env_remove(key);
+    }
+
+    for &(key, value) in config.iter().chain(NONINTERACTIVE_GIT_CONFIG.iter()) {
         command.arg("-c").arg(format!("{key}={value}"));
     }
     command
@@ -250,6 +274,25 @@ fn git_capture(path: &Path, args: &[&str]) -> Option<String> {
 mod command_tests {
     use super::*;
 
+    fn noninteractive_config_args() -> Vec<std::ffi::OsString> {
+        NONINTERACTIVE_GIT_CONFIG
+            .iter()
+            .flat_map(|(key, value)| ["-c".into(), format!("{key}={value}").into()])
+            .collect()
+    }
+
+    fn command_sets_env(command: &std::process::Command, name: &str, value: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(key, env_value)| key == name && env_value == Some(std::ffi::OsStr::new(value)))
+    }
+
+    fn command_removes_env(command: &std::process::Command, name: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(key, env_value)| key == name && env_value.is_none())
+    }
+
     #[test]
     fn config_key_validation_rejects_keys_git_cannot_parse() {
         assert!(is_valid_config_key("commit.gpgsign"));
@@ -261,14 +304,14 @@ mod command_tests {
     }
 
     #[test]
-    fn command_preserves_config_parameters_and_overrides_signing_on_command_line() {
+    fn command_preserves_config_parameters_and_applies_noninteractive_config_on_command_line() {
         let command = command();
         assert!(!command
             .get_envs()
             .any(|(key, _)| key == "GIT_CONFIG_PARAMETERS"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["-c", "commit.gpgsign=false"]
+            noninteractive_config_args()
         );
     }
 
@@ -278,14 +321,96 @@ mod command_tests {
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [
-                "-c",
-                "fetch.prune=true",
-                "-c",
-                "commit.gpgsign=true",
-                "-c",
-                "commit.gpgsign=false",
+                "-c".into(),
+                "fetch.prune=true".into(),
+                "-c".into(),
+                "commit.gpgsign=true".into(),
             ]
+            .into_iter()
+            .chain(noninteractive_config_args())
+            .collect::<Vec<std::ffi::OsString>>()
         );
+    }
+
+    #[test]
+    fn command_overrides_interactive_editor_pager_and_prompt_environment() {
+        let command = command();
+        for &(name, value) in NONINTERACTIVE_GIT_ENV {
+            assert!(
+                command_sets_env(&command, name, value),
+                "expected {name}={value} override"
+            );
+        }
+        for &name in REMOVED_INTERACTIVE_GIT_ENV {
+            assert!(
+                command_removes_env(&command, name),
+                "expected {name} removal"
+            );
+        }
+    }
+
+    #[test]
+    fn command_disables_hostile_local_editor_configuration() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let marker = repo.path().join("editor-ran");
+        let hostile_editor = format!("sh -c 'echo editor-ran > {}'", marker.display());
+        let run = |args: &[&str]| {
+            let output = command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@phoenix"]);
+        run(&["config", "user.name", "Phoenix Test"]);
+        run(&["config", "core.editor", &hostile_editor]);
+        let output = command()
+            .args(["commit", "--allow-empty", "--quiet"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git runs");
+
+        assert!(
+            !output.status.success(),
+            "empty message commit should abort"
+        );
+        assert!(!marker.exists(), "git invoked a repository-local editor");
+    }
+
+    #[test]
+    fn command_disables_hostile_local_tag_signing_configuration() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let marker = repo.path().join("editor-ran");
+        let hostile_editor = format!("sh -c 'echo editor-ran > {}'", marker.display());
+        let run = |args: &[&str]| {
+            let output = command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@phoenix"]);
+        run(&["config", "user.name", "Phoenix Test"]);
+        run(&["commit", "--allow-empty", "--quiet", "-m", "base"]);
+        run(&["config", "core.editor", &hostile_editor]);
+        run(&["config", "tag.gpgSign", "true"]);
+        run(&["tag", "v1"]);
+
+        assert!(!marker.exists(), "git invoked an editor while tagging");
     }
 
     #[test]
