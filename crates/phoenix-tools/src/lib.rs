@@ -22,6 +22,7 @@ mod terminal_last_command;
 mod think;
 pub mod tmux;
 pub mod work_scope_inventory;
+mod wait_until;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
@@ -48,6 +49,7 @@ pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use terminal_command_history::TerminalCommandHistoryTool;
 pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
+pub use wait_until::WaitUntilTool;
 pub use tmux::{
     TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxRunTool, TmuxServer,
     TmuxTool,
@@ -217,6 +219,12 @@ pub struct ToolLlmUsage {
 /// the executor via the cancellation token, never returned by `Tool::run()`;
 /// a `Cancelled` variant here would just relocate the wrong-state problem
 /// into this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutputDisposition {
+    Continue,
+    ParkAfterWakeRegistration,
+}
+
 #[derive(Debug, Clone)]
 pub enum ToolOutput {
     Success {
@@ -226,12 +234,14 @@ pub enum ToolOutput {
         images: Vec<ToolImage>,
         display_data: Option<Value>,
         llm_usage: Option<Box<ToolLlmUsage>>,
+        disposition: ToolOutputDisposition,
     },
     Error {
         output: String,
         images: Vec<ToolImage>,
         display_data: Option<Value>,
         llm_usage: Option<Box<ToolLlmUsage>>,
+        disposition: ToolOutputDisposition,
     },
 }
 
@@ -242,6 +252,7 @@ impl ToolOutput {
             images: vec![],
             display_data: None,
             llm_usage: None,
+            disposition: ToolOutputDisposition::Continue,
         }
     }
 
@@ -251,6 +262,7 @@ impl ToolOutput {
             images: vec![],
             display_data: None,
             llm_usage: None,
+            disposition: ToolOutputDisposition::Continue,
         }
     }
 
@@ -289,6 +301,16 @@ impl ToolOutput {
                 llm_usage.take().map(|usage| *usage)
             }
         }
+    }
+
+    #[must_use]
+    pub fn with_disposition(mut self, disposition: ToolOutputDisposition) -> Self {
+        match &mut self {
+            Self::Success { disposition: slot, .. } | Self::Error { disposition: slot, .. } => {
+                *slot = disposition;
+            }
+        }
+        self
     }
 
     #[must_use]
@@ -335,6 +357,14 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 display_data.as_ref()
             }
+        }
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn disposition(&self) -> ToolOutputDisposition {
+        match self {
+            Self::Success { disposition, .. } | Self::Error { disposition, .. } => *disposition,
         }
     }
 }
@@ -819,6 +849,7 @@ fn read_only_tools() -> Vec<Arc<dyn Tool>> {
 fn write_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BashTool),
+        Arc::new(WaitUntilTool),
         Arc::new(PatchTool::default()),
         Arc::new(TmuxRunTool),
         Arc::new(TmuxTool),
@@ -1228,6 +1259,18 @@ mod tests {
         assert!(!e.is_success());
         assert_eq!(e.output(), "boom");
         assert!(matches!(e, ToolOutput::Error { .. }));
+    }
+
+    #[test]
+    fn tool_output_disposition_defaults_to_continue_and_can_be_overridden() {
+        assert_eq!(ToolOutput::success("ok").disposition(), ToolOutputDisposition::Continue);
+        assert_eq!(
+            ToolOutput::success("ok")
+                .with_disposition(ToolOutputDisposition::ParkAfterWakeRegistration)
+                .disposition(),
+            ToolOutputDisposition::ParkAfterWakeRegistration
+        );
+        assert_eq!(ToolOutput::error("boom").disposition(), ToolOutputDisposition::Continue);
     }
 
     fn names(registry: &ToolRegistry) -> BTreeSet<String> {

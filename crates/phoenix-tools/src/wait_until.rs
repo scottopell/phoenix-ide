@@ -1,0 +1,453 @@
+use crate::bash::handle::{HandleId, HandleState};
+use crate::{work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput, ToolOutputDisposition};
+use async_trait::async_trait;
+use phoenix_workflow::wake_profile::{BashResourceIdentity, WakeResourceIdentity};
+use phoenix_workflow::Timestamp;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const WAKE_DEFAULT_SECONDS: u64 = 600;
+const WAKE_MAX_SECONDS: u64 = 1800;
+const CONDITION_HANDLE_TERMINAL: &str = "HandleTerminal";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitUntilInput {
+    handle: HandleRef,
+    condition: String,
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum HandleRef {
+    Bash { id: String },
+    TmuxPane { id: String },
+    SubAgent { id: String },
+}
+
+pub struct WaitUntilTool;
+
+#[async_trait]
+impl Tool for WaitUntilTool {
+    fn name(&self) -> &'static str {
+        "wait_until"
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "Registers a durable wake contract instead of polling. Use when you have nothing else to do until a known handle reaches a terminal state. Input: wait_until {{ handle: {{ kind, id }}, condition, max_wait_seconds }}. V1 supports only condition=\"{CONDITION_HANDLE_TERMINAL}\". This Bash-first slice accepts only handle.kind=\"Bash\" and rejects other handle kinds explicitly. max_wait_seconds defaults to {WAKE_DEFAULT_SECONDS} and is capped at {WAKE_MAX_SECONDS}. Success returns an immediate registration receipt and parks the turn until Phoenix delivers the later terminal result; registration errors do not park."
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "description": format!("Register a wake contract: wait_until {{ handle: {{ kind, id }}, condition, max_wait_seconds }}. V1 supports only condition=\"{CONDITION_HANDLE_TERMINAL}\". This slice accepts only handle.kind=\"Bash\"."),
+            "properties": {
+                "handle": {
+                    "type": "object",
+                    "description": "Tagged handle reference. V1 accepts { kind: \"Bash\", id } in this first slice.",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["Bash", "TmuxPane", "SubAgent"]
+                        },
+                        "id": {
+                            "type": "string",
+                            "description": "Handle identifier within the tagged kind."
+                        }
+                    },
+                    "required": ["kind", "id"]
+                },
+                "condition": {
+                    "type": "string",
+                    "enum": [CONDITION_HANDLE_TERMINAL],
+                    "description": "Wake condition to watch for. V1 supports only HandleTerminal."
+                },
+                "max_wait_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": WAKE_MAX_SECONDS,
+                    "description": format!("Maximum lifetime of the wake contract in seconds. Defaults to {WAKE_DEFAULT_SECONDS}; capped at {WAKE_MAX_SECONDS}.")
+                }
+            },
+            "required": ["handle", "condition"]
+        })
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let parsed: WaitUntilInput = match serde_json::from_value(input) {
+            Ok(parsed) => parsed,
+            Err(err) => return ToolOutput::error(format!("Invalid input: {err}")),
+        };
+        if parsed.condition != CONDITION_HANDLE_TERMINAL {
+            return ToolOutput::error(format!(
+                "Unsupported condition {:?}; v1 supports only {CONDITION_HANDLE_TERMINAL}",
+                parsed.condition
+            ));
+        }
+        let Some(tool_use_id) = ctx.tool_use_id() else {
+            return ToolOutput::error("wait_until requires a typed tool_use_id in ToolContext");
+        };
+        let Some(registrar) = ctx.wake_registrar() else {
+            return ToolOutput::error("wait_until requires wake registrar support in ToolContext");
+        };
+        let registration_scope = match work_scope_identity(&ctx.work_scope) {
+            Ok(scope) => scope,
+            Err(err) => return ToolOutput::error(err),
+        };
+
+        let (resource, handle_id) = match parsed.handle {
+            HandleRef::Bash { id } => {
+                let table = match ctx.bash_handles().await {
+                    Ok(table) => table,
+                    Err(err) => return ToolOutput::error(format!("Failed to access bash handles: {err}")),
+                };
+                let handle = {
+                    let guard = table.read().await;
+                    guard.get(&HandleId::new(id.clone()))
+                };
+                let Some(handle) = handle else {
+                    return ToolOutput::error(format!(
+                        "bash handle {id:?} was not found in this work scope"
+                    ));
+                };
+                if matches!(handle.state().await.as_ref(), HandleState::Tombstoned(_)) {
+                    return ToolOutput::error(format!(
+                        "bash handle {id:?} is already terminal; wait_until requires a live handle"
+                    ));
+                }
+                (
+                    WakeResourceIdentity::Bash(BashResourceIdentity {
+                        work_scope: registration_scope.clone(),
+                        handle_id: id.clone(),
+                    }),
+                    id,
+                )
+            }
+            HandleRef::TmuxPane { id } => {
+                return ToolOutput::error(format!(
+                    "Unsupported handle kind \"TmuxPane\" for wait_until v1 Bash-first slice (id={id})"
+                ));
+            }
+            HandleRef::SubAgent { id } => {
+                return ToolOutput::error(format!(
+                    "Unsupported handle kind \"SubAgent\" for wait_until v1 Bash-first slice (id={id})"
+                ));
+            }
+        };
+
+        let max_wait_seconds = parsed.max_wait_seconds.unwrap_or(WAKE_DEFAULT_SECONDS);
+        if max_wait_seconds > WAKE_MAX_SECONDS {
+            return ToolOutput::error(format!(
+                "max_wait_seconds {max_wait_seconds} exceeds WAKE_MAX_SECONDS {WAKE_MAX_SECONDS}"
+            ));
+        }
+
+        let registered_at = now_timestamp();
+        let expires_at = Timestamp(registered_at.0.saturating_add(max_wait_seconds));
+        let prepared_fingerprint = registration_fingerprint(
+            &ctx.conversation_id,
+            &ctx.root_conversation_id,
+            tool_use_id,
+            &resource,
+            expires_at,
+        );
+        let contract_id = format!("wake-{}", &prepared_fingerprint[..16]);
+
+        let register_input = RegisterWakeInput {
+            contract_id: contract_id.clone(),
+            conversation_id: ctx.conversation_id.clone(),
+            root_conversation_id: ctx.root_conversation_id.clone(),
+            registering_tool_use_id: tool_use_id.to_string(),
+            registration_scope,
+            resource: resource.clone(),
+            expires_at,
+            prepared_fingerprint: prepared_fingerprint.clone(),
+        };
+
+        match registrar.register(register_input).await {
+            Ok(RegisteredWake::Registered { workflow_id }) | Ok(RegisteredWake::Replayed { workflow_id }) => {
+                let receipt = json!({
+                    "status": "registered",
+                    "contract_id": contract_id,
+                    "workflow_id": workflow_id.0,
+                    "handle": { "kind": "Bash", "id": handle_id },
+                    "condition": CONDITION_HANDLE_TERMINAL,
+                    "max_wait_seconds": max_wait_seconds,
+                    "expires_at": expires_at.0,
+                    "prepared_fingerprint": prepared_fingerprint,
+                });
+                ToolOutput::success(receipt.to_string())
+                    .with_display(receipt)
+                    .with_disposition(ToolOutputDisposition::ParkAfterWakeRegistration)
+            }
+            Ok(RegisteredWake::Conflict) => ToolOutput::error(
+                "wait_until registration conflicted with an existing wake contract",
+            ),
+            Ok(other) => ToolOutput::error(format!(
+                "wait_until registration failed with unexpected registrar outcome: {other:?}"
+            )),
+            Err(err) => ToolOutput::error(format!("wait_until registration failed: {err}")),
+        }
+    }
+}
+
+fn now_timestamp() -> Timestamp {
+    Timestamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+}
+
+fn registration_fingerprint(
+    conversation_id: &str,
+    root_conversation_id: &str,
+    tool_use_id: &str,
+    resource: &WakeResourceIdentity,
+    expires_at: Timestamp,
+) -> String {
+    let canonical = serde_json::json!({
+        "tool": "wait_until",
+        "conversation_id": conversation_id,
+        "root_conversation_id": root_conversation_id,
+        "tool_use_id": tool_use_id,
+        "resource": resource,
+        "condition": CONDITION_HANDLE_TERMINAL,
+        "expires_at": expires_at.0,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bash::handle::Handle;
+    use crate::bash::ring::RING_BUFFER_BYTES;
+    use crate::{BashHandleRegistry, BrowserSessionManager, RegisteredWake, TmuxRegistry, WakeRegistrar};
+    use phoenix_workflow::wake_profile::WorkScopeIdentity;
+    use phoenix_workflow::WorkflowId;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
+
+    struct MockWakeRegistrar {
+        inputs: Mutex<Vec<RegisterWakeInput>>,
+        outcome: Mutex<Result<RegisteredWake, String>>,
+    }
+
+    impl MockWakeRegistrar {
+        fn new(outcome: Result<RegisteredWake, String>) -> Arc<Self> {
+            Arc::new(Self {
+                inputs: Mutex::new(Vec::new()),
+                outcome: Mutex::new(outcome),
+            })
+        }
+
+        fn calls(&self) -> Vec<RegisterWakeInput> {
+            self.inputs.lock().expect("inputs lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl WakeRegistrar for MockWakeRegistrar {
+        async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String> {
+            self.inputs.lock().expect("inputs lock").push(input);
+            self.outcome.lock().expect("outcome lock").clone()
+        }
+
+        async fn cancel(&self, _input: crate::CancelWakeInput) -> Result<RegisteredWake, String> {
+            Ok(RegisteredWake::CancelStale)
+        }
+    }
+
+    fn ctx(registrar: Option<Arc<dyn WakeRegistrar>>) -> ToolContext {
+        ToolContext::new(
+            CancellationToken::new(),
+            "conv-wait".to_string(),
+            PathBuf::from("/tmp"),
+            BrowserSessionManager::new(),
+            Arc::new(BashHandleRegistry::new()),
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(TmuxRegistry::new()),
+            Some(PathBuf::from("/tmp/worktree")),
+        )
+        .with_root_conversation_id("root-wait".to_string())
+        .with_tool_use_id("tool-wait")
+        .with_wake_registrar(registrar)
+    }
+
+    async fn insert_live_handle(ctx: &ToolContext, id: &str) {
+        let table: Arc<RwLock<crate::BashWorkScopeHandles>> = ctx.bash_handles().await.expect("table");
+        let mut guard = table.write().await;
+        guard.insert(Handle::new_live(
+            ctx.work_scope.clone(),
+            HandleId::new(id.to_string()),
+            "sleep 10".into(),
+            None,
+            123,
+            123,
+            RING_BUFFER_BYTES,
+        ));
+    }
+
+    async fn insert_tombstoned_handle(ctx: &ToolContext, id: &str) {
+        let table = ctx.bash_handles().await.expect("table");
+        let mut guard = table.write().await;
+        let handle = guard.insert(Handle::new_live(
+            ctx.work_scope.clone(),
+            HandleId::new(id.to_string()),
+            "true".into(),
+            None,
+            123,
+            123,
+            RING_BUFFER_BYTES,
+        ));
+        drop(guard);
+        handle
+            .transition_to_terminal(
+                crate::bash::handle::FinalCause::Exited { exit_code: Some(0) },
+                std::time::Duration::from_secs(1),
+                SystemTime::now(),
+                crate::bash::handle::TOMBSTONE_TAIL_LINES,
+            )
+            .await;
+    }
+
+    fn parse(out: &ToolOutput) -> Value {
+        out.display_data()
+            .cloned()
+            .or_else(|| serde_json::from_str(out.output()).ok())
+            .expect("json output")
+    }
+
+    #[test]
+    fn schema_exposes_tagged_handle_and_timeout_cap() {
+        let schema = WaitUntilTool.input_schema();
+        assert_eq!(schema["required"], json!(["handle", "condition"]));
+        assert_eq!(schema["properties"]["handle"]["required"], json!(["kind", "id"]));
+        assert_eq!(schema["properties"]["handle"]["properties"]["kind"]["enum"], json!(["Bash", "TmuxPane", "SubAgent"]));
+        assert_eq!(schema["properties"]["condition"]["enum"], json!([CONDITION_HANDLE_TERMINAL]));
+        assert_eq!(schema["properties"]["max_wait_seconds"]["maximum"], json!(WAKE_MAX_SECONDS));
+    }
+
+    #[tokio::test]
+    async fn missing_bash_handle_is_normative_error() {
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(7) }));
+        let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-missing"}, "condition": CONDITION_HANDLE_TERMINAL}), ctx(Some(registrar))).await;
+        assert!(!out.is_success());
+        assert_eq!(out.disposition(), ToolOutputDisposition::Continue);
+        assert!(out.output().contains("was not found in this work scope"));
+    }
+
+    #[tokio::test]
+    async fn foreign_bash_handle_is_not_visible_across_work_scope() {
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(7) }));
+        let foreign = ctx(None);
+        insert_live_handle(&foreign, "b-foreign").await;
+        let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-foreign"}, "condition": CONDITION_HANDLE_TERMINAL}), ctx(Some(registrar))).await;
+        assert!(!out.is_success());
+        assert!(out.output().contains("was not found in this work scope"));
+    }
+
+    #[tokio::test]
+    async fn terminal_bash_handle_is_rejected_without_consuming_output() {
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(7) }));
+        let context = ctx(Some(registrar));
+        insert_tombstoned_handle(&context, "b-done").await;
+        let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-done"}, "condition": CONDITION_HANDLE_TERMINAL}), context).await;
+        assert!(!out.is_success());
+        assert!(out.output().contains("already terminal"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_kinds_are_rejected_explicitly() {
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(7) }));
+        let out = WaitUntilTool.run(json!({"handle": {"kind": "TmuxPane", "id": "%1"}, "condition": CONDITION_HANDLE_TERMINAL}), ctx(Some(registrar))).await;
+        assert!(!out.is_success());
+        assert!(out.output().contains("Unsupported handle kind \"TmuxPane\""));
+    }
+
+    #[tokio::test]
+    async fn registration_invocation_passes_deterministic_identity() {
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(11) }));
+        let context = ctx(Some(registrar.clone()));
+        insert_live_handle(&context, "b-1").await;
+        let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-1"}, "condition": CONDITION_HANDLE_TERMINAL, "max_wait_seconds": 42}), context.clone()).await;
+        assert!(out.is_success(), "{}", out.output());
+        assert_eq!(out.disposition(), ToolOutputDisposition::ParkAfterWakeRegistration);
+        let calls = registrar.calls();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.conversation_id, "conv-wait");
+        assert_eq!(call.root_conversation_id, "root-wait");
+        assert_eq!(call.registering_tool_use_id, "tool-wait");
+        assert_eq!(call.registration_scope, WorkScopeIdentity { kind: phoenix_workflow::wake_profile::WorkScopeKind::Worktree, stable_key: "/tmp/worktree".to_string() });
+        assert_eq!(call.resource, WakeResourceIdentity::Bash(BashResourceIdentity { work_scope: call.registration_scope.clone(), handle_id: "b-1".to_string() }));
+        assert_eq!(call.contract_id, format!("wake-{}", &call.prepared_fingerprint[..16]));
+        let receipt = parse(&out);
+        assert_eq!(receipt["workflow_id"], 11);
+        assert_eq!(receipt["handle"]["kind"], "Bash");
+        assert_eq!(receipt["max_wait_seconds"], 42);
+    }
+
+    #[tokio::test]
+    async fn replay_and_conflict_map_to_park_or_continue() {
+        let replay = MockWakeRegistrar::new(Ok(RegisteredWake::Replayed { workflow_id: WorkflowId(13) }));
+        let replay_ctx = ctx(Some(replay.clone()));
+        insert_live_handle(&replay_ctx, "b-2").await;
+        let replay_out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-2"}, "condition": CONDITION_HANDLE_TERMINAL}), replay_ctx).await;
+        assert!(replay_out.is_success());
+        assert_eq!(replay_out.disposition(), ToolOutputDisposition::ParkAfterWakeRegistration);
+
+        let conflict = MockWakeRegistrar::new(Ok(RegisteredWake::Conflict));
+        let conflict_ctx = ctx(Some(conflict.clone()));
+        insert_live_handle(&conflict_ctx, "b-3").await;
+        let conflict_out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-3"}, "condition": CONDITION_HANDLE_TERMINAL}), conflict_ctx).await;
+        assert!(!conflict_out.is_success());
+        assert_eq!(conflict_out.disposition(), ToolOutputDisposition::Continue);
+        assert!(conflict_out.output().contains("conflicted"));
+    }
+
+    #[tokio::test]
+    async fn registrar_error_does_not_park() {
+        let registrar = MockWakeRegistrar::new(Err("db down".to_string()));
+        let context = ctx(Some(registrar));
+        insert_live_handle(&context, "b-4").await;
+        let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-4"}, "condition": CONDITION_HANDLE_TERMINAL}), context).await;
+        assert!(!out.is_success());
+        assert_eq!(out.disposition(), ToolOutputDisposition::Continue);
+        assert!(out.output().contains("db down"));
+    }
+
+    #[tokio::test]
+    async fn missing_registrar_or_tool_use_id_fail_without_registration() {
+        let context = ToolContext::new(
+            CancellationToken::new(),
+            "conv-wait".to_string(),
+            PathBuf::from("/tmp"),
+            BrowserSessionManager::new(),
+            Arc::new(BashHandleRegistry::new()),
+            Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(TmuxRegistry::new()),
+            Some(PathBuf::from("/tmp/worktree")),
+        );
+        let no_registrar = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-1"}, "condition": CONDITION_HANDLE_TERMINAL}), context.clone().with_tool_use_id("tool-only")).await;
+        assert!(!no_registrar.is_success());
+        assert!(no_registrar.output().contains("wake registrar"));
+        let no_tool_use = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-1"}, "condition": CONDITION_HANDLE_TERMINAL}), context.with_wake_registrar(Some(MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(1) }))))).await;
+        assert!(!no_tool_use.is_success());
+        assert!(no_tool_use.output().contains("tool_use_id"));
+    }
+}
