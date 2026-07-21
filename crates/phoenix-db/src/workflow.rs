@@ -798,8 +798,7 @@ impl<'a> WorkflowTx<'a> {
         match insert_attempt {
             Ok(_) => {}
             Err(sqlx::Error::Database(error))
-                if is_sqlite_busy_retryable(error.as_ref())
-                    || is_sqlite_unique_constraint(error.as_ref())
+                if is_sqlite_unique_constraint(error.as_ref())
                     || is_sqlite_primary_key_constraint(error.as_ref()) =>
             {
                 return Ok(BeginAttemptResult {
