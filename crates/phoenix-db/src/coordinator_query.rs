@@ -20,6 +20,13 @@ const ALLOWED_SCHEMA: &[&str] = &[
     "message_files",
     "message_images",
     "messages",
+    "message_fts",
+    "message_fts_content",
+    "message_fts_config",
+    "message_fts_data",
+    "message_fts_docsize",
+    "message_fts_idx",
+    "message_fts_rows",
     "projects",
     "steering_messages",
     "sub_agent_personas",
@@ -52,6 +59,13 @@ const ALLOWED_SCHEMA: &[&str] = &[
     "workflow_supported_codecs",
     "workflow_transitions",
     "workflows",
+];
+
+const DENIED_COLUMNS: &[(&str, &str)] = &[
+    ("conversation_creation_jobs", "claim_token"),
+    ("conversation_creation_jobs", "cleanup_token"),
+    ("wake_bindings", "tmux_server_token"),
+    ("wake_terminal_receipts", "tmux_server_token"),
 ];
 
 const DENIED_TABLES: &[&str] = &[
@@ -157,6 +171,11 @@ pub fn execute_coordinator_query(
     });
     unsafe {
         ffi::sqlite3_extended_result_codes(connection.0, 1);
+        ffi::sqlite3_limit(
+            connection.0,
+            ffi::SQLITE_LIMIT_LENGTH,
+            i32::try_from(MAX_BYTES).unwrap_or(i32::MAX),
+        );
         ffi::sqlite3_set_authorizer(connection.0, Some(authorize), (&raw mut *authorizer).cast());
         ffi::sqlite3_progress_handler(
             connection.0,
@@ -254,8 +273,14 @@ unsafe extern "C" fn authorize(
     let detail = unsafe { optional_c_string(arg2) };
     let allowed = match action {
         ffi::SQLITE_SELECT | ffi::SQLITE_RECURSIVE => true,
-        ffi::SQLITE_READ => object.as_deref().is_some_and(table_allowed),
+        ffi::SQLITE_READ => object
+            .as_deref()
+            .zip(detail.as_deref())
+            .is_some_and(|(table, column)| column_allowed(table, column)),
         ffi::SQLITE_FUNCTION => detail.as_deref().is_some_and(function_allowed),
+        ffi::SQLITE_PRAGMA => object
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("data_version")),
         _ => false,
     };
     if allowed {
@@ -278,12 +303,13 @@ unsafe extern "C" fn check_progress(user_data: *mut c_void) -> c_int {
     i32::from(Instant::now() >= state.deadline)
 }
 
-fn table_allowed(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    ALLOWED_SCHEMA.contains(&lower.as_str())
-        && !DENIED_TABLES.contains(&lower.as_str())
-        && !lower.starts_with("sqlite_")
-        && !lower.starts_with("message_fts_")
+fn column_allowed(table: &str, column: &str) -> bool {
+    let table = table.to_ascii_lowercase();
+    let column = column.to_ascii_lowercase();
+    ALLOWED_SCHEMA.contains(&table.as_str())
+        && !DENIED_TABLES.contains(&table.as_str())
+        && !table.starts_with("sqlite_")
+        && !DENIED_COLUMNS.contains(&(table.as_str(), column.as_str()))
 }
 
 fn function_allowed(name: &str) -> bool {
@@ -316,6 +342,7 @@ fn function_allowed(name: &str) -> bool {
             | "like"
             | "lower"
             | "ltrim"
+            | "match"
             | "max"
             | "min"
             | "nullif"
@@ -408,10 +435,10 @@ fn read_cell(statement: *mut ffi::sqlite3_stmt, index: c_int) -> CoordinatorCell
             CoordinatorCell::Real(unsafe { ffi::sqlite3_column_double(statement, index) })
         }
         ffi::SQLITE_TEXT => {
+            let value = unsafe { ffi::sqlite3_column_text(statement, index) };
             let bytes =
                 usize::try_from(unsafe { ffi::sqlite3_column_bytes(statement, index) }.max(0))
                     .unwrap_or_default();
-            let value = unsafe { ffi::sqlite3_column_text(statement, index) };
             if value.is_null() {
                 CoordinatorCell::Null
             } else {
@@ -471,7 +498,7 @@ mod tests {
         let path = dir.path().join("query.db");
         let db = rusqlite_for_test(&path);
         db.execute_batch(
-            "CREATE TABLE conversations(id TEXT, state TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_executing\"}', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
+            "CREATE TABLE conversations(id TEXT, state TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_executing\"}', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
         )
         .unwrap();
         (dir, path)
@@ -541,6 +568,7 @@ mod tests {
         for sql in [
             "SELECT * FROM auth_sessions",
             "SELECT * FROM future_secret_store",
+            "SELECT claim_token FROM conversation_creation_jobs",
             "UPDATE conversations SET id = 'changed'",
             "ATTACH DATABASE '/tmp/other.db' AS other",
             "PRAGMA query_only",
@@ -557,6 +585,17 @@ mod tests {
             execute_coordinator_query(path.to_str().unwrap(), "SELECT 1; SELECT 2"),
             Err(CoordinatorQueryError::MultipleStatements)
         ));
+    }
+
+    #[test]
+    fn allows_non_secret_columns_in_partially_sensitive_tables() {
+        let (_dir, path) = fixture();
+        let result = execute_coordinator_query(
+            path.to_str().unwrap(),
+            "SELECT status FROM conversation_creation_jobs",
+        )
+        .unwrap();
+        assert_eq!(result.columns, ["status"]);
     }
 
     #[test]
@@ -579,6 +618,19 @@ mod tests {
     }
 
     #[test]
+    fn allows_fts_queries_through_required_shadow_reads() {
+        let (_dir, path) = fixture();
+        let db = rusqlite_for_test(&path);
+        db.execute_batch("CREATE VIRTUAL TABLE message_fts USING fts5(text); INSERT INTO message_fts(text) VALUES ('wake progress');").unwrap();
+        let result = execute_coordinator_query(
+            path.to_str().unwrap(),
+            "SELECT text FROM message_fts WHERE message_fts MATCH 'wake'",
+        )
+        .unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
     fn bounds_rows_bytes_and_recursive_work() {
         let (_dir, path) = fixture();
         let rows = execute_coordinator_query(
@@ -592,7 +644,10 @@ mod tests {
         let bytes =
             execute_coordinator_query(path.to_str().unwrap(), "SELECT printf('%.*c', 70000, 'x')")
                 .unwrap();
-        assert!(bytes.rows.is_empty());
-        assert!(bytes.truncated);
+        assert!(!bytes
+            .rows
+            .iter()
+            .flatten()
+            .any(|cell| matches!(cell, CoordinatorCell::Text(value) if value.len() > MAX_BYTES)));
     }
 }

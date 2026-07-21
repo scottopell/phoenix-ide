@@ -126,18 +126,22 @@ SELECT c.id AS current_conversation_id,
        c.archived, c.user_initiated, c.parent_conversation_id,
        c.cm_task_id, c.cm_task_title, c.cm_branch_name, c.cm_base_branch
 FROM leaves JOIN conversations c ON c.id = leaves.current_id
-WHERE c.id NOT IN (SELECT conversation_id FROM coordinator)
+WHERE leaves.root_id NOT IN (SELECT conversation_id FROM coordinator)
 ORDER BY CASE WHEN json_extract(c.state, '$.type') IN
-  ('llm_requesting','streaming','tool_executing','executing','sub_agents_running','awaiting_tool_result')
+  ('llm_request','llm_stream','tool_execution','executing','sub_agents_running')
   THEN 0 ELSE 1 END,
   c.updated_at DESC
-LIMIT 40
+LIMIT 41
 ";
-        let result = self
+        let mut result = self
             .db
             .coordinator_query(SNAPSHOT_SQL)
             .await
             .map_err(|error| error.to_string())?;
+        if result.rows.len() > 40 {
+            result.rows.truncate(40);
+            result.truncated = true;
+        }
         let data = serde_json::to_string_pretty(&result)
             .map_err(|error| format!("failed to encode Coordinator snapshot: {error}"))?;
         Ok(format!(
@@ -995,11 +999,14 @@ mod tests {
         db.create_conversation("leaf", "leaf", "/tmp", true, None, None)
             .await
             .unwrap();
+        db.create_conversation("idle", "idle", "/tmp", true, None, None)
+            .await
+            .unwrap();
         sqlx::query("UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'root'")
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET state = '{\"type\":\"tool_executing\"}', state_updated_at = '2026-07-21T12:00:00Z', updated_at = '2026-07-21T12:01:00Z', cm_task_id = '44008', cm_task_title = 'done task' WHERE id = 'leaf'")
+        sqlx::query("UPDATE conversations SET state = '{\"type\":\"tool_execution\"}', state_updated_at = '2026-07-21T12:00:00Z', updated_at = '2026-07-21T12:01:00Z', cm_task_id = '44008', cm_task_title = 'done task' WHERE id = 'leaf'")
             .execute(db.pool())
             .await
             .unwrap();
@@ -1010,8 +1017,14 @@ mod tests {
             .unwrap();
         assert!(snapshot.contains("root_conversation_id"));
         assert!(snapshot.contains("current_conversation_id"));
-        assert!(snapshot.contains("tool_executing"));
+        assert!(snapshot.contains("tool_execution"));
         assert!(snapshot.contains("44008"));
         assert!(snapshot.contains("done task"));
+        let active = snapshot.find("tool_execution").unwrap();
+        let idle = snapshot.find("\"idle\"").unwrap();
+        assert!(
+            active < idle,
+            "active continuation leaf must sort before idle roots"
+        );
     }
 }
