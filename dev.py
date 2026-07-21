@@ -5660,7 +5660,8 @@ def cmd_check(
                          for n in sorted(committed.keys() - exported.keys())]
             problems += [f"stale: ui/src/generated/{n}"
                          for n in sorted(exported.keys() & committed.keys())
-                         if exported[n].read_bytes() != committed[n].read_bytes()]
+                         if _normalized_generated_typescript(exported[n])
+                         != _normalized_generated_typescript(committed[n])]
             rc, detail = (1, (
                 "ui/src/generated/ does not match a fresh ts-rs export:\n"
                 + "\n".join(f"  {p}" for p in problems)
@@ -5849,6 +5850,21 @@ def cmd_check(
 # first).
 
 
+def _normalized_generated_typescript(path):
+    """Return generated TypeScript with deterministic line endings and whitespace."""
+    text = path.read_text(encoding="utf-8")
+    return "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
+
+
+def _normalize_generated_typescript(paths):
+    """Remove generator-introduced trailing whitespace deterministically."""
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        normalized = _normalized_generated_typescript(path)
+        if normalized != text:
+            path.write_text(normalized, encoding="utf-8")
+
+
 def cmd_codegen() -> bool:
     """Regenerate `ui/src/generated/` from the Rust source of truth.
 
@@ -5870,6 +5886,14 @@ def cmd_codegen() -> bool:
     if proc.returncode != 0:
         print("✗ codegen tests failed", file=sys.stderr)
         return False
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", "--", "ui/src/generated/"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    _normalize_generated_typescript(ROOT / path for path in changed)
     print("✓ regenerated ui/src/generated/")
     # Best-effort summary of what changed.
     diff = subprocess.run(
