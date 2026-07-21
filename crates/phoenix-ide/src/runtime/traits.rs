@@ -104,7 +104,7 @@ pub trait MessageStore: Send + Sync {
         _conversation_id: &str,
         _tool_use_id: &str,
     ) -> Result<bool, String> {
-        Ok(false)
+        Ok(true)
     }
 
     async fn owed_top_level_llm_receipt(
@@ -733,7 +733,11 @@ impl MessageStore for DatabaseStorage {
             .await
             .map_err(|error| error.to_string())?
         else {
-            return Ok(false);
+            return Ok(repo
+                .load_active_top_level_llm_workflow(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none());
         };
         match repo
             .transition_top_level_llm_tool_intent(&phoenix_db::ToolIntentTransitionInput {
