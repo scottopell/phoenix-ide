@@ -122,11 +122,61 @@ impl SendChatApplicationService {
             let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
                 serde_json::from_str(&accepted.prepared_payload)
                     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-            self.runtime
-                .send_event(&conversation.id, prepared.into_event())
-                .await
-                .map_err(SendChatServiceError::Dispatch)?;
-            return Ok(SendChatOutcome::Delivered);
+            let replay_outcome = match accepted.committed_outcome {
+                phoenix_db::DirectTurnCommittedOutcome::QueuedSteering => {
+                    let event = prepared.into_event();
+                    let Event::UserMessage {
+                        text,
+                        llm_text,
+                        images,
+                        files,
+                        message_id,
+                        user_agent,
+                        skill_invocation,
+                    } = event
+                    else {
+                        return Err(SendChatServiceError::Internal(
+                            "accepted direct turn did not decode to a user message".to_string(),
+                        ));
+                    };
+                    self.runtime
+                        .send_event(
+                            &conversation.id,
+                            Event::SteerMessage {
+                                text,
+                                llm_text,
+                                images,
+                                files,
+                                message_id,
+                                user_agent,
+                                skill_invocation,
+                            },
+                        )
+                        .await
+                        .map_err(SendChatServiceError::Dispatch)?;
+                    SendChatOutcome::QueuedAsSteering
+                }
+                phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
+                | phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
+                    self.runtime
+                        .send_event(&conversation.id, prepared.into_event())
+                        .await
+                        .map_err(SendChatServiceError::Dispatch)?;
+                    insert_transient_receipt(
+                        &self.db,
+                        &mut receipts,
+                        req.message_id.clone(),
+                        ChatAcceptanceReceipt {
+                            conversation_id: conversation.id.clone(),
+                            request_fingerprint: request_fingerprint.clone(),
+                            steering: false,
+                        },
+                    )
+                    .await;
+                    SendChatOutcome::Delivered
+                }
+            };
+            return Ok(replay_outcome);
         }
         if conversation.archived {
             return Ok(SendChatOutcome::Rejected {
