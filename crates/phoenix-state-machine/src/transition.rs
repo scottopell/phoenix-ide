@@ -3569,7 +3569,10 @@ fn tool_outcome_to_event(outcome: ToolExecOutcome) -> Event {
             tool_use_id: result.tool_use_id.clone(),
             result,
         },
-        ToolExecOutcome::CompletedAndPark(result) => Event::ToolCompleteAndPark {
+        ToolExecOutcome::CompletedAndPark {
+            result,
+            registration: _,
+        } => Event::ToolCompleteAndPark {
             tool_use_id: result.tool_use_id.clone(),
             result,
         },

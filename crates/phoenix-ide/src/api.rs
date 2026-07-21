@@ -99,11 +99,7 @@ pub struct AppState {
     pub resource_monitor: Arc<resource_monitor::ResourceMonitor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AgentFacingWakeRegistrationAvailable(bool);
-
-const AGENT_FACING_WAKE_REGISTRATION: AgentFacingWakeRegistrationAvailable =
-    AgentFacingWakeRegistrationAvailable(false);
+const WAKE_LEGACY_RETIREMENT_COMPLETE: &str = "wake_legacy_retirement_complete";
 
 impl AppState {
     /// Create new application state and start the sub-agent handler
@@ -135,15 +131,22 @@ impl AppState {
             mcp_manager.clone(),
             credential_helper.clone(),
         ));
-        let retired_wakes = phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone())
-            .retire_all_registrations(phoenix_workflow::Timestamp(
-                u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-            ))
-            .await?;
-        if retired_wakes > 0 {
+        if db
+            .get_app_setting(WAKE_LEGACY_RETIREMENT_COMPLETE)
+            .await?
+            .as_deref()
+            != Some("true")
+        {
+            let retired_wakes = phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone())
+                .retire_all_registrations(phoenix_workflow::Timestamp(
+                    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                ))
+                .await?;
+            db.set_app_setting(WAKE_LEGACY_RETIREMENT_COMPLETE, "true")
+                .await?;
             tracing::warn!(
                 retired = retired_wakes,
-                "retired automatic wake obligations before runtime startup"
+                "completed one-time retirement of automatic wake obligations"
             );
         }
         runtime.start_sub_agent_handler().await;

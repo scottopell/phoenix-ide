@@ -482,6 +482,10 @@ pub enum Event {
         tool_use_id: String,
         result: ToolResult,
     },
+    ToolCompleteAndPark {
+        tool_use_id: String,
+        result: ToolResult,
+    },
     /// Tool was aborted due to cancellation
     ToolAborted {
         tool_use_id: String,
@@ -643,6 +647,7 @@ impl Event {
             Event::LlmError { .. } => "LlmError",
             Event::RetryTimeout { .. } => "RetryTimeout",
             Event::ToolComplete { .. } => "ToolComplete",
+            Event::ToolCompleteAndPark { .. } => "ToolCompleteAndPark",
             Event::ToolAborted { .. } => "ToolAborted",
             Event::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
             Event::SubAgentResult { .. } => "SubAgentResult",
@@ -723,6 +728,10 @@ pub enum CoreEvent {
         attempt: u32,
     },
     ToolComplete {
+        tool_use_id: String,
+        result: ToolResult,
+    },
+    ToolCompleteAndPark {
         tool_use_id: String,
         result: ToolResult,
     },
@@ -909,6 +918,13 @@ impl TryFrom<Event> for ParentEvent {
                 tool_use_id,
                 result,
             })),
+            Event::ToolCompleteAndPark {
+                tool_use_id,
+                result,
+            } => Ok(ParentEvent::Core(CoreEvent::ToolCompleteAndPark {
+                tool_use_id,
+                result,
+            })),
             Event::ToolAborted { tool_use_id } => {
                 Ok(ParentEvent::Core(CoreEvent::ToolAborted { tool_use_id }))
             }
@@ -1073,6 +1089,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 tool_use_id,
                 result,
             })),
+            Event::ToolCompleteAndPark {
+                tool_use_id,
+                result,
+            } => Ok(SubAgentEvent::Core(CoreEvent::ToolCompleteAndPark {
+                tool_use_id,
+                result,
+            })),
             Event::ToolAborted { tool_use_id } => {
                 Ok(SubAgentEvent::Core(CoreEvent::ToolAborted { tool_use_id }))
             }
@@ -1145,6 +1168,7 @@ impl CoreEvent {
             CoreEvent::LlmError { .. } => "LlmError",
             CoreEvent::RetryTimeout { .. } => "RetryTimeout",
             CoreEvent::ToolComplete { .. } => "ToolComplete",
+            CoreEvent::ToolCompleteAndPark { .. } => "ToolCompleteAndPark",
             CoreEvent::ToolAborted { .. } => "ToolAborted",
             CoreEvent::SpawnAgentsComplete { .. } => "SpawnAgentsComplete",
             CoreEvent::SubAgentResult { .. } => "SubAgentResult",

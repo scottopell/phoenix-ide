@@ -21,8 +21,8 @@ mod terminal_command_history;
 mod terminal_last_command;
 mod think;
 pub mod tmux;
-pub mod work_scope_inventory;
 mod wait_until;
+pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
@@ -49,11 +49,11 @@ pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use terminal_command_history::TerminalCommandHistoryTool;
 pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
-pub use wait_until::WaitUntilTool;
 pub use tmux::{
     TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxRunTool, TmuxServer,
     TmuxTool,
 };
+pub use wait_until::WaitUntilTool;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -219,10 +219,16 @@ pub struct ToolLlmUsage {
 /// the executor via the cancellation token, never returned by `Tool::run()`;
 /// a `Cancelled` variant here would just relocate the wrong-state problem
 /// into this type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOutputDisposition {
     Continue,
-    ParkAfterWakeRegistration,
+    ParkAfterWakeRegistration {
+        workflow_id: u64,
+        contract_id: String,
+        resource_kind: String,
+        handle_id: String,
+        expires_at: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -306,7 +312,12 @@ impl ToolOutput {
     #[must_use]
     pub fn with_disposition(mut self, disposition: ToolOutputDisposition) -> Self {
         match &mut self {
-            Self::Success { disposition: slot, .. } | Self::Error { disposition: slot, .. } => {
+            Self::Success {
+                disposition: slot, ..
+            }
+            | Self::Error {
+                disposition: slot, ..
+            } => {
                 *slot = disposition;
             }
         }
@@ -364,7 +375,9 @@ impl ToolOutput {
     #[must_use]
     pub fn disposition(&self) -> ToolOutputDisposition {
         match self {
-            Self::Success { disposition, .. } | Self::Error { disposition, .. } => *disposition,
+            Self::Success { disposition, .. } | Self::Error { disposition, .. } => {
+                disposition.clone()
+            }
         }
     }
 }
@@ -1263,14 +1276,32 @@ mod tests {
 
     #[test]
     fn tool_output_disposition_defaults_to_continue_and_can_be_overridden() {
-        assert_eq!(ToolOutput::success("ok").disposition(), ToolOutputDisposition::Continue);
         assert_eq!(
-            ToolOutput::success("ok")
-                .with_disposition(ToolOutputDisposition::ParkAfterWakeRegistration)
-                .disposition(),
-            ToolOutputDisposition::ParkAfterWakeRegistration
+            ToolOutput::success("ok").disposition(),
+            ToolOutputDisposition::Continue
         );
-        assert_eq!(ToolOutput::error("boom").disposition(), ToolOutputDisposition::Continue);
+        assert_eq!(
+            ToolOutput::success("park")
+                .with_disposition(ToolOutputDisposition::ParkAfterWakeRegistration {
+                    workflow_id: 1,
+                    contract_id: "wake-1".into(),
+                    resource_kind: "Bash".into(),
+                    handle_id: "b-1".into(),
+                    expires_at: 600,
+                })
+                .disposition(),
+            ToolOutputDisposition::ParkAfterWakeRegistration {
+                workflow_id: 1,
+                contract_id: "wake-1".into(),
+                resource_kind: "Bash".into(),
+                handle_id: "b-1".into(),
+                expires_at: 600,
+            }
+        );
+        assert_eq!(
+            ToolOutput::error("boom").disposition(),
+            ToolOutputDisposition::Continue
+        );
     }
 
     fn names(registry: &ToolRegistry) -> BTreeSet<String> {

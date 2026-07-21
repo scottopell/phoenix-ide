@@ -16,6 +16,7 @@ import {
   SseLlmAttemptDataSchema,
   SseConversationUpdateDataSchema,
   SseAgentDoneDataSchema,
+  SseWakeContractRegisteredDataSchema,
   SseConversationBecameTerminalDataSchema,
   SseErrorDataSchema,
   SseConversationHardDeletedDataSchema,
@@ -414,6 +415,21 @@ export function useConnection({
               // RFC3339 → unix ms once at the SSE boundary (REQ-WPV-001).
               stateUpdatedAt: Date.parse(res.data.state_updated_at),
             });
+          });
+
+          on('wake_contract_registered', (e) => {
+            const res = parseEvent(
+              SseWakeContractRegisteredDataSchema,
+              e,
+              'wake_contract_registered',
+              stampedDispatch,
+            );
+            if (res.ok) {
+              stampedDispatch({
+                type: 'sse_sequence_consumed',
+                sequenceId: res.data.sequence_id,
+              });
+            }
           });
 
           on('agent_done', (e) => {

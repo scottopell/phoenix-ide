@@ -2112,6 +2112,7 @@ mod tests {
             ],
             completed_results: vec![],
             pending_sub_agents: vec![],
+            park_after_tool_round: false,
             assistant_message,
         };
 
@@ -3073,6 +3074,7 @@ mod tests {
             remaining_tools: vec![],
             completed_results: vec![],
             pending_sub_agents: vec![],
+            park_after_tool_round: false,
             assistant_message,
         };
 

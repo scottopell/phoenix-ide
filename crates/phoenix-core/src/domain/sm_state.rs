@@ -752,6 +752,7 @@ mod tests {
             "completed_results": [],
             "pending_sub_agents": [],
             "assistant_message": AssistantMessage::default(),
+            "park_after_tool_round": false,
         });
         assert!(
             serde_json::from_value::<ConvState>(complete.clone()).is_ok(),
@@ -763,6 +764,7 @@ mod tests {
             "completed_results",
             "pending_sub_agents",
             "assistant_message",
+            "park_after_tool_round",
         ] {
             let mut partial = complete.clone();
             partial.as_object_mut().unwrap().remove(field);
@@ -832,6 +834,7 @@ mod tests {
                 remaining_tools: vec![],
                 completed_results: vec![],
                 pending_sub_agents: vec![],
+                park_after_tool_round: false,
                 assistant_message: AssistantMessage::default(),
             },
             ConvState::CancellingTool {
@@ -1133,6 +1136,10 @@ pub enum ConvState {
         /// Completed tool results — single source of truth (FM-4 Prevention).
         /// No parallel `persisted_tool_ids` tracking set.
         completed_results: Vec<ToolResult>,
+        /// Whether any successfully completed tool in this serial round
+        /// explicitly requested that the conversation park after the final
+        /// checkpoint instead of issuing another LLM request.
+        park_after_tool_round: bool,
         /// Sub-agents spawned during this tool execution phase
         pending_sub_agents: Vec<PendingSubAgent>,
         /// Assistant message held until all tools complete (not yet persisted)
@@ -1309,6 +1316,7 @@ pub enum CoreState {
         current_tool: ToolCall,
         remaining_tools: Vec<ToolCall>,
         completed_results: Vec<ToolResult>,
+        park_after_tool_round: bool,
         pending_sub_agents: Vec<PendingSubAgent>,
         assistant_message: AssistantMessage,
     },
@@ -1475,12 +1483,14 @@ impl From<CoreState> for ConvState {
                 current_tool,
                 remaining_tools,
                 completed_results,
+                park_after_tool_round,
                 pending_sub_agents,
                 assistant_message,
             } => ConvState::ToolExecuting {
                 current_tool,
                 remaining_tools,
                 completed_results,
+                park_after_tool_round,
                 pending_sub_agents,
                 assistant_message,
             },
@@ -1572,12 +1582,14 @@ impl TryFrom<ConvState> for ParentState {
                 current_tool,
                 remaining_tools,
                 completed_results,
+                park_after_tool_round,
                 pending_sub_agents,
                 assistant_message,
             } => Ok(ParentState::Core(CoreState::ToolExecuting {
                 current_tool,
                 remaining_tools,
                 completed_results,
+                park_after_tool_round,
                 pending_sub_agents,
                 assistant_message,
             })),
@@ -1706,12 +1718,14 @@ impl TryFrom<ConvState> for SubAgentState {
                 current_tool,
                 remaining_tools,
                 completed_results,
+                park_after_tool_round,
                 pending_sub_agents,
                 assistant_message,
             } => Ok(SubAgentState::Core(CoreState::ToolExecuting {
                 current_tool,
                 remaining_tools,
                 completed_results,
+                park_after_tool_round,
                 pending_sub_agents,
                 assistant_message,
             })),

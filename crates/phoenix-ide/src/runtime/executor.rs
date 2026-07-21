@@ -731,9 +731,34 @@ fn cap_tool_output_text(text: String) -> String {
 /// vice versa. There is deliberately no `Cancelled` arm — cancellation is
 /// detected by the executor via the cancellation token before this mapping
 /// is ever reached.
+fn tool_output_park_registration(
+    out: &crate::tools::ToolOutput,
+) -> Option<(u64, String, String, String, u64)> {
+    if !out.is_success() {
+        return None;
+    }
+    match out.disposition() {
+        crate::tools::ToolOutputDisposition::Continue => None,
+        crate::tools::ToolOutputDisposition::ParkAfterWakeRegistration {
+            workflow_id,
+            contract_id,
+            resource_kind,
+            handle_id,
+            expires_at,
+        } => Some((
+            workflow_id,
+            contract_id,
+            resource_kind,
+            handle_id,
+            expires_at,
+        )),
+    }
+}
+
 fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
     use crate::db::ToolContentImage;
     use crate::tools::{ToolImage, ToolOutput};
+
     let convert = |images: Vec<ToolImage>| -> Vec<ToolContentImage> {
         images
             .into_iter()
@@ -885,12 +910,29 @@ where
             success = out.is_success(),
             "Tool completed"
         );
+        let park_registration = tool_output_park_registration(&out);
         let outcome = tool_output_to_outcome(out);
-        ToolExecOutcome::Completed(ToolResult {
+        let result = ToolResult {
             tool_use_id: tool_use_id.clone(),
             outcome,
             duration_ms: Some(duration_ms),
-        })
+        };
+        if let Some((workflow_id, contract_id, resource_kind, handle_id, expires_at)) =
+            park_registration
+        {
+            ToolExecOutcome::CompletedAndPark {
+                result,
+                registration: crate::state_machine::outcome::WakeRegistrationNotice {
+                    workflow_id,
+                    contract_id,
+                    resource_kind,
+                    handle_id,
+                    expires_at,
+                },
+            }
+        } else {
+            ToolExecOutcome::Completed(result)
+        }
     } else {
         span.record("outcome", "unknown_tool");
         span.record("otel.status_code", "ERROR");
@@ -2539,6 +2581,20 @@ where
         }
 
         refresh_commission_review_approval_for_outcome(&mut self.context, &outcome);
+        if let EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark { registration, .. }) =
+            &outcome
+        {
+            let _ = self
+                .broadcast_tx
+                .send_seq(|sequence_id| SseEvent::WakeContractRegistered {
+                    sequence_id,
+                    workflow_id: registration.workflow_id,
+                    contract_id: registration.contract_id.clone(),
+                    resource_kind: registration.resource_kind.clone(),
+                    handle_id: registration.handle_id.clone(),
+                    expires_at: registration.expires_at,
+                });
+        }
 
         if let EffectOutcome::Llm(LlmOutcome::Response {
             content,
@@ -10495,6 +10551,7 @@ mod steer_drain_detector_tests {
             completed_results: vec![],
             pending_sub_agents: vec![],
             assistant_message: AssistantMessage::default(),
+            park_after_tool_round: false,
         }
     }
 
@@ -12553,7 +12610,7 @@ mod work_subagent_cwd_guard_tests {
 
 #[cfg(test)]
 mod tool_output_to_outcome_tests {
-    use super::tool_output_to_outcome;
+    use super::{tool_output_park_registration, tool_output_to_outcome};
     use crate::db::ToolOutcome;
     use crate::tools::{ToolImage, ToolOutput};
 
@@ -12594,6 +12651,20 @@ mod tool_output_to_outcome_tests {
             }
             other => panic!("expected ToolOutcome::Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn park_disposition_is_detected_from_tool_output() {
+        let out = ToolOutput::success("ran clean").with_disposition(
+            crate::tools::ToolOutputDisposition::ParkAfterWakeRegistration {
+                workflow_id: 7,
+                contract_id: "wake-7".to_string(),
+                resource_kind: "Bash".to_string(),
+                handle_id: "b-7".to_string(),
+                expires_at: 600,
+            },
+        );
+        assert!(tool_output_park_registration(&out).is_some());
     }
 }
 
@@ -12661,6 +12732,45 @@ mod sender_drop_forwarder_tests {
                 assert_eq!(error, "real error");
             }
             other => panic!("expected the real outcome forwarded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_completed_and_park_outcome_is_forwarded_unchanged() {
+        let (tool_tx, tool_rx) = oneshot::channel::<ToolExecOutcome>();
+        let (tool_outcome_tx, mut tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(4);
+
+        tool_tx
+            .send(ToolExecOutcome::CompletedAndPark {
+                result: phoenix_core::domain::db_schema::ToolResult::success(
+                    "park-id".to_string(),
+                    "parked".to_string(),
+                ),
+                registration: crate::state_machine::outcome::WakeRegistrationNotice {
+                    workflow_id: 7,
+                    contract_id: "wake-7".into(),
+                    resource_kind: "Bash".into(),
+                    handle_id: "b-7".into(),
+                    expires_at: 600,
+                },
+            })
+            .expect("send should succeed");
+
+        forward_tool_outcome(tool_rx, "ignored-id".to_string(), 4, tool_outcome_tx).await;
+
+        match tool_outcome_rx.try_recv() {
+            Ok((
+                generation,
+                ToolExecOutcome::CompletedAndPark {
+                    result,
+                    registration,
+                },
+            )) => {
+                assert_eq!(generation, 4);
+                assert_eq!(result.tool_use_id, "park-id");
+                assert_eq!(registration.workflow_id, 7);
+            }
+            other => panic!("expected CompletedAndPark forwarded unchanged, got {other:?}"),
         }
     }
 
@@ -13845,6 +13955,7 @@ mod tool_generation_guard_tests {
             completed_results: vec![],
             pending_sub_agents: vec![],
             assistant_message,
+            park_after_tool_round: false,
         };
 
         ConversationRuntime::new(

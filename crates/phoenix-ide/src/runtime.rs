@@ -1147,6 +1147,14 @@ pub enum SseEvent {
     AgentDone {
         sequence_id: i64,
     },
+    WakeContractRegistered {
+        sequence_id: i64,
+        workflow_id: u64,
+        contract_id: String,
+        resource_kind: String,
+        handle_id: String,
+        expires_at: u64,
+    },
     /// Emitted once when a conversation's `is_terminal()` first becomes true.
     /// Consumed by the terminal subsystem to tear down any active PTY session.
     ConversationBecameTerminal {

@@ -83,11 +83,26 @@ pub enum LlmOutcome {
 // Tool Outcome — returned by executor tool task via oneshot channel
 // ============================================================================
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeRegistrationNotice {
+    pub workflow_id: u64,
+    pub contract_id: String,
+    pub resource_kind: String,
+    pub handle_id: String,
+    pub expires_at: u64,
+}
+
 /// Outcome of a tool execution, sent through a typed oneshot channel.
 #[derive(Debug)]
 pub enum ToolExecOutcome {
-    /// Tool ran to completion with a result
+    /// Tool ran to completion with a result that should continue the round
     Completed(ToolResult),
+    /// Tool ran to completion with a result and an explicit request to park
+    /// after the enclosing tool round's final checkpoint.
+    CompletedAndPark {
+        result: ToolResult,
+        registration: WakeRegistrationNotice,
+    },
     /// Tool was aborted before completion
     Aborted {
         tool_use_id: String,

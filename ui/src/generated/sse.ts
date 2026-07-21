@@ -86,6 +86,10 @@ export type SseLlmAttemptData = Omit<
   'type'
 >;
 export type SseAgentDoneData = Omit<Extract<SseWireEvent, { type: 'agent_done' }>, 'type'>;
+export type SseWakeContractRegisteredData = Omit<
+  Extract<SseWireEvent, { type: 'wake_contract_registered' }>,
+  'type'
+>;
 export type { LlmAttemptReason } from './LlmAttemptReason';
 export type SseConversationBecameTerminalData = Omit<
   Extract<SseWireEvent, { type: 'conversation_became_terminal' }>,

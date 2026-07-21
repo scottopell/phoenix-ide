@@ -306,6 +306,22 @@ mod tests {
                 "type": "agent_done",
                 "sequence_id": sequence_id,
             }),
+            SseEvent::WakeContractRegistered {
+                sequence_id,
+                workflow_id,
+                contract_id,
+                resource_kind,
+                handle_id,
+                expires_at,
+            } => json!({
+                "type": "wake_contract_registered",
+                "sequence_id": sequence_id,
+                "workflow_id": workflow_id,
+                "contract_id": contract_id,
+                "resource_kind": resource_kind,
+                "handle_id": handle_id,
+                "expires_at": expires_at,
+            }),
             SseEvent::ConversationBecameTerminal { sequence_id } => json!({
                 "type": "conversation_became_terminal",
                 "sequence_id": sequence_id,

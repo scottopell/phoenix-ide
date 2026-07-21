@@ -1,5 +1,8 @@
-use crate::bash::handle::{HandleId, HandleState};
-use crate::{work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput, ToolOutputDisposition};
+use crate::bash::handle::HandleId;
+use crate::{
+    work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput,
+    ToolOutputDisposition,
+};
 use async_trait::async_trait;
 use phoenix_workflow::wake_profile::{BashResourceIdentity, WakeResourceIdentity};
 use phoenix_workflow::Timestamp;
@@ -31,6 +34,7 @@ enum HandleRef {
 
 pub struct WaitUntilTool;
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl Tool for WaitUntilTool {
     fn name(&self) -> &'static str {
@@ -105,7 +109,9 @@ impl Tool for WaitUntilTool {
             HandleRef::Bash { id } => {
                 let table = match ctx.bash_handles().await {
                     Ok(table) => table,
-                    Err(err) => return ToolOutput::error(format!("Failed to access bash handles: {err}")),
+                    Err(err) => {
+                        return ToolOutput::error(format!("Failed to access bash handles: {err}"))
+                    }
                 };
                 let handle = {
                     let guard = table.read().await;
@@ -116,11 +122,7 @@ impl Tool for WaitUntilTool {
                         "bash handle {id:?} was not found in this work scope"
                     ));
                 };
-                if matches!(handle.state().await.as_ref(), HandleState::Tombstoned(_)) {
-                    return ToolOutput::error(format!(
-                        "bash handle {id:?} is already terminal; wait_until requires a live handle"
-                    ));
-                }
+                drop(handle);
                 (
                     WakeResourceIdentity::Bash(BashResourceIdentity {
                         work_scope: registration_scope.clone(),
@@ -157,7 +159,12 @@ impl Tool for WaitUntilTool {
             &resource,
             expires_at,
         );
-        let contract_id = format!("wake-{}", &prepared_fingerprint[..16]);
+        let contract_id = format!(
+            "wake-{}",
+            prepared_fingerprint
+                .get(..16)
+                .expect("SHA-256 hex fingerprints always contain 64 ASCII bytes")
+        );
 
         let register_input = RegisterWakeInput {
             contract_id: contract_id.clone(),
@@ -171,7 +178,10 @@ impl Tool for WaitUntilTool {
         };
 
         match registrar.register(register_input).await {
-            Ok(RegisteredWake::Registered { workflow_id }) | Ok(RegisteredWake::Replayed { workflow_id }) => {
+            Ok(
+                RegisteredWake::Registered { workflow_id }
+                | RegisteredWake::Replayed { workflow_id },
+            ) => {
                 let receipt = json!({
                     "status": "registered",
                     "contract_id": contract_id,
@@ -184,7 +194,13 @@ impl Tool for WaitUntilTool {
                 });
                 ToolOutput::success(receipt.to_string())
                     .with_display(receipt)
-                    .with_disposition(ToolOutputDisposition::ParkAfterWakeRegistration)
+                    .with_disposition(ToolOutputDisposition::ParkAfterWakeRegistration {
+                        workflow_id: workflow_id.0,
+                        contract_id: contract_id.clone(),
+                        resource_kind: "Bash".to_string(),
+                        handle_id: handle_id.clone(),
+                        expires_at: expires_at.0,
+                    })
             }
             Ok(RegisteredWake::Conflict) => ToolOutput::error(
                 "wait_until registration conflicted with an existing wake contract",
@@ -232,7 +248,9 @@ mod tests {
     use super::*;
     use crate::bash::handle::Handle;
     use crate::bash::ring::RING_BUFFER_BYTES;
-    use crate::{BashHandleRegistry, BrowserSessionManager, RegisteredWake, TmuxRegistry, WakeRegistrar};
+    use crate::{
+        BashHandleRegistry, BrowserSessionManager, RegisteredWake, TmuxRegistry, WakeRegistrar,
+    };
     use phoenix_workflow::wake_profile::WorkScopeIdentity;
     use phoenix_workflow::WorkflowId;
     use std::path::PathBuf;
@@ -288,7 +306,8 @@ mod tests {
     }
 
     async fn insert_live_handle(ctx: &ToolContext, id: &str) {
-        let table: Arc<RwLock<crate::BashWorkScopeHandles>> = ctx.bash_handles().await.expect("table");
+        let table: Arc<RwLock<crate::BashWorkScopeHandles>> =
+            ctx.bash_handles().await.expect("table");
         let mut guard = table.write().await;
         guard.insert(Handle::new_live(
             ctx.work_scope.clone(),
@@ -335,15 +354,29 @@ mod tests {
     fn schema_exposes_tagged_handle_and_timeout_cap() {
         let schema = WaitUntilTool.input_schema();
         assert_eq!(schema["required"], json!(["handle", "condition"]));
-        assert_eq!(schema["properties"]["handle"]["required"], json!(["kind", "id"]));
-        assert_eq!(schema["properties"]["handle"]["properties"]["kind"]["enum"], json!(["Bash", "TmuxPane", "SubAgent"]));
-        assert_eq!(schema["properties"]["condition"]["enum"], json!([CONDITION_HANDLE_TERMINAL]));
-        assert_eq!(schema["properties"]["max_wait_seconds"]["maximum"], json!(WAKE_MAX_SECONDS));
+        assert_eq!(
+            schema["properties"]["handle"]["required"],
+            json!(["kind", "id"])
+        );
+        assert_eq!(
+            schema["properties"]["handle"]["properties"]["kind"]["enum"],
+            json!(["Bash", "TmuxPane", "SubAgent"])
+        );
+        assert_eq!(
+            schema["properties"]["condition"]["enum"],
+            json!([CONDITION_HANDLE_TERMINAL])
+        );
+        assert_eq!(
+            schema["properties"]["max_wait_seconds"]["maximum"],
+            json!(WAKE_MAX_SECONDS)
+        );
     }
 
     #[tokio::test]
     async fn missing_bash_handle_is_normative_error() {
-        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(7) }));
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered {
+            workflow_id: WorkflowId(7),
+        }));
         let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-missing"}, "condition": CONDITION_HANDLE_TERMINAL}), ctx(Some(registrar))).await;
         assert!(!out.is_success());
         assert_eq!(out.disposition(), ToolOutputDisposition::Continue);
@@ -352,7 +385,9 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_bash_handle_is_not_visible_across_work_scope() {
-        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(7) }));
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered {
+            workflow_id: WorkflowId(7),
+        }));
         let foreign = ctx(None);
         insert_live_handle(&foreign, "b-foreign").await;
         let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-foreign"}, "condition": CONDITION_HANDLE_TERMINAL}), ctx(Some(registrar))).await;
@@ -361,40 +396,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_bash_handle_is_rejected_without_consuming_output() {
-        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(7) }));
-        let context = ctx(Some(registrar));
+    async fn terminal_bash_handle_registers_for_durable_delivery() {
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered {
+            workflow_id: WorkflowId(7),
+        }));
+        let context = ctx(Some(registrar.clone()));
         insert_tombstoned_handle(&context, "b-done").await;
         let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-done"}, "condition": CONDITION_HANDLE_TERMINAL}), context).await;
-        assert!(!out.is_success());
-        assert!(out.output().contains("already terminal"));
+        assert!(matches!(
+            out.disposition(),
+            ToolOutputDisposition::ParkAfterWakeRegistration { .. }
+        ));
+        assert_eq!(registrar.calls().len(), 1);
     }
 
     #[tokio::test]
     async fn unsupported_kinds_are_rejected_explicitly() {
-        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(7) }));
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered {
+            workflow_id: WorkflowId(7),
+        }));
         let out = WaitUntilTool.run(json!({"handle": {"kind": "TmuxPane", "id": "%1"}, "condition": CONDITION_HANDLE_TERMINAL}), ctx(Some(registrar))).await;
         assert!(!out.is_success());
-        assert!(out.output().contains("Unsupported handle kind \"TmuxPane\""));
+        assert!(out
+            .output()
+            .contains("Unsupported handle kind \"TmuxPane\""));
     }
 
     #[tokio::test]
     async fn registration_invocation_passes_deterministic_identity() {
-        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(11) }));
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered {
+            workflow_id: WorkflowId(11),
+        }));
         let context = ctx(Some(registrar.clone()));
         insert_live_handle(&context, "b-1").await;
         let out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-1"}, "condition": CONDITION_HANDLE_TERMINAL, "max_wait_seconds": 42}), context.clone()).await;
         assert!(out.is_success(), "{}", out.output());
-        assert_eq!(out.disposition(), ToolOutputDisposition::ParkAfterWakeRegistration);
+        assert!(matches!(
+            out.disposition(),
+            ToolOutputDisposition::ParkAfterWakeRegistration { .. }
+        ));
         let calls = registrar.calls();
         assert_eq!(calls.len(), 1);
         let call = &calls[0];
         assert_eq!(call.conversation_id, "conv-wait");
         assert_eq!(call.root_conversation_id, "root-wait");
         assert_eq!(call.registering_tool_use_id, "tool-wait");
-        assert_eq!(call.registration_scope, WorkScopeIdentity { kind: phoenix_workflow::wake_profile::WorkScopeKind::Worktree, stable_key: "/tmp/worktree".to_string() });
-        assert_eq!(call.resource, WakeResourceIdentity::Bash(BashResourceIdentity { work_scope: call.registration_scope.clone(), handle_id: "b-1".to_string() }));
-        assert_eq!(call.contract_id, format!("wake-{}", &call.prepared_fingerprint[..16]));
+        assert_eq!(
+            call.registration_scope,
+            WorkScopeIdentity {
+                kind: phoenix_workflow::wake_profile::WorkScopeKind::Worktree,
+                stable_key: "/tmp/worktree".to_string()
+            }
+        );
+        assert_eq!(
+            call.resource,
+            WakeResourceIdentity::Bash(BashResourceIdentity {
+                work_scope: call.registration_scope.clone(),
+                handle_id: "b-1".to_string()
+            })
+        );
+        assert_eq!(
+            call.contract_id,
+            format!("wake-{}", call.prepared_fingerprint.get(..16).unwrap())
+        );
         let receipt = parse(&out);
         assert_eq!(receipt["workflow_id"], 11);
         assert_eq!(receipt["handle"]["kind"], "Bash");
@@ -403,12 +467,17 @@ mod tests {
 
     #[tokio::test]
     async fn replay_and_conflict_map_to_park_or_continue() {
-        let replay = MockWakeRegistrar::new(Ok(RegisteredWake::Replayed { workflow_id: WorkflowId(13) }));
+        let replay = MockWakeRegistrar::new(Ok(RegisteredWake::Replayed {
+            workflow_id: WorkflowId(13),
+        }));
         let replay_ctx = ctx(Some(replay.clone()));
         insert_live_handle(&replay_ctx, "b-2").await;
         let replay_out = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-2"}, "condition": CONDITION_HANDLE_TERMINAL}), replay_ctx).await;
         assert!(replay_out.is_success());
-        assert_eq!(replay_out.disposition(), ToolOutputDisposition::ParkAfterWakeRegistration);
+        assert!(matches!(
+            replay_out.disposition(),
+            ToolOutputDisposition::ParkAfterWakeRegistration { .. }
+        ));
 
         let conflict = MockWakeRegistrar::new(Ok(RegisteredWake::Conflict));
         let conflict_ctx = ctx(Some(conflict.clone()));

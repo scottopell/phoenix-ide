@@ -2021,7 +2021,16 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
 fn arb_tool_outcome() -> impl Strategy<Value = ToolExecOutcome> {
     prop_oneof![
         arb_tool_result().prop_map(ToolExecOutcome::Completed),
-        arb_tool_result().prop_map(ToolExecOutcome::CompletedAndPark),
+        arb_tool_result().prop_map(|result| ToolExecOutcome::CompletedAndPark {
+            result,
+            registration: crate::outcome::WakeRegistrationNotice {
+                workflow_id: 1,
+                contract_id: "wake-proptest".into(),
+                resource_kind: "Bash".into(),
+                handle_id: "b-proptest".into(),
+                expires_at: 600,
+            },
+        }),
         ("[a-z]{8}", arb_abort_reason()).prop_map(|(tool_use_id, reason)| {
             ToolExecOutcome::Aborted {
                 tool_use_id,

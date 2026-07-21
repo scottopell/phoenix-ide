@@ -3,6 +3,7 @@ import type { Message } from '../api';
 import { api, type Conversation } from '../api';
 import {
   SseAgentDoneDataSchema,
+  SseWakeContractRegisteredDataSchema,
   SseErrorDataSchema,
   SseInitDataSchema,
   SseLlmAttemptDataSchema,
@@ -292,6 +293,16 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             delta: res.output.text,
             requestId: res.output.request_id,
           },
+        });
+      });
+
+      source.addEventListener('wake_contract_registered', (event) => {
+        const raw: unknown = JSON.parse(event.data);
+        const res = v.safeParse(SseWakeContractRegisteredDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: { type: 'sse_sequence_consumed', sequenceId: res.output.sequence_id },
         });
       });
 

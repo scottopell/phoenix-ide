@@ -338,6 +338,15 @@ pub enum SseWireEvent {
     },
     /// Agent reached an idle state and is no longer working.
     AgentDone { sequence_id: i64 },
+    /// Explicit durable wait registration accepted.
+    WakeContractRegistered {
+        sequence_id: i64,
+        workflow_id: u64,
+        contract_id: String,
+        resource_kind: String,
+        handle_id: String,
+        expires_at: u64,
+    },
     /// Conversation hit a terminal state — the terminal subsystem uses this
     /// to tear down PTYs.
     ConversationBecameTerminal { sequence_id: i64 },
@@ -417,6 +426,7 @@ impl SseWireEvent {
             SseWireEvent::LlmAttempt { .. } => "llm_attempt",
             SseWireEvent::Token { .. } => "token",
             SseWireEvent::AgentDone { .. } => "agent_done",
+            SseWireEvent::WakeContractRegistered { .. } => "wake_contract_registered",
             SseWireEvent::ConversationBecameTerminal { .. } => "conversation_became_terminal",
             SseWireEvent::ConversationUpdate { .. } => "conversation_update",
             SseWireEvent::Error { .. } => "error",
@@ -538,6 +548,21 @@ impl From<SseEvent> for SseWireEvent {
                 request_id,
             },
             SseEvent::AgentDone { sequence_id } => SseWireEvent::AgentDone { sequence_id },
+            SseEvent::WakeContractRegistered {
+                sequence_id,
+                workflow_id,
+                contract_id,
+                resource_kind,
+                handle_id,
+                expires_at,
+            } => SseWireEvent::WakeContractRegistered {
+                sequence_id,
+                workflow_id,
+                contract_id,
+                resource_kind,
+                handle_id,
+                expires_at,
+            },
             SseEvent::ConversationBecameTerminal { sequence_id } => {
                 SseWireEvent::ConversationBecameTerminal { sequence_id }
             }

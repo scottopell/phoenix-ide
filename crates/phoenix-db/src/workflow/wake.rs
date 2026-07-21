@@ -880,6 +880,61 @@ impl WakeRepository {
         }
     }
 
+    pub async fn release_observation_authority(
+        &self,
+        authority: &super::LocalAttemptAuthority,
+    ) -> DbResult<AuthorityOutcome> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let deleted = sqlx::query(
+            "DELETE FROM workflow_reclaimable_leases
+             WHERE workflow_id = ?1 AND attempt_id = ?2
+               AND EXISTS (
+                   SELECT 1 FROM workflow_attempts a
+                   WHERE a.workflow_id = ?1 AND a.attempt_id = ?2
+                     AND a.effect_id = ?3 AND a.process_incarnation = ?4
+                     AND a.declared_workflow_version = ?5 AND a.generation = ?6
+                     AND a.status IN ('Begun', 'ObservationRecorded')
+               )",
+        )
+        .bind(to_i64(authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(authority.attempt_id.0, "attempt_id")?)
+        .bind(to_i64(authority.effect_id.0, "effect_id")?)
+        .bind(to_i64(
+            authority.process_incarnation.0,
+            "process_incarnation",
+        )?)
+        .bind(to_i64(
+            authority.declared_workflow_version.0,
+            "declared_workflow_version",
+        )?)
+        .bind(to_i64(authority.generation.0, "generation")?)
+        .execute(&mut *tx.tx)
+        .await?
+        .rows_affected();
+        if deleted == 0 {
+            tx.rollback().await?;
+            return Ok(AuthorityOutcome::StaleAuthority);
+        }
+        sqlx::query(
+            "UPDATE workflow_attempts SET status = 'AuthorityLost'
+             WHERE workflow_id = ?1 AND attempt_id = ?2",
+        )
+        .bind(to_i64(authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(authority.attempt_id.0, "attempt_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_effects SET status = 'Eligible'
+             WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'",
+        )
+        .bind(to_i64(authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(authority.effect_id.0, "effect_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        tx.commit().await?;
+        Ok(AuthorityOutcome::Authorized)
+    }
+
     pub async fn renew_observation_lease(
         &self,
         authority: &super::LocalAttemptAuthority,

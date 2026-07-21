@@ -252,11 +252,13 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             for candidate in candidates {
                 cursor = Some(candidate.workflow_id);
                 saw_candidate = true;
-                let claim_until = LeaseExpiry(
+                let claim_until = LeaseExpiry(if candidate.expires_at.0 <= now.0 {
+                    now.0.saturating_add(LEASE_DURATION.as_secs())
+                } else {
                     now.0
                         .saturating_add(LEASE_DURATION.as_secs())
-                        .min(candidate.expires_at.0.saturating_add(1)),
-                );
+                        .min(candidate.expires_at.0.saturating_add(1))
+                });
                 match self
                     .repo
                     .claim_observation_if_eligible(
@@ -326,7 +328,18 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .await
             .map_err(|error| error.clone())?
         {
-            InspectionOutcome::LiveRetry => Ok(LEASE_DURATION),
+            InspectionOutcome::LiveRetry => {
+                if candidate.expires_at.0 <= now.0 {
+                    let _ = self
+                        .repo
+                        .release_observation_authority(&authority)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(Duration::ZERO)
+                } else {
+                    Ok(LEASE_DURATION)
+                }
+            }
             InspectionOutcome::Terminal(evidence) => {
                 let observation_time = self.clock.now();
                 let outcome = self
@@ -1073,6 +1086,45 @@ mod tests {
         );
         worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 1);
+        let pending = repo.list_pending("conv").await.unwrap();
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Forgotten {
+                reason: WakeForgottenReason::PhoenixRestart,
+                ..
+            }
+        ));
+
+        worker.run_once().await.unwrap();
+        assert_eq!(pending_count(&repo).await, 1);
+    }
+
+    #[tokio::test]
+    async fn overdue_missing_bash_is_forgotten_before_expiry() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "missing", 50).await;
+        let inspector = RuntimeRegistryInspector::new(
+            Arc::new(phoenix_tools::BashHandleRegistry::new()),
+            Arc::new(phoenix_tools::TmuxRegistry::new()),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(inspector),
+            Arc::new(TestClock::new(100)),
+            ProcessIncarnation(99),
+        );
+
+        worker.run_once().await.unwrap();
+
+        let pending = repo.list_pending("conv").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Forgotten {
+                reason: WakeForgottenReason::PhoenixRestart,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

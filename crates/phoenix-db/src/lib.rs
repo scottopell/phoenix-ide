@@ -8846,6 +8846,7 @@ fn normalize_in_flight_round(
         completed_results,
         pending_sub_agents,
         assistant_message,
+        park_after_tool_round: _,
     } = state
     {
         let interrupted_tool_ids = std::iter::once(current_tool.id)
@@ -13529,6 +13530,7 @@ mod tests {
                 "real output for tool-1".to_string(),
             )],
             pending_sub_agents: vec![],
+            park_after_tool_round: false,
             assistant_message: assistant,
         };
         db.update_conversation_state("conv-1", &state)
@@ -13835,6 +13837,7 @@ mod tests {
                     mode: SubAgentMode::Explore,
                 },
             ],
+            park_after_tool_round: false,
             assistant_message: assistant,
         };
         db.update_conversation_state("conv-sa", &state)
@@ -14048,6 +14051,7 @@ mod tests {
                     mode: SubAgentMode::Explore,
                 },
             ],
+            park_after_tool_round: false,
             assistant_message: assistant,
         };
         db.update_conversation_state("conv-p", &state)

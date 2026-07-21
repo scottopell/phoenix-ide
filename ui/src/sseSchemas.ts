@@ -37,6 +37,7 @@ import type {
   SseLlmFirstByteData as WireLlmFirstByteData,
   SseLlmAttemptData as WireLlmAttemptData,
   SseAgentDoneData as WireAgentDoneData,
+  SseWakeContractRegisteredData as WireWakeContractRegisteredData,
   SseConversationBecameTerminalData as WireConversationBecameTerminalData,
   SseConversationUpdateData as WireConversationUpdateData,
   SseErrorData as WireErrorData,
@@ -326,6 +327,15 @@ export const SseAgentDoneDataSchema = v.looseObject({
   sequence_id: v.number(),
 }) satisfies v.GenericSchema<unknown, WireAgentDoneData>;
 
+export const SseWakeContractRegisteredDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  workflow_id: v.number(),
+  contract_id: v.string(),
+  resource_kind: v.string(),
+  handle_id: v.string(),
+  expires_at: v.number(),
+}) satisfies v.GenericSchema<unknown, WireWakeContractRegisteredData>;
+
 /** `conversation_became_terminal`: carries only the sequence_id today.
  *  Wired up as a no-op in the UI but validated so that if the server starts
  *  including teardown detail it is not silently dropped. */
@@ -490,6 +500,9 @@ export type SseStateChangeData = v.InferOutput<typeof SseStateChangeDataSchema>;
 export type SseTokenData = v.InferOutput<typeof SseTokenDataSchema>;
 export type SseConversationUpdateData = v.InferOutput<typeof SseConversationUpdateDataSchema>;
 export type SseAgentDoneData = v.InferOutput<typeof SseAgentDoneDataSchema>;
+export type SseWakeContractRegisteredData = v.InferOutput<
+  typeof SseWakeContractRegisteredDataSchema
+>;
 export type SseConversationBecameTerminalData = v.InferOutput<
   typeof SseConversationBecameTerminalDataSchema
 >;
