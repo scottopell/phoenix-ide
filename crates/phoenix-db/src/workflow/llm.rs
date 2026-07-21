@@ -663,15 +663,29 @@ impl WorkflowRepository {
         &self,
         input: &AcceptCompleteLlmResponseInput,
     ) -> DbResult<AcceptCompleteLlmResponseResult> {
-        let accepted_turn_id =
-            load_accepted_turn_id(&self.pool, input.authority.workflow_id).await?;
-        let call_ordinal = load_call_ordinal(
-            &self.pool,
-            input.authority.workflow_id,
-            input.authority.effect_id,
-        )
-        .await?;
         let mut tx = self.begin_tx().await?;
+        let turn = sqlx::query(
+            "SELECT dta.client_message_id, w.turn_generation, w.stopped_at, e.call_ordinal
+             FROM top_level_llm_workflows w
+             JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id
+             JOIN top_level_llm_effects e ON e.workflow_id = w.workflow_id
+             WHERE w.workflow_id = ?1 AND e.effect_id = ?2",
+        )
+        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+        let Some(turn) = turn else {
+            tx.rollback().await?;
+            return Ok(stale_complete_llm_response_result());
+        };
+        if turn.get::<Option<i64>, _>("stopped_at").is_some() {
+            tx.rollback().await?;
+            return Ok(stale_complete_llm_response_result());
+        }
+        let accepted_turn_id: String = turn.get("client_message_id");
+        let turn_generation = to_u64(turn.get::<i64, _>("turn_generation"), "turn_generation")?;
+        let call_ordinal = to_u64(turn.get::<i64, _>("call_ordinal"), "call_ordinal")?;
         let (receipt_id, delivery_id) = match (input.receipt_id, input.delivery_id) {
             (Some(receipt_id), Some(delivery_id)) => (receipt_id, delivery_id),
             (None, None) => {
@@ -700,7 +714,7 @@ impl WorkflowRepository {
         let receipt_payload = serde_json::to_vec(&llm_profile::LlmResponseReceipt {
             key: LlmEffectKey {
                 accepted_turn_id: accepted_turn_id.clone(),
-                generation: input.authority.generation.0,
+                generation: turn_generation,
                 call_ordinal,
             },
             response: input.response.clone(),
@@ -719,7 +733,7 @@ impl WorkflowRepository {
             receipt_event_payload: serde_json::to_vec(&llm_profile::LlmResponseReceipt {
                 key: LlmEffectKey {
                     accepted_turn_id,
-                    generation: input.authority.generation.0,
+                    generation: turn_generation,
                     call_ordinal,
                 },
                 response: input.response.clone(),
@@ -836,7 +850,7 @@ impl WorkflowRepository {
              JOIN top_level_llm_workflows w ON w.workflow_id = wr.workflow_id
              JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id
              JOIN workflow_receipts r ON r.workflow_id = wr.workflow_id AND r.receipt_id = wr.receipt_id
-             WHERE d.runtime_acceptance_status = 'Owed'
+             WHERE d.runtime_acceptance_status = 'Owed' AND w.stopped_at IS NULL
              ORDER BY w.workflow_id, wr.receipt_id"
         )
         .fetch_all(&self.pool)
@@ -1267,31 +1281,6 @@ fn prepared_row_from_row(
     })
 }
 
-async fn load_accepted_turn_id(pool: &SqlitePool, workflow_id: WorkflowId) -> DbResult<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT client_message_id FROM direct_turn_acceptances WHERE workflow_id = ?1",
-    )
-    .bind(to_i64(workflow_id.0, "workflow_id")?)
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::from)
-}
-
-async fn load_call_ordinal(
-    pool: &SqlitePool,
-    workflow_id: WorkflowId,
-    effect_id: EffectId,
-) -> DbResult<u64> {
-    let value = sqlx::query_scalar::<_, i64>(
-        "SELECT call_ordinal FROM top_level_llm_effects WHERE workflow_id = ?1 AND effect_id = ?2",
-    )
-    .bind(to_i64(workflow_id.0, "workflow_id")?)
-    .bind(to_i64(effect_id.0, "effect_id")?)
-    .fetch_one(pool)
-    .await?;
-    to_u64(value, "call_ordinal")
-}
-
 fn direct_turn_record_from_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> DbResult<DirectTurnAcceptanceRecord> {
@@ -1411,6 +1400,16 @@ fn parse_direct_turn_outcome(value: &str) -> DbResult<DirectTurnCommittedOutcome
         other => Err(DbError::Serialization(format!(
             "unknown direct-turn outcome: {other}"
         ))),
+    }
+}
+
+fn stale_complete_llm_response_result() -> AcceptCompleteLlmResponseResult {
+    AcceptCompleteLlmResponseResult {
+        outcome: CompleteLlmResponsePersistenceOutcome::StaleAuthority,
+        receipt: None,
+        delivery: None,
+        llm_receipt: None,
+        tool_intents: vec![],
     }
 }
 
@@ -1984,6 +1983,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stopped, CommitOutcome::Committed);
+        assert_eq!(
+            repo.accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
+                authority: LocalAttemptAuthority {
+                    workflow_id: WorkflowId(1),
+                    declared_workflow_version: Version(1),
+                    generation: Generation(0),
+                    effect_id: EffectId(2),
+                    attempt_id: AttemptId(1),
+                    process_incarnation: ProcessIncarnation(7),
+                },
+                delivery_id: None,
+                receipt_id: None,
+                response: CompleteLlmResponse {
+                    codec_version: 1,
+                    response_fingerprint: "late".to_string(),
+                    response_aggregate: "{\"late\":true}".to_string(),
+                },
+                provider_request_id: Some("provider-late".to_string()),
+                tool_intents: vec![],
+            })
+            .await
+            .unwrap()
+            .outcome,
+            CompleteLlmResponsePersistenceOutcome::StaleAuthority
+        );
+        assert!(repo
+            .load_owed_top_level_llm_receipts()
+            .await
+            .unwrap()
+            .is_empty());
         assert!(repo
             .recover_top_level_llm_attempts()
             .await

@@ -397,21 +397,32 @@ async fn deliver_pending_direct_turns(manager: &Arc<RuntimeManager>) -> Result<(
             );
             continue;
         }
-        let handle = manager
-            .get_or_create(&pending.conversation_id)
-            .await
-            .map_err(|error| error.clone())?;
+        let handle = match manager.get_or_create(&pending.conversation_id).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::error!(
+                    workflow_id = pending.workflow_id.0,
+                    conversation_id = %pending.conversation_id,
+                    error = %error,
+                    "pending direct turn runtime could not be constructed"
+                );
+                continue;
+            }
+        };
         if !matches!(
             *handle.state_rx.borrow(),
             crate::state_machine::ConvState::Idle | crate::state_machine::ConvState::Error { .. }
         ) {
             continue;
         }
-        handle
-            .event_tx
-            .send(prepared.into_event())
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = handle.event_tx.send(prepared.into_event()).await {
+            tracing::warn!(
+                workflow_id = pending.workflow_id.0,
+                conversation_id = %pending.conversation_id,
+                error = %error,
+                "pending direct turn runtime channel closed"
+            );
+        }
     }
     Ok(())
 }
