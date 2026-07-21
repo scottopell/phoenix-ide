@@ -2510,7 +2510,7 @@ impl WakeRepository {
     }
 
     pub async fn transfer(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
-        for _ in 0..5 {
+        for _ in 0..20 {
             match self.transfer_once(input).await {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
                     if super::is_sqlite_busy_retryable(error.as_ref()) =>
