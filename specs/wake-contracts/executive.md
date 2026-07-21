@@ -90,45 +90,50 @@ land separately.
 
 ## Current Reality
 
-The durable workflow substrate exists: typed wake profiles, persisted bindings,
+The durable workflow substrate provides typed wake profiles, persisted bindings,
 background observation, terminal projection, replay-safe materialization and
-runtime acceptance, restart recovery, and continuation transfer. Phoenix does
-not expose the specified agent-facing `wait_until` tool, so no ordinary bash or
-tmux handle creation registers a wake obligation. The substrate is intentionally
-dormant until an explicit registration surface owns that lifecycle.
+runtime acceptance, restart recovery, and continuation transfer. Phoenix exposes
+the unified `wait_until` tool for `HandleTerminal` on tagged Bash handles. A
+successful explicit registration checkpoints the provider-valid tool round, parks
+the conversation in `Idle`, and resumes the LLM exactly once after durable terminal
+delivery. Registration errors continue as ordinary tool errors. Existing
+`bash op=wait` behavior is unchanged, and ordinary Bash or tmux handle creation
+does not register a wake obligation.
 
-Because no explicit agent-facing registration surface exists, the wake worker is
-not started. Startup retires and suppresses persisted automatic bindings through
-canonical workflow transitions so they neither resume turns nor remain owed work;
-message and workflow audit records remain intact. The explicit wait surface will
-define its activation boundary when it is implemented.
+The wake worker starts after a one-time retirement of bindings created by the
+removed automatic-registration behavior. Later restarts preserve explicit
+registrations. Because Bash processes and handle registries are in memory, a
+pending Bash wait whose handle is absent after restart resolves exactly once as
+`Forgotten { phoenix_restart }`; Phoenix does not attempt process reattachment.
+The same tagged tool does not yet register tmux or sub-agent handles. Those kinds
+remain explicit runtime errors until their end-to-end lifecycle is implemented.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| REQ-WAKE-001 Registration | Proposed | LLM-facing tool surface; no synchronous payload; no conv state mutation |
-| REQ-WAKE-002 Persistence | Partial | Durable workflow-backed bindings, receipts, and restart reconciliation exist; agent-facing registration remains proposed |
-| REQ-WAKE-003 Router Service | Partial | Background observation and replay-safe delivery exist; no ordinary tool implicitly enrolls a handle |
+| REQ-WAKE-001 Registration | Partial | Unified explicit registration, typed park disposition, and immediate receipt are implemented for Bash handles |
+| REQ-WAKE-002 Persistence | Partial | Durable Bash bindings, receipts, exactly-once restart reconciliation, and terminal delivery are implemented |
+| REQ-WAKE-003 Router Service | Partial | Background observation and replay-safe delivery are active for explicit Bash waits; no ordinary tool implicitly enrolls a handle |
 | REQ-WAKE-004 `is_busy()` Derivation | Proposed | Reads contract table; no new state machine variant |
-| REQ-WAKE-005 V1 Condition Kinds | Partial | Durable substrate models bash, tmux, and sub-agent terminal handles; explicit tool surface is proposed |
-| REQ-WAKE-006 Wake Event Delivery | Partial | Terminal projection/materialization exists; agent-facing explicit registration is proposed |
-| REQ-WAKE-007 Mandatory Timeout | Proposed | Default 600s, cap 1800s |
+| REQ-WAKE-005 V1 Condition Kinds | Partial | `HandleTerminal` is agent-accessible for Bash; tmux and sub-agent registration remain unsupported |
+| REQ-WAKE-006 Wake Event Delivery | Partial | Bash Fired / Expired / Forgotten results use durable materialization and exactly-once auto-resume |
+| REQ-WAKE-007 Mandatory Timeout | Partial | Bash registration defaults to 600s and is capped at 1800s |
 | REQ-WAKE-008 User Status + Cancel | Proposed | UI/CLI wake status on Idle conv + cancel endpoint |
 | REQ-WAKE-009 Conv-Scoped | Proposed | Not WorkScope-scoped; explicit deconfliction |
 | REQ-WAKE-010 Independent Contracts | Proposed | No auto-cancel on sibling fire |
 | REQ-WAKE-011 Terminal Cause | Partial | Typed Fired / Expired / Cancelled / Forgotten projections exist in the durable substrate |
 | REQ-WAKE-012 Continuation Inheritance | Partial | WorkScope transfer and reconciliation exist in the durable substrate |
-| REQ-WAKE-013 User Messages | Proposed | Conv stays Idle; user messages just work |
-| REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
+| REQ-WAKE-013 User Messages | Partial | Explicit Bash waits park in ordinary Idle without introducing an AwaitingWake state |
+| REQ-WAKE-014 Tool Description | Partial | Unified tool documents registration, parking, Bash-only support, and timeout bounds |
 | REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
-| REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
+| REQ-WAKE-016 Unified Tool Surface | Partial | Single `wait_until` tool with tagged handles is implemented; only Bash registration is enabled |
 | REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Tagged exhaustive sub-agent terminal causes; missing child is Forgotten |
 | REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
 
-No requirement is complete end-to-end because the unified agent-facing tool is
-not implemented. Requirements marked Partial identify reusable runtime and
-persistence infrastructure rather than a shipped wake-contract journey.
+Requirements remain Partial because the end-to-end surface currently covers only
+Bash handles. Tmux and sub-agent registration, user status/cancellation, and the
+remaining observability surfaces are not implemented.
 
 ## Dependencies
 

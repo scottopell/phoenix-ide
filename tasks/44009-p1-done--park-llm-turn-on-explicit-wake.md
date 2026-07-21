@@ -24,11 +24,16 @@ Do not parse `wake_registration` from display JSON to control the state machine.
 
 ## Acceptance evidence
 
-- Explicit durable registration on a live bash or tmux handle checkpoints the round and produces no intervening LLM request.
+- Explicit durable registration on a live Bash handle checkpoints the round and produces no intervening LLM request.
 - Terminal completion later resumes exactly once with committed durable observations.
-- User steering, cancellation, continuation, and restart recovery preserve provider-valid history and wake ownership.
+- A Phoenix restart resolves an in-memory Bash handle exactly once as `Forgotten { phoenix_restart }` and resumes from provider-valid history.
+- User steering, cancellation, and continuation preserve provider-valid history and wake ownership.
 - Multi-tool and registration-failure regression tests prove deterministic behavior.
 - Normative specs and executive/current-reality documentation are aligned, and `./dev.py check` passes.
+
+## Slice boundary
+
+This task delivers the Bash-first vertical slice of the unified tagged `wait_until` tool. Tmux and sub-agent inputs remain explicit unsupported-kind errors. Tmux support must extend this same tool only after the Bash Fired and restart-Forgotten journeys are proven in production; it must not introduce a separate tmux wait tool.
 
 ## Non-goals
 
