@@ -1546,9 +1546,7 @@ impl Database {
         let sql = sql.to_string();
         tokio::task::spawn_blocking(move || execute_coordinator_query(&path, &sql))
             .await
-            .map_err(|error| {
-                CoordinatorQueryError::Sqlite(format!("query worker failed: {error}"))
-            })?
+            .map_err(|_| CoordinatorQueryError::WorkerFailed)?
     }
 
     /// Open an in-memory database (for testing).

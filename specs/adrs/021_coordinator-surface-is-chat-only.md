@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-20
 - **Affects:** REQ-GR-001, REQ-GR-004, REQ-GR-005, REQ-GR-010, REQ-GR-011
+- **Superseded in part by:** ADR-022 replaces the retained open-work projection and `list_open_work`; this ADR remains authoritative for the chat-only UI decision.
 
 ## Context
 
@@ -21,7 +22,7 @@ The deterministic open-work model has two agent consumers that remain valuable i
 
 Phoenix chooses option 3. `/global` presents only the shared conversation runtime. A compact `Brief me` action lives in the normal composer action group and submits a read-only prompt through the ordinary durable message path. The separate browser Open Work endpoint, pane, filtering controls, and Conversation/Work selectors are removed.
 
-The deterministic projection remains an internal application service used by `GlobalReadService::current_work_capsule` and the Coordinator-only `list_open_work` tool. Those typed consumers define why the projection exists; an unused browser adapter does not remain as an accidental third contract.
+The original decision retained an internal deterministic projection for automatic context and Coordinator reads. ADR-022 supersedes that portion with a transparent relational snapshot and bounded `query_database` tool; no inferred open-work projection remains.
 
 ## Consequences
 
@@ -37,5 +38,4 @@ The deterministic projection remains an internal application service used by `Gl
 - `specs/global-recall/executive.md`
 - `CoordinatorPage`
 - `InputArea`
-- `GlobalReadService::current_work_capsule`
-- `GlobalReadService::open_work_page`
+- `specs/adrs/022_coordinator-uses-relational-evidence.md`

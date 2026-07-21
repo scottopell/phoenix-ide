@@ -4591,7 +4591,7 @@ where
                 let capsule = match coordinator_read_service {
                     Some(service) => service.coordinator_snapshot().await.unwrap_or_else(|error| {
                         tracing::warn!(%error, "Failed to build Coordinator relational snapshot");
-                        format!("# Conversation activity snapshot unavailable\nPhoenix could not execute the bounded snapshot query for this turn: {error}\nUse query_database to inspect current relational facts directly.")
+                        "# Conversation activity snapshot unavailable\nPhoenix could not execute the bounded snapshot query for this turn. Use query_database to inspect current relational facts directly.".to_string()
                     }),
                     None => "# Conversation activity snapshot unavailable\nThe bounded snapshot query is unavailable for this turn. Use query_database to inspect current relational facts directly.".to_string(),
                 };

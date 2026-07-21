@@ -77,8 +77,14 @@ pub enum CoordinatorQueryError {
     MultipleStatements,
     #[error("query exceeded its execution budget")]
     BudgetExceeded,
-    #[error("SQLite query failed: {0}")]
-    Sqlite(String),
+    #[error("database open failed")]
+    OpenFailed,
+    #[error("statement preparation failed")]
+    PrepareFailed,
+    #[error("query execution failed")]
+    ExecutionFailed,
+    #[error("query worker failed")]
+    WorkerFailed,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,14 +142,13 @@ pub fn execute_coordinator_query(
     let sql = CString::new(sql).map_err(|_| CoordinatorQueryError::InvalidQuery)?;
     let started = Instant::now();
     let mut db = ptr::null_mut();
-    let open_flags = ffi::SQLITE_OPEN_READONLY | ffi::SQLITE_OPEN_URI | ffi::SQLITE_OPEN_NOMUTEX;
+    let open_flags = ffi::SQLITE_OPEN_READONLY | ffi::SQLITE_OPEN_NOMUTEX;
     let rc = unsafe { ffi::sqlite3_open_v2(path.as_ptr(), &raw mut db, open_flags, ptr::null()) };
     if rc != ffi::SQLITE_OK {
-        let error = sqlite_error(db);
         if !db.is_null() {
             unsafe { ffi::sqlite3_close(db) };
         }
-        return Err(CoordinatorQueryError::Sqlite(error));
+        return Err(CoordinatorQueryError::OpenFailed);
     }
     let mut connection = ConnectionGuard(db);
     let mut authorizer = Box::new(AuthorizerState { denied: None });
@@ -173,7 +178,7 @@ pub fn execute_coordinator_query(
         )
     };
     if rc != ffi::SQLITE_OK {
-        return Err(classify_error(connection.0, &authorizer, rc));
+        return Err(classify_error(&authorizer, rc, QueryPhase::Prepare));
     }
     let statement = StatementGuard(statement);
     if statement.0.is_null() || tail_has_statement(tail) {
@@ -217,7 +222,7 @@ pub fn execute_coordinator_query(
             }
             ffi::SQLITE_DONE => break,
             ffi::SQLITE_INTERRUPT => return Err(CoordinatorQueryError::BudgetExceeded),
-            _ => return Err(classify_error(connection.0, &authorizer, rc)),
+            _ => return Err(classify_error(&authorizer, rc, QueryPhase::Execute)),
         }
     }
     unsafe {
@@ -282,9 +287,57 @@ fn table_allowed(name: &str) -> bool {
 }
 
 fn function_allowed(name: &str) -> bool {
-    !matches!(
+    matches!(
         name.to_ascii_lowercase().as_str(),
-        "load_extension" | "readfile" | "writefile" | "fts3_tokenizer"
+        "abs"
+            | "avg"
+            | "coalesce"
+            | "concat"
+            | "concat_ws"
+            | "count"
+            | "date"
+            | "datetime"
+            | "format"
+            | "glob"
+            | "hex"
+            | "ifnull"
+            | "iif"
+            | "instr"
+            | "json"
+            | "json_array"
+            | "json_array_length"
+            | "json_extract"
+            | "json_object"
+            | "json_quote"
+            | "json_type"
+            | "json_valid"
+            | "julianday"
+            | "length"
+            | "like"
+            | "lower"
+            | "ltrim"
+            | "max"
+            | "min"
+            | "nullif"
+            | "printf"
+            | "quote"
+            | "replace"
+            | "round"
+            | "rtrim"
+            | "sign"
+            | "strftime"
+            | "substr"
+            | "substring"
+            | "sum"
+            | "time"
+            | "total"
+            | "trim"
+            | "typeof"
+            | "unhex"
+            | "unicode"
+            | "unixepoch"
+            | "upper"
+            | "zeroblob"
     )
 }
 
@@ -304,10 +357,16 @@ fn tail_has_statement(mut tail: *const c_char) -> bool {
     false
 }
 
+#[derive(Clone, Copy)]
+enum QueryPhase {
+    Prepare,
+    Execute,
+}
+
 fn classify_error(
-    db: *mut ffi::sqlite3,
     authorizer: &AuthorizerState,
     rc: c_int,
+    phase: QueryPhase,
 ) -> CoordinatorQueryError {
     if rc == ffi::SQLITE_AUTH || authorizer.denied.is_some() {
         CoordinatorQueryError::Denied(
@@ -319,15 +378,11 @@ fn classify_error(
     } else if rc == ffi::SQLITE_INTERRUPT {
         CoordinatorQueryError::BudgetExceeded
     } else {
-        CoordinatorQueryError::Sqlite(sqlite_error(db))
+        match phase {
+            QueryPhase::Prepare => CoordinatorQueryError::PrepareFailed,
+            QueryPhase::Execute => CoordinatorQueryError::ExecutionFailed,
+        }
     }
-}
-
-fn sqlite_error(db: *mut ffi::sqlite3) -> String {
-    if db.is_null() {
-        return "unable to open database".to_string();
-    }
-    unsafe { c_string(ffi::sqlite3_errmsg(db)) }
 }
 
 unsafe fn optional_c_string(value: *const c_char) -> Option<String> {
@@ -516,7 +571,7 @@ mod tests {
             assert!(
                 matches!(
                     execute_coordinator_query(path.to_str().unwrap(), sql),
-                    Err(CoordinatorQueryError::Denied(_) | CoordinatorQueryError::Sqlite(_))
+                    Err(CoordinatorQueryError::Denied(_) | CoordinatorQueryError::PrepareFailed)
                 ),
                 "{sql}"
             );

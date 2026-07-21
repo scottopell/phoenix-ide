@@ -156,7 +156,7 @@ impl Tool for ResolveReference {
                 Ok(value) => ToolOutput::success(value),
                 Err(error) => ToolOutput::error(format!("failed to encode reference: {error}")),
             },
-            Err(error) => ToolOutput::error(format!("{error:?}")),
+            Err(error) => ToolOutput::error(app_error_message(error)),
         }
     }
 }
@@ -285,6 +285,21 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
         SendChatServiceError::Internal(_) => "internal_error",
         SendChatServiceError::Dispatch(_) => "dispatch_failed",
         SendChatServiceError::IdempotencyConflict => "idempotency_conflict",
+    }
+}
+
+fn app_error_message(error: crate::api::handlers::AppError) -> String {
+    match error {
+        crate::api::handlers::AppError::BadRequest(message)
+        | crate::api::handlers::AppError::NotFound(message)
+        | crate::api::handlers::AppError::Forbidden(message)
+        | crate::api::handlers::AppError::Internal(message)
+        | crate::api::handlers::AppError::TypedBadRequest { message, .. }
+        | crate::api::handlers::AppError::TypedInternal { message, .. } => message,
+        crate::api::handlers::AppError::Conflict(_)
+        | crate::api::handlers::AppError::UnprocessableEntity(_) => {
+            "reference resolution failed".to_string()
+        }
     }
 }
 

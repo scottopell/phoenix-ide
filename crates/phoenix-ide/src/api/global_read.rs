@@ -967,7 +967,9 @@ fn trim_chars(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{message_id_fragment, parse_conv_handle, split_fragment};
+    use super::{message_id_fragment, parse_conv_handle, split_fragment, GlobalReadService};
+    use phoenix_db::retrieval::Fts5Retriever;
+    use std::sync::Arc;
 
     #[test]
     fn parses_durable_conversation_references() {
@@ -977,5 +979,39 @@ mod tests {
         );
         assert_eq!(message_id_fragment("message-id"), Some("id"));
         assert_eq!(parse_conv_handle("abc#message-def"), ("abc", Some("def")));
+    }
+
+    #[tokio::test]
+    async fn snapshot_exposes_active_leaf_even_when_task_metadata_looks_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.db");
+        let db = crate::db::Database::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("root", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("leaf", "leaf", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'root'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET state = '{\"type\":\"tool_executing\"}', state_updated_at = '2026-07-21T12:00:00Z', updated_at = '2026-07-21T12:01:00Z', cm_task_id = '44008', cm_task_title = 'done task' WHERE id = 'leaf'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let snapshot = GlobalReadService::new(db, retriever)
+            .coordinator_snapshot()
+            .await
+            .unwrap();
+        assert!(snapshot.contains("root_conversation_id"));
+        assert!(snapshot.contains("current_conversation_id"));
+        assert!(snapshot.contains("tool_executing"));
+        assert!(snapshot.contains("44008"));
+        assert!(snapshot.contains("done task"));
     }
 }
