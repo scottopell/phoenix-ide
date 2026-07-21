@@ -111,6 +111,10 @@ pub enum Effect {
     /// Persist the new state
     PersistState,
 
+    /// Mark a durably authorized tool invocation complete after its product
+    /// message and state have been persisted.
+    CompleteDurableToolIntent { tool_use_id: String },
+
     /// Make an LLM request
     RequestLlm,
 

@@ -286,7 +286,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "make_direct_turn_message_ids_global",
         sql: MIGRATION_054,
     },
+    Migration {
+        version: 55,
+        name: "one_live_direct_turn_per_conversation",
+        sql: MIGRATION_055,
+    },
 ];
+
+const MIGRATION_055: &str = r"
+CREATE UNIQUE INDEX direct_turn_acceptances_one_live_per_conversation
+ON direct_turn_acceptances(conversation_id)
+WHERE committed_outcome IN ('PendingRuntime', 'RuntimeAccepted');
+";
 
 const MIGRATION_054: &str = r"
 CREATE UNIQUE INDEX direct_turn_acceptances_client_message_id_unique

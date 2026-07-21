@@ -2936,8 +2936,11 @@ where
         self.state = next_state;
         self.state_updated_at = state_updated_at;
         self.manage_deadline(&old_state);
-        if let Some(tx) = &self.state_watcher {
-            let _ = tx.send(self.state.clone());
+        let drain_event = self.maybe_drain_steering_queue(&old_state, false);
+        if drain_event.is_none() {
+            if let Some(tx) = &self.state_watcher {
+                let _ = tx.send(self.state.clone());
+            }
         }
         if !product_replay {
             if let Some(message) = persisted_message {
@@ -2946,7 +2949,7 @@ where
         }
         let mut generated = Vec::new();
         let remaining_effects: Vec<_> = effects.collect();
-        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state, false) {
+        if let Some(drain_event) = drain_event {
             self.run_effects_with_inline_drain(remaining_effects, drain_event, &mut generated)
                 .await?;
         } else {
@@ -4195,6 +4198,12 @@ where
 
             Effect::PersistState => self.persist_state_effect(true).await,
 
+            Effect::CompleteDurableToolIntent { tool_use_id } => {
+                self.storage
+                    .mark_top_level_llm_tool_completed(&self.context.conversation_id, &tool_use_id)
+                    .await?;
+                Ok(None)
+            }
             Effect::RequestLlm => self.dispatch_llm_request().await,
 
             Effect::CompleteCreation { job_id, claim } => {

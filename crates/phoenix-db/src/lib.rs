@@ -4548,6 +4548,15 @@ impl Database {
         let conversation_id = match &input.product {
             AcceptedTopLevelLlmProduct::PersistedAssistant(message) => {
                 insert_message_tx(&mut tx, message).await?;
+                sqlx::query(
+                    "UPDATE top_level_llm_workflows
+                     SET accepted_assistant_message_id = ?2
+                     WHERE workflow_id = ?1",
+                )
+                .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+                .bind(&message.message_id)
+                .execute(&mut *tx)
+                .await?;
                 &message.conversation_id
             }
             AcceptedTopLevelLlmProduct::StateCheckpoint { conversation_id } => conversation_id,
@@ -12128,6 +12137,15 @@ mod tests {
         .unwrap();
         let transition_event: phoenix_workflow::llm_profile::TopLevelLlmEvent =
             serde_json::from_slice(&transition_payload).unwrap();
+        let accepted_head = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT accepted_assistant_message_id FROM top_level_llm_workflows
+             WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(WorkflowId(1).0).unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(accepted_head.as_deref(), Some("assistant-1"));
         assert!(matches!(
             transition_event,
             phoenix_workflow::llm_profile::TopLevelLlmEvent::ResponseAccepted { .. }

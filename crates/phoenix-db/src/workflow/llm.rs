@@ -388,6 +388,18 @@ impl WorkflowRepository {
                 if globally_owned {
                     return Ok(DirectTurnAcceptanceOutcome::Conflict);
                 }
+                let live_slot_taken = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM direct_turn_acceptances
+                     WHERE conversation_id = ?1
+                       AND committed_outcome IN ('PendingRuntime', 'RuntimeAccepted')",
+                )
+                .bind(&input.conversation_id)
+                .fetch_one(&self.pool)
+                .await?
+                    != 0;
+                if live_slot_taken {
+                    return Ok(DirectTurnAcceptanceOutcome::Conflict);
+                }
             }
             return Err(error.into());
         }
@@ -518,10 +530,21 @@ impl WorkflowRepository {
             .await?
                 == 1;
             if !replay {
-                tx.rollback().await?;
-                return Err(DbError::Serialization(format!(
-                    "queued steering turn {owner_message_id} cannot own the drained batch"
-                )));
+                let legacy_without_acceptance = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM direct_turn_acceptances
+                     WHERE conversation_id = ?1 AND client_message_id = ?2",
+                )
+                .bind(conversation_id)
+                .bind(owner_message_id)
+                .fetch_one(&mut *tx.tx)
+                .await?
+                    == 0;
+                if !legacy_without_acceptance {
+                    tx.rollback().await?;
+                    return Err(DbError::Serialization(format!(
+                        "queued steering turn {owner_message_id} cannot own the drained batch"
+                    )));
+                }
             }
         }
         for message_id in drained_message_ids {
@@ -1213,6 +1236,16 @@ impl WorkflowRepository {
         conversation_id: &str,
         tool_use_id: &str,
     ) -> DbResult<Option<(WorkflowId, ReceiptId, ToolIntentRecord, Generation)>> {
+        self.load_top_level_llm_tool_intent(conversation_id, tool_use_id, ToolIntentStatus::Owed)
+            .await
+    }
+
+    pub async fn load_top_level_llm_tool_intent(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+        status: ToolIntentStatus,
+    ) -> DbResult<Option<(WorkflowId, ReceiptId, ToolIntentRecord, Generation)>> {
         let row = sqlx::query(
             "SELECT ti.workflow_id, ti.receipt_id, ti.intent_ordinal, ti.status,
                     ti.tool_name, ti.tool_kind, ti.tool_use_id, ti.arguments_json,
@@ -1223,10 +1256,11 @@ impl WorkflowRepository {
                AND r.receipt_id = ti.receipt_id
              JOIN top_level_llm_workflows w ON w.workflow_id = ti.workflow_id
              WHERE dta.conversation_id = ?1 AND ti.tool_use_id = ?2
-               AND ti.status = 'Owed' AND w.stopped_at IS NULL",
+               AND ti.status = ?3 AND w.stopped_at IS NULL",
         )
         .bind(conversation_id)
         .bind(tool_use_id)
+        .bind(tool_intent_status_to_str(status))
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| {
@@ -2113,6 +2147,49 @@ mod tests {
             })
             .collect();
         assert_eq!(workflow_ids, vec![workflow_ids[0], workflow_ids[0]]);
+    }
+
+    #[tokio::test]
+    async fn distinct_direct_turns_race_for_one_conversation_slot() {
+        let (_dir, first, second) = open_independent_repos().await;
+        let left_input = DirectTurnAcceptanceInput {
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-left".to_string(),
+            prepared_fingerprint: "fp-left".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        };
+        let mut right_input = left_input.clone();
+        right_input.client_message_id = "msg-right".to_string();
+        right_input.prepared_fingerprint = "fp-right".to_string();
+        let (left, right) = tokio::join!(
+            first.accept_direct_turn(&left_input),
+            second.accept_direct_turn(&right_input),
+        );
+        let mut outcomes = [left.unwrap(), right.unwrap()];
+        for (index, repo, input) in [(0, &first, &left_input), (1, &second, &right_input)] {
+            if matches!(
+                outcomes[index],
+                DirectTurnAcceptanceOutcome::RetryablePersistence
+            ) {
+                outcomes[index] = repo.accept_direct_turn(input).await.unwrap();
+            }
+        }
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DirectTurnAcceptanceOutcome::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DirectTurnAcceptanceOutcome::Conflict))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

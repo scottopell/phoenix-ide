@@ -116,6 +116,14 @@ pub trait MessageStore: Send + Sync {
         Ok(true)
     }
 
+    async fn mark_top_level_llm_tool_completed(
+        &self,
+        _conversation_id: &str,
+        _tool_use_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn owed_top_level_llm_receipt(
         &self,
         _conversation_id: &str,
@@ -777,6 +785,46 @@ impl MessageStore for DatabaseStorage {
             phoenix_db::ToolIntentTransitionOutcome::Conflict => Ok(false),
             phoenix_db::ToolIntentTransitionOutcome::RetryablePersistence => {
                 Err("tool execution authority persistence is temporarily busy".to_string())
+            }
+        }
+    }
+
+    async fn mark_top_level_llm_tool_completed(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> Result<(), String> {
+        let repo = phoenix_db::WorkflowRepository::new(self.db.pool().clone());
+        let Some((workflow_id, receipt_id, intent, generation)) = repo
+            .load_top_level_llm_tool_intent(
+                conversation_id,
+                tool_use_id,
+                phoenix_db::ToolIntentStatus::ExecutionMayHaveBegun,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        match repo
+            .transition_top_level_llm_tool_intent(&phoenix_db::ToolIntentTransitionInput {
+                workflow_id,
+                receipt_id,
+                intent_ordinal: intent.intent_ordinal,
+                generation,
+                from: phoenix_db::ToolIntentStatus::ExecutionMayHaveBegun,
+                to: phoenix_db::ToolIntentStatus::Completed,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            phoenix_db::ToolIntentTransitionOutcome::Committed
+            | phoenix_db::ToolIntentTransitionOutcome::ExactReplay => Ok(()),
+            phoenix_db::ToolIntentTransitionOutcome::Conflict => {
+                Err("durable tool completion lost authority".to_string())
+            }
+            phoenix_db::ToolIntentTransitionOutcome::RetryablePersistence => {
+                Err("durable tool completion persistence is temporarily busy".to_string())
             }
         }
     }
