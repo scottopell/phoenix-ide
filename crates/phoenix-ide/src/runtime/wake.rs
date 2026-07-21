@@ -157,6 +157,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .await
             .map_err(|error| error.to_string())?;
         self.run_once().await?;
+        recover_top_level_llm_attempts(&manager).await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
         deliver_pending_direct_turns(&manager).await?;
         let _ = ready_tx.send(());
@@ -173,6 +174,9 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             let wait = match self.run_once().await {
                 Ok(wait) => {
                     if let Some(manager) = manager.as_ref() {
+                        if let Err(error) = recover_top_level_llm_attempts(manager).await {
+                            tracing::warn!(error = %error, "top-level LLM recovery failed; retrying");
+                        }
                         if let Err(error) = deliver_pending_direct_turns(manager).await {
                             tracing::warn!(error = %error, retry_in = ?error_backoff, "direct-turn recovery failed; retrying");
                         }
@@ -365,6 +369,107 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             }
         }
     }
+}
+
+async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+    use sha2::Digest as _;
+
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    for recovery in repo
+        .recover_top_level_llm_attempts()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let durable_request: phoenix_llm::DurableLlmRequest =
+            serde_json::from_str(&recovery.prepared_request.request_aggregate)
+                .map_err(|error| error.to_string())?;
+        let begun = repo
+            .begin_recovered_top_level_llm_attempt(
+                recovery.workflow.workflow_id,
+                recovery.prepared_request.effect_id,
+                super::process_incarnation(),
+                Timestamp(u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(authority) = begun.authority else {
+            continue;
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let request = durable_request.into_attempt(phoenix_llm::LlmRequestTelemetry {
+            conversation_id: recovery.workflow.conversation_id.clone(),
+            root_conversation_id: recovery.workflow.conversation_id.clone(),
+            request_id,
+            retry_attempt: u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX),
+        });
+        let Some(llm) = manager
+            .model_registry()
+            .get(&recovery.prepared_request.model)
+        else {
+            tracing::error!(model = %recovery.prepared_request.model, "recovered LLM model is unavailable");
+            continue;
+        };
+        match llm.complete(&request).await {
+            Ok(response) => {
+                let aggregate = serde_json::to_string(&phoenix_llm::DurableLlmResponse {
+                    response: response.clone(),
+                    provider_request_id: None,
+                })
+                .map_err(|error| error.to_string())?;
+                let fingerprint = sha2::Sha256::digest(aggregate.as_bytes()).iter().fold(
+                    String::with_capacity(64),
+                    |mut output, byte| {
+                        use std::fmt::Write as _;
+                        write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                        output
+                    },
+                );
+                let tool_intents = response
+                    .tool_uses()
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(ordinal, (id, name, arguments))| phoenix_db::ToolIntentRecord {
+                            intent_ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                            status: phoenix_db::ToolIntentStatus::PendingAcceptance,
+                            tool_name: name.to_string(),
+                            tool_kind: phoenix_db::ToolKindRecord::Function,
+                            tool_use_id: id.to_string(),
+                            arguments_json: arguments.to_string(),
+                        },
+                    )
+                    .collect();
+                repo.accept_complete_top_level_llm_response(
+                    &phoenix_db::AcceptCompleteLlmResponseInput {
+                        authority,
+                        delivery_id: None,
+                        receipt_id: None,
+                        response: phoenix_workflow::llm_profile::CompleteLlmResponse {
+                            codec_version: phoenix_llm::DURABLE_LLM_RESPONSE_CODEC_VERSION,
+                            response_fingerprint: fingerprint,
+                            response_aggregate: aggregate,
+                        },
+                        provider_request_id: None,
+                        tool_intents,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+            Err(error) => {
+                repo.record_top_level_llm_failure(&phoenix_db::RecordTopLevelLlmFailureInput {
+                    authority,
+                    observed_at: Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                    ),
+                    outcome_payload: error.to_string().into_bytes(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn deliver_pending_direct_turns(manager: &Arc<RuntimeManager>) -> Result<(), String> {

@@ -619,6 +619,49 @@ impl WorkflowRepository {
         Ok(result.outcome)
     }
 
+    pub async fn begin_recovered_top_level_llm_attempt(
+        &self,
+        workflow_id: WorkflowId,
+        effect_id: EffectId,
+        process_incarnation: ProcessIncarnation,
+        now: Timestamp,
+    ) -> DbResult<BeginAttemptResult> {
+        let mut tx = self.begin_tx().await?;
+        let attempt_id = AttemptId(
+            tx.allocate_sequence_value(workflow_id, WorkflowSequenceName::Attempt)
+                .await?,
+        );
+        sqlx::query(
+            "UPDATE workflow_attempts SET status = 'Superseded'
+             WHERE workflow_id = ?1 AND effect_id = ?2
+               AND status IN ('Begun', 'ObservationRecorded')",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(to_i64(effect_id.0, "effect_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_effects SET status = 'Eligible'
+             WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(to_i64(effect_id.0, "effect_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        let result = tx
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id,
+                effect_id,
+                attempt_id,
+                process_incarnation,
+                now,
+                lease_until: None,
+            })
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
     pub async fn recover_top_level_llm_attempts(&self) -> DbResult<Vec<RecoverTopLevelLlmAttempt>> {
         let rows = sqlx::query(
             "SELECT w.workflow_id, dta.conversation_id, dta.client_message_id AS accepted_turn_id, w.turn_generation,
