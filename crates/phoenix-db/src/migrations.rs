@@ -281,7 +281,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_top_level_llm_profile_tables",
         sql: MIGRATION_053,
     },
+    Migration {
+        version: 54,
+        name: "make_direct_turn_message_ids_global",
+        sql: MIGRATION_054,
+    },
 ];
+
+const MIGRATION_054: &str = r"
+CREATE UNIQUE INDEX direct_turn_acceptances_client_message_id_unique
+ON direct_turn_acceptances(client_message_id);
+";
 
 const MIGRATION_052: &str = r"
 CREATE TABLE IF NOT EXISTS llm_request_metrics (

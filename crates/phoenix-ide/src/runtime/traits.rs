@@ -85,10 +85,11 @@ pub trait MessageStore: Send + Sync {
         Ok(phoenix_db::DirectTurnRuntimeAdmissionOutcome::Conflict)
     }
 
-    async fn promote_queued_steering_turns(
+    async fn consume_queued_steering_batch(
         &self,
         _conversation_id: &str,
-        _message_ids: &[String],
+        _owner_message_id: &str,
+        _drained_message_ids: &[String],
     ) -> Result<(), String> {
         Ok(())
     }
@@ -710,13 +711,14 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn promote_queued_steering_turns(
+    async fn consume_queued_steering_batch(
         &self,
         conversation_id: &str,
-        message_ids: &[String],
+        owner_message_id: &str,
+        drained_message_ids: &[String],
     ) -> Result<(), String> {
         phoenix_db::WorkflowRepository::new(self.db.pool().clone())
-            .promote_queued_steering_turns(conversation_id, message_ids)
+            .consume_queued_steering_batch(conversation_id, owner_message_id, drained_message_ids)
             .await
             .map_err(|error| error.to_string())
     }

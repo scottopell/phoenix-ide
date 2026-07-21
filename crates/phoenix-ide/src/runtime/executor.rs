@@ -2593,11 +2593,18 @@ where
                 owed.workflow.workflow_id.0, owed.receipt.receipt_id.0
             )
         });
+        let owed_tool_use_ids: std::collections::HashSet<_> = owed
+            .tool_intents
+            .iter()
+            .filter(|intent| intent.status == phoenix_db::ToolIntentStatus::Owed)
+            .map(|intent| intent.tool_use_id.as_str())
+            .collect();
         Ok(Event::LlmResponse {
             tool_calls: durable
                 .response
                 .tool_uses()
                 .into_iter()
+                .filter(|(id, _, _)| owed_tool_use_ids.contains(*id))
                 .map(|(id, name, input)| crate::state_machine::state::ToolCall {
                     id: id.to_string(),
                     input: if name == "approved_commission_review" {
@@ -3257,9 +3264,10 @@ where
             .iter()
             .map(|entry| entry.message_id.clone())
             .collect();
-        self.storage
-            .promote_queued_steering_turns(&self.context.conversation_id, &drained_message_ids)
-            .await?;
+        let owner_message_id = drained_message_ids
+            .last()
+            .ok_or_else(|| "steering drain batch was empty".to_string())?
+            .clone();
         let drain_result = transition(
             &self.state,
             &self.context,
@@ -3284,6 +3292,16 @@ where
             }
         }
         for effect in drain_result.effects {
+            if matches!(effect, Effect::ClearSteeringQueueEntries { .. }) {
+                self.storage
+                    .consume_queued_steering_batch(
+                        &self.context.conversation_id,
+                        &owner_message_id,
+                        &drained_message_ids,
+                    )
+                    .await?;
+                continue;
+            }
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);
             }

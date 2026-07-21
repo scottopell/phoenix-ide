@@ -782,6 +782,7 @@ describe('conversationReducer', () => {
         lastAppliedEventSeq: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
         streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
+        activeLlmStreamRequestId: 'test-req-id',
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
@@ -795,6 +796,7 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.streamingBuffer).toBeNull();
+      expect(next.activeLlmStreamRequestId).toBeNull();
       expect(next.lastAppliedEventSeq).toBe(50);
       expect(next.eventGap).toBeNull();
     });

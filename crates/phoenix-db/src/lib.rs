@@ -4422,6 +4422,44 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         let version: i64 = workflow.get("version");
+        let receipt = sqlx::query(
+            "SELECT dta.client_message_id AS accepted_turn_id,
+                    wr.generation, e.call_ordinal
+             FROM workflow_receipts wr
+             JOIN direct_turn_acceptances dta ON dta.workflow_id = wr.workflow_id
+             JOIN top_level_llm_effects e
+               ON e.workflow_id = wr.workflow_id AND e.effect_id = wr.effect_id
+             WHERE wr.workflow_id = ?1 AND wr.receipt_id = ?2",
+        )
+        .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+        .bind(i64::try_from(input.receipt_id.0).unwrap_or(i64::MAX))
+        .fetch_one(&mut *tx)
+        .await?;
+        let assistant_message_id = match &input.product {
+            AcceptedTopLevelLlmProduct::PersistedAssistant(message) => message.message_id.clone(),
+            AcceptedTopLevelLlmProduct::StateCheckpoint { .. } => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT accepted_assistant_message_id
+                     FROM top_level_llm_workflows WHERE workflow_id = ?1",
+                )
+                .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
+        let event_payload = serde_json::to_vec(
+            &phoenix_workflow::llm_profile::TopLevelLlmEvent::ResponseAccepted {
+                key: phoenix_workflow::llm_profile::LlmEffectKey {
+                    accepted_turn_id: receipt.get("accepted_turn_id"),
+                    generation: u64::try_from(receipt.get::<i64, _>("generation"))
+                        .map_err(|_| DbError::Serialization("negative generation".to_string()))?,
+                    call_ordinal: u64::try_from(receipt.get::<i64, _>("call_ordinal"))
+                        .map_err(|_| DbError::Serialization("negative call_ordinal".to_string()))?,
+                },
+                assistant_message_id,
+            },
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
             "UPDATE workflows SET version = version + 1, updated_at = ?2
              WHERE workflow_id = ?1 AND version = ?3 AND status = 'Active'",
@@ -4435,13 +4473,14 @@ impl Database {
             "INSERT INTO workflow_transitions
              (workflow_id, transition_id, from_version, to_version, generation,
               event_codec_family, event_codec_version, event_payload, committed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'llm.event', 1, X'7B7D', ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'llm.event', 1, ?6, ?7)",
         )
         .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
         .bind(transition_id)
         .bind(version)
         .bind(version + 1)
         .bind(workflow.get::<i64, _>("generation"))
+        .bind(event_payload)
         .bind(Utc::now().timestamp_millis())
         .execute(&mut *tx)
         .await?;
@@ -12077,6 +12116,20 @@ mod tests {
             db.accept_top_level_llm_product(&input).await.unwrap(),
             AcceptTopLevelLlmProductOutcome::ExactReplay
         );
+        let transition_payload = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT event_payload FROM workflow_transitions
+             WHERE workflow_id = ?1 ORDER BY transition_id DESC LIMIT 1",
+        )
+        .bind(i64::try_from(WorkflowId(1).0).unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let transition_event: phoenix_workflow::llm_profile::TopLevelLlmEvent =
+            serde_json::from_slice(&transition_payload).unwrap();
+        assert!(matches!(
+            transition_event,
+            phoenix_workflow::llm_profile::TopLevelLlmEvent::ResponseAccepted { .. }
+        ));
         let owed_after_product = repo.load_owed_top_level_llm_receipts().await.unwrap();
         assert_eq!(owed_after_product.len(), 1);
         assert_eq!(owed_after_product[0].receipt.receipt_id, receipt_id);
