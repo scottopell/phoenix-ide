@@ -4647,17 +4647,17 @@ mod tests {
         run_pending_migrations(pool).await.unwrap();
         sqlx::query(
             "INSERT OR IGNORE INTO work_scopes
-             (id, authority_kind, lifecycle, created_at, updated_at)
-             VALUES ('conv-1', 'restricted_explore', 'active', '2025-01-01', '2025-01-01')",
+             (id, authority_kind, lifecycle, created_at, updated_at, environment_kind, cwd)
+             VALUES ('conv-1', 'restricted_explore', 'active', '2025-01-01', '2025-01-01', 'unowned_cwd', '/tmp')",
         )
         .execute(pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO conversations
-             (id, slug, title, cwd, user_initiated, state_updated_at, created_at, updated_at,
+             (id, slug, title, user_initiated, state_updated_at, created_at, updated_at,
               runtime_role, work_scope_id)
-             VALUES ('conv-1', 'conv-1', 'conv-1', '/tmp', 1, '2025-01-01', '2025-01-01',
+             VALUES ('conv-1', 'conv-1', 'conv-1', 1, '2025-01-01', '2025-01-01',
                      '2025-01-01', 'user', 'conv-1')",
         )
         .execute(pool)
@@ -4933,9 +4933,9 @@ mod tests {
     async fn insert_conversation(pool: &sqlx::SqlitePool, id: &str) {
         sqlx::query(
             "INSERT OR IGNORE INTO conversations
-             (id, slug, title, cwd, user_initiated, state_updated_at, created_at, updated_at,
+             (id, slug, title, user_initiated, state_updated_at, created_at, updated_at,
               runtime_role, work_scope_id)
-             SELECT ?1, ?1, ?1, '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01',
+             SELECT ?1, ?1, ?1, 1, '2025-01-01', '2025-01-01', '2025-01-01',
                     'user', work_scope_id
              FROM conversations
              WHERE id = 'conv-1'",

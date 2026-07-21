@@ -276,7 +276,127 @@ const MIGRATIONS: &[Migration] = &[
         name: "opaque_work_scope_identity",
         sql: MIGRATION_052,
     },
+    Migration {
+        version: 53,
+        name: "work_scope_owns_environment",
+        sql: MIGRATION_053,
+    },
 ];
+
+const MIGRATION_053: &str = r"
+ALTER TABLE work_scopes ADD COLUMN environment_kind TEXT NOT NULL DEFAULT 'none'
+    CHECK (environment_kind IN ('allocated_worktree', 'unowned_cwd', 'none'));
+ALTER TABLE work_scopes ADD COLUMN cwd TEXT;
+ALTER TABLE work_scopes ADD COLUMN worktree_path TEXT;
+ALTER TABLE work_scopes ADD COLUMN branch_name TEXT;
+ALTER TABLE work_scopes ADD COLUMN base_branch TEXT;
+
+UPDATE work_scopes
+SET environment_kind = (SELECT environment_kind FROM work_scope_environments WHERE work_scope_id = work_scopes.id),
+    cwd = (SELECT cwd FROM work_scope_environments WHERE work_scope_id = work_scopes.id),
+    worktree_path = (SELECT worktree_path FROM work_scope_environments WHERE work_scope_id = work_scopes.id),
+    branch_name = (SELECT branch_name FROM work_scope_environments WHERE work_scope_id = work_scopes.id),
+    base_branch = (SELECT base_branch FROM work_scope_environments WHERE work_scope_id = work_scopes.id),
+    updated_at = MAX(updated_at, COALESCE((SELECT updated_at FROM work_scope_environments WHERE work_scope_id = work_scopes.id), updated_at));
+
+CREATE TEMP TABLE migration_053_guard (invalid_count INTEGER NOT NULL CHECK (invalid_count = 0));
+INSERT INTO migration_053_guard
+SELECT COUNT(*) FROM work_scopes
+WHERE NOT (
+    (environment_kind = 'allocated_worktree' AND cwd IS NOT NULL AND cwd <> '' AND worktree_path IS NOT NULL AND worktree_path <> '' AND (branch_name IS NULL OR branch_name <> '') AND (base_branch IS NULL OR base_branch <> ''))
+    OR (environment_kind = 'unowned_cwd' AND cwd IS NOT NULL AND cwd <> '' AND worktree_path IS NULL AND branch_name IS NULL AND base_branch IS NULL)
+    OR (environment_kind = 'none' AND cwd IS NULL AND worktree_path IS NULL AND branch_name IS NULL AND base_branch IS NULL)
+);
+
+DROP TABLE work_scope_environments;
+CREATE VIEW work_scope_environments AS
+SELECT id AS work_scope_id, environment_kind, cwd, worktree_path, branch_name, base_branch, updated_at
+FROM work_scopes;
+CREATE TRIGGER work_scope_environments_insert
+INSTEAD OF INSERT ON work_scope_environments
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_scopes WHERE id = NEW.work_scope_id)
+        THEN RAISE(ABORT, 'work scope not found') END;
+    UPDATE work_scopes
+    SET environment_kind = NEW.environment_kind,
+        cwd = NEW.cwd,
+        worktree_path = NEW.worktree_path,
+        branch_name = NEW.branch_name,
+        base_branch = NEW.base_branch,
+        updated_at = NEW.updated_at
+    WHERE id = NEW.work_scope_id;
+END;
+CREATE TRIGGER work_scope_environments_update
+INSTEAD OF UPDATE ON work_scope_environments
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_scopes WHERE id = OLD.work_scope_id)
+        THEN RAISE(ABORT, 'work scope not found') END;
+    UPDATE work_scopes
+    SET environment_kind = NEW.environment_kind,
+        cwd = NEW.cwd,
+        worktree_path = NEW.worktree_path,
+        branch_name = NEW.branch_name,
+        base_branch = NEW.base_branch,
+        updated_at = NEW.updated_at
+    WHERE id = OLD.work_scope_id;
+END;
+CREATE TRIGGER work_scope_environment_shape_insert
+BEFORE INSERT ON work_scopes
+WHEN NOT (
+    (NEW.environment_kind = 'allocated_worktree' AND NEW.cwd IS NOT NULL AND NEW.cwd <> '' AND NEW.worktree_path IS NOT NULL AND NEW.worktree_path <> '' AND (NEW.branch_name IS NULL OR NEW.branch_name <> '') AND (NEW.base_branch IS NULL OR NEW.base_branch <> ''))
+    OR (NEW.environment_kind = 'unowned_cwd' AND NEW.cwd IS NOT NULL AND NEW.cwd <> '' AND NEW.worktree_path IS NULL AND NEW.branch_name IS NULL AND NEW.base_branch IS NULL)
+    OR (NEW.environment_kind = 'none' AND NEW.cwd IS NULL AND NEW.worktree_path IS NULL AND NEW.branch_name IS NULL AND NEW.base_branch IS NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid work scope environment');
+END;
+CREATE TRIGGER work_scope_environment_shape_update
+BEFORE UPDATE OF environment_kind, cwd, worktree_path, branch_name, base_branch ON work_scopes
+WHEN NOT (
+    (NEW.environment_kind = 'allocated_worktree' AND NEW.cwd IS NOT NULL AND NEW.cwd <> '' AND NEW.worktree_path IS NOT NULL AND NEW.worktree_path <> '' AND (NEW.branch_name IS NULL OR NEW.branch_name <> '') AND (NEW.base_branch IS NULL OR NEW.base_branch <> ''))
+    OR (NEW.environment_kind = 'unowned_cwd' AND NEW.cwd IS NOT NULL AND NEW.cwd <> '' AND NEW.worktree_path IS NULL AND NEW.branch_name IS NULL AND NEW.base_branch IS NULL)
+    OR (NEW.environment_kind = 'none' AND NEW.cwd IS NULL AND NEW.worktree_path IS NULL AND NEW.branch_name IS NULL AND NEW.base_branch IS NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid work scope environment');
+END;
+
+ALTER TABLE conversations ADD COLUMN coordinator_cwd TEXT;
+ALTER TABLE conversations ADD COLUMN coordinator_head INTEGER NOT NULL DEFAULT 0 CHECK (coordinator_head IN (0, 1));
+UPDATE conversations SET coordinator_cwd = cwd WHERE runtime_role = 'coordinator';
+UPDATE conversations SET coordinator_head = 1
+WHERE runtime_role = 'coordinator' AND continued_in_conv_id IS NULL;
+DROP INDEX one_coordinator_conversation;
+CREATE UNIQUE INDEX one_live_coordinator_conversation
+ON conversations(coordinator_head)
+WHERE coordinator_head = 1;
+ALTER TABLE conversations DROP COLUMN cwd;
+DROP TRIGGER conversations_role_scope_insert;
+DROP TRIGGER conversations_role_scope_update;
+CREATE TRIGGER conversations_role_scope_insert
+BEFORE INSERT ON conversations
+WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
+  OR ((NEW.runtime_role = 'coordinator') != (NEW.work_scope_id IS NULL))
+  OR ((NEW.runtime_role = 'coordinator') != (NEW.coordinator_cwd IS NOT NULL))
+  OR (NEW.coordinator_head = 1 AND NEW.runtime_role <> 'coordinator')
+  OR (NEW.coordinator_head = 1 AND NEW.continued_in_conv_id IS NOT NULL)
+  OR (NEW.coordinator_cwd IS NOT NULL AND NEW.coordinator_cwd = '')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
+END;
+CREATE TRIGGER conversations_role_scope_update
+BEFORE UPDATE OF runtime_role, work_scope_id, coordinator_cwd, coordinator_head, continued_in_conv_id ON conversations
+WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
+  OR ((NEW.runtime_role = 'coordinator') != (NEW.work_scope_id IS NULL))
+  OR ((NEW.runtime_role = 'coordinator') != (NEW.coordinator_cwd IS NOT NULL))
+  OR (NEW.coordinator_head = 1 AND NEW.runtime_role <> 'coordinator')
+  OR (NEW.coordinator_head = 1 AND NEW.continued_in_conv_id IS NOT NULL)
+  OR (NEW.coordinator_cwd IS NOT NULL AND NEW.coordinator_cwd = '')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
+END;
+DROP TABLE migration_053_guard;
+";
 
 const MIGRATION_052: &str = r"
 ALTER TABLE work_scopes RENAME TO work_scopes_old;
@@ -4258,7 +4378,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
 
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(work_scopes)")
             .fetch_all(&pool)
@@ -4310,6 +4430,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(invalid_lifecycle, 0);
+
+        let conversation_columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("name"))
+            .collect();
+        assert!(!conversation_columns.iter().any(|column| column == "cwd"));
+        assert!(conversation_columns
+            .iter()
+            .any(|column| column == "coordinator_cwd"));
+
+        let environment_columns: Vec<String> = sqlx::query("PRAGMA table_info(work_scopes)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("name"))
+            .collect();
+        for column in [
+            "environment_kind",
+            "cwd",
+            "worktree_path",
+            "branch_name",
+            "base_branch",
+        ] {
+            assert!(environment_columns.iter().any(|actual| actual == column));
+        }
+
+        let invalid_environment = sqlx::query(
+            "UPDATE work_scopes
+             SET environment_kind = 'allocated_worktree', cwd = NULL, worktree_path = NULL
+             LIMIT 1",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_environment.is_err());
 
         let invalid_role_scope = sqlx::query(
             "UPDATE conversations SET runtime_role = 'coordinator'

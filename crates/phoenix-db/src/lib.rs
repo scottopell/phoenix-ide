@@ -1037,10 +1037,10 @@ impl Database {
             EnvironmentContext::None => ("none", None, None, None, None),
         };
         let result = sqlx::query(
-            "UPDATE work_scope_environments
+            "UPDATE work_scopes
              SET environment_kind = ?1, cwd = ?2, worktree_path = ?3,
                  branch_name = ?4, base_branch = ?5, updated_at = ?6
-             WHERE work_scope_id = ?7",
+             WHERE id = ?7",
         )
         .bind(kind)
         .bind(cwd)
@@ -2824,13 +2824,12 @@ impl Database {
                 .await?;
             }
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             )
             .bind(id)
             .bind(&actual_slug)
             .bind(&title_str)
-            .bind(cwd)
             .bind(parent_id)
             .bind(user_initiated)
             .bind(&idle_state)
@@ -2930,7 +2929,7 @@ impl Database {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let result: DbResult<String> = async {
             if let Some(id) = sqlx::query_scalar(
-                "SELECT id FROM conversations WHERE runtime_role = 'coordinator'",
+                "SELECT id FROM conversations WHERE coordinator_head = 1",
             )
             .fetch_optional(&mut *conn)
             .await?
@@ -2944,8 +2943,8 @@ impl Database {
             let idle = serde_json::to_string(&ConvState::Idle)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, 'Coordinator', ?3, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
+                "INSERT INTO conversations (id, slug, title, coordinator_cwd, coordinator_head, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, 'Coordinator', ?3, 1, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
             )
             .bind(&id)
             .bind(slug)
@@ -2978,7 +2977,7 @@ impl Database {
     /// # Errors
     /// Returns an error when the singleton relation cannot be queried.
     pub async fn coordinator_conversation_id(&self) -> DbResult<Option<String>> {
-        sqlx::query_scalar("SELECT id FROM conversations WHERE runtime_role = 'coordinator'")
+        sqlx::query_scalar("SELECT id FROM conversations WHERE coordinator_head = 1")
             .fetch_optional(&self.pool)
             .await
             .map_err(DbError::Sqlx)
@@ -2990,7 +2989,7 @@ impl Database {
     /// Returns an error when the singleton relation cannot be queried.
     pub async fn is_coordinator_conversation(&self, conversation_id: &str) -> DbResult<bool> {
         let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM conversations WHERE runtime_role = 'coordinator' AND id = ?1",
+            "SELECT 1 FROM conversations WHERE coordinator_head = 1 AND id = ?1",
         )
         .bind(conversation_id)
         .fetch_optional(&self.pool)
@@ -3040,7 +3039,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3069,7 +3068,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3098,7 +3097,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3170,7 +3169,7 @@ impl Database {
     pub async fn preview_roots(&self) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, Option<String>>(
             "WITH RECURSIVE coordinator_chain(id) AS (
-                 SELECT id FROM conversations WHERE runtime_role = 'coordinator'
+                 SELECT id FROM conversations WHERE coordinator_head = 1
                  UNION
                  SELECT c.id
                  FROM conversations c
@@ -3181,9 +3180,11 @@ impl Database {
                  JOIN coordinator_chain cc ON c.id = cc.id
                  WHERE c.continued_in_conv_id IS NOT NULL
              )
-             SELECT cwd FROM conversations
-               WHERE cwd IS NOT NULL AND cwd != ''
-                 AND id NOT IN (SELECT id FROM coordinator_chain)
+             SELECT e.cwd
+             FROM work_scope_environments e
+             JOIN conversations c ON c.work_scope_id = e.work_scope_id
+               WHERE e.cwd IS NOT NULL AND e.cwd != ''
+                 AND c.id NOT IN (SELECT id FROM coordinator_chain)
              UNION
              SELECT e.worktree_path
              FROM work_scope_environments e
@@ -3226,7 +3227,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn managed_worktree_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3253,7 +3254,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_all_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3277,7 +3278,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3387,13 +3388,12 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?7, ?7, 0, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 'user', ?20)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?6, ?6, 0, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'user', ?19)",
             )
             .bind(id)
             .bind(&actual_slug)
             .bind(&title_str)
-            .bind(cwd)
             .bind(user_initiated)
             .bind(&creation_state_json)
             .bind(&now_str)
@@ -4819,11 +4819,16 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let cm = conv_mode_columns(mode);
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT cwd, work_scope_id FROM conversations WHERE id = ?1")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| DbError::ConversationNotFound(id.to_string()))?;
+        let row = sqlx::query(
+            "SELECT c.work_scope_id, e.cwd
+             FROM conversations c
+             JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
+             WHERE c.id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::ConversationNotFound(id.to_string()))?;
         let persisted_cwd: String = row.get("cwd");
         let cwd = new_cwd.unwrap_or(&persisted_cwd);
         let scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
@@ -4833,8 +4838,8 @@ impl Database {
             "UPDATE conversations
              SET cm_kind = ?1, cm_branch_name = ?2, cm_worktree_path = ?3, cm_base_branch = ?4,
                  cm_task_id = ?5, cm_task_title = ?6, cm_next_taskmd_id_hint = ?7,
-                 cwd = COALESCE(?8, cwd), updated_at = ?9
-             WHERE id = ?10 AND work_scope_id = ?11",
+                 updated_at = ?8
+             WHERE id = ?9 AND work_scope_id = ?10",
         )
         .bind(cm.kind)
         .bind(cm.branch_name)
@@ -4843,7 +4848,6 @@ impl Database {
         .bind(cm.task_id)
         .bind(cm.task_title)
         .bind(cm.next_taskmd_id_hint)
-        .bind(new_cwd)
         .bind(&now)
         .bind(id)
         .bind(scope_id.as_str())
@@ -4853,6 +4857,18 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        let authority = match mode {
+            ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
+            ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                AuthorityKind::Work
+            }
+        };
+        sqlx::query("UPDATE work_scopes SET authority_kind = ?1, updated_at = ?2 WHERE id = ?3")
+            .bind(authority.as_str())
+            .bind(&now)
+            .bind(scope_id.as_str())
+            .execute(&mut *tx)
+            .await?;
         Self::update_work_scope_environment_tx(
             &mut tx,
             &scope_id,
@@ -4905,7 +4921,7 @@ impl Database {
         worktree_path: &str,
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4935,7 +4951,7 @@ impl Database {
         work_scope_id: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4954,14 +4970,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Update a conversation's working directory.
-    ///
-    /// Conversation `cwd` is immutable post-creation. The only legitimate
-    /// mutations are recovery/teardown fallbacks: promoting an Explore
-    /// worktree in place at task approval, and pointing a terminal
-    /// conversation at the repo root after its worktree is deleted. The
-    /// `_recovery_only` suffix exists so this mutation is not casually
-    /// reachable — see task 13012 and `cwd_immutability_tests`.
+    /// Update the owning `WorkScope`'s environment cwd during recovery.
     ///
     /// # Errors
     ///
@@ -4980,14 +4989,30 @@ impl Database {
                  proceeding but this violates the cwd contract (task 13012)"
             );
         }
-        let now = Utc::now();
-        let result =
-            sqlx::query("UPDATE conversations SET cwd = ?1, updated_at = ?2 WHERE id = ?3")
-                .bind(cwd)
-                .bind(now.to_rfc3339())
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE work_scopes
+             SET cwd = ?1, updated_at = ?2
+             WHERE id = (SELECT work_scope_id FROM conversations WHERE id = ?3)",
+        )
+        .bind(cwd)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let result = if result.rows_affected() == 0 {
+            sqlx::query(
+                "UPDATE conversations SET coordinator_cwd = ?1, updated_at = ?2
+                 WHERE id = ?3 AND runtime_role = 'coordinator'",
+            )
+            .bind(cwd)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+        } else {
+            result
+        };
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -5121,13 +5146,12 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'user', ?18)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'user', ?17)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
             .bind(&title_for_insert)
-            .bind(&approval.worktree_path)
             .bind(&seeded_state)
             .bind(&now_str)
             .bind(parent.model.as_deref())
@@ -5388,28 +5412,26 @@ impl Database {
         // transaction guard drops and SQLite rolls back.
         let mut tx = self.pool.begin().await?;
 
-        // A coordinator continuation transfers the singleton role. Demote the
-        // exhausted row to an ordinary scoped conversation before inserting
-        // its coordinator successor so both the role/scope trigger and the
-        // singleton index remain true after every statement.
         if parent.runtime_role == RuntimeRole::Coordinator {
-            let (retired_scope_id, authority_kind, environment) =
-                Self::new_scope_for_conversation(&parent.cwd, &cm);
-            Self::insert_work_scope_environment_tx(
-                &mut tx,
-                &retired_scope_id,
-                authority_kind,
-                environment,
-                &now_str,
+            let updated = sqlx::query(
+                "UPDATE conversations SET coordinator_head = 0, updated_at = ?1
+                 WHERE id = ?2 AND coordinator_head = 1",
             )
-            .await?;
-            sqlx::query(
-                "UPDATE conversations SET runtime_role = 'user', work_scope_id = ?1 WHERE id = ?2",
-            )
-            .bind(retired_scope_id.as_str())
+            .bind(&now_str)
             .bind(parent_id)
             .execute(&mut *tx)
             .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                if let Some(existing_id) =
+                    self.get_conversation(parent_id).await?.continued_in_conv_id
+                {
+                    return Ok(ContinueOutcome::AlreadyContinued(
+                        self.get_conversation(&existing_id).await?,
+                    ));
+                }
+                return Err(DbError::ConversationNotFound(parent_id.to_string()));
+            }
         }
 
         // Retry on slug collision (UNIQUE constraint, SQLite error 2067).
@@ -5418,8 +5440,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22)",
+                "INSERT INTO conversations (id, slug, title, coordinator_cwd, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, CASE WHEN ?21 = 'coordinator' THEN ?4 ELSE NULL END, CASE WHEN ?21 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5443,7 +5465,11 @@ impl Database {
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
             .bind(parent.user_initiated)
-            .bind(parent.runtime_role.as_str())
+            .bind(if parent.runtime_role == RuntimeRole::Coordinator {
+                RuntimeRole::Coordinator.as_str()
+            } else {
+                parent.runtime_role.as_str()
+            })
             .bind(parent.work_scope_id.as_ref().map(WorkScopeId::as_str))
             .execute(&mut *tx)
             .await;
@@ -5468,17 +5494,31 @@ impl Database {
         // WHERE clause is the concurrent-continuation check — if another
         // caller raced us between the SELECT above and this UPDATE, the
         // rows_affected will be 0 and we roll back.
-        let updated = sqlx::query(
-            "UPDATE conversations SET continued_in_conv_id = ?1, updated_at = ?2 \
-             WHERE id = ?3 AND continued_in_conv_id IS NULL",
-        )
-        .bind(&new_id)
-        .bind(&now_str)
-        .bind(parent_id)
-        .execute(&mut *tx)
-        .await?;
+        let updated = if parent.runtime_role == RuntimeRole::Coordinator {
+            sqlx::query(
+                "UPDATE conversations SET continued_in_conv_id = ?1, updated_at = ?2
+                 WHERE id = ?3 AND continued_in_conv_id IS NULL",
+            )
+            .bind(&new_id)
+            .bind(&now_str)
+            .bind(parent_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE conversations SET continued_in_conv_id = ?1, updated_at = ?2 \
+                 WHERE id = ?3 AND continued_in_conv_id IS NULL",
+            )
+            .bind(&new_id)
+            .bind(&now_str)
+            .bind(parent_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
 
-        if updated.rows_affected() == 0 {
+        if updated == 0 {
             // Parent got continued by another request between our fetch and
             // our UPDATE. Drop `tx` (rollback) and report the existing
             // continuation via a fresh fetch.
@@ -5606,7 +5646,7 @@ impl Database {
                 FROM conversations c
                 JOIN chain ON c.id = chain.next_id
             )
-            SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -6302,7 +6342,6 @@ impl Database {
                          WHEN ?2 = 1 THEN ?3
                          ELSE title
                      END,
-                     cwd = COALESCE(?4, cwd),
                      project_id = CASE
                          WHEN ?5 = 1 THEN ?6
                          ELSE project_id
@@ -6327,7 +6366,7 @@ impl Database {
                     .as_ref()
                     .and_then(|v| v.as_deref()),
             )
-            .bind(now)
+            .bind(&now)
             .bind(id)
             .execute(&self.pool)
             .await;
@@ -6335,6 +6374,32 @@ impl Database {
                 Ok(result) => {
                     if result.rows_affected() == 0 {
                         return Err(DbError::ConversationNotFound(id.to_string()));
+                    }
+                    if let Some(cwd) = update.cwd.as_deref() {
+                        let updated = sqlx::query(
+                            "UPDATE work_scopes SET cwd = ?1, updated_at = ?2
+                             WHERE id = (SELECT work_scope_id FROM conversations WHERE id = ?3)",
+                        )
+                        .bind(cwd)
+                        .bind(&now)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await?;
+                        if updated.rows_affected() == 0 {
+                            let coordinator = sqlx::query(
+                                "UPDATE conversations
+                                 SET coordinator_cwd = ?1, updated_at = ?2
+                                 WHERE id = ?3 AND runtime_role = 'coordinator'",
+                            )
+                            .bind(cwd)
+                            .bind(&now)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await?;
+                            if coordinator.rows_affected() == 0 {
+                                return Err(DbError::ConversationNotFound(id.to_string()));
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -6387,7 +6452,6 @@ impl Database {
                          WHEN ?2 = 1 THEN ?3
                          ELSE title
                      END,
-                     cwd = COALESCE(?4, cwd),
                      project_id = CASE
                          WHEN ?5 = 1 THEN ?6
                          ELSE project_id
@@ -6450,19 +6514,25 @@ impl Database {
                         tx.rollback().await?;
                         return Ok(CreationCasOutcome::ClaimLost);
                     }
-                    let environment_row =
-                        sqlx::query("SELECT cwd, work_scope_id FROM conversations WHERE id = ?1")
-                            .bind(id)
-                            .fetch_one(&mut *tx)
-                            .await?;
-                    let environment_cwd: String = environment_row.get("cwd");
+                    let environment_row = sqlx::query(
+                        "SELECT e.cwd, c.work_scope_id
+                         FROM conversations c
+                         JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
+                         WHERE c.id = ?1",
+                    )
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let persisted_environment_cwd: String = environment_row.get("cwd");
+                    let environment_cwd =
+                        update.cwd.as_deref().unwrap_or(&persisted_environment_cwd);
                     let environment_scope =
                         WorkScopeId::parse(environment_row.get::<String, _>("work_scope_id"))
                             .map_err(|error| DbError::Serialization(error.to_string()))?;
                     Self::update_work_scope_environment_tx(
                         &mut tx,
                         &environment_scope,
-                        Self::environment_for_mode(&environment_cwd, &cm),
+                        Self::environment_for_mode(environment_cwd, &cm),
                         &now,
                     )
                     .await?;
@@ -6514,7 +6584,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -8565,7 +8635,7 @@ async fn insert_conversation_tx(
     // here. The legacy `steering_queue` column defaults to '[]'.
     sqlx::query(
         "INSERT INTO conversations (
-            id, slug, title, cwd, parent_conversation_id, user_initiated, state,
+            id, slug, title, coordinator_cwd, parent_conversation_id, user_initiated, state,
             state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id,
             desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, llm_language,
@@ -8573,7 +8643,7 @@ async fn insert_conversation_tx(
             cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch,
             cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
             runtime_role, work_scope_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+        ) VALUES (?1, ?2, ?3, CASE WHEN ?29 = 'coordinator' THEN ?4 ELSE NULL END, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -9810,7 +9880,7 @@ mod tests {
         assert_eq!(outcome, CreationCasOutcome::Applied);
 
         let persisted: (String, String, String, String, String, String) = sqlx::query_as(
-            "SELECT c.cm_kind, c.cwd, e.environment_kind, e.worktree_path,
+            "SELECT c.cm_kind, e.cwd, e.environment_kind, e.worktree_path,
                     e.branch_name, e.base_branch
              FROM conversations c
              JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
