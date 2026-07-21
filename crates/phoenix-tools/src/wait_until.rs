@@ -5,11 +5,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use phoenix_workflow::wake_profile::{BashResourceIdentity, WakeResourceIdentity};
-use phoenix_workflow::Timestamp;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const WAKE_DEFAULT_SECONDS: u64 = 600;
 const WAKE_MAX_SECONDS: u64 = 1800;
@@ -135,17 +133,19 @@ impl Tool for WaitUntilTool {
         };
 
         let max_wait_seconds = parsed.max_wait_seconds.unwrap_or(WAKE_DEFAULT_SECONDS);
-        if max_wait_seconds > WAKE_MAX_SECONDS {
+        if max_wait_seconds == 0 || max_wait_seconds > WAKE_MAX_SECONDS {
             return ToolOutput::error(format!(
-                "max_wait_seconds {max_wait_seconds} exceeds WAKE_MAX_SECONDS {WAKE_MAX_SECONDS}"
+                "max_wait_seconds must be between 1 and {WAKE_MAX_SECONDS}; got {max_wait_seconds}"
             ));
         }
+        let Some(tool_round_id) = ctx.tool_round_id() else {
+            return ToolOutput::error("wait_until requires a tool round identity");
+        };
 
-        let registered_at = now_timestamp();
-        let expires_at = Timestamp(registered_at.0.saturating_add(max_wait_seconds));
         let prepared_fingerprint = registration_fingerprint(
             &ctx.conversation_id,
             &ctx.root_conversation_id,
+            tool_round_id,
             tool_use_id,
             &resource,
             max_wait_seconds,
@@ -164,7 +164,7 @@ impl Tool for WaitUntilTool {
             registering_tool_use_id: tool_use_id.to_string(),
             registration_scope,
             resource: resource.clone(),
-            expires_at,
+            max_wait_seconds,
             prepared_fingerprint: prepared_fingerprint.clone(),
         };
 
@@ -210,18 +210,10 @@ impl Tool for WaitUntilTool {
     }
 }
 
-fn now_timestamp() -> Timestamp {
-    Timestamp(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
-}
-
 fn registration_fingerprint(
     conversation_id: &str,
     root_conversation_id: &str,
+    tool_round_id: &str,
     tool_use_id: &str,
     resource: &WakeResourceIdentity,
     max_wait_seconds: u64,
@@ -230,6 +222,7 @@ fn registration_fingerprint(
         "tool": "wait_until",
         "conversation_id": conversation_id,
         "root_conversation_id": root_conversation_id,
+        "tool_round_id": tool_round_id,
         "tool_use_id": tool_use_id,
         "resource": resource,
         "condition": CONDITION_HANDLE_TERMINAL,
@@ -250,9 +243,10 @@ mod tests {
     };
     use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
     use phoenix_workflow::wake_profile::WorkScopeIdentity;
-    use phoenix_workflow::WorkflowId;
+    use phoenix_workflow::{Timestamp, WorkflowId};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
     use tokio_util::sync::CancellationToken;
 
     struct MockWakeRegistrar {
@@ -301,6 +295,7 @@ mod tests {
         )
         .with_root_conversation_id("root-wait".to_string())
         .with_tool_use_id("tool-wait")
+        .with_tool_round_id("round-wait")
         .with_wake_registrar(registrar)
     }
 
@@ -523,12 +518,40 @@ mod tests {
             work_scope: WorkScopeIdentity("root-wait".to_string()),
             handle_id: "b-1".to_string(),
         });
-        let first = registration_fingerprint("conv-wait", "root-wait", "tool-wait", &resource, 42);
-        let retried =
-            registration_fingerprint("conv-wait", "root-wait", "tool-wait", &resource, 42);
-        let different_timeout =
-            registration_fingerprint("conv-wait", "root-wait", "tool-wait", &resource, 43);
+        let first = registration_fingerprint(
+            "conv-wait",
+            "root-wait",
+            "round-wait",
+            "tool-wait",
+            &resource,
+            42,
+        );
+        let retried = registration_fingerprint(
+            "conv-wait",
+            "root-wait",
+            "round-wait",
+            "tool-wait",
+            &resource,
+            42,
+        );
+        let reused_provider_id_in_new_round = registration_fingerprint(
+            "conv-wait",
+            "root-wait",
+            "round-next",
+            "tool-wait",
+            &resource,
+            42,
+        );
+        let different_timeout = registration_fingerprint(
+            "conv-wait",
+            "root-wait",
+            "round-wait",
+            "tool-wait",
+            &resource,
+            43,
+        );
         assert_eq!(first, retried);
+        assert_ne!(first, reused_provider_id_in_new_round);
         assert_ne!(first, different_timeout);
     }
 
@@ -583,7 +606,7 @@ mod tests {
             ResourceScopeKey::Work(WorkScopeId::parse("scope-wait").unwrap()),
             phoenix_core::work_scope::ResourceAuthority::Work,
         );
-        let no_registrar = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-1"}, "condition": CONDITION_HANDLE_TERMINAL}), context.clone().with_tool_use_id("tool-only")).await;
+        let no_registrar = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-1"}, "condition": CONDITION_HANDLE_TERMINAL}), context.clone().with_tool_use_id("tool-only").with_tool_round_id("round-only")).await;
         assert!(!no_registrar.is_success());
         assert!(no_registrar.output().contains("wake registrar"));
         let no_tool_use = WaitUntilTool.run(json!({"handle": {"kind": "Bash", "id": "b-1"}, "condition": CONDITION_HANDLE_TERMINAL}), context.with_wake_registrar(Some(MockWakeRegistrar::new(Ok(RegisteredWake::Registered { workflow_id: WorkflowId(1), expires_at: Timestamp(600) }))))).await;

@@ -1238,7 +1238,7 @@ mod tests {
         scope: &WorkScopeIdentity,
         handle: &str,
         fingerprint: &str,
-        expires_at: u64,
+        max_wait_seconds: u64,
     ) -> RegisterWakeInput {
         RegisterWakeInput {
             contract_id: format!("contract-{handle}"),
@@ -1250,7 +1250,7 @@ mod tests {
                 work_scope: scope.clone(),
                 handle_id: handle.to_string(),
             }),
-            expires_at: Timestamp(expires_at),
+            max_wait_seconds,
             prepared_fingerprint: fingerprint.to_string(),
         }
     }
@@ -1261,6 +1261,12 @@ mod tests {
         let (kick_tx, kick_rx) = watch::channel(0u64);
         let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
 
+        let before_registration = Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
         let first = registrar
             .register(register_input(&scope, "b-1", "fp-1", 50))
             .await
@@ -1274,14 +1280,19 @@ mod tests {
             .await
             .unwrap();
 
-        let first_id = first
-            .workflow_id()
-            .expect("first registration should allocate workflow");
+        let (first_id, first_expiry) = match first {
+            RegisteredWake::Registered {
+                workflow_id,
+                expires_at,
+            } => (workflow_id, expires_at),
+            other => panic!("expected registration, got {other:?}"),
+        };
+        assert!(first_expiry.0 >= before_registration.0.saturating_add(50));
         assert_eq!(
             replay,
             RegisteredWake::Replayed {
                 workflow_id: first_id,
-                expires_at: Timestamp(50),
+                expires_at: first_expiry,
             }
         );
         assert_eq!(conflict, RegisteredWake::Conflict);
@@ -1315,6 +1326,18 @@ mod tests {
         assert_eq!(cancelled, RegisteredWake::Cancelled);
         assert_eq!(replay, RegisteredWake::CancelReplayed);
         assert_eq!(*kick_rx.borrow(), 2);
+
+        let registration_replay = registrar
+            .register(register_input("b-1", "b-1", 50))
+            .await
+            .unwrap();
+        assert!(matches!(
+            registration_replay,
+            RegisteredWake::Replayed {
+                workflow_id: replayed_id,
+                ..
+            } if replayed_id == phoenix_workflow::WorkflowId(workflow_id)
+        ));
     }
 
     #[tokio::test]
@@ -1332,7 +1355,7 @@ mod tests {
         let (tx, rx) = watch::channel(0u64);
         let join = tokio::spawn(async move { worker.run_loop(rx).await });
         let observed_sleep = sleep_rx.await.unwrap();
-        assert_eq!(observed_sleep, EMPTY_RESCAN_INTERVAL);
+        assert_eq!(observed_sleep, LIVE_HANDLE_POLL_INTERVAL);
         tx.send(1).unwrap();
         join.abort();
     }

@@ -688,7 +688,6 @@ async fn register_tmux_wake_if_live(
         completion_policy,
     });
     let contract_id = format!("tmux:{}:{}", tool_use_id, target.window_id);
-    let expires_at = now_timestamp().saturating_add_duration(TMUX_WAKE_EXPIRY);
     let prepared_fingerprint = prepare_tmux_wake_fingerprint(
         &ctx.conversation_id,
         &ctx.root_conversation_id,
@@ -707,7 +706,7 @@ async fn register_tmux_wake_if_live(
         registering_tool_use_id: tool_use_id.to_string(),
         registration_scope,
         resource,
-        expires_at,
+        max_wait_seconds: TMUX_WAKE_EXPIRY.as_secs(),
         prepared_fingerprint,
     };
     let registration = registrar.register(register_input).await;

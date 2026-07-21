@@ -22,6 +22,10 @@ class CheckPlanTests(unittest.TestCase):
     def setUp(self):
         self.dev = load_devpy()
 
+    def test_normalize_generated_typescript_skips_deleted_paths(self):
+        missing = ROOT / "ui" / "src" / "generated" / "deleted-binding.ts"
+        self.dev._normalize_generated_typescript([missing])
+
     def test_git_config_key_validation_preserves_url_subsections(self):
         for key in (
             "url.https://github.com/.insteadOf",

@@ -5859,6 +5859,8 @@ def _normalized_generated_typescript(path):
 def _normalize_generated_typescript(paths):
     """Remove generator-introduced trailing whitespace deterministically."""
     for path in paths:
+        if not path.exists():
+            continue
         text = path.read_text(encoding="utf-8")
         normalized = _normalized_generated_typescript(path)
         if normalized != text:
@@ -5893,7 +5895,7 @@ def cmd_codegen() -> bool:
         text=True,
         check=True,
     ).stdout.splitlines()
-    _normalize_generated_typescript(ROOT / path for path in changed)
+    _normalize_generated_typescript(ROOT / relative for relative in changed)
     print("✓ regenerated ui/src/generated/")
     # Best-effort summary of what changed.
     diff = subprocess.run(

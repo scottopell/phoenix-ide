@@ -68,13 +68,19 @@ impl RecoveryDecision {
     }
 }
 
-pub fn interrupted_tool_use_ids(messages: &[Message]) -> Vec<String> {
+pub fn interrupted_wake_contract_ids(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
         .rev()
         .take_while(|message| matches!(message.message_type, MessageType::Tool))
         .filter_map(|message| match &message.content {
-            MessageContent::Tool(content) => Some(content.tool_use_id.clone()),
+            MessageContent::Tool(content) if !content.is_error => {
+                serde_json::from_str::<serde_json::Value>(&content.content)
+                    .ok()?
+                    .get("contract_id")?
+                    .as_str()
+                    .map(str::to_owned)
+            }
             _ => None,
         })
         .collect()
@@ -1018,7 +1024,7 @@ mod owed_wake_tests {
     }
 
     #[test]
-    fn interrupted_tool_ids_only_include_trailing_tool_round() {
+    fn interrupted_contract_ids_only_include_trailing_tool_round_receipts() {
         use chrono::Utc;
         use phoenix_core::domain::db_schema::{ToolContent, ToolContentImage};
         let tool = |sequence_id, tool_use_id: &str| Message {
@@ -1028,7 +1034,7 @@ mod owed_wake_tests {
             message_type: MessageType::Tool,
             content: MessageContent::Tool(ToolContent {
                 tool_use_id: tool_use_id.to_string(),
-                content: "done".to_string(),
+                content: format!(r#"{{"contract_id":"{tool_use_id}"}}"#),
                 is_error: false,
                 images: Vec::<ToolContentImage>::new(),
             }),
@@ -1040,7 +1046,10 @@ mod owed_wake_tests {
         agent.message_type = MessageType::Agent;
         agent.content = MessageContent::Agent(vec![]);
         let messages = vec![tool(1, "old-wake"), agent, tool(3, "current-tool")];
-        assert_eq!(interrupted_tool_use_ids(&messages), vec!["current-tool"]);
+        assert_eq!(
+            interrupted_wake_contract_ids(&messages),
+            vec!["current-tool"]
+        );
     }
 
     #[test]

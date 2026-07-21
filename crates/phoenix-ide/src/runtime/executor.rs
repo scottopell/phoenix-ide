@@ -1738,6 +1738,7 @@ where
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
     wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
+    registered_wake_workflows: std::collections::BTreeSet<phoenix_workflow::WorkflowId>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
@@ -2000,6 +2001,7 @@ where
             tmux_registry,
             llm_registry,
             wake_registrar: None,
+            registered_wake_workflows: std::collections::BTreeSet::new(),
             terminals,
             event_rx,
             event_tx,
@@ -2567,6 +2569,14 @@ where
     ///
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
     /// are logged and discarded — state unchanged.
+    fn remember_registered_wake(&mut self, outcome: &EffectOutcome) {
+        if let EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark { registration, .. }) = outcome
+        {
+            self.registered_wake_workflows
+                .insert(phoenix_workflow::WorkflowId(registration.workflow_id));
+        }
+    }
+
     async fn process_outcome(&mut self, mut outcome: EffectOutcome) -> Result<(), String> {
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
@@ -2614,6 +2624,8 @@ where
                 }
             }
         }
+
+        self.remember_registered_wake(&outcome);
 
         refresh_commission_review_approval_for_outcome(&mut self.context, &outcome);
         if let EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark { registration, .. }) =
@@ -2711,6 +2723,45 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
+    async fn cancel_wake_workflows(
+        registrar: &dyn crate::tools::WakeRegistrar,
+        workflow_ids: std::collections::BTreeSet<phoenix_workflow::WorkflowId>,
+        timestamp: phoenix_workflow::Timestamp,
+    ) -> Result<(), String> {
+        for workflow_id in workflow_ids {
+            registrar
+                .cancel(crate::tools::CancelWakeInput {
+                    workflow_id,
+                    timestamp,
+                    reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_registered_wakes(&mut self) -> Result<(), String> {
+        if self.registered_wake_workflows.is_empty() {
+            return Ok(());
+        }
+        let registrar = self
+            .wake_registrar
+            .as_ref()
+            .ok_or_else(|| "registered wakes exist without a wake registrar".to_string())?;
+        let timestamp = phoenix_workflow::Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        Self::cancel_wake_workflows(
+            registrar.as_ref(),
+            std::mem::take(&mut self.registered_wake_workflows),
+            timestamp,
+        )
+        .await
+    }
+
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         if matches!(self.state, ConvState::Idle)
             && matches!(
@@ -2728,6 +2779,9 @@ where
             return Ok(());
         }
 
+        if matches!(event, Event::UserCancel { .. }) {
+            self.cancel_registered_wakes().await?;
+        }
         if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;
         }
@@ -2943,6 +2997,9 @@ where
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        if matches!(self.state, ConvState::Idle) {
+            self.registered_wake_workflows.clear();
+        }
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
         // an empty steering drain re-enters the same state) and reach here
@@ -5214,6 +5271,15 @@ where
         tx
     }
 
+    fn current_tool_round_id(&self) -> Result<String, String> {
+        match &self.state {
+            ConvState::ToolExecuting {
+                assistant_message, ..
+            } => Ok(assistant_message.message_id.clone()),
+            _ => Err("tool dispatch requires ToolExecuting state".to_string()),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
@@ -5281,6 +5347,7 @@ where
                 });
         });
         let llm_metrics_tx = self.create_tool_llm_metrics_sink();
+        let tool_round_id = self.current_tool_round_id()?;
         let tool_ctx = match &self.context.execution_environment {
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
@@ -5312,6 +5379,7 @@ where
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())
+        .with_tool_round_id(tool_round_id)
         .with_wake_registrar(self.wake_registrar.clone())
         .with_llm_metrics_tx(llm_metrics_tx);
 
@@ -9204,6 +9272,73 @@ mod context_exhausted_preserves_worktree_tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{broadcast, mpsc};
+
+    struct RecordingWakeRegistrar(std::sync::Mutex<Vec<phoenix_workflow::WorkflowId>>);
+
+    #[async_trait::async_trait]
+    impl crate::tools::WakeRegistrar for RecordingWakeRegistrar {
+        async fn register(
+            &self,
+            _input: crate::tools::RegisterWakeInput,
+        ) -> Result<crate::tools::RegisteredWake, String> {
+            unreachable!("registration is not under test")
+        }
+
+        async fn cancel(
+            &self,
+            input: crate::tools::CancelWakeInput,
+        ) -> Result<crate::tools::RegisteredWake, String> {
+            self.0.lock().unwrap().push(input.workflow_id);
+            Ok(crate::tools::RegisteredWake::Cancelled)
+        }
+    }
+
+    #[tokio::test]
+    async fn user_cancel_cancels_all_registered_sibling_wakes() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "tool-2",
+                ToolInput::Bash(crate::tools::BashToolInput::run("sleep 10")),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            park_after_tool_round: true,
+            pending_sub_agents: vec![],
+            assistant_message: phoenix_core::domain::sm_state::AssistantMessage::new(
+                "round-1".to_string(),
+                vec![],
+                None,
+                None,
+            ),
+        };
+        let (mut runtime, _) =
+            build_runtime_with_state(storage, "cancel-wakes", temp.path().to_path_buf(), state);
+        let registrar = Arc::new(RecordingWakeRegistrar(std::sync::Mutex::new(vec![])));
+        runtime.wake_registrar = Some(registrar.clone());
+        runtime.registered_wake_workflows.extend([
+            phoenix_workflow::WorkflowId(11),
+            phoenix_workflow::WorkflowId(12),
+        ]);
+
+        runtime
+            .process_event(Event::UserCancel {
+                cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                reason: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *registrar.0.lock().unwrap(),
+            vec![
+                phoenix_workflow::WorkflowId(11),
+                phoenix_workflow::WorkflowId(12)
+            ]
+        );
+        assert!(runtime.registered_wake_workflows.is_empty());
+    }
 
     #[allow(clippy::type_complexity)]
     fn build_runtime(

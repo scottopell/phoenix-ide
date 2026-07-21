@@ -122,7 +122,7 @@ pub struct RegisterWakeInput {
     pub registering_tool_use_id: String,
     pub registration_scope: WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
-    pub expires_at: Timestamp,
+    pub max_wait_seconds: u64,
     pub prepared_fingerprint: String,
 }
 
@@ -137,7 +137,7 @@ impl RegisterWakeInput {
             resource: self.resource,
             registering_tool_use_id: self.registering_tool_use_id,
             registered_at,
-            expires_at: self.expires_at,
+            expires_at: Timestamp(registered_at.0.saturating_add(self.max_wait_seconds)),
         }
     }
 }
@@ -460,6 +460,7 @@ pub struct ToolContext {
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
     tool_use_id: Option<String>,
+    tool_round_id: Option<String>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
@@ -551,6 +552,7 @@ impl ToolContext {
             work_scope: ResourceScopeKey::Coordinator,
             bash_progress_sink: None,
             tool_use_id: None,
+            tool_round_id: None,
             wake_registrar: None,
             llm_metrics_tx: None,
         }
@@ -606,6 +608,7 @@ impl ToolContext {
             work_scope,
             bash_progress_sink: None,
             tool_use_id: None,
+            tool_round_id: None,
             wake_registrar: None,
         }
     }
@@ -625,6 +628,12 @@ impl ToolContext {
     #[must_use]
     pub fn with_tool_use_id(mut self, tool_use_id: impl Into<String>) -> Self {
         self.tool_use_id = Some(tool_use_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_round_id(mut self, tool_round_id: impl Into<String>) -> Self {
+        self.tool_round_id = Some(tool_round_id.into());
         self
     }
 
@@ -721,6 +730,11 @@ impl ToolContext {
     #[must_use]
     pub fn tool_use_id(&self) -> Option<&str> {
         self.tool_use_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn tool_round_id(&self) -> Option<&str> {
+        self.tool_round_id.as_deref()
     }
 
     #[must_use]

@@ -2090,12 +2090,12 @@ impl WakeRepository {
         Ok(out)
     }
 
-    pub async fn has_owed_work_for_tool_uses(
+    pub async fn has_owed_work_for_contracts(
         &self,
         conversation_id: &str,
-        tool_use_ids: &[String],
+        contract_ids: &[String],
     ) -> DbResult<bool> {
-        if tool_use_ids.is_empty() {
+        if contract_ids.is_empty() {
             return Ok(false);
         }
         let mut tx = self.workflow_repo.begin_tx().await?;
@@ -2103,7 +2103,7 @@ impl WakeRepository {
             "SELECT EXISTS (
                 SELECT 1 FROM wake_bindings b
                 JOIN workflows w ON w.workflow_id = b.workflow_id
-                JOIN json_each(?2) ids ON ids.value = b.registering_tool_use_id
+                JOIN json_each(?2) ids ON ids.value = b.contract_id
                 WHERE b.conversation_id = ?1
                   AND (
                     (w.status = 'Active' AND b.resolved_at IS NULL)
@@ -2117,7 +2117,7 @@ impl WakeRepository {
         )
         .bind(conversation_id)
         .bind(
-            serde_json::to_string(tool_use_ids)
+            serde_json::to_string(contract_ids)
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
         )
         .fetch_one(&mut *tx.tx)
@@ -7722,11 +7722,11 @@ mod tests {
         );
 
         assert!(repo
-            .has_owed_work_for_tool_uses("conv-1", &["tool-unresolved".to_string()])
+            .has_owed_work_for_contracts("conv-1", &["contract-unresolved".to_string()])
             .await
             .unwrap());
         assert!(!repo
-            .has_owed_work_for_tool_uses("conv-1", &["unrelated-tool".to_string()])
+            .has_owed_work_for_contracts("conv-1", &["unrelated-contract".to_string()])
             .await
             .unwrap());
 
