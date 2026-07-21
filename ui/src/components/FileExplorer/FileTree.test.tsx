@@ -615,6 +615,19 @@ describe('FileTree — reveal active file', () => {
     expect(screen.getByLabelText('Git status untracked')).toBeInTheDocument();
   });
 
+  it('counts a same-directory rename once on its parent', async () => {
+    render(<FileTree rootPath="/proj" onFileSelect={vi.fn()} gitStatus={{
+      kind: 'snapshot',
+      checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc', remote_status: { kind: 'no_known' } },
+      counts: { changed_paths: 1, staged_paths: 1, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
+      changed_paths: [{ kind: 'renamed', path: 'ui/new.ts', previous_path: 'ui/old.ts', index_status: 'renamed', worktree_status: 'unmodified' }],
+    }} />);
+
+    await screen.findByText('ui');
+    expect(screen.getByLabelText('1 changed descendant')).toBeInTheDocument();
+    expect(screen.queryByLabelText('2 changed descendants')).not.toBeInTheDocument();
+  });
+
   it('counts both source and destination ancestors for cross-directory renames', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation(async (url: string | URL | Request) => {

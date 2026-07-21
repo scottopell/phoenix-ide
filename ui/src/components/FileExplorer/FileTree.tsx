@@ -92,16 +92,11 @@ function gitDecorations(canonicalRootPath: string | null, status: ConversationGi
   const result = new Map<string, GitDecoration>();
   if (status?.kind !== 'snapshot' || !canonicalRootPath) return result;
   const root = canonicalRootPath.replace(/\/$/, '');
-  function incrementAncestors(path: string) {
+  function ancestors(path: string): string[] {
     const segments = path.split('/');
-    for (let index = 1; index < segments.length; index += 1) {
-      const ancestor = `${root}/${segments.slice(0, index).join('/')}`;
-      const current = result.get(ancestor);
-      result.set(ancestor, {
-        statuses: current?.statuses ?? [],
-        descendants: (current?.descendants ?? 0) + 1,
-      });
-    }
+    return segments.slice(1).map((_, index) => (
+      `${root}/${segments.slice(0, index + 1).join('/')}`
+    ));
   }
 
   for (const entry of status.changed_paths) {
@@ -114,9 +109,16 @@ function gitDecorations(canonicalRootPath: string | null, status: ConversationGi
         : [...(current?.statuses ?? []), statusValue],
       descendants: current?.descendants ?? 0,
     });
-    incrementAncestors(entry.path);
+    const dirtyAncestors = new Set(ancestors(entry.path));
     if (entry.kind === 'renamed' && entry.index_status === 'renamed' && entry.previous_path !== entry.path) {
-      incrementAncestors(entry.previous_path);
+      for (const ancestor of ancestors(entry.previous_path)) dirtyAncestors.add(ancestor);
+    }
+    for (const ancestor of dirtyAncestors) {
+      const decoration = result.get(ancestor);
+      result.set(ancestor, {
+        statuses: decoration?.statuses ?? [],
+        descendants: (decoration?.descendants ?? 0) + 1,
+      });
     }
   }
   return result;
