@@ -1036,7 +1036,19 @@ impl WorkflowRepository {
              JOIN top_level_llm_workflows w ON w.workflow_id = wr.workflow_id
              JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id
              JOIN workflow_receipts r ON r.workflow_id = wr.workflow_id AND r.receipt_id = wr.receipt_id
-             WHERE d.runtime_acceptance_status = 'Owed' AND w.stopped_at IS NULL
+             WHERE (
+                 d.runtime_acceptance_status = 'Owed'
+                 OR (
+                     d.runtime_acceptance_status = 'Accepted'
+                     AND EXISTS (
+                         SELECT 1 FROM top_level_llm_tool_intents ti
+                         WHERE ti.workflow_id = wr.workflow_id
+                           AND ti.receipt_id = wr.receipt_id
+                           AND ti.status = 'Owed'
+                     )
+                 )
+             )
+               AND w.stopped_at IS NULL
              ORDER BY w.workflow_id, wr.receipt_id"
         )
         .fetch_all(&self.pool)

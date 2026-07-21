@@ -12066,6 +12066,9 @@ mod tests {
             db.accept_top_level_llm_product(&input).await.unwrap(),
             AcceptTopLevelLlmProductOutcome::ExactReplay
         );
+        let owed_after_product = repo.load_owed_top_level_llm_receipts().await.unwrap();
+        assert_eq!(owed_after_product.len(), 1);
+        assert_eq!(owed_after_product[0].receipt.receipt_id, receipt_id);
     }
 
     #[tokio::test]

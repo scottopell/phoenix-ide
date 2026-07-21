@@ -2920,10 +2920,8 @@ where
                 state_updated_at,
             })
             .await?;
-        if outcome == phoenix_db::AcceptTopLevelLlmProductOutcome::ExactReplay {
-            return Ok(vec![]);
-        }
-        if outcome != phoenix_db::AcceptTopLevelLlmProductOutcome::Committed {
+        let product_replay = outcome == phoenix_db::AcceptTopLevelLlmProductOutcome::ExactReplay;
+        if outcome != phoenix_db::AcceptTopLevelLlmProductOutcome::Committed && !product_replay {
             return Err(format!(
                 "durable LLM product acceptance failed: {outcome:?}"
             ));
@@ -2934,8 +2932,10 @@ where
         if let Some(tx) = &self.state_watcher {
             let _ = tx.send(self.state.clone());
         }
-        if let Some(message) = persisted_message {
-            let _ = self.broadcast_tx.send_message(message);
+        if !product_replay {
+            if let Some(message) = persisted_message {
+                let _ = self.broadcast_tx.send_message(message);
+            }
         }
         let mut generated = Vec::new();
         let remaining_effects: Vec<_> = effects.collect();
