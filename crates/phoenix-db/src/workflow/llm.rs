@@ -1299,7 +1299,9 @@ impl WorkflowRepository {
              FROM workflows wf
              JOIN top_level_llm_workflows w ON w.workflow_id = wf.workflow_id
              JOIN direct_turn_acceptances dta ON dta.workflow_id = wf.workflow_id
-             WHERE dta.conversation_id = ?1 AND wf.status = 'Active' AND w.stopped_at IS NULL
+             WHERE dta.conversation_id = ?1
+               AND dta.committed_outcome = 'RuntimeAccepted'
+               AND wf.status = 'Active' AND w.stopped_at IS NULL
              ORDER BY dta.accepted_at DESC LIMIT 1",
         )
         .bind(conversation_id)

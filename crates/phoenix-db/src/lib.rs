@@ -11967,6 +11967,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn llm_product_acceptance_commits_message_state_delivery_and_tool_authority() {
         let db = Database::open_in_memory().await.unwrap();
@@ -12069,6 +12070,27 @@ mod tests {
         let owed_after_product = repo.load_owed_top_level_llm_receipts().await.unwrap();
         assert_eq!(owed_after_product.len(), 1);
         assert_eq!(owed_after_product[0].receipt.receipt_id, receipt_id);
+        assert_eq!(
+            repo.stop_active_top_level_llm_for_conversation("conv-direct", Timestamp(5),)
+                .await
+                .unwrap(),
+            Some(phoenix_workflow::CommitOutcome::Committed)
+        );
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM top_level_llm_tool_intents
+             WHERE workflow_id = ?1 AND receipt_id = ?2 AND intent_ordinal = 0",
+        )
+        .bind(i64::try_from(WorkflowId(1).0).unwrap())
+        .bind(i64::try_from(receipt_id.0).unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "Suppressed");
+        assert!(repo
+            .load_owed_top_level_llm_receipts()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
