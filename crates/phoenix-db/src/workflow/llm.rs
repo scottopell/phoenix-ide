@@ -12,13 +12,11 @@ use super::{
 };
 use phoenix_workflow::llm_profile;
 use phoenix_workflow::llm_profile::{
-    CompleteLlmResponse, LlmEffectKey, PreparedLlmRequest, TopLevelLlmSnapshot,
+    CompleteLlmResponse, LlmEffectKey, PreparedLlmRequest, TopLevelLlmSnapshot, TopLevelTurnRef,
 };
 use phoenix_workflow::{CodecRef, EffectRole, EffectStatus, ExecutionCapability};
 use sqlx::SqlitePool;
 
-#[cfg(test)]
-use phoenix_workflow::llm_profile::TopLevelTurnRef;
 #[cfg(test)]
 use phoenix_workflow::ClaimOutcome;
 use serde::{Deserialize, Serialize};
@@ -1062,6 +1060,68 @@ impl WorkflowRepository {
                 ToolIntentTransitionOutcome::Conflict
             },
         )
+    }
+
+    pub async fn stop_active_top_level_llm_for_conversation(
+        &self,
+        conversation_id: &str,
+        stopped_at: Timestamp,
+    ) -> DbResult<Option<CommitOutcome>> {
+        let row = sqlx::query(
+            "SELECT wf.workflow_id, wf.version, wf.generation
+             FROM workflows wf
+             JOIN top_level_llm_workflows w ON w.workflow_id = wf.workflow_id
+             JOIN direct_turn_acceptances dta ON dta.workflow_id = wf.workflow_id
+             WHERE dta.conversation_id = ?1 AND wf.status = 'Active' AND w.stopped_at IS NULL
+             ORDER BY dta.accepted_at DESC LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let workflow_id = WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?);
+        let current = self
+            .load_active_top_level_llm_workflow(conversation_id)
+            .await?
+            .ok_or_else(|| DbError::Serialization("active LLM workflow disappeared".to_string()))?;
+        let next_snapshot = TopLevelLlmSnapshot {
+            turn_ref: TopLevelTurnRef {
+                conversation_id: current.conversation_id.clone(),
+                accepted_turn_id: current.accepted_turn_id.clone(),
+                generation: current.turn_generation.0,
+            },
+            accepted_assistant_message_id: current.accepted_assistant_message_id,
+            stopped_at: Some(stopped_at.0),
+        };
+        let mut tx = self.begin_tx().await?;
+        let transition_id = TransitionId(
+            tx.allocate_sequence_value(workflow_id, WorkflowSequenceName::Transition)
+                .await?,
+        );
+        tx.commit().await?;
+        self.stop_top_level_llm_and_suppress_pending_delivery(&StopTopLevelLlmInput {
+            workflow_id,
+            stopped_at,
+            expected_version: Version(to_u64(row.get("version"), "version")?),
+            transition_id,
+            generation: Generation(to_u64(row.get("generation"), "generation")?),
+            next_status: WorkflowStatus::Cancelled,
+            event_payload: serde_json::to_vec(&llm_profile::TopLevelLlmEvent::ResponseCancelled {
+                key: LlmEffectKey {
+                    accepted_turn_id: current.accepted_turn_id.clone(),
+                    generation: current.turn_generation.0,
+                    call_ordinal: 0,
+                },
+                reason: "stop".to_string(),
+            })
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
+            next_snapshot,
+            suppression_reason: SuppressionReason::Cancelled,
+        })
+        .await
+        .map(Some)
     }
 
     pub async fn stop_top_level_llm_and_suppress_pending_delivery(

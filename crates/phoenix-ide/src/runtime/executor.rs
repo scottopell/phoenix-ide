@@ -4191,6 +4191,22 @@ where
 
             Effect::AbortLlm => {
                 tracing::info!("Aborting LLM request");
+                let stopped_at = phoenix_workflow::Timestamp(
+                    u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                );
+                match self
+                    .storage
+                    .stop_active_top_level_llm_for_conversation(
+                        &self.context.conversation_id,
+                        stopped_at,
+                    )
+                    .await?
+                {
+                    Some(phoenix_workflow::CommitOutcome::Committed) | None => {}
+                    Some(outcome) => {
+                        return Err(format!("durable LLM stop lost authority: {outcome:?}"));
+                    }
+                }
                 // Bump the generation so the aborted task's forwarded outcome
                 // (a synthetic NetworkError from the dropped sender) is stale
                 // and gets discarded by the select loop, rather than being
