@@ -1059,6 +1059,45 @@ impl WorkflowRepository {
         Ok(out)
     }
 
+    pub async fn load_owed_top_level_llm_tool_intent(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> DbResult<Option<(WorkflowId, ReceiptId, ToolIntentRecord, Generation)>> {
+        let row = sqlx::query(
+            "SELECT ti.workflow_id, ti.receipt_id, ti.intent_ordinal, ti.status,
+                    ti.tool_name, ti.tool_kind, ti.tool_use_id, ti.arguments_json,
+                    r.generation
+             FROM top_level_llm_tool_intents ti
+             JOIN direct_turn_acceptances dta ON dta.workflow_id = ti.workflow_id
+             JOIN workflow_receipts r ON r.workflow_id = ti.workflow_id
+               AND r.receipt_id = ti.receipt_id
+             JOIN top_level_llm_workflows w ON w.workflow_id = ti.workflow_id
+             WHERE dta.conversation_id = ?1 AND ti.tool_use_id = ?2
+               AND ti.status = 'Owed' AND w.stopped_at IS NULL",
+        )
+        .bind(conversation_id)
+        .bind(tool_use_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok((
+                WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
+                ReceiptId(to_u64(row.get("receipt_id"), "receipt_id")?),
+                ToolIntentRecord {
+                    intent_ordinal: to_u32(row.get::<i64, _>("intent_ordinal"), "intent_ordinal")?,
+                    status: parse_tool_intent_status(&row.get::<String, _>("status"))?,
+                    tool_name: row.get("tool_name"),
+                    tool_kind: parse_tool_kind(&row.get::<String, _>("tool_kind"))?,
+                    tool_use_id: row.get("tool_use_id"),
+                    arguments_json: row.get("arguments_json"),
+                },
+                Generation(to_u64(row.get("generation"), "generation")?),
+            ))
+        })
+        .transpose()
+    }
+
     pub async fn transition_top_level_llm_tool_intent(
         &self,
         input: &ToolIntentTransitionInput,

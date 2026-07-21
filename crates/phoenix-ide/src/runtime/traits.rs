@@ -99,6 +99,14 @@ pub trait MessageStore: Send + Sync {
         Err("durable top-level LLM attempts are unsupported by this storage".to_string())
     }
 
+    async fn mark_top_level_llm_tool_execution_may_have_begun(
+        &self,
+        _conversation_id: &str,
+        _tool_use_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     async fn owed_top_level_llm_receipt(
         &self,
         _conversation_id: &str,
@@ -712,6 +720,40 @@ impl MessageStore for DatabaseStorage {
             .prepare_and_begin_top_level_llm_attempt(input)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn mark_top_level_llm_tool_execution_may_have_begun(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> Result<bool, String> {
+        let repo = phoenix_db::WorkflowRepository::new(self.db.pool().clone());
+        let Some((workflow_id, receipt_id, intent, generation)) = repo
+            .load_owed_top_level_llm_tool_intent(conversation_id, tool_use_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        match repo
+            .transition_top_level_llm_tool_intent(&phoenix_db::ToolIntentTransitionInput {
+                workflow_id,
+                receipt_id,
+                intent_ordinal: intent.intent_ordinal,
+                generation,
+                from: phoenix_db::ToolIntentStatus::Owed,
+                to: phoenix_db::ToolIntentStatus::ExecutionMayHaveBegun,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            phoenix_db::ToolIntentTransitionOutcome::Committed
+            | phoenix_db::ToolIntentTransitionOutcome::ExactReplay => Ok(true),
+            phoenix_db::ToolIntentTransitionOutcome::Conflict => Ok(false),
+            phoenix_db::ToolIntentTransitionOutcome::RetryablePersistence => {
+                Err("tool execution authority persistence is temporarily busy".to_string())
+            }
+        }
     }
 
     async fn owed_top_level_llm_receipt(

@@ -4138,7 +4138,24 @@ where
                 Ok(None)
             }
 
-            Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
+            Effect::ExecuteTool { tool } => {
+                if !self.context.is_sub_agent {
+                    let durable = self
+                        .storage
+                        .mark_top_level_llm_tool_execution_may_have_begun(
+                            &self.context.conversation_id,
+                            &tool.id,
+                        )
+                        .await?;
+                    if !durable {
+                        return Err(format!(
+                            "tool {} has no committed durable execution authority",
+                            tool.id
+                        ));
+                    }
+                }
+                self.dispatch_tool_execution(tool).await
+            }
 
             Effect::ScheduleRetry {
                 delay,
