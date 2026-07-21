@@ -524,7 +524,10 @@ rule BrowserSessionFellAutoClosesSlot {
     when: BrowserSessionActiveFell(slot)
     requires: slot.kind = browser
     ensures: slot.kind = none
-    ensures: ViewerSnapshotCleared(slot.conversation.slug)
+    @guidance
+        -- Storage cleanup removes the per-conversation snapshot only when it
+        -- still names the browser viewer. A durable prose, diff, message,
+        -- inspect, or review snapshot survives browser shutdown.
 }
 
 -- @guidance: the falling edge source is intentionally opaque to the slot:

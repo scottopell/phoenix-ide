@@ -92,6 +92,7 @@ export function BrowserViewPanel({
   const stopBrowserSession = useCallback(async () => {
     if (stopping) return;
     const terminalBeforeRequest = statusRef.current.kind === 'no-session'
+      || statusRef.current.kind === 'error'
       || (statusRef.current.kind === 'ended' && reconnectTimerRef.current === null);
     stoppingRef.current = !terminalBeforeRequest;
     liveFrameSuppressedDuringStopRef.current = false;
@@ -233,8 +234,13 @@ export function BrowserViewPanel({
       // race against that signal. Status stays at whatever the WS last
       // reported so the overlay doesn't flicker back to "Connecting…".
       const wasLive = statusRef.current.kind === 'live';
-      if (wasLive && stoppingRef.current) {
+      if (stoppingRef.current && wasLive) {
         reconnectSuppressedDuringStopRef.current = true;
+      } else if (stoppingRef.current) {
+        stoppingRef.current = false;
+        liveFrameSuppressedDuringStopRef.current = false;
+        reconnectSuppressedDuringStopRef.current = false;
+        setStopping(false);
       } else if (wasLive) {
         setStatus({ kind: 'ended' });
         reconnectTimerRef.current = window.setTimeout(() => {

@@ -120,6 +120,33 @@ describe('BrowserViewPanel stop-session control', () => {
     expect(screen.queryByText('Stopping browser…')).toBeNull();
   });
 
+  it('does not enter pending stop from an existing error state', async () => {
+    stopBrowser.mockResolvedValue({ success: true });
+    render(<BrowserViewPanel conversationId="conv-1" />);
+    act(() => { sockets[0]!.onmessage?.(statusMessage('error: attach failed')); });
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Stop browser session'));
+      await Promise.resolve();
+    });
+
+    expect(stopBrowser).toHaveBeenCalledWith('conv-1');
+    expect(screen.getByLabelText('Stop browser session')).not.toBeDisabled();
+    expect(screen.queryByText('Stopping browser…')).toBeNull();
+  });
+
+  it('settles a connecting stop when the socket closes without status', () => {
+    stopBrowser.mockReturnValue(new Promise(() => {}));
+    render(<BrowserViewPanel conversationId="conv-1" />);
+    fireEvent.click(screen.getByLabelText('Stop browser session'));
+    expect(screen.getByLabelText('Stop browser session')).toBeDisabled();
+
+    act(() => { sockets[0]!.onclose?.(); });
+
+    expect(screen.getByLabelText('Stop browser session')).not.toBeDisabled();
+    expect(screen.queryByText('Stopping browser…')).toBeNull();
+  });
+
   it('settles pending stop when websocket reports an error status', async () => {
     stopBrowser.mockResolvedValue({ success: true });
     render(<BrowserViewPanel conversationId="conv-1" />);
