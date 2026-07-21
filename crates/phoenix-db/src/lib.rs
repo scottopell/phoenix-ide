@@ -4378,6 +4378,93 @@ impl Database {
         Ok(DirectTurnRuntimeAdmissionOutcome::Committed)
     }
 
+    /// Atomically consumes one owed LLM delivery into product state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when message, state, delivery, or tool authorization fails.
+    pub async fn accept_top_level_llm_product(
+        &self,
+        input: &AcceptTopLevelLlmProductInput,
+    ) -> DbResult<AcceptTopLevelLlmProductOutcome> {
+        match self.accept_top_level_llm_product_once(input).await {
+            Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                if is_sqlite_busy_retryable(error.as_ref()) =>
+            {
+                Ok(AcceptTopLevelLlmProductOutcome::RetryablePersistence)
+            }
+            result => result,
+        }
+    }
+
+    async fn accept_top_level_llm_product_once(
+        &self,
+        input: &AcceptTopLevelLlmProductInput,
+    ) -> DbResult<AcceptTopLevelLlmProductOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let accepted = sqlx::query(
+            "UPDATE workflow_deliveries
+             SET status = 'Accepted', runtime_acceptance_status = 'Accepted'
+             WHERE workflow_id = ?1 AND delivery_id = ?2 AND receipt_id = ?3
+               AND status = 'Pending' AND runtime_acceptance_status = 'Owed'
+               AND EXISTS (
+                   SELECT 1 FROM top_level_llm_workflows w
+                   WHERE w.workflow_id = workflow_deliveries.workflow_id
+                     AND w.stopped_at IS NULL
+               )",
+        )
+        .bind(i64::try_from(input.workflow_id.0).map_err(|_| {
+            DbError::Serialization("workflow_id exceeds SQLite integer range".to_string())
+        })?)
+        .bind(i64::try_from(input.delivery_id.0).map_err(|_| {
+            DbError::Serialization("delivery_id exceeds SQLite integer range".to_string())
+        })?)
+        .bind(i64::try_from(input.receipt_id.0).map_err(|_| {
+            DbError::Serialization("receipt_id exceeds SQLite integer range".to_string())
+        })?)
+        .execute(&mut *tx)
+        .await?;
+        if accepted.rows_affected() == 0 {
+            let replay = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM workflow_deliveries d
+                 JOIN messages m ON m.message_id = ?4
+                 WHERE d.workflow_id = ?1 AND d.delivery_id = ?2 AND d.receipt_id = ?3
+                   AND d.status = 'Accepted' AND d.runtime_acceptance_status = 'Accepted'",
+            )
+            .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+            .bind(i64::try_from(input.delivery_id.0).unwrap_or(i64::MAX))
+            .bind(i64::try_from(input.receipt_id.0).unwrap_or(i64::MAX))
+            .bind(&input.message.message_id)
+            .fetch_one(&mut *tx)
+            .await?
+                == 1;
+            tx.rollback().await?;
+            return Ok(if replay {
+                AcceptTopLevelLlmProductOutcome::ExactReplay
+            } else {
+                AcceptTopLevelLlmProductOutcome::StaleAuthority
+            });
+        }
+        insert_message_tx(&mut tx, &input.message).await?;
+        update_conversation_state_at_tx(
+            &mut tx,
+            &input.message.conversation_id,
+            &input.next_state,
+            input.state_updated_at,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE top_level_llm_tool_intents SET status = 'Owed'
+             WHERE workflow_id = ?1 AND receipt_id = ?2 AND status = 'PendingAcceptance'",
+        )
+        .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+        .bind(i64::try_from(input.receipt_id.0).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(AcceptTopLevelLlmProductOutcome::Committed)
+    }
+
     /// Update conversation state with an explicit `state_updated_at`. The
     /// runtime threads its in-memory entry timestamp here so the DB row and
     /// the `StateChange` wire event share one value (REQ-WPV-001) — no

@@ -99,6 +99,20 @@ pub trait MessageStore: Send + Sync {
         Err("durable top-level LLM attempts are unsupported by this storage".to_string())
     }
 
+    async fn owed_top_level_llm_receipt(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_db::OwedTopLevelLlmReceipt>, String> {
+        Ok(None)
+    }
+
+    async fn accept_top_level_llm_product(
+        &self,
+        _input: &phoenix_db::AcceptTopLevelLlmProductInput,
+    ) -> Result<phoenix_db::AcceptTopLevelLlmProductOutcome, String> {
+        Ok(phoenix_db::AcceptTopLevelLlmProductOutcome::StaleAuthority)
+    }
+
     async fn stop_active_top_level_llm_for_conversation(
         &self,
         _conversation_id: &str,
@@ -696,6 +710,26 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<phoenix_db::PreparedTopLevelLlmAttempt, String> {
         phoenix_db::WorkflowRepository::new(self.db.pool().clone())
             .prepare_and_begin_top_level_llm_attempt(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn owed_top_level_llm_receipt(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_db::OwedTopLevelLlmReceipt>, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .load_owed_top_level_llm_receipt_for_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn accept_top_level_llm_product(
+        &self,
+        input: &phoenix_db::AcceptTopLevelLlmProductInput,
+    ) -> Result<phoenix_db::AcceptTopLevelLlmProductOutcome, String> {
+        self.db
+            .accept_top_level_llm_product(input)
             .await
             .map_err(|error| error.to_string())
     }

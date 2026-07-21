@@ -246,6 +246,24 @@ pub struct OwedTopLevelLlmReceipt {
     pub tool_intents: Vec<ToolIntentRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AcceptTopLevelLlmProductInput {
+    pub workflow_id: WorkflowId,
+    pub delivery_id: DeliveryId,
+    pub receipt_id: ReceiptId,
+    pub message: phoenix_core::domain::db_schema::Message,
+    pub next_state: phoenix_core::domain::sm_state::ConvState,
+    pub state_updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptTopLevelLlmProductOutcome {
+    Committed,
+    ExactReplay,
+    StaleAuthority,
+    RetryablePersistence,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopTopLevelLlmInput {
     pub workflow_id: WorkflowId,
@@ -1103,6 +1121,17 @@ impl WorkflowRepository {
                 ToolIntentTransitionOutcome::Conflict
             },
         )
+    }
+
+    pub async fn load_owed_top_level_llm_receipt_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<OwedTopLevelLlmReceipt>> {
+        Ok(self
+            .load_owed_top_level_llm_receipts()
+            .await?
+            .into_iter()
+            .find(|owed| owed.workflow.conversation_id == conversation_id))
     }
 
     pub async fn stop_active_top_level_llm_for_conversation(

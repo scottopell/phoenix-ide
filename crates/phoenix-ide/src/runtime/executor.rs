@@ -2573,6 +2573,46 @@ where
         self.execute_effect(Effect::RequestLlm).await.map(|_| ())
     }
 
+    async fn canonicalize_llm_response_event(&self, event: Event) -> Result<Event, String> {
+        if !matches!(event, Event::LlmResponse { .. }) {
+            return Ok(event);
+        }
+        let Some(owed) = self
+            .storage
+            .owed_top_level_llm_receipt(&self.context.conversation_id)
+            .await?
+        else {
+            return Ok(event);
+        };
+        let durable: phoenix_llm::DurableLlmResponse =
+            serde_json::from_str(&owed.llm_receipt.response_aggregate)
+                .map_err(|error| error.to_string())?;
+        let request_id = durable.provider_request_id.unwrap_or_else(|| {
+            format!(
+                "llm-receipt-{}-{}",
+                owed.workflow.workflow_id.0, owed.receipt.receipt_id.0
+            )
+        });
+        Ok(Event::LlmResponse {
+            tool_calls: durable
+                .response
+                .tool_uses()
+                .into_iter()
+                .map(|(id, name, input)| crate::state_machine::state::ToolCall {
+                    id: id.to_string(),
+                    input: crate::state_machine::state::ToolInput::from_name_and_value(
+                        name,
+                        input.clone(),
+                    ),
+                })
+                .collect(),
+            content: durable.response.content,
+            end_turn: durable.response.end_turn,
+            usage: durable.response.usage,
+            request_id,
+        })
+    }
+
     async fn pending_direct_turn_for_event(
         &self,
         event: &Event,
@@ -2663,6 +2703,14 @@ where
         let mut events_to_process = vec![event];
 
         while let Some(current_event) = events_to_process.pop() {
+            let owed_llm_receipt = if matches!(current_event, Event::LlmResponse { .. }) {
+                self.storage
+                    .owed_top_level_llm_receipt(&self.context.conversation_id)
+                    .await?
+            } else {
+                None
+            };
+            let current_event = self.canonicalize_llm_response_event(current_event).await?;
             // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
                 if let ConvState::AwaitingSubAgents { ref pending, .. }
@@ -2702,6 +2750,9 @@ where
 
             let generated_events = if let Some(pending) = pending_direct_turn {
                 self.apply_direct_turn_transition(result, pending).await?
+            } else if let Some(owed) = owed_llm_receipt {
+                self.apply_durable_llm_receipt_transition(result, owed)
+                    .await?
             } else {
                 self.apply_transition_result(result).await?
             };
@@ -2777,6 +2828,81 @@ where
             );
         }
         to_drain
+    }
+
+    async fn apply_durable_llm_receipt_transition(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+        owed: phoenix_db::OwedTopLevelLlmReceipt,
+    ) -> Result<Vec<Event>, String> {
+        let mut effects = result.effects.into_iter();
+        let Some(Effect::PersistMessage {
+            content,
+            display_data,
+            usage_data,
+            message_id,
+            idempotent: false,
+        }) = effects.next()
+        else {
+            return Err(
+                "durable LLM response did not begin with assistant persistence".to_string(),
+            );
+        };
+        if !matches!(effects.next(), Some(Effect::PersistState)) {
+            return Err(
+                "durable LLM response did not pair message and state persistence".to_string(),
+            );
+        }
+        let old_state = self.state.clone();
+        let next_state = result.new_state;
+        let state_updated_at = if next_state == old_state {
+            self.state_updated_at
+        } else {
+            Utc::now()
+        };
+        let message = crate::db::Message {
+            message_id,
+            conversation_id: self.context.conversation_id.clone(),
+            sequence_id: self.broadcast_tx.next_seq(),
+            message_type: content.message_type(),
+            content,
+            display_data,
+            usage_data,
+            created_at: Utc::now(),
+        };
+        let outcome = self
+            .storage
+            .accept_top_level_llm_product(&phoenix_db::AcceptTopLevelLlmProductInput {
+                workflow_id: owed.workflow.workflow_id,
+                delivery_id: owed.delivery.delivery_id,
+                receipt_id: owed.receipt.receipt_id,
+                message: message.clone(),
+                next_state: next_state.clone(),
+                state_updated_at,
+            })
+            .await?;
+        if outcome == phoenix_db::AcceptTopLevelLlmProductOutcome::ExactReplay {
+            return Ok(vec![]);
+        }
+        if outcome != phoenix_db::AcceptTopLevelLlmProductOutcome::Committed {
+            return Err(format!(
+                "durable LLM product acceptance failed: {outcome:?}"
+            ));
+        }
+        self.state = next_state;
+        self.state_updated_at = state_updated_at;
+        self.manage_deadline(&old_state);
+        if let Some(tx) = &self.state_watcher {
+            let _ = tx.send(self.state.clone());
+        }
+        let _ = self.broadcast_tx.send_message(message);
+        let mut generated = Vec::new();
+        for effect in effects {
+            if let Some(event) = self.execute_effect(effect).await? {
+                generated.push(event);
+            }
+        }
+        Ok(generated)
     }
 
     async fn apply_direct_turn_transition(
@@ -4811,7 +4937,7 @@ where
                     if let Some(attempt) = durable_attempt.as_ref() {
                         let durable_response = phoenix_llm::DurableLlmResponse {
                             response: response.clone(),
-                            provider_request_id: None,
+                            provider_request_id: Some(request_id.clone()),
                         };
                         let response_aggregate = match serde_json::to_string(&durable_response) {
                             Ok(aggregate) => aggregate,
@@ -4850,7 +4976,7 @@ where
                                             response_fingerprint: response_fingerprint.clone(),
                                             response_aggregate: response_aggregate.clone(),
                                         },
-                                        provider_request_id: None,
+                                        provider_request_id: Some(request_id.clone()),
                                         tool_intents: tool_intents.clone(),
                                     },
                                 )

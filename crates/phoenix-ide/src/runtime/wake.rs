@@ -158,6 +158,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .map_err(|error| error.to_string())?;
         self.run_once().await?;
         recover_top_level_llm_attempts(&manager).await?;
+        deliver_owed_top_level_llm_receipts(&manager).await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
         deliver_pending_direct_turns(&manager).await?;
         let _ = ready_tx.send(());
@@ -176,6 +177,9 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                     if let Some(manager) = manager.as_ref() {
                         if let Err(error) = recover_top_level_llm_attempts(manager).await {
                             tracing::warn!(error = %error, "top-level LLM recovery failed; retrying");
+                        }
+                        if let Err(error) = deliver_owed_top_level_llm_receipts(manager).await {
+                            tracing::warn!(error = %error, "owed LLM receipt delivery failed; retrying");
                         }
                         if let Err(error) = deliver_pending_direct_turns(manager).await {
                             tracing::warn!(error = %error, retry_in = ?error_backoff, "direct-turn recovery failed; retrying");
@@ -371,6 +375,58 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
     }
 }
 
+async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    for owed in repo
+        .load_owed_top_level_llm_receipts()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let durable: phoenix_llm::DurableLlmResponse =
+            serde_json::from_str(&owed.llm_receipt.response_aggregate)
+                .map_err(|error| error.to_string())?;
+        let handle = match manager.get_or_create(&owed.workflow.conversation_id).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(%error, "owed LLM receipt runtime unavailable");
+                continue;
+            }
+        };
+        if !matches!(
+            *handle.state_rx.borrow(),
+            crate::state_machine::ConvState::LlmRequesting { .. }
+        ) {
+            continue;
+        }
+        let event = phoenix_core::domain::sm_event::Event::LlmResponse {
+            tool_calls: durable
+                .response
+                .tool_uses()
+                .into_iter()
+                .map(
+                    |(id, name, input)| phoenix_core::domain::sm_state::ToolCall {
+                        id: id.to_string(),
+                        input: phoenix_core::domain::sm_state::ToolInput::from_name_and_value(
+                            name,
+                            input.clone(),
+                        ),
+                    },
+                )
+                .collect(),
+            content: durable.response.content,
+            end_turn: durable.response.end_turn,
+            usage: durable.response.usage,
+            request_id: durable
+                .provider_request_id
+                .unwrap_or_else(|| format!("llm-receipt-{}", owed.receipt.receipt_id.0)),
+        };
+        if let Err(error) = handle.event_tx.send(event).await {
+            tracing::warn!(error = %error, "owed LLM receipt runtime channel closed");
+        }
+    }
+    Ok(())
+}
+
 async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     use sha2::Digest as _;
 
@@ -399,7 +455,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
         let request = durable_request.into_attempt(phoenix_llm::LlmRequestTelemetry {
             conversation_id: recovery.workflow.conversation_id.clone(),
             root_conversation_id: recovery.workflow.conversation_id.clone(),
-            request_id,
+            request_id: request_id.clone(),
             retry_attempt: u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX),
         });
         let Some(llm) = manager
@@ -413,7 +469,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
             Ok(response) => {
                 let aggregate = serde_json::to_string(&phoenix_llm::DurableLlmResponse {
                     response: response.clone(),
-                    provider_request_id: None,
+                    provider_request_id: Some(request_id.clone()),
                 })
                 .map_err(|error| error.to_string())?;
                 let fingerprint = sha2::Sha256::digest(aggregate.as_bytes()).iter().fold(
@@ -449,7 +505,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                             response_fingerprint: fingerprint,
                             response_aggregate: aggregate,
                         },
-                        provider_request_id: None,
+                        provider_request_id: Some(request_id),
                         tool_intents,
                     },
                 )
