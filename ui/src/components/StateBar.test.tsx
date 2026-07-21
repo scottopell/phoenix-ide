@@ -250,7 +250,8 @@ describe('StateBar PR badge', () => {
       check_state: state.check_state,
     }) });
 
-    const badge = await screen.findByRole('link', { name: label });
+    const badge = await screen.findByRole('link', { name: /#12.*Add PR tracking/i });
+    expect(badge).toHaveTextContent(label);
     expect(badge).toHaveClass('pr-badge', className);
     expect(badge).toHaveAttribute('href', 'https://github.com/scottopell/phoenix-ide/pull/12');
     expect(badge).toHaveAttribute('target', '_blank');

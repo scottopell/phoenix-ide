@@ -227,7 +227,7 @@ THE SYSTEM SHALL require an explicit display label before it can be rendered
 WHEN agent is idle, in error, or in a terminal state
 THE SYSTEM SHALL NOT show the activity indicator
 
-**Rationale:** Users need confidence the system is making progress (transparency questions 1-2). Exhaustive state labels prevent silent degradation when backend states evolve. The "is the agent working?" question must have exactly one unambiguous answer derived from one source. A slot that changes role between cold load and streaming blurs two visually-similar but semantically-distinct things; each concern therefore has a single fixed home — live activity in the StateBar, whole-conversation navigation in the top strip (REQ-CONV-023), and per-turn tool detail inline in the message list (REQ-CONV-022).
+**Rationale:** Users need confidence the system is making progress (transparency questions 1-2). Exhaustive state labels prevent silent degradation when backend states evolve. The "is the agent working?" question must have exactly one detailed answer derived from one source. The StateBar owns that full activity label and elapsed phase detail; compact attention markers in the conversation list and collapsed sidebar remain available under REQ-CONV-012 and REQ-CONV-016 for locating conversations that need attention. A slot that changes role between cold load and streaming blurs two visually-similar but semantically-distinct things; each detailed concern therefore has a single fixed home — live activity in the StateBar, whole-conversation navigation in the top strip (REQ-CONV-023), and per-turn tool detail inline in the message list (REQ-CONV-022).
 
 
 ---

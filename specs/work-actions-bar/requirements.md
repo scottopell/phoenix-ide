@@ -275,10 +275,10 @@ effects differ between the two verbs.
 THE SYSTEM SHALL NOT render a disabled button as a status display.
 
 A disabled button reads as "this action is temporarily unavailable — try again later or fix a
-prerequisite." Stable status belongs in the StateBar (the PR badge / identity and the conversation
-phase indicator), never in the work actions bar as a ghosted, un-clickable control. The work
-actions bar may carry only action-adjacent PR context such as freshness or coverage signals, and
-those signals SHALL remain clearly subordinate to the StateBar's identity/status ownership. Every
+prerequisite." Stable conversation phase and the compact active-PR status badge belong in the StateBar, never in
+the work actions bar as a ghosted, un-clickable control. The work actions bar may carry PR identity
+and review context on actionable PR rail entries as required by REQ-WAB-002, plus freshness or
+coverage signals; those signals SHALL remain clearly subordinate to the selected PR and its status. Every
 button the bar renders is enabled and invocable; a verb that does not apply to the current state is
 absent, not disabled.
 

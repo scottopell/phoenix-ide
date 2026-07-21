@@ -118,6 +118,17 @@ describe('conversationIdentity', () => {
     }))).toBe('renamed-work-conversation');
   });
 
+  it('rejects generated short-id slugs without rejecting ordinary hex-like words', () => {
+    expect(getConversationDisplayTitle(makeConversation({
+      slug: 'fork-c8f92b',
+      task_title: 'Readable task title',
+    }))).toBe('Readable task title');
+    expect(getConversationDisplayTitle(makeConversation({
+      slug: 'debug-deadbeef-caching',
+      task_title: 'Original task title',
+    }))).toBe('debug-deadbeef-caching');
+  });
+
   it('returns a shared typed identity display payload', () => {
     expect(getConversationIdentityDisplay(makeConversation({
       slug: '123e4567-e89b-12d3-a456-426614174000',

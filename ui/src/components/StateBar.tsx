@@ -176,6 +176,7 @@ function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
         target="_blank"
         rel="noreferrer"
         className={prBadgeClass(pr)}
+        aria-label={`${prBadgeLabel(pr)}${pr.title ? ` · ${pr.title}` : ''}`}
         title={prTooltip(pr)}
         onClick={stopPropagation}
         onKeyDown={(event) => {

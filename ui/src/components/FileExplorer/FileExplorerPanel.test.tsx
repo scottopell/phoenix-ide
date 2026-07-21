@@ -67,7 +67,7 @@ function skill(name: string, source: string, path: string): SkillEntry {
   return { name, description: `${name} description`, source, path };
 }
 
-function renderPanel(conversationId = 'conv-1') {
+function renderPanel(conversationId = 'conv-1', rootPath = '/repo') {
   return render(
     <MemoryRouter initialEntries={['/c/slug']}>
       <ConversationProvider>
@@ -76,7 +76,7 @@ function renderPanel(conversationId = 'conv-1') {
             <FileExplorerPanel
               collapsed={false}
               onToggle={() => {}}
-              rootPath="/repo"
+              rootPath={rootPath}
               conversationId={conversationId}
               showToast={() => {}}
               showError={() => {}}
@@ -128,6 +128,14 @@ describe('FileExplorerPanel grounding detail navigation', () => {
 
     expect(await screen.findByText('Files in repo')).toBeInTheDocument();
     expect(screen.queryByText(/main/)).not.toBeInTheDocument();
+  });
+
+  it('keeps opaque root paths in the tooltip instead of the visible subtitle', async () => {
+    const opaqueRoot = '/tmp/9d1b4cc93b7845228e4fdbe566761f44';
+    renderPanel('conv-1', opaqueRoot);
+
+    expect(await screen.findByText('Project files')).toHaveAttribute('title', opaqueRoot);
+    expect(screen.queryByText(opaqueRoot)).not.toBeInTheDocument();
   });
 
   it('keeps Tasks expanded and preserves task group state after Back', async () => {

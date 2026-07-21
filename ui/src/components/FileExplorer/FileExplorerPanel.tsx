@@ -79,8 +79,8 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const liveAttentionCount = liveWorkScope ? workScopeLiveCount(liveWorkScope) : workScopeCount;
   const hasFileRoot = !!rootPath;
   const projectName = rootPath
-    ? getConversationProjectLabel({ project_name: null, worktree_path: null, cwd: rootPath }) ?? rootPath
-    : 'Read-only';
+    ? getConversationProjectLabel({ project_name: null, worktree_path: null, cwd: rootPath })
+    : null;
 
   const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
@@ -138,7 +138,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         <div className="fe-title-stack">
           <span className="fe-title">Grounding</span>
           <span className="fe-subtitle" title={rootPath ?? undefined}>
-            {rootPath ? `Files in ${projectName}` : 'Read-only history'}
+            {rootPath ? (projectName ? `Files in ${projectName}` : 'Project files') : 'Read-only history'}
           </span>
         </div>
         {hasFileRoot && (

@@ -62,9 +62,9 @@ This targeting contract uses an explicit active PR rather than a hidden singular
 - A compatibility primary-PR projection may exist for singular compatibility consumers, but it is
   not the hidden authority for active multi-PR actions.
 
-- The **StateBar** renders the **PR badge / PR identity link** (`StateBarPrBadge`) — the full
-  human-facing PR identity and status for the active PR: number, title, and state. This is a
-  StateBar concern.
+- The **StateBar** renders the **PR badge / PR identity link** (`StateBarPrBadge`) — a compact
+  active-PR number and state/check summary. The link exposes the PR title in its accessible name
+  and tooltip so the full identity remains available without crowding the persistent chrome.
 - The **work actions bar** renders the **Address-CI auto-fix affordance**
   (`WorkActions.tsx` → `PrRemediationActions`). The StateBar has no auto-fix logic.
 
