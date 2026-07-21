@@ -1224,6 +1224,29 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelector('.conv-chain-summary-title')?.textContent).not.toContain('9d1b4cc');
   });
 
+  it('rejects generated prefixed UUID names in collapsed chain headers', () => {
+    const root = makeConv('fork-root', 'fork-123e4567-e89b-42d3-a456-426614174000', {
+      continued_in_conv_id: 'fork-leaf',
+      chain_name: null,
+      task_title: 'Readable fork task title',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const leaf = makeConv('fork-leaf', 'continue-readable-work', {
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[leaf, root]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('Readable fork task title');
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).not.toContain('fork-123e4567');
+  });
+
   it('keeps cleaned-up terminal mobile chains collapsed by default', () => {
     const root = makeConv('cleanup-root', 'explore-options', {
       continued_in_conv_id: 'cleanup-middle',

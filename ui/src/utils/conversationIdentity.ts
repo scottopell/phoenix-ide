@@ -95,12 +95,9 @@ function modeIdentity(mode: string | null | undefined): ConversationModeIdentity
 export function isLowValueIdentifier(value: string | null | undefined): boolean {
   const normalized = value?.trim();
   if (!normalized) return true;
-  return UUID_PATTERN.test(normalized) || LONG_HEX_TOKEN_PATTERN.test(normalized);
-}
-
-function isLowValueConversationLabel(value: string | null | undefined): boolean {
-  const normalized = value?.trim();
-  return isLowValueIdentifier(normalized) || Boolean(normalized && GENERATED_UUID_LABEL_PATTERN.test(normalized));
+  return UUID_PATTERN.test(normalized)
+    || GENERATED_UUID_LABEL_PATTERN.test(normalized)
+    || LONG_HEX_TOKEN_PATTERN.test(normalized);
 }
 
 export function getPathDisplayLabel(path: string | null | undefined): string | null {
@@ -173,7 +170,7 @@ export function getConversationDisplayTitle(
   fallback = 'Untitled conversation',
 ): string {
   const slug = conversation.slug?.trim();
-  if (!isLowValueConversationLabel(slug)) return slug!;
+  if (!isLowValueIdentifier(slug)) return slug!;
 
   const candidates = [
     conversation.task_title,
