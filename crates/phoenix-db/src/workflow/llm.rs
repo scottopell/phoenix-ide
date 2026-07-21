@@ -1839,6 +1839,36 @@ mod tests {
         (dir, WorkflowRepository::new(pool), lock_pool)
     }
 
+    async fn open_independent_repos() -> (tempfile::TempDir, WorkflowRepository, WorkflowRepository)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let url = format!("sqlite://{}", path.display());
+        let options = || {
+            SqliteConnectOptions::from_str(&url)
+                .unwrap()
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(5))
+        };
+        let first_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options())
+            .await
+            .unwrap();
+        setup_repo_schema(&first_pool).await;
+        let second_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options())
+            .await
+            .unwrap();
+        (
+            dir,
+            WorkflowRepository::new(first_pool),
+            WorkflowRepository::new(second_pool),
+        )
+    }
+
     fn snapshot() -> TopLevelLlmSnapshot {
         TopLevelLlmSnapshot {
             turn_ref: TopLevelTurnRef {
@@ -1926,6 +1956,60 @@ mod tests {
             repo.accept_direct_turn(&conflict).await.unwrap(),
             DirectTurnAcceptanceOutcome::Conflict
         );
+    }
+
+    #[tokio::test]
+    async fn direct_turn_acceptance_has_one_winner_across_independent_connections() {
+        let (_dir, first, second) = open_independent_repos().await;
+        let input = DirectTurnAcceptanceInput {
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-race".to_string(),
+            prepared_fingerprint: "fp-race".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        };
+        let (left, right) = tokio::join!(
+            first.accept_direct_turn(&input),
+            second.accept_direct_turn(&input),
+        );
+        let mut outcomes = [left.unwrap(), right.unwrap()];
+        if matches!(
+            outcomes[0],
+            DirectTurnAcceptanceOutcome::RetryablePersistence
+        ) {
+            outcomes[0] = first.accept_direct_turn(&input).await.unwrap();
+        }
+        if matches!(
+            outcomes[1],
+            DirectTurnAcceptanceOutcome::RetryablePersistence
+        ) {
+            outcomes[1] = second.accept_direct_turn(&input).await.unwrap();
+        }
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DirectTurnAcceptanceOutcome::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DirectTurnAcceptanceOutcome::Replayed(_)))
+                .count(),
+            1
+        );
+        let workflow_ids: Vec<_> = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                DirectTurnAcceptanceOutcome::Created(record)
+                | DirectTurnAcceptanceOutcome::Replayed(record) => Some(record.workflow_id),
+                DirectTurnAcceptanceOutcome::Conflict
+                | DirectTurnAcceptanceOutcome::RetryablePersistence => None,
+            })
+            .collect();
+        assert_eq!(workflow_ids, vec![workflow_ids[0], workflow_ids[0]]);
     }
 
     #[tokio::test]
