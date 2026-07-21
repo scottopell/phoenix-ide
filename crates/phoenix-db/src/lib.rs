@@ -12012,14 +12012,24 @@ mod tests {
                     response_aggregate: "{}".to_string(),
                 },
                 provider_request_id: Some("request-1".to_string()),
-                tool_intents: vec![ToolIntentRecord {
-                    intent_ordinal: 0,
-                    status: ToolIntentStatus::PendingAcceptance,
-                    tool_name: "bash".to_string(),
-                    tool_kind: ToolKindRecord::Function,
-                    tool_use_id: "tool-1".to_string(),
-                    arguments_json: "{}".to_string(),
-                }],
+                tool_intents: vec![
+                    ToolIntentRecord {
+                        intent_ordinal: 0,
+                        status: ToolIntentStatus::PendingAcceptance,
+                        tool_name: "bash".to_string(),
+                        tool_kind: ToolKindRecord::Function,
+                        tool_use_id: "tool-1".to_string(),
+                        arguments_json: "{}".to_string(),
+                    },
+                    ToolIntentRecord {
+                        intent_ordinal: 1,
+                        status: ToolIntentStatus::PendingAcceptance,
+                        tool_name: "think".to_string(),
+                        tool_kind: ToolKindRecord::Function,
+                        tool_use_id: "tool-2".to_string(),
+                        arguments_json: "{}".to_string(),
+                    },
+                ],
             })
             .await
             .unwrap();
@@ -12071,6 +12081,19 @@ mod tests {
         assert_eq!(owed_after_product.len(), 1);
         assert_eq!(owed_after_product[0].receipt.receipt_id, receipt_id);
         assert_eq!(
+            repo.transition_top_level_llm_tool_intent(&ToolIntentTransitionInput {
+                workflow_id: WorkflowId(1),
+                receipt_id,
+                intent_ordinal: 1,
+                generation: Generation(0),
+                from: ToolIntentStatus::Owed,
+                to: ToolIntentStatus::ExecutionMayHaveBegun,
+            })
+            .await
+            .unwrap(),
+            ToolIntentTransitionOutcome::Committed
+        );
+        assert_eq!(
             repo.stop_active_top_level_llm_for_conversation("conv-direct", Timestamp(5),)
                 .await
                 .unwrap(),
@@ -12086,6 +12109,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, "Suppressed");
+        let begun_status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM top_level_llm_tool_intents
+             WHERE workflow_id = ?1 AND receipt_id = ?2 AND intent_ordinal = 1",
+        )
+        .bind(i64::try_from(WorkflowId(1).0).unwrap())
+        .bind(i64::try_from(receipt_id.0).unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(begun_status, "Interrupted");
         assert!(repo
             .load_owed_top_level_llm_receipts()
             .await

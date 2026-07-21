@@ -2299,6 +2299,15 @@ mod tests {
             CompleteLlmResponsePersistenceOutcome::Accepted
         );
         assert_eq!(repo.list_receipts(WorkflowId(1)).await.unwrap().len(), 1);
+        let replay = repo
+            .accept_complete_top_level_llm_response(&input)
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.outcome,
+            CompleteLlmResponsePersistenceOutcome::ExactReplay
+        );
+        assert_eq!(repo.list_receipts(WorkflowId(1)).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
