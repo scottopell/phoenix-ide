@@ -186,7 +186,7 @@ pub trait WakeRegistrar: Send + Sync {
 /// Converts a resource scope to the persisted identity that may own a durable wake.
 ///
 /// # Errors
-/// Returns an error for the global terminal namespace, which has no durable work owner.
+/// Returns an error for namespaces that cannot own a durable wake.
 pub fn work_scope_identity(scope: &ResourceScopeKey) -> Result<WorkScopeIdentity, String> {
     match scope {
         ResourceScopeKey::Work(id) => Ok(WorkScopeIdentity(id.as_str().to_string())),

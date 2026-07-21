@@ -576,6 +576,13 @@ impl WakeRepository {
                 WakeRegistrationOutcome::Conflict
             });
         }
+        if fetch_unresolved_resource_binding_tx(&mut tx, input)
+            .await?
+            .is_some()
+        {
+            tx.commit().await?;
+            return Ok(WakeRegistrationOutcome::Conflict);
+        }
 
         let workflow_id = match allocated_workflow_id {
             Some(workflow_id) => workflow_id,
@@ -673,7 +680,19 @@ impl WakeRepository {
         }
         #[cfg(test)]
         maybe_fail_after_canonical_transition(self.failpoint_namespace, workflow_id)?;
-        insert_binding_tx(&mut tx, workflow_id, input, prepared_fingerprint, now).await?;
+        if let Err(error) =
+            insert_binding_tx(&mut tx, workflow_id, input, prepared_fingerprint, now).await
+        {
+            if matches!(
+                &error,
+                DbError::Sqlx(sqlx::Error::Database(database_error))
+                    if is_unique_or_primary_constraint(database_error.as_ref())
+            ) {
+                tx.rollback().await?;
+                return Ok(WakeRegistrationOutcome::Conflict);
+            }
+            return Err(error);
+        }
         tx.commit().await?;
         Ok(WakeRegistrationOutcome::Registered {
             workflow_id,
@@ -3513,6 +3532,34 @@ async fn fetch_existing_binding_tx(
     row.as_ref().map(binding_from_row).transpose()
 }
 
+async fn fetch_unresolved_resource_binding_tx(
+    tx: &mut WorkflowTx<'_>,
+    input: &WakeRegistrationIntent,
+) -> DbResult<Option<WakeBindingRecord>> {
+    let row = sqlx::query(
+        "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
+                scope_kind, scope_stable_key, resource_kind, bash_handle_id,
+                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
+                expires_at, prepared_fingerprint
+         FROM wake_bindings
+         WHERE profile_kind = 'wake' AND profile_version = ?1 AND conversation_id = ?2
+           AND resource_kind = ?3
+           AND COALESCE(bash_handle_id, '') = ?4
+           AND COALESCE(tmux_server_token, '') = ?5
+           AND COALESCE(tmux_window_id, '') = ?6
+           AND resolved_at IS NULL",
+    )
+    .bind(i64::from(wake_profile::PROTOCOL_VERSION))
+    .bind(&input.conversation_id)
+    .bind(resource_kind_str(&input.resource))
+    .bind(bash_handle_id(&input.resource).unwrap_or_default())
+    .bind(tmux_server_token(&input.resource).unwrap_or_default())
+    .bind(tmux_window_id(&input.resource).unwrap_or_default())
+    .fetch_optional(&mut *tx.tx)
+    .await?;
+    row.as_ref().map(binding_from_row).transpose()
+}
+
 async fn fetch_binding_by_workflow_tx(
     tx: &mut WorkflowTx<'_>,
     workflow_id: WorkflowId,
@@ -6068,6 +6115,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn different_contract_on_unresolved_resource_returns_conflict() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let input = intent();
+        assert!(matches!(
+            repo.register(&input, "fp-1", Timestamp(10)).await.unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let mut duplicate_resource = input;
+        duplicate_resource.contract_id = "different-contract".to_string();
+        duplicate_resource.registering_tool_use_id = "different-tool".to_string();
+        assert_eq!(
+            repo.register(&duplicate_resource, "fp-2", Timestamp(11))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Conflict
+        );
+    }
+
+    #[tokio::test]
     async fn failpoint_rolls_back_everything() {
         let (_dir, repo, _) = open_repo_pair().await;
         let input = intent();
@@ -6554,6 +6620,7 @@ mod tests {
         let workflow_id = WorkflowId(118);
         let started = unwrap_started(register_and_begin(&repo, workflow_id).await);
         let identity_before = external_acceptance_identity(&repo, workflow_id).await;
+        let expected_scope_after = "conversation:conv-2";
 
         assert_eq!(
             repo.transfer(&transfer_input(
@@ -6580,10 +6647,24 @@ mod tests {
             "conv-2"
         );
         assert_eq!(
+            restarted
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .registration_scope
+                .stable_key,
+            expected_scope_after
+        );
+        assert_eq!(
             external_acceptance_identity(&repo, workflow_id).await,
             identity_before
         );
 
+        let mut evidence = bash_evidence(19);
+        if let WakeTerminalEvidence::Bash(bash) = &mut evidence {
+            bash.identity.work_scope.stable_key = expected_scope_after.to_string();
+        }
         repo.record_terminal_evidence(
             workflow_id,
             started.authority.as_ref().unwrap(),
@@ -6591,7 +6672,7 @@ mod tests {
             ReceiptId(1),
             DeliveryId(1),
             Timestamp(20),
-            &bash_evidence(19),
+            &evidence,
         )
         .await
         .unwrap();
@@ -7371,6 +7452,34 @@ mod tests {
         assert_eq!(
             deliveries[0].status,
             phoenix_workflow::DeliveryStatus::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_resource_returns_typed_outcomes() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let first = intent();
+        let mut second = first.clone();
+        second.contract_id = "different-contract".to_string();
+        second.registering_tool_use_id = "different-tool".to_string();
+        let (left, right) = tokio::join!(
+            repo.register(&first, "fp-1", Timestamp(10)),
+            restarted.register(&second, "fp-2", Timestamp(10)),
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, WakeRegistrationOutcome::Registered { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, WakeRegistrationOutcome::Conflict))
+                .count(),
+            1
         );
     }
 

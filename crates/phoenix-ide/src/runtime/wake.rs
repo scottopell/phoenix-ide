@@ -391,6 +391,28 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
     }
 }
 
+async fn adopt_materialized_delivery(
+    handle: &crate::runtime::ConversationHandle,
+    repo: &WakeRepository,
+    conversation_id: &str,
+    now: Timestamp,
+) -> Result<(), String> {
+    if let WakeAdoptMaterializedPendingOutcome::Adopted(adopted) = repo
+        .adopt_materialized_pending_for_conversation(conversation_id, now)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if adopted.auto_resume {
+            handle
+                .event_tx
+                .send(crate::state_machine::Event::WakeBatchAdopted)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn deliver_pending(
     manager: &Arc<RuntimeManager>,
@@ -472,6 +494,19 @@ async fn deliver_pending(
                     }
                 },
             };
+            if repo
+                .get_delivery_message_link(
+                    current.workflow_id,
+                    current.canonical_delivery.delivery_id,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                adopt_materialized_delivery(&handle, repo, &current.conversation_id, now).await?;
+                cursor = Some(next_cursor);
+                continue;
+            }
             let (sequence_guard, sequence_ids) =
                 handle.broadcast_tx.reserve_next_persisted_message_range(1);
             let sequence_id = sequence_ids[0];
@@ -514,25 +549,8 @@ async fn deliver_pending(
                     }
                 }
                 MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
-                    let conversation_id = current.conversation_id;
-                    match repo
-                        .adopt_materialized_pending_for_conversation(&conversation_id, now)
-                        .await
-                        .map_err(|error| error.to_string())?
-                    {
-                        WakeAdoptMaterializedPendingOutcome::Adopted(adopted) => {
-                            if adopted.auto_resume {
-                                handle
-                                    .event_tx
-                                    .send(crate::state_machine::Event::WakeBatchAdopted)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                            }
-                        }
-                        WakeAdoptMaterializedPendingOutcome::Busy(_)
-                        | WakeAdoptMaterializedPendingOutcome::NothingPending
-                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
-                    }
+                    adopt_materialized_delivery(&handle, repo, &current.conversation_id, now)
+                        .await?;
                 }
                 MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
                     repo.suppress_pending_for_archived_conversation(&current, now)
@@ -1669,11 +1687,13 @@ mod tests {
         let before = handle.broadcast_tx.snapshot_pending();
         assert_eq!(before.3.len(), 1);
 
+        let sequence_before = handle.broadcast_tx.current_seq();
         deliver_pending(&manager, &repo, Timestamp(21))
             .await
             .unwrap();
 
         let after = handle.broadcast_tx.snapshot_pending();
+        assert_eq!(handle.broadcast_tx.current_seq(), sequence_before);
         assert_eq!(after.0, before.0);
         assert_eq!(after.3.len(), 1);
         assert!(matches!(
