@@ -3328,7 +3328,7 @@ impl RuntimeManager {
 /// sub-agents it follows `parent_conversation_id` links until it reaches a
 /// conversation with no parent, or until the 10-iteration guard fires on
 /// corrupt data.
-async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> String {
+pub(crate) async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> String {
     let mut current_id = conversation_id.to_string();
     for _ in 0..10 {
         match db.get_conversation(&current_id).await {
@@ -3936,6 +3936,27 @@ mod broadcaster_tests {
             }
             other => panic!("expected Token, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_after_accepts_anchor_and_tip_boundaries() {
+        let b = SseBroadcaster::new(16, 0);
+        let _rx = b.subscribe();
+        let _ = b.send_persisted_message(test_message(5, "anchor"));
+        let _ = b.send_seq(|seq| token_event(seq, "a"));
+        let _ = b.send_seq(|seq| token_event(seq, "b"));
+
+        let (anchor, truncated, highest, after_anchor) = b
+            .snapshot_pending_after(5)
+            .expect("cursor at anchor should be replayable");
+        assert_eq!((anchor, truncated, highest), (5, false, 7));
+        assert_eq!(after_anchor.len(), 2);
+
+        let (_, _, highest, after_tip) = b
+            .snapshot_pending_after(7)
+            .expect("cursor at tip should produce an empty replay");
+        assert_eq!(highest, 7);
+        assert!(after_tip.is_empty());
     }
 
     #[test]

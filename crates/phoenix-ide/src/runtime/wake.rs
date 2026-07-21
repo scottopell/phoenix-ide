@@ -461,6 +461,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
         });
         match llm.complete(&request).await {
             Ok(response) => {
+                let response_usage = response.usage.clone();
                 let aggregate = serde_json::to_string(&phoenix_llm::DurableLlmResponse {
                     response: response.clone(),
                     provider_request_id: Some(request_id.clone()),
@@ -501,7 +502,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                     provider_request_id: Some(request_id),
                     tool_intents,
                 };
-                loop {
+                let persistence_outcome = loop {
                     let outcome = repo
                         .accept_complete_top_level_llm_response(&acceptance)
                         .await
@@ -509,9 +510,31 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                     if outcome.outcome
                         != phoenix_db::CompleteLlmResponsePersistenceOutcome::RetryablePersistence
                     {
-                        break;
+                        break outcome.outcome;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                };
+                if persistence_outcome
+                    == phoenix_db::CompleteLlmResponsePersistenceOutcome::Accepted
+                {
+                    let root_conversation_id = super::find_root_conversation_id(
+                        manager.db(),
+                        &recovery.workflow.conversation_id,
+                    )
+                    .await;
+                    if let Err(error) = manager
+                        .db()
+                        .insert_turn_usage(
+                            &recovery.workflow.conversation_id,
+                            &root_conversation_id,
+                            &recovery.prepared_request.model,
+                            &response_usage,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to record recovered LLM usage");
+                    }
                 }
             }
             Err(error) => {

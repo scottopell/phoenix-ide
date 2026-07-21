@@ -748,6 +748,13 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         firstByteRequestId: null,
       };
     case 'sse_llm_first_byte':
+      if (atom.phase.type !== 'llm_requesting') return atom;
+      if (
+        atom.activeLlmStreamRequestId !== null &&
+        atom.activeLlmStreamRequestId !== action.requestId
+      ) {
+        return atom;
+      }
       return { ...atom, firstByteRequestId: action.requestId };
     case 'sse_llm_attempt':
       return {

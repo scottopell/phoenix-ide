@@ -4436,9 +4436,11 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         let assistant_message_id = match &input.product {
-            AcceptedTopLevelLlmProduct::PersistedAssistant(message) => message.message_id.clone(),
+            AcceptedTopLevelLlmProduct::PersistedAssistant(message) => {
+                Some(message.message_id.clone())
+            }
             AcceptedTopLevelLlmProduct::StateCheckpoint { .. } => {
-                sqlx::query_scalar::<_, String>(
+                sqlx::query_scalar::<_, Option<String>>(
                     "SELECT accepted_assistant_message_id
                      FROM top_level_llm_workflows WHERE workflow_id = ?1",
                 )

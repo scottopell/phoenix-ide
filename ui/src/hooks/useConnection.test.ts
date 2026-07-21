@@ -377,6 +377,42 @@ describe('useConnection epoch stamping (task 08683)', () => {
     }
   });
 
+  it('cancels stale reconnected-display timer after switching conversation', () => {
+    vi.useFakeTimers();
+    try {
+      const dispatch = vi.fn();
+      const { rerender, result } = renderHook(
+        ({ convId }: { convId: string }) => useConnection({ conversationId: convId, dispatch }),
+        { initialProps: { convId: 'conv-A' } },
+      );
+
+      const esA = FakeEventSource.instances[0]!;
+      act(() => {
+        esA.emit('init', makeInitPayload('conv-A', 'slug-A'));
+      });
+      expect(result.current.state).toBe('connected');
+      act(() => {
+        esA.emit('error', '');
+        vi.advanceTimersByTime(1000);
+      });
+      const reconnected = FakeEventSource.instances[1]!;
+      act(() => {
+        reconnected.emit('init', makeInitPayload('conv-A', 'slug-A'));
+      });
+      expect(result.current.state).toBe('reconnected');
+
+      rerender({ convId: 'conv-B' });
+      expect(result.current.state).toBe('connecting');
+      act(() => {
+        vi.advanceTimersByTime(2500);
+      });
+      expect(result.current.state).toBe('connecting');
+      expect(FakeEventSource.instances).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('mints a strictly increasing epoch on each OPEN_SSE', () => {
     const captured: SSEAction[] = [];
     const dispatch = (a: SSEAction) => {

@@ -103,7 +103,7 @@ fn receipt_delivery_and_runtime_mapping_matches_events() {
 
     let accepted = TopLevelLlmEvent::ResponseAccepted {
         key: receipt.key.clone(),
-        assistant_message_id: "msg-1".into(),
+        assistant_message_id: Some("msg-1".into()),
     };
     assert!(LlmProfile::decision_handles_delivery(&item, &accepted));
     assert!(LlmProfile::decision_handles_runtime_acceptance(

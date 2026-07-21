@@ -1641,6 +1641,68 @@ describe('conversationReducer', () => {
       expect(next.streamingBuffer?.startedAt).not.toBe(startedAt);
     });
 
+    it('rejects tokens for an unannounced replacement stream', () => {
+      let atom = llmRequestingAtom();
+      atom = dispatch(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: 1,
+        requestId: 'attempt-1',
+        workflowId: 7,
+        effectId: 2,
+        attemptId: 1,
+        generation: 0,
+      });
+      atom = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 2,
+        delta: 'attempt one',
+        requestId: 'attempt-1',
+      });
+      const withoutMarker = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 3,
+        delta: 'attempt two',
+        requestId: 'attempt-2',
+      });
+      expect(withoutMarker.streamingBuffer?.text).toBe('attempt one');
+      expect(withoutMarker.activeLlmStreamRequestId).toBe('attempt-1');
+    });
+
+    it('ignores stale first-byte markers after stream supersession', () => {
+      let atom = llmRequestingAtom();
+      atom = dispatch(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: 1,
+        requestId: 'attempt-2',
+        workflowId: 7,
+        effectId: 2,
+        attemptId: 2,
+        generation: 0,
+      });
+      const stale = dispatch(atom, {
+        type: 'sse_llm_first_byte',
+        sequenceId: 2,
+        requestId: 'attempt-1',
+      });
+      expect(stale.firstByteRequestId).toBeNull();
+
+      const current = dispatch(stale, {
+        type: 'sse_llm_first_byte',
+        sequenceId: 3,
+        requestId: 'attempt-2',
+      });
+      expect(current.firstByteRequestId).toBe('attempt-2');
+      const outsideRequest = dispatch(
+        { ...current, phase: { type: 'idle' } },
+        {
+          type: 'sse_llm_first_byte',
+          sequenceId: 4,
+          requestId: 'attempt-2',
+        },
+      );
+      expect(outsideRequest.firstByteRequestId).toBe('attempt-2');
+    });
+
     it('supersedes partial output and drops late tokens from the abandoned attempt', () => {
       let atom = llmRequestingAtom();
       atom = dispatch(atom, {

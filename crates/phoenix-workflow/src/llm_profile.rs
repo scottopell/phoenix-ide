@@ -61,7 +61,7 @@ pub enum TopLevelLlmEvent {
     },
     ResponseAccepted {
         key: LlmEffectKey,
-        assistant_message_id: String,
+        assistant_message_id: Option<String>,
     },
     ResponseCancelled {
         key: LlmEffectKey,
