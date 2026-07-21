@@ -826,7 +826,15 @@ pub async fn cascade_browser_on_delete(
     work_scope: &ResourceScopeKey,
     actor: &EffectiveResourceAccess,
     inheritor_scope: Option<&ResourceScopeKey>,
+    surviving_actor: Option<&EffectiveResourceAccess>,
 ) {
+    if inheritor_scope == Some(work_scope)
+        && surviving_actor
+            .is_some_and(|survivor| survivor.authority() == ResourceAuthority::Restricted)
+    {
+        manager.kill_session_for_actor(work_scope, actor).await;
+        return;
+    }
     if actor.authority() == ResourceAuthority::Restricted {
         manager.kill_session_for_actor(work_scope, actor).await;
         return;

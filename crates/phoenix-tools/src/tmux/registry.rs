@@ -629,6 +629,42 @@ impl TmuxRegistry {
         self.inner.read().await.get(&key).cloned()
     }
 
+    async fn find_socket_for_token(
+        &self,
+        expected_server_token: &str,
+    ) -> Result<Option<PathBuf>, TmuxError> {
+        let mut entries = match tokio::fs::read_dir(&self.socket_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(TmuxError::ProbeFailed {
+                    socket_path: self.socket_dir.clone(),
+                    source,
+                });
+            }
+        };
+        while let Some(entry) =
+            entries
+                .next_entry()
+                .await
+                .map_err(|source| TmuxError::ProbeFailed {
+                    socket_path: self.socket_dir.clone(),
+                    source,
+                })?
+        {
+            let candidate = entry.path();
+            if candidate.extension().and_then(|ext| ext.to_str()) != Some("sock") {
+                continue;
+            }
+            if matches!(probe(&candidate).await, Ok(ProbeResult::Live))
+                && read_server_token(&candidate).await.as_deref() == Some(expected_server_token)
+            {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
     /// Read-only exact inspection of one window on its owning tmux server.
     /// A server absent from the in-memory registry is rediscovered by its deterministic
     /// socket path and accepted only when its stamped token matches the persisted binding.
@@ -650,37 +686,7 @@ impl TmuxRegistry {
             }
             server.socket_path.clone()
         } else {
-            let derived = self.derived_socket_path(work_scope);
-            let mut candidates = vec![derived.clone()];
-            if let Ok(mut entries) = tokio::fs::read_dir(&self.socket_dir).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path != derived
-                        && path.extension().and_then(|ext| ext.to_str()) == Some("sock")
-                    {
-                        candidates.push(path);
-                    }
-                }
-            }
-            let mut matched = None;
-            for candidate in candidates {
-                match probe(&candidate)
-                    .await
-                    .map_err(|source| TmuxError::ProbeFailed {
-                        socket_path: candidate.clone(),
-                        source,
-                    })? {
-                    ProbeResult::Live
-                        if read_server_token(&candidate).await.as_deref()
-                            == Some(expected_server_token) =>
-                    {
-                        matched = Some(candidate);
-                        break;
-                    }
-                    ProbeResult::Live | ProbeResult::NoSocket | ProbeResult::DeadSocket => {}
-                }
-            }
-            let Some(matched) = matched else {
+            let Some(matched) = self.find_socket_for_token(expected_server_token).await? else {
                 return Ok(None);
             };
             matched
@@ -726,11 +732,10 @@ impl TmuxRegistry {
             }
             server.socket_path.clone()
         } else {
-            let derived = self.derived_socket_path(work_scope);
-            if read_server_token(&derived).await.as_deref() != Some(expected_server_token) {
+            let Some(matched) = self.find_socket_for_token(expected_server_token).await? else {
                 return Ok(());
-            }
-            derived
+            };
+            matched
         };
         run_tmux_quiet(&socket_path, &["kill-window", "-t", window_id]).await;
         Ok(())

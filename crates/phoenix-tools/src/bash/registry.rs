@@ -206,6 +206,23 @@ impl ResourceScopeKeyHandles {
             .collect()
     }
 
+    pub fn remove_inaccessible_to_actor(
+        &mut self,
+        actor: &EffectiveResourceAccess,
+    ) -> Vec<Arc<Handle>> {
+        let ids: Vec<_> = self
+            .handles
+            .iter()
+            .filter(|(_, handle)| {
+                !actor.can_control(&handle.creator_conversation_id, handle.authority)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.handles.remove(&id))
+            .collect()
+    }
+
     /// Enforce the live-handle cap against resources visible to `actor`.
     ///
     /// # Errors
@@ -528,7 +545,19 @@ pub async fn cascade_bash_on_delete(
     work_scope: &ResourceScopeKey,
     actor: &EffectiveResourceAccess,
     inheritor_scope: Option<&ResourceScopeKey>,
+    surviving_actor: Option<&EffectiveResourceAccess>,
 ) -> CascadeBashReport {
+    if let Some(survivor) = surviving_actor {
+        if inheritor_scope == Some(work_scope)
+            && survivor.authority() == phoenix_core::work_scope::ResourceAuthority::Restricted
+        {
+            let Some(entry) = registry.get_existing(work_scope).await else {
+                return CascadeBashReport::default();
+            };
+            let handles = entry.write().await.remove_inaccessible_to_actor(survivor);
+            return kill_selected_handles(registry, work_scope, handles).await;
+        }
+    }
     if actor.authority() == phoenix_core::work_scope::ResourceAuthority::Restricted {
         let mut report = CascadeBashReport::default();
         let Some(entry) = registry.get_existing(work_scope).await else {
@@ -609,6 +638,36 @@ pub async fn cascade_bash_on_delete(
     // return above, where nothing changed.
     registry.emit_lifecycle(work_scope, BashLifecyclePhase::Terminal);
 
+    report
+}
+
+async fn kill_selected_handles(
+    registry: &BashHandleRegistry,
+    work_scope: &ResourceScopeKey,
+    handles: Vec<Arc<Handle>>,
+) -> CascadeBashReport {
+    let mut report = CascadeBashReport::default();
+    for handle in handles {
+        if let Some(group_id) = handle.live_pgid().await {
+            record_handle_in_report(
+                &mut report,
+                group_id,
+                handle.live_pid().await,
+                handle.is_kill_pending_kernel().await,
+            );
+            #[cfg(unix)]
+            {
+                let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        report.kill_failures.push((group_id, err.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    registry.emit_lifecycle(work_scope, BashLifecyclePhase::Terminal);
     report
 }
 
@@ -871,6 +930,7 @@ mod tests {
             &scope("never-existed"),
             &work_actor("owner"),
             None,
+            None,
         )
         .await;
         assert!(report.kill_failures.is_empty());
@@ -896,8 +956,14 @@ mod tests {
         )
         .await;
 
-        let report =
-            cascade_bash_on_delete(&registry, &scope("conv-1"), &work_actor("owner"), None).await;
+        let report = cascade_bash_on_delete(
+            &registry,
+            &scope("conv-1"),
+            &work_actor("owner"),
+            None,
+            None,
+        )
+        .await;
         assert!(report.kill_failures.is_empty());
         assert!(report.live_handle_pgids.is_empty());
         // Registry entry is gone after cascade.
@@ -926,7 +992,8 @@ mod tests {
         }
 
         // Inheritor resolves to the same scope → skip teardown.
-        let report = cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&wt)).await;
+        let report =
+            cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&wt), None).await;
         assert!(report.live_handle_pgids.is_empty());
         assert!(report.kill_failures.is_empty());
         // The table is preserved and the handle is still reachable.
@@ -945,7 +1012,7 @@ mod tests {
         let _ = registry.get_or_create(&wt).await;
 
         let report =
-            cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&other)).await;
+            cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&other), None).await;
         assert!(report.kill_failures.is_empty());
         assert_eq!(registry.scope_count().await, 0);
     }
@@ -966,7 +1033,7 @@ mod tests {
             g.insert(make_handle("conv-teardown", "b-1", RING_BUFFER_BYTES));
         }
 
-        let _ = cascade_bash_on_delete(&registry, &s, &work_actor("owner"), None).await;
+        let _ = cascade_bash_on_delete(&registry, &s, &work_actor("owner"), None, None).await;
 
         let evt = rx.try_recv().expect("teardown must emit a lifecycle edge");
         assert_eq!(evt.work_scope, s);
@@ -983,7 +1050,7 @@ mod tests {
         let wt = scope("/tmp/wt-preserve-no-emit");
         let _ = registry.get_or_create(&wt).await;
 
-        let _ = cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&wt)).await;
+        let _ = cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&wt), None).await;
 
         assert!(
             rx.try_recv().is_err(),
@@ -1002,6 +1069,7 @@ mod tests {
             &registry,
             &scope("never-existed"),
             &work_actor("owner"),
+            None,
             None,
         )
         .await;
@@ -1027,8 +1095,14 @@ mod tests {
             g.insert(make_handle("conv-1", "b-2", RING_BUFFER_BYTES));
         }
 
-        let report =
-            cascade_bash_on_delete(&registry, &scope("conv-1"), &work_actor("owner"), None).await;
+        let report = cascade_bash_on_delete(
+            &registry,
+            &scope("conv-1"),
+            &work_actor("owner"),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(report.live_handle_pgids.len(), 2);
         assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
         assert!(report.kill_failures.is_empty(), "ESRCH must be swallowed");
@@ -1097,7 +1171,7 @@ mod tests {
         }
 
         let report =
-            cascade_bash_on_delete(&registry, &real_scope, &work_actor("owner"), None).await;
+            cascade_bash_on_delete(&registry, &real_scope, &work_actor("owner"), None, None).await;
         assert!(report.live_handle_pgids.contains(&pgid));
         assert!(report.kill_failures.is_empty());
         assert_eq!(registry.scope_count().await, 0);

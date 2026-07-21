@@ -208,7 +208,6 @@ function useHandleInspection(scopeKey: string, handleId: string, conversationId:
 
   // Seed + reset when the target handle changes.
   useEffect(() => {
-    if (!conversationId) return;
     let cancelled = false;
     sinceRef.current = undefined;
     terminalRef.current = false;
@@ -221,6 +220,8 @@ function useHandleInspection(scopeKey: string, handleId: string, conversationId:
     setSnapshot(null);
     setEntries([]);
     setStatus('ok');
+
+    if (!conversationId) return;
 
     api
       .getBashHandleInspection(scopeKey, handleId, conversationId!)
@@ -250,8 +251,9 @@ function useHandleInspection(scopeKey: string, handleId: string, conversationId:
   // seed retry can't overlap an outstanding fetch or leak across a target
   // switch.
   const polling =
-    (snapshot != null && !isTerminal(snapshot.state)) ||
-    (snapshot == null && status === 'loading-failed');
+    conversationId != null &&
+    ((snapshot != null && !isTerminal(snapshot.state)) ||
+      (snapshot == null && status === 'loading-failed'));
   useEffect(() => {
     if (!polling) return;
     let cancelled = false;

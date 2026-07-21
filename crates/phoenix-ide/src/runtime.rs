@@ -1499,6 +1499,11 @@ impl RuntimeManager {
                     {
                         continue;
                     }
+                    if matches!(audience, BrowserSessionAudience::Scope)
+                        && matches!(conv.conv_mode, ConvMode::Explore { .. })
+                    {
+                        continue;
+                    }
                     refresh_scopes.insert(conv_scope.clone());
                     let broadcaster = {
                         let runtimes = manager.runtimes.read().await;
@@ -1944,6 +1949,7 @@ impl RuntimeManager {
     /// write, so the conversation being deleted/archived still reads
     /// non-terminal in the DB. Without excluding it, the scope would always
     /// look live and never tear down.
+    #[cfg(test)]
     pub(crate) async fn scope_has_live_conversation_excluding(
         &self,
         work_scope: &ResourceScopeKey,
