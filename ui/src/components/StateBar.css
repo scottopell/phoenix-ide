@@ -460,12 +460,14 @@
 }
 
 .statebar-project {
+  margin-left: 0;
   color: var(--text-muted);
   font-size: 11px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 160px;
+  opacity: 1;
 }
 
 .statebar-mode {

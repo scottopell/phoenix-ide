@@ -3076,17 +3076,6 @@ pre:hover .copy-btn {
   white-space: nowrap;
 }
 
-.statebar-project {
-  margin-left: auto;
-  color: var(--text-muted);
-  font-size: 10px;
-  opacity: 0.7;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 160px;
-}
-
 /* StateBar mode indicator pill */
 .statebar-mode {
   display: inline-block;

@@ -129,6 +129,13 @@ describe('conversationIdentity', () => {
     }))).toBe('debug-deadbeef-caching');
   });
 
+  it('rejects generated prefixed long hashes in explicit project names', () => {
+    expect(getConversationProjectLabel(makeConversation({
+      project_name: 'fork-9d1b4cc93b7845228e4fdbe566761f44',
+      cwd: '/Users/scott/phoenix-ide',
+    }))).toBe('phoenix-ide');
+  });
+
   it('returns a shared typed identity display payload', () => {
     expect(getConversationIdentityDisplay(makeConversation({
       slug: '123e4567-e89b-12d3-a456-426614174000',
