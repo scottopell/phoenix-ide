@@ -690,7 +690,10 @@ impl WorkflowRepository {
         Ok(result)
     }
 
-    pub async fn recover_top_level_llm_attempts(&self) -> DbResult<Vec<RecoverTopLevelLlmAttempt>> {
+    pub async fn recover_top_level_llm_attempts(
+        &self,
+        current_process_incarnation: ProcessIncarnation,
+    ) -> DbResult<Vec<RecoverTopLevelLlmAttempt>> {
         let rows = sqlx::query(
             "SELECT w.workflow_id, dta.conversation_id, dta.client_message_id AS accepted_turn_id, w.turn_generation,
                     w.accepted_assistant_message_id, w.stopped_at,
@@ -705,9 +708,14 @@ impl WorkflowRepository {
              JOIN workflow_attempts a ON a.workflow_id = e.workflow_id AND a.effect_id = e.effect_id
              LEFT JOIN workflow_reclaimable_leases l ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
              WHERE a.status IN ('Begun', 'ObservationRecorded')
+               AND a.process_incarnation <> ?1
                AND w.stopped_at IS NULL
              ORDER BY w.workflow_id, a.attempt_id"
         )
+        .bind(to_i64(
+            current_process_incarnation.0,
+            "current_process_incarnation",
+        )?)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -1913,7 +1921,7 @@ mod tests {
             AuthorityOutcome::Authorized
         );
         assert!(repo
-            .recover_top_level_llm_attempts()
+            .recover_top_level_llm_attempts(ProcessIncarnation(9))
             .await
             .unwrap()
             .is_empty());
@@ -2104,7 +2112,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(begun.outcome, ClaimOutcome::Started);
-        let recoverable = repo.recover_top_level_llm_attempts().await.unwrap();
+        assert!(repo
+            .recover_top_level_llm_attempts(ProcessIncarnation(7))
+            .await
+            .unwrap()
+            .is_empty());
+        let recoverable = repo
+            .recover_top_level_llm_attempts(ProcessIncarnation(8))
+            .await
+            .unwrap();
         assert_eq!(recoverable.len(), 1);
         let recovered = repo
             .begin_recovered_top_level_llm_attempt(
@@ -2125,7 +2141,10 @@ mod tests {
         assert_eq!(attempts[0].status, AttemptStatus::AuthorityLost);
         assert_eq!(attempts[1].status, AttemptStatus::Begun);
         assert_eq!(
-            repo.recover_top_level_llm_attempts().await.unwrap().len(),
+            repo.recover_top_level_llm_attempts(ProcessIncarnation(9))
+                .await
+                .unwrap()
+                .len(),
             1
         );
         let result = repo
@@ -2272,7 +2291,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(repo
-            .recover_top_level_llm_attempts()
+            .recover_top_level_llm_attempts(ProcessIncarnation(10))
             .await
             .unwrap()
             .is_empty());

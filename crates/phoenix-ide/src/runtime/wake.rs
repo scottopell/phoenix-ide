@@ -157,7 +157,6 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .await
             .map_err(|error| error.to_string())?;
         self.run_once().await?;
-        recover_top_level_llm_attempts(&manager).await?;
         deliver_owed_top_level_llm_receipts(&manager).await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
         deliver_pending_direct_turns(&manager).await?;
@@ -432,7 +431,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
 
     let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
     for recovery in repo
-        .recover_top_level_llm_attempts()
+        .recover_top_level_llm_attempts(super::process_incarnation())
         .await
         .map_err(|error| error.to_string())?
     {
