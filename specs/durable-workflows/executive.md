@@ -36,9 +36,11 @@ Wake is implemented end to end for durable Bash and tmux obligations:
 registration precedes acknowledgement, observation and deadline arbitration are
 restart-safe, terminal results materialize once as linked conversation messages,
 adoption atomically resolves exact delivery sets, and auto-resume is coalesced
-through durable runtime acceptance. Direct chat, top-level LLM effects, and
-conversation creation are specified profiles without matching complete vertical-
-slice implementations.
+through durable runtime acceptance. Direct chat and top-level LLM effects are
+implemented end to end with immutable acceptance, durable dispatch obligations,
+attempt and Stop fencing, completed-response receipts, atomic product acceptance,
+tool-intent recovery, and attempt-correlated stream supersession. Conversation
+creation remains a specified profile without a matching complete vertical slice.
 
 ## Normative Shape
 
@@ -82,9 +84,9 @@ These artifacts now state:
 | REQ-DWF-001–005 reducer authority, normalized ownership, atomic plans, DAGs, barriers | Implemented | The pure engine validates typed transition plans; SQLite persists normalized workflow, effect, dependency, barrier, receipt, delivery, and schedule state atomically. |
 | REQ-DWF-006–012 attempt fencing, optional leases, recovery policies, cancellation, manual resolution | Implemented | Persisted attempt/process authority fences every execution; only reclaimable observations receive renewable leases; cancellation and manual outcomes use typed transitions. |
 | REQ-DWF-013–018 capabilities, typed migration contract, deterministic verification | Implemented | Capability classes, supported codecs, profile/version compatibility, incompatible status, transactional failpoints, concurrency tests, and restart tests cover the implemented foundation. |
-| REQ-DWF-029–042 acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Foundation implemented; profile coverage varies | The shared one-scheduler repository, durable acknowledgement, canonical delivery, submit-observe, capability, scheduling, and migration-safety mechanisms are implemented. Direct-turn profile behavior remains specified only. |
-| REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | Target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out have no matching vertical-slice implementation. |
-| REQ-DWF-LLM-001–010 top-level LLM profile | Specified only | Covered calls across all providers require stable effect identity, immutable requests, safely repeatable unknown attempts, completed-response receipts before product meaning, atomic assistant/state/tool-intent acceptance, conservative tool recovery, ephemeral stream replacement, Stop fencing, and legacy cutover without inferred history. |
+| REQ-DWF-029–042 acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Foundation implemented; profile coverage varies | The shared one-scheduler repository, durable acknowledgement, canonical delivery, submit-observe, capability, scheduling, direct-turn, and migration-safety mechanisms are implemented. |
+| REQ-DWF-CHAT-001–011 direct-chat profile | Implemented for direct conversation turns and queued steering | Target-bound acceptance stores immutable prepared payloads, classifies replay/conflict, arbitrates runtime admission transactionally, redelivers accepted dispatch obligations after restart, and races safely across independent SQLite connections. |
+| REQ-DWF-LLM-001–010 top-level LLM profile | Implemented | Covered calls persist stable effect and attempt identity before provider dispatch, retain completed responses through lock contention, atomically accept product state and normalized tool intents, recover unknown attempts and owed tools, supersede partial streams by exact attempt identity, fence both Stop orderings, and share orchestration across representative provider routes. |
 | REQ-DWF-WAKE-001–005 wake profile | Implemented | Durable Bash/tmux registration, observation, expiry and cancellation arbitration, continuation transfer, canonical terminal delivery, exact-set adoption, restart recovery, and coalesced auto-resume use the normalized foundation. |
 | REQ-DWF-CREATE-001–005 creation profile | Specified only | Conversation creation has no matching vertical-slice implementation against the normalized foundation. |
 
@@ -102,14 +104,8 @@ repository, migration, concurrency, restart, failpoint, runtime-recovery, and
 tool-registration tests. Full project validation checks Rust, TypeScript, E2E,
 code generation, specification shape, and Allium consistency.
 
-Remaining profile work is:
-
-- direct-chat acceptance, replay, conflict, exact-ID reconciliation, and
-  target-local runtime arbitration;
-- top-level LLM durable attempts, receipts, response acceptance, tool intents,
-  stream replacement, cancellation fencing, and provider-contract parity;
-- conversation-creation execution and compensation against the normalized
-  foundation.
+Remaining profile work is conversation-creation execution and compensation
+against the normalized foundation.
 
 ## Related Decisions
 
