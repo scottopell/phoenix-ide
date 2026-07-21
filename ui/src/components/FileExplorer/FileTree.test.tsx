@@ -591,7 +591,7 @@ describe('FileTree — reveal active file', () => {
       kind: 'snapshot',
       checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc', remote_status: { kind: 'no_known' } },
       counts: { changed_paths: 1, staged_paths: 1, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
-      changed_paths: [{ kind: 'renamed', path: 'ui/a.ts', previous_path: 'src/a.ts', index_status: 'copied', worktree_status: 'unmodified' }],
+      changed_paths: [{ kind: 'copied', path: 'ui/a.ts', source_path: 'src/a.ts', worktree_status: 'unmodified' }],
     }} />);
 
     await screen.findByText('src');
@@ -620,7 +620,7 @@ describe('FileTree — reveal active file', () => {
       kind: 'snapshot',
       checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc', remote_status: { kind: 'no_known' } },
       counts: { changed_paths: 1, staged_paths: 1, unstaged_paths: 0, untracked_paths: 0, conflicted_paths: 0 },
-      changed_paths: [{ kind: 'renamed', path: 'ui/new.ts', previous_path: 'ui/old.ts', index_status: 'renamed', worktree_status: 'unmodified' }],
+      changed_paths: [{ kind: 'renamed', path: 'ui/new.ts', previous_path: 'ui/old.ts', worktree_status: 'unmodified' }],
     }} />);
 
     await screen.findByText('ui');
@@ -655,7 +655,6 @@ describe('FileTree — reveal active file', () => {
             kind: 'renamed',
             path: 'ui/moved.ts',
             previous_path: 'src/moved.ts',
-            index_status: 'renamed',
             worktree_status: 'unmodified',
           }],
         }}

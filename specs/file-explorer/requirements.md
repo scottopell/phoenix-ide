@@ -214,7 +214,7 @@ AND a stale or failed snapshot SHALL NOT be presented as clean
 
 WHEN the desktop file explorer is expanded
 THE SYSTEM SHALL show a compact Git grounding section with live checkout identity, changed-path count, and locally known upstream relationship
-AND activating it SHALL open Workspace Diff
+AND when the conversation mode supports workspace diffs, activating it SHALL open Workspace Diff
 
 WHEN the mobile file browser overlay is open
 THE SYSTEM SHALL show the same compact Git grounding summary in its header

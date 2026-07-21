@@ -12,6 +12,7 @@ export function checkoutLabel(status: Snapshot['checkout_status']): string {
           : [remote.ahead > 0 ? `↑${remote.ahead}` : '', remote.behind > 0 ? `↓${remote.behind}` : ''].filter(Boolean).join(' ');
         return `${status.branch_name} · ${remote.remote_ref} · ${relationship}`;
       }
+      if (remote.kind === 'unavailable') return `${status.branch_name} · upstream unavailable`;
       return status.branch_name;
     }
     case 'detached': return `detached @ ${status.head_oid.slice(0, 7)}`;

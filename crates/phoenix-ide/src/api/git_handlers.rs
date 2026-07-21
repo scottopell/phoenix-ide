@@ -289,11 +289,18 @@ fn parse_porcelain_v2_status_record(
                             .to_vec(),
                     )
                     .map_err(|_| "invalid utf-8 in git rename source".to_string())?;
-                    GitChangedPath::Renamed {
-                        path,
-                        previous_path,
-                        index_status,
-                        worktree_status,
+                    if index_status == GitFileStatus::Copied {
+                        GitChangedPath::Copied {
+                            path,
+                            source_path: previous_path,
+                            worktree_status,
+                        }
+                    } else {
+                        GitChangedPath::Renamed {
+                            path,
+                            previous_path,
+                            worktree_status,
+                        }
                     }
                 }
                 b'u' => GitChangedPath::Unmerged {
@@ -342,16 +349,23 @@ fn parse_git_status_porcelain_v2(output: &[u8]) -> Result<GitStatusSnapshot, Str
                 index_status,
                 worktree_status,
                 ..
-            }
-            | GitChangedPath::Renamed {
-                index_status,
-                worktree_status,
-                ..
             } => {
                 counts.changed_paths += 1;
                 if *index_status != GitFileStatus::Unmodified {
                     counts.staged_paths += 1;
                 }
+                if *worktree_status != GitFileStatus::Unmodified {
+                    counts.unstaged_paths += 1;
+                }
+            }
+            GitChangedPath::Renamed {
+                worktree_status, ..
+            }
+            | GitChangedPath::Copied {
+                worktree_status, ..
+            } => {
+                counts.changed_paths += 1;
+                counts.staged_paths += 1;
                 if *worktree_status != GitFileStatus::Unmodified {
                     counts.unstaged_paths += 1;
                 }
@@ -438,6 +452,14 @@ fn capture_git_status_snapshot(worktree_path: &FsPath) -> Result<GitStatusSnapsh
                 } => {
                     if let Some(stripped) = previous_path.strip_prefix(&prefix) {
                         *previous_path = stripped.to_string();
+                    }
+                    path
+                }
+                GitChangedPath::Copied {
+                    path, source_path, ..
+                } => {
+                    if let Some(stripped) = source_path.strip_prefix(&prefix) {
+                        *source_path = stripped.to_string();
                     }
                     path
                 }
@@ -2484,7 +2506,6 @@ mod tests {
             GitChangedPath::Renamed {
                 path,
                 previous_path,
-                index_status: GitFileStatus::Renamed,
                 worktree_status: GitFileStatus::Unmodified,
             } if path == "renamed new.txt" && previous_path == "old name.txt"
         ));
@@ -2578,7 +2599,7 @@ mod tests {
         let snapshot = capture_git_status_snapshot(repo.path()).unwrap();
         assert!(snapshot.changed_paths.iter().any(|path| matches!(
             path,
-            GitChangedPath::Renamed { path, previous_path, index_status: GitFileStatus::Copied, .. }
+            GitChangedPath::Copied { path, source_path: previous_path, .. }
                 if path == "copy.txt" && previous_path == "source.txt"
         )));
     }
@@ -2646,7 +2667,6 @@ mod tests {
             GitChangedPath::Renamed {
                 path,
                 previous_path,
-                index_status: GitFileStatus::Renamed,
                 worktree_status: GitFileStatus::Unmodified,
             } if path == "rename new é.txt" && previous_path == "rename old é.txt"
         )));

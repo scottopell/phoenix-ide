@@ -927,7 +927,11 @@ pub enum GitChangedPath {
     Renamed {
         path: String,
         previous_path: String,
-        index_status: GitFileStatus,
+        worktree_status: GitFileStatus,
+    },
+    Copied {
+        path: String,
+        source_path: String,
         worktree_status: GitFileStatus,
     },
     Untracked {

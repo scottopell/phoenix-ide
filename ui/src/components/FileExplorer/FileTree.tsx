@@ -85,6 +85,8 @@ function gitStatusLabel(status: GitDecorationStatus): string | null {
 function changedPathStatus(entry: GitChangedPath): GitDecorationStatus {
   if (entry.kind === 'untracked') return 'untracked';
   if (entry.kind === 'unmerged') return 'unmerged';
+  if (entry.kind === 'renamed') return entry.worktree_status !== 'unmodified' ? entry.worktree_status : 'renamed';
+  if (entry.kind === 'copied') return entry.worktree_status !== 'unmodified' ? entry.worktree_status : 'copied';
   return entry.worktree_status !== 'unmodified' ? entry.worktree_status : entry.index_status;
 }
 
@@ -110,7 +112,7 @@ function gitDecorations(canonicalRootPath: string | null, status: ConversationGi
       descendants: current?.descendants ?? 0,
     });
     const dirtyAncestors = new Set(ancestors(entry.path));
-    if (entry.kind === 'renamed' && entry.index_status === 'renamed' && entry.previous_path !== entry.path) {
+    if (entry.kind === 'renamed' && entry.previous_path !== entry.path) {
       for (const ancestor of ancestors(entry.previous_path)) dirtyAncestors.add(ancestor);
     }
     for (const ancestor of dirtyAncestors) {

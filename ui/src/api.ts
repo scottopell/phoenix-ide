@@ -735,7 +735,12 @@ export type GitChangedPath =
     kind: 'renamed';
     path: string;
     previous_path: string;
-    index_status: GitFileStatus;
+    worktree_status: GitFileStatus;
+  }
+  | {
+    kind: 'copied';
+    path: string;
+    source_path: string;
     worktree_status: GitFileStatus;
   }
   | {

@@ -11,6 +11,15 @@ describe('checkoutLabel', () => {
     })).toBe('feature · origin/feature · ↑2 ↓1');
   });
 
+  it('surfaces unavailable upstream observation', () => {
+    expect(checkoutLabel({
+      kind: 'named_branch',
+      branch_name: 'feature',
+      head_oid: 'abc',
+      remote_status: { kind: 'unavailable', reason: 'missing ref' },
+    })).toBe('feature · upstream unavailable');
+  });
+
   it('shows detached checkout identity', () => {
     expect(checkoutLabel({ kind: 'detached', head_oid: 'abcdef123456', pointing_refs: [] }))
       .toBe('detached @ abcdef1');
