@@ -33,6 +33,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [019](019_runtime-ownership-requires-positive-evidence.md) | Runtime ownership requires positive evidence | Accepted | REQ-DEPLOY-002A, REQ-RU-004A |
 | [020](020_durable-workflow-core-matches-one-scheduler-and-durable-acknowledgement.md) | Durable-workflow core matches one scheduler authority and durable acknowledgement | Accepted | REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029–042, wake and creation profile reshaping |
 | [021](021_coordinator-surface-is-chat-only.md) | The Coordinator surface is chat-only | Accepted | REQ-GR-001, REQ-GR-004, REQ-GR-005, REQ-GR-010, REQ-GR-011 |
+| [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Accepted | REQ-GR-001–005, REQ-GR-007–011A |
 
 ## For agents: which decisions bind your task
 
@@ -59,7 +60,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
-| Specifying the Coordinator surface, current-work orientation, or browser work projection | 021 |
+| Specifying the Coordinator surface, current-activity orientation, or database read boundary | 022, then 021 for chat-only UI history |
 
 ## Decision dependencies
 
@@ -86,6 +87,7 @@ ADR-000 (adopt spEARS v2 for new work)
           ├── ADR-016 (Durable-workflow boundaries include client acceptance and adoption)
           └── ADR-019 (Durable-workflow core matches one scheduler authority and durable acknowledgement)
       └── ADR-021 (The Coordinator surface is chat-only)
+          └── ADR-022 (The Coordinator uses bounded relational evidence)
 ```
 
 ## Conventions

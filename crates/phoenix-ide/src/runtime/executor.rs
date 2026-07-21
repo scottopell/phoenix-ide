@@ -4589,11 +4589,11 @@ where
             let mut system = vec![SystemContent::cached(&system_prompt)];
             if is_coordinator {
                 let capsule = match coordinator_read_service {
-                    Some(service) => service.current_work_capsule().await.unwrap_or_else(|error| {
-                        tracing::warn!(%error, "Failed to build Coordinator current-work capsule");
-                        format!("# Current work — projection unavailable\nPhoenix could not build the deterministic current-state projection for this turn: {error}\nUse list_open_work to retry. This is not transcript evidence or an exact delta.")
+                    Some(service) => service.coordinator_snapshot().await.unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Failed to build Coordinator relational snapshot");
+                        format!("# Conversation activity snapshot unavailable\nPhoenix could not execute the bounded snapshot query for this turn: {error}\nUse query_database to inspect current relational facts directly.")
                     }),
-                    None => "# Current work — projection unavailable\nThe deterministic current-state projection is unavailable for this turn. Use list_open_work to retry. This is not transcript evidence or an exact delta.".to_string(),
+                    None => "# Conversation activity snapshot unavailable\nThe bounded snapshot query is unavailable for this turn. Use query_database to inspect current relational facts directly.".to_string(),
                 };
                 system.push(SystemContent::new(capsule));
             }

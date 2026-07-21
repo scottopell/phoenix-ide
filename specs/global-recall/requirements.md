@@ -24,81 +24,67 @@ The user must be able to answer:
 4. Which source conversations or messages support a Coordinator claim about history?
 5. Which durable conversation received each attempted message?
 6. Was each attempted message delivered, queued as steering, or rejected, and why?
-7. Is a displayed projection current and potentially truncated rather than an event history or exact change set?
+7. Which current relational facts and timestamps support each status interpretation, and was the raw result truncated?
 
 ## Requirements
 
-### REQ-GR-001: Provide Deterministic Current Work
+### REQ-GR-001: Provide Transparent Current Activity Facts
 
-WHEN the Coordinator evaluates current Phoenix work
-THE SYSTEM SHALL provide a deterministic projection through its turn-current context and bounded global read tools
+WHEN the Coordinator evaluates current Phoenix activity
+THE SYSTEM SHALL provide bounded relational facts rather than application-inferred open, stalled, or attention classifications
 
 WHEN a user opens the Coordinator surface
 THE surface SHALL present only the normal Coordinator conversation
 
-THE projection SHALL describe current state and SHALL NOT represent an event history, unread inbox, acknowledgement ledger, resolution ledger, or exact delta from a prior observation
+THE facts SHALL distinguish continuation-root identity from current-conversation identity and SHALL include current state, state-update time, conversation-update time, and available task metadata without suppressing runtime state when task metadata disagrees
 
 ---
 
-### REQ-GR-002: Collapse Continuation Chains Into One Work Item
+### REQ-GR-002: Expose Continuation Identity Without Collapsing Evidence
 
-WHEN conversations form a linear continuation chain
-THE SYSTEM SHALL represent the chain as one open-work item identified by its chain root
+WHEN conversations form a continuation chain
+THE SYSTEM SHALL expose both the durable chain root and the current/latest conversation
 
-THE SYSTEM SHALL expose the current/latest conversation for the chain
+WHEN the Coordinator requests current transcript evidence
+THE SYSTEM SHALL direct it to the current/latest conversation rather than silently reading only the historical root
 
-THE SYSTEM SHALL NOT show non-leaf chain members as separate open-work items when they are already represented by the chain item
-
-WHEN historical chain members are archived
-THE SYSTEM SHALL preserve the original chain root as the work-item identity if the latest conversation still has positive open-work evidence
+Historical chain members SHALL remain addressable through durable references
 
 ---
 
-### REQ-GR-003: Explain Current Inclusion and Attention
+### REQ-GR-003: Interpret Activity From Explicit Evidence
 
-WHEN an open-work item is visible
-THE SYSTEM SHALL expose deterministic signals that explain its inclusion and current attention priority
+WHEN the Coordinator describes work as active, idle, blocked, stale, or stalled
+THE SYSTEM SHALL instruct it to identify the current relational state, relevant timestamps, and recent message or tool evidence supporting that interpretation
 
-THE signals SHALL cover recent activity, work mode, active or attention-needing runtime state, task status when available, and error or recovery state when applicable
+THE SYSTEM SHALL NOT suppress an active runtime merely because associated task metadata is closed, unavailable, or inconsistent
 
-THE SYSTEM SHALL include a Work-mode item only when its task status is `in-progress`, `ready`, or `blocked`, or when its runtime state is active, recovery-like, or attention-needing
-
-THE SYSTEM SHALL include an otherwise-idle Direct, Explore, or Branch item only when it was updated within 14 days
-
-THE SYSTEM SHALL suppress completed, failed, handed-off, terminal, archived, and non-user-initiated current conversations
-
-IF a Work-mode task status is unavailable
-THE SYSTEM SHALL NOT treat recency alone as evidence that the work remains open
-
-WHEN an item's current state no longer needs attention
-THE SYSTEM SHALL remove it from the attention projection without retaining historical inbox state
+Stored state, task metadata, and transcript content SHALL remain separate facts when they disagree
 
 ---
 
-### REQ-GR-004: Provide Bounded Work Selection Data
+### REQ-GR-004: Provide Bounded Read-Only Relational Queries
 
-WHEN the Coordinator or current-work utility presents an item for selection
-THE SYSTEM SHALL provide its stable work reference, project, concise title, current conversation, current state, mode, recency, strongest inclusion or attention signals, and app-local navigation target
+WHILE the Coordinator is answering a user request
+THE SYSTEM SHALL allow exactly one bounded read-only SQLite statement per database-query tool call against operational Phoenix data
 
-WHEN the complete deterministic projection is queried
-THE SYSTEM MAY additionally provide task, branch, worktree, continuation-root, and chain-membership metadata
+THE query capability SHALL support relational joins, common table expressions, grouping, ordering, JSON reads, and allowed full-text reads
 
-THE SYSTEM SHALL tolerate missing metadata without fabricating substitute values
+THE SYSTEM SHALL enforce statement count, read-only authority, allowed objects and functions, result rows, result bytes, and execution work or duration structurally rather than through prompt discipline or SQL keyword filtering
 
-WHEN a deterministic work query includes a text filter
-THE SYSTEM SHALL apply the filter before bounded pagination
+THE SYSTEM SHALL return typed cells, explicit truncation, and stable policy or budget errors without exposing the database filesystem path
 
 ---
 
 ### REQ-GR-005: Provide Stable References and App-Local Links
 
-WHEN an open-work item, chain, conversation, or source message is displayed as a source
+WHEN a work identity, chain, conversation, or source message is displayed as a source
 THE SYSTEM SHALL provide an app-local navigation target or stable reference handle that can be copied or cited
 
 THE reference syntax SHALL distinguish chains, conversations, and open-work items
 
-WHEN an open-work item later closes or becomes archived
-THE SYSTEM SHALL continue to resolve its previously issued work-item reference to the durable source identity and SHALL report its current open, closed, or archived status
+WHEN a previously issued work-item reference is resolved
+THE SYSTEM SHALL continue to resolve it to the durable root and current conversation identities and SHALL report raw current state and timestamps without inferring open or closed status
 
 THE navigation targets SHALL be app-relative so deployment hostnames and browser gateways do not determine reference validity
 
@@ -120,10 +106,10 @@ THE SYSTEM SHALL NOT present the Coordinator as ordinary project coding work or 
 ### REQ-GR-007: Bound Phoenix-Wide Coordinator Capabilities
 
 WHILE a normal coding conversation is running
-THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, complete open-work reads, global reference resolution, or cross-conversation messaging tools
+THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 WHILE the Coordinator is answering a user request
-THE SYSTEM MAY provide host-bound tools for global message search, bounded conversation reads, deterministic open-work reads, and reference resolution
+THE SYSTEM MAY provide host-bound tools for global message search, bounded conversation reads, bounded read-only database queries, and reference resolution
 
 THE SYSTEM MAY provide exactly one cross-conversation mutation capability to the Coordinator: sending non-empty text to one existing non-Coordinator conversation through the authoritative user-message acceptance path
 
@@ -140,7 +126,7 @@ THE SYSTEM SHALL instruct the answering agent to cite source conversations or me
 
 THE SYSTEM SHALL expose enough source metadata through global read tools for the agent to cite the conversation id, message id when available, role, timestamp, and excerpt or read content that supports the answer
 
-THE SYSTEM SHALL distinguish deterministic current-work orientation from transcript evidence and SHALL NOT present the current-work projection as proof of historical claims
+THE SYSTEM SHALL distinguish current relational facts from transcript evidence and SHALL NOT present either as proof of claims belonging to the other source
 
 ---
 
@@ -170,18 +156,29 @@ THE briefing action SHALL preserve the user's draft and SHALL NOT create a separ
 
 ---
 
-### REQ-GR-011: Inject Bounded Current-Work Context
+### REQ-GR-011: Inject a Bounded Relational Snapshot
 
 WHEN the Coordinator dispatches an LLM turn
-THE SYSTEM SHALL attach a bounded deterministic current-work capsule after the stable cached Coordinator prompt
+THE SYSTEM SHALL attach a bounded current-activity snapshot after the stable cached Coordinator prompt
 
-THE capsule SHALL prioritize attention or recovery work, then active work, then recently idle open work, using deterministic ordering
+THE snapshot SHALL expose raw current continuation leaves with root and current identifiers, state, state-update time, conversation-update time, and available task metadata
 
-THE capsule SHALL include aggregate counts and SHALL explicitly report truncation when bounded output omits items
+THE snapshot SHALL order active runtime states first and then by conversation update time, SHALL state its row limit and selection rule, and SHALL explicitly report result truncation
 
-THE capsule SHALL state that it represents current deterministic state rather than complete history, transcript evidence, or an exact delta
+THE snapshot SHALL state that it contains raw facts rather than open-work, stalled, attention, history, or exact-delta classifications
 
-THE SYSTEM SHALL keep a complete or paginated deterministic open-work tool available when the bounded capsule is insufficient
+THE SYSTEM SHALL keep the bounded read-only database query tool available when the snapshot is insufficient
+
+---
+
+### REQ-GR-011A: Exclude Sensitive Database Material
+
+WHILE the Coordinator executes a database query
+THE SYSTEM SHALL structurally deny authentication sessions, OAuth registrations and tokens, share tokens, secret-bearing settings, SQLite internal and shadow storage, filesystem functions, extension loading, database attachment, pragmas, writes, and transactions
+
+THE denial boundary SHALL apply at SQLite authorization time so views, common table expressions, subqueries, aliases, and alternate SQL spelling cannot bypass it
+
+Conversation, message, project, workflow, wake, and non-secret operational metadata MAY remain readable within query budgets
 
 ---
 

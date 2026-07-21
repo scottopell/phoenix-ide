@@ -2,6 +2,7 @@
 //!
 //! Provides persistence for conversations and messages.
 
+mod coordinator_query;
 mod ddl;
 mod migrations;
 pub mod retrieval;
@@ -16,6 +17,9 @@ use phoenix_core::domain::creation_protocol::{
 };
 use phoenix_core::domain::db_schema as schema;
 
+pub use coordinator_query::{
+    execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
+};
 pub use migrations::run_pending_migrations;
 pub use retrieval::{
     Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope, RetrievedChunk,
@@ -1527,6 +1531,24 @@ impl Database {
         // `restrict_file_permissions` again afterward.
         db.restrict_file_permissions();
         Ok(db)
+    }
+
+    /// Execute one bounded Coordinator read query against a separate read-only connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a policy, budget, or `SQLite` error without exposing the database path.
+    pub async fn coordinator_query(
+        &self,
+        sql: &str,
+    ) -> Result<CoordinatorQueryResult, CoordinatorQueryError> {
+        let path = self.path.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || execute_coordinator_query(&path, &sql))
+            .await
+            .map_err(|error| {
+                CoordinatorQueryError::Sqlite(format!("query worker failed: {error}"))
+            })?
     }
 
     /// Open an in-memory database (for testing).
