@@ -420,6 +420,7 @@ async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> R
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     use sha2::Digest as _;
 
@@ -432,6 +433,13 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
         let durable_request: phoenix_llm::DurableLlmRequest =
             serde_json::from_str(&recovery.prepared_request.request_aggregate)
                 .map_err(|error| error.to_string())?;
+        let Some(llm) = manager
+            .model_registry()
+            .get(&recovery.prepared_request.model)
+        else {
+            tracing::error!(model = %recovery.prepared_request.model, "recovered LLM model is unavailable");
+            continue;
+        };
         let begun = repo
             .begin_recovered_top_level_llm_attempt(
                 recovery.workflow.workflow_id,
@@ -451,13 +459,6 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
             request_id: request_id.clone(),
             retry_attempt: u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX),
         });
-        let Some(llm) = manager
-            .model_registry()
-            .get(&recovery.prepared_request.model)
-        else {
-            tracing::error!(model = %recovery.prepared_request.model, "recovered LLM model is unavailable");
-            continue;
-        };
         match llm.complete(&request).await {
             Ok(response) => {
                 let aggregate = serde_json::to_string(&phoenix_llm::DurableLlmResponse {
@@ -488,22 +489,30 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                         },
                     )
                     .collect();
-                repo.accept_complete_top_level_llm_response(
-                    &phoenix_db::AcceptCompleteLlmResponseInput {
-                        authority,
-                        delivery_id: None,
-                        receipt_id: None,
-                        response: phoenix_workflow::llm_profile::CompleteLlmResponse {
-                            codec_version: phoenix_llm::DURABLE_LLM_RESPONSE_CODEC_VERSION,
-                            response_fingerprint: fingerprint,
-                            response_aggregate: aggregate,
-                        },
-                        provider_request_id: Some(request_id),
-                        tool_intents,
+                let acceptance = phoenix_db::AcceptCompleteLlmResponseInput {
+                    authority,
+                    delivery_id: None,
+                    receipt_id: None,
+                    response: phoenix_workflow::llm_profile::CompleteLlmResponse {
+                        codec_version: phoenix_llm::DURABLE_LLM_RESPONSE_CODEC_VERSION,
+                        response_fingerprint: fingerprint,
+                        response_aggregate: aggregate,
                     },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                    provider_request_id: Some(request_id),
+                    tool_intents,
+                };
+                loop {
+                    let outcome = repo
+                        .accept_complete_top_level_llm_response(&acceptance)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if outcome.outcome
+                        != phoenix_db::CompleteLlmResponsePersistenceOutcome::RetryablePersistence
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
             }
             Err(error) => {
                 repo.record_top_level_llm_failure(&phoenix_db::RecordTopLevelLlmFailureInput {
