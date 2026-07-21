@@ -184,12 +184,15 @@ entity CodexResponsesLiteRequest {
     developer_instructions_is_second: Boolean
     parallel_tool_calls: Boolean
     reasoning_context: String
+    reasoning_effort: String
     compatibility_header: Boolean
 }
 
 -- A continuation snapshot is isolated by PromptCacheKey in the shared model
 -- service. `prefix` contains every prior client input item followed by the
--- exact output items returned by the server.
+-- exact output items returned by the server. The continuation fingerprint is
+-- the exact serialized request with input removed, so reasoning.effort and
+-- every other non-input field participate in reuse compatibility.
 entity CodexWebSocketSession {
     cache_key: String
     response_id: String
@@ -326,6 +329,7 @@ rule CodexResponsesLitePrefixTranslated {
             developer_instructions_is_second: true,
             parallel_tool_calls: false,
             reasoning_context: "all_turns",
+            reasoning_effort: "medium",
             compatibility_header: true
         )
 
@@ -336,6 +340,11 @@ rule CodexResponsesLitePrefixTranslated {
         -- instructions and tools are absent. The request retains store=false
         -- and prompt_cache_key. Direct-platform requests and pre-GPT-5.6 Codex
         -- requests retain the platform-shaped translation.
+        -- The Lite request composes OpenAI's `reasoning` object from the
+        -- effective effort and the fixed context value: `{ effort, context }`
+        -- with context `all_turns`. That full object participates in the
+        -- continuation fingerprint because the fingerprint is the exact
+        -- serialized request with only `input` removed.
         -- Every WebSocket response.create also carries the Responses Lite
         -- selector in client_metadata; the upgrade header alone is insufficient
         -- because one connection carries multiple independent creates.
@@ -845,53 +854,23 @@ invariant ResponsesCacheDetailsSubsetOfInput {
 }
 
 ------------------------------------------------------------
--- Open Questions
+-- Scope Notes
 ------------------------------------------------------------
--- All resolved 2026-05-22. Kept as prose so the file stays parseable.
+-- Billed-but-empty normalization is modelled directly in
+-- ResponsesResponseNormalized: a completed response with no content block but
+-- raw_output_tokens > 0 yields a retryable server_error, while a genuinely
+-- empty turn with output_tokens = 0 remains a valid empty llm/LlmResponse.
 --
--- Q1. RESOLVED — billed-but-empty is now a distinct outcome of
---     ResponsesResponseNormalized. A completed response with no content
---     block but raw_output_tokens > 0 yields a retryable server_error:
---     OpenAI billed for a message it did not deliver. The
---     wire-indistinguishable "genuinely empty valid turn" case
---     (output_tokens = 0) still resolves to an empty llm/LlmResponse —
---     correct, a model can finish a tool loop with nothing to add. The
---     residual case (a reasoning-only turn with output_tokens > 0 and
---     no message) takes the error branch: a degenerate turn is better
---     retried than persisted empty.
+-- Responses normalization discards `reasoning` output items. Multi-turn
+-- reasoning replay through the Responses API `include` field is therefore out
+-- of scope for this file until Phoenix has a durable transcript shape for
+-- reasoning items.
 --
--- Q2. RESOLVED — keep as-is. classify_responses_error routes a code
---     *containing* "quota" to the retryable rate_limit family; only the
---     exact code "usage_limit_reached" is terminal. A hypothetical code
---     such as "insufficient_quota" would be retried rather than failing
---     terminally. Accepted: no such code is observed on the Responses
---     path today, and the path that actually matters for quota
---     exhaustion — the codex backend — signals it via the structured
---     error.type field (ResponsesCodex429Classified), not the code
---     string. The substring scan is a heuristic for the platform API's
---     less-structured errors; pre-emptively guessing an unobserved code
---     spelling would itself be a guess. Revisit if such a code appears
---     in logs.
+-- ResponsesCodex429Classified / ResponsesCodex503Classified govern only the
+-- codex-backend path. Platform Responses HTTP/SSE failures use
+-- ResponsesSseErrorClassified or the non-streaming HTTP classifier.
 --
--- Q3. RESOLVED — accept as a deferred capability. The reasoning output
---     item is discarded during normalization, so multi-turn reasoning
---     context is not carried between turns. The Responses API can
---     return encrypted reasoning for replay via the `include` request
---     field, but Phoenix sends an empty `include` until it has a
---     durable transcript representation for reasoning items. A known
---     limitation, not a bug; reasoning replay is separate work.
---
--- Q4. RESOLVED — scoping note, no decision needed.
---     ResponsesCodex429Classified / ResponsesCodex503Classified apply
---     only when use_codex_backend is true; the platform Responses API
---     uses ResponsesSseErrorClassified (SSE) or from_http_status (HTTP).
---     The backend selector is request-scoped configuration, modelled in
---     neither branch's trigger; both per-backend paths are specified so
---     the selector's two outcomes are each covered.
---
--- Note (stream exhausted without response.completed): if the byte
---     stream ends before a response.completed event, the accumulator
---     still assembles whatever it collected — no `done` transition, no
---     error. A degenerate path; not modelled as a rule because it
---     produces no distinct observable outcome beyond a possibly-empty
---     response, which the billed-but-empty guard (Q1) now screens.
+-- If the byte stream ends before a response.completed event, the accumulator
+-- assembles whatever it already collected. This produces no distinct
+-- observable state beyond the normalized response, so it is left as a scope
+-- note rather than a separate rule.

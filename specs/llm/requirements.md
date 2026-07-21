@@ -67,6 +67,26 @@ AND log warning about fallback
 **Rationale:** Model listing is a validation aid, not a required deployment dependency.
 
 ---
+### REQ-LLM-003b: Typed Model Effort Capability Registry
+
+WHEN the model registry describes a model's reasoning-effort capability
+THE SYSTEM SHALL classify that capability as exactly one of:
+- known native support, where the provider exposes a native reasoning-effort control and Phoenix knows the provider's accepted native values
+- unknown support, where Phoenix cannot prove whether a native reasoning-effort control exists or which values it accepts
+- unsupported, where Phoenix knows the provider has no native reasoning-effort control
+
+WHEN the capability is known native support
+THE SYSTEM SHALL store the provider-native value mapping as part of the model specification
+AND SHALL make invalid native values unrepresentable to provider translation
+
+WHEN the capability is unknown support or unsupported
+THE SYSTEM SHALL preserve the distinction between those two cases
+AND SHALL NOT collapse both into a single "off" or "none" state
+
+**Rationale:** Phoenix needs a first-class capability model so request translation, UI affordances, and conversation state can distinguish "native and known", "maybe but unknown", and "definitively absent" without parallel ad-hoc flags.
+
+---
+
 
 ### REQ-LLM-004: Request Format
 
@@ -82,6 +102,94 @@ THE SYSTEM SHALL encode appropriately for provider
 AND respect provider's image size limits
 
 **Rationale:** Consistent request format enables the state machine to work with any provider.
+
+---
+### REQ-LLM-004a: Model-Native Reasoning Effort Omission
+
+WHEN a request targets a model whose reasoning-effort capability is unknown support or unsupported
+THE SYSTEM SHALL omit the provider-native reasoning-effort field from the translated provider request
+AND SHALL NOT serialize a guessed placeholder, sentinel, or default-native value on that model's behalf
+
+WHEN a request targets a model with known native support and the conversation has no explicit override
+THE SYSTEM SHALL use the model's configured native reasoning-effort default
+
+WHEN a request carries an explicit override that the selected model cannot represent natively
+THE SYSTEM SHALL fail before provider I/O with an explicit capability mismatch rather than silently degrading to an unrelated native value
+
+**Rationale:** A missing native field means "Phoenix is not asserting a native effort value for this model." Guessing one would create false compatibility and hide capability mismatches.
+
+---
+
+### REQ-LLM-004b: Per-Conversation Explicit Reasoning Effort Override
+
+WHEN a user explicitly sets a reasoning-effort override for a conversation
+THE SYSTEM SHALL persist that override as conversation state independent of the selected model's default
+AND SHALL apply it to subsequent requests for that conversation until the override is reset
+
+WHEN the user resets the override
+THE SYSTEM SHALL return the conversation to model-native default behavior rather than preserving the previous explicit value implicitly
+
+WHEN a conversation is resumed, retried, or continued through the same conversation state
+THE SYSTEM SHALL preserve the explicit override exactly
+
+**Rationale:** Reasoning effort is a conversation-level choice once the user sets it; retries and continuations must not drift back to whatever the registry default happens to be.
+
+---
+
+### REQ-LLM-004c: Atomic Model Switch and Override Reset
+
+WHEN the selected model changes for a conversation
+THE SYSTEM SHALL apply the new selected model and any simultaneous explicit reasoning-effort reset or replacement as one atomic state transition
+AND SHALL NOT permit an intermediate persisted state where the old override is paired with the new model unintentionally
+
+WHEN a model switch would leave the conversation with an explicit override the target model cannot represent
+THE SYSTEM SHALL require the switch operation to include either a compatible replacement override or an explicit reset to model-native behavior
+
+**Rationale:** Model selection and reasoning-effort state co-determine request translation. Updating them separately creates transient invalid combinations that can leak into retries, persistence, or sub-agent spawn snapshots.
+
+---
+
+### REQ-LLM-004d: Subagent Non-Inheritance of Native Reasoning Effort
+
+WHEN Phoenix spawns a subagent conversation from a parent conversation
+THE SYSTEM SHALL copy only the parent's explicit reasoning-effort override when one exists
+AND SHALL NOT copy the parent's resolved model-native reasoning-effort value as if it were an explicit child setting
+
+WHEN the parent conversation is using only model-native default behavior
+THE child conversation SHALL resolve its own model-native default from its selected model independently
+
+**Rationale:** A native default belongs to the selected model, not to the parent conversation. Copying the resolved native value into a child would freeze a provider-specific default across model boundaries and make non-overrides look user-explicit.
+
+---
+
+### REQ-LLM-004e: Provider Translation of Reasoning Effort
+
+WHEN request translation targets a provider with known native reasoning-effort support
+THE SYSTEM SHALL translate Phoenix's internal reasoning-effort selection to the provider's native field and native value vocabulary
+
+WHEN request translation targets a provider without known native support
+THE SYSTEM SHALL preserve the internal reasoning-effort selection in Phoenix state and observability surfaces without inventing a provider field
+
+WHEN provider translation uses a provider-native reasoning-effort field
+THE SYSTEM SHALL compose it with the rest of the provider request shape rather than replacing or bypassing the common request format
+
+**Rationale:** Provider translation is where internal selection becomes wire shape. The common request model stays authoritative; providers only contribute native encoding.
+
+---
+
+### REQ-LLM-004f: Output Headroom Reservation
+
+WHEN Phoenix prepares a request for a model with a bounded output budget
+THE SYSTEM SHALL reserve output headroom separately from input-context accounting
+AND SHALL apply reasoning-effort-dependent output headroom defaults before dispatch
+
+WHEN an explicit reasoning-effort selection changes the model's expected output budget
+THE SYSTEM SHALL recompute reserved output headroom from that effective selection
+
+WHEN reporting context-window usage
+THE SYSTEM SHALL distinguish consumed context from reserved output headroom rather than treating reserved output capacity as already-consumed input context
+
+**Rationale:** Input history and reserved completion budget are different quantities. Reasoning effort can change how much output space Phoenix must reserve, so the reservation has to be explicit and recomputable.
 
 ---
 
@@ -166,6 +274,21 @@ THE SYSTEM SHALL compute total as input + output + cache tokens
 **Rationale:** Users need visibility into token consumption for context window management.
 
 ---
+### REQ-LLM-007a: Reasoning Token and Effort Observability
+
+WHEN Phoenix records usage or request telemetry for a response
+THE SYSTEM SHALL record the effective reasoning-effort selection used for that request
+AND SHALL record provider-reported reasoning-token usage when the provider exposes it
+
+WHEN the provider does not expose reasoning-token usage
+THE SYSTEM SHALL preserve the distinction between "not reported" and zero rather than fabricating a zero-valued reasoning-token count
+
+WHEN a response is surfaced to users or operators through observability interfaces
+THE SYSTEM SHALL make reasoning-effort and reasoning-token facts available without requiring access to raw provider payloads
+
+**Rationale:** Reasoning effort is a user-visible control only if Phoenix can later explain what effective setting ran and, when available, how much provider-reported reasoning budget it consumed.
+
+---
 
 ### REQ-LLM-008: Request Observability
 
@@ -195,6 +318,17 @@ THE SYSTEM SHALL keep TTFT telemetry content-free and privacy-preserving
 AND SHALL NOT include prompts, generated content, tool arguments, or any raw provider event payload needed only to reconstruct user-visible content
 
 **Rationale:** Operators need request latency, TTFT, usage, correlation, retry, failure, and transport visibility without turning long-lived LLM spans into unbounded payload stores or exposing user content and credentials. Provider-centric TTFT must reflect provider generation onset rather than client-visible wording so that queueing, scheduling, prefill, and transport behavior remain comparable across providers and transports.
+
+---
+### REQ-LLM-008a: Reasoning Effort in Request Observability
+
+WHEN an LLM request executes
+THE SYSTEM SHALL include the effective reasoning-effort selection, the model capability classification that justified its wire encoding or omission, and any reserved output headroom in bounded structured telemetry
+
+WHEN the selected provider request omits a native reasoning-effort field because support is unknown or unsupported
+THE SYSTEM SHALL make that omission observable as an intentional classified outcome rather than leaving it implicit in missing provider payload fields
+
+**Rationale:** Operators need to tell the difference between "effort omitted because unsupported", "effort omitted because unknown", and "effort sent natively" without inspecting raw request bodies.
 
 ---
 
