@@ -315,11 +315,11 @@ impl Effect {
     pub fn persist_agent_message(
         blocks: Vec<ContentBlock>,
         usage: Option<UsageData>,
-        cwd: &Path,
+        cwd: Option<&Path>,
         message_id: String,
         final_attempt: u32,
     ) -> Self {
-        let mut display_data = compute_bash_display_data(&blocks, cwd);
+        let mut display_data = cwd.and_then(|root| compute_bash_display_data(&blocks, root));
         let retry_count = final_attempt.saturating_sub(1);
         if retry_count > 0 {
             // Only stamp the key when we actually retried — keeps the

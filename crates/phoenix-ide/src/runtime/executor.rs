@@ -5630,6 +5630,13 @@ where
                         approved_cwd.raw(),
                     )
                     .await?;
+                let restricted_access = crate::work_scope::EffectiveResourceAccess::new(
+                    &self.context.conversation_id,
+                    crate::work_scope::ResourceAuthority::Restricted,
+                );
+                self.browser_sessions
+                    .kill_session_for_actor(&self.context.resource_scope, &restricted_access)
+                    .await;
                 self.context
                     .set_filesystem_root(std::path::PathBuf::from(&approval_result.worktree_path));
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;

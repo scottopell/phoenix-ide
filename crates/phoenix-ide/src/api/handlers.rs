@@ -3058,9 +3058,14 @@ async fn get_work_scope_inventory(
                 handle.health = Some(super::resource_monitor::health_for_pids(&generation, pids));
             }
         }
-        let scope_pids = generation.scope_pids(&scope_key);
-        inventory.health = (!scope_pids.is_empty())
-            .then(|| super::resource_monitor::health_for_pids(&generation, &scope_pids));
+        let visible_handle_ids = inventory
+            .bash
+            .iter()
+            .map(|handle| handle.handle_id.clone())
+            .collect::<Vec<_>>();
+        let visible_pids = generation.visible_handle_pids(&scope_key, &visible_handle_ids);
+        inventory.health = (!visible_pids.is_empty())
+            .then(|| super::resource_monitor::health_for_pids(&generation, &visible_pids));
         inventory.health_sampled_at = Some(generation.sampled_at);
     }
 

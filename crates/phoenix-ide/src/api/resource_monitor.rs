@@ -77,11 +77,11 @@ impl ResourceObservationGeneration {
             .map(|target| &target.pids)
     }
 
-    pub fn scope_pids(&self, scope_key: &str) -> BTreeSet<u32> {
-        self.handles
+    pub fn visible_handle_pids(&self, scope_key: &str, handle_ids: &[String]) -> BTreeSet<u32> {
+        handle_ids
             .iter()
-            .filter(|target| target.scope_key == scope_key)
-            .flat_map(|target| target.pids.iter().copied())
+            .filter_map(|handle_id| self.handle_pids(scope_key, handle_id))
+            .flat_map(|pids| pids.iter().copied())
             .collect()
     }
 }
@@ -332,8 +332,8 @@ mod tests {
             },
         ];
         assert_eq!(
-            generation.scope_pids("conversation:c1"),
-            BTreeSet::from([10, 11, 12])
+            generation.visible_handle_pids("conversation:c1", &["b-1".into()]),
+            BTreeSet::from([10, 11])
         );
         assert_eq!(generation.all_bash_pids(), BTreeSet::from([10, 11, 12]));
         assert_eq!(

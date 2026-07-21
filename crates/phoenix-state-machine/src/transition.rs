@@ -890,7 +890,7 @@ fn handle_core_llm_response(
             .with_effect(Effect::persist_agent_message(
                 content,
                 Some(usage_data),
-                context.filesystem_root(),
+                context.execution_environment.working_dir(),
                 request_id,
                 final_attempt,
             ))
@@ -901,7 +901,10 @@ fn handle_core_llm_response(
     // Has tools -> ToolExecuting
     let first = tool_calls[0].clone();
     let rest = tool_calls[1..].to_vec();
-    let mut display_data = compute_bash_display_data(&content, context.filesystem_root());
+    let mut display_data = context
+        .execution_environment
+        .working_dir()
+        .and_then(|cwd| compute_bash_display_data(&content, cwd));
     // REQ-LRV-006: same retry_count stamp as the no-tool path
     // (persist_agent_message above). The tool-round flow persists the
     // assistant message via PersistCheckpoint, not persist_agent_message,
@@ -2167,7 +2170,10 @@ pub fn transition_parent(
             // captured by ref) so each branch can still move its own `content`
             // into `AssistantMessage::new` after calling this.
             let make_display_data = |c: &[phoenix_core::domain::llm_types::ContentBlock]| {
-                let mut dd = compute_bash_display_data(c, context.filesystem_root());
+                let mut dd = context
+                    .execution_environment
+                    .working_dir()
+                    .and_then(|cwd| compute_bash_display_data(c, cwd));
                 stamp_retry_count(&mut dd, final_attempt);
                 dd
             };
@@ -3134,7 +3140,7 @@ pub fn transition_sub_agent(
                     tr = tr.with_effect(Effect::persist_agent_message(
                         content,
                         Some(usage_data),
-                        context.filesystem_root(),
+                        context.execution_environment.working_dir(),
                         request_id,
                         final_attempt,
                     ));
@@ -3184,7 +3190,7 @@ pub fn transition_sub_agent(
                         .with_effect(Effect::persist_agent_message(
                             content,
                             Some(usage_data),
-                            context.filesystem_root(),
+                            context.execution_environment.working_dir(),
                             request_id,
                             final_attempt,
                         ))
@@ -3203,7 +3209,7 @@ pub fn transition_sub_agent(
                         .with_effect(Effect::persist_agent_message(
                             content,
                             Some(usage_data),
-                            context.filesystem_root(),
+                            context.execution_environment.working_dir(),
                             request_id,
                             final_attempt,
                         ))
@@ -3555,7 +3561,7 @@ fn handle_context_exhaustion(
             .with_effect(Effect::persist_agent_message(
                 blocks,
                 Some(usage_data),
-                ctx.filesystem_root(),
+                ctx.execution_environment.working_dir(),
                 request_id,
                 final_attempt,
             ))
@@ -3577,7 +3583,7 @@ fn handle_context_exhaustion(
             .with_effect(Effect::persist_agent_message(
                 blocks,
                 Some(usage_data),
-                ctx.filesystem_root(),
+                ctx.execution_environment.working_dir(),
                 request_id,
                 final_attempt,
             ))
@@ -5051,6 +5057,60 @@ mod tests {
                 .any(|e| matches!(e, Effect::NotifyAgentDone)),
             "Sub-agent should NOT emit agent_done SSE event"
         );
+    }
+
+    #[test]
+    fn coordinator_text_only_response_persists_without_filesystem() {
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &context,
+            Event::LlmResponse {
+                content: vec![ContentBlock::text("Global answer")],
+                tool_calls: vec![],
+                end_turn: true,
+                usage: Usage::default(),
+                request_id: "coordinator-response".into(),
+            },
+        )
+        .expect("filesystem-free response");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistMessage {
+                display_data: None,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn coordinator_tool_response_checkpoints_without_filesystem() {
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &context,
+            Event::LlmResponse {
+                content: vec![ContentBlock::text("I will inspect globally")],
+                tool_calls: vec![test_tool_call("think-1")],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-tool-response".into(),
+            },
+        )
+        .expect("filesystem-free tool response");
+
+        assert!(matches!(result.new_state, ConvState::ToolExecuting { .. }));
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::BroadcastAssistantMessage { message }
+                if message.display_data.is_none()
+        )));
     }
 
     #[test]

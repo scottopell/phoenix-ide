@@ -5397,6 +5397,22 @@ impl Database {
         // transaction guard drops and SQLite rolls back.
         let mut tx = self.pool.begin().await?;
 
+        let continuation_work_scope_id = if matches!(parent.conv_mode, ConvMode::Direct) {
+            let (scope_id, authority_kind, environment) =
+                Self::new_scope_for_conversation(&parent.cwd, &cm);
+            Self::insert_work_scope_environment_tx(
+                &mut tx,
+                &scope_id,
+                authority_kind,
+                environment,
+                &now_str,
+            )
+            .await?;
+            Some(scope_id)
+        } else {
+            parent.work_scope_id.clone()
+        };
+
         if parent.runtime_role == RuntimeRole::Coordinator {
             let updated = sqlx::query(
                 "UPDATE conversations SET coordinator_head = 0, updated_at = ?1
@@ -5455,7 +5471,7 @@ impl Database {
             } else {
                 parent.runtime_role.as_str()
             })
-            .bind(parent.work_scope_id.as_ref().map(WorkScopeId::as_str))
+            .bind(continuation_work_scope_id.as_ref().map(WorkScopeId::as_str))
             .execute(&mut *tx)
             .await;
 
@@ -5556,7 +5572,7 @@ impl Database {
             project_id: parent.project_id,
             conv_mode: parent.conv_mode,
             runtime_role: parent.runtime_role,
-            work_scope_id: parent.work_scope_id,
+            work_scope_id: continuation_work_scope_id,
             desired_base_branch: parent.desired_base_branch,
             message_count: 0,
             seed_parent_id: None,
@@ -14438,6 +14454,24 @@ mod tests {
             Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "no-such-conv"),
             other => panic!("expected ConversationNotFound, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn direct_continuation_gets_fresh_work_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent =
+            setup_exhausted_parent(&db, "direct-root", "direct", "/tmp", &ConvMode::Direct).await;
+
+        let child = match db.continue_conversation(&parent.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
+        };
+
+        assert_ne!(child.work_scope_id, parent.work_scope_id);
+        assert_eq!(child.cwd, parent.cwd);
     }
 
     /// Sequential slugs: first continuation is `{root}-2`, multi-level chains
