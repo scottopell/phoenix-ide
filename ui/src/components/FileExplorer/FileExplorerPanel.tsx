@@ -4,6 +4,7 @@
  */
 
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { ExternalLink } from 'lucide-react';
 import { FileTree } from './FileTree';
 import { FileTreeContextMenu } from './FileTreeContextMenu';
 import { McpStatusPanel } from '../McpStatusPanel';
@@ -289,7 +290,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
                   aria-label="Open Git diff"
                   title="Open Workspace Diff"
                 >
-                  Open diff
+                  <ExternalLink size={13} aria-hidden="true" />
                 </button>
               ) : undefined}
             >

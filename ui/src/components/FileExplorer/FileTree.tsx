@@ -57,8 +57,7 @@ type TreeRowView = {
   disabled: boolean;
   active: boolean;
   dimmed: boolean;
-  gitStatusLabel: string | null;
-  gitStatusClass: string | null;
+  gitStatuses: Array<{ label: string; status: Exclude<GitDecoration['statuses'][number], null> }>;
   gitChangedDescendants: number;
 };
 
@@ -66,9 +65,10 @@ function treeRowIndentPx(depth: number): number {
   return TREE_ROW_BASE_INDENT_PX + depth * TREE_ROW_DEPTH_STEP_PX;
 }
 
-type GitDecoration = { status: GitFileStatus | 'untracked' | 'unmerged' | null; descendants: number };
+type GitDecorationStatus = GitFileStatus | 'untracked' | 'unmerged';
+type GitDecoration = { statuses: GitDecorationStatus[]; descendants: number };
 
-function gitStatusLabel(status: GitDecoration['status'] | null): string | null {
+function gitStatusLabel(status: GitDecorationStatus): string | null {
   switch (status) {
     case 'modified': return 'M';
     case 'added': return 'A';
@@ -82,7 +82,7 @@ function gitStatusLabel(status: GitDecoration['status'] | null): string | null {
   }
 }
 
-function changedPathStatus(entry: GitChangedPath): GitDecoration['status'] {
+function changedPathStatus(entry: GitChangedPath): GitDecorationStatus {
   if (entry.kind === 'untracked') return 'untracked';
   if (entry.kind === 'unmerged') return 'unmerged';
   return entry.worktree_status !== 'unmodified' ? entry.worktree_status : entry.index_status;
@@ -98,7 +98,7 @@ function gitDecorations(canonicalRootPath: string | null, status: ConversationGi
       const ancestor = `${root}/${segments.slice(0, index).join('/')}`;
       const current = result.get(ancestor);
       result.set(ancestor, {
-        status: current?.status ?? null,
+        statuses: current?.statuses ?? [],
         descendants: (current?.descendants ?? 0) + 1,
       });
     }
@@ -106,9 +106,16 @@ function gitDecorations(canonicalRootPath: string | null, status: ConversationGi
 
   for (const entry of status.changed_paths) {
     const path = `${root}/${entry.path}`;
-    result.set(path, { status: changedPathStatus(entry), descendants: 0 });
+    const current = result.get(path);
+    const statusValue = changedPathStatus(entry);
+    result.set(path, {
+      statuses: current?.statuses.includes(statusValue)
+        ? current.statuses
+        : [...(current?.statuses ?? []), statusValue],
+      descendants: current?.descendants ?? 0,
+    });
     incrementAncestors(entry.path);
-    if (entry.kind === 'renamed' && entry.previous_path !== entry.path) {
+    if (entry.kind === 'renamed' && entry.index_status === 'renamed' && entry.previous_path !== entry.path) {
       incrementAncestors(entry.previous_path);
     }
   }
@@ -140,8 +147,10 @@ function buildTreeRowView(
     disabled: !item.is_directory && item.viewer.kind === 'opaque',
     active: isActive,
     dimmed: item.is_gitignored,
-    gitStatusLabel: gitStatusLabel(decoration?.status ?? null),
-    gitStatusClass: decoration?.status ?? null,
+    gitStatuses: (decoration?.statuses ?? []).flatMap(status => {
+      const label = gitStatusLabel(status);
+      return label ? [{ label, status }] : [];
+    }),
     gitChangedDescendants: decoration?.descendants ?? 0,
   };
 }
@@ -363,15 +372,16 @@ const FileTreeItem = memo(function FileTreeItem({
             {row.gitChangedDescendants}
           </span>
         )}
-        {row.gitStatusLabel && row.gitStatusClass && (
+        {row.gitStatuses.map(({ label, status }) => (
           <span
-            className={`ft-git-status ft-git-status--${row.gitStatusClass.replace('_', '-')}`}
-            aria-label={`Git status ${row.gitStatusClass.replace('_', ' ')}`}
-            title={`Git status ${row.gitStatusClass.replace('_', ' ')}`}
+            key={status}
+            className={`ft-git-status ft-git-status--${status.replace('_', '-')}`}
+            aria-label={`Git status ${status.replace('_', ' ')}`}
+            title={`Git status ${status.replace('_', ' ')}`}
           >
-            {row.gitStatusLabel}
+            {label}
           </span>
-        )}
+        ))}
       </div>
       {item.is_directory && isExpanded && (
         <div
@@ -479,6 +489,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   const treeRootRef = useRef<HTMLDivElement | null>(null);
   const childRequestsRef = useRef<Map<string, AbortController>>(new Map());
   const previousRefreshKeyRef = useRef(refreshKey);
+  const rootGenerationRef = useRef(0);
   // Tracks the activeFile we last successfully scrolled to, so an updated
   // childItems map (from any later directory load) doesn't yank scroll
   // position back to the same row over and over.
@@ -704,11 +715,14 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
 
   // Load root directory contents
   useEffect(() => {
+    const generation = ++rootGenerationRef.current;
     const controller = new AbortController();
     setLoading(true);
     setError(null);
     listFiles(rootPath, controller.signal)
-      .then(result => { if (!controller.signal.aborted) setItems(result); })
+      .then(result => {
+        if (!controller.signal.aborted && generation === rootGenerationRef.current) setItems(result);
+      })
       .catch(err => {
         if (!controller.signal.aborted) {
           setError(err instanceof Error ? err.message : 'Failed to load');
@@ -748,8 +762,10 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   // point that reloads the root and any visible expanded descendants.
   const refreshVisibleTree = useCallback(async () => {
     if (document.visibilityState !== 'visible') return;
+    const generation = rootGenerationRef.current;
     try {
       const result = await listFiles(rootPath);
+      if (generation !== rootGenerationRef.current) return;
       setItems(prev => {
         if (fingerprintFiles(prev) === fingerprintFiles(result)) {
           return prev;

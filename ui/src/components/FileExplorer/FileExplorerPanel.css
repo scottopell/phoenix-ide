@@ -2,9 +2,12 @@
   border: 1px solid var(--border-color);
   background: var(--bg-primary);
   color: var(--text-secondary);
-  border-radius: 999px;
-  padding: 2px 8px;
-  font-size: 11px;
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 4px;
+  padding: 0;
   cursor: pointer;
 }
 
