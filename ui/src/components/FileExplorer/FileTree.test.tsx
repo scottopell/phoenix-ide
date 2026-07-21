@@ -457,6 +457,25 @@ describe('FileTree — reveal active file', () => {
     expect(await screen.findByText('src')).toBeInTheDocument();
   });
 
+  it('keeps the auto-refresh deadline stable while folders are expanded', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const onRefreshTick = vi.fn();
+
+    render(<FileTree rootPath="/proj" onFileSelect={vi.fn()} onRefreshTick={onRefreshTick} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    fireEvent.click(screen.getByText('ui'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+
+    expect(onRefreshTick).toHaveBeenCalledTimes(1);
+    vi.mocked(Math.random).mockRestore();
+    vi.useRealTimers();
+  });
+
   it('does not refresh git status while the document is hidden', async () => {
     vi.useFakeTimers();
     const onRefreshTick = vi.fn();

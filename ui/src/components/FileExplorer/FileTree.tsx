@@ -764,6 +764,13 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     }
   }, [rootPath, items, childItems, expandedPaths, loadChildren]);
 
+  const refreshVisibleTreeRef = useRef(refreshVisibleTree);
+  const onRefreshTickRef = useRef(onRefreshTick);
+  useEffect(() => {
+    refreshVisibleTreeRef.current = refreshVisibleTree;
+    onRefreshTickRef.current = onRefreshTick;
+  }, [refreshVisibleTree, onRefreshTick]);
+
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -771,8 +778,8 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
       const jitter = Math.random() * 4000 - 2000;
       timer = setTimeout(async () => {
         if (cancelled) return;
-        await refreshVisibleTree();
-        if (!cancelled && document.visibilityState === 'visible') onRefreshTick?.();
+        await refreshVisibleTreeRef.current();
+        if (!cancelled && document.visibilityState === 'visible') onRefreshTickRef.current?.();
         if (!cancelled) scheduleRefresh();
       }, 10000 + jitter);
     }
@@ -781,7 +788,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [refreshVisibleTree, onRefreshTick]);
+  }, [rootPath]);
 
   // An explicit refresh now routes through the shared panel owner. The tree
   // still tracks refreshKey so legacy callers continue to trigger a refresh.
