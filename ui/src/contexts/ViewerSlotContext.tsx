@@ -442,27 +442,37 @@ export function ViewerSlotProvider({
   // prior conversation's flag would be misread as an edge on entry.
   const prevActiveRef = useRef(browserSessionActive);
   const edgeScopeRef = useRef(scopeKey);
+  const pendingBrowserFallScopeRef = useRef<string | undefined>(undefined);
   const slotKind = slot.kind;
   useEffect(() => {
     if (edgeScopeRef.current !== scopeKey) {
       edgeScopeRef.current = scopeKey;
       prevActiveRef.current = browserSessionActive;
+      pendingBrowserFallScopeRef.current = undefined;
       return;
     }
     const prev = prevActiveRef.current;
     prevActiveRef.current = browserSessionActive;
     if (prev !== true && browserSessionActive === true && slotKind === 'none') {
       if (restorationScheduledForScopeRef.current !== scopeKey) openBrowser();
+    } else if (prev === true && browserSessionActive === false && slotKind === 'browser') {
+      // The observed lifecycle fall closes the viewer immediately. Storage
+      // invalidation waits for authoritative conversation state so a cached
+      // row cannot erase a valid browser snapshot.
+      if (browserSessionStateLoaded) {
+        pendingBrowserFallScopeRef.current = undefined;
+        clearSlot(true);
+      } else {
+        pendingBrowserFallScopeRef.current = scopeKey;
+        clearSlot(false);
+      }
     } else if (
-      prev === true
-      && browserSessionActive === false
+      pendingBrowserFallScopeRef.current === scopeKey
       && browserSessionStateLoaded
-      && slotKind === 'browser'
+      && browserSessionActive === false
     ) {
-      // Browser snapshots are only useful while their server-owned session is
-      // live. Keeping one here would restore a dead full-screen viewer on the
-      // next in-app entry, where no new falling edge exists to close it.
-      clearSlot(true);
+      if (scopeKey) clearLastViewer(scopeKey);
+      pendingBrowserFallScopeRef.current = undefined;
     }
   }, [scopeKey, browserSessionActive, browserSessionStateLoaded, slotKind, openBrowser, clearSlot]);
 
