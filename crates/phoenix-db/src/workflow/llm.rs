@@ -450,6 +450,53 @@ impl WorkflowRepository {
         })
     }
 
+    pub async fn promote_queued_steering_turns(
+        &self,
+        conversation_id: &str,
+        message_ids: &[String],
+    ) -> DbResult<()> {
+        let mut tx = self.begin_tx().await?;
+        for message_id in message_ids {
+            let updated = sqlx::query(
+                "UPDATE direct_turn_acceptances
+                 SET committed_outcome = 'RuntimeAccepted'
+                 WHERE conversation_id = ?1 AND client_message_id = ?2
+                   AND committed_outcome = 'QueuedSteering'
+                   AND EXISTS (
+                       SELECT 1 FROM top_level_llm_workflows w
+                       WHERE w.workflow_id = direct_turn_acceptances.workflow_id
+                         AND w.stopped_at IS NULL
+                   )",
+            )
+            .bind(conversation_id)
+            .bind(message_id)
+            .execute(&mut *tx.tx)
+            .await?;
+            if updated.rows_affected() == 0 {
+                let replay = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM direct_turn_acceptances a
+                     JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
+                     WHERE a.conversation_id = ?1 AND a.client_message_id = ?2
+                       AND a.committed_outcome = 'RuntimeAccepted'
+                       AND w.stopped_at IS NULL",
+                )
+                .bind(conversation_id)
+                .bind(message_id)
+                .fetch_one(&mut *tx.tx)
+                .await?
+                    == 1;
+                if !replay {
+                    tx.rollback().await?;
+                    return Err(DbError::Serialization(format!(
+                        "queued steering turn {message_id} cannot be promoted"
+                    )));
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn load_pending_direct_turn_runtime_admission(
         &self,
         conversation_id: &str,
@@ -1870,6 +1917,49 @@ mod tests {
         assert_eq!(
             repo.accept_direct_turn(&conflict).await.unwrap(),
             DirectTurnAcceptanceOutcome::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_steering_promotion_is_atomic_and_replayable() {
+        let repo = open_repo().await;
+        let input = DirectTurnAcceptanceInput {
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-1".to_string(),
+            prepared_fingerprint: "fp-1".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        };
+        let DirectTurnAcceptanceOutcome::Created(record) =
+            repo.accept_direct_turn(&input).await.unwrap()
+        else {
+            panic!("direct turn was not created");
+        };
+        repo.commit_direct_turn_runtime_admission(&DirectTurnRuntimeAdmissionInput {
+            workflow_id: record.workflow_id,
+            conversation_id: input.conversation_id.clone(),
+            client_message_id: input.client_message_id.clone(),
+            generation: Generation(4),
+            disposition: DirectTurnCommittedOutcome::QueuedSteering,
+        })
+        .await
+        .unwrap();
+
+        let message_ids = vec![input.client_message_id.clone()];
+        repo.promote_queued_steering_turns(&input.conversation_id, &message_ids)
+            .await
+            .unwrap();
+        repo.promote_queued_steering_turns(&input.conversation_id, &message_ids)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.load_active_top_level_llm_workflow(&input.conversation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow_id,
+            record.workflow_id
         );
     }
 

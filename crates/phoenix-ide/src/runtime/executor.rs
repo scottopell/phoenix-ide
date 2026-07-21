@@ -2930,9 +2930,15 @@ where
             let _ = self.broadcast_tx.send_message(message);
         }
         let mut generated = Vec::new();
-        for effect in effects {
-            if let Some(event) = self.execute_effect(effect).await? {
-                generated.push(event);
+        let remaining_effects: Vec<_> = effects.collect();
+        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state, false) {
+            self.run_effects_with_inline_drain(remaining_effects, drain_event, &mut generated)
+                .await?;
+        } else {
+            for effect in remaining_effects {
+                if let Some(event) = self.execute_effect(effect).await? {
+                    generated.push(event);
+                }
             }
         }
         Ok(generated)
@@ -3239,6 +3245,13 @@ where
         let Event::SteerDrainedUserMessages { entries } = drain_event else {
             unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
         };
+        let drained_message_ids: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.message_id.clone())
+            .collect();
+        self.storage
+            .promote_queued_steering_turns(&self.context.conversation_id, &drained_message_ids)
+            .await?;
         let drain_result = transition(
             &self.state,
             &self.context,
