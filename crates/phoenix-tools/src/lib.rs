@@ -151,8 +151,14 @@ pub struct CancelWakeInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisteredWake {
-    Registered { workflow_id: WorkflowId },
-    Replayed { workflow_id: WorkflowId },
+    Registered {
+        workflow_id: WorkflowId,
+        expires_at: Timestamp,
+    },
+    Replayed {
+        workflow_id: WorkflowId,
+        expires_at: Timestamp,
+    },
     Conflict,
     Cancelled,
     CancelReplayed,
@@ -163,7 +169,9 @@ impl RegisteredWake {
     #[must_use]
     pub fn workflow_id(&self) -> Option<WorkflowId> {
         match self {
-            Self::Registered { workflow_id } | Self::Replayed { workflow_id } => Some(*workflow_id),
+            Self::Registered { workflow_id, .. } | Self::Replayed { workflow_id, .. } => {
+                Some(*workflow_id)
+            }
             Self::Conflict | Self::Cancelled | Self::CancelReplayed | Self::CancelStale => None,
         }
     }

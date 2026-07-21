@@ -527,6 +527,26 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(6);
     });
 
+    it('fresh connect consumes pending wake registration sequence', () => {
+      const payload = makeInitPayload({
+        lastAppliedEventSeq: 6,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [{
+          type: 'wake_contract_registered',
+          sequence_id: 6,
+          workflow_id: 42,
+          contract_id: 'wake-42',
+          resource_kind: 'BashHandle',
+          handle_id: 'b-1',
+          expires_at: 600,
+        }],
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.lastAppliedEventSeq).toBe(6);
+    });
+
     it('fresh connect with pending state_change updates phase to latest pending state', () => {
       const payload = makeInitPayload({
         phase: { type: 'awaiting_llm' },

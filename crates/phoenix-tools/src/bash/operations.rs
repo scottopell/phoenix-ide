@@ -1450,7 +1450,10 @@ fn send_signal_to_group(_pgid: i32, _signal: KillSignal) {
 // Lookup helper
 // ---------------------------------------------------------------------------
 
-async fn lookup_handle(ctx: &ToolContext, handle_id: &str) -> Result<Arc<Handle>, BashError> {
+pub(crate) async fn lookup_handle(
+    ctx: &ToolContext,
+    handle_id: &str,
+) -> Result<Arc<Handle>, BashError> {
     let registered = ctx
         .bash_handle_registry()
         .get_by_id(&HandleId::new(handle_id.to_string()))
@@ -2012,6 +2015,7 @@ mod tests {
             *self.register_calls.lock().expect("register_calls lock") += 1;
             Ok(RegisteredWake::Registered {
                 workflow_id: phoenix_workflow::WorkflowId(1),
+                expires_at: crate::Timestamp(600),
             })
         }
 

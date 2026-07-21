@@ -16,6 +16,7 @@ import {
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
   SseRateLimitSnapshotDataSchema,
+  SseWakeContractRegisteredDataSchema,
   SseWorkScopeUpdateDataSchema,
   SseErrorDataSchema,
 } from '../sseSchemas';
@@ -1087,6 +1088,14 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         }
         return atom;
       }
+      return conversationReducer(atom, {
+        type: 'sse_sequence_consumed',
+        sequenceId: res.output.sequence_id,
+      });
+    }
+    case 'wake_contract_registered': {
+      const res = v.safeParse(SseWakeContractRegisteredDataSchema, entry);
+      if (!res.success) return atom;
       return conversationReducer(atom, {
         type: 'sse_sequence_consumed',
         sequenceId: res.output.sequence_id,

@@ -68,6 +68,18 @@ impl RecoveryDecision {
     }
 }
 
+pub fn interrupted_tool_use_ids(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .rev()
+        .take_while(|message| matches!(message.message_type, MessageType::Tool))
+        .filter_map(|message| match &message.content {
+            MessageContent::Tool(content) => Some(content.tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn suppress_auto_continue_for_owed_wake(
     decision: RecoveryDecision,
     has_owed_wake_work: bool,
@@ -997,12 +1009,38 @@ mod owed_wake_tests {
     use super::*;
 
     #[test]
-    fn owed_wake_work_suppresses_restart_auto_continue() {
+    fn owed_wake_for_interrupted_tool_suppresses_restart_auto_continue() {
         let decision =
             suppress_auto_continue_for_owed_wake(RecoveryDecision::auto_continue(), true);
         assert_eq!(decision.state, ConvState::Idle);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::WakeDeliveryPending);
+    }
+
+    #[test]
+    fn interrupted_tool_ids_only_include_trailing_tool_round() {
+        use chrono::Utc;
+        use phoenix_core::domain::db_schema::{ToolContent, ToolContentImage};
+        let tool = |sequence_id, tool_use_id: &str| Message {
+            message_id: format!("m-{sequence_id}"),
+            conversation_id: "conv".to_string(),
+            sequence_id,
+            message_type: MessageType::Tool,
+            content: MessageContent::Tool(ToolContent {
+                tool_use_id: tool_use_id.to_string(),
+                content: "done".to_string(),
+                is_error: false,
+                images: Vec::<ToolContentImage>::new(),
+            }),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let mut agent = tool(2, "ignored");
+        agent.message_type = MessageType::Agent;
+        agent.content = MessageContent::Agent(vec![]);
+        let messages = vec![tool(1, "old-wake"), agent, tool(3, "current-tool")];
+        assert_eq!(interrupted_tool_use_ids(&messages), vec!["current-tool"]);
     }
 
     #[test]

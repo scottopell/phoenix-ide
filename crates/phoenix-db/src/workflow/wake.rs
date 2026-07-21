@@ -2090,6 +2090,43 @@ impl WakeRepository {
         Ok(out)
     }
 
+    pub async fn has_owed_work_for_tool_uses(
+        &self,
+        conversation_id: &str,
+        tool_use_ids: &[String],
+    ) -> DbResult<bool> {
+        if tool_use_ids.is_empty() {
+            return Ok(false);
+        }
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let owed = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM wake_bindings b
+                JOIN workflows w ON w.workflow_id = b.workflow_id
+                JOIN json_each(?2) ids ON ids.value = b.registering_tool_use_id
+                WHERE b.conversation_id = ?1
+                  AND (
+                    (w.status = 'Active' AND b.resolved_at IS NULL)
+                    OR EXISTS (
+                      SELECT 1 FROM workflow_deliveries d
+                      WHERE d.workflow_id = b.workflow_id
+                        AND d.status IN ('Pending', 'Materialized')
+                    )
+                  )
+            )",
+        )
+        .bind(conversation_id)
+        .bind(
+            serde_json::to_string(tool_use_ids)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .fetch_one(&mut *tx.tx)
+        .await?
+            != 0;
+        tx.commit().await?;
+        Ok(owed)
+    }
+
     pub async fn has_owed_work_for_conversation(&self, conversation_id: &str) -> DbResult<bool> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let owed = sqlx::query_scalar::<_, i64>(
@@ -7683,6 +7720,15 @@ mod tests {
             )
             .await,
         );
+
+        assert!(repo
+            .has_owed_work_for_tool_uses("conv-1", &["tool-unresolved".to_string()])
+            .await
+            .unwrap());
+        assert!(!repo
+            .has_owed_work_for_tool_uses("conv-1", &["unrelated-tool".to_string()])
+            .await
+            .unwrap());
 
         assert_eq!(
             repo.retire_all_registrations(Timestamp(40)).await.unwrap(),

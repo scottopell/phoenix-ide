@@ -730,7 +730,7 @@ async fn register_tmux_wake_if_live(
     }
     match registration {
         Ok(
-            RegisteredWake::Registered { workflow_id } | RegisteredWake::Replayed { workflow_id },
+            RegisteredWake::Registered { workflow_id, .. } | RegisteredWake::Replayed { workflow_id, .. },
         ) => {
             if let Some(display) = response.display_data().cloned() {
                 let mut enriched = display;
@@ -913,9 +913,11 @@ mod tests {
             match self.behavior.lock().expect("behavior lock").remove(0) {
                 RegistrarBehavior::Registered(id) => Ok(RegisteredWake::Registered {
                     workflow_id: phoenix_workflow::WorkflowId(id),
+                    expires_at: Timestamp(600),
                 }),
                 RegistrarBehavior::Replayed(id) => Ok(RegisteredWake::Replayed {
                     workflow_id: phoenix_workflow::WorkflowId(id),
+                    expires_at: Timestamp(600),
                 }),
                 RegistrarBehavior::Conflict => Ok(RegisteredWake::Conflict),
                 RegistrarBehavior::Error(msg) => Err(msg.to_string()),

@@ -27,6 +27,7 @@ use tokio::sync::watch;
 const OBSERVATION_BATCH_LIMIT: usize = 64;
 const EXPIRY_BATCH_LIMIT: usize = 64;
 const LEASE_DURATION: Duration = Duration::from_secs(30);
+const LIVE_HANDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const EMPTY_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 const ERROR_RETRY_BASE_INTERVAL: Duration = Duration::from_millis(250);
 const ERROR_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
@@ -73,12 +74,20 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             .map_err(|e| e.to_string())?;
         self.kick();
         Ok(match outcome {
-            WakeRegistrationOutcome::Registered { workflow_id, .. } => {
-                RegisteredWake::Registered { workflow_id }
-            }
-            WakeRegistrationOutcome::Replayed { workflow_id, .. } => {
-                RegisteredWake::Replayed { workflow_id }
-            }
+            WakeRegistrationOutcome::Registered {
+                workflow_id,
+                receipt,
+            } => RegisteredWake::Registered {
+                workflow_id,
+                expires_at: receipt.expires_at,
+            },
+            WakeRegistrationOutcome::Replayed {
+                workflow_id,
+                receipt,
+            } => RegisteredWake::Replayed {
+                workflow_id,
+                expires_at: receipt.expires_at,
+            },
             WakeRegistrationOutcome::Conflict => RegisteredWake::Conflict,
         })
     }
@@ -329,16 +338,18 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .map_err(|error| error.clone())?
         {
             InspectionOutcome::LiveRetry => {
-                if candidate.expires_at.0 <= now.0 {
-                    let _ = self
-                        .repo
-                        .release_observation_authority(&authority)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    Ok(Duration::ZERO)
-                } else {
-                    Ok(LEASE_DURATION)
-                }
+                let _ = self
+                    .repo
+                    .release_observation_authority(&authority)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Duration::from_secs(
+                    candidate
+                        .expires_at
+                        .0
+                        .saturating_sub(now.0)
+                        .min(LIVE_HANDLE_POLL_INTERVAL.as_secs()),
+                ))
             }
             InspectionOutcome::Terminal(evidence) => {
                 let observation_time = self.clock.now();
@@ -1269,7 +1280,8 @@ mod tests {
         assert_eq!(
             replay,
             RegisteredWake::Replayed {
-                workflow_id: first_id
+                workflow_id: first_id,
+                expires_at: Timestamp(50),
             }
         );
         assert_eq!(conflict, RegisteredWake::Conflict);
@@ -1323,6 +1335,21 @@ mod tests {
         assert_eq!(observed_sleep, EMPTY_RESCAN_INTERVAL);
         tx.send(1).unwrap();
         join.abort();
+    }
+
+    #[tokio::test]
+    async fn live_handle_poll_is_short_and_bounded_by_expiry() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "b-1", 12).await;
+        let clock = Arc::new(TestClock::new(10));
+        let worker = WakeWorker::new(
+            repo,
+            Arc::new(MockInspector::new()),
+            clock,
+            ProcessIncarnation(1),
+        );
+
+        assert_eq!(worker.run_once().await.unwrap(), LIVE_HANDLE_POLL_INTERVAL);
     }
 
     #[tokio::test]

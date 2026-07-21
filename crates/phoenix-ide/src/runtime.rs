@@ -3627,9 +3627,10 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
+        let interrupted_tool_use_ids = recovery::interrupted_tool_use_ids(&messages);
         let has_owed_wake_work =
             phoenix_db::workflow::wake::WakeRepository::new(self.db.pool().clone())
-                .has_owed_work_for_conversation(conversation_id)
+                .has_owed_work_for_tool_uses(conversation_id, &interrupted_tool_use_ids)
                 .await
                 .map_err(|e| e.to_string())?;
         let decision = recovery::suppress_auto_continue_for_owed_wake(
