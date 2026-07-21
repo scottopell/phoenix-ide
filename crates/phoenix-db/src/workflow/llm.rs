@@ -645,12 +645,22 @@ impl WorkflowRepository {
         now: Timestamp,
     ) -> DbResult<BeginAttemptResult> {
         let mut tx = self.begin_tx().await?;
+        sqlx::query(
+            "INSERT INTO workflow_sequences (workflow_id, sequence_name, next_value)
+             SELECT ?1, 'attempt', COALESCE(MAX(attempt_id), 0) + 1
+             FROM workflow_attempts WHERE workflow_id = ?1
+             ON CONFLICT(workflow_id, sequence_name) DO UPDATE SET
+               next_value = MAX(workflow_sequences.next_value, excluded.next_value)",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
         let attempt_id = AttemptId(
             tx.allocate_sequence_value(workflow_id, WorkflowSequenceName::Attempt)
                 .await?,
         );
         sqlx::query(
-            "UPDATE workflow_attempts SET status = 'Superseded'
+            "UPDATE workflow_attempts SET status = 'AuthorityLost'
              WHERE workflow_id = ?1 AND effect_id = ?2
                AND status IN ('Begun', 'ObservationRecorded')",
         )
@@ -1694,6 +1704,7 @@ fn parse_tool_kind(value: &str) -> DbResult<ToolKindRecord> {
 mod tests {
     use super::*;
     use crate::migrations::run_pending_migrations;
+    use phoenix_workflow::AttemptStatus;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
 
@@ -2093,13 +2104,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(begun.outcome, ClaimOutcome::Started);
+        let recoverable = repo.recover_top_level_llm_attempts().await.unwrap();
+        assert_eq!(recoverable.len(), 1);
+        let recovered = repo
+            .begin_recovered_top_level_llm_attempt(
+                WorkflowId(1),
+                EffectId(2),
+                ProcessIncarnation(8),
+                Timestamp(4),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.outcome, ClaimOutcome::Started);
+        let recovered_authority = recovered.authority.unwrap();
+        let attempts = repo
+            .list_attempts(WorkflowId(1), EffectId(2))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, AttemptStatus::AuthorityLost);
+        assert_eq!(attempts[1].status, AttemptStatus::Begun);
         assert_eq!(
             repo.recover_top_level_llm_attempts().await.unwrap().len(),
             1
         );
         let result = repo
             .accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
-                authority: begun.authority.unwrap(),
+                authority: recovered_authority,
                 delivery_id: Some(DeliveryId(1)),
                 receipt_id: Some(ReceiptId(1)),
                 response: CompleteLlmResponse {
