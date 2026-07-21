@@ -15,11 +15,12 @@ use phoenix_db::workflow::wake::{
     WakeTerminalEvidenceInput, WakeTerminalEvidenceOutcome,
 };
 use phoenix_db::workflow::LocalAttemptAuthority;
-use phoenix_tools::bash::handle::{FinalCause, HandleState};
+use phoenix_tools::bash::handle::{FinalCause, Handle, HandleState, LiveData};
 use phoenix_tools::{CancelWakeInput, RegisterWakeInput, RegisteredWake, WakeRegistrar};
 use phoenix_workflow::wake_profile::{
-    BashTerminalEvidence, BashTerminalStatus, TmuxCompletionPolicy, TmuxTerminalEvidence,
-    TmuxTerminalStatus, WakeForgottenReason, WakeResourceIdentity, WakeTerminalEvidence,
+    BashResourceIdentity, BashTerminalEvidence, BashTerminalStatus, TmuxCompletionPolicy,
+    TmuxTerminalEvidence, TmuxTerminalStatus, WakeForgottenReason, WakeResourceIdentity,
+    WakeTerminalEvidence,
 };
 use phoenix_workflow::{LeaseExpiry, ProcessIncarnation, Timestamp};
 use tokio::sync::watch;
@@ -627,6 +628,33 @@ fn system_time_to_timestamp(time: std::time::SystemTime) -> Timestamp {
     Timestamp(seconds)
 }
 
+async fn inspect_live_bash(
+    handle: &Handle,
+    identity: &BashResourceIdentity,
+    live: &LiveData,
+) -> InspectionOutcome {
+    let Some(kill_attempt) = handle.kill_attempt().await else {
+        return InspectionOutcome::LiveRetry;
+    };
+    let ring = live.ring.lock().await;
+    let final_tail = ring
+        .tail(200)
+        .lines
+        .into_iter()
+        .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
+        .collect();
+    InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+        identity: identity.clone(),
+        status: BashTerminalStatus::KillPendingKernel,
+        occurred_at: system_time_to_timestamp(kill_attempt.attempted_at),
+        exit_code: None,
+        duration_ms: None,
+        signal_number: None,
+        kill_signal_sent: Some(kill_attempt.signal_sent.as_str().to_string()),
+        final_tail,
+    }))
+}
+
 impl TerminalInspector for RuntimeRegistryInspector {
     fn inspect<'a>(
         &'a self,
@@ -653,7 +681,9 @@ impl TerminalInspector for RuntimeRegistryInspector {
                     };
                     let state = handle.state().await;
                     match state.as_ref() {
-                        HandleState::Live(_) => Ok(InspectionOutcome::LiveRetry),
+                        HandleState::Live(live) => {
+                            Ok(inspect_live_bash(&handle, identity, live).await)
+                        }
                         HandleState::Tombstoned(tomb) => {
                             let status = match &tomb.final_cause {
                                 FinalCause::Exited { .. } => BashTerminalStatus::Exited,
@@ -1078,7 +1108,66 @@ mod tests {
         );
         let wait = worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 0);
-        assert_eq!(wait, EMPTY_RESCAN_INTERVAL);
+        assert_eq!(wait, LIVE_HANDLE_POLL_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn kill_pending_bash_projects_terminal_observation() {
+        use phoenix_core::domain::kill_signal::KillSignal;
+        use phoenix_tools::bash::handle::{Handle, HandleId};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "b-1", 50).await;
+        let bash = Arc::new(phoenix_tools::BashHandleRegistry::new());
+        let scope = WorkScope::Conversation("conv".to_string());
+        let handle = Handle::new_live(
+            scope.clone(),
+            HandleId::new("b-1"),
+            "sleep 60".to_string(),
+            None,
+            123,
+            123,
+            RING_BUFFER_BYTES,
+        );
+        let attempted_at = std::time::UNIX_EPOCH + Duration::from_secs(9);
+        assert!(
+            handle
+                .mark_kill_pending_kernel(KillSignal::Term, attempted_at)
+                .await
+        );
+        bash.get_or_create(&scope)
+            .await
+            .write()
+            .await
+            .insert(handle);
+        let worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(RuntimeRegistryInspector::new(
+                bash,
+                Arc::new(phoenix_tools::TmuxRegistry::new()),
+            )),
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+
+        worker.run_once().await.unwrap();
+
+        let pending = repo.list_pending("conv").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Fired {
+                evidence: phoenix_workflow::wake_profile::WakeTerminalEvidence::Bash(
+                    BashTerminalEvidence {
+                        status: BashTerminalStatus::KillPendingKernel,
+                        occurred_at: Timestamp(9),
+                        ..
+                    }
+                ),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
