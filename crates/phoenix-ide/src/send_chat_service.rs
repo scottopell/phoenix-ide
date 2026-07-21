@@ -226,6 +226,7 @@ impl SendChatApplicationService {
                     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
                 let acceptance = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
                     .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+                        initial_outcome: phoenix_db::DirectTurnCommittedOutcome::QueuedSteering,
                         conversation_id: conversation.id.clone(),
                         client_message_id: req.message_id.clone(),
                         prepared_fingerprint: request_fingerprint.clone(),
@@ -257,30 +258,10 @@ impl SendChatApplicationService {
                         return Err(SendChatServiceError::IdempotencyConflict);
                     }
                 };
-                match phoenix_db::WorkflowRepository::new(self.db.pool().clone())
-                    .commit_direct_turn_runtime_admission(
-                        &phoenix_db::DirectTurnRuntimeAdmissionInput {
-                            workflow_id: acceptance.workflow_id,
-                            conversation_id: conversation.id.clone(),
-                            client_message_id: req.message_id.clone(),
-                            generation: phoenix_workflow::Generation(0),
-                            disposition: phoenix_db::DirectTurnCommittedOutcome::QueuedSteering,
-                        },
-                    )
-                    .await
-                    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-                {
-                    phoenix_db::DirectTurnRuntimeAdmissionOutcome::Committed
-                    | phoenix_db::DirectTurnRuntimeAdmissionOutcome::ExactReplay => {}
-                    phoenix_db::DirectTurnRuntimeAdmissionOutcome::RetryablePersistence => {
-                        return Err(SendChatServiceError::Dispatch(
-                            "steering admission persistence is temporarily busy".to_string(),
-                        ));
-                    }
-                    phoenix_db::DirectTurnRuntimeAdmissionOutcome::Conflict => {
-                        return Err(SendChatServiceError::IdempotencyConflict);
-                    }
-                }
+                debug_assert_eq!(
+                    acceptance.committed_outcome,
+                    phoenix_db::DirectTurnCommittedOutcome::QueuedSteering
+                );
                 let event = Event::SteerMessage {
                     text: expanded.display_text.clone(),
                     llm_text: expanded.llm_text,
@@ -348,6 +329,7 @@ impl SendChatApplicationService {
         };
         let acceptance = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
             .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+                initial_outcome: phoenix_db::DirectTurnCommittedOutcome::PendingRuntime,
                 conversation_id: conversation.id.clone(),
                 client_message_id: req.message_id.clone(),
                 prepared_fingerprint: request_fingerprint.clone(),

@@ -294,9 +294,16 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 const MIGRATION_055: &str = r"
-CREATE UNIQUE INDEX direct_turn_acceptances_one_live_per_conversation
-ON direct_turn_acceptances(conversation_id)
+ALTER TABLE direct_turn_acceptances ADD COLUMN live_slot INTEGER
+CHECK (live_slot IS NULL OR live_slot = 1);
+UPDATE direct_turn_acceptances SET live_slot = 1
 WHERE committed_outcome IN ('PendingRuntime', 'RuntimeAccepted');
+CREATE UNIQUE INDEX direct_turn_acceptances_one_live_per_conversation
+ON direct_turn_acceptances(conversation_id) WHERE live_slot = 1;
+";
+WHERE committed_outcome IN ('PendingRuntime', 'RuntimeAccepted');
+CREATE UNIQUE INDEX direct_turn_acceptances_one_live_per_conversation
+ON direct_turn_acceptances(conversation_id) WHERE live_slot = 1;
 ";
 
 const MIGRATION_054: &str = r"

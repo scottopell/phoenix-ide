@@ -94,6 +94,10 @@ pub trait MessageStore: Send + Sync {
         Ok(())
     }
 
+    fn requires_durable_top_level_llm(&self) -> bool {
+        false
+    }
+
     async fn active_top_level_llm_workflow(
         &self,
         _conversation_id: &str,
@@ -333,6 +337,14 @@ pub trait LlmClient: Send + Sync {
     /// Get the model ID
     #[allow(dead_code)] // API completeness
     fn model_id(&self) -> &str;
+
+    fn durable_provider(&self) -> String {
+        "custom".to_string()
+    }
+
+    fn durable_backend(&self) -> String {
+        "direct".to_string()
+    }
 
     /// Typed provider/route limits for continuation-summary requests.
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
@@ -624,6 +636,14 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
         (**self).model_id()
     }
 
+    fn durable_provider(&self) -> String {
+        (**self).durable_provider()
+    }
+
+    fn durable_backend(&self) -> String {
+        (**self).durable_backend()
+    }
+
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
         (**self).continuation_request_limits()
     }
@@ -729,6 +749,10 @@ impl MessageStore for DatabaseStorage {
             .consume_queued_steering_batch(conversation_id, owner_message_id, drained_message_ids)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    fn requires_durable_top_level_llm(&self) -> bool {
+        true
     }
 
     async fn active_top_level_llm_workflow(
@@ -1175,6 +1199,23 @@ impl LlmClient for RegistryLlmClient {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn durable_provider(&self) -> String {
+        self.registry.provider_display_name(&self.model_id)
+    }
+
+    fn durable_backend(&self) -> String {
+        self.registry.get(&self.model_id).map_or_else(
+            || "unavailable".to_string(),
+            |service| {
+                if service.uses_codex_bridge() {
+                    "codex_bridge".to_string()
+                } else {
+                    "direct".to_string()
+                }
+            },
+        )
     }
 
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {

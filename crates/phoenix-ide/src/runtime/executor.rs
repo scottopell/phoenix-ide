@@ -4800,6 +4800,14 @@ where
         } else {
             storage.active_top_level_llm_workflow(&conv_id).await?
         };
+        if !is_sub_agent
+            && self.storage.requires_durable_top_level_llm()
+            && durable_workflow.is_none()
+        {
+            return Err(
+                "top-level LLM dispatch requires an accepted durable direct turn".to_string(),
+            );
+        }
         let mode_context = self.context.mode_context.clone();
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
@@ -5008,9 +5016,9 @@ where
                             prepared_request: phoenix_workflow::llm_profile::PreparedLlmRequest {
                                 codec_version: phoenix_llm::DURABLE_LLM_REQUEST_CODEC_VERSION,
                                 request_fingerprint,
-                                provider: "configured".to_string(),
+                                provider: llm_client.durable_provider(),
                                 model: model_id.clone(),
-                                backend: "llm_client".to_string(),
+                                backend: llm_client.durable_backend(),
                                 request_aggregate,
                             },
                         },

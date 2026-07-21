@@ -1584,6 +1584,7 @@ mod tests {
         let prepared_payload = serde_json::to_string(&prepared).unwrap();
         phoenix_db::WorkflowRepository::new(db.pool().clone())
             .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+                initial_outcome: phoenix_db::DirectTurnCommittedOutcome::PendingRuntime,
                 conversation_id: "conv".to_string(),
                 client_message_id: "message-recovered".to_string(),
                 prepared_fingerprint: "fingerprint".to_string(),

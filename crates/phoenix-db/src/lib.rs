@@ -4557,6 +4557,13 @@ impl Database {
                 .bind(&message.message_id)
                 .execute(&mut *tx)
                 .await?;
+                sqlx::query(
+                    "UPDATE direct_turn_acceptances SET live_slot = NULL
+                     WHERE workflow_id = ?1",
+                )
+                .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+                .execute(&mut *tx)
+                .await?;
                 &message.conversation_id
             }
             AcceptedTopLevelLlmProduct::StateCheckpoint { conversation_id } => conversation_id,
@@ -9095,6 +9102,7 @@ mod tests {
     async fn accepted_pending_direct_turn(db: &Database) {
         WorkflowRepository::new(db.pool().clone())
             .accept_direct_turn(&DirectTurnAcceptanceInput {
+                initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
                 conversation_id: "conv-direct".to_string(),
                 client_message_id: "msg-direct".to_string(),
                 prepared_fingerprint: "fingerprint".to_string(),

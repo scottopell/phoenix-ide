@@ -31,6 +31,7 @@ pub enum DirectTurnCommittedOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectTurnAcceptanceInput {
+    pub initial_outcome: DirectTurnCommittedOutcome,
     pub conversation_id: String,
     pub client_message_id: String,
     pub prepared_fingerprint: String,
@@ -355,14 +356,19 @@ impl WorkflowRepository {
             now: input.accepted_at,
         };
         tx.insert_workflow(&create).await?;
-        let acceptance_insert = sqlx::query("INSERT INTO direct_turn_acceptances (conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
+        let acceptance_insert = sqlx::query("INSERT INTO direct_turn_acceptances (conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at, live_slot) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
             .bind(&input.conversation_id)
             .bind(&input.client_message_id)
             .bind(to_i64(workflow_id.0, "workflow_id")?)
             .bind(&input.prepared_fingerprint)
             .bind(&input.prepared_payload)
-            .bind(direct_turn_outcome_to_str(&DirectTurnCommittedOutcome::PendingRuntime))
+            .bind(direct_turn_outcome_to_str(&input.initial_outcome))
             .bind(to_i64(input.accepted_at.0, "accepted_at")?)
+            .bind(if input.initial_outcome == DirectTurnCommittedOutcome::PendingRuntime {
+                Some(1_i64)
+            } else {
+                None
+            })
             .execute(&mut *tx.tx)
             .await;
         if let Err(error) = acceptance_insert {
@@ -418,7 +424,7 @@ impl WorkflowRepository {
                 client_message_id: input.client_message_id.clone(),
                 prepared_fingerprint: input.prepared_fingerprint.clone(),
                 prepared_payload: input.prepared_payload.clone(),
-                committed_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+                committed_outcome: input.initial_outcome.clone(),
                 accepted_at: input.accepted_at,
             },
         ))
@@ -448,7 +454,8 @@ impl WorkflowRepository {
         let mut tx = self.begin_tx().await?;
         let updated = sqlx::query(
             "UPDATE direct_turn_acceptances
-             SET committed_outcome = ?5
+             SET committed_outcome = ?5,
+                 live_slot = CASE WHEN ?5 = 'RuntimeAccepted' THEN 1 ELSE NULL END
              WHERE workflow_id = ?1
                AND conversation_id = ?2
                AND client_message_id = ?3
@@ -503,7 +510,7 @@ impl WorkflowRepository {
         let mut tx = self.begin_tx().await?;
         let updated = sqlx::query(
             "UPDATE direct_turn_acceptances
-             SET committed_outcome = 'RuntimeAccepted'
+             SET committed_outcome = 'RuntimeAccepted', live_slot = 1
              WHERE conversation_id = ?1 AND client_message_id = ?2
                AND committed_outcome = 'QueuedSteering'
                AND EXISTS (
@@ -1366,10 +1373,11 @@ impl WorkflowRepository {
              FROM workflows wf
              JOIN top_level_llm_workflows w ON w.workflow_id = wf.workflow_id
              JOIN direct_turn_acceptances dta ON dta.workflow_id = wf.workflow_id
+             JOIN top_level_llm_effects e ON e.workflow_id = wf.workflow_id
              WHERE dta.conversation_id = ?1
                AND dta.committed_outcome = 'RuntimeAccepted'
                AND wf.status = 'Active' AND w.stopped_at IS NULL
-             ORDER BY dta.accepted_at DESC LIMIT 1",
+             ORDER BY dta.accepted_at DESC, e.call_ordinal DESC LIMIT 1",
         )
         .bind(conversation_id)
         .fetch_optional(&self.pool)
@@ -1991,6 +1999,7 @@ mod tests {
     async fn direct_turn_accept_replay_conflict() {
         let repo = open_repo().await;
         let input = DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2099,6 +2108,7 @@ mod tests {
     async fn direct_turn_acceptance_has_one_winner_across_independent_connections() {
         let (_dir, first, second) = open_independent_repos().await;
         let input = DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-race".to_string(),
             prepared_fingerprint: "fp-race".to_string(),
@@ -2153,6 +2163,7 @@ mod tests {
     async fn distinct_direct_turns_race_for_one_conversation_slot() {
         let (_dir, first, second) = open_independent_repos().await;
         let left_input = DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-left".to_string(),
             prepared_fingerprint: "fp-left".to_string(),
@@ -2196,6 +2207,7 @@ mod tests {
     async fn queued_steering_batch_consumption_is_atomic_and_replayable() {
         let repo = open_repo().await;
         let input = DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2247,6 +2259,7 @@ mod tests {
     async fn prepare_and_begin_allocates_authoritative_effect_and_attempt_identity() {
         let repo = open_repo().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2307,6 +2320,7 @@ mod tests {
     async fn runtime_admission_reports_retryable_persistence_while_writer_is_locked() {
         let (_dir, repo, lock_pool) = open_repo_with_lock_pool().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2348,6 +2362,7 @@ mod tests {
     async fn completed_response_reports_retryable_persistence_while_writer_is_locked() {
         let (_dir, repo, lock_pool) = open_repo_with_lock_pool().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2442,6 +2457,7 @@ mod tests {
     async fn prepare_begin_recover_accept_owed_and_stop_flow() {
         let repo = open_repo().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),

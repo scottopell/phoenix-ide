@@ -1053,6 +1053,9 @@ fn handle_core_tool_complete(
                 assistant_message: assistant_message.clone(),
             })
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::CompleteDurableToolIntent {
+                tool_use_id: tool_use_id.clone(),
+            })
             .with_effect(Effect::notify_state_change())
             .with_effect(Effect::execute_tool(next_tool)))
         }
@@ -1080,6 +1083,9 @@ fn handle_core_tool_complete(
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::CompleteDurableToolIntent {
+                tool_use_id: tool_use_id.clone(),
+            })
             .with_effect(Effect::notify_state_change()))
         }
 
