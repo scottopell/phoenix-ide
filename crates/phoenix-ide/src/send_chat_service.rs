@@ -111,6 +111,23 @@ impl SendChatApplicationService {
             receipts.remove(&req.message_id);
             return Ok(SendChatOutcome::QueuedAsSteering);
         }
+        if let Some(accepted) = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .load_direct_turn_acceptance(&conversation.id, &req.message_id)
+            .await
+            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
+        {
+            if accepted.prepared_fingerprint != request_fingerprint {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
+            let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
+                serde_json::from_str(&accepted.prepared_payload)
+                    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+            self.runtime
+                .send_event(&conversation.id, prepared.into_event())
+                .await
+                .map_err(SendChatServiceError::Dispatch)?;
+            return Ok(SendChatOutcome::Delivered);
+        }
         if conversation.archived {
             return Ok(SendChatOutcome::Rejected {
                 message: "Conversation is archived and unavailable for messaging.".to_string(),
@@ -161,7 +178,7 @@ impl SendChatApplicationService {
                     .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
                         conversation_id: conversation.id.clone(),
                         client_message_id: req.message_id.clone(),
-                        prepared_fingerprint: sha256_hex(prepared_payload.as_bytes()),
+                        prepared_fingerprint: request_fingerprint.clone(),
                         prepared_payload,
                         accepted_at: phoenix_workflow::Timestamp(
                             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
@@ -270,7 +287,6 @@ impl SendChatApplicationService {
         };
         let prepared_payload = serde_json::to_string(&prepared)
             .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-        let prepared_fingerprint = sha256_hex(prepared_payload.as_bytes());
         let event = Event::UserMessage {
             text: expanded.display_text.clone(),
             llm_text: expanded.llm_text,
@@ -284,7 +300,7 @@ impl SendChatApplicationService {
             .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
                 conversation_id: conversation.id.clone(),
                 client_message_id: req.message_id.clone(),
-                prepared_fingerprint,
+                prepared_fingerprint: request_fingerprint.clone(),
                 prepared_payload,
                 accepted_at: phoenix_workflow::Timestamp(
                     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),

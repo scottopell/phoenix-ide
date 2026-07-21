@@ -284,6 +284,14 @@ pub struct StopTopLevelLlmInput {
 }
 
 impl WorkflowRepository {
+    pub async fn load_direct_turn_acceptance(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+    ) -> DbResult<Option<DirectTurnAcceptanceRecord>> {
+        load_direct_turn_acceptance(&self.pool, conversation_id, client_message_id).await
+    }
+
     pub async fn accept_direct_turn(
         &self,
         input: &DirectTurnAcceptanceInput,
