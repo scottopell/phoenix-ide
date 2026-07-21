@@ -39,7 +39,7 @@ function lines(...specs: [number, string][]) {
 async function renderPanel() {
   let utils!: ReturnType<typeof render>;
   await act(async () => {
-    utils = render(<ProcessInspectorPanel scopeKey="ws-1" handleId="b-1" />);
+    utils = render(<ProcessInspectorPanel conversationId="conv-1" scopeKey="ws-1" handleId="b-1" />);
     await Promise.resolve();
   });
   return utils;
@@ -66,7 +66,7 @@ describe('ProcessInspectorPanel — output accumulation', () => {
 
     await renderPanel();
     // Seed call carries no `since`.
-    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1');
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 'conv-1');
     expect(screen.getByText('first')).toBeTruthy();
     expect(screen.getByText('second')).toBeTruthy();
 
@@ -75,7 +75,7 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     });
 
     // Poll call advances `since` to the prior `end_offset` (2).
-    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 2);
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 'conv-1', 2);
     // Prior lines retained, new line appended.
     expect(screen.getByText('first')).toBeTruthy();
     expect(screen.getByText('third')).toBeTruthy();
@@ -301,7 +301,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
       await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(2);
-    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 1);
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 'conv-1', 1);
 
     // Several more intervals fire while the first poll is still outstanding.
     // The in-flight gate must suppress every one of them — no second fetch.
@@ -330,7 +330,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
       await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(3);
-    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 3);
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 'conv-1', 3);
 
     // No duplicate 'a'/'b' lines (offset-keyed entries appended once).
     expect(screen.getAllByText('a').length).toBe(1);
@@ -348,7 +348,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
 
     let utils!: ReturnType<typeof render>;
     await act(async () => {
-      utils = render(<ProcessInspectorPanel scopeKey="ws-1" handleId="a-1" />);
+      utils = render(<ProcessInspectorPanel conversationId="conv-1" scopeKey="ws-1" handleId="a-1" />);
       await Promise.resolve();
     });
     expect(screen.getByText('A-seed')).toBeTruthy();
@@ -358,7 +358,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
       await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(2); // A seed + A slow poll
-    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'a-1', 1);
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'a-1', 'conv-1', 1);
 
     // Switch to target B while A's poll is still pending.
     getInsp.mockResolvedValueOnce(
@@ -367,7 +367,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
     const slowPollB = deferred<BashHandleInspection>();
     getInsp.mockReturnValueOnce(slowPollB.promise);
     await act(async () => {
-      utils.rerender(<ProcessInspectorPanel scopeKey="ws-1" handleId="b-2" />);
+      utils.rerender(<ProcessInspectorPanel conversationId="conv-1" scopeKey="ws-1" handleId="b-2" />);
       await Promise.resolve();
     });
     expect(screen.getByText('B-seed')).toBeTruthy();
@@ -378,7 +378,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
       await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(4); // + B slow poll
-    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-2', 1);
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-2', 'conv-1', 1);
 
     // Now A's stale poll resolves LATE. Its `.finally` must NOT clear the shared
     // in-flight gate — B still owns it.
@@ -413,7 +413,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
       await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(5);
-    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-2', 1);
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-2', 'conv-1', 1);
   });
 });
 
@@ -538,7 +538,7 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
     });
     expect(getInsp).toHaveBeenCalledTimes(2);
     // The retry carries no advanced cursor (the failed seed never set one).
-    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', undefined);
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 'conv-1', undefined);
 
     // Recovered: the empty error state is gone and the snapshot's output renders.
     expect(screen.queryByText('inspection failed to load')).toBeNull();

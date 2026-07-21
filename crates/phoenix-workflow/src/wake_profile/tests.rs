@@ -102,3 +102,20 @@ fn cancellation_request_invalidates_registration_effect() {
         }]
     );
 }
+
+#[test]
+fn work_scope_identity_decodes_legacy_object_payload() {
+    let identity: WorkScopeIdentity =
+        serde_json::from_str(r#"{"kind":"Worktree","stable_key":"worktree:/tmp/project"}"#)
+            .expect("legacy identity");
+    assert_eq!(identity.as_str(), "worktree:/tmp/project");
+}
+
+#[test]
+fn tmux_identity_without_work_scope_remains_decodable() {
+    let identity: TmuxResourceIdentity = serde_json::from_str(
+        r#"{"server_token":"server","window_id":"@1","completion_policy":"KeepOpen"}"#,
+    )
+    .expect("legacy tmux identity");
+    assert_eq!(identity.work_scope.as_str(), "legacy-unscoped");
+}

@@ -2112,6 +2112,22 @@ pub enum ExploreBashCapability {
     Unavailable,
 }
 
+#[derive(Debug, Clone)]
+pub enum ConversationExecutionEnvironment {
+    Filesystem { working_dir: PathBuf },
+    NoFilesystem,
+}
+
+impl ConversationExecutionEnvironment {
+    #[must_use]
+    pub fn working_dir(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Filesystem { working_dir } => Some(working_dir),
+            Self::NoFilesystem => None,
+        }
+    }
+}
+
 /// Context for a conversation (immutable configuration)
 #[derive(Debug, Clone)]
 pub struct ConvContext {
@@ -2120,7 +2136,7 @@ pub struct ConvContext {
     /// For root conversations this equals `conversation_id`.
     /// For sub-agents it is the root ancestor's id.
     pub root_conversation_id: String,
-    pub working_dir: PathBuf,
+    pub execution_environment: ConversationExecutionEnvironment,
     #[allow(dead_code)] // Used by LLM client selection
     pub model_id: String,
     /// Whether this is a sub-agent conversation
@@ -2178,11 +2194,25 @@ impl ConvContext {
         model_id: impl Into<String>,
         context_window: usize,
     ) -> Self {
+        Self::with_execution_environment(
+            conversation_id,
+            ConversationExecutionEnvironment::Filesystem { working_dir },
+            model_id,
+            context_window,
+        )
+    }
+
+    fn with_execution_environment(
+        conversation_id: impl Into<String>,
+        execution_environment: ConversationExecutionEnvironment,
+        model_id: impl Into<String>,
+        context_window: usize,
+    ) -> Self {
         let id = conversation_id.into();
         Self {
             root_conversation_id: id.clone(),
             conversation_id: id,
-            working_dir,
+            execution_environment,
             model_id: model_id.into(),
             is_sub_agent: false,
             context_window,
@@ -2205,6 +2235,38 @@ impl ConvContext {
         }
     }
 
+    #[must_use]
+    pub fn coordinator(
+        conversation_id: impl Into<String>,
+        model_id: impl Into<String>,
+        context_window: usize,
+    ) -> Self {
+        let mut context = Self::with_execution_environment(
+            conversation_id,
+            ConversationExecutionEnvironment::NoFilesystem,
+            model_id,
+            context_window,
+        );
+        context.resource_scope = crate::work_scope::ResourceScopeKey::Coordinator;
+        context.is_coordinator = true;
+        context
+    }
+
+    /// Return the conversation's filesystem root.
+    ///
+    /// # Panics
+    /// Panics when called for a filesystem-free Coordinator context.
+    #[must_use]
+    pub fn filesystem_root(&self) -> &std::path::Path {
+        self.execution_environment
+            .working_dir()
+            .expect("filesystem capability required by this transition")
+    }
+
+    pub fn set_filesystem_root(&mut self, working_dir: PathBuf) {
+        self.execution_environment = ConversationExecutionEnvironment::Filesystem { working_dir };
+    }
+
     /// Create a sub-agent context
     pub fn sub_agent(
         conversation_id: impl Into<String>,
@@ -2216,7 +2278,7 @@ impl ConvContext {
         Self {
             conversation_id: conversation_id.into(),
             root_conversation_id: root_conversation_id.into(),
-            working_dir,
+            execution_environment: ConversationExecutionEnvironment::Filesystem { working_dir },
             model_id: model_id.into(),
             is_sub_agent: true,
             context_window,

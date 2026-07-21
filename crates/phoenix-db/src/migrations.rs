@@ -361,9 +361,7 @@ BEGIN
     SELECT RAISE(ABORT, 'invalid work scope environment');
 END;
 
-ALTER TABLE conversations ADD COLUMN coordinator_cwd TEXT;
 ALTER TABLE conversations ADD COLUMN coordinator_head INTEGER NOT NULL DEFAULT 0 CHECK (coordinator_head IN (0, 1));
-UPDATE conversations SET coordinator_cwd = cwd WHERE runtime_role = 'coordinator';
 UPDATE conversations SET coordinator_head = 1
 WHERE runtime_role = 'coordinator' AND continued_in_conv_id IS NULL;
 DROP INDEX one_coordinator_conversation;
@@ -377,21 +375,17 @@ CREATE TRIGGER conversations_role_scope_insert
 BEFORE INSERT ON conversations
 WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
   OR ((NEW.runtime_role = 'coordinator') != (NEW.work_scope_id IS NULL))
-  OR ((NEW.runtime_role = 'coordinator') != (NEW.coordinator_cwd IS NOT NULL))
   OR (NEW.coordinator_head = 1 AND NEW.runtime_role <> 'coordinator')
   OR (NEW.coordinator_head = 1 AND NEW.continued_in_conv_id IS NOT NULL)
-  OR (NEW.coordinator_cwd IS NOT NULL AND NEW.coordinator_cwd = '')
 BEGIN
     SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
 END;
 CREATE TRIGGER conversations_role_scope_update
-BEFORE UPDATE OF runtime_role, work_scope_id, coordinator_cwd, coordinator_head, continued_in_conv_id ON conversations
+BEFORE UPDATE OF runtime_role, work_scope_id, coordinator_head, continued_in_conv_id ON conversations
 WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
   OR ((NEW.runtime_role = 'coordinator') != (NEW.work_scope_id IS NULL))
-  OR ((NEW.runtime_role = 'coordinator') != (NEW.coordinator_cwd IS NOT NULL))
   OR (NEW.coordinator_head = 1 AND NEW.runtime_role <> 'coordinator')
   OR (NEW.coordinator_head = 1 AND NEW.continued_in_conv_id IS NOT NULL)
-  OR (NEW.coordinator_cwd IS NOT NULL AND NEW.coordinator_cwd = '')
 BEGIN
     SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
 END;
@@ -4439,7 +4433,7 @@ mod tests {
             .map(|row| row.get("name"))
             .collect();
         assert!(!conversation_columns.iter().any(|column| column == "cwd"));
-        assert!(conversation_columns
+        assert!(!conversation_columns
             .iter()
             .any(|column| column == "coordinator_cwd"));
 

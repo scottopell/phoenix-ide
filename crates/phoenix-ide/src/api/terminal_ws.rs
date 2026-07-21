@@ -9,7 +9,7 @@
 //! guard, PTY spawn, frame type filtering, and process lifecycle.
 
 use crate::api::AppState;
-use crate::runtime::RuntimeManager;
+use crate::runtime::{RuntimeManager, SseEvent};
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
@@ -50,8 +50,15 @@ pub async fn terminal_ws_handler(
     let db = state.db.clone();
     let runtime = Arc::clone(&state.runtime);
     ws.on_upgrade(move |socket| async move {
-        let (cwd, scope) = match db.get_conversation(&conversation_id).await {
+        let (cwd, scope, teardown_on_terminal) = match db.get_conversation(&conversation_id).await {
             Ok(conv) => {
+                if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        "Terminal: Coordinator has no filesystem environment"
+                    );
+                    return;
+                }
                 if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent
                     && matches!(conv.conv_mode, ConvMode::Explore { .. })
                 {
@@ -66,14 +73,27 @@ pub async fn terminal_ws_handler(
                     conv.work_scope_id
                         .expect("persisted conversation has work scope"),
                 );
-                (std::path::PathBuf::from(&conv.cwd), scope)
+                (
+                    std::path::PathBuf::from(&conv.cwd),
+                    scope,
+                    matches!(conv.conv_mode, ConvMode::Direct),
+                )
             }
             Err(e) => {
                 tracing::warn!(conv_id = %conversation_id, error = %e, "Terminal: conversation not found");
                 return;
             }
         };
-        handle_socket(socket, scope, cwd, conversation_id, terminals, runtime).await;
+        handle_socket(
+            socket,
+            scope,
+            cwd,
+            conversation_id,
+            teardown_on_terminal,
+            terminals,
+            runtime,
+        )
+        .await;
     })
 }
 
@@ -97,6 +117,7 @@ pub async fn terminal_ws_global_handler(
             ResourceScopeKey::GlobalTerminal,
             cwd,
             "global".to_string(),
+            false,
             terminals,
             runtime,
         )
@@ -109,6 +130,7 @@ async fn handle_socket(
     scope: ResourceScopeKey,
     cwd: std::path::PathBuf,
     id_label: String,
+    teardown_on_terminal: bool,
     terminals: ActiveTerminals,
     runtime: Arc<RuntimeManager>,
 ) {
@@ -177,6 +199,26 @@ async fn handle_socket(
     // stale `Detach` and exit immediately.
     let _ = arc_handle.stop_tx.send(StopReason::Running);
     let stop_rx = arc_handle.stop_tx.subscribe();
+
+    if teardown_on_terminal {
+        let teardown_stop = arc_handle.stop_tx.clone();
+        let teardown_conv_id = conversation_id.clone();
+        if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
+            tokio::spawn(async move {
+                loop {
+                    match bcast_rx.recv().await {
+                        Ok(SseEvent::ConversationBecameTerminal { .. }) => {
+                            tracing::debug!(conv_id = %teardown_conv_id, "Terminal: Direct conversation ended, tearing down PTY");
+                            let _ = teardown_stop.send(StopReason::TearDown);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    }
 
     // Adapt WS sender: Sink<Message> → Sink<Vec<u8>> by wrapping in Message::Binary.
     // Pin the With adaptor so it implements Unpin.

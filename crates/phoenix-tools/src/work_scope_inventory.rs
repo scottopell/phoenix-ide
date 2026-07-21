@@ -15,7 +15,7 @@ use phoenix_core::domain::work_scope_inventory::{
     BashHandleInventory, BashHandleState, BrowserInventory, BrowserSessionLiveness, TmuxInventory,
     TmuxServerStatus, WorkScopeInventory,
 };
-use phoenix_core::work_scope::ResourceScopeKey;
+use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceScopeKey};
 
 use crate::bash::handle::{Handle, HandleState};
 use crate::bash::registry::BashHandleRegistry;
@@ -30,15 +30,16 @@ use crate::tmux::registry::{ServerStatus, TmuxRegistry};
 /// materialising one.
 pub async fn assemble_inventory(
     work_scope: &ResourceScopeKey,
+    actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
     tmux_registry: &Arc<TmuxRegistry>,
     browser_sessions: &Arc<BrowserSessionManager>,
 ) -> WorkScopeInventory {
     WorkScopeInventory {
         scope_key: work_scope.stable_key(),
-        bash: assemble_bash(work_scope, bash_handles).await,
+        bash: assemble_bash(work_scope, actor, bash_handles).await,
         tmux: assemble_tmux(work_scope, tmux_registry).await,
-        browser: assemble_browser(work_scope, browser_sessions).await,
+        browser: assemble_browser(work_scope, actor, browser_sessions).await,
         health_sampled_at: None,
         health: None,
     }
@@ -48,6 +49,7 @@ pub async fn assemble_inventory(
 /// [`BashHandleInventory`]. Empty when the scope has no handle table.
 async fn assemble_bash(
     work_scope: &ResourceScopeKey,
+    actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Vec<BashHandleInventory> {
     let Some(table) = bash_handles.get_existing(work_scope).await else {
@@ -56,7 +58,11 @@ async fn assemble_bash(
     let table = table.read().await;
     let mut out = Vec::new();
     for handle in table.all() {
-        out.push(project_handle(handle).await);
+        if actor.is_none_or(|access| {
+            access.can_control(&handle.creator_conversation_id, handle.authority)
+        }) {
+            out.push(project_handle(handle).await);
+        }
     }
     out
 }
@@ -135,9 +141,16 @@ fn project_tmux_status(status: ServerStatus) -> TmuxServerStatus {
 /// `Instant` at assembly time.
 async fn assemble_browser(
     work_scope: &ResourceScopeKey,
+    actor: Option<&EffectiveResourceAccess>,
     browser_sessions: &Arc<BrowserSessionManager>,
 ) -> Option<BrowserInventory> {
-    let session = browser_sessions.get_existing(work_scope).await?;
+    let session = match actor {
+        Some(access) => browser_sessions
+            .get_existing_for_actor(work_scope, access)
+            .await
+            .ok()??,
+        None => browser_sessions.get_existing(work_scope).await?,
+    };
     let last_activity = session.read().await.last_activity;
     let idle_ms = u64::try_from(last_activity.elapsed().as_millis()).unwrap_or(u64::MAX);
     Some(BrowserInventory {
@@ -165,7 +178,7 @@ mod tests {
         ));
         let browser = BrowserSessionManager::new();
 
-        let inv = assemble_inventory(&scope(), &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
         assert_eq!(inv.scope_key, scope().stable_key());
         assert!(inv.bash.is_empty());
         assert!(inv.tmux.is_none());
@@ -191,7 +204,7 @@ mod tests {
             "/tmp/phoenix-inv-test".into(),
         ));
         let browser = BrowserSessionManager::new();
-        let inv = assemble_inventory(&scope(), &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
 
         assert_eq!(inv.bash.len(), 1);
         let h = &inv.bash[0];
@@ -204,6 +217,37 @@ mod tests {
         assert!(h.duration_ms.is_none());
         // output_bytes is always present (0 at spawn, no output written yet).
         assert_eq!(h.output_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn restricted_actor_inventory_hides_sibling_handle() {
+        use phoenix_core::work_scope::ResourceAuthority;
+
+        let bash = Arc::new(BashHandleRegistry::new());
+        let table = bash.get_or_create(&scope()).await;
+        for actor in ["sibling-a", "sibling-b"] {
+            table.write().await.insert(Handle::new_live_for_actor(
+                scope(),
+                HandleId::new(format!("b-{actor}")),
+                actor.to_string(),
+                ResourceAuthority::Restricted,
+                format!("secret-{actor}"),
+                None,
+                1,
+                1,
+                RING_BUFFER_BYTES,
+            ));
+        }
+        let tmux = Arc::new(TmuxRegistry::with_socket_dir(
+            "/tmp/phoenix-inv-test".into(),
+        ));
+        let browser = BrowserSessionManager::new();
+        let actor = EffectiveResourceAccess::new("sibling-a", ResourceAuthority::Restricted);
+
+        let inventory = assemble_inventory(&scope(), Some(&actor), &bash, &tmux, &browser).await;
+
+        assert_eq!(inventory.bash.len(), 1);
+        assert_eq!(inventory.bash[0].cmd, "secret-sibling-a");
     }
 
     #[tokio::test]
@@ -228,7 +272,7 @@ mod tests {
             "/tmp/phoenix-inv-test".into(),
         ));
         let browser = BrowserSessionManager::new();
-        let inv = assemble_inventory(&scope(), &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
         assert_eq!(inv.bash[0].state, BashHandleState::KillPendingKernel);
     }
 
@@ -259,7 +303,7 @@ mod tests {
             "/tmp/phoenix-inv-test".into(),
         ));
         let browser = BrowserSessionManager::new();
-        let inv = assemble_inventory(&scope(), &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
         let h = &inv.bash[0];
         assert_eq!(h.state, BashHandleState::Tombstoned);
         assert_eq!(h.duration_ms, Some(7));
@@ -302,7 +346,7 @@ mod tests {
             "/tmp/phoenix-inv-test".into(),
         ));
         let browser = BrowserSessionManager::new();
-        let inv = assemble_inventory(&scope(), &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
         let h = &inv.bash[0];
         assert_eq!(h.state, BashHandleState::Tombstoned);
         // A signal kill projects the failure outcome: a recorded signal, no

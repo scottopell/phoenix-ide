@@ -2055,6 +2055,7 @@ function ConversationPageContent({
             <ProcessInspectorPanel
               scopeKey={inspectSlot.scopeKey}
               handleId={inspectSlot.handleId}
+              conversationId={conversationId}
               onClose={handleCloseInspector}
               inline
             />
@@ -2703,6 +2704,7 @@ function ConversationPageContent({
           <ProcessInspectorPanel
             scopeKey={inspectSlot.scopeKey}
             handleId={inspectSlot.handleId}
+            conversationId={conversationId}
             onClose={handleCloseInspector}
           />
         </Suspense>
@@ -2804,6 +2806,7 @@ function ConversationPageContent({
                 <ProcessInspectorPanel
                   scopeKey={inspectSlot.scopeKey}
                   handleId={inspectSlot.handleId}
+                  conversationId={conversationId}
                   onClose={handleCloseInspector}
                   inline
                 />

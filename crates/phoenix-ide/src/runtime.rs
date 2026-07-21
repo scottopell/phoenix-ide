@@ -1832,14 +1832,6 @@ impl RuntimeManager {
         self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
     ) {
-        let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
-            work_scope,
-            self.bash_handles(),
-            self.tmux_registry(),
-            self.browser_sessions(),
-        )
-        .await;
-
         // Same resolution as the browser lifecycle bridge: enumerate live
         // runtime handles, resolve each conversation's scope, match.
         let conv_ids: Vec<String> = {
@@ -1852,11 +1844,10 @@ impl RuntimeManager {
             let Ok(conv) = self.db().get_conversation(&conv_id).await else {
                 continue;
             };
-            let conv_scope = ResourceScopeKey::Work(
-                conv.work_scope_id
-                    .clone()
-                    .expect("persisted conversation has work scope"),
-            );
+            let Some(scope_id) = conv.work_scope_id.clone() else {
+                continue;
+            };
+            let conv_scope = ResourceScopeKey::Work(scope_id);
             if &conv_scope != work_scope {
                 continue;
             }
@@ -1867,10 +1858,23 @@ impl RuntimeManager {
             let Some(broadcaster) = broadcaster else {
                 continue;
             };
+            let authority = match conv.conv_mode {
+                ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+                _ => crate::work_scope::ResourceAuthority::Work,
+            };
+            let actor = crate::work_scope::EffectiveResourceAccess::new(&conv_id, authority);
+            let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
+                work_scope,
+                Some(&actor),
+                self.bash_handles(),
+                self.tmux_registry(),
+                self.browser_sessions(),
+            )
+            .await;
             if broadcaster
                 .send_seq(|seq| SseEvent::WorkScopeUpdate {
                     sequence_id: seq,
-                    inventory: inventory.clone(),
+                    inventory,
                 })
                 .is_ok()
             {
@@ -2267,7 +2271,7 @@ impl RuntimeManager {
         // Sub-agent inherits parent's worktree cwd; discover the project's
         // tasks directory the same way the parent did.
         conv_context.tasks_dir_name =
-            taskmd_core::discover::discover_or_default(&conv_context.working_dir)
+            taskmd_core::discover::discover_or_default(conv_context.filesystem_root())
                 .to_string_lossy()
                 .into_owned();
         // Sub-agents inherit their parent's LLM language.
@@ -2488,16 +2492,25 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        let conv_cwd = crate::conversation_cwd::validate_conversation_cwd_for_runtime(
-            conversation_id,
-            &conv.cwd,
-        )
-        .map_err(|e| {
-            format!("Conversation '{conversation_id}' has an invalid working directory: {e}")
-        })?;
-
         // Check if this is a sub-agent being resumed (shouldn't happen normally)
         let is_sub_agent = conv.parent_conversation_id.is_some();
+        let is_coordinator =
+            !is_sub_agent && conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator;
+        let conv_cwd = if is_coordinator {
+            None
+        } else {
+            Some(
+                crate::conversation_cwd::validate_conversation_cwd_for_runtime(
+                    conversation_id,
+                    &conv.cwd,
+                )
+                .map_err(|e| {
+                    format!(
+                        "Conversation '{conversation_id}' has an invalid working directory: {e}"
+                    )
+                })?,
+            )
+        };
 
         // Resolve model once: use conversation's stored model, or fall back to registry default
         let model_id = conv
@@ -2510,13 +2523,26 @@ impl RuntimeManager {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
             ConvContext::sub_agent(
                 &conv.id,
-                conv_cwd.path_buf(),
+                conv_cwd
+                    .as_ref()
+                    .expect("sub-agent has filesystem environment")
+                    .path_buf(),
                 &model_id,
                 context_window,
                 root_id,
             )
+        } else if is_coordinator {
+            ConvContext::coordinator(&conv.id, &model_id, context_window)
         } else {
-            ConvContext::new(&conv.id, conv_cwd.path_buf(), &model_id, context_window)
+            ConvContext::new(
+                &conv.id,
+                conv_cwd
+                    .as_ref()
+                    .expect("ordinary conversation has filesystem environment")
+                    .path_buf(),
+                &model_id,
+                context_window,
+            )
         };
         context.resource_scope = match conv.work_scope_id.clone() {
             Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
@@ -2544,9 +2570,11 @@ impl RuntimeManager {
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on
         // the same name without re-walking the worktree.
-        context.tasks_dir_name = taskmd_core::discover::discover_or_default(&context.working_dir)
-            .to_string_lossy()
-            .into_owned();
+        if let Some(root) = context.execution_environment.working_dir() {
+            context.tasks_dir_name = taskmd_core::discover::discover_or_default(root)
+                .to_string_lossy()
+                .into_owned();
+        }
         // Pin the LLM-facing language for the lifetime of this runtime so
         // the system prompt and tool descriptions stay consistent across all
         // turns even if the global default changes mid-conversation.
@@ -2613,18 +2641,13 @@ impl RuntimeManager {
         // spawn_agents schema and the executor's agent_type resolution share a
         // single catalog instead of independently re-discovering the filesystem
         // (REQ-AG-008). Sub-agents cannot spawn, so theirs is empty.
-        let agent_catalog: Arc<[phoenix_agents::AgentDefinition]> = if is_sub_agent {
-            Arc::from(Vec::new())
-        } else {
-            Arc::from(phoenix_agents::discover_agents(&context.working_dir))
-        };
+        let agent_catalog: Arc<[phoenix_agents::AgentDefinition]> =
+            if is_sub_agent || is_coordinator {
+                Arc::from(Vec::new())
+            } else {
+                Arc::from(phoenix_agents::discover_agents(context.filesystem_root()))
+            };
         let available_model_ids = self.llm_registry.available_models();
-        let is_coordinator = !is_sub_agent
-            && self
-                .db
-                .is_coordinator_conversation(conversation_id)
-                .await
-                .map_err(|e| e.to_string())?;
         context.is_coordinator = is_coordinator;
 
         let tool_executor = if is_sub_agent {
@@ -2671,7 +2694,9 @@ impl RuntimeManager {
                             agent_catalog.to_vec(),
                             available_model_ids.clone(),
                         );
-                        if phoenix_core::git::detect_git_repo_root(&context.working_dir).is_some() {
+                        if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
+                            .is_some()
+                        {
                             registry.with_propose_task().with_commission_review()
                         } else {
                             registry

@@ -101,7 +101,7 @@ fn resolve_commission_review_approval(
     context: &ConvContext,
 ) -> CommissionReviewApprovalAvailability {
     resolve_commission_review_approval_from_parts(
-        &context.working_dir,
+        context.filesystem_root(),
         context.mode_context.as_ref(),
     )
 }
@@ -4475,7 +4475,7 @@ where
         let context_window = self.context.context_window;
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
-        let working_dir = self.context.working_dir.clone();
+        let working_dir = self.context.filesystem_root().to_path_buf();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
@@ -4909,7 +4909,7 @@ where
         let tool_ctx = ToolContext::new_with_resource_scope(
             cancel_token,
             self.context.conversation_id.clone(),
-            self.context.working_dir.clone(),
+            self.context.filesystem_root().to_path_buf(),
             self.browser_sessions.clone(),
             self.bash_handles.clone(),
             self.llm_registry.clone(),
@@ -5111,8 +5111,11 @@ where
         // the conversation's working_dir. The stored path is relative to the
         // repository root so the spawn/review surface resolves it regardless of
         // which worktree or subdir the origin ran in.
-        let normalized_task_file =
-            normalize_task_file_repo_relative(&self.context.working_dir, &task_file, &proposal_id);
+        let normalized_task_file = normalize_task_file_repo_relative(
+            self.context.filesystem_root(),
+            &task_file,
+            &proposal_id,
+        );
 
         let conv_id = self.context.conversation_id.clone();
 
@@ -5562,7 +5565,7 @@ where
         priority: crate::task_source::Priority,
         plan: String,
     ) -> Result<(), String> {
-        let cwd = self.context.working_dir.clone();
+        let cwd = self.context.filesystem_root().to_path_buf();
         // The spec invariant WorktreePathDerivedFromConversation requires
         // the worktree path to be rooted at the repo root, not at cwd.
         // For Managed conversations cwd IS the Explore worktree; for legacy
@@ -5627,7 +5630,8 @@ where
                         approved_cwd.raw(),
                     )
                     .await?;
-                self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
+                self.context
+                    .set_filesystem_root(std::path::PathBuf::from(&approval_result.worktree_path));
                 self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
                 // Refresh in-memory mode_context so downstream checks
@@ -5775,7 +5779,7 @@ where
         priority: crate::task_source::Priority,
         plan: String,
     ) -> Result<Option<Event>, String> {
-        let cwd = self.context.working_dir.clone();
+        let cwd = self.context.filesystem_root().to_path_buf();
         let repo_root =
             crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         let conv_id = self.context.conversation_id.clone();

@@ -20,9 +20,28 @@ pub const TERMINAL_CODEC_FAMILY: &str = "wake.terminal";
 pub const REGISTRATION_BARRIER_ID: BarrierId = BarrierId(1);
 pub const REGISTRATION_EFFECT_ID: EffectId = EffectId(1);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct WorkScopeIdentity(pub String);
+
+impl<'de> Deserialize<'de> for WorkScopeIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum CompatibleIdentity {
+            Opaque(String),
+            Legacy { stable_key: String },
+        }
+
+        Ok(match CompatibleIdentity::deserialize(deserializer)? {
+            CompatibleIdentity::Opaque(value) => Self(value),
+            CompatibleIdentity::Legacy { stable_key } => Self(stable_key),
+        })
+    }
+}
 
 impl WorkScopeIdentity {
     #[must_use]
@@ -43,8 +62,15 @@ pub enum TmuxCompletionPolicy {
     CloseAfterCompletion,
 }
 
+fn legacy_work_scope_identity() -> WorkScopeIdentity {
+    WorkScopeIdentity("legacy-unscoped".to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TmuxResourceIdentity {
+    // owned: pre-WorkScope wake payloads omitted this field; a sentinel keeps
+    // them decodable so persisted wake recovery can classify them safely.
+    #[serde(default = "legacy_work_scope_identity")]
     pub work_scope: WorkScopeIdentity,
     pub server_token: String,
     pub window_id: String,

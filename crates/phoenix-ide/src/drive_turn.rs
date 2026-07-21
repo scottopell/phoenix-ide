@@ -236,6 +236,12 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         manager.tmux_registry(),
         &work_scope,
         None,
+        conversation
+            .conv_mode
+            .worktree_path()
+            .map(std::path::Path::new),
+        matches!(conversation.conv_mode, crate::db::ConvMode::Direct)
+            .then_some(conversation.id.as_str()),
     )
     .await;
     if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {

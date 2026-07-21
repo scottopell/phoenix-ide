@@ -930,11 +930,7 @@ async fn ensure_coordinator(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let conversation = state
         .db
-        .get_or_create_coordinator(
-            &state.runtime_env.home().to_string_lossy(),
-            Some(state.llm_registry.default_model_id()),
-            llm_language,
-        )
+        .get_or_create_coordinator(Some(state.llm_registry.default_model_id()), llm_language)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(ConversationResponse {
@@ -3002,15 +2998,53 @@ async fn get_conversation_slug(
 /// value; it is parsed back into a `ResourceScopeKey` to query the registries. The
 /// assembly is read-only — it never spawns a process or allocates a registry
 /// table for a scope that has none.
+#[derive(serde::Deserialize)]
+struct WorkScopeActorQuery {
+    conversation_id: String,
+}
+
+async fn work_scope_actor(
+    state: &AppState,
+    work_scope: &crate::work_scope::ResourceScopeKey,
+    conversation_id: &str,
+) -> Result<crate::work_scope::EffectiveResourceAccess, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let conversation_scope = conversation
+        .work_scope_id
+        .clone()
+        .map(crate::work_scope::ResourceScopeKey::Work);
+    if conversation_scope.as_ref() != Some(work_scope) {
+        return Err(AppError::Forbidden(
+            "conversation does not belong to the requested work scope".to_string(),
+        ));
+    }
+    let authority = match conversation.conv_mode {
+        crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+        _ => crate::work_scope::ResourceAuthority::Work,
+    };
+    Ok(crate::work_scope::EffectiveResourceAccess::new(
+        conversation.id,
+        authority,
+    ))
+}
+
 async fn get_work_scope_inventory(
     State(state): State<AppState>,
     Path(scope_key): Path<String>,
+    Query(query): Query<WorkScopeActorQuery>,
 ) -> Result<Json<phoenix_core::domain::work_scope_inventory::WorkScopeInventory>, AppError> {
     let work_scope = crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
         .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
+    let actor = work_scope_actor(&state, &work_scope, &query.conversation_id).await?;
 
     let mut inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
         &work_scope,
+        Some(&actor),
         state.runtime.bash_handles(),
         state.runtime.tmux_registry(),
         state.runtime.browser_sessions(),
@@ -3044,11 +3078,18 @@ async fn stop_conversation_browser_session(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let work_scope = conversation_work_scope(&conversation);
+    let actor = crate::work_scope::EffectiveResourceAccess::new(
+        conversation.id.clone(),
+        match conversation.conv_mode {
+            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        },
+    );
 
     state
         .runtime
         .browser_sessions()
-        .request_kill_session(&work_scope)
+        .request_kill_session_for_actor(&work_scope, &actor)
         .await;
 
     Ok(Json(SuccessResponse { success: true }))
@@ -3062,14 +3103,16 @@ async fn stop_conversation_browser_session(
 async fn stop_work_scope_browser_session(
     State(state): State<AppState>,
     Path(scope_key): Path<String>,
+    Query(query): Query<WorkScopeActorQuery>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let work_scope = crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
         .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
+    let actor = work_scope_actor(&state, &work_scope, &query.conversation_id).await?;
 
     state
         .runtime
         .browser_sessions()
-        .request_kill_session(&work_scope)
+        .request_kill_session_for_actor(&work_scope, &actor)
         .await;
 
     Ok(Json(SuccessResponse { success: true }))
@@ -3078,6 +3121,7 @@ async fn stop_work_scope_browser_session(
 /// Optional `since=K` incremental output cursor for the inspect endpoint.
 #[derive(serde::Deserialize)]
 struct InspectQuery {
+    conversation_id: String,
     since: Option<u64>,
 }
 
@@ -3096,11 +3140,13 @@ async fn inspect_bash_handle(
 ) -> Result<Json<phoenix_core::domain::process_inspection::BashHandleInspection>, AppError> {
     let work_scope = crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
         .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
+    let actor = work_scope_actor(&state, &work_scope, &query.conversation_id).await?;
 
     let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
         &work_scope,
         &handle_id,
         query.since,
+        Some(&actor),
         state.runtime.bash_handles(),
     )
     .await
@@ -3143,10 +3189,7 @@ async fn get_system_prompt(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
-        .to_string_lossy()
-        .into_owned();
+    let is_coordinator = conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator;
     // Reflect the real prompt for named sub-agents: a sub-agent (one with a
     // parent) gets the sub-agent suffix, and its persona replaces the base
     // preamble (REQ-AG-006). Without this the inspection endpoint shows a
@@ -3175,14 +3218,13 @@ async fn get_system_prompt(
     } else {
         phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
     };
-    let system_prompt = if state
-        .db
-        .is_coordinator_conversation(&conversation.id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    {
+    let system_prompt = if is_coordinator {
         crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
     } else {
+        let cwd = std::path::PathBuf::from(&conversation.cwd);
+        let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
+            .to_string_lossy()
+            .into_owned();
         crate::system_prompt::build_system_prompt(
             &cwd,
             &tasks_dir_name,
@@ -4391,6 +4433,13 @@ pub(super) async fn run_resource_cleanup_cascade(
 ) -> Result<(), AppError> {
     let id = conv.id.as_str();
     let work_scope = conversation_work_scope(conv);
+    let actor = crate::work_scope::EffectiveResourceAccess::new(
+        conv.id.clone(),
+        match conv.conv_mode {
+            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        },
+    );
 
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
@@ -4404,6 +4453,7 @@ pub(super) async fn run_resource_cleanup_cascade(
     let bash_report = crate::tools::bash::registry::cascade_bash_on_delete(
         state.runtime.bash_handles(),
         &work_scope,
+        &actor,
         inheritor_scope,
     )
     .await;
@@ -4430,10 +4480,15 @@ pub(super) async fn run_resource_cleanup_cascade(
 
     // Step 3: tmux server. Preserve iff the scope is still owned by a live
     // conversation other than this one (REQ-TMUX-WS-002).
+    let legacy_worktree_path = conv.conv_mode.worktree_path().map(std::path::Path::new);
+    let legacy_conversation_id =
+        matches!(conv.conv_mode, crate::db::ConvMode::Direct).then_some(conv.id.as_str());
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
         state.runtime.tmux_registry(),
         &work_scope,
         inheritor_scope,
+        legacy_worktree_path,
+        legacy_conversation_id,
     )
     .await;
     if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
@@ -4474,6 +4529,7 @@ pub(super) async fn run_resource_cleanup_cascade(
     crate::tools::browser::session::cascade_browser_on_delete(
         state.runtime.browser_sessions(),
         &work_scope,
+        &actor,
         inheritor_scope,
     )
     .await;
@@ -4633,6 +4689,7 @@ async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::
     let scope = crate::work_scope::ResourceScopeKey::Work(scope_id.clone());
     let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
         &scope,
+        None,
         state.runtime.bash_handles(),
         state.runtime.tmux_registry(),
         state.runtime.browser_sessions(),
@@ -5781,6 +5838,12 @@ async fn search_conversation_files(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     // Search the same directory that `message_expander::expand` resolves
+    if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        return Err(AppError::BadRequest(
+            "Coordinator has no filesystem environment".to_string(),
+        ));
+    }
+
     // `@file` references against at send time (the conversation's `cwd`), so
     // every autocomplete candidate is one that will actually expand.
     let root = std::path::PathBuf::from(&conversation.cwd);
@@ -6110,6 +6173,12 @@ async fn list_conversation_skills(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        return Err(AppError::BadRequest(
+            "Coordinator has no filesystem environment".to_string(),
+        ));
+    }
+
     let cwd = std::path::PathBuf::from(&conversation.cwd);
     Ok(Json(SkillsResponse {
         skills: skill_entries_from_dir(&cwd, None),
@@ -6268,6 +6337,11 @@ async fn list_conversation_tasks(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        return Err(AppError::BadRequest(
+            "Coordinator has no filesystem environment".to_string(),
+        ));
+    }
     let cwd = std::path::PathBuf::from(&conversation.cwd);
     Ok(Json(TasksResponse {
         tasks: task_entries_for_cwd(&state, &cwd).await,
@@ -6324,6 +6398,11 @@ async fn get_conversation_task_count(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    if conversation.runtime_role == crate::work_scope::RuntimeRole::Coordinator {
+        return Err(AppError::BadRequest(
+            "Coordinator has no filesystem environment".to_string(),
+        ));
+    }
     let cwd = std::path::PathBuf::from(&conversation.cwd);
     Ok(Json(task_counts_for_cwd(
         &cwd,
@@ -10051,10 +10130,26 @@ pub(crate) mod hard_delete_cascade_tests {
     #[tokio::test]
     async fn work_scope_inventory_empty_scope_returns_empty_inventory() {
         let state = make_test_state().await;
-        let scope = crate::scope("conv-empty");
-        let Json(inv) = super::get_work_scope_inventory(State(state), Path(scope.stable_key()))
+        state
+            .db
+            .create_conversation("conv-empty", "empty", "/tmp", true, None, None)
             .await
-            .expect("inventory");
+            .expect("conversation");
+        let conv = state
+            .db
+            .get_conversation("conv-empty")
+            .await
+            .expect("conversation");
+        let scope = crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id.expect("scope"));
+        let Json(inv) = super::get_work_scope_inventory(
+            State(state),
+            Path(scope.stable_key()),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: "conv-empty".into(),
+            }),
+        )
+        .await
+        .expect("inventory");
         assert_eq!(inv.scope_key, scope.stable_key());
         assert!(inv.bash.is_empty());
         assert!(inv.tmux.is_none());
@@ -10068,7 +10163,17 @@ pub(crate) mod hard_delete_cascade_tests {
         use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
 
         let state = make_test_state().await;
-        let scope = crate::scope("conv-live");
+        state
+            .db
+            .create_conversation("conv-live", "live", "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+        let conv = state
+            .db
+            .get_conversation("conv-live")
+            .await
+            .expect("conversation");
+        let scope = crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id.expect("scope"));
 
         // Insert a live handle directly into the ResourceScopeKey-keyed registry.
         let table = state.runtime.bash_handles().get_or_create(&scope).await;
@@ -10083,9 +10188,15 @@ pub(crate) mod hard_delete_cascade_tests {
         );
         table.write().await.insert(handle);
 
-        let Json(inv) = super::get_work_scope_inventory(State(state), Path(scope.stable_key()))
-            .await
-            .expect("inventory");
+        let Json(inv) = super::get_work_scope_inventory(
+            State(state),
+            Path(scope.stable_key()),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: "conv-live".into(),
+            }),
+        )
+        .await
+        .expect("inventory");
 
         assert_eq!(inv.bash.len(), 1);
         let h = &inv.bash[0];
@@ -10100,9 +10211,15 @@ pub(crate) mod hard_delete_cascade_tests {
     #[tokio::test]
     async fn work_scope_inventory_rejects_malformed_key() {
         let state = make_test_state().await;
-        let err = super::get_work_scope_inventory(State(state), Path("bogus-no-namespace".into()))
-            .await
-            .expect_err("malformed key must be rejected");
+        let err = super::get_work_scope_inventory(
+            State(state),
+            Path("bogus-no-namespace".into()),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: "unused".into(),
+            }),
+        )
+        .await
+        .expect_err("malformed key must be rejected");
         assert!(matches!(err, AppError::BadRequest(_)));
     }
 
@@ -10121,22 +10238,42 @@ pub(crate) mod hard_delete_cascade_tests {
     #[tokio::test]
     async fn stop_work_scope_browser_session_rejects_malformed_key() {
         let state = make_test_state().await;
-        let err =
-            super::stop_work_scope_browser_session(State(state), Path("bogus-no-namespace".into()))
-                .await
-                .expect_err("malformed key must be rejected");
+        let err = super::stop_work_scope_browser_session(
+            State(state),
+            Path("bogus-no-namespace".into()),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: "unused".into(),
+            }),
+        )
+        .await
+        .expect_err("malformed key must be rejected");
         assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[tokio::test]
     async fn stop_work_scope_browser_session_absent_session_is_successful_noop() {
         let state = make_test_state().await;
-        let scope = crate::scope("conv-no-browser");
+        state
+            .db
+            .create_conversation("conv-no-browser", "empty", "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+        let conv = state
+            .db
+            .get_conversation("conv-no-browser")
+            .await
+            .expect("conversation");
+        let scope = crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id.expect("scope"));
 
-        let Json(resp) =
-            super::stop_work_scope_browser_session(State(state.clone()), Path(scope.stable_key()))
-                .await
-                .expect("absent browser stop should succeed");
+        let Json(resp) = super::stop_work_scope_browser_session(
+            State(state.clone()),
+            Path(scope.stable_key()),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: "conv-no-browser".into(),
+            }),
+        )
+        .await
+        .expect("absent browser stop should succeed");
 
         assert!(resp.success);
         assert!(!state.runtime.browser_sessions().is_active(&scope).await);
@@ -10204,7 +10341,10 @@ pub(crate) mod hard_delete_cascade_tests {
         let Json(inspection) = super::inspect_bash_handle(
             State(state),
             Path((scope.stable_key(), "b-1".to_string())),
-            Query(super::InspectQuery { since: None }),
+            Query(super::InspectQuery {
+                conversation_id: "conv-inspect".into(),
+                since: None,
+            }),
         )
         .await
         .expect("inspection");
@@ -10289,7 +10429,10 @@ pub(crate) mod hard_delete_cascade_tests {
         let Json(inspection) = super::inspect_bash_handle(
             State(state),
             Path((scope.stable_key(), "b-1".to_string())),
-            Query(super::InspectQuery { since: None }),
+            Query(super::InspectQuery {
+                conversation_id: "conv-inspect".into(),
+                since: None,
+            }),
         )
         .await
         .expect("inspection");
@@ -10319,7 +10462,10 @@ pub(crate) mod hard_delete_cascade_tests {
         let err = super::inspect_bash_handle(
             State(state),
             Path(("bogus-no-namespace".to_string(), "b-1".to_string())),
-            Query(super::InspectQuery { since: None }),
+            Query(super::InspectQuery {
+                conversation_id: "conv-inspect".into(),
+                since: None,
+            }),
         )
         .await
         .expect_err("malformed key must be rejected");
@@ -10335,7 +10481,10 @@ pub(crate) mod hard_delete_cascade_tests {
         let err = super::inspect_bash_handle(
             State(state),
             Path((scope.stable_key(), "b-404".to_string())),
-            Query(super::InspectQuery { since: None }),
+            Query(super::InspectQuery {
+                conversation_id: "conv-inspect".into(),
+                since: None,
+            }),
         )
         .await
         .expect_err("unknown handle must be not-found");

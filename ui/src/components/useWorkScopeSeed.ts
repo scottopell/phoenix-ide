@@ -23,11 +23,14 @@ import { workScopeLiveCount } from './workScopeHelpers';
  * Carries the same stale-scope guard as `useWorkScopeInventory`: a fetch for the
  * previous scope that resolves after `scopeKey` changes is rejected.
  */
-function useSeededInventory(scopeKey: string | null | undefined): WorkScopeInventory | null {
+function useSeededInventory(
+  scopeKey: string | null | undefined,
+  conversationId: string | null | undefined,
+): WorkScopeInventory | null {
   const [seeded, setSeeded] = useState<WorkScopeInventory | null>(null);
 
   useEffect(() => {
-    if (!scopeKey) {
+    if (!scopeKey || !conversationId) {
       setSeeded(null);
       return;
     }
@@ -35,7 +38,7 @@ function useSeededInventory(scopeKey: string | null | undefined): WorkScopeInven
     setSeeded(null);
     void (async () => {
       try {
-        const inv = await api.getWorkScopeInventory(scopeKey);
+        const inv = await api.getWorkScopeInventory(scopeKey, conversationId);
         if (!cancelled) setSeeded(inv);
       } catch {
         // A failed seed leaves the badge on the SSE-fed value — no worse than
@@ -45,7 +48,7 @@ function useSeededInventory(scopeKey: string | null | undefined): WorkScopeInven
     return () => {
       cancelled = true;
     };
-  }, [scopeKey]);
+  }, [scopeKey, conversationId]);
 
   return seeded;
 }
@@ -58,8 +61,9 @@ function useSeededInventory(scopeKey: string | null | undefined): WorkScopeInven
  */
 export function useSeededLiveCount(
   scopeKey: string | null | undefined,
+  conversationId: string | null | undefined,
   liveInventory: WorkScopeInventory | null | undefined,
 ): number {
-  const seeded = useSeededInventory(scopeKey);
+  const seeded = useSeededInventory(scopeKey, conversationId);
   return workScopeLiveCount(liveInventory ?? seeded);
 }

@@ -784,6 +784,8 @@ impl TmuxRegistry {
         &self,
         work_scope: &ResourceScopeKey,
         inheritor_scope: Option<&ResourceScopeKey>,
+        legacy_worktree_path: Option<&Path>,
+        legacy_conversation_id: Option<&str>,
     ) -> CascadeReport {
         // Preservation by scope equality: the inheritor (continuation) is
         // still driving the same tmux server iff it resolves to the same
@@ -823,10 +825,30 @@ impl TmuxRegistry {
             let server = arc.read().await;
             server.socket_path.clone()
         } else {
-            // No registry entry — fall back to the deterministic path so
-            // we still attempt cleanup of any orphaned socket from a
-            // prior process.
-            self.derived_socket_path(work_scope)
+            let current = self.derived_socket_path(work_scope);
+            let legacy = legacy_worktree_path
+                .map(|path| socket_path_for_worktree(&self.socket_dir, path))
+                .or_else(|| legacy_conversation_id.map(|id| socket_path_for(&self.socket_dir, id)));
+            if let Some(legacy) = legacy {
+                if legacy != current
+                    && matches!(
+                        probe(&current).await,
+                        Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket)
+                    )
+                    && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
+                {
+                    tracing::info!(
+                        scope = %work_scope,
+                        socket = %legacy.display(),
+                        "tmux: cleaning live pre-opaque-scope socket"
+                    );
+                    legacy
+                } else {
+                    current
+                }
+            } else {
+                current
+            }
         };
 
         let mut report = CascadeReport {
@@ -912,9 +934,16 @@ pub async fn cascade_tmux_on_delete(
     registry: &Arc<TmuxRegistry>,
     work_scope: &ResourceScopeKey,
     inheritor_scope: Option<&ResourceScopeKey>,
+    legacy_worktree_path: Option<&Path>,
+    legacy_conversation_id: Option<&str>,
 ) -> CascadeReport {
     registry
-        .cascade_on_delete(work_scope, inheritor_scope)
+        .cascade_on_delete(
+            work_scope,
+            inheritor_scope,
+            legacy_worktree_path,
+            legacy_conversation_id,
+        )
         .await
 }
 
@@ -1287,7 +1316,7 @@ mod tests {
         assert!(created, "first insert must report created");
 
         // Tearing down a held entry emits exactly one removal edge.
-        let _ = reg.cascade_on_delete(&scope, None).await;
+        let _ = reg.cascade_on_delete(&scope, None, None, None).await;
         let e = rx.try_recv().expect("removal event missing");
         assert_eq!(e.work_scope, scope);
         assert!(rx.try_recv().is_err(), "no more events expected");
@@ -1305,7 +1334,7 @@ mod tests {
             Some(tx),
         );
         let scope = scope("never-existed");
-        let _ = reg.cascade_on_delete(&scope, None).await;
+        let _ = reg.cascade_on_delete(&scope, None, None, None).await;
         assert!(rx.try_recv().is_err(), "no entry → no removal event");
     }
 
@@ -1324,7 +1353,7 @@ mod tests {
         let sock =
             socket_path_for_worktree(tmp.path(), Path::new("/tmp/phoenix-tmux-preserve-emit"));
         let _ = reg.get_or_insert(&wt, sock).await;
-        let _ = reg.cascade_on_delete(&wt, Some(&wt)).await;
+        let _ = reg.cascade_on_delete(&wt, Some(&wt), None, None).await;
         assert!(
             rx.try_recv().is_err(),
             "preserved entry must not emit a removal edge"
@@ -1352,7 +1381,7 @@ mod tests {
         );
 
         // Sibling continuation inherits the same scope → preserved path.
-        let _ = reg.cascade_on_delete(&wt, Some(&wt)).await;
+        let _ = reg.cascade_on_delete(&wt, Some(&wt), None, None).await;
 
         assert_eq!(
             reg.conversation_count().await,
@@ -1662,7 +1691,7 @@ mod tests {
         // No prior entry, no on-disk socket — cascade should be a no-op
         // that returns without errors.
         let scope = scope("never-existed");
-        let report = reg.cascade_on_delete(&scope, None).await;
+        let report = reg.cascade_on_delete(&scope, None, None, None).await;
         assert!(report.kill_server_error.is_none());
         assert!(report.unlink_error.is_none());
     }
@@ -1696,14 +1725,14 @@ mod tests {
             "precondition: both entries present"
         );
 
-        let _ = reg.cascade_on_delete(&conv_scope, None).await;
+        let _ = reg.cascade_on_delete(&conv_scope, None, None, None).await;
         assert_eq!(
             reg.conversation_count().await,
             1,
             "Conversation-scope cascade must remove the Conversation-keyed entry"
         );
 
-        let _ = reg.cascade_on_delete(&wt_scope, None).await;
+        let _ = reg.cascade_on_delete(&wt_scope, None, None, None).await;
         assert_eq!(
             reg.conversation_count().await,
             0,
@@ -1724,7 +1753,7 @@ mod tests {
         let parent_scope = scope("worktree-preserve");
         let child_scope = parent_scope.clone();
         let report = reg
-            .cascade_on_delete(&parent_scope, Some(&child_scope))
+            .cascade_on_delete(&parent_scope, Some(&child_scope), None, None)
             .await;
         assert!(report.kill_server_error.is_none());
         assert!(report.unlink_error.is_none());

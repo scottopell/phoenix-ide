@@ -580,6 +580,7 @@ function ChainWorkScopeDock({
       {!collapsed && <ChainWorkIdentityBlock identity={workIdentity} />}
       <WorkScopePanel
         scopeKey={scopeKey}
+        conversationId={activeConvId}
         collapsed={collapsed}
         onToggle={() => setCollapsed((c) => !c)}
         width={collapsed ? undefined : pane.size}

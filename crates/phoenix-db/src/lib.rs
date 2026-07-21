@@ -2921,7 +2921,6 @@ impl Database {
     /// Returns an error when the transaction, insert, or conversation reload fails.
     pub async fn get_or_create_coordinator(
         &self,
-        cwd: &str,
         model: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
@@ -2943,12 +2942,11 @@ impl Database {
             let idle = serde_json::to_string(&ConvState::Idle)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_cwd, coordinator_head, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, 'Coordinator', ?3, 1, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
+                "INSERT INTO conversations (id, slug, title, coordinator_head, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, 'Coordinator', 1, 0, ?3, ?4, ?4, ?4, 0, 1, ?5, ?6, 'explore', 'coordinator', NULL)",
             )
             .bind(&id)
             .bind(slug)
-            .bind(cwd)
             .bind(idle)
             .bind(now)
             .bind(model)
@@ -3039,7 +3037,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3068,7 +3066,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3097,7 +3095,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3227,7 +3225,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn managed_worktree_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3254,7 +3252,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_all_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -3278,7 +3276,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4921,7 +4919,7 @@ impl Database {
         worktree_path: &str,
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4951,7 +4949,7 @@ impl Database {
         work_scope_id: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -5000,19 +4998,6 @@ impl Database {
         .bind(id)
         .execute(&self.pool)
         .await?;
-        let result = if result.rows_affected() == 0 {
-            sqlx::query(
-                "UPDATE conversations SET coordinator_cwd = ?1, updated_at = ?2
-                 WHERE id = ?3 AND runtime_role = 'coordinator'",
-            )
-            .bind(cwd)
-            .bind(&now)
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-        } else {
-            result
-        };
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -5440,8 +5425,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_cwd, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, CASE WHEN ?21 = 'coordinator' THEN ?4 ELSE NULL END, CASE WHEN ?21 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22)",
+                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, CASE WHEN ?21 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5646,7 +5631,7 @@ impl Database {
                 FROM conversations c
                 JOIN chain ON c.id = chain.next_id
             )
-            SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -6386,19 +6371,7 @@ impl Database {
                         .execute(&self.pool)
                         .await?;
                         if updated.rows_affected() == 0 {
-                            let coordinator = sqlx::query(
-                                "UPDATE conversations
-                                 SET coordinator_cwd = ?1, updated_at = ?2
-                                 WHERE id = ?3 AND runtime_role = 'coordinator'",
-                            )
-                            .bind(cwd)
-                            .bind(&now)
-                            .bind(id)
-                            .execute(&self.pool)
-                            .await?;
-                            if coordinator.rows_affected() == 0 {
-                                return Err(DbError::ConversationNotFound(id.to_string()));
-                            }
+                            return Err(DbError::ConversationNotFound(id.to_string()));
                         }
                     }
                     return Ok(());
@@ -6584,7 +6557,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, c.coordinator_cwd) AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.slug, c.title, COALESCE(e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -8635,7 +8608,7 @@ async fn insert_conversation_tx(
     // here. The legacy `steering_queue` column defaults to '[]'.
     sqlx::query(
         "INSERT INTO conversations (
-            id, slug, title, coordinator_cwd, parent_conversation_id, user_initiated, state,
+            id, slug, title, parent_conversation_id, user_initiated, state,
             state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id,
             desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, llm_language,
@@ -8643,7 +8616,7 @@ async fn insert_conversation_tx(
             cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch,
             cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
             runtime_role, work_scope_id
-        ) VALUES (?1, ?2, ?3, CASE WHEN ?29 = 'coordinator' THEN ?4 ELSE NULL END, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+        ) VALUES (?1, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -12116,7 +12089,6 @@ mod tests {
 
         let first = db
             .get_or_create_coordinator(
-                "/tmp/coordinator",
                 Some("test-model"),
                 phoenix_core::llm_language::LlmLanguage::Caveman,
             )
@@ -12124,7 +12096,6 @@ mod tests {
             .unwrap();
         let second = db
             .get_or_create_coordinator(
-                "/tmp/ignored",
                 Some("other-model"),
                 phoenix_core::llm_language::LlmLanguage::default(),
             )
@@ -12164,12 +12135,10 @@ mod tests {
 
         let (left, right) = tokio::join!(
             db.get_or_create_coordinator(
-                "/tmp/coordinator",
                 Some("test-model"),
                 phoenix_core::llm_language::LlmLanguage::default()
             ),
             db.get_or_create_coordinator(
-                "/tmp/coordinator",
                 Some("test-model"),
                 phoenix_core::llm_language::LlmLanguage::default()
             ),
@@ -12279,7 +12248,6 @@ mod tests {
 
         let coordinator = db
             .get_or_create_coordinator(
-                "/tmp",
                 Some("test-model"),
                 phoenix_core::llm_language::LlmLanguage::default(),
             )
@@ -14523,7 +14491,6 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let coordinator = db
             .get_or_create_coordinator(
-                "/tmp",
                 Some("test-model"),
                 phoenix_core::llm_language::LlmLanguage::default(),
             )

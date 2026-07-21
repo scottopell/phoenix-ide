@@ -890,7 +890,7 @@ fn handle_core_llm_response(
             .with_effect(Effect::persist_agent_message(
                 content,
                 Some(usage_data),
-                &context.working_dir,
+                context.filesystem_root(),
                 request_id,
                 final_attempt,
             ))
@@ -901,7 +901,7 @@ fn handle_core_llm_response(
     // Has tools -> ToolExecuting
     let first = tool_calls[0].clone();
     let rest = tool_calls[1..].to_vec();
-    let mut display_data = compute_bash_display_data(&content, &context.working_dir);
+    let mut display_data = compute_bash_display_data(&content, context.filesystem_root());
     // REQ-LRV-006: same retry_count stamp as the no-tool path
     // (persist_agent_message above). The tool-round flow persists the
     // assistant message via PersistCheckpoint, not persist_agent_message,
@@ -1884,7 +1884,7 @@ pub fn transition_parent(
                     phoenix_core::domain::sm_state::ApprovedCommissionReviewInput {
                         request: request.clone(),
                         runtime_base_branch: Some(scope.base.clone()),
-                        approved_working_dir: context.working_dir.display().to_string(),
+                        approved_working_dir: context.filesystem_root().display().to_string(),
                         approved_worktree_path: context
                             .work_scope_worktree
                             .as_ref()
@@ -2167,7 +2167,7 @@ pub fn transition_parent(
             // captured by ref) so each branch can still move its own `content`
             // into `AssistantMessage::new` after calling this.
             let make_display_data = |c: &[phoenix_core::domain::llm_types::ContentBlock]| {
-                let mut dd = compute_bash_display_data(c, &context.working_dir);
+                let mut dd = compute_bash_display_data(c, context.filesystem_root());
                 stamp_retry_count(&mut dd, final_attempt);
                 dd
             };
@@ -2258,7 +2258,7 @@ pub fn transition_parent(
                 };
 
                 let snapshot = match resolve_task_file(
-                    &context.working_dir,
+                    context.filesystem_root(),
                     &context.tasks_dir_name,
                     &input.task_file,
                 ) {
@@ -2302,7 +2302,7 @@ pub fn transition_parent(
                         Some(ModeContext::Work { .. } | ModeContext::Branch { .. })
                     )
                     || (matches!(context.mode, ModeKind::Direct)
-                        && is_git_repository(&context.working_dir));
+                        && is_git_repository(context.filesystem_root()));
 
                 if is_explore {
                     let tool_result = ToolResult::success(
@@ -3134,7 +3134,7 @@ pub fn transition_sub_agent(
                     tr = tr.with_effect(Effect::persist_agent_message(
                         content,
                         Some(usage_data),
-                        &context.working_dir,
+                        context.filesystem_root(),
                         request_id,
                         final_attempt,
                     ));
@@ -3153,7 +3153,8 @@ pub fn transition_sub_agent(
                 if tool_calls.len() > 1 {
                     let msg =
                         "submit_result/submit_error must be the only tool in response".to_string();
-                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let display_data =
+                        compute_bash_display_data(&content, context.filesystem_root());
                     let assistant_message = AssistantMessage::new(
                         request_id.clone(),
                         content,
@@ -3183,7 +3184,7 @@ pub fn transition_sub_agent(
                         .with_effect(Effect::persist_agent_message(
                             content,
                             Some(usage_data),
-                            &context.working_dir,
+                            context.filesystem_root(),
                             request_id,
                             final_attempt,
                         ))
@@ -3202,7 +3203,7 @@ pub fn transition_sub_agent(
                         .with_effect(Effect::persist_agent_message(
                             content,
                             Some(usage_data),
-                            &context.working_dir,
+                            context.filesystem_root(),
                             request_id,
                             final_attempt,
                         ))
@@ -3244,7 +3245,7 @@ pub fn transition_sub_agent(
                     "propose_task is not available to sub-agents — task management is the \
                      parent conversation's job."
                         .to_string();
-                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let display_data = compute_bash_display_data(&content, context.filesystem_root());
                 let assistant_message = AssistantMessage::new(
                     request_id.clone(),
                     content,
@@ -3554,7 +3555,7 @@ fn handle_context_exhaustion(
             .with_effect(Effect::persist_agent_message(
                 blocks,
                 Some(usage_data),
-                &ctx.working_dir,
+                ctx.filesystem_root(),
                 request_id,
                 final_attempt,
             ))
@@ -3576,7 +3577,7 @@ fn handle_context_exhaustion(
             .with_effect(Effect::persist_agent_message(
                 blocks,
                 Some(usage_data),
-                &ctx.working_dir,
+                ctx.filesystem_root(),
                 request_id,
                 final_attempt,
             ))
@@ -4576,7 +4577,10 @@ mod tests {
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            execution_environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: PathBuf::from("/tmp"),
+                },
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 100_000,
@@ -4650,7 +4654,10 @@ mod tests {
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-cancel".to_string(),
             root_conversation_id: "test-root".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            execution_environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: PathBuf::from("/tmp"),
+                },
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 100_000,
@@ -4980,7 +4987,10 @@ mod tests {
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            execution_environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: PathBuf::from("/tmp"),
+                },
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
@@ -5094,7 +5104,10 @@ mod tests {
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            execution_environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: PathBuf::from("/tmp"),
+                },
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
@@ -5154,7 +5167,10 @@ mod tests {
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            execution_environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: PathBuf::from("/tmp"),
+                },
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
@@ -5221,7 +5237,10 @@ mod tests {
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
-            working_dir: PathBuf::from("/tmp"),
+            execution_environment:
+                phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                    working_dir: PathBuf::from("/tmp"),
+                },
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
@@ -6718,7 +6737,7 @@ mod tests {
                     );
                     assert_eq!(
                         input.approved_working_dir,
-                        context.working_dir.display().to_string()
+                        context.filesystem_root().display().to_string()
                     );
                     assert_eq!(input.approved_head.as_deref(), Some("head-sha"));
                     assert_eq!(input.approved_base.as_deref(), Some("base-sha"));

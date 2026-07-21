@@ -56,6 +56,8 @@ interface Props {
   /** The scope key to query (`work_scope_key` on the conversation, or the
    *  chain's active/latest member's scope key). */
   scopeKey: string;
+  /** Conversation whose authority filters inventory and lifecycle actions. */
+  conversationId: string;
   /** Live inventory from the conversation atom (SSE-fed). When provided it
    *  overrides the panel's initial fetch — it is at least as fresh. Omit on
    *  the chain page, which has no per-conversation push channel. */
@@ -200,20 +202,20 @@ function BrowserOpenButton() {
   );
 }
 
-function BrowserStopButton({ scopeKey, onStopped, onError }: { scopeKey: string; onStopped: () => void; onError: (message: string) => void }) {
+function BrowserStopButton({ scopeKey, conversationId, onStopped, onError }: { scopeKey: string; conversationId: string; onStopped: () => void; onError: (message: string) => void }) {
   const [stopping, setStopping] = useState(false);
   const stop = useCallback(async () => {
     if (stopping) return;
     setStopping(true);
     try {
-      await api.stopWorkScopeBrowserSession(scopeKey);
+      await api.stopWorkScopeBrowserSession(scopeKey, conversationId);
       onStopped();
     } catch (err) {
       onError(err instanceof Error ? err.message : 'Failed to stop browser session');
     } finally {
       setStopping(false);
     }
-  }, [scopeKey, stopping, onStopped, onError]);
+  }, [scopeKey, conversationId, stopping, onStopped, onError]);
 
   return (
     <button
@@ -330,6 +332,7 @@ function BrowserRow({
   state,
   idleMs,
   scopeKey,
+  conversationId,
   inspectable,
   onStopped,
   onError,
@@ -337,6 +340,7 @@ function BrowserRow({
   state: 'live' | 'torn_down';
   idleMs: number;
   scopeKey: string;
+  conversationId: string;
   inspectable: boolean;
   onStopped: () => void;
   onError: (message: string) => void;
@@ -358,7 +362,7 @@ function BrowserRow({
         <span className="ws-row-label">browser</span>
         <span className="ws-row-meta">{display.text}</span>
         {state === 'live' && inspectable && <BrowserOpenButton />}
-        {state === 'live' && <BrowserStopButton scopeKey={scopeKey} onStopped={onStopped} onError={onError} />}
+        {state === 'live' && <BrowserStopButton scopeKey={scopeKey} conversationId={conversationId} onStopped={onStopped} onError={onError} />}
       </div>
     </div>
   );
@@ -403,6 +407,7 @@ function BrowserRow({
  */
 function useWorkScopeInventory(
   scopeKey: string,
+  conversationId: string,
   liveInventory: WorkScopeInventory | null | undefined,
   pollActive: boolean,
   visible: boolean,
@@ -447,14 +452,14 @@ function useWorkScopeInventory(
     const requestedGen = sseGenRef.current;
     setError(false);
     try {
-      const inv = await api.getWorkScopeInventory(requestedKey);
+      const inv = await api.getWorkScopeInventory(requestedKey, conversationId);
       if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
       setDisplayed(inv);
     } catch {
       if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
       setError(true);
     }
-  }, []);
+  }, [conversationId]);
 
   // Initial pull (REQ-WSUI-006). Re-runs (and clears the stale snapshot) when
   // the scope key changes.
@@ -518,6 +523,7 @@ function WorkScopeBody({
   now,
   onRetry,
   scopeKey,
+  conversationId,
   inspectable,
 }: {
   inventory: WorkScopeInventory | null;
@@ -525,6 +531,7 @@ function WorkScopeBody({
   now: number;
   onRetry: () => void;
   scopeKey: string;
+  conversationId: string;
   /** Whether bash rows offer the "inspect" affordance. True only on the
    *  conversation page, where the meta-viewer slot is rendered to host the
    *  inspector; the chain-page dock has the slot context but no renderer, so
@@ -580,6 +587,7 @@ function WorkScopeBody({
                 state={inventory.browser.state}
                 idleMs={inventory.browser.idle_ms}
                 scopeKey={inventory.scope_key}
+                conversationId={conversationId}
                 inspectable={inspectable}
                 onStopped={refreshAfterStop}
                 onError={setActionError}
@@ -608,6 +616,7 @@ function summarizeWorkScope(inv: WorkScopeInventory | null, count: number): stri
 interface SectionProps {
   /** The scope key to query (`work_scope_key` on the conversation). */
   scopeKey: string;
+  conversationId: string;
   /** Live inventory from the conversation atom (SSE-fed). When provided it
    *  overrides the section's initial fetch — it is at least as fresh. */
   liveInventory?: WorkScopeInventory | null | undefined;
@@ -621,9 +630,10 @@ interface SectionProps {
  * the header + own-expand-state pattern of `SkillsPanel` / `TasksPanel`; the
  * dense resource body is the shared `WorkScopeBody`.
  */
-export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleExpanded }: SectionProps) {
+export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expanded, onToggleExpanded }: SectionProps) {
   const { inventory, error, now, retry } = useWorkScopeInventory(
     scopeKey,
+    conversationId,
     liveInventory,
     expanded,
     expanded,
@@ -643,7 +653,7 @@ export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleEx
       onToggle={() => onToggleExpanded(!expanded)}
     >
       <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>
-        <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} inspectable />
+        <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} conversationId={conversationId} inspectable />
       </div>
     </GroundingSection>
   );
@@ -654,7 +664,7 @@ export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleEx
  * no left explorer panel to host a section. Collapsed it is a single
  * live-count badge rail; expanded it shows the shared resource body.
  */
-export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, width }: Props) {
+export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collapsed, onToggle, width }: Props) {
   // An SSE-less surface (no `liveInventory`) must keep polling even while
   // collapsed so the count badge can settle: with no push channel, a resource
   // live at collapse and then exited/reaped would otherwise read as running
@@ -666,6 +676,7 @@ export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, w
   const pollActive = !collapsed || liveInventory == null;
   const { inventory, error, now, retry } = useWorkScopeInventory(
     scopeKey,
+    conversationId,
     liveInventory,
     pollActive,
     !collapsed,
@@ -715,7 +726,7 @@ export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, w
         <span className="ws-title">Work scope</span>
         <span className={`ws-count-badge${count > 0 ? ' ws-count-badge--active' : ''}`}>{count}</span>
       </div>
-      <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} inspectable={false} />
+      <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} conversationId={conversationId} inspectable={false} />
     </aside>
   );
 }

@@ -1716,8 +1716,9 @@ export const api = {
 
   /** Initial pull of a scope's work-affine resource inventory (REQ-WSUI-006).
    *  The live `work_scope_update` SSE event keeps it fresh afterwards. */
-  async getWorkScopeInventory(scopeKey: string): Promise<WorkScopeInventoryType> {
-    const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/inventory`);
+  async getWorkScopeInventory(scopeKey: string, conversationId: string): Promise<WorkScopeInventoryType> {
+    const query = new URLSearchParams({ conversation_id: conversationId });
+    const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/inventory?${query}`);
     if (!resp.ok) throw new Error('Failed to get work-scope inventory');
     return resp.json();
   },
@@ -1736,8 +1737,9 @@ export const api = {
   /** Terminate the live browser session owned by a work scope. Closing the
    *  viewer only hides UI; this calls the server-side session lifecycle path so
    *  browser_session_active and work-scope inventory update from server truth. */
-  async stopWorkScopeBrowserSession(scopeKey: string): Promise<{ success: boolean }> {
-    const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/browser-session`, {
+  async stopWorkScopeBrowserSession(scopeKey: string, conversationId: string): Promise<{ success: boolean }> {
+    const query = new URLSearchParams({ conversation_id: conversationId });
+    const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/browser-session?${query}`, {
       method: 'DELETE',
     });
     if (!resp.ok) throw new Error('Failed to stop browser session');
@@ -1752,11 +1754,13 @@ export const api = {
   async getBashHandleInspection(
     scopeKey: string,
     handleId: string,
+    conversationId: string,
     since?: number,
   ): Promise<BashHandleInspectionType> {
-    const query = since !== undefined ? `?since=${encodeURIComponent(since)}` : '';
+    const query = new URLSearchParams({ conversation_id: conversationId });
+    if (since !== undefined) query.set('since', String(since));
     const resp = await fetch(
-      `/api/work-scope/${encodeURIComponent(scopeKey)}/bash/${encodeURIComponent(handleId)}/inspect${query}`,
+      `/api/work-scope/${encodeURIComponent(scopeKey)}/bash/${encodeURIComponent(handleId)}/inspect?${query}`,
     );
     // 404 = the handle table no longer knows this id (e.g. lost after a
     // restart). A typed error lets the inspector stop polling and show a

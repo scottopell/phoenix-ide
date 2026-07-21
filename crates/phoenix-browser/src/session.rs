@@ -824,8 +824,13 @@ impl Drop for BrowserSessionGuard<'_> {
 pub async fn cascade_browser_on_delete(
     manager: &Arc<BrowserSessionManager>,
     work_scope: &ResourceScopeKey,
+    actor: &EffectiveResourceAccess,
     inheritor_scope: Option<&ResourceScopeKey>,
 ) {
+    if actor.authority() == ResourceAuthority::Restricted {
+        manager.kill_session_for_actor(work_scope, actor).await;
+        return;
+    }
     if inheritor_scope == Some(work_scope) {
         tracing::debug!(
             work_scope = %work_scope,
@@ -1323,6 +1328,17 @@ impl BrowserSessionManager {
         }))
     }
 
+    pub async fn request_kill_session_for_actor(
+        self: &Arc<Self>,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) {
+        let key = session_key(work_scope, actor);
+        let _ = self
+            .spawn_kill_session_by_key(key, work_scope.clone())
+            .await;
+    }
+
     /// Request session kill and return as soon as teardown has been queued.
     /// The session remains tracked as live until the spawned teardown task has
     /// actually terminated Chrome, removed the manager entry, and emitted the
@@ -1340,6 +1356,26 @@ impl BrowserSessionManager {
             let _ = self
                 .spawn_kill_session_by_key(key, work_scope.clone())
                 .await;
+        }
+    }
+
+    pub async fn kill_session_for_actor(
+        self: &Arc<Self>,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) {
+        let key = session_key(work_scope, actor);
+        match self
+            .spawn_kill_session_by_key(key, work_scope.clone())
+            .await
+        {
+            KillSessionOutcome::Absent => {}
+            KillSessionOutcome::Started(handle) => {
+                let _ = handle.await;
+            }
+            KillSessionOutcome::AlreadyRequested { key, done } => {
+                self.wait_for_kill_completion(&key, done).await;
+            }
         }
     }
 
@@ -1620,6 +1656,29 @@ mod lifecycle_hook_tests {
                 .await
                 .unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn actor_specific_stop_preserves_restricted_sibling_session() {
+        let (manager, _rx) = install_sink();
+        let shared = scope("shared-stop-scope");
+        let restricted_a =
+            EffectiveResourceAccess::new("explore-child-a", ResourceAuthority::Restricted);
+        let restricted_b =
+            EffectiveResourceAccess::new("explore-child-b", ResourceAuthority::Restricted);
+        manager
+            .get_session_for_actor(&shared, &restricted_a)
+            .await
+            .expect("first child session");
+        manager
+            .get_session_for_actor(&shared, &restricted_b)
+            .await
+            .expect("sibling session");
+
+        manager.kill_session_for_actor(&shared, &restricted_a).await;
+
+        assert!(!manager.is_active_for_actor(&shared, &restricted_a).await);
+        assert!(manager.is_active_for_actor(&shared, &restricted_b).await);
     }
 
     /// Test the full create-emit + kill-emit pair end-to-end using a

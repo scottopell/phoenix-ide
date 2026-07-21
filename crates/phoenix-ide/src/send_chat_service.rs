@@ -290,7 +290,6 @@ async fn expand_message(
     text: &str,
     policy: MessageExpansionPolicy,
 ) -> Result<ExpandedDispatchMessage, SendChatServiceError> {
-    let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
     let expanded = if policy == MessageExpansionPolicy::LiteralText
         || db
             .is_coordinator_conversation(conversation_id)
@@ -303,6 +302,7 @@ async fn expand_message(
             skill_invocation: None,
         }
     } else {
+        let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
         crate::message_expander::expand(text, &resolution_root).map_err(|error| {
             SendChatServiceError::Expansion {
                 message: error.to_string(),

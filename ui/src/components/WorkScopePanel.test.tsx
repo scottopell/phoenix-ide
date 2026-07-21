@@ -86,6 +86,7 @@ function sectionTree(props: { scopeKey: string; liveInventory?: WorkScopeInvento
           element={
             <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
               <WorkScopeSection
+              conversationId="conv-1"
                 scopeKey={props.scopeKey}
                 liveInventory={props.liveInventory ?? null}
                 expanded={true}
@@ -493,7 +494,7 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
 
     await act(async () => {
       render(
-        <WorkScopePanel scopeKey="ws-1" liveInventory={null} collapsed={true} onToggle={() => {}} />,
+        <WorkScopePanel conversationId="conv-1" scopeKey="ws-1" liveInventory={null} collapsed={true} onToggle={() => {}} />,
       );
     });
     await act(async () => {
@@ -555,6 +556,7 @@ function sectionCollapsedTree(props: { scopeKey: string; liveInventory?: WorkSco
           element={
             <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
               <WorkScopeSection
+              conversationId="conv-1"
                 scopeKey={props.scopeKey}
                 liveInventory={props.liveInventory ?? null}
                 expanded={false}
@@ -577,7 +579,7 @@ describe('inspect affordance + provider dependency', () => {
 
     await act(async () => {
       render(
-        <WorkScopePanel scopeKey="ws-1" liveInventory={null} collapsed={false} onToggle={() => {}} />,
+        <WorkScopePanel conversationId="conv-1" scopeKey="ws-1" liveInventory={null} collapsed={false} onToggle={() => {}} />,
       );
     });
     await act(async () => {
@@ -616,6 +618,7 @@ describe('browser open affordance (Phase 3)', () => {
             element={
               <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={true}>
                 <WorkScopeSection
+              conversationId="conv-1"
                   scopeKey="ws-1"
                   liveInventory={props.inventory}
                   expanded={true}
@@ -673,7 +676,7 @@ describe('browser open affordance (Phase 3)', () => {
       await Promise.resolve();
     });
 
-    expect(stopBrowser).toHaveBeenCalledWith('ws-1');
+    expect(stopBrowser).toHaveBeenCalledWith('ws-1', 'conv-1');
   });
 
   it('browser stop uses the live inventory scope rather than the requested prop scope', async () => {
@@ -696,7 +699,7 @@ describe('browser open affordance (Phase 3)', () => {
       await Promise.resolve();
     });
 
-    expect(stopBrowser).toHaveBeenCalledWith('worktree:/tmp/promoted');
+    expect(stopBrowser).toHaveBeenCalledWith('worktree:/tmp/promoted', 'conv-1');
   });
 
   it('stop failure is rendered visibly in the work-scope body', async () => {
@@ -745,6 +748,7 @@ describe('browser open affordance (Phase 3)', () => {
     await act(async () => {
       render(
         <WorkScopePanel
+          conversationId="conv-1"
           scopeKey="ws-1"
           liveInventory={liveBrowser}
           collapsed={false}
@@ -772,7 +776,7 @@ describe('useSeededLiveCount (collapsed-badge seed)', () => {
     scopeKey: string | null | undefined;
     live: WorkScopeInventory | null | undefined;
   }) {
-    const count = useSeededLiveCount(scopeKey, live);
+    const count = useSeededLiveCount(scopeKey, "conv-1", live);
     return <span data-testid="count">{count}</span>;
   }
 
@@ -786,7 +790,7 @@ describe('useSeededLiveCount (collapsed-badge seed)', () => {
       await Promise.resolve();
     });
 
-    expect(getInv).toHaveBeenCalledWith('ws-1');
+    expect(getInv).toHaveBeenCalledWith('ws-1', 'conv-1');
     expect(screen.getByTestId('count').textContent).toBe('1');
   });
 

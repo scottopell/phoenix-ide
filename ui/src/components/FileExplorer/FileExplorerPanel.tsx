@@ -188,7 +188,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   }, [loadGitStatus]);
 
   const currentTaskId = extractTaskId(branchName);
-  const workScopeCount = useSeededLiveCount(workScopeKey, liveWorkScope);
+  const workScopeCount = useSeededLiveCount(workScopeKey, conversationId, liveWorkScope);
   const liveAttentionCount = liveWorkScope ? workScopeLiveCount(liveWorkScope) : workScopeCount;
   const hasFileRoot = !!rootPath;
   const projectName = rootPath ? (rootPath.split('/').filter(Boolean).slice(-1)[0] || rootPath) : 'Read-only';
@@ -331,9 +331,10 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
             scrollTop={tasksScrollTop}
             onScrollTopChange={setTasksScrollTop}
           />
-          {workScopeKey && (
+          {workScopeKey && conversationId && (
             <WorkScopeSection
               scopeKey={workScopeKey}
+              conversationId={conversationId}
               liveInventory={liveWorkScope}
               expanded={workScopeExpanded}
               onToggleExpanded={setWorkScopeExpanded}

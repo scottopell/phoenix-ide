@@ -19,6 +19,13 @@ fn scope(id: &str) -> phoenix_core::work_scope::ResourceScopeKey {
     )
 }
 
+fn work_actor(id: &str) -> phoenix_core::work_scope::EffectiveResourceAccess {
+    phoenix_core::work_scope::EffectiveResourceAccess::new(
+        id,
+        phoenix_core::work_scope::ResourceAuthority::Work,
+    )
+}
+
 /// Check if Chrome is available or obtainable.
 ///
 /// `dev.py check` classifies the environment up front and sets internal
@@ -3169,7 +3176,13 @@ async fn cascade_preserves_when_inheritor_scope_matches() {
     assert!(manager.is_active(&scope).await);
 
     // Continuation inherits the same scope.
-    crate::browser::session::cascade_browser_on_delete(&manager, &scope, Some(&scope)).await;
+    crate::browser::session::cascade_browser_on_delete(
+        &manager,
+        &scope,
+        &work_actor("owner"),
+        Some(&scope),
+    )
+    .await;
 
     assert!(
         manager.is_active(&scope).await,
@@ -3199,7 +3212,13 @@ async fn cascade_tears_down_when_no_inheritor() {
     let _ = manager.get_session(&scope).await.expect("create");
     assert!(manager.is_active(&scope).await);
 
-    crate::browser::session::cascade_browser_on_delete(&manager, &scope, None).await;
+    crate::browser::session::cascade_browser_on_delete(
+        &manager,
+        &scope,
+        &work_actor("owner"),
+        None,
+    )
+    .await;
 
     assert!(
         !manager.is_active(&scope).await,
@@ -3223,7 +3242,13 @@ async fn cascade_tears_down_when_inheritor_scope_differs() {
     let _ = manager.get_session(&parent).await.expect("create parent");
     assert!(manager.is_active(&parent).await);
 
-    crate::browser::session::cascade_browser_on_delete(&manager, &parent, Some(&child)).await;
+    crate::browser::session::cascade_browser_on_delete(
+        &manager,
+        &parent,
+        &work_actor("owner"),
+        Some(&child),
+    )
+    .await;
 
     assert!(
         !manager.is_active(&parent).await,

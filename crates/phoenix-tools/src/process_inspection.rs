@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 
 use phoenix_core::domain::process_inspection::BashHandleInspection;
 use phoenix_core::domain::work_scope_inventory::BashHandleState;
-use phoenix_core::work_scope::ResourceScopeKey;
+use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceScopeKey};
 
 use crate::bash::handle::{Handle, HandleId, HandleState};
 use crate::bash::operations::{
@@ -52,6 +52,7 @@ pub async fn assemble_inspection(
     work_scope: &ResourceScopeKey,
     handle_id: &str,
     since: Option<u64>,
+    actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Option<InspectionAssembly> {
     let table = bash_handles.get_existing(work_scope).await?;
@@ -59,6 +60,11 @@ pub async fn assemble_inspection(
         .read()
         .await
         .get(&HandleId::new(handle_id.to_string()))?;
+    if actor.is_some_and(|access| {
+        !access.can_control(&handle.creator_conversation_id, handle.authority)
+    }) {
+        return None;
+    }
     Some(project_inspection(&handle, since).await)
 }
 
@@ -147,14 +153,40 @@ mod tests {
     async fn unknown_scope_or_handle_is_none() {
         let bash = Arc::new(BashHandleRegistry::new());
         // No table at all.
-        assert!(assemble_inspection(&scope(), "b-1", None, &bash)
+        assert!(assemble_inspection(&scope(), "b-1", None, None, &bash)
             .await
             .is_none());
         // Table exists but handle absent.
         let _ = bash.get_or_create(&scope()).await;
-        assert!(assemble_inspection(&scope(), "b-999", None, &bash)
+        assert!(assemble_inspection(&scope(), "b-999", None, None, &bash)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn restricted_actor_cannot_inspect_sibling_handle() {
+        use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority};
+
+        let bash = Arc::new(BashHandleRegistry::new());
+        let table = bash.get_or_create(&scope()).await;
+        table.write().await.insert(Handle::new_live_for_actor(
+            scope(),
+            HandleId::new("b-private"),
+            "sibling-b".into(),
+            ResourceAuthority::Restricted,
+            "secret".into(),
+            None,
+            1,
+            1,
+            RING_BUFFER_BYTES,
+        ));
+        let actor = EffectiveResourceAccess::new("sibling-a", ResourceAuthority::Restricted);
+
+        assert!(
+            assemble_inspection(&scope(), "b-private", None, Some(&actor), &bash)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -172,7 +204,7 @@ mod tests {
         );
         table.write().await.insert(handle);
 
-        let assembly = assemble_inspection(&scope(), "b-1", None, &bash)
+        let assembly = assemble_inspection(&scope(), "b-1", None, None, &bash)
             .await
             .expect("inspection");
         let inv = &assembly.inspection;
@@ -208,7 +240,7 @@ mod tests {
             .await;
         table.write().await.insert(handle);
 
-        let assembly = assemble_inspection(&scope(), "b-1", None, &bash)
+        let assembly = assemble_inspection(&scope(), "b-1", None, None, &bash)
             .await
             .expect("inspection");
         assert_eq!(
@@ -244,7 +276,7 @@ mod tests {
             .await;
         table.write().await.insert(handle);
 
-        let assembly = assemble_inspection(&scope(), "b-1", None, &bash)
+        let assembly = assemble_inspection(&scope(), "b-1", None, None, &bash)
             .await
             .expect("inspection");
         let inv = &assembly.inspection;
