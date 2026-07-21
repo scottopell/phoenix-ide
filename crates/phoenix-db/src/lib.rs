@@ -4397,15 +4397,59 @@ impl Database {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn accept_top_level_llm_product_once(
         &self,
         input: &AcceptTopLevelLlmProductInput,
     ) -> DbResult<AcceptTopLevelLlmProductOutcome> {
         let mut tx = self.pool.begin().await?;
+        let transition_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO workflow_sequences (workflow_id, sequence_name, next_value)
+             VALUES (?1, 'transition', 2)
+             ON CONFLICT(workflow_id, sequence_name)
+             DO UPDATE SET next_value = workflow_sequences.next_value + 1
+             RETURNING next_value - 1",
+        )
+        .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+        .fetch_one(&mut *tx)
+        .await?;
+        let workflow = sqlx::query(
+            "SELECT version, generation, status, snapshot_codec_family,
+                    snapshot_codec_version, snapshot_payload
+             FROM workflows WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+        .fetch_one(&mut *tx)
+        .await?;
+        let version: i64 = workflow.get("version");
+        sqlx::query(
+            "UPDATE workflows SET version = version + 1, updated_at = ?2
+             WHERE workflow_id = ?1 AND version = ?3 AND status = 'Active'",
+        )
+        .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+        .bind(Utc::now().timestamp_millis())
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO workflow_transitions
+             (workflow_id, transition_id, from_version, to_version, generation,
+              event_codec_family, event_codec_version, event_payload, committed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'llm.event', 1, X'7B7D', ?6)",
+        )
+        .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+        .bind(transition_id)
+        .bind(version)
+        .bind(version + 1)
+        .bind(workflow.get::<i64, _>("generation"))
+        .bind(Utc::now().timestamp_millis())
+        .execute(&mut *tx)
+        .await?;
         let accepted = sqlx::query(
             "UPDATE workflow_deliveries
-             SET status = 'Accepted', runtime_acceptance_status = 'Accepted'
-             WHERE workflow_id = ?1 AND delivery_id = ?2 AND receipt_id = ?3
+             SET status = 'Accepted', runtime_acceptance_status = 'Accepted',
+                 accepted_by_transition_id = ?3
+             WHERE workflow_id = ?1 AND delivery_id = ?2
                AND status = 'Pending' AND runtime_acceptance_status = 'Owed'
                AND EXISTS (
                    SELECT 1 FROM top_level_llm_workflows w
@@ -4419,21 +4463,18 @@ impl Database {
         .bind(i64::try_from(input.delivery_id.0).map_err(|_| {
             DbError::Serialization("delivery_id exceeds SQLite integer range".to_string())
         })?)
-        .bind(i64::try_from(input.receipt_id.0).map_err(|_| {
-            DbError::Serialization("receipt_id exceeds SQLite integer range".to_string())
-        })?)
+        .bind(transition_id)
         .execute(&mut *tx)
         .await?;
         if accepted.rows_affected() == 0 {
             let replay = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM workflow_deliveries d
-                 JOIN messages m ON m.message_id = ?4
-                 WHERE d.workflow_id = ?1 AND d.delivery_id = ?2 AND d.receipt_id = ?3
+                 JOIN messages m ON m.message_id = ?3
+                 WHERE d.workflow_id = ?1 AND d.delivery_id = ?2
                    AND d.status = 'Accepted' AND d.runtime_acceptance_status = 'Accepted'",
             )
             .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
             .bind(i64::try_from(input.delivery_id.0).unwrap_or(i64::MAX))
-            .bind(i64::try_from(input.receipt_id.0).unwrap_or(i64::MAX))
             .bind(&input.message.message_id)
             .fetch_one(&mut *tx)
             .await?
@@ -8961,8 +9002,9 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phoenix_core::domain::llm_types::ContentBlock;
     use phoenix_core::llm_language::LlmLanguage;
-    use phoenix_workflow::{Generation, Timestamp, WorkflowId};
+    use phoenix_workflow::{Generation, ProcessIncarnation, Timestamp, WorkflowId};
 
     fn direct_turn_snapshot() -> phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
         phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
@@ -11898,6 +11940,107 @@ mod tests {
                 .await
                 .unwrap(),
             DirectTurnRuntimeAdmissionOutcome::ExactReplay
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_product_acceptance_commits_message_state_delivery_and_tool_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-direct", "session", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        accepted_pending_direct_turn(&db).await;
+        let repo = WorkflowRepository::new(db.pool().clone());
+        repo.commit_direct_turn_runtime_admission(&DirectTurnRuntimeAdmissionInput {
+            workflow_id: WorkflowId(1),
+            conversation_id: "conv-direct".to_string(),
+            client_message_id: "msg-direct".to_string(),
+            generation: Generation(1),
+            disposition: DirectTurnCommittedOutcome::RuntimeAccepted,
+        })
+        .await
+        .unwrap();
+        let prepared = repo
+            .prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
+                workflow_id: WorkflowId(1),
+                committed_at: Timestamp(2),
+                process_incarnation: ProcessIncarnation(3),
+                prepared_request: phoenix_workflow::llm_profile::PreparedLlmRequest {
+                    codec_version: 1,
+                    request_fingerprint: "request".to_string(),
+                    provider: "test".to_string(),
+                    model: "test".to_string(),
+                    backend: "test".to_string(),
+                    request_aggregate: "{}".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        let receipt = repo
+            .accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
+                authority: prepared.authority,
+                delivery_id: None,
+                receipt_id: None,
+                response: phoenix_workflow::llm_profile::CompleteLlmResponse {
+                    codec_version: 1,
+                    response_fingerprint: "response".to_string(),
+                    response_aggregate: "{}".to_string(),
+                },
+                provider_request_id: Some("request-1".to_string()),
+                tool_intents: vec![ToolIntentRecord {
+                    intent_ordinal: 0,
+                    status: ToolIntentStatus::PendingAcceptance,
+                    tool_name: "bash".to_string(),
+                    tool_kind: ToolKindRecord::Function,
+                    tool_use_id: "tool-1".to_string(),
+                    arguments_json: "{}".to_string(),
+                }],
+            })
+            .await
+            .unwrap();
+        let receipt_id = receipt.llm_receipt.unwrap().receipt_id;
+        let delivery_id = receipt.delivery.unwrap().delivery_id;
+        let next_state = ConvState::Idle;
+        let input = AcceptTopLevelLlmProductInput {
+            workflow_id: WorkflowId(1),
+            delivery_id,
+            receipt_id,
+            message: Message {
+                message_id: "assistant-1".to_string(),
+                conversation_id: "conv-direct".to_string(),
+                sequence_id: 2,
+                message_type: MessageType::Agent,
+                content: MessageContent::agent(vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }]),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            next_state: next_state.clone(),
+            state_updated_at: Utc::now(),
+        };
+        assert_eq!(
+            db.accept_top_level_llm_product(&input).await.unwrap(),
+            AcceptTopLevelLlmProductOutcome::Committed
+        );
+        assert!(db.message_exists("assistant-1").await.unwrap());
+        assert_eq!(
+            db.get_conversation("conv-direct").await.unwrap().state,
+            next_state
+        );
+        assert_eq!(
+            repo.load_owed_top_level_llm_tool_intent("conv-direct", "tool-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .2
+                .status,
+            ToolIntentStatus::Owed
+        );
+        assert_eq!(
+            db.accept_top_level_llm_product(&input).await.unwrap(),
+            AcceptTopLevelLlmProductOutcome::ExactReplay
         );
     }
 
