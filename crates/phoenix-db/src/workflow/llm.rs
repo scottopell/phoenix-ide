@@ -247,11 +247,17 @@ pub struct OwedTopLevelLlmReceipt {
 }
 
 #[derive(Debug, Clone)]
+pub enum AcceptedTopLevelLlmProduct {
+    PersistedAssistant(Box<phoenix_core::domain::db_schema::Message>),
+    StateCheckpoint { conversation_id: String },
+}
+
+#[derive(Debug, Clone)]
 pub struct AcceptTopLevelLlmProductInput {
     pub workflow_id: WorkflowId,
     pub delivery_id: DeliveryId,
     pub receipt_id: ReceiptId,
-    pub message: phoenix_core::domain::db_schema::Message,
+    pub product: AcceptedTopLevelLlmProduct,
     pub next_state: phoenix_core::domain::sm_state::ConvState,
     pub state_updated_at: chrono::DateTime<chrono::Utc>,
 }

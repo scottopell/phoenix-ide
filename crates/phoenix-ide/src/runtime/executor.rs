@@ -2711,6 +2711,21 @@ where
                 None
             };
             let current_event = self.canonicalize_llm_response_event(current_event).await?;
+            if owed_llm_receipt.is_some()
+                && matches!(current_event, Event::LlmResponse { .. })
+                && matches!(self.state, ConvState::Idle)
+            {
+                let attempt = owed_llm_receipt
+                    .as_ref()
+                    .and_then(|owed| owed.receipt.attempt_id)
+                    .and_then(|attempt_id| u32::try_from(attempt_id.0).ok())
+                    .unwrap_or(1);
+                self.state = ConvState::LlmRequesting { attempt };
+                self.state_updated_at = Utc::now();
+                if let Some(state_watcher) = &self.state_watcher {
+                    let _ = state_watcher.send(self.state.clone());
+                }
+            }
             // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
                 if let ConvState::AwaitingSubAgents { ref pending, .. }
@@ -2836,23 +2851,49 @@ where
         owed: phoenix_db::OwedTopLevelLlmReceipt,
     ) -> Result<Vec<Event>, String> {
         let mut effects = result.effects.into_iter();
-        let Some(Effect::PersistMessage {
-            content,
-            display_data,
-            usage_data,
-            message_id,
-            idempotent: false,
-        }) = effects.next()
-        else {
-            return Err(
-                "durable LLM response did not begin with assistant persistence".to_string(),
-            );
+        let (product, persisted_message) = match effects.next() {
+            Some(Effect::PersistMessage {
+                content,
+                display_data,
+                usage_data,
+                message_id,
+                idempotent: false,
+            }) => {
+                if !matches!(effects.next(), Some(Effect::PersistState)) {
+                    return Err(
+                        "durable LLM response did not pair message and state persistence"
+                            .to_string(),
+                    );
+                }
+                let message = crate::db::Message {
+                    message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: self.broadcast_tx.next_seq(),
+                    message_type: content.message_type(),
+                    content,
+                    display_data,
+                    usage_data,
+                    created_at: Utc::now(),
+                };
+                (
+                    phoenix_db::AcceptedTopLevelLlmProduct::PersistedAssistant(Box::new(
+                        message.clone(),
+                    )),
+                    Some(message),
+                )
+            }
+            Some(Effect::PersistState) => (
+                phoenix_db::AcceptedTopLevelLlmProduct::StateCheckpoint {
+                    conversation_id: self.context.conversation_id.clone(),
+                },
+                None,
+            ),
+            _ => {
+                return Err(
+                    "durable LLM response did not begin with product persistence".to_string(),
+                );
+            }
         };
-        if !matches!(effects.next(), Some(Effect::PersistState)) {
-            return Err(
-                "durable LLM response did not pair message and state persistence".to_string(),
-            );
-        }
         let old_state = self.state.clone();
         let next_state = result.new_state;
         let state_updated_at = if next_state == old_state {
@@ -2860,23 +2901,13 @@ where
         } else {
             Utc::now()
         };
-        let message = crate::db::Message {
-            message_id,
-            conversation_id: self.context.conversation_id.clone(),
-            sequence_id: self.broadcast_tx.next_seq(),
-            message_type: content.message_type(),
-            content,
-            display_data,
-            usage_data,
-            created_at: Utc::now(),
-        };
         let outcome = self
             .storage
             .accept_top_level_llm_product(&phoenix_db::AcceptTopLevelLlmProductInput {
                 workflow_id: owed.workflow.workflow_id,
                 delivery_id: owed.delivery.delivery_id,
                 receipt_id: owed.receipt.receipt_id,
-                message: message.clone(),
+                product,
                 next_state: next_state.clone(),
                 state_updated_at,
             })
@@ -2895,7 +2926,9 @@ where
         if let Some(tx) = &self.state_watcher {
             let _ = tx.send(self.state.clone());
         }
-        let _ = self.broadcast_tx.send_message(message);
+        if let Some(message) = persisted_message {
+            let _ = self.broadcast_tx.send_message(message);
+        }
         let mut generated = Vec::new();
         for effect in effects {
             if let Some(event) = self.execute_effect(effect).await? {

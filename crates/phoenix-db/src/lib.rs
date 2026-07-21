@@ -4467,18 +4467,36 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         if accepted.rows_affected() == 0 {
-            let replay = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM workflow_deliveries d
-                 JOIN messages m ON m.message_id = ?3
-                 WHERE d.workflow_id = ?1 AND d.delivery_id = ?2
-                   AND d.status = 'Accepted' AND d.runtime_acceptance_status = 'Accepted'",
-            )
-            .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
-            .bind(i64::try_from(input.delivery_id.0).unwrap_or(i64::MAX))
-            .bind(&input.message.message_id)
-            .fetch_one(&mut *tx)
-            .await?
-                == 1;
+            let replay = match &input.product {
+                AcceptedTopLevelLlmProduct::PersistedAssistant(message) => {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM workflow_deliveries d
+                         JOIN messages m ON m.message_id = ?3
+                         WHERE d.workflow_id = ?1 AND d.delivery_id = ?2
+                           AND d.status = 'Accepted'
+                           AND d.runtime_acceptance_status = 'Accepted'",
+                    )
+                    .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(input.delivery_id.0).unwrap_or(i64::MAX))
+                    .bind(&message.message_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                        == 1
+                }
+                AcceptedTopLevelLlmProduct::StateCheckpoint { .. } => {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM workflow_deliveries
+                         WHERE workflow_id = ?1 AND delivery_id = ?2
+                           AND status = 'Accepted'
+                           AND runtime_acceptance_status = 'Accepted'",
+                    )
+                    .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(input.delivery_id.0).unwrap_or(i64::MAX))
+                    .fetch_one(&mut *tx)
+                    .await?
+                        == 1
+                }
+            };
             tx.rollback().await?;
             return Ok(if replay {
                 AcceptTopLevelLlmProductOutcome::ExactReplay
@@ -4486,10 +4504,16 @@ impl Database {
                 AcceptTopLevelLlmProductOutcome::StaleAuthority
             });
         }
-        insert_message_tx(&mut tx, &input.message).await?;
+        let conversation_id = match &input.product {
+            AcceptedTopLevelLlmProduct::PersistedAssistant(message) => {
+                insert_message_tx(&mut tx, message).await?;
+                &message.conversation_id
+            }
+            AcceptedTopLevelLlmProduct::StateCheckpoint { conversation_id } => conversation_id,
+        };
         update_conversation_state_at_tx(
             &mut tx,
-            &input.message.conversation_id,
+            conversation_id,
             &input.next_state,
             input.state_updated_at,
         )
@@ -12005,7 +12029,7 @@ mod tests {
             workflow_id: WorkflowId(1),
             delivery_id,
             receipt_id,
-            message: Message {
+            product: AcceptedTopLevelLlmProduct::PersistedAssistant(Box::new(Message {
                 message_id: "assistant-1".to_string(),
                 conversation_id: "conv-direct".to_string(),
                 sequence_id: 2,
@@ -12016,7 +12040,7 @@ mod tests {
                 display_data: None,
                 usage_data: None,
                 created_at: Utc::now(),
-            },
+            })),
             next_state: next_state.clone(),
             state_updated_at: Utc::now(),
         };

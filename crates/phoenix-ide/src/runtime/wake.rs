@@ -391,12 +391,6 @@ async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> R
                 continue;
             }
         };
-        if !matches!(
-            *handle.state_rx.borrow(),
-            crate::state_machine::ConvState::LlmRequesting { .. }
-        ) {
-            continue;
-        }
         let event = phoenix_core::domain::sm_event::Event::LlmResponse {
             tool_calls: durable
                 .response
