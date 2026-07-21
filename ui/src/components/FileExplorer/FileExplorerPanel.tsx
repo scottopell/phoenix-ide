@@ -57,14 +57,15 @@ function describeGitSummary(status: ConversationGitStatusResponse | null | undef
   switch (status.kind) {
     case 'snapshot': {
       const counts = status.counts;
-      if (counts.changed_paths === 0) return { summary: 'Workspace clean', attention: false };
+      const checkout = checkoutLabel(status.checkout_status);
+      if (counts.changed_paths === 0) return { summary: `${checkout} · clean`, attention: false };
       const parts = [
         `${counts.changed_paths} changed`,
         counts.staged_paths > 0 ? `${counts.staged_paths} staged` : null,
         counts.unstaged_paths > 0 ? `${counts.unstaged_paths} unstaged` : null,
         counts.untracked_paths > 0 ? `${counts.untracked_paths} untracked` : null,
       ].filter(Boolean);
-      return { summary: parts.join(' · '), count: counts.changed_paths, attention: counts.conflicted_paths > 0 };
+      return { summary: `${checkout} · ${parts.join(' · ')}`, count: counts.changed_paths, attention: counts.conflicted_paths > 0 };
     }
     case 'non_git':
       return { summary: 'Not a git workspace', attention: false };
@@ -275,6 +276,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
             <GroundingSection
               icon="Δ"
               title="Git"
+              {...(!gitExpanded ? { summary: gitSummary.summary } : {})}
               {...(gitSummary.count !== undefined ? { count: gitSummary.count } : {})}
               attention={gitSummary.attention}
               expanded={gitExpanded}

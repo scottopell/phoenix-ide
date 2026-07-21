@@ -129,6 +129,21 @@ describe('FileExplorerPanel grounding detail navigation', () => {
     expect(screen.getByRole('button', { name: 'Open Git diff' })).toBeInTheDocument();
   });
 
+  it('shows checkout and dirty state in the collapsed Git header only', async () => {
+    vi.mocked(api.getConversationGitStatus).mockResolvedValue({
+      kind: 'snapshot',
+      checkout_status: { kind: 'named_branch', branch_name: 'feature', head_oid: 'abc123', remote_status: { kind: 'no_known' } },
+      counts: { changed_paths: 2, staged_paths: 0, unstaged_paths: 1, untracked_paths: 1, conflicted_paths: 0 },
+      changed_paths: [],
+    });
+    renderPanel();
+    await screen.findByText('Changes not staged for commit');
+
+    expect(screen.getByText('Git').closest('button')).not.toHaveTextContent('feature · 2 changed');
+    fireEvent.click(screen.getByText('Git').closest('button')!);
+    expect(screen.getByText('Git').closest('button')).toHaveTextContent('feature · 2 changed · 1 unstaged · 1 untracked');
+  });
+
   it('shows the locally known upstream relationship', async () => {
     vi.mocked(api.getConversationGitStatus).mockResolvedValue({
       kind: 'snapshot',
