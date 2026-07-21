@@ -20,13 +20,6 @@ const ALLOWED_SCHEMA: &[&str] = &[
     "message_files",
     "message_images",
     "messages",
-    "message_fts",
-    "message_fts_content",
-    "message_fts_config",
-    "message_fts_data",
-    "message_fts_docsize",
-    "message_fts_idx",
-    "message_fts_rows",
     "projects",
     "steering_messages",
     "sub_agent_personas",
@@ -66,6 +59,7 @@ const DENIED_COLUMNS: &[(&str, &str)] = &[
     ("conversation_creation_jobs", "cleanup_token"),
     ("wake_bindings", "tmux_server_token"),
     ("wake_terminal_receipts", "tmux_server_token"),
+    ("workflow_external_acceptance_bindings", "idempotency_key"),
 ];
 
 const DENIED_TABLES: &[&str] = &[
@@ -278,9 +272,6 @@ unsafe extern "C" fn authorize(
             .zip(detail.as_deref())
             .is_some_and(|(table, column)| column_allowed(table, column)),
         ffi::SQLITE_FUNCTION => detail.as_deref().is_some_and(function_allowed),
-        ffi::SQLITE_PRAGMA => object
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case("data_version")),
         _ => false,
     };
     if allowed {
@@ -342,7 +333,6 @@ fn function_allowed(name: &str) -> bool {
             | "like"
             | "lower"
             | "ltrim"
-            | "match"
             | "max"
             | "min"
             | "nullif"
@@ -498,7 +488,7 @@ mod tests {
         let path = dir.path().join("query.db");
         let db = rusqlite_for_test(&path);
         db.execute_batch(
-            "CREATE TABLE conversations(id TEXT, state TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_executing\"}', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
+            "CREATE TABLE conversations(id TEXT, state TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             CREATE TABLE workflow_external_acceptance_bindings(id TEXT, idempotency_key TEXT, status TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_executing\"}', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
         )
         .unwrap();
         (dir, path)
@@ -569,6 +559,7 @@ mod tests {
             "SELECT * FROM auth_sessions",
             "SELECT * FROM future_secret_store",
             "SELECT claim_token FROM conversation_creation_jobs",
+            "SELECT idempotency_key FROM workflow_external_acceptance_bindings",
             "UPDATE conversations SET id = 'changed'",
             "ATTACH DATABASE '/tmp/other.db' AS other",
             "PRAGMA query_only",
@@ -618,16 +609,19 @@ mod tests {
     }
 
     #[test]
-    fn allows_fts_queries_through_required_shadow_reads() {
+    fn denies_fts_index_and_shadow_storage() {
         let (_dir, path) = fixture();
         let db = rusqlite_for_test(&path);
         db.execute_batch("CREATE VIRTUAL TABLE message_fts USING fts5(text); INSERT INTO message_fts(text) VALUES ('wake progress');").unwrap();
-        let result = execute_coordinator_query(
-            path.to_str().unwrap(),
+        for sql in [
             "SELECT text FROM message_fts WHERE message_fts MATCH 'wake'",
-        )
-        .unwrap();
-        assert_eq!(result.rows.len(), 1);
+            "SELECT c0 FROM message_fts_content",
+        ] {
+            assert!(matches!(
+                execute_coordinator_query(path.to_str().unwrap(), sql),
+                Err(CoordinatorQueryError::Denied(_))
+            ));
+        }
     }
 
     #[test]
