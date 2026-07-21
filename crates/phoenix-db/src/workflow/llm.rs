@@ -364,7 +364,11 @@ impl WorkflowRepository {
             .bind(&input.prepared_payload)
             .bind(direct_turn_outcome_to_str(&input.initial_outcome))
             .bind(to_i64(input.accepted_at.0, "accepted_at")?)
-            .bind(if input.initial_outcome == DirectTurnCommittedOutcome::PendingRuntime {
+            .bind(if matches!(
+                input.initial_outcome,
+                DirectTurnCommittedOutcome::PendingRuntime
+                    | DirectTurnCommittedOutcome::RuntimeAccepted
+            ) {
                 Some(1_i64)
             } else {
                 None
@@ -669,6 +673,75 @@ impl WorkflowRepository {
         })?;
         let version = Version(to_u64(workflow.get("version"), "version")?);
         let generation = Generation(to_u64(workflow.get("generation"), "generation")?);
+        if let Some(existing) = sqlx::query(
+            "SELECT e.effect_id, e.call_ordinal, pr.codec_version,
+                    pr.request_fingerprint, pr.provider, pr.model, pr.backend,
+                    pr.request_aggregate
+             FROM top_level_llm_effects e
+             JOIN top_level_llm_prepared_requests pr
+               ON pr.workflow_id = e.workflow_id AND pr.effect_id = e.effect_id
+             JOIN workflow_attempts a
+               ON a.workflow_id = e.workflow_id AND a.effect_id = e.effect_id
+             WHERE e.workflow_id = ?1
+               AND a.status IN ('AuthorityLost', 'ReceiptAccepted')
+               AND NOT EXISTS (
+                   SELECT 1 FROM top_level_llm_response_receipts rr
+                   WHERE rr.workflow_id = e.workflow_id AND rr.effect_id = e.effect_id
+               )
+               AND e.call_ordinal = (
+                   SELECT MAX(call_ordinal) FROM top_level_llm_effects
+                   WHERE workflow_id = ?1
+               )
+             ORDER BY a.attempt_id DESC LIMIT 1",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        {
+            let effect_id = EffectId(to_u64(existing.get("effect_id"), "effect_id")?);
+            let attempt_id = AttemptId(
+                tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Attempt)
+                    .await?,
+            );
+            sqlx::query(
+                "UPDATE workflow_effects SET status = 'Eligible'
+                 WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(effect_id.0, "effect_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
+            let begun = tx
+                .begin_attempt(&BeginAttemptInput {
+                    workflow_id: input.workflow_id,
+                    effect_id,
+                    attempt_id,
+                    process_incarnation: input.process_incarnation,
+                    now: input.committed_at,
+                    lease_until: None,
+                })
+                .await?;
+            let authority = begun.authority.ok_or_else(|| {
+                DbError::Serialization("retryable LLM effect was not claimable".to_string())
+            })?;
+            let prepared_request = TopLevelLlmPreparedRequestRecord {
+                workflow_id: input.workflow_id,
+                effect_id,
+                call_ordinal: to_u64(existing.get("call_ordinal"), "call_ordinal")?,
+                codec_version: to_u32(existing.get("codec_version"), "codec_version")?,
+                request_fingerprint: existing.get("request_fingerprint"),
+                provider: existing.get("provider"),
+                model: existing.get("model"),
+                backend: existing.get("backend"),
+                request_aggregate: existing.get("request_aggregate"),
+            };
+            let result = PreparedTopLevelLlmAttempt {
+                prepared_request,
+                authority,
+            };
+            tx.commit().await?;
+            return Ok(result);
+        }
         let snapshot: TopLevelLlmSnapshot =
             serde_json::from_slice(&workflow.get::<Vec<u8>, _>("snapshot_payload"))
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -1373,11 +1446,10 @@ impl WorkflowRepository {
              FROM workflows wf
              JOIN top_level_llm_workflows w ON w.workflow_id = wf.workflow_id
              JOIN direct_turn_acceptances dta ON dta.workflow_id = wf.workflow_id
-             JOIN top_level_llm_effects e ON e.workflow_id = wf.workflow_id
              WHERE dta.conversation_id = ?1
                AND dta.committed_outcome = 'RuntimeAccepted'
                AND wf.status = 'Active' AND w.stopped_at IS NULL
-             ORDER BY dta.accepted_at DESC, e.call_ordinal DESC LIMIT 1",
+             ORDER BY dta.accepted_at DESC LIMIT 1",
         )
         .bind(conversation_id)
         .fetch_optional(&self.pool)
@@ -1478,6 +1550,12 @@ impl WorkflowRepository {
             .execute(&mut *tx.tx)
             .await?;
             fence_tool_intents_for_stop(&mut tx, input.workflow_id).await?;
+            sqlx::query(
+                "UPDATE direct_turn_acceptances SET live_slot = NULL WHERE workflow_id = ?1",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
             tx.commit().await?;
             return Ok(CommitOutcome::Committed);
         }
@@ -1513,6 +1591,10 @@ impl WorkflowRepository {
             .execute(&mut *tx.tx)
             .await?;
         fence_tool_intents_for_stop(&mut tx, input.workflow_id).await?;
+        sqlx::query("UPDATE direct_turn_acceptances SET live_slot = NULL WHERE workflow_id = ?1")
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
         tx.commit().await?;
         Ok(CommitOutcome::Committed)
     }
@@ -2279,20 +2361,21 @@ mod tests {
         .await
         .unwrap();
 
+        let input = PrepareAndBeginTopLevelLlmInput {
+            workflow_id: WorkflowId(1),
+            committed_at: Timestamp(2),
+            process_incarnation: ProcessIncarnation(9),
+            prepared_request: PreparedLlmRequest {
+                codec_version: 1,
+                request_fingerprint: "request-fp".to_string(),
+                provider: "configured".to_string(),
+                model: "model".to_string(),
+                backend: "llm_client".to_string(),
+                request_aggregate: "{}".to_string(),
+            },
+        };
         let prepared = repo
-            .prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
-                workflow_id: WorkflowId(1),
-                committed_at: Timestamp(2),
-                process_incarnation: ProcessIncarnation(9),
-                prepared_request: PreparedLlmRequest {
-                    codec_version: 1,
-                    request_fingerprint: "request-fp".to_string(),
-                    provider: "configured".to_string(),
-                    model: "model".to_string(),
-                    backend: "llm_client".to_string(),
-                    request_aggregate: "{}".to_string(),
-                },
-            })
+            .prepare_and_begin_top_level_llm_attempt(&input)
             .await
             .unwrap();
 
@@ -2309,6 +2392,17 @@ mod tests {
             .unwrap(),
             AuthorityOutcome::Authorized
         );
+        let retry = repo
+            .prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
+                committed_at: Timestamp(4),
+                ..input
+            })
+            .await
+            .unwrap();
+        assert_eq!(retry.prepared_request.effect_id, EffectId(1));
+        assert_eq!(retry.prepared_request.call_ordinal, 0);
+        assert_eq!(retry.authority.effect_id, EffectId(1));
+        assert_eq!(retry.authority.attempt_id, AttemptId(2));
         assert!(repo
             .recover_top_level_llm_attempts(ProcessIncarnation(9))
             .await
@@ -2451,6 +2545,49 @@ mod tests {
             CompleteLlmResponsePersistenceOutcome::ExactReplay
         );
         assert_eq!(repo.list_receipts(WorkflowId(1)).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_before_first_effect_commits_and_releases_live_slot() {
+        let repo = open_repo().await;
+        let input = DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnCommittedOutcome::RuntimeAccepted,
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-1".to_string(),
+            prepared_fingerprint: "fp-1".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        };
+        assert!(matches!(
+            repo.accept_direct_turn(&input).await.unwrap(),
+            DirectTurnAcceptanceOutcome::Created(_)
+        ));
+
+        assert_eq!(
+            repo.stop_active_top_level_llm_for_conversation("conv-1", Timestamp(2))
+                .await
+                .unwrap(),
+            Some(CommitOutcome::Committed)
+        );
+
+        let next = DirectTurnAcceptanceInput {
+            client_message_id: "msg-2".to_string(),
+            prepared_fingerprint: "fp-2".to_string(),
+            accepted_at: Timestamp(3),
+            snapshot: TopLevelLlmSnapshot {
+                turn_ref: TopLevelTurnRef {
+                    accepted_turn_id: "msg-2".to_string(),
+                    ..snapshot().turn_ref
+                },
+                ..snapshot()
+            },
+            ..input
+        };
+        assert!(matches!(
+            repo.accept_direct_turn(&next).await.unwrap(),
+            DirectTurnAcceptanceOutcome::Created(_)
+        ));
     }
 
     #[tokio::test]

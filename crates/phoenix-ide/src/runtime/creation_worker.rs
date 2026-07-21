@@ -12,6 +12,7 @@ use fs2::FileExt;
 use phoenix_core::domain::creation_protocol::{
     CreationClaimToken, CreationStatus, CreationWorkerId,
 };
+use sha2::Digest as _;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -775,6 +776,66 @@ async fn provision_conversation(
             ErrorKind::ServerError,
         )
     })?;
+    let prepared_turn = phoenix_core::domain::sm_event::PreparedDirectTurn {
+        codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+        text: display_text.clone(),
+        llm_text: llm_text.clone(),
+        images: images.clone(),
+        files: files.clone(),
+        message_id: message_id.clone(),
+        user_agent: None,
+        skill_invocation: skill_invocation.clone(),
+    };
+    let prepared_payload = serde_json::to_string(&prepared_turn).map_err(|error| {
+        (
+            format!("failed to encode initial direct turn: {error}"),
+            ErrorKind::ServerError,
+        )
+    })?;
+    let prepared_fingerprint = sha2::Sha256::digest(prepared_payload.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        });
+    match phoenix_db::WorkflowRepository::new(manager.db().pool().clone())
+        .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+            initial_outcome: phoenix_db::DirectTurnCommittedOutcome::PendingRuntime,
+            conversation_id: job.conversation_id.clone(),
+            client_message_id: message_id.clone(),
+            prepared_fingerprint,
+            prepared_payload,
+            accepted_at: phoenix_workflow::Timestamp(
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+            ),
+            snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                    conversation_id: job.conversation_id.clone(),
+                    accepted_turn_id: message_id.clone(),
+                    generation: 0,
+                },
+                accepted_assistant_message_id: None,
+                stopped_at: None,
+            },
+        })
+        .await
+        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?
+    {
+        phoenix_db::DirectTurnAcceptanceOutcome::Created(_)
+        | phoenix_db::DirectTurnAcceptanceOutcome::Replayed(_) => {}
+        phoenix_db::DirectTurnAcceptanceOutcome::Conflict => {
+            return Err((
+                "initial direct-turn acceptance conflicted".to_string(),
+                ErrorKind::ServerError,
+            ));
+        }
+        phoenix_db::DirectTurnAcceptanceOutcome::RetryablePersistence => {
+            return Err((
+                "initial direct-turn acceptance is temporarily busy".to_string(),
+                ErrorKind::ServerError,
+            ));
+        }
+    }
     let event = Event::CreationProvisioned {
         job_id: job.id.clone(),
         claim: claim.clone(),

@@ -2518,6 +2518,35 @@ where
             }
         }
 
+        if !self.context.is_sub_agent
+            && matches!(outcome, EffectOutcome::Llm(LlmOutcome::Response { .. }))
+            && self
+                .storage
+                .owed_top_level_llm_receipt(&self.context.conversation_id)
+                .await?
+                .is_some()
+        {
+            let EffectOutcome::Llm(LlmOutcome::Response {
+                content,
+                tool_calls,
+                end_turn,
+                usage,
+                request_id,
+            }) = outcome
+            else {
+                unreachable!("guard requires an LLM response");
+            };
+            return self
+                .process_event(Event::LlmResponse {
+                    content,
+                    tool_calls,
+                    end_turn,
+                    usage,
+                    request_id,
+                })
+                .await;
+        }
+
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => r,
             Err(invalid) => {
@@ -2596,7 +2625,13 @@ where
         let owed_tool_use_ids: std::collections::HashSet<_> = owed
             .tool_intents
             .iter()
-            .filter(|intent| intent.status == phoenix_db::ToolIntentStatus::Owed)
+            .filter(|intent| {
+                matches!(
+                    intent.status,
+                    phoenix_db::ToolIntentStatus::PendingAcceptance
+                        | phoenix_db::ToolIntentStatus::Owed
+                )
+            })
             .map(|intent| intent.tool_use_id.as_str())
             .collect();
         Ok(Event::LlmResponse {
@@ -2632,8 +2667,12 @@ where
         &self,
         event: &Event,
     ) -> Result<Option<phoenix_db::PendingDirectTurnRuntimeAdmission>, String> {
-        let Event::UserMessage { message_id, .. } = event else {
-            return Ok(None);
+        let message_id = match event {
+            Event::UserMessage { message_id, .. } => message_id,
+            Event::CreationProvisioned {
+                initial_message, ..
+            } => &initial_message.message_id,
+            _ => return Ok(None),
         };
         self.storage
             .pending_direct_turn(&self.context.conversation_id, message_id)
@@ -2973,7 +3012,7 @@ where
             display_data,
             usage_data,
             message_id,
-            idempotent: false,
+            idempotent: _,
         }) = effects.next()
         else {
             return Err(

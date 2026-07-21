@@ -547,6 +547,22 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                 })
                 .await
                 .map_err(|error| error.to_string())?;
+                let handle = manager
+                    .get_or_create(&recovery.workflow.conversation_id)
+                    .await?;
+                if let Err(send_error) = handle
+                    .event_tx
+                    .send(phoenix_core::domain::sm_event::Event::LlmError {
+                        message: error.to_string(),
+                        error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidResponse,
+                        attempt: 1,
+                        recovery_in_progress: false,
+                        resets_at: None,
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %send_error, "recovered LLM error runtime channel closed");
+                }
             }
         }
     }
