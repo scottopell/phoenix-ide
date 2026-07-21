@@ -1597,11 +1597,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(phoenix_db::WorkflowRepository::new(db.pool().clone())
+        let pending_dispatch = phoenix_db::WorkflowRepository::new(db.pool().clone())
             .load_pending_direct_turns()
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert_eq!(pending_dispatch.len(), 1);
+        assert_eq!(
+            pending_dispatch[0].committed_outcome,
+            phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted
+        );
     }
 
     #[tokio::test]

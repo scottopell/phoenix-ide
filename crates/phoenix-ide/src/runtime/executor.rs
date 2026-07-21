@@ -3009,10 +3009,8 @@ where
             .storage
             .persist_direct_turn_runtime_acceptance(&acceptance)
             .await?;
-        if outcome == phoenix_db::DirectTurnRuntimeAdmissionOutcome::ExactReplay {
-            return Ok(vec![]);
-        }
-        if outcome != phoenix_db::DirectTurnRuntimeAdmissionOutcome::Committed {
+        let product_replay = outcome == phoenix_db::DirectTurnRuntimeAdmissionOutcome::ExactReplay;
+        if outcome != phoenix_db::DirectTurnRuntimeAdmissionOutcome::Committed && !product_replay {
             return Err(format!("durable direct turn admission failed: {outcome:?}"));
         }
         self.state = next_state;
@@ -3021,7 +3019,9 @@ where
         if let Some(tx) = &self.state_watcher {
             let _ = tx.send(self.state.clone());
         }
-        let _ = self.broadcast_tx.send_message(message);
+        if !product_replay {
+            let _ = self.broadcast_tx.send_message(message);
+        }
         let mut generated = Vec::new();
         for effect in effects {
             if let Some(event) = self.execute_effect(effect).await? {

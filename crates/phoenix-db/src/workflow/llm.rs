@@ -515,7 +515,17 @@ impl WorkflowRepository {
              FROM direct_turn_acceptances a
              JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
              WHERE a.conversation_id = ?1 AND a.client_message_id = ?2
-               AND a.committed_outcome = 'PendingRuntime' AND w.stopped_at IS NULL",
+               AND (
+                   a.committed_outcome = 'PendingRuntime'
+                   OR (
+                       a.committed_outcome = 'RuntimeAccepted'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM top_level_llm_effects e
+                           WHERE e.workflow_id = a.workflow_id
+                       )
+                   )
+               )
+               AND w.stopped_at IS NULL",
         )
         .bind(conversation_id)
         .bind(client_message_id)
@@ -534,7 +544,22 @@ impl WorkflowRepository {
 
     pub async fn load_pending_direct_turns(&self) -> DbResult<Vec<DirectTurnAcceptanceRecord>> {
         let rows = sqlx::query(
-            "SELECT conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at FROM direct_turn_acceptances WHERE committed_outcome = 'PendingRuntime' ORDER BY accepted_at, conversation_id, client_message_id",
+            "SELECT a.conversation_id, a.client_message_id, a.workflow_id,
+                    a.prepared_fingerprint, a.prepared_payload, a.committed_outcome, a.accepted_at
+             FROM direct_turn_acceptances a
+             JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
+             WHERE (
+                 a.committed_outcome = 'PendingRuntime'
+                 OR (
+                     a.committed_outcome = 'RuntimeAccepted'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM top_level_llm_effects e
+                         WHERE e.workflow_id = a.workflow_id
+                     )
+                 )
+             )
+               AND w.stopped_at IS NULL
+             ORDER BY a.accepted_at, a.conversation_id, a.client_message_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1961,6 +1986,27 @@ mod tests {
             .unwrap(),
             DirectTurnRuntimeAdmissionOutcome::Conflict
         );
+        assert_eq!(repo.load_pending_direct_turns().await.unwrap().len(), 1);
+        assert!(repo
+            .load_pending_direct_turn_runtime_admission("conv-1", "msg-1")
+            .await
+            .unwrap()
+            .is_some());
+        repo.prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
+            workflow_id: WorkflowId(1),
+            committed_at: Timestamp(3),
+            process_incarnation: ProcessIncarnation(7),
+            prepared_request: PreparedLlmRequest {
+                codec_version: 1,
+                request_fingerprint: "req-1".to_string(),
+                provider: "mock".to_string(),
+                model: "mock".to_string(),
+                backend: "mock".to_string(),
+                request_aggregate: "{}".to_string(),
+            },
+        })
+        .await
+        .unwrap();
         assert!(repo.load_pending_direct_turns().await.unwrap().is_empty());
         let mut conflict = input.clone();
         conflict.prepared_fingerprint = "fp-2".to_string();
