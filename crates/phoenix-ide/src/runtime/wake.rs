@@ -353,6 +353,19 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                 ))
             }
             InspectionOutcome::Terminal(evidence) => {
+                let evidence_time = match &evidence {
+                    WakeTerminalEvidence::Bash(evidence) => evidence.occurred_at,
+                    WakeTerminalEvidence::TmuxWindow(evidence) => evidence.occurred_at,
+                    WakeTerminalEvidence::Subagent(evidence) => evidence.occurred_at,
+                };
+                if evidence_time.0 > candidate.expires_at.0 {
+                    let _ = self
+                        .repo
+                        .release_observation_authority(&authority)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(Duration::ZERO);
+                }
                 let observation_time = self.clock.now();
                 let outcome = self
                     .repo
@@ -1480,6 +1493,44 @@ mod tests {
         );
 
         assert_eq!(worker.run_once().await.unwrap(), LIVE_HANDLE_POLL_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn post_expiry_terminal_evidence_yields_to_expiry() {
+        let (_db, repo) = open_repo().await;
+        register_bash(&repo, "b-1", 12).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            1,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: conv_scope(),
+                    handle_id: "b-1".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(13),
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec![],
+            })),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(14)),
+            ProcessIncarnation(1),
+        );
+
+        worker.run_once().await.unwrap();
+
+        let pending = repo.list_pending("conv").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Expired { .. }
+        ));
     }
 
     #[tokio::test]

@@ -1049,6 +1049,7 @@ impl ToolRegistry {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
         tools.push(Arc::new(SandboxedBashTool));
+        tools.push(Arc::new(WaitUntilTool));
         if policy.allow_top_level_spawn_agents() {
             tools.extend(parent_coordination_tools(agents, model_ids));
         } else {
@@ -1100,6 +1101,7 @@ impl ToolRegistry {
         let mut tools = read_only_tools();
         tools.push(Arc::new(SandboxedBashTool));
         tools.extend(browser_tools());
+        tools.push(Arc::new(WaitUntilTool));
         tools.extend(sub_agent_terminal_tools());
         Self { tools }
     }
@@ -1372,6 +1374,17 @@ mod tests {
     /// `read_only_tools()` in tools.rs will automatically propagate it to
     /// every mode and keep this test passing; forgetting to add it to a
     /// specific constructor will fail this test.
+    #[test]
+    fn sandboxed_explore_modes_include_wait_until() {
+        assert!(names(&ToolRegistry::explore(
+            "tasks",
+            Vec::new(),
+            sandbox_policy()
+        ))
+        .contains("wait_until"));
+        assert!(names(&ToolRegistry::for_subagent_explore(sandbox_policy())).contains("wait_until"));
+    }
+
     #[test]
     fn registry_mode_matrix_read_only_tools_everywhere() {
         let read_only_expected: BTreeSet<&str> = [

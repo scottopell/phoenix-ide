@@ -969,7 +969,11 @@ fn handle_core_tool_complete(
         unreachable!("handle_core_tool_complete called in non-ToolExecuting state");
     };
 
-    let event_requests_park = matches!(&event, CoreEvent::ToolCompleteAndPark { .. });
+    let event_requests_park = matches!(
+        &event,
+        CoreEvent::ToolCompleteAndPark { result, .. }
+            if matches!(result.outcome, phoenix_core::domain::db_schema::ToolOutcome::Success { .. })
+    );
 
     match event {
         // ToolComplete/ToolCompleteAndPark (more tools remaining) -> next tool
@@ -5463,6 +5467,55 @@ mod tests {
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn failed_park_result_does_not_park_after_successful_sibling() {
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::{db_schema::ToolResult, llm_types::ContentBlock};
+
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![
+                ContentBlock::tool_use("tool-1", "wait_until", serde_json::json!({})),
+                ContentBlock::tool_use("tool-2", "bash", serde_json::json!({})),
+            ],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "tool-1",
+                ToolInput::Unknown {
+                    name: "wait_until".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ),
+            remaining_tools: vec![ToolCall::new(
+                "tool-2",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("true")),
+            )],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message,
+            park_after_tool_round: false,
+        };
+        let first = transition(
+            &state,
+            &test_context(),
+            Event::ToolCompleteAndPark {
+                tool_use_id: "tool-1".to_string(),
+                result: ToolResult::error("tool-1".to_string(), "registration failed".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            first.new_state,
+            ConvState::ToolExecuting {
+                park_after_tool_round: false,
+                ..
+            }
+        ));
     }
 
     #[test]

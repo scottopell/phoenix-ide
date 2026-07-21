@@ -3736,16 +3736,34 @@ fn evidence_occurred_at(evidence: &WakeTerminalEvidence) -> Timestamp {
     }
 }
 
+fn work_scope_matches_terminal_evidence(
+    expected: &wake_types::WorkScopeIdentity,
+    actual: &wake_types::WorkScopeIdentity,
+) -> bool {
+    expected == actual
+        || (expected.kind == wake_types::WorkScopeKind::Conversation
+            && actual.kind == wake_types::WorkScopeKind::Conversation)
+}
+
 fn resource_matches_evidence(
     resource: &WakeResourceIdentity,
     evidence: &WakeTerminalEvidence,
 ) -> bool {
     match (resource, evidence) {
         (WakeResourceIdentity::Bash(expected), WakeTerminalEvidence::Bash(actual)) => {
-            &actual.identity == expected
+            actual.identity.handle_id == expected.handle_id
+                && work_scope_matches_terminal_evidence(
+                    &expected.work_scope,
+                    &actual.identity.work_scope,
+                )
         }
         (WakeResourceIdentity::TmuxWindow(expected), WakeTerminalEvidence::TmuxWindow(actual)) => {
-            &actual.identity == expected
+            actual.identity.server_token == expected.server_token
+                && actual.identity.window_id == expected.window_id
+                && work_scope_matches_terminal_evidence(
+                    &expected.work_scope,
+                    &actual.identity.work_scope,
+                )
         }
         (WakeResourceIdentity::Subagent(_), WakeTerminalEvidence::Subagent(_)) => {
             unreachable!("subagent wake bindings not implemented")
