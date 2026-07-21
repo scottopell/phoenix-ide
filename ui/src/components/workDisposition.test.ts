@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import type {
   PrStatusResponse,
   PrDisplayState,
@@ -8,6 +8,8 @@ import type {
 } from '../api';
 import {
   deriveWorkDisposition,
+  type DispositionNote,
+  type ResolveVerb,
   type WorkDispositionInput,
   type WorkDisposition,
 } from './workDisposition';
@@ -444,115 +446,52 @@ describe('idle terminal dispositions', () => {
 // --- Structural invariants ------------------------------------------------
 
 describe('structural invariants', () => {
-  // Enumerate a broad matrix of inputs and assert structural invariants on each.
-  const displayStates: (PrDisplayState | undefined)[] = ['open', 'draft', 'merged', 'closed', undefined];
-  const checkStates: (PrCheckState | undefined)[] = ['passing', 'pending', 'failing', 'unknown', undefined];
-  const refreshStates: PrRefreshState[] = ['fresh', 'unavailable', 'not_found'];
+  it('makes hidden bars incompatible with visible actions', () => {
+    type Hidden = Extract<WorkDisposition, { visible: false }>;
+    type InvalidHiddenResolve = Extract<Hidden, { primary: 'resolve' }>;
 
-  function* matrix(): Generator<WorkDispositionInput> {
-    for (const convModeLabel of ['Work', 'Branch', 'Explore', undefined]) {
-      for (const phaseType of ['idle', 'error', 'awaiting_llm', 'context_exhausted']) {
-        for (const continuedInConvId of [null, 'conv-x']) {
-          for (const prLoading of [false, true]) {
-            for (const canSendMessage of [false, true]) {
-              for (const found of [false, true]) {
-                for (const display_state of displayStates) {
-                  for (const check_state of checkStates) {
-                    for (const rs of refreshStates) {
-                      // null prStatus permutation (e.g. loading / disabled)
-                      const base: WorkDispositionInput = {
-                        convModeLabel,
-                        phaseType,
-                        continuedInConvId,
-                        prStatus: null,
-                        prLoading,
-                        workChange: cleanWorkChange(),
-                        canSendMessage,
-                      };
-                      yield base;
-
-                      const pr: PrStatusResponse = found
-                        ? {
-                            found: true,
-                            number: PR_NUMBER,
-                            url: PR_URL,
-                            ...(display_state ? { display_state } : {}),
-                            ...(check_state ? { check_state } : {}),
-                            refresh: refresh(rs),
-                            work_change: cleanWorkChange(),
-                          }
-                        : { found: false, refresh: refresh(rs), work_change: cleanWorkChange() };
-                      yield { ...base, prStatus: pr };
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  it('always returns exactly one primary and never throws', () => {
-    const valid: WorkDisposition['primary'][] = ['none', 'review', 'resolve', 'clean_up', 'abandon'];
-    let count = 0;
-    for (const inp of matrix()) {
-      count++;
-      const d = deriveWorkDisposition(inp);
-      expect(valid).toContain(d.primary);
-    }
-    expect(count).toBeGreaterThan(1000);
+    expectTypeOf<Hidden['primary']>().toEqualTypeOf<'none'>();
+    expectTypeOf<Hidden['resolve']>().toEqualTypeOf<null>();
+    expectTypeOf<Hidden['showCleanUp']>().toEqualTypeOf<false>();
+    expectTypeOf<Hidden['showAbandon']>().toEqualTypeOf<false>();
+    expectTypeOf<Hidden['note']>().toEqualTypeOf<null>();
+    expectTypeOf<InvalidHiddenResolve>().toEqualTypeOf<never>();
   });
 
-  it('resolve is non-null iff primary === resolve', () => {
-    for (const inp of matrix()) {
-      const d = deriveWorkDisposition(inp);
-      expect(d.resolve !== null).toBe(d.primary === 'resolve');
-    }
+  it('couples resolve primaries to their verbs', () => {
+    type ResolveDisposition = Extract<WorkDisposition, { primary: 'resolve' }>;
+    type NonResolveDisposition = Exclude<WorkDisposition, ResolveDisposition>;
+
+    expectTypeOf<ResolveDisposition['resolve']>().toEqualTypeOf<ResolveVerb>();
+    expectTypeOf<NonResolveDisposition['resolve']>().toEqualTypeOf<null>();
   });
 
-  it('secondaryResolve, when present, rides only beside an address_feedback primary', () => {
-    for (const inp of matrix()) {
-      const d = deriveWorkDisposition(inp);
-      if (d.secondaryResolve !== null) {
-        expect(d.primary).toBe('resolve');
-        expect(d.resolve?.kind).toBe('address_feedback');
-        // It is always a GitHub link-out, never a second address button.
-        expect(['merge_pr', 'open_pr']).toContain(d.secondaryResolve.kind);
-      }
-    }
+  it('allows link-only secondaries beside address feedback', () => {
+    type AddressFeedback = Extract<WorkDisposition, { resolve: { kind: 'address_feedback' } }>;
+    type OtherDispositions = Exclude<WorkDisposition, AddressFeedback>;
+    type PrLink = Extract<ResolveVerb, { kind: 'merge_pr' | 'open_pr' }>;
+
+    expectTypeOf<AddressFeedback['secondaryResolve']>().toEqualTypeOf<PrLink | null>();
+    expectTypeOf<OtherDispositions['secondaryResolve']>().toEqualTypeOf<null>();
   });
 
-  it('hidden bars carry safe defaults', () => {
-    for (const inp of matrix()) {
-      const d = deriveWorkDisposition(inp);
-      if (!d.visible) {
-        expect(d.primary).toBe('none');
-        expect(d.resolve).toBeNull();
-        expect(d.showCleanUp).toBe(false);
-        expect(d.note).toBeNull();
-      }
-    }
+  it('makes continued the only visible disposition without Abandon', () => {
+    type VisibleWithoutAbandon = Extract<WorkDisposition, { visible: true; showAbandon: false }>;
+
+    expectTypeOf<VisibleWithoutAbandon['primary']>().toEqualTypeOf<'none'>();
+    expectTypeOf<VisibleWithoutAbandon['note']>().toEqualTypeOf<
+      Extract<DispositionNote, { kind: 'continued' }>
+    >();
   });
 
-  it('Abandon is hidden (on a visible bar) only in the continued case', () => {
-    for (const inp of matrix()) {
-      const d = deriveWorkDisposition(inp);
-      if (d.visible && !d.showAbandon) {
-        expect(d.note?.kind).toBe('continued');
-        expect(d.primary).toBe('none');
-      }
-    }
-  });
+  it('restricts gh-unavailable notes to Clean up', () => {
+    type CleanUp = Extract<WorkDisposition, { primary: 'clean_up' }>;
+    type OtherDispositions = Exclude<WorkDisposition, CleanUp>;
 
-  it('gh_unavailable notes only appear with Clean up visible', () => {
-    for (const inp of matrix()) {
-      const d = deriveWorkDisposition(inp);
-      if (d.note?.kind === 'gh_unavailable') {
-        expect(d.showCleanUp).toBe(true);
-        expect(d.primary).toBe('clean_up');
-      }
-    }
+    expectTypeOf<CleanUp['note']>().toEqualTypeOf<
+      Extract<DispositionNote, { kind: 'gh_unavailable' }> | null
+    >();
+    expectTypeOf<Extract<NonNullable<OtherDispositions['note']>, { kind: 'gh_unavailable' }>>()
+      .toEqualTypeOf<never>();
   });
 });

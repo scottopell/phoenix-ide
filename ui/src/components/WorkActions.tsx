@@ -172,8 +172,6 @@ export function WorkControlBar({
   });
 
   const isBranch = convModeLabel === 'Branch';
-  const primaryClass = (role: 'review' | 'resolve' | 'clean_up' | 'abandon') =>
-    disposition.primary === role ? ' work-actions-btn--primary' : '';
 
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
   const coverageMarker = prStatus ? prFeedbackCoverageMarker(prStatus) : null;
@@ -269,6 +267,9 @@ export function WorkControlBar({
   };
 
   if (!disposition.visible) return null;
+
+  const primaryClass = (role: 'review' | 'resolve' | 'clean_up' | 'abandon') =>
+    disposition.primary === role ? ' work-actions-btn--primary' : '';
 
   const terminalActionStillSafe = async (): Promise<boolean> => {
     const latest = await prStatusHandle.refresh();
@@ -397,7 +398,7 @@ export function WorkControlBar({
               <button type="button" className="mobile-pr-action mobile-pr-action--workspace" aria-label="Workspace diff" onClick={() => openDiffFullscreen('workspace')}>
                 <span className="mobile-pr-action-icon" aria-hidden="true">▱</span><span>Workspace</span>
               </button>
-              {disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
+              {disposition.secondaryResolve && (
                 <a
                   className="mobile-pr-action mobile-pr-action--external"
                   href={disposition.secondaryResolve.url}
@@ -548,7 +549,7 @@ export function WorkControlBar({
         {!prStatusHandle.ambiguous && disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
           <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
         )}
-        {!prStatusHandle.ambiguous && disposition.secondaryResolve && disposition.secondaryResolve.kind !== 'address_feedback' && (
+        {!prStatusHandle.ambiguous && disposition.secondaryResolve && (
           <ResolveLink verb={disposition.secondaryResolve} primary={false} coverageMarker={coverageMarker} />
         )}
         {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
