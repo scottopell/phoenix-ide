@@ -2982,6 +2982,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn migration_058_adds_typed_effort_and_usage_columns() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY);\
+             CREATE TABLE turn_usage (id INTEGER PRIMARY KEY);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_058).execute(&pool).await.unwrap();
+
+        let conversation_columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("name"))
+            .collect();
+        assert!(conversation_columns.iter().any(|column| column == "effort"));
+
+        let usage_columns: Vec<String> = sqlx::query("PRAGMA table_info(turn_usage)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("name"))
+            .collect();
+        for expected in ["reasoning_tokens", "effort_source", "effort_level"] {
+            assert!(usage_columns.iter().any(|column| column == expected));
+        }
+
+        sqlx::query("INSERT INTO turn_usage (id) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = sqlx::query(
+            "SELECT reasoning_tokens, effort_source, effort_level FROM turn_usage WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("reasoning_tokens"), 0);
+        assert_eq!(row.get::<String, _>("effort_source"), "native_unknown");
+        assert_eq!(row.get::<Option<String>, _>("effort_level"), None);
+
+        sqlx::query("INSERT INTO conversations (id) VALUES ('c')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query("UPDATE conversations SET effort = 'nonsense'")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(
+            sqlx::query("UPDATE turn_usage SET effort_source = 'nonsense' WHERE id = 1")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
     async fn setup_workflow_only_schema(pool: &SqlitePool) {
         sqlx::raw_sql(
             "CREATE TABLE conversations (\

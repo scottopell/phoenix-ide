@@ -257,8 +257,11 @@ impl LoggingService {
             root_conv_id = telemetry.map(|value| value.root_conversation_id.as_str()),
             request_id,
             retry_attempt = telemetry.map_or(1, |value| value.retry_attempt),
+            effort_source = telemetry.map(|value| value.effective_effort.source.as_str()),
+            effort_level = telemetry.and_then(|value| value.effective_effort.level.map(ModelEffort::as_wire_name)),
             input_tokens = tracing::field::Empty,
             output_tokens = tracing::field::Empty,
+            reasoning_tokens = tracing::field::Empty,
             cache_read_tokens = tracing::field::Empty,
             cache_creation_tokens = tracing::field::Empty,
             error.kind = tracing::field::Empty,
@@ -363,6 +366,7 @@ impl LoggingService {
             Ok(response) => {
                 span.record("input_tokens", response.usage.input_tokens);
                 span.record("output_tokens", response.usage.output_tokens);
+                span.record("reasoning_tokens", response.usage.reasoning_tokens);
                 span.record("cache_read_tokens", response.usage.cache_read_tokens);
                 span.record(
                     "cache_creation_tokens",

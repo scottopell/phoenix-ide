@@ -1944,6 +1944,7 @@ mod conversation_serde_tests {
             transcript_generation: 1,
             model: None,
             project_id: None,
+            effort: None,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,

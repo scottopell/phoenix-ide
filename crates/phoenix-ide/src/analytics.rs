@@ -61,6 +61,7 @@ impl AnalyticsFidelity {
 pub struct TokenTotals {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub reasoning_tokens: i64,
     pub cache_creation_tokens: i64,
     pub cache_read_tokens: i64,
 }
@@ -71,6 +72,8 @@ pub struct AnalyticsUsageTurn {
     pub conversation_id: String,
     pub root_conversation_id: String,
     pub model: String,
+    pub effort_source: phoenix_core::domain::llm_types::EffortSource,
+    pub effort_level: Option<phoenix_core::domain::llm_types::ModelEffort>,
     pub created_at: DateTime<Utc>,
     pub first_byte_at: Option<DateTime<Utc>>,
     pub first_byte_latency_ms: Option<u64>,
@@ -219,6 +222,7 @@ fn project_usage_turns(
             let tokens = TokenTotals {
                 input_tokens: r.input_tokens,
                 output_tokens: r.output_tokens,
+                reasoning_tokens: r.reasoning_tokens,
                 cache_creation_tokens: r.cache_creation_tokens,
                 cache_read_tokens: r.cache_read_tokens,
             };
@@ -227,6 +231,8 @@ fn project_usage_turns(
                 conversation_id: r.conversation_id.clone(),
                 root_conversation_id: r.root_conversation_id.clone(),
                 model: r.model.clone(),
+                effort_source: r.effort_source,
+                effort_level: r.effort_level,
                 created_at,
                 first_byte_at,
                 first_byte_latency_ms,

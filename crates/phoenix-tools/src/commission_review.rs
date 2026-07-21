@@ -459,6 +459,10 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 request_id: uuid::Uuid::new_v4().to_string(),
                 retry_attempt: 1,
                 attempt_capture: attempt_capture.clone(),
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort {
+                    source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
+                    level: None,
+                },
             }),
             cache_key: PromptCacheKey::stable(format!(
                 "commission-review:{}:{index}",
@@ -3136,6 +3140,7 @@ mod tests {
                 usage: phoenix_core::domain::llm_types::Usage {
                     input_tokens: 10,
                     output_tokens: 20,
+                    reasoning_tokens: 0,
                     cache_creation_tokens: 30,
                     cache_read_tokens: 40,
                 },

@@ -174,6 +174,7 @@ pub struct LlmRequestTelemetry {
     pub request_id: String,
     pub retry_attempt: u32,
     pub attempt_capture: LlmAttemptCapture,
+    pub effective_effort: EffectiveEffort,
 }
 
 /// Content-free summary of a provider streaming attempt.

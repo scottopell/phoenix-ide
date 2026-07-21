@@ -4914,6 +4914,7 @@ where
                     request_id: request_id.clone(),
                     retry_attempt,
                     attempt_capture: attempt_capture.clone(),
+                    effective_effort,
                 }),
                 // Every turn in a conversation reuses the same prefix
                 // (system prompt + earlier turns), so all turns share one key.
@@ -5732,6 +5733,10 @@ where
                     request_id,
                     retry_attempt,
                     attempt_capture: attempt_capture.clone(),
+                    effective_effort: phoenix_core::domain::llm_types::EffectiveEffort {
+                        source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
+                        level: None,
+                    },
                 }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
