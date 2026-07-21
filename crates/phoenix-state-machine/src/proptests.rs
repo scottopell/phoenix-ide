@@ -126,6 +126,7 @@ fn arb_tool_executing_state() -> impl Strategy<Value = ConvState> {
                     None,
                     None,
                 ),
+                park_after_tool_round: false,
             }
         })
 }
@@ -540,6 +541,7 @@ proptest! {
             completed_results: vec![],
             pending_sub_agents: vec![],
             assistant_message: assistant_message_for_tools(&all_id_refs),
+            park_after_tool_round: false,
         };
         let event = Event::ToolComplete {
             tool_use_id: current.id.clone(),
@@ -889,6 +891,7 @@ proptest! {
             completed_results: vec![],
             pending_sub_agents: vec![],
             assistant_message: AssistantMessage::default(),
+            park_after_tool_round: false,
         };
 
         let result = transition(&state, &test_context(), Event::UserCancel { reason: None, cause: CancelCause::UserRequested });
@@ -1047,6 +1050,7 @@ proptest! {
             completed_results: vec![],
             pending_sub_agents: vec![],
             assistant_message: AssistantMessage::default(),
+            park_after_tool_round: false,
         };
         let event = Event::ToolComplete {
             tool_use_id: "wrong-id".to_string(),
@@ -1423,6 +1427,7 @@ fn test_cancel_mid_tool_chain() {
         completed_results: vec![t1_result],
         pending_sub_agents: vec![],
         assistant_message,
+        park_after_tool_round: false,
     };
 
     // Phase 1: UserCancel -> CancellingTool + AbortTool effect
@@ -1514,6 +1519,7 @@ fn test_tool_completion_advances_to_next_tool() {
         completed_results: vec![],
         pending_sub_agents: vec![],
         assistant_message: assistant_message_for_tools(&["t1", "t2"]),
+        park_after_tool_round: false,
     };
 
     let result = transition(
@@ -1565,6 +1571,7 @@ fn test_last_tool_completion_goes_to_llm_requesting() {
         completed_results: vec![],
         pending_sub_agents: vec![],
         assistant_message: assistant_message_for_tools(&["t1"]),
+        park_after_tool_round: false,
     };
 
     let result = transition(
@@ -1853,6 +1860,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
             },
         ],
         assistant_message: assistant_message_for_tools(&["t1"]),
+        park_after_tool_round: false,
     };
 
     let event = Event::ToolComplete {
@@ -1897,6 +1905,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
             mode: SubAgentMode::Explore,
         }],
         assistant_message: AssistantMessage::default(),
+        park_after_tool_round: false,
     };
 
     let event = Event::SpawnAgentsComplete {
@@ -2012,6 +2021,7 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
 fn arb_tool_outcome() -> impl Strategy<Value = ToolExecOutcome> {
     prop_oneof![
         arb_tool_result().prop_map(ToolExecOutcome::Completed),
+        arb_tool_result().prop_map(ToolExecOutcome::CompletedAndPark),
         ("[a-z]{8}", arb_abort_reason()).prop_map(|(tool_use_id, reason)| {
             ToolExecOutcome::Aborted {
                 tool_use_id,
@@ -2204,6 +2214,7 @@ proptest! {
             completed_results: vec![],
             pending_sub_agents: vec![],
             assistant_message: assistant_message_for_tools(&all_id_refs),
+            park_after_tool_round: false,
         };
         let tool_result = ToolResult::success(current.id.clone(), "done".to_string());
         let outcome = EffectOutcome::Tool(ToolExecOutcome::Completed(tool_result));

@@ -749,6 +749,7 @@ pub fn transition_core(
 
         // Tool Execution (REQ-BED-004)
         (CoreState::ToolExecuting { .. }, CoreEvent::ToolComplete { .. })
+        | (CoreState::ToolExecuting { .. }, CoreEvent::ToolCompleteAndPark { .. })
         | (CoreState::ToolExecuting { .. }, CoreEvent::SpawnAgentsComplete { .. }) => {
             handle_core_tool_complete(state, event)
         }
@@ -942,6 +943,7 @@ fn handle_core_llm_response(
         completed_results: vec![],
         pending_sub_agents: vec![],
         assistant_message,
+        park_after_tool_round: false,
     })
     .with_effect(Effect::PersistState)
     .with_effect(broadcast_effect)
@@ -961,19 +963,27 @@ fn handle_core_tool_complete(
         completed_results,
         pending_sub_agents,
         assistant_message,
+        park_after_tool_round,
     } = state
     else {
         unreachable!("handle_core_tool_complete called in non-ToolExecuting state");
     };
 
+    let event_requests_park = matches!(&event, CoreEvent::ToolCompleteAndPark { .. });
+
     match event {
-        // ToolComplete (more tools remaining) -> next tool
+        // ToolComplete/ToolCompleteAndPark (more tools remaining) -> next tool
         CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        }
+        | CoreEvent::ToolCompleteAndPark {
             tool_use_id,
             result,
         } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result);
+            let new_park_after_tool_round = *park_after_tool_round || event_requests_park;
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
@@ -984,14 +994,19 @@ fn handle_core_tool_complete(
                 completed_results: new_results,
                 pending_sub_agents: pending_sub_agents.clone(),
                 assistant_message: assistant_message.clone(),
+                park_after_tool_round: new_park_after_tool_round,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
-        // ToolComplete (last tool, no sub-agents) -> LlmRequesting
+        // ToolComplete/ToolCompleteAndPark (last tool, no sub-agents) -> LlmRequesting or Idle
         CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        }
+        | CoreEvent::ToolCompleteAndPark {
             tool_use_id,
             result,
         } if tool_use_id == current_tool.id
@@ -1000,21 +1015,34 @@ fn handle_core_tool_complete(
         {
             let mut all_results = completed_results.clone();
             all_results.push(result);
+            let park_after_round = *park_after_tool_round || event_requests_park;
 
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in last-tool transition");
 
-            Ok(
+            let result = if park_after_round {
+                CoreTransitionResult::new(CoreState::Idle)
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::NotifyAgentDone)
+            } else {
                 CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm),
-            )
+                    .with_effect(Effect::RequestLlm)
+            };
+
+            Ok(result)
         }
 
-        // ToolComplete (last tool, has sub-agents) -> AwaitingSubAgents
+        // ToolComplete/ToolCompleteAndPark (last tool, has sub-agents) -> AwaitingSubAgents
         CoreEvent::ToolComplete {
+            tool_use_id,
+            result,
+        }
+        | CoreEvent::ToolCompleteAndPark {
             tool_use_id,
             result,
         } if tool_use_id == current_tool.id
@@ -1060,6 +1088,7 @@ fn handle_core_tool_complete(
                 completed_results: new_results,
                 pending_sub_agents: new_pending,
                 assistant_message: assistant_message.clone(),
+                park_after_tool_round: *park_after_tool_round,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
@@ -1094,6 +1123,7 @@ fn handle_core_tool_complete(
 
         // tool_use_id mismatch or unexpected event variant
         CoreEvent::ToolComplete { .. }
+        | CoreEvent::ToolCompleteAndPark { .. }
         | CoreEvent::SpawnAgentsComplete { .. }
         | CoreEvent::UserMessage { .. }
         | CoreEvent::AuthoritativeUserMessage { .. }
@@ -1149,6 +1179,7 @@ fn handle_core_cancellation(
                 completed_results,
                 pending_sub_agents,
                 assistant_message,
+                ..
             },
             CoreEvent::UserCancel { .. },
         ) => {
@@ -1954,6 +1985,7 @@ pub fn transition_parent(
                     completed_results: vec![],
                     pending_sub_agents: vec![],
                     assistant_message: assistant_message.clone(),
+                    park_after_tool_round: false,
                 }))
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
@@ -3048,6 +3080,7 @@ pub fn transition_sub_agent(
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                park_after_tool_round: _,
             }),
             SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
         ) => Ok(
@@ -3533,6 +3566,10 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
 fn tool_outcome_to_event(outcome: ToolExecOutcome) -> Event {
     match outcome {
         ToolExecOutcome::Completed(result) => Event::ToolComplete {
+            tool_use_id: result.tool_use_id.clone(),
+            result,
+        },
+        ToolExecOutcome::CompletedAndPark(result) => Event::ToolCompleteAndPark {
             tool_use_id: result.tool_use_id.clone(),
             result,
         },
@@ -4595,6 +4632,7 @@ mod tests {
                 completed_results: vec![],
                 pending_sub_agents: vec![],
                 assistant_message,
+                park_after_tool_round: false,
             },
             &test_context(),
             Event::UserCancel {
@@ -4847,6 +4885,7 @@ mod tests {
                 completed_results: vec![],
                 pending_sub_agents: vec![],
                 assistant_message,
+                park_after_tool_round: false,
             },
             &sub_agent_context(),
             Event::UserCancel {
@@ -5268,6 +5307,169 @@ mod tests {
         .expect("filesystem-free stale tool response");
 
         assert!(matches!(result.new_state, ConvState::ToolExecuting { .. }));
+    }
+
+    #[test]
+    fn tool_complete_and_park_last_tool_settles_idle_without_request_llm() {
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::{db_schema::ToolResult, llm_types::ContentBlock};
+
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::tool_use(
+                "tool-1",
+                "bash",
+                serde_json::json!({"op": "run", "cmd": "echo park"}),
+            )],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "tool-1",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    "echo park",
+                )),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message,
+            park_after_tool_round: false,
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::ToolCompleteAndPark {
+                tool_use_id: "tool-1".to_string(),
+                result: ToolResult::success("tool-1".to_string(), "done".to_string()),
+            },
+        )
+        .expect("parking tool completion should transition");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistCheckpoint { .. })));
+        assert!(result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistState)));
+        assert!(result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyStateChange)));
+        assert!(result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyAgentDone)));
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "parking completion must stop after checkpoint instead of requesting the LLM"
+        );
+    }
+
+    #[test]
+    fn tool_complete_and_park_accumulates_across_serial_siblings() {
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::{db_schema::ToolResult, llm_types::ContentBlock};
+
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![
+                ContentBlock::tool_use(
+                    "tool-1",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "echo one"}),
+                ),
+                ContentBlock::tool_use(
+                    "tool-2",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "echo two"}),
+                ),
+            ],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "tool-1",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    "echo one",
+                )),
+            ),
+            remaining_tools: vec![ToolCall::new(
+                "tool-2",
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    "echo two",
+                )),
+            )],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message,
+            park_after_tool_round: false,
+        };
+
+        let first = transition(
+            &state,
+            &test_context(),
+            Event::ToolCompleteAndPark {
+                tool_use_id: "tool-1".to_string(),
+                result: ToolResult::success("tool-1".to_string(), "first done".to_string()),
+            },
+        )
+        .expect("first parking completion should transition");
+
+        let ConvState::ToolExecuting {
+            current_tool,
+            completed_results,
+            park_after_tool_round,
+            ..
+        } = &first.new_state
+        else {
+            panic!(
+                "expected ToolExecuting after first sibling, got {:?}",
+                first.new_state
+            );
+        };
+        assert_eq!(current_tool.id, "tool-2");
+        assert_eq!(completed_results.len(), 1);
+        assert!(
+            *park_after_tool_round,
+            "park intent should carry to later siblings"
+        );
+        assert!(first
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::ExecuteTool { .. })));
+
+        let second = transition(
+            &first.new_state,
+            &test_context(),
+            Event::ToolComplete {
+                tool_use_id: "tool-2".to_string(),
+                result: ToolResult::success("tool-2".to_string(), "second done".to_string()),
+            },
+        )
+        .expect("final sibling completion should honor accumulated park");
+
+        assert!(matches!(second.new_state, ConvState::Idle));
+        assert!(second
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyAgentDone)));
+        assert!(
+            !second
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "accumulated park intent must suppress the follow-up LLM request"
+        );
     }
 
     #[test]
@@ -6155,6 +6357,7 @@ mod tests {
             completed_results: vec![],
             pending_sub_agents: vec![],
             assistant_message: AssistantMessage::default(),
+            park_after_tool_round: false,
         };
 
         let result = transition(&state, &test_context(), Event::UserTriggerContinuation)
@@ -6434,6 +6637,7 @@ mod tests {
             completed_results: vec![],
             pending_sub_agents: vec![],
             assistant_message: AssistantMessage::default(),
+            park_after_tool_round: false,
         };
 
         let result = transition(
