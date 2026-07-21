@@ -824,10 +824,9 @@ async fn cached_pr_summary_for_conversation(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> Result<Option<crate::runtime::CachedPrSummary>, AppError> {
-    let scope = conv
-        .work_scope_id
-        .as_ref()
-        .expect("persisted conversation has work scope");
+    let Some(scope) = conv.work_scope_id.as_ref() else {
+        return Ok(None);
+    };
     Ok(state
         .runtime
         .db()
@@ -10158,6 +10157,23 @@ pub(crate) mod hard_delete_cascade_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn coordinator_cached_pr_summary_is_absent() {
+        let state = make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("coordinator");
+
+        assert!(
+            super::cached_pr_summary_for_conversation(&state, &coordinator)
+                .await
+                .expect("cached PR lookup")
+                .is_none()
+        );
     }
 
     #[tokio::test]
