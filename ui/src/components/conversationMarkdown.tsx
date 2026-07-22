@@ -1,4 +1,5 @@
 import React from 'react';
+import { Link } from 'react-router-dom';
 import { FilePathLink } from '../utils/FilePathLink';
 import { isConversationFilePath, type FilePathCopyContext } from '../utils/linkify';
 
@@ -8,6 +9,20 @@ export type MarkdownAnchorProps = React.ComponentPropsWithoutRef<'a'> & {
   filePathCopyContext?: FilePathCopyContext | undefined;
 };
 export type MarkdownImageProps = React.ComponentPropsWithoutRef<'img'> & { node?: unknown };
+
+function appLocalDestination(href: string | undefined): string | undefined {
+  if (!href || typeof window === 'undefined') return undefined;
+  if (href.startsWith('/') && !href.startsWith('//')) return href;
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return undefined;
+  try {
+    const destination = new URL(href);
+    return destination.origin === window.location.origin
+      ? `${destination.pathname}${destination.search}${destination.hash}`
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export function ConversationMarkdownAnchor({
   node,
@@ -27,6 +42,14 @@ export function ConversationMarkdownAnchor({
       >
         {children}
       </FilePathLink>
+    );
+  }
+  const appDestination = appLocalDestination(href);
+  if (appDestination) {
+    return (
+      <Link {...props} to={appDestination}>
+        {children}
+      </Link>
     );
   }
   return (

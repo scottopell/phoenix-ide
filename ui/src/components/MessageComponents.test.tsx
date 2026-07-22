@@ -1860,6 +1860,24 @@ describe('conversation markdown links', () => {
     expect(screen.getByRole('link', { name: 'settings' })).toHaveAttribute('href', 'settings/profile');
     expect(screen.queryByRole('button', { name: /section|settings/ })).not.toBeInTheDocument();
   });
+  it('keeps finalized app-local conversation citations in the current browsing context', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-app-link', [{
+            type: 'text',
+            text: 'See [source message](/c/source#message-message-id).',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    const link = screen.getByRole('link', { name: 'source message' });
+    expect(link).toHaveAttribute('href', '/c/source#message-message-id');
+    expect(link).not.toHaveAttribute('target');
+  });
+
   it('opens finalized agent Markdown links in a new tab with safe rel attributes', () => {
     render(
       <MemoryRouter>
