@@ -217,18 +217,23 @@ impl Tool for TmuxRunTool {
                 let response =
                     return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd)
                         .await;
-                register_tmux_wake_if_live(
+                let completion_policy = if parsed.keep_open_on_exit {
+                    TmuxCompletionPolicy::KeepOpen
+                } else {
+                    TmuxCompletionPolicy::CloseAfterCompletion
+                };
+                let response = register_tmux_wake_if_live(
                     &ctx,
                     &server_token,
                     &target,
-                    if parsed.keep_open_on_exit {
-                        TmuxCompletionPolicy::KeepOpen
-                    } else {
-                        TmuxCompletionPolicy::CloseAfterCompletion
-                    },
+                    completion_policy,
                     response,
                 )
-                .await
+                .await;
+                if !parsed.keep_open_on_exit && !response_has_wake_registration(&response) {
+                    let _ = kill_window(&config_path, &socket_path, &target.window_id).await;
+                }
+                response
             }
             ValidReadiness::WaitForText { text, timeout } => {
                 wait_for_text_response(
@@ -456,17 +461,21 @@ async fn wait_for_text_response(
                 } else {
                     TmuxCompletionPolicy::KeepOpen
                 };
-                match register_tmux_wake_if_live(
+                let registered = register_tmux_wake_if_live(
                     ctx,
                     server_token,
                     target,
                     completion_policy,
                     response,
                 )
-                .await
-                {
-                    ok if ok.is_success() => ok,
-                    err => return err,
+                .await;
+                if close_after_completion && !response_has_wake_registration(&registered) {
+                    let _ = kill_window(config_path, socket_path, &target.window_id).await;
+                }
+                if registered.is_success() {
+                    registered
+                } else {
+                    return registered;
                 }
             };
             if close_after_completion && (exited || status == "readiness_timed_out") {
@@ -638,6 +647,12 @@ fn observation_from_bytes(
         exit_code,
         readiness_seen,
     }
+}
+
+fn response_has_wake_registration(response: &ToolOutput) -> bool {
+    response
+        .display_data()
+        .is_some_and(|display| display.get("wake_registration").is_some())
 }
 
 fn response_keeps_live_inspectable_window(response: &ToolOutput) -> bool {
