@@ -79,7 +79,8 @@ export type { BashRingWindow } from './generated/BashRingWindow';
 export type { BashRingLine } from './generated/BashRingLine';
 import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
 
-export type ModelEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type { ModelEffort } from './generated/ModelEffort';
+import type { ModelEffort } from './generated/ModelEffort';
 
 export type NativeDefaultCapability =
   | { known: ModelEffort }
