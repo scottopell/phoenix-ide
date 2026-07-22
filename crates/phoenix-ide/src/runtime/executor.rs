@@ -4850,6 +4850,7 @@ where
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
@@ -4906,19 +4907,34 @@ where
                     progress,
                 });
         });
-        let tool_ctx = ToolContext::new_with_resource_scope(
-            cancel_token,
-            self.context.conversation_id.clone(),
-            self.context.filesystem_root().to_path_buf(),
-            self.browser_sessions.clone(),
-            self.bash_handles.clone(),
-            self.llm_registry.clone(),
-            self.terminals.clone(),
-            self.tmux_registry.clone(),
-            scope_worktree,
-            self.context.resource_scope.clone(),
-            self.context.resource_authority,
-        )
+        let tool_ctx = match &self.context.execution_environment {
+            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
+                working_dir,
+            } => ToolContext::new_with_resource_scope(
+                cancel_token,
+                self.context.conversation_id.clone(),
+                working_dir.clone(),
+                self.browser_sessions.clone(),
+                self.bash_handles.clone(),
+                self.llm_registry.clone(),
+                self.terminals.clone(),
+                self.tmux_registry.clone(),
+                scope_worktree,
+                self.context.resource_scope.clone(),
+                self.context.resource_authority,
+            ),
+            phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
+                ToolContext::new_without_filesystem(
+                    cancel_token,
+                    self.context.conversation_id.clone(),
+                    self.browser_sessions.clone(),
+                    self.bash_handles.clone(),
+                    self.llm_registry.clone(),
+                    self.terminals.clone(),
+                    self.tmux_registry.clone(),
+                )
+            }
+        }
         .with_bash_progress_sink(bash_progress_sink)
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())

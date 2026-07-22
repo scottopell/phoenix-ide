@@ -59,7 +59,7 @@ impl Tool for SkillTool {
             return ToolOutput::error("skill_name is required");
         }
 
-        let skills = phoenix_skills::discover_skills(&ctx.working_dir);
+        let skills = phoenix_skills::discover_skills(ctx.working_dir());
         match phoenix_skills::invoke_skill(skill_name, args, &skills) {
             Ok(invocation) => ToolOutput::success(invocation.body),
             Err(e) => ToolOutput::error(e),

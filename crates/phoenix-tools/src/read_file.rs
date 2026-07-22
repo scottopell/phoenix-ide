@@ -115,7 +115,7 @@ impl Tool for ReadFileTool {
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
-        let resolved = match resolve_and_validate(&input.path, &ctx.working_dir) {
+        let resolved = match resolve_and_validate(&input.path, ctx.working_dir()) {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(e),
         };
@@ -173,7 +173,7 @@ impl Tool for ReadFileTool {
             output = "(empty file)".to_string();
         }
 
-        let viewer_available = is_within_viewer_roots(&resolved, &ctx.working_dir)
+        let viewer_available = is_within_viewer_roots(&resolved, ctx.working_dir())
             && std::fs::metadata(&resolved)
                 .is_ok_and(|metadata| metadata.len() <= FILE_VIEWER_MAX_BYTES)
             && classify_for_viewer(&resolved) == ViewerFileClass::Text

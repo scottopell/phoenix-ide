@@ -293,9 +293,9 @@ fn validate_readiness(readiness: Readiness) -> Result<ValidReadiness, ToolOutput
 fn effective_file_root(ctx: &ToolContext) -> PathBuf {
     let path = ctx
         .worktree_path
-        .as_ref()
-        .unwrap_or(&ctx.working_dir)
-        .clone();
+        .as_deref()
+        .unwrap_or_else(|| ctx.working_dir())
+        .to_path_buf();
     path.canonicalize().unwrap_or(path)
 }
 
@@ -1726,7 +1726,7 @@ mod tests {
             .tmux_registry()
             .ensure_live(
                 &ctx.work_scope,
-                &ctx.working_dir,
+                ctx.working_dir(),
                 ctx.worktree_path.as_deref(),
                 Some(&ctx.conversation_id),
             )

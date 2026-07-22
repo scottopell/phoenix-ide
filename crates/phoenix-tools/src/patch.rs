@@ -130,7 +130,7 @@ impl PatchTool {
         if p.is_absolute() {
             p
         } else {
-            ctx.working_dir.join(p)
+            ctx.working_dir().join(p)
         }
     }
 
@@ -165,7 +165,7 @@ impl PatchTool {
             ));
         }
 
-        let allowed_root = ctx.working_dir.join(tasks_dir_name);
+        let allowed_root = ctx.working_dir().join(tasks_dir_name);
         let canon_allowed = std::fs::canonicalize(&allowed_root).unwrap_or(allowed_root);
         let canon_resolved =
             std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());

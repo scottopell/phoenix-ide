@@ -53,7 +53,7 @@ pub use tmux::{
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -343,6 +343,12 @@ impl ToolOutput {
 ///
 /// REQ-BASH-010, REQ-BT-012: Stateless Tools with Context Injection
 #[derive(Clone)]
+enum ToolExecutionEnvironment {
+    Filesystem(PathBuf),
+    NoFilesystem,
+}
+
+#[derive(Clone)]
 pub struct ToolContext {
     /// Cancellation signal for long-running operations
     pub cancel: CancellationToken,
@@ -356,8 +362,7 @@ pub struct ToolContext {
     /// Root conversation for trace correlation across sub-agents.
     pub root_conversation_id: String,
 
-    /// Working directory for file operations
-    pub working_dir: PathBuf,
+    execution_environment: ToolExecutionEnvironment,
 
     /// Browser session manager (access via `browser()` method)
     browser_sessions: Arc<BrowserSessionManager>,
@@ -464,6 +469,54 @@ impl ToolContext {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn new_without_filesystem(
+        cancel: CancellationToken,
+        conversation_id: String,
+        browser_sessions: Arc<BrowserSessionManager>,
+        bash_handles: Arc<BashHandleRegistry>,
+        llm_selector: Arc<dyn LlmSelector>,
+        terminals: phoenix_terminal::ActiveTerminals,
+        tmux_registry: Arc<TmuxRegistry>,
+    ) -> Self {
+        let root_conversation_id = conversation_id.clone();
+        Self {
+            cancel,
+            resource_access: phoenix_core::work_scope::EffectiveResourceAccess::new(
+                conversation_id.clone(),
+                phoenix_core::work_scope::ResourceAuthority::Work,
+            ),
+            conversation_id,
+            root_conversation_id,
+            execution_environment: ToolExecutionEnvironment::NoFilesystem,
+            browser_sessions,
+            bash_handles,
+            llm_selector,
+            terminals,
+            tmux_registry,
+            worktree_path: None,
+            work_scope: ResourceScopeKey::Coordinator,
+            bash_progress_sink: None,
+            tool_use_id: None,
+            wake_registrar: None,
+        }
+    }
+
+    /// Returns the filesystem root required by filesystem-capable tools.
+    ///
+    /// # Panics
+    /// Panics for a filesystem-free context. Its registry must not expose
+    /// filesystem-capable tools.
+    #[must_use]
+    pub fn working_dir(&self) -> &Path {
+        match &self.execution_environment {
+            ToolExecutionEnvironment::Filesystem(path) => path,
+            ToolExecutionEnvironment::NoFilesystem => {
+                panic!("filesystem capability required by tool")
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_resource_scope(
         cancel: CancellationToken,
         conversation_id: String,
@@ -487,7 +540,7 @@ impl ToolContext {
             conversation_id,
             resource_access,
             root_conversation_id,
-            working_dir,
+            execution_environment: ToolExecutionEnvironment::Filesystem(working_dir),
             browser_sessions,
             bash_handles,
             llm_selector,
@@ -640,7 +693,7 @@ impl ToolContext {
         self.tmux_registry
             .ensure_live(
                 &self.work_scope,
-                &self.working_dir,
+                self.working_dir(),
                 self.worktree_path.as_deref(),
                 Some(&self.conversation_id),
             )

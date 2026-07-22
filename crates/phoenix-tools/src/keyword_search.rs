@@ -81,14 +81,14 @@ pub struct KeywordSearchTool;
 impl KeywordSearchTool {
     /// Find git repository root or fall back to working directory
     fn find_search_root(ctx: &ToolContext) -> PathBuf {
-        let mut current = ctx.working_dir.clone();
+        let mut current = ctx.working_dir().to_path_buf();
         loop {
             if current.join(".git").exists() {
                 return current;
             }
             match current.parent() {
                 Some(parent) => current = parent.to_path_buf(),
-                None => return ctx.working_dir.clone(),
+                None => return ctx.working_dir().to_path_buf(),
             }
         }
     }

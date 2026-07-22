@@ -33,7 +33,7 @@ impl ReadImageTool {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            ctx.working_dir.join(path)
+            ctx.working_dir().join(path)
         }
     }
 

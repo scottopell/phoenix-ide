@@ -330,7 +330,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         .map_err(|e| format!("Invalid approved commission_review input: {e}"))?;
     assert_approved_context_has_not_drifted(&ctx, &approved)?;
     if let Some(approved_head) = approved.approved_head.as_deref() {
-        let current_head = git_capture(&ctx.working_dir, &["rev-parse", "HEAD"]).await?;
+        let current_head = git_capture(ctx.working_dir(), &["rev-parse", "HEAD"]).await?;
         if current_head != approved_head {
             return Err(format!(
                 "commission_review target changed after approval: HEAD was `{approved_head}` at approval time but is now `{current_head}`. Request review again."
@@ -342,7 +342,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         approved.approved_base.as_deref(),
     ) {
         let current_base =
-            git_capture(&ctx.working_dir, &["merge-base", base_branch, "HEAD"]).await?;
+            git_capture(ctx.working_dir(), &["merge-base", base_branch, "HEAD"]).await?;
         if current_base != approved_base {
             return Err(format!(
                 "commission_review target changed after approval: merge base was `{approved_base}` at approval time but is now `{current_base}`. Request review again."
@@ -748,7 +748,7 @@ impl ReviewRun {
 fn fallback_target_summary(ctx: &ToolContext) -> ReviewTargetSummary {
     ReviewTargetSummary {
         kind: ReviewTargetKind::CommittedBranchDiff,
-        repo_root: ctx.working_dir.display().to_string(),
+        repo_root: ctx.working_dir().display().to_string(),
         base: "unknown".to_string(),
         head: "unknown".to_string(),
         dirty: false,
@@ -1423,7 +1423,7 @@ fn assert_approved_context_has_not_drifted(
         .as_ref()
         .map(|path| path.display().to_string());
     assert_approved_paths_match(
-        &ctx.working_dir.display().to_string(),
+        &ctx.working_dir().display().to_string(),
         current_worktree.as_ref(),
         approved,
     )
@@ -1501,7 +1501,7 @@ async fn resolve_target(
     _input: &CommissionReviewInput,
     runtime_base_branch: Option<&str>,
 ) -> Result<ReviewTarget, String> {
-    let repo_root = git_capture(&ctx.working_dir, &["rev-parse", "--show-toplevel"]).await?;
+    let repo_root = git_capture(ctx.working_dir(), &["rev-parse", "--show-toplevel"]).await?;
     let repo = PathBuf::from(repo_root.trim());
     let dirty = !git_capture(&repo, &["status", "--porcelain"])
         .await?

@@ -178,11 +178,11 @@ impl Tool for SearchTool {
         };
 
         let search_path = match &input.path {
-            Some(p) => match resolve_and_validate(p, &ctx.working_dir) {
+            Some(p) => match resolve_and_validate(p, ctx.working_dir()) {
                 Ok(resolved) => resolved,
                 Err(e) => return ToolOutput::error(e),
             },
-            None => match ctx.working_dir.canonicalize() {
+            None => match ctx.working_dir().canonicalize() {
                 Ok(p) => p,
                 Err(e) => {
                     return ToolOutput::error(format!("Cannot resolve working directory: {e}"))
@@ -190,7 +190,7 @@ impl Tool for SearchTool {
             },
         };
 
-        let canonical_wd = match ctx.working_dir.canonicalize() {
+        let canonical_wd = match ctx.working_dir().canonicalize() {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(format!("Cannot resolve working directory: {e}")),
         };

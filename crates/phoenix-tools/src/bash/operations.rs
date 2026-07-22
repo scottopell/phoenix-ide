@@ -610,11 +610,11 @@ fn spawn_child(
     let mut command = match spawn_mode {
         BashSpawnMode::Direct => {
             let mut command = Command::new("bash");
-            command.arg("-c").arg(cmd).current_dir(&ctx.working_dir);
+            command.arg("-c").arg(cmd).current_dir(ctx.working_dir());
             command
         }
         BashSpawnMode::ExploreReadOnly => {
-            let sandbox_command = ExploreSandboxLauncher::command(cmd, &ctx.working_dir)?;
+            let sandbox_command = ExploreSandboxLauncher::command(cmd, ctx.working_dir())?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
         }
