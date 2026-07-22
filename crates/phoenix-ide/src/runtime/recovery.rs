@@ -69,19 +69,49 @@ impl RecoveryDecision {
 }
 
 pub fn interrupted_wake_contract_ids(messages: &[Message]) -> Vec<String> {
-    messages
+    let Some((agent_index, wait_tool_use_ids)) =
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                let MessageContent::Agent(blocks) = &message.content else {
+                    return None;
+                };
+                Some((
+                    index,
+                    blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::ToolUse { id, name, .. } if name == "wait_until" => {
+                                Some(id.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<std::collections::HashSet<_>>(),
+                ))
+            })
+    else {
+        return Vec::new();
+    };
+
+    messages[agent_index + 1..]
         .iter()
-        .rev()
-        .take_while(|message| matches!(message.message_type, MessageType::Tool))
-        .filter_map(|message| match &message.content {
-            MessageContent::Tool(content) if !content.is_error => {
-                serde_json::from_str::<serde_json::Value>(&content.content)
-                    .ok()?
-                    .get("contract_id")?
-                    .as_str()
-                    .map(str::to_owned)
+        .filter_map(|message| {
+            let MessageContent::Tool(tool) = &message.content else {
+                return None;
+            };
+            if tool.is_error || !wait_tool_use_ids.contains(tool.tool_use_id.as_str()) {
+                return None;
             }
-            _ => None,
+            let value: serde_json::Value = serde_json::from_str(&tool.content).ok()?;
+            if value.get("status").and_then(serde_json::Value::as_str) != Some("registered") {
+                return None;
+            }
+            value
+                .get("contract_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
         })
         .collect()
 }
@@ -1027,14 +1057,14 @@ mod owed_wake_tests {
     fn interrupted_contract_ids_only_include_trailing_tool_round_receipts() {
         use chrono::Utc;
         use phoenix_core::domain::db_schema::{ToolContent, ToolContentImage};
-        let tool = |sequence_id, tool_use_id: &str| Message {
+        let tool = |sequence_id, tool_use_id: &str, contract_id: &str| Message {
             message_id: format!("m-{sequence_id}"),
             conversation_id: "conv".to_string(),
             sequence_id,
             message_type: MessageType::Tool,
             content: MessageContent::Tool(ToolContent {
                 tool_use_id: tool_use_id.to_string(),
-                content: format!(r#"{{"contract_id":"{tool_use_id}"}}"#),
+                content: format!(r#"{{"status":"registered","contract_id":"{contract_id}"}}"#),
                 is_error: false,
                 images: Vec::<ToolContentImage>::new(),
             }),
@@ -1042,14 +1072,70 @@ mod owed_wake_tests {
             usage_data: None,
             created_at: Utc::now(),
         };
-        let mut agent = tool(2, "ignored");
-        agent.message_type = MessageType::Agent;
-        agent.content = MessageContent::Agent(vec![]);
-        let messages = vec![tool(1, "old-wake"), agent, tool(3, "current-tool")];
+        let agent = |sequence_id, tool_use_id: &str| Message {
+            message_id: format!("m-{sequence_id}"),
+            conversation_id: "conv".to_string(),
+            sequence_id,
+            message_type: MessageType::Agent,
+            content: MessageContent::Agent(vec![ContentBlock::ToolUse {
+                id: tool_use_id.to_string(),
+                name: "wait_until".to_string(),
+                input: serde_json::json!({}),
+            }]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let messages = vec![
+            agent(1, "old-tool"),
+            tool(2, "old-tool", "old-wake"),
+            agent(3, "current-tool"),
+            tool(4, "current-tool", "current-wake"),
+        ];
         assert_eq!(
             interrupted_wake_contract_ids(&messages),
-            vec!["current-tool"]
+            vec!["current-wake"]
         );
+    }
+
+    #[test]
+    fn unrelated_tool_contract_id_is_not_treated_as_wake_receipt() {
+        use chrono::Utc;
+        use phoenix_core::domain::db_schema::{ToolContent, ToolContentImage};
+        let messages = vec![
+            Message {
+                message_id: "agent-1".to_string(),
+                conversation_id: "conv".to_string(),
+                sequence_id: 1,
+                message_type: MessageType::Agent,
+                content: MessageContent::Agent(vec![ContentBlock::ToolUse {
+                    id: "other-tool".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            Message {
+                message_id: "tool-2".to_string(),
+                conversation_id: "conv".to_string(),
+                sequence_id: 2,
+                message_type: MessageType::Tool,
+                content: MessageContent::Tool(ToolContent {
+                    tool_use_id: "other-tool".to_string(),
+                    content: r#"{"contract_id":"unrelated-domain-id","status":"registered"}"#
+                        .to_string(),
+                    is_error: false,
+                    images: Vec::<ToolContentImage>::new(),
+                }),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+        ];
+
+        assert!(interrupted_wake_contract_ids(&messages).is_empty());
     }
 
     #[test]
