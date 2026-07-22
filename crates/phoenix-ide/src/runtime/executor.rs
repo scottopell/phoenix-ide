@@ -4844,6 +4844,22 @@ where
         });
     }
 
+    fn create_tool_llm_metrics_sink(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            while let Some(metrics) = rx.recv().await {
+                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "failed to persist tool-internal LLM metrics");
+                }
+            }
+        });
+        tx
+    }
+
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
@@ -4909,7 +4925,7 @@ where
                     progress,
                 });
         });
-        let (llm_metrics_tx, mut llm_metrics_rx) = tokio::sync::mpsc::unbounded_channel();
+        let llm_metrics_tx = self.create_tool_llm_metrics_sink();
         let tool_ctx = ToolContext::new(
             cancel_token,
             self.context.conversation_id.clone(),
@@ -4931,14 +4947,6 @@ where
         let root_conv_id = self.context.root_conversation_id.clone();
         let storage = self.storage.clone();
         let tool_executor = self.tool_executor.clone();
-        let metrics_storage = storage.clone();
-        tokio::spawn(async move {
-            while let Some(metrics) = llm_metrics_rx.recv().await {
-                if let Err(error) = metrics_storage.upsert_llm_request_metrics(&metrics).await {
-                    tracing::warn!(%error, "failed to persist tool-internal LLM metrics");
-                }
-            }
-        });
         let tool_use_id = tool.id.clone();
         // Retained for the outcome forwarder so a dropped sender (panicked or
         // aborted tool task) still produces a typed outcome for this tool_use.
