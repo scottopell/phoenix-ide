@@ -473,6 +473,45 @@ describe('ConversationPage message delivery reconciliation', () => {
     });
   });
 
+  it('rolls back awaiting_llm when a replayed direct turn is already persisted', async () => {
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
+      conversation_idle: false,
+      entries: [{
+        message_id: messageId!,
+        acceptance: 'runtime_accepted',
+        materialization: {
+          status: 'persisted',
+          message: { ...historyMessage, message_id: messageId!, sequence_id: 21 },
+        },
+      }],
+    }));
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'replayed and persisted' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm'));
+    const [sentMessageId] = vi.mocked(api.sendMessage).mock.calls[0]!.slice(-1) as [string];
+
+    await act(async () => {
+      response.resolve({
+        message_id: sentMessageId,
+        request_result: 'replayed',
+        disposition: 'runtime_accepted',
+      });
+      await response.promise;
+    });
+
+    await waitFor(() => {
+      expect(api.reconcileAcceptedMessages).toHaveBeenCalledWith(conversationId, [sentMessageId]);
+      expect(store.getSnapshot(slug).phase.type).toBe('idle');
+      expect(store.getSnapshot(slug).messages.map((message) => message.message_id)).toContain(sentMessageId);
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+  });
+
   it('marks failed only when exact-ID reconcile reports no acceptance and no persisted materialization', async () => {
     const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);

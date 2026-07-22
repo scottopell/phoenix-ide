@@ -269,10 +269,10 @@ function mergeConversationMessages<T extends { message_id: string; sequence_id: 
 }
 
 function categorizeReconciledMessage(entry: AcceptedMessageReconciliation): 'accepted' | 'steering_queued' | 'cancelled' | 'recoverable_inconsistency' | 'failed' | 'persisted_only' {
+  if (entry.materialization.status === 'persisted') return 'persisted_only';
   if (entry.acceptance === 'queued_steering') return 'steering_queued';
   if (entry.acceptance === 'cancelled_steering') return 'cancelled';
   if (entry.acceptance === 'pending_runtime' || entry.acceptance === 'runtime_accepted') return 'accepted';
-  if (entry.materialization.status === 'persisted') return 'persisted_only';
   return 'failed';
 }
 
@@ -1437,6 +1437,16 @@ function ConversationPageContent({
             });
           }
           const result = await api.sendMessage(conversationId, text, imgs, files, localId);
+          if (result.request_result === 'replayed') {
+            const replayOutcome = await reconcileExactAcceptedMessage(
+              localId,
+              phaseEventSeqBeforePost,
+            );
+            if (replayOutcome === 'persisted_only') {
+              rollbackOptimisticPhase();
+              return;
+            }
+          }
           // Don't touch the queue here for direct acceptance beyond recording
           // accepted status. The entry stays visible until authoritative history
           // contains `message_id == localId`, at which point `pendingMessages`

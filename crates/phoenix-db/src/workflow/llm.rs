@@ -2581,6 +2581,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_reclamation_reuses_effect_before_pending_delivery() {
+        let repo = open_repo().await;
+        repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::RuntimeAccepted,
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-1".to_string(),
+            prepared_fingerprint: "fp-1".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        })
+        .await
+        .unwrap();
+        let old_incarnation = PrepareAndBeginTopLevelLlmInput {
+            workflow_id: WorkflowId(1),
+            committed_at: Timestamp(2),
+            process_incarnation: ProcessIncarnation(7),
+            prepared_request: PreparedLlmRequest {
+                codec_version: 1,
+                request_fingerprint: "request-fp".to_string(),
+                provider: "configured".to_string(),
+                model: "model".to_string(),
+                backend: "llm_client".to_string(),
+                request_aggregate: "{}".to_string(),
+            },
+        };
+        let first = repo
+            .prepare_and_begin_top_level_llm_attempt(&old_incarnation)
+            .await
+            .unwrap();
+        assert_eq!(first.prepared_request.effect_id, EffectId(1));
+        assert_eq!(first.prepared_request.call_ordinal, 0);
+
+        let recovered = repo
+            .recover_top_level_llm_attempts(ProcessIncarnation(8))
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].prepared_request.effect_id, EffectId(1));
+        assert_eq!(recovered[0].prepared_request.call_ordinal, 0);
+        let resumed = repo
+            .begin_recovered_top_level_llm_attempt(
+                WorkflowId(1),
+                EffectId(1),
+                ProcessIncarnation(8),
+                Timestamp(3),
+            )
+            .await
+            .unwrap();
+        let resumed_authority = resumed.authority.expect("reclaimed attempt authority");
+
+        assert_eq!(resumed_authority.effect_id, EffectId(1));
+        assert_eq!(resumed_authority.attempt_id, AttemptId(2));
+        assert_eq!(
+            repo.list_attempts(WorkflowId(1), EffectId(1))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_admission_reports_retryable_persistence_while_writer_is_locked() {
         let (_dir, repo, lock_pool) = open_repo_with_lock_pool().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {

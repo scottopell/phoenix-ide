@@ -112,6 +112,38 @@ impl SendChatApplicationService {
             .get_conversation(&req.conversation_id)
             .await
             .map_err(|e| SendChatServiceError::NotFound(e.to_string()))?;
+        if let Some(accepted) = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .load_direct_turn_acceptance(&conversation.id, &req.message_id)
+            .await
+            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
+        {
+            let validated_files = validate_files(&req).await?;
+            let expanded = expand_request(&self.db, &conversation, &req).await?;
+            let prepared_retry = phoenix_core::domain::sm_event::PreparedDirectTurn {
+                codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+                text: expanded.display_text,
+                llm_text: expanded.llm_text,
+                images: map_images(req.images.clone()),
+                files: validated_files,
+                message_id: req.message_id.clone(),
+                user_agent: req.user_agent.clone(),
+                skill_invocation: expanded.skill_invocation,
+            };
+            let prepared_retry_payload = serde_json::to_string(&prepared_retry)
+                .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+            if accepted.prepared_fingerprint != sha256_hex(prepared_retry_payload.as_bytes()) {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
+            return self
+                .replay_durable_acceptance(
+                    &conversation,
+                    &req,
+                    &request_fingerprint,
+                    accepted,
+                    &mut receipts,
+                )
+                .await;
+        }
         if let Ok(message) = self.db.get_message_by_id(&req.message_id).await {
             let persisted_matches = match &message.content {
                 phoenix_core::domain::db_schema::MessageContent::Skill(skill) => {
@@ -153,99 +185,6 @@ impl SendChatApplicationService {
                 SendChatRequestResult::Replayed,
                 SendChatDisposition::QueuedSteering,
             ));
-        }
-        if let Some(accepted) = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
-            .load_direct_turn_acceptance(&conversation.id, &req.message_id)
-            .await
-            .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-        {
-            if accepted.prepared_fingerprint != request_fingerprint {
-                return Err(SendChatServiceError::IdempotencyConflict);
-            }
-            let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
-                serde_json::from_str(&accepted.prepared_payload)
-                    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-            let message_id = req.message_id.clone();
-            let replay_outcome = match accepted.committed_outcome {
-                phoenix_db::DirectTurnCommittedOutcome::QueuedSteering => {
-                    let event = prepared.into_event();
-                    let Event::UserMessage {
-                        text,
-                        llm_text,
-                        images,
-                        files,
-                        message_id,
-                        user_agent,
-                        skill_invocation,
-                    } = event
-                    else {
-                        return Err(SendChatServiceError::Internal(
-                            "accepted direct turn did not decode to a user message".to_string(),
-                        ));
-                    };
-                    kick_runtime_delivery(
-                        self.runtime.clone(),
-                        conversation.id.clone(),
-                        Event::SteerMessage {
-                            text,
-                            llm_text,
-                            images,
-                            files,
-                            message_id: message_id.clone(),
-                            user_agent,
-                            skill_invocation,
-                        },
-                    );
-                    SendChatOutcome::accepted(
-                        message_id,
-                        SendChatRequestResult::Replayed,
-                        SendChatDisposition::QueuedSteering,
-                    )
-                }
-                phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => {
-                    SendChatOutcome::accepted(
-                        message_id,
-                        SendChatRequestResult::Replayed,
-                        SendChatDisposition::CancelledSteering,
-                    )
-                }
-                phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
-                | phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
-                    kick_runtime_delivery(
-                        self.runtime.clone(),
-                        conversation.id.clone(),
-                        prepared.into_event(),
-                    );
-                    insert_transient_receipt(
-                        &self.db,
-                        &mut receipts,
-                        req.message_id.clone(),
-                        ChatAcceptanceReceipt {
-                            conversation_id: conversation.id.clone(),
-                            request_fingerprint: request_fingerprint.clone(),
-                            steering: false,
-                        },
-                    )
-                    .await;
-                    SendChatOutcome::accepted(
-                        message_id,
-                        SendChatRequestResult::Replayed,
-                        match accepted.committed_outcome {
-                            phoenix_db::DirectTurnCommittedOutcome::PendingRuntime => {
-                                SendChatDisposition::PendingRuntime
-                            }
-                            phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
-                                SendChatDisposition::RuntimeAccepted
-                            }
-                            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering
-                            | phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => {
-                                unreachable!()
-                            }
-                        },
-                    )
-                }
-            };
-            return Ok(replay_outcome);
         }
         if conversation.archived {
             return Ok(SendChatOutcome::Rejected {
@@ -293,6 +232,7 @@ impl SendChatApplicationService {
                 };
                 let prepared_payload = serde_json::to_string(&prepared)
                     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+                let prepared_fingerprint = prepared_direct_turn_fingerprint(&prepared_payload);
                 let steering_entry = crate::state_machine::event::SteerEntry {
                     text: expanded.display_text.clone(),
                     llm_text: expanded.llm_text.clone(),
@@ -309,7 +249,7 @@ impl SendChatApplicationService {
                         },
                         conversation_id: conversation.id.clone(),
                         client_message_id: req.message_id.clone(),
-                        prepared_fingerprint: request_fingerprint.clone(),
+                        prepared_fingerprint,
                         prepared_payload,
                         accepted_at: phoenix_workflow::Timestamp(
                             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
@@ -403,6 +343,7 @@ impl SendChatApplicationService {
         };
         let prepared_payload = serde_json::to_string(&prepared)
             .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+        let prepared_fingerprint = prepared_direct_turn_fingerprint(&prepared_payload);
         let event = Event::UserMessage {
             text: expanded.display_text.clone(),
             llm_text: expanded.llm_text,
@@ -417,7 +358,7 @@ impl SendChatApplicationService {
                 initial_outcome: phoenix_db::DirectTurnInitialOutcome::PendingRuntime,
                 conversation_id: conversation.id.clone(),
                 client_message_id: req.message_id.clone(),
-                prepared_fingerprint: request_fingerprint.clone(),
+                prepared_fingerprint,
                 prepared_payload,
                 accepted_at: phoenix_workflow::Timestamp(
                     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
@@ -472,6 +413,91 @@ impl SendChatApplicationService {
             request_result,
             SendChatDisposition::PendingRuntime,
         ))
+    }
+
+    async fn replay_durable_acceptance(
+        &self,
+        conversation: &crate::db::Conversation,
+        req: &SendChatRequest,
+        request_fingerprint: &str,
+        accepted: phoenix_db::DirectTurnAcceptanceRecord,
+        receipts: &mut std::collections::HashMap<String, ChatAcceptanceReceipt>,
+    ) -> Result<SendChatOutcome, SendChatServiceError> {
+        let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
+            serde_json::from_str(&accepted.prepared_payload)
+                .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+        let message_id = req.message_id.clone();
+        Ok(match accepted.committed_outcome {
+            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering => {
+                let Event::UserMessage {
+                    text,
+                    llm_text,
+                    images,
+                    files,
+                    message_id,
+                    user_agent,
+                    skill_invocation,
+                } = prepared.into_event()
+                else {
+                    return Err(SendChatServiceError::Internal(
+                        "accepted direct turn did not decode to a user message".to_string(),
+                    ));
+                };
+                kick_runtime_delivery(
+                    self.runtime.clone(),
+                    conversation.id.clone(),
+                    Event::SteerMessage {
+                        text,
+                        llm_text,
+                        images,
+                        files,
+                        message_id: message_id.clone(),
+                        user_agent,
+                        skill_invocation,
+                    },
+                );
+                SendChatOutcome::accepted(
+                    message_id,
+                    SendChatRequestResult::Replayed,
+                    SendChatDisposition::QueuedSteering,
+                )
+            }
+            phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => SendChatOutcome::accepted(
+                message_id,
+                SendChatRequestResult::Replayed,
+                SendChatDisposition::CancelledSteering,
+            ),
+            phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
+            | phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
+                kick_runtime_delivery(
+                    self.runtime.clone(),
+                    conversation.id.clone(),
+                    prepared.into_event(),
+                );
+                insert_transient_receipt(
+                    &self.db,
+                    receipts,
+                    req.message_id.clone(),
+                    ChatAcceptanceReceipt {
+                        conversation_id: conversation.id.clone(),
+                        request_fingerprint: request_fingerprint.to_string(),
+                        steering: false,
+                    },
+                )
+                .await;
+                let disposition = match accepted.committed_outcome {
+                    phoenix_db::DirectTurnCommittedOutcome::PendingRuntime => {
+                        SendChatDisposition::PendingRuntime
+                    }
+                    phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
+                        SendChatDisposition::RuntimeAccepted
+                    }
+                    phoenix_db::DirectTurnCommittedOutcome::QueuedSteering
+                    | phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => unreachable!(),
+                };
+                SendChatOutcome::accepted(message_id, SendChatRequestResult::Replayed, disposition)
+            }
+        })
     }
 
     async fn effective_state(
@@ -726,6 +752,10 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
     Ok(sha256_hex(&canonical))
 }
 
+fn prepared_direct_turn_fingerprint(prepared_payload: &str) -> String {
+    sha256_hex(prepared_payload.as_bytes())
+}
+
 fn sha256_hex(value: &[u8]) -> String {
     use sha2::Digest as _;
     sha2::Sha256::digest(value)
@@ -782,9 +812,73 @@ fn transition_code(err: &TransitionError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        persisted_skill_matches, queued_retry_matches, MessageExpansionPolicy, SendChatRequest,
+        persisted_skill_matches, prepared_direct_turn_fingerprint, queued_retry_matches,
+        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest, SendChatServiceError,
     };
     use phoenix_core::domain::db_schema::SkillContent;
+
+    #[tokio::test]
+    async fn durable_replay_conflicts_when_reference_expansion_changes() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let cwd = tempfile::tempdir().expect("create temp cwd");
+        let reference = cwd.path().join("notes.md");
+        std::fs::write(&reference, "first expansion").expect("write initial reference");
+        state
+            .db
+            .create_conversation(
+                "conv-prepared-replay",
+                "prepared replay",
+                cwd.path().to_str().expect("utf-8 cwd"),
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+        let service = SendChatApplicationService::new(state.db.clone(), state.runtime.clone());
+        let request = SendChatRequest {
+            conversation_id: "conv-prepared-replay".to_string(),
+            text: "Review @notes.md".to_string(),
+            message_id: "message-prepared-replay".to_string(),
+            images: Vec::new(),
+            files: Vec::new(),
+            user_agent: None,
+            expansion_policy: MessageExpansionPolicy::ExpandReferences,
+        };
+
+        service
+            .send(request.clone())
+            .await
+            .expect("accept initial prepared turn");
+        std::fs::write(&reference, "changed expansion").expect("mutate reference");
+
+        assert!(matches!(
+            service.send(request).await,
+            Err(SendChatServiceError::IdempotencyConflict)
+        ));
+    }
+
+    #[test]
+    fn prepared_fingerprint_changes_when_expansion_changes() {
+        let base = phoenix_core::domain::sm_event::PreparedDirectTurn {
+            codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            text: "@ref".to_string(),
+            llm_text: Some("first expansion".to_string()),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "msg".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let mut changed = base.clone();
+        changed.llm_text = Some("changed expansion".to_string());
+        let base = serde_json::to_string(&base).unwrap();
+        let changed = serde_json::to_string(&changed).unwrap();
+        assert_ne!(
+            prepared_direct_turn_fingerprint(&base),
+            prepared_direct_turn_fingerprint(&changed)
+        );
+    }
 
     #[test]
     fn queued_retry_compares_submitted_payload_not_mutable_expansion() {
