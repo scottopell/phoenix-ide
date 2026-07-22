@@ -180,7 +180,7 @@ pub struct RuntimeManager {
     mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
-    runtimes: RwLock<HashMap<String, ConversationHandle>>,
+    pub(crate) runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
     /// materialize concurrently, while callers for one conversation observe the

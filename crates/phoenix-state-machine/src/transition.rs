@@ -1441,7 +1441,11 @@ fn handle_core_sub_agents(
                 outcome,
             });
 
-            let result = CoreTransitionResult::new(if *park_after_tool_round {
+            let should_park = *park_after_tool_round
+                && new_results
+                    .iter()
+                    .all(|result| matches!(result.outcome, SubAgentOutcome::Success { .. }));
+            let result = CoreTransitionResult::new(if should_park {
                 CoreState::Idle
             } else {
                 CoreState::LlmRequesting { attempt: 1 }
@@ -1452,7 +1456,7 @@ fn handle_core_sub_agents(
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change());
-            Ok(if *park_after_tool_round {
+            Ok(if should_park {
                 result.with_effect(Effect::NotifyAgentDone)
             } else {
                 result.with_effect(Effect::RequestLlm)
@@ -5464,6 +5468,42 @@ mod tests {
             .iter()
             .any(|effect| matches!(effect, Effect::NotifyAgentDone)));
         assert!(!completed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn failed_sub_agent_fan_in_does_not_park() {
+        use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
+        let state = ConvState::AwaitingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "agent-1".to_string(),
+                task: "fail".to_string(),
+                mode: SubAgentMode::Explore,
+            }],
+            completed_results: vec![],
+            park_after_tool_round: true,
+            spawn_tool_id: None,
+        };
+
+        let completed = transition(
+            &state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "agent-1".to_string(),
+                outcome: SubAgentOutcome::Failure {
+                    error: "failed".to_string(),
+                    error_kind: ErrorKind::InvalidResponse,
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            completed.new_state,
+            ConvState::LlmRequesting { .. }
+        ));
+        assert!(completed
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::RequestLlm)));

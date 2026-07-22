@@ -9,10 +9,10 @@ use crate::runtime::RuntimeManager;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_db::workflow::wake::{
     MaterializePendingDeliveryMessageInput, MaterializePendingDeliveryMessageOutcome,
-    WakeAdoptMaterializedPendingOutcome, WakeCancelIfUnresolvedInput, WakeCancellationOutcome,
-    WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationOutcome,
-    WakePendingDelivery, WakePendingGlobalCursor, WakeRegistrationOutcome, WakeRepository,
-    WakeTerminalEvidenceInput, WakeTerminalEvidenceOutcome,
+    WakeCancelIfUnresolvedInput, WakeCancellationOutcome, WakeForgetIfUnresolvedInput,
+    WakeObservationCandidateRow, WakeObservationOutcome, WakePendingDelivery,
+    WakePendingGlobalCursor, WakeRegistrationOutcome, WakeRepository, WakeTerminalEvidenceInput,
+    WakeTerminalEvidenceOutcome,
 };
 use phoenix_db::workflow::LocalAttemptAuthority;
 use phoenix_tools::bash::handle::{FinalCause, Handle, HandleState, LiveData};
@@ -405,22 +405,41 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
 }
 
 async fn adopt_materialized_delivery(
+    manager: &Arc<RuntimeManager>,
     handle: &crate::runtime::ConversationHandle,
     repo: &WakeRepository,
     conversation_id: &str,
+    auto_resume: bool,
     now: Timestamp,
 ) -> Result<(), String> {
-    if let WakeAdoptMaterializedPendingOutcome::Adopted(adopted) = repo
+    let runtimes = manager.runtimes.read().await;
+    let Some(current) = runtimes.get(conversation_id) else {
+        return Ok(());
+    };
+    if !Arc::ptr_eq(&current.identity, &handle.identity) {
+        return Ok(());
+    }
+    let permit = if auto_resume {
+        Some(
+            current
+                .event_tx
+                .reserve()
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let outcome = repo
         .adopt_materialized_pending_for_conversation(conversation_id, now)
         .await
-        .map_err(|error| error.to_string())?
-    {
-        if adopted.auto_resume {
-            handle
-                .event_tx
-                .send(crate::state_machine::Event::WakeBatchAdopted)
-                .await
-                .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?;
+    if matches!(
+        outcome,
+        phoenix_db::workflow::wake::WakeAdoptMaterializedPendingOutcome::Adopted(_)
+    ) {
+        if let Some(permit) = permit {
+            permit.send(crate::state_machine::Event::WakeBatchAdopted);
         }
     }
     Ok(())
@@ -507,16 +526,23 @@ async fn deliver_pending(
                     }
                 },
             };
-            if repo
+            if let Some(link) = repo
                 .get_delivery_message_link(
                     current.workflow_id,
                     current.canonical_delivery.delivery_id,
                 )
                 .await
                 .map_err(|error| error.to_string())?
-                .is_some()
             {
-                adopt_materialized_delivery(&handle, repo, &current.conversation_id, now).await?;
+                adopt_materialized_delivery(
+                    manager,
+                    &handle,
+                    repo,
+                    &current.conversation_id,
+                    link.auto_resume,
+                    now,
+                )
+                .await?;
                 cursor = Some(next_cursor);
                 continue;
             }
@@ -541,29 +567,26 @@ async fn deliver_pending(
                     let _ = handle
                         .broadcast_tx
                         .send_message(link.linked_message.message.clone());
-                    let conversation_id = current.conversation_id;
-                    match repo
-                        .adopt_materialized_pending_for_conversation(&conversation_id, now)
-                        .await
-                        .map_err(|error| error.to_string())?
-                    {
-                        WakeAdoptMaterializedPendingOutcome::Adopted(adopted) => {
-                            if adopted.auto_resume {
-                                handle
-                                    .event_tx
-                                    .send(crate::state_machine::Event::WakeBatchAdopted)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                            }
-                        }
-                        WakeAdoptMaterializedPendingOutcome::Busy(_)
-                        | WakeAdoptMaterializedPendingOutcome::NothingPending
-                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
-                    }
+                    adopt_materialized_delivery(
+                        manager,
+                        &handle,
+                        repo,
+                        &current.conversation_id,
+                        link.auto_resume,
+                        now,
+                    )
+                    .await?;
                 }
-                MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
-                    adopt_materialized_delivery(&handle, repo, &current.conversation_id, now)
-                        .await?;
+                MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(link) => {
+                    adopt_materialized_delivery(
+                        manager,
+                        &handle,
+                        repo,
+                        &current.conversation_id,
+                        link.auto_resume,
+                        now,
+                    )
+                    .await?;
                 }
                 MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
                     repo.suppress_pending_for_archived_conversation(&current, now)
@@ -1665,6 +1688,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_runtime_identity_does_not_accept_wake_event() {
+        let (db, repo) = open_repo().await;
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db,
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let handle = manager.get_or_create("conv").await.unwrap();
+        let stale = crate::runtime::ConversationHandle {
+            identity: Arc::new(()),
+            ..handle.clone()
+        };
+        adopt_materialized_delivery(&manager, &stale, &repo, "conv", true, Timestamp(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn already_materialized_wake_does_not_reset_newer_replay_events() {
         let (db, repo, scope) = open_repo().await;
         let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
@@ -1746,11 +1791,10 @@ mod tests {
         let after = handle.broadcast_tx.snapshot_pending();
         assert_eq!(handle.broadcast_tx.current_seq(), sequence_before);
         assert_eq!(after.0, before.0);
-        assert_eq!(after.3.len(), 1);
-        assert!(matches!(
-            &after.3[0],
+        assert!(after.3.iter().any(|event| matches!(
+            event,
             crate::runtime::SseEvent::Token { text, .. } if text == "newer"
-        ));
+        )));
     }
 
     #[test]

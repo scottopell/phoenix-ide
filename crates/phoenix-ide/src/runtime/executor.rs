@@ -2572,8 +2572,15 @@ where
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
     /// are logged and discarded — state unchanged.
     fn publish_wake_registration(&mut self, registration: WakeRegistrationNotice) {
-        self.registered_wake_workflows
-            .insert(phoenix_workflow::WorkflowId(registration.workflow_id));
+        if matches!(
+            self.state,
+            ConvState::ToolExecuting { .. }
+                | ConvState::AwaitingSubAgents { .. }
+                | ConvState::CancellingTool { .. }
+        ) {
+            self.registered_wake_workflows
+                .insert(phoenix_workflow::WorkflowId(registration.workflow_id));
+        }
         let _ = self
             .broadcast_tx
             .send_seq(|sequence_id| SseEvent::WakeContractRegistered {
@@ -3000,7 +3007,10 @@ where
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
-        if matches!(self.state, ConvState::Idle) {
+        if matches!(
+            self.state,
+            ConvState::Idle | ConvState::LlmRequesting { .. }
+        ) {
             self.registered_wake_workflows.clear();
         }
         // Only stamp a fresh entry time when the phase actually changes.
@@ -9294,6 +9304,22 @@ mod context_exhausted_preserves_worktree_tests {
             self.0.lock().unwrap().push(input.workflow_id);
             Ok(crate::tools::RegisteredWake::Cancelled)
         }
+    }
+
+    #[tokio::test]
+    async fn parked_idle_registration_is_not_tracked_for_next_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let (mut runtime, _) = build_runtime(storage, "parked-idle", temp.path().to_path_buf());
+        runtime.state = ConvState::Idle;
+        runtime.publish_wake_registration(WakeRegistrationNotice {
+            workflow_id: 11,
+            contract_id: "wake-11".to_string(),
+            resource_kind: "BashHandle".to_string(),
+            handle_id: "b-1".to_string(),
+            expires_at: 600,
+        });
+        assert!(runtime.registered_wake_workflows.is_empty());
     }
 
     #[tokio::test]
