@@ -649,6 +649,12 @@ const CLEAR_AT_LEAST_TOKENS: usize = 8192;
 const CLEAR_GAIN_FRACTION_NUM: usize = 1;
 const CLEAR_GAIN_FRACTION_DEN: usize = 20;
 
+fn should_defer_owed_llm_receipt(state: &ConvState, event: &Event, receipt_owed: bool) -> bool {
+    receipt_owed
+        && matches!(event, Event::LlmResponse { .. })
+        && matches!(state, ConvState::ToolExecuting { .. })
+}
+
 fn proportional_gain_tokens(reported_prompt_tokens: i64) -> usize {
     let prompt = usize::try_from(reported_prompt_tokens).unwrap_or(usize::MAX);
     prompt
@@ -2616,7 +2622,7 @@ where
         let durable: phoenix_llm::DurableLlmResponse =
             serde_json::from_str(&owed.llm_receipt.response_aggregate)
                 .map_err(|error| error.to_string())?;
-        let request_id = durable.provider_request_id.unwrap_or_else(|| {
+        let request_id = owed.llm_receipt.provider_request_id.unwrap_or_else(|| {
             format!(
                 "llm-receipt-{}-{}",
                 owed.workflow.workflow_id.0, owed.receipt.receipt_id.0
@@ -2721,13 +2727,6 @@ where
             }
             self.steering_queue.push(entry);
             let queue_position = self.steering_queue.len() - 1;
-            if let Err(e) = self
-                .storage
-                .update_steering_queue(&self.context.conversation_id, &self.steering_queue)
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to persist steering queue");
-            }
             // Notify the UI so it can show the queued indicator
             let _ = self
                 .broadcast_tx
@@ -2778,6 +2777,13 @@ where
                 None
             };
             let current_event = self.canonicalize_llm_response_event(current_event).await?;
+            if should_defer_owed_llm_receipt(
+                &self.state,
+                &current_event,
+                owed_llm_receipt.is_some(),
+            ) {
+                return Ok(());
+            }
             if owed_llm_receipt.is_some()
                 && matches!(current_event, Event::LlmResponse { .. })
                 && matches!(self.state, ConvState::Idle)
@@ -5193,7 +5199,6 @@ where
                     if let Some(attempt) = durable_attempt.as_ref() {
                         let durable_response = phoenix_llm::DurableLlmResponse {
                             response: response.clone(),
-                            provider_request_id: Some(request_id.clone()),
                         };
                         let response_aggregate = match serde_json::to_string(&durable_response) {
                             Ok(aggregate) => aggregate,
@@ -10394,6 +10399,26 @@ mod steer_drain_detector_tests {
         (rt, storage)
     }
 
+    #[test]
+    fn owed_llm_receipt_waits_for_tool_execution_to_finish() {
+        let state = mk_tool_executing();
+        let event = Event::LlmResponse {
+            content: Vec::new(),
+            tool_calls: Vec::new(),
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "owed-receipt".to_string(),
+        };
+
+        assert!(super::should_defer_owed_llm_receipt(&state, &event, true));
+        assert!(!super::should_defer_owed_llm_receipt(
+            &ConvState::Idle,
+            &event,
+            true
+        ));
+        assert!(!super::should_defer_owed_llm_receipt(&state, &event, false));
+    }
+
     /// Filter generated events down to `SteerDrainedUserMessages` payloads.
     fn extract_steer_drain_entries(events: &[Event]) -> Vec<Vec<SteerEntry>> {
         events
@@ -11160,7 +11185,6 @@ mod steer_drain_detector_tests {
     /// enqueue-during-drain race.
     #[tokio::test]
     async fn clear_steering_queue_entries_preserves_concurrent_enqueue() {
-        use crate::runtime::traits::StateStore;
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-clear-effect",
             ConvState::LlmRequesting { attempt: 1 },
@@ -11168,17 +11192,14 @@ mod steer_drain_detector_tests {
         );
         // Pre-seed storage as if drain took [p1, p2] from in-memory, then a
         // concurrent enqueue persisted [p1, p2, c1] (c1 added by enqueue).
-        storage
-            .update_steering_queue(
-                "conv-clear-effect",
-                &[
-                    mk_entry("p1", "pending-1"),
-                    mk_entry("p2", "pending-2"),
-                    mk_entry("c1", "concurrent"),
-                ],
-            )
-            .await
-            .expect("seed steering queue");
+        storage.set_steering_queue(
+            "conv-clear-effect",
+            vec![
+                mk_entry("p1", "pending-1"),
+                mk_entry("p2", "pending-2"),
+                mk_entry("c1", "concurrent"),
+            ],
+        );
 
         // Drain only removes p1 and p2.
         rt.execute_effect(Effect::ClearSteeringQueueEntries {

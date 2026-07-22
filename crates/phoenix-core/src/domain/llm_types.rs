@@ -615,7 +615,6 @@ pub struct LlmResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DurableLlmResponse {
     pub response: LlmResponse,
-    pub provider_request_id: Option<String>,
 }
 
 impl LlmResponse {
@@ -817,7 +816,7 @@ mod durable_codec_tests {
     }
 
     #[test]
-    fn durable_response_round_trip_preserves_tool_content_usage_and_provider_id() {
+    fn durable_response_round_trip_preserves_tool_content_and_usage() {
         let durable = DurableLlmResponse {
             response: LlmResponse {
                 content: vec![ContentBlock::ToolUse {
@@ -833,7 +832,6 @@ mod durable_codec_tests {
                     cache_read_tokens: 3,
                 },
             },
-            provider_request_id: Some("provider-1".to_string()),
         };
         let encoded = serde_json::to_vec(&durable).unwrap();
         assert_eq!(

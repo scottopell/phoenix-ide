@@ -601,14 +601,6 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).upsert_llm_request_metrics(metrics).await
     }
 
-    async fn update_steering_queue(
-        &self,
-        conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String> {
-        (**self).update_steering_queue(conv_id, queue).await
-    }
-
     async fn remove_steering_entries(
         &self,
         conv_id: &str,
@@ -1132,17 +1124,6 @@ impl StateStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .upsert_llm_request_metrics(metrics)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn update_steering_queue(
-        &self,
-        conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String> {
-        self.db
-            .update_steering_queue(conv_id, queue)
             .await
             .map_err(|e| e.to_string())
     }

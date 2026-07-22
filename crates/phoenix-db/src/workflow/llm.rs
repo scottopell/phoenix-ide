@@ -592,6 +592,10 @@ impl WorkflowRepository {
              SET committed_outcome = 'RuntimeAccepted', live_slot = 1
              WHERE conversation_id = ?1 AND client_message_id = ?2
                AND committed_outcome = 'QueuedSteering'
+               AND NOT EXISTS (
+                   SELECT 1 FROM direct_turn_steering_cancellations c
+                   WHERE c.workflow_id = direct_turn_acceptances.workflow_id
+               )
                AND EXISTS (
                    SELECT 1 FROM top_level_llm_workflows w
                    WHERE w.workflow_id = direct_turn_acceptances.workflow_id
@@ -608,6 +612,10 @@ impl WorkflowRepository {
                  JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
                  WHERE a.conversation_id = ?1 AND a.client_message_id = ?2
                    AND a.committed_outcome = 'RuntimeAccepted'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM direct_turn_steering_cancellations c
+                       WHERE c.workflow_id = a.workflow_id
+                   )
                    AND w.stopped_at IS NULL",
             )
             .bind(conversation_id)
@@ -2244,6 +2252,50 @@ mod tests {
             .await
             .unwrap(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_drain_cannot_promote_cancelled_steering() {
+        let repo = open_repo().await;
+        repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::QueuedSteering {
+                entry: Box::new(phoenix_core::domain::sm_event::SteerEntry {
+                    text: "steer".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "msg-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }),
+            },
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-steer".to_string(),
+            prepared_fingerprint: "fp-steer".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        })
+        .await
+        .unwrap();
+        let staged = vec!["msg-steer".to_string()];
+        assert!(repo
+            .cancel_queued_steering("conv-1", "msg-steer")
+            .await
+            .unwrap());
+
+        assert!(repo
+            .consume_queued_steering_batch("conv-1", "msg-steer", &staged)
+            .await
+            .is_err());
+        assert_eq!(
+            repo.load_direct_turn_acceptance("conv-1", "msg-steer")
+                .await
+                .unwrap()
+                .unwrap()
+                .committed_outcome,
+            DirectTurnCommittedOutcome::CancelledSteering
         );
     }
 

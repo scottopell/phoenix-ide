@@ -410,7 +410,8 @@ async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> R
             content: durable.response.content,
             end_turn: durable.response.end_turn,
             usage: durable.response.usage,
-            request_id: durable
+            request_id: owed
+                .llm_receipt
                 .provider_request_id
                 .unwrap_or_else(|| format!("llm-receipt-{}", owed.receipt.receipt_id.0)),
         };
@@ -465,7 +466,6 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                 let response_usage = response.usage.clone();
                 let aggregate = serde_json::to_string(&phoenix_llm::DurableLlmResponse {
                     response: response.clone(),
-                    provider_request_id: Some(request_id.clone()),
                 })
                 .map_err(|error| error.to_string())?;
                 let fingerprint = sha2::Sha256::digest(aggregate.as_bytes()).iter().fold(
