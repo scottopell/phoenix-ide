@@ -78,6 +78,25 @@ describe('ReleaseUpdatePanel', () => {
     expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
   });
 
+  it('hydrates durable transaction status when initial discovery fails', async () => {
+    const active = {
+      kind: 'present' as const, transaction_id: 'tx-reconnect', state: 'activating', source_commit: null,
+      release_tag: 'v1.1.0', expected_version: '1.1.0', expected_git_sha: snapshot.preview.commit,
+      created_at: null, updated_at: null, failure: null, rollback_failure: null, stale: false,
+    };
+    const fetchMock = vi.mocked(fetch)
+      .mockRejectedValueOnce(new Error('release discovery unavailable'))
+      .mockImplementationOnce(() => json(active));
+    render(<ReleaseUpdatePanel />);
+    expect(await screen.findByText(/release information unavailable — release discovery unavailable/i)).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(await screen.findByText(/activating and verifying/i)).toBeInTheDocument();
+    expect(screen.getByText('tx-reconnect')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/release-updates/transaction');
+  });
+
   it('preserves the last-good candidate when discovery returns unavailable', async () => {
     const unavailable = {
       ...snapshot,

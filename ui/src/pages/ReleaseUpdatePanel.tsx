@@ -14,6 +14,8 @@ const TERMINAL_STATES = new Set([
   'rejected_concurrent',
 ]);
 
+type ReleaseDiscoverySnapshot = Omit<ReleaseUpdateSnapshot, 'transaction'>;
+
 function authorityText(authority: ReleaseUpdateAuthority): string | null {
   switch (authority.kind) {
     case 'allowed': return null;
@@ -82,7 +84,8 @@ export function ReleaseUpdatePanel({
 }: {
   onDeploymentChange?: (snapshot: Pick<ReleaseUpdateSnapshot, 'current_version' | 'current_git_sha' | 'installation_ownership'>) => void;
 }) {
-  const [snapshot, setSnapshot] = useState<ReleaseUpdateSnapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<ReleaseDiscoverySnapshot | null>(null);
+  const [transaction, setTransaction] = useState<ReleaseTransactionStatus | null>(null);
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [transactionError, setTransactionError] = useState<string | null>(null);
   const [approvalError, setApprovalError] = useState<string | null>(null);
@@ -95,9 +98,9 @@ export function ReleaseUpdatePanel({
   const [discoveryCheckedAt, setDiscoveryCheckedAt] = useState<string | null>(null);
   const loadInFlight = useRef(false);
   const mounted = useRef(false);
-  const snapshotRef = useRef<ReleaseUpdateSnapshot | null>(null);
+  const transactionRef = useRef<ReleaseTransactionStatus | null>(null);
   const confirmedIdentityRef = useRef<string | null>(null);
-  snapshotRef.current = snapshot;
+  transactionRef.current = transaction;
   confirmedIdentityRef.current = confirmedIdentity;
 
   const markDiscoveryStale = useCallback((reason: string) => {
@@ -106,21 +109,17 @@ export function ReleaseUpdatePanel({
     setConfirmedIdentity(null);
   }, []);
 
-  const mergeFullSnapshot = useCallback((
-    current: ReleaseUpdateSnapshot | null,
-    next: ReleaseUpdateSnapshot,
-  ): ReleaseUpdateSnapshot => {
-    if (
-      current?.transaction.kind === 'present'
-      && !TERMINAL_STATES.has(current.transaction.state)
-      && next.transaction.kind !== 'present'
-    ) {
-      setTransactionError(next.transaction.kind === 'unreadable'
-        ? next.transaction.reason
+  const mergeTransaction = useCallback((
+    current: ReleaseTransactionStatus | null,
+    next: ReleaseTransactionStatus,
+  ): ReleaseTransactionStatus => {
+    if (current?.kind === 'present' && !TERMINAL_STATES.has(current.state) && next.kind !== 'present') {
+      setTransactionError(next.kind === 'unreadable'
+        ? next.reason
         : 'Durable transaction status temporarily disappeared');
-      return { ...next, transaction: current.transaction };
+      return current;
     }
-    if (next.transaction.kind !== 'unreadable') setTransactionError(null);
+    if (next.kind !== 'unreadable') setTransactionError(null);
     return next;
   }, []);
 
@@ -130,6 +129,8 @@ export function ReleaseUpdatePanel({
     try {
       const next = await api.releaseUpdateSnapshot(refresh);
       if (!mounted.current) return false;
+      const { transaction: nextTransaction, ...nextDiscovery } = next;
+      setTransaction((current) => mergeTransaction(current, nextTransaction));
       if (next.preview.kind === 'available') {
         const nextIdentity = `${next.preview.tag}:${next.preview.commit}:${next.preview.asset_sha256}`;
         if (confirmedIdentityRef.current !== null && confirmedIdentityRef.current !== nextIdentity) {
@@ -138,15 +139,12 @@ export function ReleaseUpdatePanel({
         }
         setDiscoveryCheckedAt(next.sampled_at);
         setDiscoveryError(null);
-        setSnapshot((current) => mergeFullSnapshot(current, next));
+        setSnapshot(nextDiscovery);
       } else {
         markDiscoveryStale(next.preview.reason);
-        setSnapshot((current) => mergeFullSnapshot(
-          current,
-          current?.preview.kind === 'available'
-            ? { ...next, preview: current.preview }
-            : next,
-        ));
+        setSnapshot((current) => current?.preview.kind === 'available'
+          ? { ...nextDiscovery, preview: current.preview }
+          : nextDiscovery);
       }
       onDeploymentChange?.(next);
       return true;
@@ -157,7 +155,7 @@ export function ReleaseUpdatePanel({
       if (mounted.current) setLoading(false);
       loadInFlight.current = false;
     }
-  }, [markDiscoveryStale, mergeFullSnapshot, onDeploymentChange]);
+  }, [markDiscoveryStale, mergeTransaction, onDeploymentChange]);
 
   useEffect(() => {
     mounted.current = true;
@@ -165,12 +163,13 @@ export function ReleaseUpdatePanel({
     return () => { mounted.current = false; };
   }, [load]);
 
-  const active = snapshot?.transaction.kind === 'present'
-    && !TERMINAL_STATES.has(snapshot.transaction.state);
+  const active = transaction?.kind === 'present'
+    && !TERMINAL_STATES.has(transaction.state);
   const shouldPollTransaction = handoffTransactionId !== null
     || reconciliationTransactionId !== null
-    || snapshot?.transaction.kind === 'none'
-    || snapshot?.transaction.kind === 'unreadable'
+    || (!loading && snapshot === null && transaction === null)
+    || transaction?.kind === 'none'
+    || transaction?.kind === 'unreadable'
     || active;
 
   useEffect(() => {
@@ -181,9 +180,9 @@ export function ReleaseUpdatePanel({
       try {
         const transaction = await api.releaseUpdateTransaction();
         if (!cancelled && mounted.current) {
-          const current = snapshotRef.current;
+          const current = transactionRef.current;
           if (transaction.kind === 'present') {
-            setSnapshot((value) => value ? { ...value, transaction } : value);
+            setTransaction(transaction);
             setTransactionError(null);
             if (transaction.transaction_id === handoffTransactionId) {
               setHandoffTransactionId(null);
@@ -192,12 +191,12 @@ export function ReleaseUpdatePanel({
               setReconciliationTransactionId(transaction.transaction_id);
               if (await load()) setReconciliationTransactionId(null);
             }
-          } else if (current?.transaction.kind === 'present') {
+          } else if (current?.kind === 'present') {
             setTransactionError(transaction.kind === 'unreadable'
               ? transaction.reason
               : 'Durable transaction status temporarily disappeared');
           } else {
-            setSnapshot((value) => value ? { ...value, transaction } : value);
+            setTransaction(transaction);
             setTransactionError(transaction.kind === 'unreadable' ? transaction.reason : null);
           }
         }
@@ -250,15 +249,15 @@ export function ReleaseUpdatePanel({
   }, [confirmedIdentity, discoveryError, snapshot]);
 
   const handoffPending = handoffTransactionId !== null;
-  const approvalStatusSafe = !handoffPending && transactionError === null && (snapshot?.transaction.kind === 'none'
-    || (snapshot?.transaction.kind === 'present'
-      && TERMINAL_STATES.has(snapshot.transaction.state)
-      && snapshot.transaction.state !== 'activation_failed_rollback_failed'));
+  const approvalStatusSafe = !handoffPending && transactionError === null && (transaction?.kind === 'none'
+    || (transaction?.kind === 'present'
+      && TERMINAL_STATES.has(transaction.state)
+      && transaction.state !== 'activation_failed_rollback_failed'));
   const availablePreview = snapshot?.preview.kind === 'available' ? snapshot.preview : null;
-  const committedReleaseIsPreview = snapshot?.transaction.kind === 'present'
-    && snapshot.transaction.state === 'committed'
-    && availablePreview?.tag === snapshot.transaction.release_tag
-    && availablePreview.commit === snapshot.transaction.source_commit;
+  const committedReleaseIsPreview = transaction?.kind === 'present'
+    && transaction.state === 'committed'
+    && availablePreview?.tag === transaction.release_tag
+    && availablePreview.commit === transaction.source_commit;
   const discoveryFreshness = discoveryError && snapshot?.preview.kind === 'available'
     ? 'stale'
     : loading
@@ -344,10 +343,10 @@ export function ReleaseUpdatePanel({
               )}
             </div>
           )}
-          {active && <div className="release-update__hint">An approved update is in progress. Transaction status refreshes every 2 seconds; Phoenix may disconnect while the native backend activates, verifies, or rolls back.</div>}
-          <TransactionStatus transaction={snapshot.transaction} />
         </>
       )}
+      {active && <div className="release-update__hint">An approved update is in progress. Transaction status refreshes every 2 seconds; Phoenix may disconnect while the native backend activates, verifies, or rolls back.</div>}
+      {transaction && <TransactionStatus transaction={transaction} />}
     </section>
   );
 }
