@@ -10,7 +10,10 @@ export function checkoutLabel(status: Snapshot['checkout_status']): string {
         const relationship = remote.ahead === 0 && remote.behind === 0
           ? 'up to date'
           : [remote.ahead > 0 ? `↑${remote.ahead}` : '', remote.behind > 0 ? `↓${remote.behind}` : ''].filter(Boolean).join(' ');
-        return `${status.branch_name} · ${remote.remote_ref} · ${relationship}`;
+        const relationshipLabel = remote.kind === 'matching'
+          ? `matching ${remote.remote_ref} (not upstream)`
+          : remote.remote_ref;
+        return `${status.branch_name} · ${relationshipLabel} · ${relationship}`;
       }
       if (remote.kind === 'unavailable') return `${status.branch_name} · upstream unavailable`;
       return status.branch_name;

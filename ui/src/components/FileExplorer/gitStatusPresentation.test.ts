@@ -11,6 +11,15 @@ describe('checkoutLabel', () => {
     })).toBe('feature · origin/feature · ↑2 ↓1');
   });
 
+  it('distinguishes a matching remote from a configured upstream', () => {
+    expect(checkoutLabel({
+      kind: 'named_branch',
+      branch_name: 'feature',
+      head_oid: 'abc',
+      remote_status: { kind: 'matching', remote_ref: 'origin/feature', ahead: 0, behind: 0 },
+    })).toBe('feature · matching origin/feature (not upstream) · up to date');
+  });
+
   it('surfaces unavailable upstream observation', () => {
     expect(checkoutLabel({
       kind: 'named_branch',
