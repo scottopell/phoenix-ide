@@ -77,7 +77,7 @@ function openBashDetail() {
  *  useLocation) wrapping the viewer-slot context (BashRow's inspect affordance
  *  calls useViewerSlot). Tests render/rerender through this so the section
  *  mounts in the same context the app gives it. */
-function sectionTree(props: { scopeKey: string; liveInventory?: WorkScopeInventory | null }) {
+function sectionTree(props: { scopeKey: string; conversationId?: string; liveInventory?: WorkScopeInventory | null }) {
   return (
     <MemoryRouter initialEntries={['/c/conv-A']}>
       <Routes>
@@ -86,7 +86,7 @@ function sectionTree(props: { scopeKey: string; liveInventory?: WorkScopeInvento
           element={
             <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
               <WorkScopeSection
-              conversationId="conv-1"
+                conversationId={props.conversationId ?? 'conv-1'}
                 scopeKey={props.scopeKey}
                 liveInventory={props.liveInventory ?? null}
                 expanded={true}
@@ -352,6 +352,35 @@ describe('WorkScopeSection stale-scope guard', () => {
     expect(screen.getByText('NEW-SCOPE-CMD')).toBeTruthy();
     expect(screen.queryByText('OLD-SCOPE-CMD')).toBeNull();
   });
+  it('a fetch for an old actor resolving after conversationId changed does NOT overwrite the new actor', async () => {
+    let resolveOld!: (v: WorkScopeInventory) => void;
+    const oldPending = new Promise<WorkScopeInventory>((resolve) => {
+      resolveOld = resolve;
+    });
+    const oldInv = inv([bash({ cmd: 'OLD-ACTOR-CMD', state: 'tombstoned', duration_ms: 1 })]);
+    const newInv = inv([bash({ cmd: 'NEW-ACTOR-CMD', state: 'tombstoned', duration_ms: 1 })]);
+    getInv.mockImplementation((_key: string, conversationId: string) =>
+      conversationId === 'conv-old' ? oldPending : Promise.resolve(newInv),
+    );
+
+    let utils!: ReturnType<typeof render>;
+    await act(async () => {
+      utils = render(sectionTree({ scopeKey: 'ws-shared', conversationId: 'conv-old' }));
+    });
+    await act(async () => {
+      utils.rerender(sectionTree({ scopeKey: 'ws-shared', conversationId: 'conv-new' }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText('NEW-ACTOR-CMD')).toBeTruthy();
+
+    await act(async () => {
+      resolveOld(oldInv);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('NEW-ACTOR-CMD')).toBeTruthy();
+    expect(screen.queryByText('OLD-ACTOR-CMD')).toBeNull();
+  });
 });
 
 describe('WorkScopeSection SSE-generation guard (same-scope time ordering)', () => {
@@ -547,7 +576,7 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
 });
 
 /** WorkScopeSection rendered collapsed (expanded=false) in its provider tree. */
-function sectionCollapsedTree(props: { scopeKey: string; liveInventory?: WorkScopeInventory | null }) {
+function sectionCollapsedTree(props: { scopeKey: string; conversationId?: string; liveInventory?: WorkScopeInventory | null }) {
   return (
     <MemoryRouter initialEntries={['/c/conv-A']}>
       <Routes>
@@ -556,7 +585,7 @@ function sectionCollapsedTree(props: { scopeKey: string; liveInventory?: WorkSco
           element={
             <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
               <WorkScopeSection
-              conversationId="conv-1"
+                conversationId={props.conversationId ?? 'conv-1'}
                 scopeKey={props.scopeKey}
                 liveInventory={props.liveInventory ?? null}
                 expanded={false}

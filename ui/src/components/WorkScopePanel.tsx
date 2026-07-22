@@ -420,6 +420,8 @@ function useWorkScopeInventory(
   // Latest scope key for the poll callback without re-creating it per render.
   const scopeKeyRef = useRef(scopeKey);
   scopeKeyRef.current = scopeKey;
+  const conversationIdRef = useRef(conversationId);
+  conversationIdRef.current = conversationId;
 
   // SSE-generation counter, bumped every time an SSE `liveInventory` update
   // writes `displayed`. A pull captures this at request time; if it advanced
@@ -449,24 +451,33 @@ function useWorkScopeInventory(
   // so no pull-sequence guard is needed.
   const fetchSnapshot = useCallback(async () => {
     const requestedKey = scopeKeyRef.current;
+    const requestedConversationId = conversationIdRef.current;
     const requestedGen = sseGenRef.current;
     setError(false);
     try {
-      const inv = await api.getWorkScopeInventory(requestedKey, conversationId);
-      if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
+      const inv = await api.getWorkScopeInventory(requestedKey, requestedConversationId);
+      if (
+        scopeKeyRef.current !== requestedKey ||
+        conversationIdRef.current !== requestedConversationId ||
+        sseGenRef.current !== requestedGen
+      ) return;
       setDisplayed(inv);
     } catch {
-      if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
+      if (
+        scopeKeyRef.current !== requestedKey ||
+        conversationIdRef.current !== requestedConversationId ||
+        sseGenRef.current !== requestedGen
+      ) return;
       setError(true);
     }
-  }, [conversationId]);
+  }, []);
 
-  // Initial pull (REQ-WSUI-006). Re-runs (and clears the stale snapshot) when
-  // the scope key changes.
+  // Initial pull (REQ-WSUI-006). Re-runs and clears the stale snapshot when
+  // either the scope or actor changes.
   useEffect(() => {
     setDisplayed(null);
     void fetchSnapshot();
-  }, [scopeKey, fetchSnapshot]);
+  }, [scopeKey, conversationId, fetchSnapshot]);
 
   // SSE push: a fresh full snapshot for this scope. It is "newer truth" — bump
   // the generation so any pull in flight (captured an older gen) drops its
