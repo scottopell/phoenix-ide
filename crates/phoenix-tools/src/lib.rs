@@ -1131,6 +1131,7 @@ impl ToolRegistry {
     pub fn for_subagent_work() -> Self {
         let mut tools = read_only_tools();
         tools.push(Arc::new(BashTool));
+        tools.push(Arc::new(WaitUntilTool));
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
         tools.push(Arc::new(PatchTool::default()));
@@ -1383,6 +1384,11 @@ mod tests {
         ))
         .contains("wait_until"));
         assert!(names(&ToolRegistry::for_subagent_explore(sandbox_policy())).contains("wait_until"));
+    }
+
+    #[test]
+    fn work_subagent_includes_wait_until() {
+        assert!(names(&ToolRegistry::for_subagent_work()).contains("wait_until"));
     }
 
     #[test]

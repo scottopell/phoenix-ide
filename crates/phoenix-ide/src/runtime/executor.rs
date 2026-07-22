@@ -20,7 +20,9 @@ use super::{
 };
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
-use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
+use crate::state_machine::outcome::{
+    EffectOutcome, LlmOutcome, ToolExecOutcome, WakeRegistrationNotice,
+};
 use crate::state_machine::state::{
     CommissionReviewApprovalAvailability, CommissionReviewApprovalScope, SubAgentMode,
     SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
@@ -2569,12 +2571,19 @@ where
     ///
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
     /// are logged and discarded — state unchanged.
-    fn remember_registered_wake(&mut self, outcome: &EffectOutcome) {
-        if let EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark { registration, .. }) = outcome
-        {
-            self.registered_wake_workflows
-                .insert(phoenix_workflow::WorkflowId(registration.workflow_id));
-        }
+    fn publish_wake_registration(&mut self, registration: WakeRegistrationNotice) {
+        self.registered_wake_workflows
+            .insert(phoenix_workflow::WorkflowId(registration.workflow_id));
+        let _ = self
+            .broadcast_tx
+            .send_seq(|sequence_id| SseEvent::WakeContractRegistered {
+                sequence_id,
+                workflow_id: registration.workflow_id,
+                contract_id: registration.contract_id,
+                resource_kind: registration.resource_kind,
+                handle_id: registration.handle_id,
+                expires_at: registration.expires_at,
+            });
     }
 
     async fn process_outcome(&mut self, mut outcome: EffectOutcome) -> Result<(), String> {
@@ -2625,24 +2634,14 @@ where
             }
         }
 
-        self.remember_registered_wake(&outcome);
+        let wake_registration = match &outcome {
+            EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark { registration, .. }) => {
+                Some(registration.clone())
+            }
+            _ => None,
+        };
 
         refresh_commission_review_approval_for_outcome(&mut self.context, &outcome);
-        if let EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark { registration, .. }) =
-            &outcome
-        {
-            let _ = self
-                .broadcast_tx
-                .send_seq(|sequence_id| SseEvent::WakeContractRegistered {
-                    sequence_id,
-                    workflow_id: registration.workflow_id,
-                    contract_id: registration.contract_id.clone(),
-                    resource_kind: registration.resource_kind.clone(),
-                    handle_id: registration.handle_id.clone(),
-                    expires_at: registration.expires_at,
-                });
-        }
-
         if let EffectOutcome::Llm(LlmOutcome::Response {
             content,
             tool_calls,
@@ -2681,6 +2680,10 @@ where
 
         // Apply transition result and process any generated events
         let mut events_to_process = self.apply_transition_result(result).await?;
+
+        if let Some(registration) = wake_registration {
+            self.publish_wake_registration(registration);
+        }
 
         // Process chained events (e.g., SpawnAgentsComplete from execute_effect)
         while let Some(event) = events_to_process.pop() {
