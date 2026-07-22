@@ -4,6 +4,7 @@ use crate::db::{Conversation, DbError, MessageType, RetrievalScope};
 use axum::{extract::State, Json};
 use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -13,6 +14,58 @@ const SEARCH_TOP_K: usize = 10;
 const READ_PAGE_CHARS: usize = 7000;
 const READ_MESSAGE_BATCH: i64 = 64;
 const READ_TARGET_SIDE_MESSAGES: i64 = 32;
+
+#[derive(Serialize)]
+struct CoordinatorActivityRow {
+    current_conversation_id: String,
+    root_conversation_id: String,
+    slug: Option<String>,
+    title: Option<String>,
+    project_id: Option<String>,
+    mode: Option<String>,
+    state: Option<String>,
+    state_updated_at: String,
+    updated_at: String,
+    continued_in_conv_id: Option<String>,
+    archived: bool,
+    user_initiated: bool,
+    parent_conversation_id: Option<String>,
+    cm_task_id: Option<String>,
+    cm_task_title: Option<String>,
+    cm_branch_name: Option<String>,
+    cm_base_branch: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CoordinatorActivitySnapshot {
+    rows: Vec<CoordinatorActivityRow>,
+    truncated: bool,
+    row_limit: usize,
+}
+
+impl CoordinatorActivityRow {
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            current_conversation_id: row.try_get("current_conversation_id")?,
+            root_conversation_id: row.try_get("root_conversation_id")?,
+            slug: row.try_get("slug")?,
+            title: row.try_get("title")?,
+            project_id: row.try_get("project_id")?,
+            mode: row.try_get("mode")?,
+            state: row.try_get("state")?,
+            state_updated_at: row.try_get("state_updated_at")?,
+            updated_at: row.try_get("updated_at")?,
+            continued_in_conv_id: row.try_get("continued_in_conv_id")?,
+            archived: row.try_get("archived")?,
+            user_initiated: row.try_get("user_initiated")?,
+            parent_conversation_id: row.try_get("parent_conversation_id")?,
+            cm_task_id: row.try_get("cm_task_id")?,
+            cm_task_title: row.try_get("cm_task_title")?,
+            cm_branch_name: row.try_get("cm_branch_name")?,
+            cm_base_branch: row.try_get("cm_base_branch")?,
+        })
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 struct ConversationReadTarget {
     conversation_id: String,
@@ -133,16 +186,22 @@ ORDER BY CASE WHEN json_extract(c.state, '$.type') IN
   c.updated_at DESC
 LIMIT 41
 ";
-        let mut result = self
-            .db
-            .coordinator_query(SNAPSHOT_SQL)
+        let mut rows = sqlx::query(SNAPSHOT_SQL)
+            .fetch_all(self.db.pool())
             .await
-            .map_err(|error| error.to_string())?;
-        if result.rows.len() > 40 {
-            result.rows.truncate(40);
-            result.truncated = true;
-        }
-        let data = serde_json::to_string_pretty(&result)
+            .map_err(|error| format!("snapshot query failed: {error}"))?
+            .into_iter()
+            .map(|row| CoordinatorActivityRow::from_row(&row))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("snapshot row decode failed: {error}"))?;
+        let truncated = rows.len() > 40;
+        rows.truncate(40);
+        let snapshot = CoordinatorActivitySnapshot {
+            rows,
+            truncated,
+            row_limit: 40,
+        };
+        let data = serde_json::to_string_pretty(&snapshot)
             .map_err(|error| format!("failed to encode Coordinator snapshot: {error}"))?;
         Ok(format!(
             "# Conversation activity snapshot — raw relational facts\n\

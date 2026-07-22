@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 const MAX_ROWS: usize = 200;
 const MAX_BYTES: usize = 64 * 1024;
 const MAX_DURATION: Duration = Duration::from_millis(750);
+const MAX_SQL_BYTES: usize = 16 * 1024;
+const MAX_COLUMNS: c_int = 64;
 const PROGRESS_OPS: c_int = 1_000;
 
 const ALLOWED_SCHEMA: &[&str] = &[
@@ -56,6 +58,7 @@ const ALLOWED_SCHEMA: &[&str] = &[
 const DENIED_COLUMNS: &[(&str, &str)] = &[
     ("conversation_creation_jobs", "claim_token"),
     ("conversation_creation_jobs", "cleanup_token"),
+    ("conversations", "state"),
     ("message_images", "data"),
     ("wake_bindings", "tmux_server_token"),
     ("wake_terminal_receipts", "tmux_server_token"),
@@ -65,6 +68,15 @@ const DENIED_COLUMNS: &[(&str, &str)] = &[
         "workflow_external_acceptance_bindings",
         "disposition_handle",
     ),
+    ("workflow_authoritative_observations", "observation_payload"),
+    ("workflow_barriers", "reducer_event_payload"),
+    ("workflow_deliveries", "payload_blob"),
+    ("workflow_effects", "intent_payload"),
+    ("workflow_manual_resolution_choices", "payload_blob"),
+    ("workflow_receipts", "receipt_payload"),
+    ("workflow_stale_observations", "observation_payload"),
+    ("workflow_transitions", "event_payload"),
+    ("workflows", "snapshot_payload"),
 ];
 
 const DENIED_TABLES: &[&str] = &[
@@ -151,6 +163,9 @@ pub fn execute_coordinator_query(
             elapsed_ms: 0,
         });
     }
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(CoordinatorQueryError::BudgetExceeded);
+    }
     let path = CString::new(path).map_err(|_| CoordinatorQueryError::InvalidPath)?;
     let sql = CString::new(sql).map_err(|_| CoordinatorQueryError::InvalidQuery)?;
     let started = Instant::now();
@@ -170,11 +185,7 @@ pub fn execute_coordinator_query(
     });
     unsafe {
         ffi::sqlite3_extended_result_codes(connection.0, 1);
-        ffi::sqlite3_limit(
-            connection.0,
-            ffi::SQLITE_LIMIT_LENGTH,
-            i32::try_from(MAX_BYTES).unwrap_or(i32::MAX),
-        );
+        ffi::sqlite3_limit(connection.0, ffi::SQLITE_LIMIT_COLUMN, MAX_COLUMNS);
         ffi::sqlite3_set_authorizer(connection.0, Some(authorize), (&raw mut *authorizer).cast());
         ffi::sqlite3_progress_handler(
             connection.0,
@@ -249,14 +260,21 @@ pub fn execute_coordinator_query(
     }
     drop(statement);
     connection.close();
-    Ok(CoordinatorQueryResult {
+    let mut result = CoordinatorQueryResult {
         columns,
         rows,
         truncated,
         row_limit: MAX_ROWS,
         byte_limit: MAX_BYTES,
         elapsed_ms: started.elapsed().as_millis(),
-    })
+    };
+    while serde_json::to_vec(&result).map_or(usize::MAX, |json| json.len()) > MAX_BYTES {
+        if result.rows.pop().is_none() {
+            return Err(CoordinatorQueryError::BudgetExceeded);
+        }
+        result.truncated = true;
+    }
+    Ok(result)
 }
 
 unsafe extern "C" fn authorize(
@@ -493,7 +511,7 @@ mod tests {
         let path = dir.path().join("query.db");
         let db = rusqlite_for_test(&path);
         db.execute_batch(
-            "CREATE TABLE conversations(id TEXT, state TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             CREATE TABLE workflow_external_acceptance_bindings(id TEXT, idempotency_key TEXT, receipt_handle BLOB, disposition_handle BLOB, status TEXT);\n             CREATE TABLE messages(message_id TEXT, content TEXT, display_data TEXT);\n             CREATE TABLE message_images(message_id TEXT, ordinal INTEGER, media_type TEXT, data TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_executing\"}', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
+            "CREATE TABLE conversations(id TEXT, state TEXT, state_updated_at TEXT, updated_at TEXT);\n             CREATE TABLE auth_sessions(id TEXT, token_hash TEXT);\n             CREATE TABLE future_secret_store(id TEXT, secret TEXT);\n             CREATE TABLE conversation_creation_jobs(id TEXT, claim_token TEXT, status TEXT);\n             CREATE TABLE workflow_external_acceptance_bindings(id TEXT, idempotency_key TEXT, receipt_handle BLOB, disposition_handle BLOB, status TEXT);\n             CREATE TABLE messages(message_id TEXT, content TEXT, display_data TEXT);\n             CREATE TABLE message_images(message_id TEXT, ordinal INTEGER, media_type TEXT, data TEXT);\n             CREATE TABLE workflow_effects(id TEXT, intent_payload BLOB, status TEXT);\n             INSERT INTO conversations VALUES ('active', '{\"type\":\"tool_execution\",\"pending\":\"secret\"}', '2026-07-21', '2026-07-21');\n             INSERT INTO auth_sessions VALUES ('session', 'secret');",
         )
         .unwrap();
         (dir, path)
@@ -549,10 +567,10 @@ mod tests {
         let (_dir, path) = fixture();
         let result = execute_coordinator_query(
             path.to_str().unwrap(),
-            "SELECT id, json_extract(state, '$.type') AS state FROM conversations",
+            "SELECT id, state_updated_at FROM conversations",
         )
         .unwrap();
-        assert_eq!(result.columns, ["id", "state"]);
+        assert_eq!(result.columns, ["id", "state_updated_at"]);
         assert_eq!(result.rows.len(), 1);
         assert!(matches!(&result.rows[0][0], CoordinatorCell::Text(v) if v == "active"));
     }
@@ -569,6 +587,8 @@ mod tests {
             "SELECT CAST(disposition_handle AS TEXT) FROM workflow_external_acceptance_bindings",
             "SELECT content FROM messages",
             "SELECT data FROM message_images",
+            "SELECT state FROM conversations",
+            "SELECT intent_payload FROM workflow_effects",
             "UPDATE conversations SET id = 'changed'",
             "ATTACH DATABASE '/tmp/other.db' AS other",
             "PRAGMA query_only",
@@ -632,6 +652,24 @@ mod tests {
                 Err(CoordinatorQueryError::Denied(_))
             ));
         }
+    }
+
+    #[test]
+    fn budgets_the_serialized_result_and_sql_shape() {
+        let (_dir, path) = fixture();
+        let alias = "x".repeat(MAX_SQL_BYTES);
+        assert!(matches!(
+            execute_coordinator_query(path.to_str().unwrap(), &format!("SELECT 1 AS '{alias}'")),
+            Err(CoordinatorQueryError::BudgetExceeded)
+        ));
+        let aliases = (0..=MAX_COLUMNS)
+            .map(|index| format!("1 AS c{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            execute_coordinator_query(path.to_str().unwrap(), &format!("SELECT {aliases}"))
+                .is_err()
+        );
     }
 
     #[test]
