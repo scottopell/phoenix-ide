@@ -2183,26 +2183,8 @@ where
                     }
                 }
                 Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
-                    self.llm_task_handle = None;
-                    self.active_llm_attempt = None;
-                    // Generation guard for the LLM request, mirroring the
-                    // `RetryTimeout` guard above. A `forward_llm_outcome` send
-                    // whose generation has been superseded (by a later dispatch
-                    // or an intentional `Effect::AbortLlm`) is stale: its
-                    // synthetic NetworkError must not be applied to the current,
-                    // unrelated `LlmRequesting` turn. Drop it.
-                    if self.llm_outcome_is_stale(generation) {
-                        tracing::debug!(
-                            outcome_generation = generation,
-                            current_generation = self.llm_request_generation,
-                            state = self.state.variant_name(),
-                            "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
-                        );
-                    } else if let Err(e) =
-                        self.process_outcome(EffectOutcome::Llm(llm_outcome)).await
-                    {
-                        tracing::warn!(error = %e, "Outcome rejected by state machine");
-                    }
+                    self.process_generation_tagged_llm_outcome(generation, llm_outcome)
+                        .await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -2443,17 +2425,33 @@ where
         }
     }
 
-    /// Process a typed effect outcome from a background task.
+    /// Accept a forwarded LLM outcome only when its generation is current.
     ///
-    /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
-    /// are logged and discarded — state unchanged.
-    /// Whether a forwarded LLM outcome stamped with `generation` belongs to a
-    /// superseded request. An outcome is stale when its generation no longer
-    /// matches the current in-flight generation — either a later
-    /// `Effect::RequestLlm` opened a newer generation, or an intentional
-    /// `Effect::AbortLlm` bumped it. Stale outcomes (including the synthetic
-    /// `NetworkError` produced when an aborted task drops its sender) are
-    /// discarded so they cannot misfire on a subsequent unrelated turn.
+    /// A later dispatch or abort supersedes the generation. Its stale outcome
+    /// cannot clear the current request's task handle or metrics capture;
+    /// current outcomes consume both before entering the state machine.
+    async fn process_generation_tagged_llm_outcome(
+        &mut self,
+        generation: u64,
+        llm_outcome: LlmOutcome,
+    ) {
+        if self.llm_outcome_is_stale(generation) {
+            tracing::debug!(
+                outcome_generation = generation,
+                current_generation = self.llm_request_generation,
+                state = self.state.variant_name(),
+                "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
+            );
+            return;
+        }
+
+        self.llm_task_handle = None;
+        self.active_llm_attempt = None;
+        if let Err(error) = self.process_outcome(EffectOutcome::Llm(llm_outcome)).await {
+            tracing::warn!(%error, "Outcome rejected by state machine");
+        }
+    }
+
     fn llm_outcome_is_stale(&self, generation: u64) -> bool {
         generation != self.llm_request_generation
     }
@@ -2479,6 +2477,10 @@ where
         generation != self.retry_generation
     }
 
+    /// Process a typed effect outcome from a background task.
+    ///
+    /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
+    /// are logged and discarded — state unchanged.
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
@@ -12627,6 +12629,32 @@ mod llm_generation_guard_tests {
             state_before,
             "a stale aborted outcome must not move state — no spurious retry/error"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_preserves_current_request_handle_and_metrics() {
+        let mut rt = runtime_requesting();
+        rt.llm_request_generation = 2;
+        rt.llm_task_handle = Some(tokio::spawn(std::future::pending()));
+        rt.active_llm_attempt = Some(phoenix_llm::LlmAttemptCapture::new());
+
+        rt.process_generation_tagged_llm_outcome(
+            1,
+            LlmOutcome::NetworkError {
+                message: "stale aborted request".to_string(),
+            },
+        )
+        .await;
+
+        assert!(
+            rt.llm_task_handle.is_some(),
+            "a stale outcome must not clear the current request task handle"
+        );
+        assert!(
+            rt.active_llm_attempt.is_some(),
+            "a stale outcome must not clear the current request metrics capture"
+        );
+        rt.llm_task_handle.take().expect("test task handle").abort();
     }
 
     /// The current-generation outcome is honoured: not stale, so it flows into

@@ -462,15 +462,23 @@ impl TtftAccumulator {
     fn observe(
         &mut self,
         outcome: &phoenix_core::domain::llm_types::LlmAttemptOutcome,
+        transport: phoenix_core::domain::llm_types::LlmTransport,
         ttft_ms: Option<u64>,
     ) {
         match (outcome, ttft_ms) {
             (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, Some(ms)) => {
                 self.sample_ms.push(ms);
             }
-            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, None) => {
+            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, None)
+                if matches!(
+                    transport,
+                    phoenix_core::domain::llm_types::LlmTransport::HttpSse
+                        | phoenix_core::domain::llm_types::LlmTransport::Websocket
+                ) =>
+            {
                 self.no_token_success_count += 1;
             }
+            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, None) => {}
             (_, _) => self.error_count += 1,
         }
     }
@@ -585,23 +593,24 @@ fn build_ttft_summary(rows: Vec<phoenix_db::UsageRecentLlmMetricRow>) -> TtftWin
         let outcome = row.outcome;
         let provider = row.provider;
         let model = row.model;
-        let transport = row.transport.as_str().to_string();
+        let transport_kind = row.transport;
+        let transport = transport_kind.as_str().to_string();
         let day = row.created_at.chars().take(10).collect::<String>();
         seen_days.insert(day.clone());
 
-        totals.observe(&outcome, ttft_ms);
+        totals.observe(&outcome, transport_kind, ttft_ms);
         provider_map
             .entry((scope, provider.clone()))
             .or_default()
-            .observe(&outcome, ttft_ms);
+            .observe(&outcome, transport_kind, ttft_ms);
         grouped_map
             .entry((scope, provider.clone(), model.clone(), transport.clone()))
             .or_default()
-            .observe(&outcome, ttft_ms);
+            .observe(&outcome, transport_kind, ttft_ms);
         daily_map
             .entry((day, scope))
             .or_default()
-            .observe(&outcome, ttft_ms);
+            .observe(&outcome, transport_kind, ttft_ms);
     }
 
     let mut provider_rows: Vec<_> = provider_map
@@ -1037,6 +1046,27 @@ mod tests {
         assert_eq!(totals.cost.estimated_usd, 7.0);
         assert_eq!(totals.cost.unknown_turns, 0.0);
         assert!(totals.cost.pricing_known);
+    }
+
+    #[test]
+    fn ttft_summary_excludes_unsupported_transport_from_no_token_successes() {
+        use phoenix_core::domain::llm_types::{LlmAttemptOutcome, LlmTransport};
+
+        let summary = build_ttft_summary(vec![phoenix_db::UsageRecentLlmMetricRow {
+            request_id: "req-http-json-success".to_string(),
+            retry_attempt: 1,
+            created_at: "2025-08-10T02:30:00+00:00".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            transport: LlmTransport::HttpJson,
+            outcome: LlmAttemptOutcome::Success,
+            dispatch_to_first_generation_event_ms: None,
+        }]);
+
+        assert_eq!(summary.sample_count, 0.0);
+        assert_eq!(summary.no_token_success_count, 0.0);
+        assert_eq!(summary.error_count, 0.0);
+        assert_eq!(summary.grouped_rows[0].no_token_success_count, 0.0);
     }
 
     #[test]

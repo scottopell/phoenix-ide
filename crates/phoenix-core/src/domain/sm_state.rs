@@ -630,6 +630,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn continuation_recovery_defaults_missing_attempt_to_first_attempt() {
+        let state: ConvState = serde_json::from_value(serde_json::json!({
+            "type": "awaiting_recovery",
+            "message": "refresh credentials",
+            "error_kind": "auth",
+            "recovery_kind": "credential",
+            "resume": {
+                "type": "continuation_summary",
+                "request": { "rejected_tool_calls": [] }
+            }
+        }))
+        .expect("pre-feature continuation recovery row should deserialize");
+
+        let ConvState::AwaitingRecovery {
+            resume: RecoveryResumeTarget::ContinuationSummary { request },
+            ..
+        } = state
+        else {
+            panic!("expected continuation recovery state");
+        };
+        assert_eq!(request.attempt, 1);
+    }
+
     /// Task 02713: model change is allowed from `Idle` and `Error` only.
     ///
     /// The `match` below is intentionally wildcard-free: adding a new
@@ -900,10 +924,16 @@ pub enum RecoveryKind {
     Credential,
 }
 
+const fn first_continuation_attempt() -> u32 {
+    1
+}
+
 /// Operation-specific inputs for a continuation summary request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContinuationSummaryRequest {
     pub rejected_tool_calls: Vec<ToolCall>,
+    // owned: pre-feature recovery rows had no attempt; the initial attempt is correct.
+    #[serde(default = "first_continuation_attempt")]
     pub attempt: u32,
 }
 
