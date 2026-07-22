@@ -342,6 +342,7 @@ pub struct TtftSummaryRow {
     pub transport: Option<String>,
     pub sample_count: f64,
     pub no_token_success_count: f64,
+    pub cancellation_count: f64,
     pub error_count: f64,
     pub percentiles: TtftPercentiles,
     pub thresholds: Vec<TtftThresholdStat>,
@@ -354,6 +355,7 @@ pub struct DailyTtftTrendRow {
     pub attempt_scope: TtftAttemptScope,
     pub sample_count: f64,
     pub no_token_success_count: f64,
+    pub cancellation_count: f64,
     pub error_count: f64,
     pub percentiles: TtftPercentiles,
 }
@@ -364,6 +366,7 @@ pub struct TtftWindowSummary {
     pub window_days: f64,
     pub sample_count: f64,
     pub no_token_success_count: f64,
+    pub cancellation_count: f64,
     pub error_count: f64,
     pub provider_rows: Vec<TtftSummaryRow>,
     pub grouped_rows: Vec<TtftSummaryRow>,
@@ -455,6 +458,7 @@ const TTFT_THRESHOLDS_MS: &[u64] = &[2_000, 5_000, 10_000, 30_000];
 struct TtftAccumulator {
     sample_ms: Vec<u64>,
     no_token_success_count: u64,
+    cancellation_count: u64,
     error_count: u64,
 }
 
@@ -479,6 +483,9 @@ impl TtftAccumulator {
                 self.no_token_success_count += 1;
             }
             (phoenix_core::domain::llm_types::LlmAttemptOutcome::Success, None) => {}
+            (phoenix_core::domain::llm_types::LlmAttemptOutcome::Cancelled, _) => {
+                self.cancellation_count += 1;
+            }
             (_, _) => self.error_count += 1,
         }
     }
@@ -498,6 +505,7 @@ impl TtftAccumulator {
             transport,
             sample_count: self.sample_ms.len() as f64,
             no_token_success_count: self.no_token_success_count as f64,
+            cancellation_count: self.cancellation_count as f64,
             error_count: self.error_count as f64,
             percentiles: ttft_percentiles(&self.sample_ms),
             thresholds: ttft_thresholds(&self.sample_ms),
@@ -511,6 +519,7 @@ impl TtftAccumulator {
             attempt_scope,
             sample_count: self.sample_ms.len() as f64,
             no_token_success_count: self.no_token_success_count as f64,
+            cancellation_count: self.cancellation_count as f64,
             error_count: self.error_count as f64,
             percentiles: ttft_percentiles(&self.sample_ms),
         }
@@ -564,6 +573,7 @@ fn empty_ttft_summary() -> TtftWindowSummary {
         window_days: TTFT_WINDOW_DAYS as f64,
         sample_count: 0.0,
         no_token_success_count: 0.0,
+        cancellation_count: 0.0,
         error_count: 0.0,
         provider_rows: Vec::new(),
         grouped_rows: Vec::new(),
@@ -583,6 +593,7 @@ fn build_ttft_summary(rows: Vec<phoenix_db::UsageRecentLlmMetricRow>) -> TtftWin
     let mut totals = TtftAccumulator {
         sample_ms: Vec::new(),
         no_token_success_count: 0,
+        cancellation_count: 0,
         error_count: 0,
     };
     let mut seen_days = BTreeSet::new();
@@ -651,6 +662,7 @@ fn build_ttft_summary(rows: Vec<phoenix_db::UsageRecentLlmMetricRow>) -> TtftWin
         window_days: TTFT_WINDOW_DAYS as f64,
         sample_count: totals.sample_ms.len() as f64,
         no_token_success_count: totals.no_token_success_count as f64,
+        cancellation_count: totals.cancellation_count as f64,
         error_count: totals.error_count as f64,
         provider_rows,
         grouped_rows,
@@ -1049,6 +1061,27 @@ mod tests {
     }
 
     #[test]
+    fn ttft_summary_separates_cancellations_from_provider_errors() {
+        use phoenix_core::domain::llm_types::{LlmAttemptOutcome, LlmTransport};
+
+        let summary = build_ttft_summary(vec![phoenix_db::UsageRecentLlmMetricRow {
+            request_id: "req-cancelled".to_string(),
+            retry_attempt: 1,
+            created_at: "2025-08-10T02:00:00+00:00".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            transport: LlmTransport::HttpSse,
+            outcome: LlmAttemptOutcome::Cancelled,
+            dispatch_to_first_generation_event_ms: None,
+        }]);
+
+        assert_eq!(summary.cancellation_count, 1.0);
+        assert_eq!(summary.error_count, 0.0);
+        assert_eq!(summary.provider_rows[0].cancellation_count, 1.0);
+        assert_eq!(summary.daily_trend[0].cancellation_count, 1.0);
+    }
+
+    #[test]
     fn ttft_summary_excludes_unsupported_transport_from_no_token_successes() {
         use phoenix_core::domain::llm_types::{LlmAttemptOutcome, LlmTransport};
 
@@ -1065,6 +1098,7 @@ mod tests {
 
         assert_eq!(summary.sample_count, 0.0);
         assert_eq!(summary.no_token_success_count, 0.0);
+        assert_eq!(summary.cancellation_count, 0.0);
         assert_eq!(summary.error_count, 0.0);
         assert_eq!(summary.grouped_rows[0].no_token_success_count, 0.0);
     }
@@ -1119,6 +1153,7 @@ mod tests {
 
         assert_eq!(summary.sample_count, 2.0);
         assert_eq!(summary.no_token_success_count, 1.0);
+        assert_eq!(summary.cancellation_count, 0.0);
         assert_eq!(summary.error_count, 1.0);
         assert_eq!(summary.provider_rows.len(), 3);
 

@@ -36,6 +36,7 @@ const overview: UsageOverview = {
     window_days: 14,
     sample_count: 3,
     no_token_success_count: 1,
+    cancellation_count: 1,
     error_count: 1,
     provider_rows: [
       {
@@ -45,6 +46,7 @@ const overview: UsageOverview = {
         transport: null,
         sample_count: 2,
         no_token_success_count: 1,
+        cancellation_count: 1,
         error_count: 0,
         percentiles: { p50_ms: 800, p75_ms: 1200, p90_ms: 1200, p95_ms: 1200, p99_ms: 1200 },
         thresholds: [
@@ -61,6 +63,7 @@ const overview: UsageOverview = {
         transport: null,
         sample_count: 1,
         no_token_success_count: 0,
+        cancellation_count: 0,
         error_count: 1,
         percentiles: { p50_ms: 6000, p75_ms: 6000, p90_ms: 6000, p95_ms: 6000, p99_ms: 6000 },
         thresholds: [
@@ -79,6 +82,7 @@ const overview: UsageOverview = {
         transport: 'http_sse',
         sample_count: 2,
         no_token_success_count: 1,
+        cancellation_count: 1,
         error_count: 0,
         percentiles: { p50_ms: 800, p75_ms: 1200, p90_ms: 1200, p95_ms: 1200, p99_ms: 1200 },
         thresholds: [
@@ -90,8 +94,8 @@ const overview: UsageOverview = {
       },
     ],
     daily_trend: [
-      { day: '2025-08-10', attempt_scope: 'first_attempt', sample_count: 2, no_token_success_count: 1, error_count: 0, percentiles: { p50_ms: 800, p75_ms: 1200, p90_ms: 1200, p95_ms: 1200, p99_ms: 1200 } },
-      { day: '2025-08-10', attempt_scope: 'retry', sample_count: 1, no_token_success_count: 0, error_count: 1, percentiles: { p50_ms: 6000, p75_ms: 6000, p90_ms: 6000, p95_ms: 6000, p99_ms: 6000 } },
+      { day: '2025-08-10', attempt_scope: 'first_attempt', sample_count: 2, no_token_success_count: 1, cancellation_count: 1, error_count: 0, percentiles: { p50_ms: 800, p75_ms: 1200, p90_ms: 1200, p95_ms: 1200, p99_ms: 1200 } },
+      { day: '2025-08-10', attempt_scope: 'retry', sample_count: 1, no_token_success_count: 0, cancellation_count: 0, error_count: 1, percentiles: { p50_ms: 6000, p75_ms: 6000, p90_ms: 6000, p95_ms: 6000, p99_ms: 6000 } },
     ],
   },
 };
@@ -114,6 +118,7 @@ describe('UsagePage TTFT hero', () => {
     await waitFor(() => expect(screen.getByText('Time to first token')).toBeInTheDocument());
     expect(screen.getByText(/Provider efficiency over the last 14 days/)).toBeInTheDocument();
     expect(screen.getByText('TTFT samples')).toBeInTheDocument();
+    expect(screen.getByText('Cancellations')).toBeInTheDocument();
     expect(screen.getByText('Best-covered first-attempt provider')).toBeInTheDocument();
     expect(screen.getByText('Retry behavior')).toBeInTheDocument();
     expect(screen.getByText('Provider / model / transport comparison')).toBeInTheDocument();

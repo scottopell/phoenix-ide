@@ -70,9 +70,9 @@ function attemptScopeLabel(scope: TtftSummaryRow['attempt_scope']): string {
   return scope === 'first_attempt' ? 'First attempt' : 'Retry';
 }
 
-function fmtTtftSampleQuality(row: Pick<TtftSummaryRow, 'sample_count' | 'no_token_success_count' | 'error_count'>): string {
-  const observed = row.sample_count + row.no_token_success_count + row.error_count;
-  return `${Math.round(row.sample_count)} TTFT samples · ${Math.round(row.no_token_success_count)} no-token successes · ${Math.round(row.error_count)} errors${observed > 0 ? ` · ${fmtRatioPct(row.sample_count / observed)} sampled` : ''}`;
+function fmtTtftSampleQuality(row: Pick<TtftSummaryRow, 'sample_count' | 'no_token_success_count' | 'cancellation_count' | 'error_count'>): string {
+  const observed = row.sample_count + row.no_token_success_count + row.cancellation_count + row.error_count;
+  return `${Math.round(row.sample_count)} TTFT samples · ${Math.round(row.no_token_success_count)} no-token successes · ${Math.round(row.cancellation_count)} cancellations · ${Math.round(row.error_count)} errors${observed > 0 ? ` · ${fmtRatioPct(row.sample_count / observed)} sampled` : ''}`;
 }
 
 // Recharts tooltip formatters receive `ValueType | undefined` (number, string,
@@ -201,7 +201,7 @@ function TtftHero({ data }: { data: UsageOverview['ttft'] }) {
   });
   const topFirstAttempt = firstAttemptRows[0] ?? null;
   const topRetry = retryRows[0] ?? null;
-  const observed = data.sample_count + data.no_token_success_count + data.error_count;
+  const observed = data.sample_count + data.no_token_success_count + data.cancellation_count + data.error_count;
 
   return (
     <section className="usage-card usage-ttft-hero">
@@ -209,7 +209,7 @@ function TtftHero({ data }: { data: UsageOverview['ttft'] }) {
         <div>
           <h3>Time to first token</h3>
           <span className="usage-card__hint">
-            Provider efficiency over the last {Math.round(data.window_days)} days. TTFT uses dispatch→first generation event and excludes no-token successes and failures from percentile math.
+            Provider efficiency over the last {Math.round(data.window_days)} days. TTFT uses dispatch→first generation event and excludes no-token successes, cancellations, and failures from percentile math.
           </span>
         </div>
       </div>
@@ -222,6 +222,7 @@ function TtftHero({ data }: { data: UsageOverview['ttft'] }) {
             <div className="usage-export__summary">
               <div><span>TTFT samples</span><strong>{Math.round(data.sample_count)}</strong></div>
               <div><span>No-token success</span><strong>{Math.round(data.no_token_success_count)}</strong></div>
+              <div><span>Cancellations</span><strong>{Math.round(data.cancellation_count)}</strong></div>
               <div><span>Errors</span><strong>{Math.round(data.error_count)}</strong></div>
               <div><span>Sample quality</span><strong>{fmtRatioPct(observed > 0 ? data.sample_count / observed : null)}</strong></div>
             </div>

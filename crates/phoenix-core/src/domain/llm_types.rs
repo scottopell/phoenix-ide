@@ -683,6 +683,14 @@ mod attempt_capture_tests {
     use super::*;
 
     #[test]
+    fn pre_dispatch_cancellation_is_not_a_provider_attempt() {
+        let capture = LlmAttemptCapture::new();
+
+        assert_eq!(capture.finalize_cancelled(), None);
+        assert_eq!(capture.finalized(), None);
+    }
+
+    #[test]
     fn cancelled_attempt_preserves_partial_provider_progress() {
         let capture = LlmAttemptCapture::new();
         let telemetry = LlmRequestTelemetry {

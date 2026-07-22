@@ -2,4 +2,4 @@
 import type { TtftAttemptScope } from "./TtftAttemptScope";
 import type { TtftPercentiles } from "./TtftPercentiles";
 
-export type DailyTtftTrendRow = { day: string, attempt_scope: TtftAttemptScope, sample_count: number, no_token_success_count: number, error_count: number, percentiles: TtftPercentiles, };
+export type DailyTtftTrendRow = { day: string, attempt_scope: TtftAttemptScope, sample_count: number, no_token_success_count: number, cancellation_count: number, error_count: number, percentiles: TtftPercentiles, };

@@ -2,4 +2,4 @@
 import type { DailyTtftTrendRow } from "./DailyTtftTrendRow";
 import type { TtftSummaryRow } from "./TtftSummaryRow";
 
-export type TtftWindowSummary = { window_days: number, sample_count: number, no_token_success_count: number, error_count: number, provider_rows: Array<TtftSummaryRow>, grouped_rows: Array<TtftSummaryRow>, daily_trend: Array<DailyTtftTrendRow>, };
+export type TtftWindowSummary = { window_days: number, sample_count: number, no_token_success_count: number, cancellation_count: number, error_count: number, provider_rows: Array<TtftSummaryRow>, grouped_rows: Array<TtftSummaryRow>, daily_trend: Array<DailyTtftTrendRow>, };

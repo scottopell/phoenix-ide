@@ -3,4 +3,4 @@ import type { TtftAttemptScope } from "./TtftAttemptScope";
 import type { TtftPercentiles } from "./TtftPercentiles";
 import type { TtftThresholdStat } from "./TtftThresholdStat";
 
-export type TtftSummaryRow = { attempt_scope: TtftAttemptScope, provider: string, model: string | null, transport: string | null, sample_count: number, no_token_success_count: number, error_count: number, percentiles: TtftPercentiles, thresholds: Array<TtftThresholdStat>, };
+export type TtftSummaryRow = { attempt_scope: TtftAttemptScope, provider: string, model: string | null, transport: string | null, sample_count: number, no_token_success_count: number, cancellation_count: number, error_count: number, percentiles: TtftPercentiles, thresholds: Array<TtftThresholdStat>, };

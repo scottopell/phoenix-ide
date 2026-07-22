@@ -268,7 +268,7 @@ impl ResponsesStreamAccumulator {
             .unwrap_or(event_type);
 
         match dispatch_type {
-            "response.output_text.delta" => {
+            "response.output_text.delta" | "response.refusal.delta" => {
                 if let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str) {
                     if !delta.is_empty() {
                         self.telemetry
@@ -1061,11 +1061,13 @@ async fn complete_codex_websocket(
             acc.process_event(event_type, &text, chunk_tx)
                 .await
                 .map_err(CodexWsError::backend)?;
-            if event_type == "response.output_text.delta"
-                && value
-                    .get("delta")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|delta| !delta.is_empty())
+            if matches!(
+                event_type,
+                "response.output_text.delta" | "response.refusal.delta"
+            ) && value
+                .get("delta")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|delta| !delta.is_empty())
             {
                 public_output_started = true;
             }
@@ -3520,6 +3522,29 @@ mod tests {
             "first empty-dispatch event is logged"
         );
         acc.process_event("", r#"{"type":""}"#, &tx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refusal_delta_records_generated_visible_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+
+        acc.process_event(
+            "response.refusal.delta",
+            r#"{"type":"response.refusal.delta","delta":"I can't help with that."}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        let Some(super::super::TokenChunk::Text(text)) = rx.recv().await else {
+            panic!("expected refusal delta as text chunk");
+        };
+        assert_eq!(text, "I can't help with that.");
+        let telemetry = acc.telemetry.snapshot(false);
+        assert_eq!(telemetry.generation_event_count, 1);
+        assert_eq!(telemetry.visible_text_event_count, 1);
+        assert!(telemetry.dispatch_to_first_generation_event_ms.is_some());
     }
 
     #[tokio::test]

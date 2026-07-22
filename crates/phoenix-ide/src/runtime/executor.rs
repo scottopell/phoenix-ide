@@ -4524,19 +4524,6 @@ where
 
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let task_attempt_capture = attempt_capture.clone();
-        let pending_telemetry = phoenix_llm::LlmRequestTelemetry {
-            conversation_id: conv_id.clone(),
-            root_conversation_id: root_conv_id.clone(),
-            request_id: request_id.clone(),
-            retry_attempt,
-            attempt_capture: attempt_capture.clone(),
-        };
-        attempt_capture.begin(
-            &pending_telemetry,
-            "unknown",
-            &model_id,
-            phoenix_llm::LlmTransport::HttpSse,
-        );
         let forwarder_abort = forwarder_handle.abort_handle();
         let handle = tokio::spawn(async move {
             // Tokio cancellation is not recursive. Aborting the request must
