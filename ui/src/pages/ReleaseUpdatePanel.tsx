@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '../api';
+import { ApiResponseError, api } from '../api';
 import type { ReleaseTransactionStatus } from '../generated/ReleaseTransactionStatus';
 import type { ReleaseUpdateAuthority } from '../generated/ReleaseUpdateAuthority';
 import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
@@ -236,7 +236,12 @@ export function ReleaseUpdatePanel({
       approvedTransactionId = approval.transaction_id;
     } catch (cause) {
       if (mounted.current) {
-        setApprovalError(cause instanceof Error ? cause.message : String(cause));
+        if (cause instanceof ApiResponseError && cause.status === 409) {
+          markDiscoveryStale(cause.message);
+          setApprovalError(null);
+        } else {
+          setApprovalError(cause instanceof Error ? cause.message : String(cause));
+        }
         setApproving(false);
       }
       return;
@@ -246,7 +251,7 @@ export function ReleaseUpdatePanel({
       setHandoffTransactionId(approvedTransactionId);
       setApproving(false);
     }
-  }, [confirmedIdentity, discoveryError, snapshot]);
+  }, [confirmedIdentity, discoveryError, markDiscoveryStale, snapshot]);
 
   const handoffPending = handoffTransactionId !== null;
   const approvalStatusSafe = !handoffPending && transactionError === null && (transaction?.kind === 'none'

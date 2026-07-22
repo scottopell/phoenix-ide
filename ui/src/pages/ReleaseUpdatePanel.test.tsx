@@ -293,6 +293,21 @@ describe('ReleaseUpdatePanel', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('marks discovery stale when approval conflicts with the current preview', async () => {
+    const fetchMock = vi.mocked(fetch)
+      .mockImplementationOnce(() => json(snapshot))
+      .mockImplementationOnce(() => json({ error: 'release preview changed; refresh before approving' }, 409));
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText('v1.1.0');
+    fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Approve and install' }));
+
+    expect(await screen.findByText(/release information is stale — release preview changed/i)).toBeInTheDocument();
+    expect(screen.queryByText(/update approval failed/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Approve and install' })).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('blocks approval while durable transaction status is stale', async () => {
     vi.mocked(fetch).mockImplementation((input) => {
       const url = String(input);

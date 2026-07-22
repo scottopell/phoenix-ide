@@ -12,6 +12,13 @@ import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 // Phoenix API Client
 
+export class ApiResponseError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = 'ApiResponseError';
+  }
+}
+
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
 // are typed against the Rust-generated wire shapes in `./generated/sse`
 // via `v.GenericSchema<unknown, T>`. The `Sse*Data` names re-exported
@@ -1199,7 +1206,7 @@ export const api = {
       } catch {
         // keep fallback
       }
-      throw new Error(detail);
+      throw new ApiResponseError(detail, resp.status);
     }
     return resp.json();
   },

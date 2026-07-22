@@ -23,6 +23,9 @@ enum InstallState {
     | rejected | failed
 }
 enum ControllerConnectionState { connected | disconnected }
+enum DiscoveryFreshness { current | stale | unavailable }
+enum TransactionObservation { absent | readable | unreadable }
+enum DiscoveryTrigger { initial_load | operator_check | committed_reconciliation }
 
 enum TerminalMessageKind {
     none | success | rollback | rollback_failure | rejected | failure
@@ -85,6 +88,11 @@ entity UpdateController {
     connection: ControllerConnectionState
     visible_terminal_message: TerminalMessageKind
     hydrated_from_backend: Boolean
+    discovery_freshness: DiscoveryFreshness
+    discovery_sampled_at: Timestamp?
+    discovery_trigger: DiscoveryTrigger?
+    transaction_observation: TransactionObservation
+    transaction_polling: Boolean
 
     transitions connection {
         connected -> disconnected
@@ -128,6 +136,59 @@ entity UpdateController {
 -- audit_trail_complete(installation) -> Boolean
 --   durable release-update records preserve preview.id, approved_identity,
 --   installation.id, and terminal backend outcome.
+-- last_good_preview_retained(controller) -> Boolean
+--   a discovery failure does not replace the last successfully sampled preview.
+-- last_active_status_retained(controller) -> Boolean
+--   an unreadable or absent sample does not replace known nonterminal progress.
+
+rule ReleaseDiscoveryRecordsItsOwnSampleTime {
+    when: ReleaseDiscoverySucceeded(controller, preview, trigger)
+    requires: trigger in { initial_load, operator_check, committed_reconciliation }
+    requires: stable_published_release_exists(preview)
+    ensures: controller.preview = preview
+    ensures: controller.discovery_trigger = trigger
+    ensures: controller.discovery_freshness = current
+    ensures: controller.discovery_sampled_at = preview.discovered_at
+}
+
+rule FailedDiscoveryRetainsLastGoodPreview {
+    when: ReleaseDiscoveryFailed(controller)
+    requires: controller.preview != null
+    ensures: controller.discovery_freshness = stale
+    ensures: last_good_preview_retained(controller)
+}
+
+rule FailedInitialDiscoveryIsUnavailable {
+    when: ReleaseDiscoveryFailed(controller)
+    requires: controller.preview = null
+    ensures: controller.discovery_freshness = unavailable
+    ensures: controller.discovery_sampled_at = null
+}
+
+rule RecoverableTransactionStatesKeepPolling {
+    when: TransactionPollScheduled(controller)
+    requires: controller.transaction_observation in { absent, unreadable }
+        or controller.installation != null
+            and controller.installation.state in { requested, in_progress }
+    ensures: controller.transaction_polling = true
+}
+
+rule TransientTransactionSampleRetainsActiveStatus {
+    when: TransactionStatusUnavailable(controller)
+    requires: controller.installation != null
+    requires: controller.installation.state in { requested, in_progress }
+    ensures: controller.transaction_observation in { absent, unreadable }
+    ensures: last_active_status_retained(controller)
+    ensures: controller.transaction_polling = true
+}
+
+rule TerminalTransactionStopsPolling {
+    when: TransactionTerminalObserved(controller)
+    requires: controller.installation != null
+    requires: controller.installation.state in { committed, rolled_back, rollback_failed, rejected, failed }
+    ensures: controller.transaction_observation = readable
+    ensures: controller.transaction_polling = false
+}
 
 rule DiscoverStablePublishedRelease {
     when: StableReleaseDiscovered(preview)

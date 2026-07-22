@@ -42,7 +42,14 @@ const TERMINAL_STATUS_STATES: &[&str] = &[
     "activation_failed_rollback_failed",
     "rejected_concurrent",
 ];
-static PREVIEW_CACHE: OnceLock<RwLock<Option<(Instant, ReleasePreview)>>> = OnceLock::new();
+#[derive(Clone)]
+struct CachedPreview {
+    cached_at: Instant,
+    sampled_at: DateTime<Utc>,
+    preview: ReleasePreview,
+}
+
+static PREVIEW_CACHE: OnceLock<RwLock<Option<CachedPreview>>> = OnceLock::new();
 static GITHUB_REQUEST_GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static SYSTEMD_AUTHORITY_CACHE: OnceLock<RwLock<Option<(Instant, bool)>>> = OnceLock::new();
 
@@ -331,20 +338,33 @@ async fn discover_release() -> Result<ReleasePreview, String> {
     })
 }
 
-async fn cached_preview(refresh: bool) -> Result<ReleasePreview, String> {
+fn fresh_cached_preview(cached: &CachedPreview) -> Option<(ReleasePreview, DateTime<Utc>)> {
+    (cached.cached_at.elapsed() < PREVIEW_CACHE_TTL)
+        .then(|| (cached.preview.clone(), cached.sampled_at))
+}
+
+async fn cached_preview(refresh: bool) -> Result<(ReleasePreview, DateTime<Utc>), String> {
     let cache = PREVIEW_CACHE.get_or_init(|| RwLock::new(None));
     if !refresh {
-        if let Some((sampled, preview)) = cache.read().expect("preview cache poisoned").as_ref() {
-            if sampled.elapsed() < PREVIEW_CACHE_TTL {
-                return Ok(preview.clone());
-            }
+        if let Some(cached) = cache
+            .read()
+            .expect("preview cache poisoned")
+            .as_ref()
+            .and_then(fresh_cached_preview)
+        {
+            return Ok(cached);
         }
     }
     let preview = discover_release()
         .await
         .unwrap_or_else(|reason| ReleasePreview::Unavailable { reason });
-    *cache.write().expect("preview cache poisoned") = Some((Instant::now(), preview.clone()));
-    Ok(preview)
+    let sampled_at = Utc::now();
+    *cache.write().expect("preview cache poisoned") = Some(CachedPreview {
+        cached_at: Instant::now(),
+        sampled_at,
+        preview: preview.clone(),
+    });
+    Ok((preview, sampled_at))
 }
 
 fn status_path(state: &AppState, backend: ReleaseUpdateBackend) -> Option<PathBuf> {
@@ -600,9 +620,9 @@ pub async fn snapshot(
     let ownership = installation_ownership::detect(&state.runtime_env).await;
     let selected_backend = backend(&ownership);
     let local = client_is_local(peer.ip(), &headers);
-    let preview = cached_preview(query.refresh)
+    let (preview, sampled_at) = cached_preview(query.refresh)
         .await
-        .unwrap_or_else(|reason| ReleasePreview::Unavailable { reason });
+        .unwrap_or_else(|reason| (ReleasePreview::Unavailable { reason }, Utc::now()));
     Json(ReleaseUpdateSnapshot {
         installation_ownership: ownership.clone(),
         current_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -610,7 +630,7 @@ pub async fn snapshot(
         authority: authority(&state, local, &ownership, selected_backend, query.refresh),
         transaction: read_status(&state, transaction_backend(&ownership)),
         preview,
-        sampled_at: Utc::now(),
+        sampled_at,
     })
 }
 
@@ -896,6 +916,23 @@ pub async fn approve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_preview_preserves_discovery_sample_time() {
+        let sampled_at = Utc::now() - chrono::Duration::minutes(2);
+        let preview = ReleasePreview::Unavailable {
+            reason: "offline".to_string(),
+        };
+        let cached = CachedPreview {
+            cached_at: Instant::now(),
+            sampled_at,
+            preview: preview.clone(),
+        };
+
+        let (cached_preview, cached_sampled_at) = fresh_cached_preview(&cached).unwrap();
+        assert!(matches!(cached_preview, ReleasePreview::Unavailable { .. }));
+        assert_eq!(cached_sampled_at, sampled_at);
+    }
 
     #[test]
     fn approval_is_bound_to_both_tag_and_commit() {
