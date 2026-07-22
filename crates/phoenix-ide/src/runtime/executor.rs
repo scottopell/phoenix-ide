@@ -649,10 +649,25 @@ const CLEAR_AT_LEAST_TOKENS: usize = 8192;
 const CLEAR_GAIN_FRACTION_NUM: usize = 1;
 const CLEAR_GAIN_FRACTION_DEN: usize = 20;
 
-fn should_defer_owed_llm_receipt(state: &ConvState, event: &Event, receipt_owed: bool) -> bool {
-    receipt_owed
-        && matches!(event, Event::LlmResponse { .. })
-        && matches!(state, ConvState::ToolExecuting { .. })
+fn owed_tool_to_dispatch(
+    state: &ConvState,
+    event: &Event,
+    owed: Option<&phoenix_db::OwedTopLevelLlmReceipt>,
+) -> Option<ToolCall> {
+    let ConvState::ToolExecuting { current_tool, .. } = state else {
+        return None;
+    };
+    if !matches!(event, Event::LlmResponse { .. }) {
+        return None;
+    }
+    owed?
+        .tool_intents
+        .iter()
+        .any(|intent| {
+            intent.tool_use_id == current_tool.id
+                && intent.status == phoenix_db::ToolIntentStatus::Owed
+        })
+        .then(|| current_tool.clone())
 }
 
 fn proportional_gain_tokens(reported_prompt_tokens: i64) -> usize {
@@ -2777,11 +2792,10 @@ where
                 None
             };
             let current_event = self.canonicalize_llm_response_event(current_event).await?;
-            if should_defer_owed_llm_receipt(
-                &self.state,
-                &current_event,
-                owed_llm_receipt.is_some(),
-            ) {
+            if let Some(tool) =
+                owed_tool_to_dispatch(&self.state, &current_event, owed_llm_receipt.as_ref())
+            {
+                self.execute_effect(Effect::ExecuteTool { tool }).await?;
                 return Ok(());
             }
             if owed_llm_receipt.is_some()
@@ -10397,26 +10411,6 @@ mod steer_drain_detector_tests {
         )
         .with_steering_queue(queue);
         (rt, storage)
-    }
-
-    #[test]
-    fn owed_llm_receipt_waits_for_tool_execution_to_finish() {
-        let state = mk_tool_executing();
-        let event = Event::LlmResponse {
-            content: Vec::new(),
-            tool_calls: Vec::new(),
-            end_turn: true,
-            usage: phoenix_llm::Usage::default(),
-            request_id: "owed-receipt".to_string(),
-        };
-
-        assert!(super::should_defer_owed_llm_receipt(&state, &event, true));
-        assert!(!super::should_defer_owed_llm_receipt(
-            &ConvState::Idle,
-            &event,
-            true
-        ));
-        assert!(!super::should_defer_owed_llm_receipt(&state, &event, false));
     }
 
     /// Filter generated events down to `SteerDrainedUserMessages` payloads.
