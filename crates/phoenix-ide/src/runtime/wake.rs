@@ -426,7 +426,6 @@ async fn adopt_materialized_delivery(
     handle: &crate::runtime::ConversationHandle,
     repo: &WakeRepository,
     conversation_id: &str,
-    auto_resume: bool,
     now: Timestamp,
 ) -> Result<(), String> {
     let runtimes = manager.runtimes.read().await;
@@ -436,26 +435,19 @@ async fn adopt_materialized_delivery(
     if !Arc::ptr_eq(&current.identity, &handle.identity) {
         return Ok(());
     }
-    let permit = if auto_resume {
-        Some(
-            current
-                .event_tx
-                .reserve()
-                .await
-                .map_err(|error| error.to_string())?,
-        )
-    } else {
-        None
-    };
+    let permit = current
+        .event_tx
+        .reserve()
+        .await
+        .map_err(|error| error.to_string())?;
     let outcome = repo
         .adopt_materialized_pending_for_conversation(conversation_id, now)
         .await
         .map_err(|error| error.to_string())?;
-    if matches!(
-        outcome,
-        phoenix_db::workflow::wake::WakeAdoptMaterializedPendingOutcome::Adopted(_)
-    ) {
-        if let Some(permit) = permit {
+    if let phoenix_db::workflow::wake::WakeAdoptMaterializedPendingOutcome::Adopted(adopted) =
+        outcome
+    {
+        if adopted.auto_resume {
             permit.send(crate::state_machine::Event::WakeBatchAdopted);
         }
     }
@@ -543,23 +535,17 @@ async fn deliver_pending(
                     }
                 },
             };
-            if let Some(link) = repo
+            if repo
                 .get_delivery_message_link(
                     current.workflow_id,
                     current.canonical_delivery.delivery_id,
                 )
                 .await
                 .map_err(|error| error.to_string())?
+                .is_some()
             {
-                adopt_materialized_delivery(
-                    manager,
-                    &handle,
-                    repo,
-                    &current.conversation_id,
-                    link.auto_resume,
-                    now,
-                )
-                .await?;
+                adopt_materialized_delivery(manager, &handle, repo, &current.conversation_id, now)
+                    .await?;
                 cursor = Some(next_cursor);
                 continue;
             }
@@ -589,18 +575,16 @@ async fn deliver_pending(
                         &handle,
                         repo,
                         &current.conversation_id,
-                        link.auto_resume,
                         now,
                     )
                     .await?;
                 }
-                MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(link) => {
+                MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
                     adopt_materialized_delivery(
                         manager,
                         &handle,
                         repo,
                         &current.conversation_id,
-                        link.auto_resume,
                         now,
                     )
                     .await?;
@@ -1721,9 +1705,105 @@ mod tests {
             identity: Arc::new(()),
             ..handle.clone()
         };
-        adopt_materialized_delivery(&manager, &stale, &repo, "conv", true, Timestamp(1))
+        adopt_materialized_delivery(&manager, &stale, &repo, "conv", Timestamp(1))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_materialized_batch_uses_batch_auto_resume_decision() {
+        let (db, repo) = open_repo().await;
+        let cancelled_id = register_bash(&repo, "b-cancelled", 50).await;
+        let fired_id = register_bash(&repo, "b-fired", 50).await;
+        let (kick_tx, _) = watch::channel(0u64);
+        ProductionWakeRegistrar::new(repo.clone(), kick_tx)
+            .cancel(CancelWakeInput {
+                workflow_id: phoenix_workflow::WorkflowId(cancelled_id),
+                timestamp: Timestamp(5),
+                reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+            })
+            .await
+            .unwrap();
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            fired_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: conv_scope(),
+                    handle_id: "b-fired".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        )
+        .run_once()
+        .await
+        .unwrap();
+
+        let pending = repo.list_pending("conv").await.unwrap();
+        assert_eq!(pending.len(), 2);
+        for (index, delivery) in pending.iter().enumerate() {
+            let auto_resume = !matches!(
+                delivery.receipt.terminal,
+                phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
+            );
+            repo.materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
+                workflow_id: delivery.workflow_id,
+                delivery_id: delivery.canonical_delivery.delivery_id,
+                conversation_id: "conv".to_string(),
+                rendered_content: render_terminal_result(delivery),
+                display_data: None,
+                auto_resume,
+                created_at: Timestamp(20),
+                sequence_id: Some(i64::try_from(index + 1).unwrap()),
+            })
+            .await
+            .unwrap();
+        }
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
+        ));
+
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db,
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let handle = manager.get_or_create("conv").await.unwrap();
+        let mut state_rx = handle.state_rx.clone();
+        adopt_materialized_delivery(&manager, &handle, &repo, "conv", Timestamp(21))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    *state_rx.borrow(),
+                    crate::state_machine::ConvState::LlmRequesting { .. }
+                ) {
+                    break;
+                }
+                state_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("mixed batch should resume the live runtime");
     }
 
     #[tokio::test]
