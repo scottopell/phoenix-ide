@@ -5,7 +5,12 @@ import { ConversationMarkdownAnchor } from './conversationMarkdown';
 
 function CurrentLocation() {
   const location = useLocation();
-  return <output data-testid="location">{`${location.pathname}${location.search}${location.hash}`}</output>;
+  return (
+    <>
+      <output data-testid="location">{`${location.pathname}${location.search}${location.hash}`}</output>
+      <output data-testid="location-state">{JSON.stringify(location.state)}</output>
+    </>
+  );
 }
 
 function renderAnchor(href: string, onFileClick?: (path: string) => void) {
@@ -25,6 +30,9 @@ describe('ConversationMarkdownAnchor', () => {
     expect(link).not.toHaveAttribute('target');
     fireEvent.click(link);
     expect(screen.getByTestId('location')).toHaveTextContent('/c/source-conversation#message-message-id');
+    expect(screen.getByTestId('location-state')).toHaveTextContent(
+      JSON.stringify({ conversationReturnOrigin: { kind: 'coordinator', href: '/global/coordinator' } }),
+    );
   });
 
   it('treats same-origin absolute URLs as in-app destinations', () => {
@@ -34,6 +42,18 @@ describe('ConversationMarkdownAnchor', () => {
     expect(link).not.toHaveAttribute('target');
     fireEvent.click(link);
     expect(screen.getByTestId('location')).toHaveTextContent('/c/source?view=chat#message-message-id');
+  });
+
+  it('does not attach a Coordinator return origin to unrelated app-local links', () => {
+    render(
+      <MemoryRouter initialEntries={['/c/current']}>
+        <ConversationMarkdownAnchor href="/c/source">Citation</ConversationMarkdownAnchor>
+        <CurrentLocation />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('link', { name: 'Citation' }));
+    expect(screen.getByTestId('location-state')).toHaveTextContent('null');
   });
 
   it('opens external destinations in a separate safe browsing context', () => {

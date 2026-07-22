@@ -52,6 +52,7 @@ import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
 import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
+import { ConversationReturnBreadcrumb } from '../components/ConversationReturnBreadcrumb';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
@@ -2213,6 +2214,7 @@ function ConversationPageContent({
       className={showSplitPaneViewer ? 'app-split-pane' : undefined}
     >
       <div className="conversation-column">
+      <ConversationReturnBreadcrumb />
       {seedBreadcrumb}
       {parentConvBreadcrumb}
       {viewerSlot.browserSessionActive && !isArchived && !browserOpen && (

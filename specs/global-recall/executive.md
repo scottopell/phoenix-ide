@@ -24,7 +24,7 @@ Natural-language message search, bounded transcript reads, durable reference res
 | **REQ-GR-002:** Expose Continuation Identity Without Collapsing Evidence | ✅ Complete | Snapshot and reference resolution expose both durable root and current conversation IDs |
 | **REQ-GR-003:** Interpret Activity From Explicit Evidence | ✅ Complete | Prompt requires current relational state, timestamps, and recent evidence for status conclusions |
 | **REQ-GR-004:** Provide Bounded Read-Only Relational Queries | ✅ Complete | Engine-authorized one-statement SQLite reads have work, row, and byte budgets |
-| **REQ-GR-005:** Provide Stable References and App-Local Links | ✅ Complete | Work, chain, conversation, and message references remain durable and resolvable; Markdown citations navigate within the current Phoenix context |
+| **REQ-GR-005:** Provide Stable References and App-Local Links | ✅ Complete | Work, chain, conversation, and message references remain durable and resolvable; Coordinator citations navigate within the current Phoenix context and expose the existing parent-style return breadcrumb |
 | **REQ-GR-006:** Provide One Durable Coordinator Identity | ✅ Complete | `/api/global/coordinator` resolves the singleton through the standard runtime and UI |
 | **REQ-GR-007:** Bound Phoenix-Wide Coordinator Capabilities | ✅ Complete | Database and history reads are Coordinator-only; one text-message mutation remains |
 | **REQ-GR-008:** Answer With Source Citations | ✅ Complete | Transcript reads expose citation metadata and the prompt requires stable citations |
@@ -36,7 +36,7 @@ Natural-language message search, bounded transcript reads, durable reference res
 
 ## Verification Summary
 
-Coverage verifies operator-level application-data reads, read-only SQLite authority, denied internal/filesystem/mutation operations, statement cardinality, SQL/column/row/serialized-output/work bounds, typed results, raw continuation identities, stable references, current-context app-local citation navigation, transcript paging, Coordinator-only tools, chat-only responsive layout, and shared message acceptance semantics.
+Coverage verifies operator-level application-data reads, read-only SQLite authority, denied internal/filesystem/mutation operations, statement cardinality, SQL/column/row/serialized-output/work bounds, typed results, raw continuation identities, stable references, current-context app-local citation navigation with a Coordinator return origin, transcript paging, Coordinator-only tools, chat-only responsive layout, and shared message acceptance semantics.
 
 ## Scope
 

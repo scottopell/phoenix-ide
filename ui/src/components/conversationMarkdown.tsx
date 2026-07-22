@@ -1,7 +1,8 @@
 import React from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { FilePathLink } from '../utils/FilePathLink';
 import { isConversationFilePath, type FilePathCopyContext } from '../utils/linkify';
+import { coordinatorConversationLinkState } from './conversationReturnOrigin';
 
 export type MarkdownAnchorProps = React.ComponentPropsWithoutRef<'a'> & {
   node?: unknown;
@@ -10,13 +11,19 @@ export type MarkdownAnchorProps = React.ComponentPropsWithoutRef<'a'> & {
 };
 export type MarkdownImageProps = React.ComponentPropsWithoutRef<'img'> & { node?: unknown };
 
+function isPhoenixConversationDestination(path: string): boolean {
+  return /^\/(?:c|chains|global)(?:\/|$)/.test(path);
+}
+
 function appLocalDestination(href: string | undefined): string | undefined {
   if (!href || typeof window === 'undefined') return undefined;
-  if (href.startsWith('/') && !href.startsWith('//')) return href;
+  if (href.startsWith('/') && !href.startsWith('//')) {
+    return isPhoenixConversationDestination(href) ? href : undefined;
+  }
   if (!/^[a-z][a-z0-9+.-]*:/i.test(href)) return undefined;
   try {
     const destination = new URL(href);
-    return destination.origin === window.location.origin
+    return destination.origin === window.location.origin && isPhoenixConversationDestination(destination.pathname)
       ? `${destination.pathname}${destination.search}${destination.hash}`
       : undefined;
   } catch {
@@ -33,6 +40,22 @@ export function ConversationMarkdownAnchor({
   ...props
 }: MarkdownAnchorProps) {
   void node;
+  const location = useLocation();
+  const appDestination = appLocalDestination(href);
+  if (appDestination) {
+    return (
+      <Link
+        {...props}
+        to={appDestination}
+        state={coordinatorConversationLinkState(
+          `${location.pathname}${location.search}${location.hash}`,
+          appDestination,
+        )}
+      >
+        {children}
+      </Link>
+    );
+  }
   if (href && isConversationFilePath(href)) {
     return (
       <FilePathLink
@@ -42,14 +65,6 @@ export function ConversationMarkdownAnchor({
       >
         {children}
       </FilePathLink>
-    );
-  }
-  const appDestination = appLocalDestination(href);
-  if (appDestination) {
-    return (
-      <Link {...props} to={appDestination}>
-        {children}
-      </Link>
     );
   }
   return (
