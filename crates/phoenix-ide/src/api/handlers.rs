@@ -4354,11 +4354,11 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
 /// can't be made, so the cascade is refused; the caller retries once the DB
 /// is healthy. This runs BEFORE any cleanup side effect, so an early return
 /// leaves no partial state.
-async fn surviving_work_actor_after_delete(
+async fn scope_still_owned_after_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
-) -> Result<Option<crate::work_scope::EffectiveResourceAccess>, AppError> {
+) -> Result<bool, AppError> {
     let id = conv.id.as_str();
 
     if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
@@ -4366,15 +4366,7 @@ async fn surviving_work_actor_after_delete(
             Ok(continuation) => {
                 let cont_scope = conversation_work_scope(&continuation);
                 if &cont_scope == work_scope {
-                    return Ok(Some(crate::work_scope::EffectiveResourceAccess::new(
-                        continuation.id,
-                        match continuation.conv_mode {
-                            crate::db::ConvMode::Explore { .. } => {
-                                crate::work_scope::ResourceAuthority::Restricted
-                            }
-                            _ => crate::work_scope::ResourceAuthority::Work,
-                        },
-                    )));
+                    return Ok(true);
                 }
             }
             Err(e) => {
@@ -4403,22 +4395,9 @@ async fn surviving_work_actor_after_delete(
         })?)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(conversations
-        .into_iter()
-        .find(|candidate| {
-            candidate.id != id && crate::runtime::conversation_owns_work_scope(candidate)
-        })
-        .map(|survivor| {
-            crate::work_scope::EffectiveResourceAccess::new(
-                survivor.id,
-                match survivor.conv_mode {
-                    crate::db::ConvMode::Explore { .. } => {
-                        crate::work_scope::ResourceAuthority::Restricted
-                    }
-                    _ => crate::work_scope::ResourceAuthority::Work,
-                },
-            )
-        }))
+    Ok(conversations.into_iter().any(|candidate| {
+        candidate.id != id && crate::runtime::conversation_owns_work_scope(&candidate)
+    }))
 }
 
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
@@ -4459,8 +4438,8 @@ pub(super) async fn run_resource_cleanup_cascade(
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
     // terminal, browser) so they all honor the same any-live-owner signal.
-    let surviving_actor = surviving_work_actor_after_delete(state, conv, &work_scope).await?;
-    let inheritor_scope = surviving_actor.as_ref().map(|_| &work_scope);
+    let scope_still_owned = scope_still_owned_after_delete(state, conv, &work_scope).await?;
+    let inheritor_scope = scope_still_owned.then_some(&work_scope);
 
     // Step 2: bash handles. Preserve iff the scope is still owned by a live
     // conversation other than this one (REQ-BASH-WS-002).
@@ -4477,7 +4456,6 @@ pub(super) async fn run_resource_cleanup_cascade(
             },
         ),
         inheritor_scope,
-        surviving_actor.as_ref(),
     )
     .await;
     let had_live_handles = !bash_report.live_handle_pgids.is_empty();
@@ -4562,7 +4540,6 @@ pub(super) async fn run_resource_cleanup_cascade(
             },
         ),
         inheritor_scope,
-        surviving_actor.as_ref(),
     )
     .await;
 
