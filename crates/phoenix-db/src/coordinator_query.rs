@@ -12,84 +12,6 @@ const MAX_SQL_BYTES: usize = 16 * 1024;
 const MAX_COLUMNS: c_int = 64;
 const PROGRESS_OPS: c_int = 1_000;
 
-const ALLOWED_SCHEMA: &[&str] = &[
-    "chain_qa",
-    "continuation_dispatch_intents",
-    "conversation_creation_jobs",
-    "conversations",
-    "coordinator",
-    "fork_proposals",
-    "message_files",
-    "message_images",
-    "projects",
-    "steering_messages",
-    "sub_agent_personas",
-    "turn_usage",
-    "wake_bindings",
-    "wake_delivery_messages",
-    "wake_terminal_receipt_tails",
-    "wake_terminal_receipts",
-    "work_scope_active_pr_selection",
-    "work_scope_observed_branches",
-    "work_scope_pr_associations",
-    "work_scope_pr_feedback_baselines",
-    "work_scopes",
-    "workflow_attempts",
-    "workflow_authoritative_observations",
-    "workflow_barrier_members",
-    "workflow_barriers",
-    "workflow_deliveries",
-    "workflow_effect_dependencies",
-    "workflow_effects",
-    "workflow_external_acceptance_bindings",
-    "workflow_global_sequences",
-    "workflow_manual_resolution_choices",
-    "workflow_manual_resolutions",
-    "workflow_receipts",
-    "workflow_reclaimable_leases",
-    "workflow_schedules",
-    "workflow_sequences",
-    "workflow_stale_observations",
-    "workflow_supported_codecs",
-    "workflow_transitions",
-    "workflows",
-];
-
-const DENIED_COLUMNS: &[(&str, &str)] = &[
-    ("conversation_creation_jobs", "claim_token"),
-    ("conversation_creation_jobs", "cleanup_token"),
-    ("conversations", "state"),
-    ("message_images", "data"),
-    ("wake_bindings", "tmux_server_token"),
-    ("wake_terminal_receipts", "tmux_server_token"),
-    ("workflow_external_acceptance_bindings", "idempotency_key"),
-    ("workflow_external_acceptance_bindings", "receipt_handle"),
-    (
-        "workflow_external_acceptance_bindings",
-        "disposition_handle",
-    ),
-    ("workflow_authoritative_observations", "observation_payload"),
-    ("workflow_barriers", "reducer_event_payload"),
-    ("workflow_deliveries", "payload_blob"),
-    ("workflow_effects", "intent_payload"),
-    ("workflow_manual_resolution_choices", "payload_blob"),
-    ("workflow_receipts", "receipt_payload"),
-    ("workflow_stale_observations", "observation_payload"),
-    ("workflow_transitions", "event_payload"),
-    ("workflows", "snapshot_payload"),
-];
-
-const DENIED_TABLES: &[&str] = &[
-    "app_settings",
-    "auth_sessions",
-    "mcp_oauth_registrations",
-    "mcp_oauth_tokens",
-    "share_tokens",
-    "sqlite_dbpage",
-    "sqlite_dbdata",
-    "sqlite_dbptr",
-];
-
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorQueryError {
     #[error("query contains a NUL byte")]
@@ -150,19 +72,6 @@ pub fn execute_coordinator_query(
     path: &str,
     sql: &str,
 ) -> Result<CoordinatorQueryResult, CoordinatorQueryError> {
-    if sql.trim().eq_ignore_ascii_case("SHOW ALLOWED SCHEMA") {
-        return Ok(CoordinatorQueryResult {
-            columns: vec!["table".to_string()],
-            rows: ALLOWED_SCHEMA
-                .iter()
-                .map(|table| vec![CoordinatorCell::Text((*table).to_string())])
-                .collect(),
-            truncated: false,
-            row_limit: MAX_ROWS,
-            byte_limit: MAX_BYTES,
-            elapsed_ms: 0,
-        });
-    }
     if sql.len() > MAX_SQL_BYTES {
         return Err(CoordinatorQueryError::BudgetExceeded);
     }
@@ -290,10 +199,7 @@ unsafe extern "C" fn authorize(
     let detail = unsafe { optional_c_string(arg2) };
     let allowed = match action {
         ffi::SQLITE_SELECT | ffi::SQLITE_RECURSIVE => true,
-        ffi::SQLITE_READ => object
-            .as_deref()
-            .zip(detail.as_deref())
-            .is_some_and(|(table, column)| column_allowed(table, column)),
+        ffi::SQLITE_READ => object.as_deref().is_some_and(object_allowed),
         ffi::SQLITE_FUNCTION => detail.as_deref().is_some_and(function_allowed),
         _ => false,
     };
@@ -317,13 +223,9 @@ unsafe extern "C" fn check_progress(user_data: *mut c_void) -> c_int {
     i32::from(Instant::now() >= state.deadline)
 }
 
-fn column_allowed(table: &str, column: &str) -> bool {
-    let table = table.to_ascii_lowercase();
-    let column = column.to_ascii_lowercase();
-    ALLOWED_SCHEMA.contains(&table.as_str())
-        && !DENIED_TABLES.contains(&table.as_str())
-        && !table.starts_with("sqlite_")
-        && !DENIED_COLUMNS.contains(&(table.as_str(), column.as_str()))
+fn object_allowed(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !name.starts_with("sqlite_") && !name.starts_with("message_fts_") && name != "message_fts"
 }
 
 fn function_allowed(name: &str) -> bool {
@@ -554,41 +456,28 @@ mod tests {
     }
 
     #[test]
-    fn reads_operational_rows_and_typed_cells() {
-        let schema = execute_coordinator_query("ignored", "SHOW ALLOWED SCHEMA").unwrap();
-        assert!(schema
-            .rows
-            .iter()
-            .any(|row| matches!(&row[0], CoordinatorCell::Text(v) if v == "conversations")));
-        assert!(!schema
-            .rows
-            .iter()
-            .any(|row| matches!(&row[0], CoordinatorCell::Text(v) if v == "auth_sessions")));
+    fn reads_application_data_including_operator_only_rows() {
         let (_dir, path) = fixture();
-        let result = execute_coordinator_query(
-            path.to_str().unwrap(),
-            "SELECT id, state_updated_at FROM conversations",
-        )
-        .unwrap();
-        assert_eq!(result.columns, ["id", "state_updated_at"]);
-        assert_eq!(result.rows.len(), 1);
-        assert!(matches!(&result.rows[0][0], CoordinatorCell::Text(v) if v == "active"));
+        let db = rusqlite_for_test(&path);
+        db.execute_batch("INSERT INTO messages VALUES ('hidden', 'operator-only text', '{}'); INSERT INTO future_secret_store VALUES ('secret-id', 'secret-value');").unwrap();
+        for sql in [
+            "SELECT id, state FROM conversations",
+            "SELECT content FROM messages",
+            "SELECT secret FROM future_secret_store",
+            "SELECT token_hash FROM auth_sessions",
+            "SELECT claim_token FROM conversation_creation_jobs",
+            "SELECT idempotency_key, receipt_handle, disposition_handle FROM workflow_external_acceptance_bindings",
+            "SELECT data FROM message_images",
+            "SELECT intent_payload FROM workflow_effects",
+        ] {
+            execute_coordinator_query(path.to_str().unwrap(), sql).unwrap();
+        }
     }
 
     #[test]
-    fn denies_sensitive_tables_writes_attach_and_multiple_statements() {
+    fn denies_writes_attach_pragmas_and_multiple_statements() {
         let (_dir, path) = fixture();
         for sql in [
-            "SELECT * FROM auth_sessions",
-            "SELECT * FROM future_secret_store",
-            "SELECT claim_token FROM conversation_creation_jobs",
-            "SELECT idempotency_key FROM workflow_external_acceptance_bindings",
-            "SELECT CAST(receipt_handle AS TEXT) FROM workflow_external_acceptance_bindings",
-            "SELECT CAST(disposition_handle AS TEXT) FROM workflow_external_acceptance_bindings",
-            "SELECT content FROM messages",
-            "SELECT data FROM message_images",
-            "SELECT state FROM conversations",
-            "SELECT intent_payload FROM workflow_effects",
             "UPDATE conversations SET id = 'changed'",
             "ATTACH DATABASE '/tmp/other.db' AS other",
             "PRAGMA query_only",
@@ -605,18 +494,6 @@ mod tests {
             execute_coordinator_query(path.to_str().unwrap(), "SELECT 1; SELECT 2"),
             Err(CoordinatorQueryError::MultipleStatements)
         ));
-    }
-
-    #[test]
-    fn allows_non_secret_columns_in_partially_sensitive_tables() {
-        let (_dir, path) = fixture();
-        for sql in [
-            "SELECT status FROM conversation_creation_jobs",
-            "SELECT status FROM workflow_external_acceptance_bindings",
-            "SELECT media_type FROM message_images",
-        ] {
-            execute_coordinator_query(path.to_str().unwrap(), sql).unwrap();
-        }
     }
 
     #[test]

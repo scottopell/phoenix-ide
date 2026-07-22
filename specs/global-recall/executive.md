@@ -12,7 +12,7 @@ The `/global` surface is the standard transcript and composer without a separate
 
 Coordinator LLM requests keep the stable language-specific prompt as their cached prefix and append a bounded snapshot of raw continuation-leaf facts. The snapshot identifies both root and current conversations, exact runtime state, state and conversation timestamps, and available task metadata. It applies no open, stalled, closed, or attention classification.
 
-The Coordinator-only `query_database` tool executes one SQLite statement on a separate read-only connection. SQLite authorization denies mutation, connection-changing operations, internal storage, filesystem and extension functions, credential/session/token tables, and secret settings. A progress handler and row/byte bounds limit work and output. Results use typed cells and report truncation.
+The Coordinator-only `query_database` tool provides operator-level forensic reads of Phoenix application tables, including hidden messages and sensitive records that may not be visible in normal UI. It executes one statement on a separate read-only connection. SQLite authorization denies mutation, connection-changing operations, internal and FTS shadow storage, filesystem and extension functions, while SQL/column/row/serialized-output/time bounds protect system stability. Results use typed cells and report truncation.
 
 Natural-language message search, bounded transcript reads, durable reference resolution, and the shared cross-conversation message service remain specialized tools. The Coordinator registry remains builtin-only and excludes shell, filesystem, browser, MCP, repository, task, project, workspace, conversation creation, approval, and lifecycle mutation tools.
 
@@ -31,12 +31,12 @@ Natural-language message search, bounded transcript reads, durable reference res
 | **REQ-GR-009:** Resolve Durable Targets Without Guessing | ✅ Complete | Typed resolution supports work/conversation handles, links, IDs, and chain checks |
 | **REQ-GR-010:** Keep the Coordinator Surface Chat-Only | ✅ Complete | `/global` mounts only the shared conversation runtime and inline briefing action |
 | **REQ-GR-011:** Inject a Bounded Relational Snapshot | ✅ Complete | Requests append transparent turn-current facts after the cached stable prompt |
-| **REQ-GR-011A:** Exclude Sensitive Database Material | ✅ Complete | SQLite authorizer denies credential, secret, internal, filesystem, and mutation access |
+| **REQ-GR-011A:** Bound Database Integrity and Resource Use | ✅ Complete | Application data is readable; SQLite authority and resource budgets protect integrity and stability |
 | **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and Coordinator action share typed delivery, steering, and rejection outcomes |
 
 ## Verification Summary
 
-Coverage verifies read-only SQLite authority, denied sensitive objects/functions, statement cardinality, row/byte/work bounds, typed results, raw continuation identities, stable references, transcript paging, Coordinator-only tools, chat-only responsive layout, and shared message acceptance semantics.
+Coverage verifies operator-level application-data reads, read-only SQLite authority, denied internal/filesystem/mutation operations, statement cardinality, SQL/column/row/serialized-output/work bounds, typed results, raw continuation identities, stable references, transcript paging, Coordinator-only tools, chat-only responsive layout, and shared message acceptance semantics.
 
 ## Scope
 
@@ -46,7 +46,7 @@ The Coordinator runs only on user turns. It does not monitor work in the backgro
 
 ## Out of Scope
 
-- Database writes or access to credentials, sessions, OAuth material, share tokens, secret settings, attached databases, extensions, filesystem functions, or SQLite internal storage.
+- Database writes, attached databases, extensions, filesystem functions, or SQLite internal and FTS shadow storage.
 - Ambient Phoenix-wide tools for ordinary coding agents.
 - Images, files, skills, user-agent metadata, or lifecycle commands in cross-conversation messages.
 - Batch-action transactions or atomic fan-out.

@@ -171,14 +171,18 @@ THE SYSTEM SHALL keep the bounded read-only database query tool available when t
 
 ---
 
-### REQ-GR-011A: Exclude Sensitive Database Material
+### REQ-GR-011A: Bound Database Integrity and Resource Use
 
 WHILE the Coordinator executes a database query
-THE SYSTEM SHALL structurally deny authentication sessions, OAuth registrations and tokens, share tokens, secret-bearing settings, SQLite internal and shadow storage, filesystem functions, extension loading, database attachment, pragmas, writes, and transactions
+THE SYSTEM SHALL permit reads from Phoenix application tables, including hidden messages, credentials, tokens, settings, serialized state, and workflow payloads that may not be visible through normal UI
 
-THE denial boundary SHALL apply at SQLite authorization time so views, common table expressions, subqueries, aliases, and alternate SQL spelling cannot bypass it
+THE SYSTEM SHALL describe this capability as operator-level forensic access and SHALL treat all returned values as untrusted stored data rather than instructions
 
-Conversation, message, project, workflow, wake, and non-secret operational metadata MAY remain readable within query budgets
+THE SYSTEM SHALL structurally deny writes, transactions, SQLite internal and FTS shadow storage, filesystem functions, extension loading, database attachment, and pragmas
+
+THE integrity boundary SHALL apply at SQLite authorization time so views, common table expressions, subqueries, aliases, and alternate SQL spelling cannot bypass it
+
+THE SYSTEM SHALL enforce bounded SQL input, columns, rows, serialized output, and execution work or duration
 
 ---
 
