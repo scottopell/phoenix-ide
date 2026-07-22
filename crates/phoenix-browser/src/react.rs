@@ -117,13 +117,17 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
   // Performance.getMetrics round-trips (F5: those collapse to ~0 for real
   // in-window work). A longtask PerformanceObserver installed here (at
   // document-start, BEFORE page scripts) accumulates blocking-task duration
-  // from the very start. __perfReset opens a window (t0 = performance.now(),
-  // accumulators zeroed, React commit buffer cleared); __perfRead closes it
-  // and returns the in-page accumulators in one call.
+  // from the very start. Entries are admitted by entry.startTime, not by
+  // callback delivery time: browsers may deliver a pre-window longtask after
+  // __perfReset, and that setup work must remain structurally unmeasurable.
+  // __perfReset opens a window (t0 = performance.now(), accumulators zeroed,
+  // React commit buffer cleared); __perfRead closes it and returns the in-page
+  // accumulators in one call.
   var __lt_ms = 0, __lt_n = 0, __win_t0 = null;
   try {
     var __po = new PerformanceObserver(function (l) {
       l.getEntries().forEach(function (e) {
+        if (__win_t0 == null || e.startTime < __win_t0) return;
         __lt_ms += e.duration;
         __lt_n += 1;
       });

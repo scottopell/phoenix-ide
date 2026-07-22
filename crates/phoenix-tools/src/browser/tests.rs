@@ -2947,6 +2947,55 @@ async fn test_browser_profile_react_no_profiling_build_path() {
     shutdown_test(manager, server).await;
 }
 
+fn eval_json_string(output: &str) -> String {
+    let json = output
+        .trim()
+        .strip_prefix("<javascript_result>")
+        .and_then(|s| s.strip_suffix("</javascript_result>"))
+        .expect("browser_eval result wrapper");
+    serde_json::from_str(json).expect("outer JSON string")
+}
+
+fn assert_profile_window_marks(
+    marks: &serde_json::Value,
+    sample: &serde_json::Value,
+    script_ms: f64,
+    long_tasks: u64,
+    wall_ms: f64,
+) {
+    let mark = |name: &str| -> f64 {
+        marks[name]
+            .as_f64()
+            .unwrap_or_else(|| panic!("missing numeric mark {name}: {marks}"))
+    };
+    let pre_end = mark("pre_end");
+    let window_start = mark("window_start");
+    let ping_start = mark("ping_start");
+    let ping_end = mark("ping_end");
+    let window_end_lower_bound = window_start + wall_ms;
+
+    assert!(
+        pre_end <= window_start,
+        "pre-readiness work must finish before the measured window opens; marks={marks}, sample={sample}"
+    );
+    assert!(
+        window_start <= ping_start && ping_end <= window_end_lower_bound,
+        "click-handler work must be inside the measured window; marks={marks}, sample={sample}"
+    );
+    assert!(
+        script_ms > 0.0,
+        "in-window click work must contribute script_ms without relying on a fixed duration threshold; got {script_ms}. marks={marks}, sample={sample}"
+    );
+    assert!(
+        long_tasks >= 1,
+        "the in-window blocking task must register at least one longtask entry; got {long_tasks}. marks={marks}, sample={sample}"
+    );
+    assert!(
+        wall_ms > 0.0,
+        "wall_ms must be a positive performance.now() span; got {wall_ms}. sample: {sample}"
+    );
+}
+
 /// F3/F5 FIX GUARD (gated: chrome only, network-free).
 ///
 /// Was `test_browser_profile_f3_mount_in_window_characterization` — a
@@ -2955,39 +3004,37 @@ async fn test_browser_profile_react_no_profiling_build_path() {
 /// proves BOTH F3 (pre-readiness mount/settle excluded) and F5
 /// (real in-window work captured) are fixed.
 ///
-/// The page burns ~180ms of synchronous JS and builds an 8000-node
-/// subtree BEFORE setting `window.__ready` (the async-mount shape). The
-/// scenario's FIRST step is `wait_eval window.__ready` — the readiness
-/// step — so the page-anchored window opens AFTER it: that pre-readiness
-/// burn is structurally outside the window (F3 fixed). A post-readiness
-/// ~70ms blocking task is then run as a positive control: it lands in
-/// the window and must be captured (F5 fixed — `script_ms` reflects real
-/// in-window longtask cost, where the old host-bracketed `ScriptDuration`
-/// delta collapsed to ~0).
+/// The page records its own phase markers around a pre-readiness blocking
+/// task and a post-readiness click handler. The assertion compares the
+/// measured `wall_ms` with those markers: setup work ended before the
+/// measurement window opened, and measured work happened after it opened.
 #[tokio::test]
 async fn test_browser_profile_window_excludes_pre_readiness_work() {
     require_chrome!();
 
-    // The in-window positive control is the CLICK HANDLER's ~70ms
-    // blocking loop, not a CDP `eval` step: a Runtime.evaluate task is
-    // NOT observed by the page's `longtask` PerformanceObserver, but a
-    // page-driven event handler IS. The pre-readiness ~180ms burn runs
-    // in a post-load `setTimeout` BEFORE `__ready` (untimed setup).
+    // The in-window positive control is the CLICK HANDLER's blocking loop,
+    // not a CDP `eval` step: a Runtime.evaluate task is not observed by the
+    // page's `longtask` PerformanceObserver, but a page-driven event handler
+    // is. The pre-readiness burn runs before `__ready` and its longtask entry
+    // may be delivered after `__perfReset`; the harness must still reject it
+    // by entry.startTime rather than callback delivery time.
     let html = r#"<!doctype html><html><body><button id="ping">ping</button>
 <script>
 window.__ready = false; window.__pinged = false;
+window.__marks = { pre_start: null, pre_end: null, ping_start: null, ping_end: null };
 document.getElementById('ping').addEventListener('click', function () {
-  var t = Date.now(); while (Date.now() - t < 70) {}   // ~70ms in-window longtask
+  window.__marks.ping_start = performance.now();
+  var t = Date.now(); while (Date.now() - t < 70) {}
+  window.__marks.ping_end = performance.now();
   window.__pinged = true;
 });
-// Heavy work scheduled AFTER load, BEFORE __ready — the async-mount
-// shape. ~180ms busy + 8000 DOM nodes. With a page-anchored window
-// that opens after the readiness step this is UNTIMED setup.
 setTimeout(function () {
+  window.__marks.pre_start = performance.now();
   var t = Date.now(); while (Date.now() - t < 180) {}
   var box = document.createElement('div');
   for (var i = 0; i < 8000; i++) { var d = document.createElement('div'); d.textContent = i; box.appendChild(d); }
   document.body.appendChild(box);
+  window.__marks.pre_end = performance.now();
   window.__ready = true;
 }, 0);
 </script></body></html>"#;
@@ -3003,10 +3050,9 @@ setTimeout(function () {
         .await;
 
     // First step is the readiness wait → the page-anchored window opens
-    // AFTER `window.__ready` (the ~180ms pre-readiness burn is untimed
-    // setup). The post-readiness click fires the page's ~70ms blocking
-    // handler — a page-driven task the `longtask` observer DOES see —
-    // as the positive control: it must be captured in `script_ms`.
+    // after `window.__ready`. The measured step reads that page-anchored
+    // start timestamp and then fires the click handler, so the assertion can
+    // prove the boundary by ordering instead of duration thresholds.
     let r = BrowserProfileTool
         .run(
             json!({
@@ -3016,6 +3062,7 @@ setTimeout(function () {
                 "gc_per_run": false,
                 "steps": [
                     { "kind": "wait_eval", "expression": "window.__ready === true", "timeout": "20s" },
+                    { "kind": "eval", "expression": "window.__marks.window_start = performance.now()" },
                     { "kind": "click", "selector": "#ping" },
                     { "kind": "wait_eval", "expression": "window.__pinged === true", "timeout": "10s" }
                 ]
@@ -3036,30 +3083,20 @@ setTimeout(function () {
     let wall_ms = sample["wall_ms"]
         .as_f64()
         .expect("wall_ms is a number (window performance.now span)");
-
-    // F3 FIXED — the ~180ms pre-readiness burn is EXCLUDED: it ran
-    // before `window.__ready`, i.e. before the readiness step that
-    // opens the window. F5 FIXED — the ~70ms post-readiness blocking
-    // task IS captured (the old host-bracketed `ScriptDuration` delta
-    // read ~0 here). So `script_ms` must include the in-window ~70ms
-    // longtask but exclude the pre-window 180ms.
+    let marks_output = BrowserEvalTool
+        .run(
+            json!({ "expression": "JSON.stringify(window.__marks)", "timeout": "5s" }),
+            ctx.clone(),
+        )
+        .await;
     assert!(
-        (50.0..160.0).contains(&script_ms),
-        "page-anchored window: script_ms must capture the in-window \
-         ~70ms longtask (>= 50ms, F5 fixed) but exclude the \
-         pre-readiness ~180ms burn (< 160ms, F3 fixed); got \
-         {script_ms}ms. sample: {sample}"
+        marks_output.is_success(),
+        "failed to read page marks: {}",
+        marks_output.output()
     );
-    assert!(
-        long_tasks >= 1,
-        "the in-window ~70ms blocking task must register at least one \
-         longtask entry; got {long_tasks}. sample: {sample}"
-    );
-    assert!(
-        wall_ms > 0.0,
-        "wall_ms must be a positive performance.now() span; got \
-         {wall_ms}. sample: {sample}"
-    );
+    let marks_str = eval_json_string(marks_output.output());
+    let marks: serde_json::Value = serde_json::from_str(&marks_str).expect("page marks JSON");
+    assert_profile_window_marks(&marks, sample, script_ms, long_tasks, wall_ms);
 
     shutdown_test(manager, server).await;
 }
