@@ -573,8 +573,9 @@ describe('ConversationPage message delivery reconciliation', () => {
       status: 'steering_queued',
       acceptedAfterEventSeq: 0,
     }]));
+    const firstAttempt = deferred<Awaited<ReturnType<typeof api.reconcileAcceptedMessages>>>();
     vi.mocked(api.reconcileAcceptedMessages)
-      .mockRejectedValueOnce(new Error('offline'))
+      .mockImplementationOnce(() => firstAttempt.promise)
       .mockResolvedValueOnce({
         conversation_idle: true,
         entries: [{
@@ -600,6 +601,10 @@ describe('ConversationPage message delivery reconciliation', () => {
       });
     });
     await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      firstAttempt.reject(new Error('offline'));
+      await firstAttempt.promise.catch(() => {});
+    });
 
     hooksMockState.useConnection.mockReturnValue({
       state: 'offline', attempt: 1, nextRetryIn: null, retryNow: vi.fn(),
