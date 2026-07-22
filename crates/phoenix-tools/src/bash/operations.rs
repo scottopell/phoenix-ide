@@ -2022,6 +2022,15 @@ mod tests {
         async fn cancel(&self, _input: crate::CancelWakeInput) -> Result<RegisteredWake, String> {
             Ok(RegisteredWake::CancelStale)
         }
+
+        async fn rekey_work_scope(
+            &self,
+            _conversation_id: &str,
+            _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+            _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+        ) -> Result<u64, String> {
+            Ok(0)
+        }
     }
 
     fn ctx_with_registrar(

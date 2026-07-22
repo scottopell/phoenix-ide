@@ -112,6 +112,23 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             WakeCancellationOutcome::Stale => RegisteredWake::CancelStale,
         })
     }
+
+    async fn rekey_work_scope(
+        &self,
+        conversation_id: &str,
+        old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+        new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+    ) -> Result<u64, String> {
+        let moved = self
+            .repo
+            .rekey_active_work_scope(conversation_id, old_scope, new_scope)
+            .await
+            .map_err(|error| error.to_string())?;
+        if moved > 0 {
+            self.kick();
+        }
+        Ok(moved)
+    }
 }
 
 pub(crate) async fn run(

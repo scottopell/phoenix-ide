@@ -3086,6 +3086,61 @@ describe('SubAgentStatus inline activity', () => {
     });
   });
 
+  it('keeps a parked child stream open through idle and resumed output', async () => {
+    const childConversation = {
+      ...baseConversation,
+      state: { type: 'llm_requesting' as const, attempt: 1 },
+    };
+    const state: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: [{ agent_id: 'agent-1', task: 'Wait for build' }],
+      completed_results: [],
+    };
+    (api.getConversation as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      conversation: childConversation,
+      messages: [],
+      agent_working: true,
+      presentation_mode: 'working',
+      context_window_size: 0,
+    });
+
+    render(
+      <MemoryRouter>
+        <SubAgentStatus stateData={state} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText(/Wait for build/));
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const source = FakeEventSource.instances[0]!;
+
+    act(() => {
+      emitInit(source, [], [], childConversation);
+      source.emit('state_change', {
+        type: 'state_change',
+        sequence_id: 101,
+        state: { type: 'idle' },
+        presentation_mode: 'idle',
+        state_updated_at: '2026-01-01T00:00:01Z',
+      });
+    });
+    expect(source.readyState).toBe(1);
+
+    act(() => {
+      source.emit('message', {
+        sequence_id: 102,
+        message: {
+          message_id: 'resumed-child-message',
+          conversation_id: childConversation.id,
+          sequence_id: 102,
+          message_type: 'agent',
+          content: [{ type: 'text', text: 'Build wake resumed the child.' }],
+          created_at: '2026-01-01T00:00:02Z',
+        },
+      });
+    });
+    expect(await screen.findByText('Build wake resumed the child.')).toBeInTheDocument();
+  });
+
   it('folds child stream init pending events before advancing sequence floor', async () => {
     const initialMessage = agentMessage('agent-msg-1', [
       { type: 'tool_use', id: 'tool-1', name: 'bash', input: { cmd: 'ls /root/var' } },

@@ -2577,7 +2577,8 @@ where
             ConvState::ToolExecuting { .. }
                 | ConvState::AwaitingSubAgents { .. }
                 | ConvState::CancellingTool { .. }
-        ) {
+        ) || (self.context.is_sub_agent && matches!(self.state, ConvState::Idle))
+        {
             self.registered_wake_workflows
                 .insert(phoenix_workflow::WorkflowId(registration.workflow_id));
         }
@@ -3007,10 +3008,9 @@ where
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
-        if matches!(
-            self.state,
-            ConvState::Idle | ConvState::LlmRequesting { .. }
-        ) {
+        if matches!(self.state, ConvState::LlmRequesting { .. })
+            || (!self.context.is_sub_agent && matches!(self.state, ConvState::Idle))
+        {
             self.registered_wake_workflows.clear();
         }
         // Only stamp a fresh entry time when the phase actually changes.
@@ -6114,7 +6114,34 @@ where
                 // this write is a no-op — worktree_path == conv.cwd already.
                 // For legacy Managed conversations whose cwd was the repo root,
                 // this is load-bearing: it moves cwd to the new worktree path.
+                let old_scope = self.context.resource_scope.clone();
                 promote_runtime_context_to_work(&mut self.context, &approval_result);
+                let new_scope = self.context.resource_scope.clone();
+
+                let bash_moved = self.bash_handles.rekey_scope(&old_scope, &new_scope).await;
+                let browser_moved = self
+                    .browser_sessions
+                    .rekey_scope(&old_scope, &new_scope)
+                    .await;
+                let tmux_moved = self.tmux_registry.rekey_scope(&old_scope, &new_scope).await;
+                let wake_moved = if let Some(registrar) = self.wake_registrar.as_ref() {
+                    registrar
+                        .rekey_work_scope(
+                            &self.context.conversation_id,
+                            &crate::tools::work_scope_identity(&old_scope)?,
+                            &crate::tools::work_scope_identity(&new_scope)?,
+                        )
+                        .await?
+                } else {
+                    0
+                };
+
+                if bash_moved || browser_moved || tmux_moved || wake_moved > 0 {
+                    self.bash_handles.emit_lifecycle(
+                        &new_scope,
+                        phoenix_tools::bash::BashLifecyclePhase::Spawned,
+                    );
+                }
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -9304,6 +9331,15 @@ mod context_exhausted_preserves_worktree_tests {
             self.0.lock().unwrap().push(input.workflow_id);
             Ok(crate::tools::RegisteredWake::Cancelled)
         }
+
+        async fn rekey_work_scope(
+            &self,
+            _conversation_id: &str,
+            _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+            _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+        ) -> Result<u64, String> {
+            Ok(0)
+        }
     }
 
     #[tokio::test]
@@ -9319,6 +9355,38 @@ mod context_exhausted_preserves_worktree_tests {
             handle_id: "b-1".to_string(),
             expires_at: 600,
         });
+        assert!(runtime.registered_wake_workflows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parked_sub_agent_registration_remains_cancellable() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let (mut runtime, _) = build_runtime(storage, "parked-child", temp.path().to_path_buf());
+        runtime.context.is_sub_agent = true;
+        runtime.state = ConvState::Idle;
+        let registrar = Arc::new(RecordingWakeRegistrar(std::sync::Mutex::new(vec![])));
+        runtime.wake_registrar = Some(registrar.clone());
+        runtime.publish_wake_registration(WakeRegistrationNotice {
+            workflow_id: 11,
+            contract_id: "wake-11".to_string(),
+            resource_kind: "BashHandle".to_string(),
+            handle_id: "b-1".to_string(),
+            expires_at: 600,
+        });
+
+        runtime
+            .process_event(Event::UserCancel {
+                cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                reason: Some("cancelled by parent".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *registrar.0.lock().unwrap(),
+            vec![phoenix_workflow::WorkflowId(11)]
+        );
         assert!(runtime.registered_wake_workflows.is_empty());
     }
 

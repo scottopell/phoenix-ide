@@ -2549,6 +2549,31 @@ impl WakeRepository {
             .collect()
     }
 
+    pub async fn rekey_active_work_scope(
+        &self,
+        conversation_id: &str,
+        old_scope: &wake_types::WorkScopeIdentity,
+        new_scope: &wake_types::WorkScopeIdentity,
+    ) -> DbResult<u64> {
+        let result = sqlx::query(
+            "UPDATE wake_bindings
+             SET scope_kind = ?3, scope_stable_key = ?4
+             WHERE conversation_id = ?1
+               AND resource_kind IN ('Bash', 'TmuxWindow')
+               AND scope_kind = ?2
+               AND scope_stable_key = ?5
+               AND resolved_at IS NULL",
+        )
+        .bind(conversation_id)
+        .bind(scope_kind_str(old_scope))
+        .bind(scope_kind_str(new_scope))
+        .bind(&new_scope.stable_key)
+        .bind(&old_scope.stable_key)
+        .execute(&self.workflow_repo.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let predecessors = sqlx::query_scalar::<_, String>(
@@ -6627,6 +6652,49 @@ mod tests {
             | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
             | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
                 panic!("expected recorded, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn active_binding_rekeys_when_its_work_scope_is_promoted() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(117);
+        let old_scope = wake_types::WorkScopeIdentity {
+            kind: wake_types::WorkScopeKind::Conversation,
+            stable_key: "conversation:conv-1".to_string(),
+        };
+        let mut input = intent();
+        input.registration_scope = old_scope.clone();
+        if let WakeResourceIdentity::Bash(identity) = &mut input.resource {
+            identity.work_scope = old_scope.clone();
+        }
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &input, "fp-1", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let new_scope = wake_types::WorkScopeIdentity {
+            kind: wake_types::WorkScopeKind::Worktree,
+            stable_key: "worktree:/tmp/promoted".to_string(),
+        };
+
+        assert_eq!(
+            repo.rekey_active_work_scope("conv-1", &old_scope, &new_scope)
+                .await
+                .unwrap(),
+            1
+        );
+        let binding = repo.fetch_binding(workflow_id).await.unwrap().unwrap();
+        assert_eq!(binding.conversation_id, "conv-1");
+        assert_eq!(binding.registration_scope, new_scope);
+        match binding.resource {
+            WakeResourceIdentity::Bash(identity) => {
+                assert_eq!(identity.work_scope, binding.registration_scope);
+            }
+            other @ (WakeResourceIdentity::TmuxWindow(_) | WakeResourceIdentity::Subagent(_)) => {
+                panic!("expected bash resource, got {other:?}")
             }
         }
     }

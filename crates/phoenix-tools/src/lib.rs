@@ -181,6 +181,12 @@ impl RegisteredWake {
 pub trait WakeRegistrar: Send + Sync {
     async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String>;
     async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String>;
+    async fn rekey_work_scope(
+        &self,
+        conversation_id: &str,
+        old_scope: &WorkScopeIdentity,
+        new_scope: &WorkScopeIdentity,
+    ) -> Result<u64, String>;
 }
 
 /// Converts a resource scope to the persisted identity that may own a durable wake.
@@ -1686,6 +1692,16 @@ mod wake_registrar_seam_tests {
         async fn cancel(&self, _input: CancelWakeInput) -> Result<RegisteredWake, String> {
             self.calls.lock().await.push("cancel".to_string());
             Ok(RegisteredWake::CancelStale)
+        }
+
+        async fn rekey_work_scope(
+            &self,
+            _conversation_id: &str,
+            _old_scope: &WorkScopeIdentity,
+            _new_scope: &WorkScopeIdentity,
+        ) -> Result<u64, String> {
+            self.calls.lock().await.push("rekey".to_string());
+            Ok(0)
         }
     }
 

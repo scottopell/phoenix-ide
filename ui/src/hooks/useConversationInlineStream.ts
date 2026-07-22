@@ -1,6 +1,6 @@
 import { useEffect, useReducer, type Dispatch } from 'react';
 import type { Message } from '../api';
-import { api, type Conversation } from '../api';
+import { api, isTerminalConversationState, type Conversation } from '../api';
 import {
   SseAgentDoneDataSchema,
   SseWakeContractRegisteredDataSchema,
@@ -22,7 +22,7 @@ import {
   SseTokenDataSchema,
   type SseInitData,
 } from '../sseSchemas';
-import { parseConversationState, isAgentWorking } from '../utils';
+import { parseConversationState } from '../utils';
 import { conversationReducer, createInitialAtom, type ConversationAtom, type InitPayload } from '../conversation/atom';
 import * as v from 'valibot';
 
@@ -237,11 +237,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             stateUpdatedAt: Date.parse(res.output.state_updated_at),
           },
         });
-        // Sub-agent reached a terminal/idle state — stop streaming so we
-        // don't hold the single live-stream slot (or an idle connection)
-        // open after the agent has finished. The final phase is already on
-        // the atom, so consumers see the completed state.
-        if (!isAgentWorking(phase)) {
+        if (isTerminalConversationState(phase)) {
           closeSource();
         }
       });
