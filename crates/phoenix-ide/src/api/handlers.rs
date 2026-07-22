@@ -21,11 +21,11 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
-    CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
-    CodeSearchResponse, ConflictErrorResponse, ContinueConversationRequest,
-    ContinueConversationResponse, ContinueConversationStatus, ConversationListResponse,
-    ConversationMessageRangeResponse, ConversationMessageSliceResponse,
+    AcceptedMessageDisposition, AcceptedMessageReconciliation, AddressPrFeedbackRequest,
+    AddressPrFeedbackResponse, AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse,
+    CodeSearchEntry, CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse,
+    ContinueConversationRequest, ContinueConversationResponse, ContinueConversationStatus,
+    ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
@@ -376,6 +376,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/associated-pr/resume-inference",
             post(resume_associated_pr_inference),
+        )
+        .route(
+            "/api/conversations/:id/address-pr-feedback",
+            post(address_pr_feedback),
         )
         .route(
             "/api/conversations/:id/pr-auto-fix-context",
@@ -3464,6 +3468,48 @@ async fn upload_conversation_attachments(
         ));
     }
     Ok(Json(AttachmentUploadResponse { files }))
+}
+
+async fn address_pr_feedback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AddressPrFeedbackRequest>,
+) -> Result<Json<AddressPrFeedbackResponse>, AppError> {
+    let message_id = req
+        .message_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let service =
+        crate::address_feedback_workflow::AddressFeedbackWorkflowService::new(state.clone());
+    let response = service
+        .submit(
+            crate::address_feedback_workflow::AddressFeedbackWorkflowRequest {
+                conversation_id: id,
+                message_id,
+                guidance: req.guidance,
+                user_agent: req.user_agent,
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::Rejected {
+                message,
+                code,
+            } => AppError::Conflict(Box::new(ConflictErrorResponse::new(message, &code))),
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::IdempotencyConflict => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    error.to_string(),
+                    "idempotency_conflict",
+                )))
+            }
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::Capture(message) => {
+                AppError::BadRequest(message)
+            }
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::Workflow(message)
+            | crate::address_feedback_workflow::AddressFeedbackWorkflowError::Dispatch(message) => {
+                AppError::Internal(message)
+            }
+        })?;
+    Ok(Json(response))
 }
 
 async fn send_chat(

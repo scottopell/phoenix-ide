@@ -115,9 +115,10 @@ FINISH per the table) is independent of which single slot glows.
 
 ## RESOLVE Zone: Address Feedback
 
-Address feedback calls `POST /api/conversations/:id/pr-auto-fix-context`, captures the returned
-message string, and posts it as a `UserMessage` to the conversation. It is enabled only when
-`PrAutoFixAffordance.enabled = true` (`pr-association` `WorkActionsPrAffordanceContract`).
+Address feedback calls `POST /api/conversations/:id/address-pr-feedback`; the backend accepts a
+durable server-owned intent, captures PR feedback context, renders the canonical XML model-facing
+message, and hands that message to the ordinary conversation submission path. It is enabled only
+when `PrAutoFixAffordance.enabled = true` (`pr-association` `WorkActionsPrAffordanceContract`).
 
 This verb is idle-only (REQ-WAB-005): posting a `UserMessage` to an errored or
 context-exhausted conversation would be rejected or would silently reopen a non-resumable

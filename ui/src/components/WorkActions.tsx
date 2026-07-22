@@ -8,6 +8,7 @@ import { deriveWorkDisposition } from './workDisposition';
 import { derivePrRailAvailability } from './prRailAvailability';
 import { prReviewState } from './prReviewState';
 import { useIsMobile } from '../hooks';
+import { generateUUID } from '../utils/uuid';
 import './WorkActions.css';
 
 interface WorkControlBarProps {
@@ -15,7 +16,6 @@ interface WorkControlBarProps {
   convModeLabel: string | undefined;
   phaseType: string;
   continuedInConvId: string | null | undefined;
-  onSendMessage?: (text: string) => Promise<void> | void;
   showError?: (message: string) => void;
   prStatusHandle: ConversationPrStatusHandle;
 }
@@ -115,7 +115,6 @@ export function WorkControlBar({
   convModeLabel,
   phaseType,
   continuedInConvId,
-  onSendMessage,
   showError,
   prStatusHandle,
 }: WorkControlBarProps) {
@@ -123,12 +122,28 @@ export function WorkControlBar({
   const [markingMerged, setMarkingMerged] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [addressMessageId, setAddressMessageId] = useState<string | null>(null);
+  const [addressSubmitted, setAddressSubmitted] = useState(false);
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
   const [expandedPrIdentity, setExpandedPrIdentity] = useState<string | null>(null);
   const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
   const isMobile = useIsMobile();
-  const isLoading = markingMerged || abandoning;
+  const addressLocked = capturing || addressSubmitted;
+  const isLoading = markingMerged || abandoning || addressLocked;
   const { openDiffFullscreen } = useViewerSlotCommands();
+
+  useEffect(() => {
+    setCapturing(false);
+    setAddressSubmitted(false);
+    setAddressMessageId(null);
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (addressSubmitted && phaseType !== 'idle') {
+      setAddressSubmitted(false);
+      setAddressMessageId(null);
+    }
+  }, [addressSubmitted, phaseType]);
 
   const prLoading = prStatusHandle.state.status === 'loading';
   const prStatus = prStatusHandle.state.status === 'ready' ? prStatusHandle.state.prStatus : null;
@@ -167,7 +182,7 @@ export function WorkControlBar({
     continuedInConvId,
     prStatus,
     prLoading,
-    canSendMessage: !!onSendMessage,
+    canSendMessage: true,
     workChange: prStatus?.work_change ?? null,
   });
 
@@ -177,14 +192,20 @@ export function WorkControlBar({
   const coverageMarker = prStatus ? prFeedbackCoverageMarker(prStatus) : null;
 
   const handleAddressFeedback = async () => {
-    if (!onSendMessage) return;
+    if (addressLocked) return;
+    const messageId = addressMessageId ?? generateUUID();
+    if (!addressMessageId) setAddressMessageId(messageId);
     setCapturing(true);
     try {
-      const ctx = await api.createPrAutoFixContext(conversationId);
-      await onSendMessage(ctx.message);
+      const response = await api.addressPrFeedback(conversationId, messageId);
+      if (response.no_op) {
+        setAddressMessageId(null);
+        return;
+      }
+      setAddressSubmitted(true);
       await prStatusHandle.refresh();
     } catch (err) {
-      showError?.(err instanceof Error ? err.message : 'Failed to capture PR context');
+      showError?.(err instanceof Error ? err.message : 'Failed to address PR feedback');
     } finally {
       setCapturing(false);
     }
@@ -286,7 +307,11 @@ export function WorkControlBar({
   };
 
   const note = disposition.note;
-  const addressFeedbackLabel = capturing ? `Capturing ${activePrLabel}…` : `Address ${activePrLabel} feedback`;
+  const addressFeedbackLabel = capturing
+    ? `Capturing ${activePrLabel}…`
+    : addressSubmitted
+      ? `Addressing ${activePrLabel}…`
+      : `Address ${activePrLabel} feedback`;
   const addressFeedbackAriaLabel = canShowPrDiff
     ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
     : addressFeedbackLabel;
@@ -302,10 +327,10 @@ export function WorkControlBar({
               type="button"
               className="mobile-pr-action mobile-pr-action--hero"
               data-testid="mobile-primary-address-feedback"
-              disabled={capturing}
+              disabled={addressLocked}
               onClick={handleAddressFeedback}
             >
-              <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
+              <span>{capturing ? `Capturing ${activePrLabel}…` : addressSubmitted ? `Addressing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
               <CoverageMarker marker={coverageMarker} />
             </button>
           )}
@@ -372,10 +397,10 @@ export function WorkControlBar({
         type="button"
         className="mobile-pr-action mobile-pr-action--hero"
         data-testid="mobile-primary-address-feedback"
-        disabled={capturing}
+        disabled={addressLocked}
         onClick={handleAddressFeedback}
       >
-        <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
+        <span>{capturing ? `Capturing ${activePrLabel}…` : addressSubmitted ? `Addressing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
         <CoverageMarker marker={coverageMarker} />
       </button>
     ) : disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && !prStatusHandle.ambiguous ? (
@@ -538,7 +563,7 @@ export function WorkControlBar({
             className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}
             data-testid="address-feedback-button"
             aria-label={addressFeedbackAriaLabel}
-            disabled={capturing}
+            disabled={addressLocked}
             onClick={handleAddressFeedback}
           >
             <span className="work-actions-address-copy">{addressFeedbackLabel}</span>

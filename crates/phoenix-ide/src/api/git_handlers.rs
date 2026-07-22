@@ -1736,14 +1736,14 @@ async fn attach_pr_feedback_freshness(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn create_pr_auto_fix_context(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<PrAutoFixContextResponse>, AppError> {
+pub(crate) async fn capture_pr_auto_fix_context_for_conversation(
+    state: &AppState,
+    id: &str,
+) -> Result<PrAutoFixContextResponse, AppError> {
     let conv = state
         .runtime
         .db()
-        .get_conversation(&id)
+        .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
@@ -1761,7 +1761,7 @@ pub(crate) async fn create_pr_auto_fix_context(
             branch_name.to_string(),
             worktree_path.to_string(),
             crate::work_scope::WorkScope::resolve(
-                &id,
+                id,
                 Some(std::path::Path::new(worktree_path.as_str())),
             ),
         ),
@@ -1863,7 +1863,16 @@ pub(crate) async fn create_pr_auto_fix_context(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
-    Ok(Json(response?))
+    response
+}
+
+pub(crate) async fn create_pr_auto_fix_context(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PrAutoFixContextResponse>, AppError> {
+    capture_pr_auto_fix_context_for_conversation(&state, &id)
+        .await
+        .map(Json)
 }
 
 fn validate_pr_auto_fix_artifact_path(artifact_path: &str) -> Result<(), AppError> {
@@ -1926,7 +1935,14 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
     let Some((artifact_path, _)) = raw.split_once('`') else {
         return Ok(());
     };
+    record_pr_auto_fix_context_baseline_for_artifact(db, conversation_id, artifact_path).await
+}
 
+pub(crate) async fn record_pr_auto_fix_context_baseline_for_artifact(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    artifact_path: &str,
+) -> Result<(), AppError> {
     let conv = db
         .get_conversation(conversation_id)
         .await

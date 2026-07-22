@@ -1906,7 +1906,6 @@ function ConversationPageContent({
       clearCreateIntent(conversationId);
     }
   }, [convStateForChildren.type, conversationId]);
-  const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
   const fileRootPath = routePrefix === '/global' || isArchived || !conversation
     ? null
     : (conversation.worktree_path ?? conversation.cwd);
@@ -2513,7 +2512,6 @@ function ConversationPageContent({
             convModeLabel={conversation.conv_mode_label}
             phaseType={convStateForChildren.type}
             continuedInConvId={conversation.continued_in_conv_id}
-            onSendMessage={handleSendTextOnly}
             showError={showError}
             prStatusHandle={prStatusHandle}
           />

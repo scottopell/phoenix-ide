@@ -250,6 +250,35 @@ pub struct ChatResponse {
     pub already_persisted: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AddressPrFeedbackRequest {
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub guidance: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddressPrFeedbackResponse {
+    pub workflow_id: u64,
+    pub message_id: String,
+    pub queued: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub steering: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_op: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+}
+
 /// Response for cancel action.
 ///
 /// `ok` is always true; `no_op` is `true` when the conversation was already

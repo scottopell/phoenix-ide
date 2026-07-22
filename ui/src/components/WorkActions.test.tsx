@@ -49,7 +49,7 @@ vi.mock('../api', () => ({
     markMerged: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
     getPrStatus: vi.fn(),
-    createPrAutoFixContext: vi
+    addressPrFeedback: vi
       .fn()
       .mockResolvedValue({ message: 'Address `.phoenix/pr-context/pr-12.json`' }),
   },
@@ -231,7 +231,6 @@ describe('WorkControlBar — stuck phases suppress RESOLVE (REQ-WAB-005)', () =>
           convModeLabel="Work"
           phaseType={phaseType}
           continuedInConvId={null}
-          onSendMessage={vi.fn()}
           prStatusHandle={prStatusHandle({
             found: true,
             number: 12,
@@ -257,7 +256,6 @@ describe('WorkControlBar — stuck phases suppress RESOLVE (REQ-WAB-005)', () =>
         convModeLabel="Work"
         phaseType="error"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({ found: false })}
       />,
     );
@@ -306,14 +304,13 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(note?.textContent).toMatch(/PR #133 is closed without merge\. Use Abandon/i);
   });
 
-  it('open PR, failing checks + onSendMessage → address-feedback present + primary', () => {
+  it('open PR, failing checks → address-feedback present + primary', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-fail"
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 12,
@@ -338,7 +335,6 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 120,
@@ -363,14 +359,13 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(primaryCount()).toBe(1);
   });
 
-  it('open PR, fresh feedback + onSendMessage → address-feedback present + primary', () => {
+  it('open PR, fresh feedback → address-feedback present + primary', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-fresh"
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 12,
@@ -394,7 +389,6 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 77,
@@ -424,7 +418,6 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 88,
@@ -449,7 +442,6 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 89,
@@ -699,7 +691,6 @@ describe('WorkControlBar — active PR interactions', () => {
           convModeLabel="Work"
           phaseType="idle"
           continuedInConvId={null}
-          onSendMessage={vi.fn()}
           prStatusHandle={handle}
         />
       </>,
@@ -813,7 +804,6 @@ describe('WorkControlBar — active PR interactions', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({ found: true, number: 12, url: 'https://gh/pr/12', display_state: 'open', check_state: 'failing' })}
       />,
     );
@@ -848,7 +838,7 @@ describe('WorkControlBar — active PR interactions', () => {
     delete ambiguousHandle.activeSelection.active_pr;
 
     renderWithProviders(
-      <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={ambiguousHandle} />,
+      <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={ambiguousHandle} />,
     );
 
     expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
@@ -869,14 +859,14 @@ describe('WorkControlBar — active PR interactions', () => {
     });
     delete ambiguousHandle.activeSelection.active_pr;
     const { rerender } = renderWithProviders(
-      <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={ambiguousHandle} />,
+      <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={ambiguousHandle} />,
     );
     expect(screen.queryByTestId('view-active-pr-diff-button')).not.toBeInTheDocument();
 
     rerender(
       <MemoryRouter>
         <ViewerSlotProvider browserSessionActive={false}>
-          <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={prStatusHandle({ found: true, number: 12, url: 'https://gh/pr/12', display_state: 'open', check_state: 'failing' })} />
+          <WorkControlBar conversationId="conv-1" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle({ found: true, number: 12, url: 'https://gh/pr/12', display_state: 'open', check_state: 'failing' })} />
         </ViewerSlotProvider>
       </MemoryRouter>,
     );
@@ -905,7 +895,6 @@ describe('WorkControlBar — invariants', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 91,
@@ -930,7 +919,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 137,
@@ -954,7 +942,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 138,
@@ -978,7 +965,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 144,
@@ -999,7 +985,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 143,
@@ -1024,7 +1009,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 140,
@@ -1056,7 +1040,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 142,
@@ -1087,7 +1070,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={vi.fn()}
         prStatusHandle={prStatusHandle({
           found: true,
           number: 141,
@@ -1108,8 +1090,10 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
 
   it('keeps remediation loading until send completes and then refreshes PR status', async () => {
     let resolveSend!: () => void;
-    const sendPromise = new Promise<void>((resolve) => { resolveSend = resolve; });
-    const onSendMessage = vi.fn(() => sendPromise);
+    const sendPromise = new Promise<{ queued: boolean; workflow_id: number; message_id: string }>((resolve) => {
+      resolveSend = () => resolve({ queued: true, workflow_id: 1, message_id: 'msg' });
+    });
+    (api.addressPrFeedback as ReturnType<typeof vi.fn>).mockReturnValueOnce(sendPromise);
     const handle = prStatusHandle({
       found: true,
       number: 139,
@@ -1128,7 +1112,6 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
         convModeLabel="Work"
         phaseType="idle"
         continuedInConvId={null}
-        onSendMessage={onSendMessage}
         prStatusHandle={handle}
       />,
     );
@@ -1136,10 +1119,9 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     const button = screen.getByTestId('address-feedback-button');
     fireEvent.click(button);
 
-    // createPrAutoFixContext → onSendMessage with the captured message.
+    // One browser-originated request performs durable capture and message handoff.
     await waitFor(() => {
-      expect(api.createPrAutoFixContext).toHaveBeenCalledWith('conv-remediate');
-      expect(onSendMessage).toHaveBeenCalledWith('Address `.phoenix/pr-context/pr-12.json`');
+      expect(api.addressPrFeedback).toHaveBeenCalledWith('conv-remediate', expect.any(String));
     });
 
     // Loading state holds while send is in flight; refresh not yet called.
@@ -1150,14 +1132,15 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
 
     resolveSend();
 
-    // Once send completes, PR status refreshes and the label settles back.
+    // Once the durable request is accepted, PR status refreshes but the action
+    // remains locked until server activity catches up.
     await waitFor(() => {
       expect(handle.refresh).toHaveBeenCalledTimes(1);
     });
     await waitFor(() => {
-      expect(screen.getByTestId('address-feedback-button').textContent).toMatch(
-        /Address PR #139 feedback/i,
-      );
+      const settled = screen.getByTestId('address-feedback-button') as HTMLButtonElement;
+      expect(settled.textContent).toMatch(/Addressing PR #139/i);
+      expect(settled.disabled).toBe(true);
     });
   });
 });
@@ -1180,7 +1163,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       },
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-multi" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-desktop-multi" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
@@ -1207,7 +1190,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       },
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-expand" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-desktop-expand" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 Fix CI open task-123/ }));
@@ -1233,7 +1216,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       },
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-feedback" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-desktop-feedback" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     expect(screen.getByRole('button', { name: /#13 Needs review open task-124$/ })).toBeInTheDocument();
@@ -1257,7 +1240,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       },
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-approved" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-desktop-approved" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('#12open👍');
@@ -1270,7 +1253,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       { activeSelection: null, activePrSummary: null, ambiguous: false },
     );
     renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-legacy-pr" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-desktop-legacy-pr" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     const identity = screen.getByTestId('desktop-work-actions-identity');
@@ -1293,7 +1276,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       },
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-summary-authority" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-desktop-summary-authority" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     expect(screen.getByTestId('desktop-work-actions-identity')).toHaveTextContent('#12draft👍');
@@ -1314,7 +1297,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
       },
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-review-state" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-mobile-review-state" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     expect(screen.getByRole('button', { name: /#12 open feedback in progress \(eyes reaction\)/ })).toBeInTheDocument();
@@ -1335,7 +1318,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
     });
     handle.activePrSummary = null;
     renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-stale-active" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-desktop-stale-active" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
@@ -1344,7 +1327,7 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
 
   it('uses the compact desktop rail for a single actionable PR', () => {
     renderWithProviders(
-      <WorkControlBar conversationId="conv-desktop-single" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={prStatusHandle()} />,
+      <WorkControlBar conversationId="conv-desktop-single" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
     );
 
     expect(screen.getByTestId('desktop-work-controls')).toBeInTheDocument();
@@ -1391,7 +1374,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       selection: twoOpenPrSelection(),
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-mobile" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
@@ -1432,7 +1415,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       selection: twoOpenPrSelection(),
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-open" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-mobile-open" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
@@ -1453,7 +1436,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       selection: twoOpenPrSelection(),
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-coverage" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-mobile-coverage" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
@@ -1473,7 +1456,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       selection: twoOpenPrSelection(),
     });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-hints" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-mobile-hints" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
@@ -1515,7 +1498,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       { activeSelection: null, activePrSummary: null, ambiguous: false },
     );
     renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-cached" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-mobile-cached" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
@@ -1568,7 +1551,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       selection: pinnedSelection,
     }, { resumeInference });
     renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-pinned" convModeLabel="Work" phaseType="idle" continuedInConvId={null} onSendMessage={vi.fn()} prStatusHandle={handle} />,
+      <WorkControlBar conversationId="conv-mobile-pinned" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
