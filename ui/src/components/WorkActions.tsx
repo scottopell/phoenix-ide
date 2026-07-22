@@ -199,7 +199,7 @@ export function WorkControlBar({
     try {
       const response = await api.addressPrFeedback(conversationId, messageId);
       if (response.no_op) {
-        setAddressMessageId(null);
+        setAddressSubmitted(true);
         return;
       }
       setAddressSubmitted(true);

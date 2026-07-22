@@ -252,8 +252,7 @@ pub struct ChatResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct AddressPrFeedbackRequest {
-    #[serde(default)]
-    pub message_id: Option<String>,
+    pub message_id: String,
     #[serde(default)]
     pub guidance: Option<String>,
     #[serde(default)]

@@ -92,6 +92,57 @@ impl AddressFeedbackWorkflowService {
         Self { state }
     }
 
+    pub(crate) async fn recover_pending(&self) {
+        let repo = WorkflowRepository::new(self.state.db.pool().clone());
+        let rows = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
+            "SELECT workflow_id, snapshot_payload, version FROM workflows WHERE profile_kind = ? AND profile_version = ? AND status = 'Active'",
+        )
+        .bind(PROFILE_KIND)
+        .bind(i64::from(PROFILE_VERSION))
+        .fetch_all(self.state.db.pool())
+        .await;
+        let Ok(rows) = rows else {
+            tracing::warn!(error = ?rows.err(), "failed to load pending address feedback workflows");
+            return;
+        };
+        for (workflow_id_raw, payload, version_raw) in rows {
+            let Ok(snapshot) = serde_json::from_slice::<AddressFeedbackSnapshot>(&payload) else {
+                tracing::warn!(
+                    workflow_id = workflow_id_raw,
+                    "skipping unreadable address feedback workflow snapshot"
+                );
+                continue;
+            };
+            if snapshot.dispatch.is_some()
+                || snapshot.model_message.is_none()
+                || snapshot.target.is_none()
+            {
+                continue;
+            }
+            let Ok(workflow_id) = u64::try_from(workflow_id_raw).map(WorkflowId) else {
+                continue;
+            };
+            let req = AddressFeedbackWorkflowRequest {
+                conversation_id: snapshot.conversation_id.clone(),
+                message_id: snapshot.message_id.clone(),
+                guidance: snapshot.guidance.clone(),
+                user_agent: None,
+            };
+            if let Err(error) = self
+                .dispatch_persisted_snapshot(
+                    &repo,
+                    workflow_id,
+                    u64::try_from(version_raw).unwrap_or(0),
+                    snapshot,
+                    req,
+                )
+                .await
+            {
+                tracing::warn!(workflow_id = workflow_id_raw, error = ?error, "failed to recover address feedback workflow");
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn submit(
         &self,
@@ -166,13 +217,6 @@ impl AddressFeedbackWorkflowService {
                 .map_err(map_app_error_for_capture)?;
         let model_message =
             render_address_feedback_xml(&capture, head_oid.as_deref(), req.guidance.as_deref());
-        record_pr_auto_fix_context_baseline_for_artifact(
-            self.state.runtime.db(),
-            &req.conversation_id,
-            &capture.artifact_path,
-        )
-        .await
-        .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
 
         let captured = AddressFeedbackSnapshot {
             status: AddressFeedbackStatus::Captured,
@@ -218,6 +262,13 @@ impl AddressFeedbackWorkflowService {
                 });
             }
         };
+        record_pr_auto_fix_context_baseline_for_artifact(
+            self.state.runtime.db(),
+            &captured.conversation_id,
+            captured.artifact_path.as_deref().unwrap_or_default(),
+        )
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
         let handed_off = AddressFeedbackSnapshot {
             status: if no_op {
                 AddressFeedbackStatus::DuplicateNoOp
@@ -283,6 +334,15 @@ impl AddressFeedbackWorkflowService {
                 });
             }
         };
+        if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
+            record_pr_auto_fix_context_baseline_for_artifact(
+                self.state.runtime.db(),
+                &snapshot.conversation_id,
+                artifact_path,
+            )
+            .await
+            .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
+        }
         let completed = AddressFeedbackSnapshot {
             status: if no_op {
                 AddressFeedbackStatus::DuplicateNoOp
@@ -460,7 +520,7 @@ fn workflow_id_for(conversation_id: &str, message_id: &str) -> WorkflowId {
         sha2::Sha256::digest(format!("{PROFILE_KIND}\0{conversation_id}\0{message_id}").as_bytes());
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
-    let value = u64::from_be_bytes(bytes).max(1);
+    let value = (u64::from_be_bytes(bytes) & i64::MAX as u64).max(1);
     WorkflowId(value)
 }
 
@@ -489,7 +549,7 @@ fn render_address_feedback_xml(
 ) -> String {
     let guidance = guidance.unwrap_or("Address the captured PR feedback and failing checks. Use the context artifact as the source of truth for this request.");
     format!(
-        "<address_pr_feedback>\n  <target repo_owner=\"{}\" repo_name=\"{}\" pr_number=\"{}\"{} />\n  <context artifact=\"{}\" />\n  <guidance>{}</guidance>\n</address_pr_feedback>",
+        "<address_pr_feedback>\n  <target repo_owner=\"{}\" repo_name=\"{}\" pr_number=\"{}\"{} />\n  <context artifact=\"{}\" />\n  <guidance>{}</guidance>\n  <instruction>{}</instruction>\n</address_pr_feedback>",
         escape_xml(&capture.repo_owner),
         escape_xml(&capture.repo_name),
         capture.pr_number,
@@ -498,6 +558,7 @@ fn render_address_feedback_xml(
             .unwrap_or_default(),
         escape_xml(&capture.artifact_path),
         escape_xml(guidance),
+        escape_xml(&capture.message),
     )
 }
 
@@ -568,6 +629,7 @@ mod tests {
         assert!(rendered.contains("repo_name=\"r&quot;epo\""));
         assert!(rendered.contains("artifact=\".phoenix/pr-context/a&amp;b.json\""));
         assert!(rendered.contains("fix &lt;all&gt; &amp; &quot;now&quot;"));
+        assert!(rendered.contains("<instruction>legacy</instruction>"));
     }
 
     #[test]

@@ -100,6 +100,12 @@ const STREAMING_ROUTES: &[&str] = &[
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
+    let recovery_state = state.clone();
+    tokio::spawn(async move {
+        crate::address_feedback_workflow::AddressFeedbackWorkflowService::new(recovery_state)
+            .recover_pending()
+            .await;
+    });
     // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
     // from `spa_routes::SPA_ROUTES` — the single source of truth shared with the
     // auth exemption (`auth::is_exempt_path`) so the two cannot drift. Adding a
@@ -3471,9 +3477,10 @@ async fn address_pr_feedback(
     Path(id): Path<String>,
     Json(req): Json<AddressPrFeedbackRequest>,
 ) -> Result<Json<AddressPrFeedbackResponse>, AppError> {
-    let message_id = req
-        .message_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let message_id = req.message_id;
+    if message_id.is_empty() {
+        return Err(AppError::BadRequest("message_id is required".to_string()));
+    }
     let service =
         crate::address_feedback_workflow::AddressFeedbackWorkflowService::new(state.clone());
     let response = service
