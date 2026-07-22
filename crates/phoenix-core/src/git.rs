@@ -23,15 +23,13 @@ const NONINTERACTIVE_GIT_ENV: &[(&str, &str)] = &[
     ("GIT_TERMINAL_PROMPT", "0"),
 ];
 
-const REMOVED_INTERACTIVE_GIT_ENV: &[&str] = &["GIT_ASKPASS", "SSH_ASKPASS"];
-
 /// Construct a Git subprocess with Phoenix's process-level safety defaults.
 ///
 /// The environment and command-line configuration overrides take precedence over
 /// system, global, local, and inherited process configuration without modifying
 /// any of them. Every statically spawned Git process in Phoenix goes through this
 /// constructor so repository setup in tests and production Git probes cannot
-/// invoke an interactive editor, pager, prompt, or signing agent.
+/// invoke an interactive editor, pager, terminal prompt, or signing agent.
 #[must_use]
 pub fn command() -> std::process::Command {
     command_with_config(&[])
@@ -58,9 +56,6 @@ pub fn command_with_config(config: &[(&str, &str)]) -> std::process::Command {
     }
     for &(key, value) in NONINTERACTIVE_GIT_ENV {
         command.env(key, value);
-    }
-    for &key in REMOVED_INTERACTIVE_GIT_ENV {
-        command.env_remove(key);
     }
 
     for &(key, value) in config.iter().chain(NONINTERACTIVE_GIT_CONFIG.iter()) {
@@ -287,12 +282,6 @@ mod command_tests {
             .any(|(key, env_value)| key == name && env_value == Some(std::ffi::OsStr::new(value)))
     }
 
-    fn command_removes_env(command: &std::process::Command, name: &str) -> bool {
-        command
-            .get_envs()
-            .any(|(key, env_value)| key == name && env_value.is_none())
-    }
-
     #[test]
     fn config_key_validation_rejects_keys_git_cannot_parse() {
         assert!(is_valid_config_key("commit.gpgsign"));
@@ -333,7 +322,7 @@ mod command_tests {
     }
 
     #[test]
-    fn command_overrides_interactive_editor_pager_and_prompt_environment() {
+    fn command_overrides_interactive_editor_pager_and_terminal_prompt_environment() {
         let command = command();
         for &(name, value) in NONINTERACTIVE_GIT_ENV {
             assert!(
@@ -341,12 +330,14 @@ mod command_tests {
                 "expected {name}={value} override"
             );
         }
-        for &name in REMOVED_INTERACTIVE_GIT_ENV {
-            assert!(
-                command_removes_env(&command, name),
-                "expected {name} removal"
-            );
-        }
+    }
+
+    #[test]
+    fn command_preserves_askpass_credential_helpers() {
+        let command = command();
+        assert!(!command
+            .get_envs()
+            .any(|(key, value)| (key == "GIT_ASKPASS" || key == "SSH_ASKPASS") && value.is_none()));
     }
 
     #[test]
