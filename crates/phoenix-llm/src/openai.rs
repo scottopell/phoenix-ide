@@ -3558,10 +3558,8 @@ mod tests {
         .await
         .unwrap();
 
-        let Some(super::super::TokenChunk::Text(text)) =
-            tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("refusal delta should be emitted promptly")
+        let super::super::TokenChunk::Text(text) =
+            rx.try_recv().expect("refusal delta should be enqueued")
         else {
             panic!("expected refusal delta as text chunk");
         };
