@@ -606,9 +606,73 @@ async fn deliver_pending(
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct BashWakeObservation<'a> {
+    contract_id: &'a str,
+    handle: &'a str,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_cause: Option<&'static str>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    signal_number: Option<i32>,
+    kill_signal_sent: Option<&'a str>,
+    finished_at: String,
+    start_offset: u64,
+    end_offset: u64,
+    truncated_before: bool,
+    lines: Vec<phoenix_core::domain::tool_wire::BashRingLine>,
+}
+
 fn render_terminal_result(pending: &WakePendingDelivery) -> String {
-    serde_json::to_string(&pending.receipt.terminal)
-        .unwrap_or_else(|_| "Wake completed; inspect display metadata for details.".to_string())
+    let rendered = match &pending.receipt.terminal {
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Fired {
+            contract_id,
+            evidence: WakeTerminalEvidence::Bash(evidence),
+            ..
+        } => {
+            let lines = evidence
+                .final_tail
+                .iter()
+                .enumerate()
+                .map(
+                    |(offset, bytes)| phoenix_core::domain::tool_wire::BashRingLine {
+                        offset: u64::try_from(offset).unwrap_or(u64::MAX),
+                        bytes: bytes.clone(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            serde_json::to_string(&BashWakeObservation {
+                contract_id,
+                handle: &evidence.identity.handle_id,
+                status: match evidence.status {
+                    BashTerminalStatus::Exited | BashTerminalStatus::Killed => "tombstoned",
+                    BashTerminalStatus::KillPendingKernel => "kill_pending_kernel",
+                },
+                final_cause: match evidence.status {
+                    BashTerminalStatus::Exited => Some("exited"),
+                    BashTerminalStatus::Killed => Some("killed"),
+                    BashTerminalStatus::KillPendingKernel => None,
+                },
+                exit_code: evidence.exit_code,
+                duration_ms: evidence.duration_ms,
+                signal_number: evidence.signal_number,
+                kill_signal_sent: evidence.kill_signal_sent.as_deref(),
+                finished_at: chrono::DateTime::from_timestamp(
+                    i64::try_from(evidence.occurred_at.0).unwrap_or(i64::MAX),
+                    0,
+                )
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .to_rfc3339(),
+                start_offset: 0,
+                end_offset: u64::try_from(lines.len()).unwrap_or(u64::MAX),
+                truncated_before: false,
+                lines,
+            })
+        }
+        terminal => serde_json::to_string(terminal),
+    };
+    rendered.unwrap_or_else(|_| "Wake completed; inspect display metadata for details.".to_string())
 }
 
 fn duration_until(now: Timestamp, then: u64) -> Duration {
@@ -1053,6 +1117,62 @@ mod tests {
 
     async fn pending_count(repo: &WakeRepository) -> usize {
         repo.list_pending("conv").await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn fired_bash_wake_renders_wait_compatible_observation() {
+        let (_db, repo) = open_repo().await;
+        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: conv_scope(),
+                    handle_id: "b-1".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(25),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["first".to_string(), "second".to_string()],
+            })),
+        );
+        WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        )
+        .run_once()
+        .await
+        .unwrap();
+        let pending = repo.list_pending("conv").await.unwrap().pop().unwrap();
+
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_terminal_result(&pending)).unwrap();
+        assert_eq!(rendered["contract_id"], "contract-b-1");
+        assert_eq!(rendered["handle"], "b-1");
+        assert_eq!(rendered["status"], "tombstoned");
+        assert_eq!(rendered["final_cause"], "exited");
+        assert_eq!(rendered["exit_code"], 0);
+        assert_eq!(rendered["duration_ms"], 25);
+        assert_eq!(rendered["finished_at"], "1970-01-01T00:00:10+00:00");
+        assert_eq!(rendered["start_offset"], 0);
+        assert_eq!(rendered["end_offset"], 2);
+        assert_eq!(rendered["truncated_before"], false);
+        assert_eq!(
+            rendered["lines"],
+            serde_json::json!([
+                {"offset": 0, "bytes": "first"},
+                {"offset": 1, "bytes": "second"}
+            ])
+        );
+        assert!(rendered.get("Fired").is_none());
+        assert!(rendered.get("resource").is_none());
+        assert!(rendered.get("evidence").is_none());
     }
 
     #[tokio::test]
