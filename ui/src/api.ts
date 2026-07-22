@@ -605,7 +605,7 @@ export interface ConversationMessageSliceResponse {
   has_older_messages: boolean;
 }
 
-export type AcceptedMessageAcceptance = 'pending_runtime' | 'runtime_accepted' | 'queued_steering';
+export type AcceptedMessageAcceptance = 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering';
 
 export type AcceptedMessageMaterialization =
   | { status: 'persisted'; message: Message }

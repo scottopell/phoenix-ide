@@ -535,10 +535,15 @@ rule PersistedMessageClearsReplayRing {
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
 -- conversation_became_terminal, error, browser_session_state,
--- steer_message_queued, rate_limit_snapshot, llm_first_byte,
--- llm_attempt. Excludes Init (per-stream, never broadcast) and
+-- steer_message_queued, rate_limit_snapshot, llm_stream_started,
+-- llm_first_byte, llm_attempt. Excludes Init (per-stream, never broadcast) and
 -- ConversationHardDeleted (terminal action; no subsequent init can
 -- fire for this conversation, so replay is moot).
+--
+-- `llm_stream_started` MUST replay because it binds the durable workflow,
+-- effect, attempt, and call ordinal to the streaming request. Reconnecting
+-- clients use that identity to correlate the later `llm_first_byte` and token
+-- events with the same attempt rather than a stale or superseded stream.
 --
 -- `llm_first_byte` (introduced by specs/working-phase-visibility/)
 -- MUST replay alongside the `token` events it precedes — if a client

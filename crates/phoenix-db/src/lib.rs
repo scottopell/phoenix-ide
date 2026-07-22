@@ -4439,6 +4439,9 @@ impl Database {
             AcceptedTopLevelLlmProduct::PersistedAssistant(message) => {
                 Some(message.message_id.clone())
             }
+            AcceptedTopLevelLlmProduct::PersistedCheckpoint { assistant, .. } => {
+                Some(assistant.message_id.clone())
+            }
             AcceptedTopLevelLlmProduct::StateCheckpoint { .. } => {
                 sqlx::query_scalar::<_, Option<String>>(
                     "SELECT accepted_assistant_message_id
@@ -4524,6 +4527,21 @@ impl Database {
                     .await?
                         == 1
                 }
+                AcceptedTopLevelLlmProduct::PersistedCheckpoint { assistant, .. } => {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM workflow_deliveries d
+                         JOIN messages m ON m.message_id = ?3
+                         WHERE d.workflow_id = ?1 AND d.delivery_id = ?2
+                           AND d.status = 'Accepted'
+                           AND d.runtime_acceptance_status = 'Accepted'",
+                    )
+                    .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(input.delivery_id.0).unwrap_or(i64::MAX))
+                    .bind(&assistant.message_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                        == 1
+                }
                 AcceptedTopLevelLlmProduct::StateCheckpoint { .. } => {
                     sqlx::query_scalar::<_, i64>(
                         "SELECT COUNT(*) FROM workflow_deliveries
@@ -4557,17 +4575,36 @@ impl Database {
                 .bind(&message.message_id)
                 .execute(&mut *tx)
                 .await?;
+                &message.conversation_id
+            }
+            AcceptedTopLevelLlmProduct::PersistedCheckpoint {
+                assistant,
+                tool_results,
+            } => {
+                insert_message_tx(&mut tx, assistant).await?;
+                for message in tool_results {
+                    insert_message_tx(&mut tx, message).await?;
+                }
                 sqlx::query(
-                    "UPDATE direct_turn_acceptances SET live_slot = NULL
+                    "UPDATE top_level_llm_workflows
+                     SET accepted_assistant_message_id = ?2
                      WHERE workflow_id = ?1",
                 )
                 .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+                .bind(&assistant.message_id)
                 .execute(&mut *tx)
                 .await?;
-                &message.conversation_id
+                &assistant.conversation_id
             }
             AcceptedTopLevelLlmProduct::StateCheckpoint { conversation_id } => conversation_id,
         };
+        sqlx::query(
+            "UPDATE direct_turn_acceptances SET live_slot = NULL
+             WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await?;
         update_conversation_state_at_tx(
             &mut tx,
             conversation_id,
@@ -6466,6 +6503,8 @@ impl Database {
             "DELETE FROM workflows
              WHERE workflow_id IN (
                  SELECT workflow_id FROM wake_bindings WHERE conversation_id = ?1
+                 UNION
+                 SELECT workflow_id FROM direct_turn_acceptances WHERE conversation_id = ?1
              )",
         )
         .bind(id)
@@ -12208,6 +12247,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_checkpoint_product_releases_live_direct_turn_slot() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-direct", "session", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        accepted_pending_direct_turn(&db).await;
+        let repo = WorkflowRepository::new(db.pool().clone());
+        repo.commit_direct_turn_runtime_admission(&DirectTurnRuntimeAdmissionInput {
+            workflow_id: WorkflowId(1),
+            conversation_id: "conv-direct".to_string(),
+            client_message_id: "msg-direct".to_string(),
+            generation: Generation(1),
+            disposition: DirectTurnCommittedOutcome::RuntimeAccepted,
+        })
+        .await
+        .unwrap();
+        let prepared = repo
+            .prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
+                workflow_id: WorkflowId(1),
+                committed_at: Timestamp(2),
+                process_incarnation: ProcessIncarnation(3),
+                prepared_request: phoenix_workflow::llm_profile::PreparedLlmRequest {
+                    codec_version: 1,
+                    request_fingerprint: "request".to_string(),
+                    provider: "test".to_string(),
+                    model: "test".to_string(),
+                    backend: "test".to_string(),
+                    request_aggregate: "{}".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        let receipt = repo
+            .accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
+                authority: prepared.authority,
+                delivery_id: None,
+                receipt_id: None,
+                response: phoenix_workflow::llm_profile::CompleteLlmResponse {
+                    codec_version: 1,
+                    response_fingerprint: "response".to_string(),
+                    response_aggregate: "{}".to_string(),
+                },
+                provider_request_id: None,
+                tool_intents: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let input = AcceptTopLevelLlmProductInput {
+            workflow_id: WorkflowId(1),
+            delivery_id: receipt.delivery.unwrap().delivery_id,
+            receipt_id: receipt.llm_receipt.unwrap().receipt_id,
+            product: AcceptedTopLevelLlmProduct::StateCheckpoint {
+                conversation_id: "conv-direct".to_string(),
+            },
+            next_state: ConvState::Error {
+                message: "terminal".to_string(),
+                error_kind: ErrorKind::InvalidResponse,
+                resets_at: None,
+            },
+            state_updated_at: Utc::now(),
+        };
+        assert_eq!(
+            db.accept_top_level_llm_product(&input).await.unwrap(),
+            AcceptTopLevelLlmProductOutcome::Committed
+        );
+        assert_eq!(
+            db.accept_top_level_llm_product(&input).await.unwrap(),
+            AcceptTopLevelLlmProductOutcome::ExactReplay
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM direct_turn_acceptances WHERE live_slot = 1"
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn direct_turn_runtime_acceptance_rolls_back_when_product_state_fails() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-direct", "session", "/tmp", true, None, None)
@@ -15426,6 +15546,39 @@ mod tests {
             .await
             .unwrap();
 
+        let direct_workflow_id = match WorkflowRepository::new(db.pool().clone())
+            .accept_direct_turn(&DirectTurnAcceptanceInput {
+                initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
+                conversation_id: "conv-del".to_string(),
+                client_message_id: "msg-del".to_string(),
+                prepared_fingerprint: "fp-direct-del".to_string(),
+                prepared_payload: "{}".to_string(),
+                accepted_at: phoenix_workflow::Timestamp(60),
+                snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                    turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                        conversation_id: "conv-del".to_string(),
+                        accepted_turn_id: "msg-del".to_string(),
+                        generation: 1,
+                    },
+                    accepted_assistant_message_id: None,
+                    stopped_at: None,
+                },
+            })
+            .await
+            .unwrap()
+        {
+            DirectTurnAcceptanceOutcome::Created(record) => record.workflow_id,
+            DirectTurnAcceptanceOutcome::Replayed(record) => {
+                panic!("expected created direct workflow, got replay {record:?}")
+            }
+            DirectTurnAcceptanceOutcome::RetryablePersistence => {
+                panic!("expected created direct workflow, got retryable persistence")
+            }
+            DirectTurnAcceptanceOutcome::Conflict => {
+                panic!("expected created direct workflow, got conflict")
+            }
+        };
+
         db.delete_conversation("conv-del").await.unwrap();
 
         assert!(db.get_conversation("conv-del").await.is_err());
@@ -15456,6 +15609,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(workflow_exists, 0);
+        let direct_workflow_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE workflow_id = ?1")
+                .bind(i64::try_from(direct_workflow_id.0).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(direct_workflow_exists, 0);
         assert_eq!(binding_exists, 0);
         assert_eq!(receipt_exists, 0);
         assert_eq!(link_exists, 0);

@@ -27,6 +27,7 @@ pub enum DirectTurnCommittedOutcome {
     PendingRuntime,
     RuntimeAccepted,
     QueuedSteering,
+    CancelledSteering,
 }
 
 #[derive(Debug, Clone)]
@@ -270,7 +271,13 @@ pub struct OwedTopLevelLlmReceipt {
 #[derive(Debug, Clone)]
 pub enum AcceptedTopLevelLlmProduct {
     PersistedAssistant(Box<phoenix_core::domain::db_schema::Message>),
-    StateCheckpoint { conversation_id: String },
+    PersistedCheckpoint {
+        assistant: Box<phoenix_core::domain::db_schema::Message>,
+        tool_results: Vec<phoenix_core::domain::db_schema::Message>,
+    },
+    StateCheckpoint {
+        conversation_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +312,36 @@ pub struct StopTopLevelLlmInput {
 }
 
 impl WorkflowRepository {
+    pub async fn cancel_queued_steering(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "INSERT OR IGNORE INTO direct_turn_steering_cancellations (workflow_id, cancelled_at)
+             SELECT workflow_id, unixepoch('subsec') * 1000
+             FROM direct_turn_acceptances
+             WHERE conversation_id = ?1 AND client_message_id = ?2
+               AND committed_outcome = 'QueuedSteering'",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            "DELETE FROM steering_messages
+             WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(updated > 0)
+    }
+
     pub async fn load_direct_turn_acceptance(
         &self,
         conversation_id: &str,
@@ -645,6 +682,11 @@ impl WorkflowRepository {
              FROM direct_turn_acceptances a
              JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
              WHERE a.committed_outcome = 'PendingRuntime'
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs cj
+                   WHERE cj.conversation_id = a.conversation_id
+                     AND cj.message_id = a.client_message_id
+               )
                AND w.stopped_at IS NULL
              ORDER BY a.accepted_at, a.conversation_id, a.client_message_id",
         )
@@ -1732,7 +1774,14 @@ async fn load_direct_turn_acceptance(
     client_message_id: &str,
 ) -> DbResult<Option<DirectTurnAcceptanceRecord>> {
     let row = sqlx::query(
-        "SELECT conversation_id, client_message_id, workflow_id, prepared_fingerprint, prepared_payload, committed_outcome, accepted_at FROM direct_turn_acceptances WHERE conversation_id = ?1 AND client_message_id = ?2",
+        "SELECT a.conversation_id, a.client_message_id, a.workflow_id,
+                a.prepared_fingerprint, a.prepared_payload,
+                CASE WHEN c.workflow_id IS NULL THEN a.committed_outcome
+                     ELSE 'CancelledSteering' END AS committed_outcome,
+                a.accepted_at
+         FROM direct_turn_acceptances a
+         LEFT JOIN direct_turn_steering_cancellations c ON c.workflow_id = a.workflow_id
+         WHERE a.conversation_id = ?1 AND a.client_message_id = ?2",
     )
     .bind(conversation_id)
     .bind(client_message_id)
@@ -1903,6 +1952,9 @@ fn direct_turn_outcome_to_str(value: &DirectTurnCommittedOutcome) -> &'static st
         DirectTurnCommittedOutcome::PendingRuntime => "PendingRuntime",
         DirectTurnCommittedOutcome::RuntimeAccepted => "RuntimeAccepted",
         DirectTurnCommittedOutcome::QueuedSteering => "QueuedSteering",
+        DirectTurnCommittedOutcome::CancelledSteering => {
+            unreachable!("cancelled steering is represented by its typed tombstone")
+        }
     }
 }
 
@@ -1911,6 +1963,7 @@ fn parse_direct_turn_outcome(value: &str) -> DbResult<DirectTurnCommittedOutcome
         "PendingRuntime" => Ok(DirectTurnCommittedOutcome::PendingRuntime),
         "RuntimeAccepted" => Ok(DirectTurnCommittedOutcome::RuntimeAccepted),
         "QueuedSteering" => Ok(DirectTurnCommittedOutcome::QueuedSteering),
+        "CancelledSteering" => Ok(DirectTurnCommittedOutcome::CancelledSteering),
         other => Err(DbError::Serialization(format!(
             "unknown direct-turn outcome: {other}"
         ))),
@@ -2141,6 +2194,56 @@ mod tests {
         assert_eq!(
             persisted.get::<Option<String>, _>("user_agent"),
             entry.user_agent
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_steering_is_tombstoned_and_cannot_replay_as_queued() {
+        let repo = open_repo().await;
+        let input = DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::QueuedSteering {
+                entry: Box::new(phoenix_core::domain::sm_event::SteerEntry {
+                    text: "steer".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "msg-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }),
+            },
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-steer".to_string(),
+            prepared_fingerprint: "fp-steer".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        };
+        repo.accept_direct_turn(&input).await.unwrap();
+        assert!(repo
+            .cancel_queued_steering("conv-1", "msg-steer")
+            .await
+            .unwrap());
+        assert!(!repo
+            .cancel_queued_steering("conv-1", "msg-steer")
+            .await
+            .unwrap());
+        assert_eq!(
+            repo.load_direct_turn_acceptance("conv-1", "msg-steer")
+                .await
+                .unwrap()
+                .unwrap()
+                .committed_outcome,
+            DirectTurnCommittedOutcome::CancelledSteering
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM steering_messages WHERE message_id = 'msg-steer'"
+            )
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap(),
+            0
         );
     }
 

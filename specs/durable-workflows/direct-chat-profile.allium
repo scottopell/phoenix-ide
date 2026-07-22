@@ -26,7 +26,7 @@ enum DirectChatRejectReason {
 enum PayloadSourceKind { inline_text | inline_file_reference | skill_invocation }
 enum RuntimeSlotStatus { idle | accepted }
 enum ConsumerProgressStatus { owed | in_progress | delivered | failed | suppressed }
-enum CommittedOutcomeKind { PendingRuntime | RuntimeAccepted | QueuedSteering }
+enum CommittedOutcomeKind { PendingRuntime | RuntimeAccepted | QueuedSteering | CancelledSteering }
 enum RequestResultKind {
     Created
     | Replayed
@@ -73,6 +73,7 @@ value CommittedOutcome {
     pending_runtime: AcceptedTurnRef? when kind = PendingRuntime
     runtime_accepted: AcceptedTurnRef? when kind = RuntimeAccepted
     queued_steering: AcceptedTurnRef? when kind = QueuedSteering
+    cancelled_steering: AcceptedTurnRef? when kind = CancelledSteering
 }
 
 value DirectChatOutcome {
@@ -347,6 +348,16 @@ rule ReplayReturnsRuntimeAcceptedAfterCommittedRuntimeOutcome {
     ensures: replayed_with(committed_outcome_for(same_key_existing_acceptance(turn_key)))
 }
 
+rule CancelledSteeringCannotReplayAsQueued {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+    requires: committed_outcome_for(same_key_existing_acceptance(turn_key)).kind = CancelledSteering
+
+    ensures: replayed_with(committed_outcome_for(same_key_existing_acceptance(turn_key)))
+    ensures: not runtime_delivery_remains_owed(same_key_existing_acceptance(turn_key))
+}
+
 rule SteeringConversionPreservesAcceptedIdentity {
     when: RuntimeSteeringConverted(acceptance)
     requires: acceptance.committed_outcome.kind = QueuedSteering
@@ -397,7 +408,8 @@ surface DirectChatDispositionSurface {
 
     @guarantee TypedOutcomeFamily
         -- A successful submission reports Created or Replayed separately from
-        -- the durable PendingRuntime, RuntimeAccepted, or QueuedSteering
+        -- the durable PendingRuntime, RuntimeAccepted, QueuedSteering, or
+        -- CancelledSteering
         -- disposition. Conflict and terminal rejection remain unaccepted request
         -- outcomes rather than accepted-turn lifecycle states.
 

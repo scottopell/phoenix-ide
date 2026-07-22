@@ -2771,6 +2771,9 @@ async fn reconcile_accepted_messages(
                 phoenix_db::DirectTurnCommittedOutcome::QueuedSteering => {
                     AcceptedMessageAcceptanceDisposition::QueuedSteering
                 }
+                phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => {
+                    AcceptedMessageAcceptanceDisposition::CancelledSteering
+                }
             });
         let materialization = match state.db.get_message_by_id(&message_id).await {
             Ok(message) if message.conversation_id == id => {
@@ -3545,6 +3548,9 @@ async fn send_chat(
                 crate::send_chat_service::SendChatDisposition::QueuedSteering => {
                     ChatDisposition::QueuedSteering
                 }
+                crate::send_chat_service::SendChatDisposition::CancelledSteering => {
+                    ChatDisposition::CancelledSteering
+                }
             },
         },
         crate::send_chat_service::SendChatOutcome::Rejected { message, code } => {
@@ -3831,10 +3837,8 @@ async fn cancel_steering_message(
 
     // Delete the entry directly (cascading its attachments); a missing entry is
     // a no-op, matching the idempotent contract.
-    state
-        .runtime
-        .db()
-        .remove_steering_entries(&id, std::slice::from_ref(&message_id))
+    phoenix_db::WorkflowRepository::new(state.runtime.db().pool().clone())
+        .cancel_queued_steering(&id, &message_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 

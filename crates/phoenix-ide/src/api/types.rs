@@ -190,6 +190,7 @@ pub enum AcceptedMessageAcceptanceDisposition {
     PendingRuntime,
     RuntimeAccepted,
     QueuedSteering,
+    CancelledSteering,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,6 +258,7 @@ pub enum ChatDisposition {
     PendingRuntime,
     RuntimeAccepted,
     QueuedSteering,
+    CancelledSteering,
 }
 
 /// Response for chat action

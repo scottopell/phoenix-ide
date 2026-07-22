@@ -33,6 +33,7 @@ enum MessageAcceptanceDisposition: String, Codable {
     case pendingRuntime = "pending_runtime"
     case runtimeAccepted = "runtime_accepted"
     case queuedSteering = "queued_steering"
+    case cancelledSteering = "cancelled_steering"
 }
 
 struct MessageAcceptance: Codable {
@@ -141,7 +142,9 @@ struct MessageReconciliationEntry: Codable {
    locally before submitting.
 2. On a typed successful response, mark the local operation accepted. Treat
    `pending_runtime` and `runtime_accepted` as normal sent states;
-   `queued_steering` may use a queued indicator.
+   `queued_steering` may use a queued indicator. A `cancelled_steering` replay
+   removes any optimistic queued item and must not resubmit or recreate the
+   cancelled steer.
 3. On timeout, disconnect, cancellation, backgrounding, or app termination, keep
    the same unresolved local operation. Do not generate a replacement ID.
 4. On reconnect or relaunch, batch unresolved IDs through reconciliation.

@@ -273,7 +273,7 @@ afterEach(() => {
 
 describe('ConversationPage message delivery reconciliation', () => {
   it('does not overwrite authoritative idle when SSE completes before the chat POST response', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     const sendMessage = vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const { store } = renderPage(makeConversation());
 
@@ -322,7 +322,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('optimistically leaves a resumable error while an accepted retry awaits SSE', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const errorState = {
       type: 'error' as const,
@@ -345,7 +345,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('rolls back an optimistic phase after a steering response despite non-phase SSE traffic', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const { store } = renderPage(makeConversation());
 
@@ -366,7 +366,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('rolls back an optimistic phase after a failed POST despite non-phase SSE traffic', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const { store } = renderPage(makeConversation());
 
@@ -387,7 +387,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('keeps a transport-failed POST accepted when exact-ID reconcile reports runtime acceptance', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
       conversation_idle: false,
@@ -416,7 +416,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('keeps a transport-failed POST queued when exact-ID reconcile reports queued steering', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
       conversation_idle: false,
@@ -444,7 +444,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('merges persisted materialization after transport failure instead of marking failed', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
       conversation_idle: false,
@@ -474,7 +474,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('marks failed only when exact-ID reconcile reports no acceptance and no persisted materialization', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
       conversation_idle: false,
@@ -501,7 +501,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('rolls back an optimistic phase after a failed POST despite non-phase SSE traffic', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
       conversation_idle: false,
@@ -574,7 +574,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('prevents overlapping composer submissions while the first POST is unresolved', async () => {
-    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' | 'cancelled_steering' }>();
     const sendMessage = vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     renderPage(makeConversation());
 

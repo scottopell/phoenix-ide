@@ -291,7 +291,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "one_live_direct_turn_per_conversation",
         sql: MIGRATION_055,
     },
+    Migration {
+        version: 56,
+        name: "add_cancelled_steering_disposition",
+        sql: MIGRATION_056,
+    },
 ];
+
+const MIGRATION_056: &str = r"
+CREATE TABLE direct_turn_steering_cancellations (
+    workflow_id INTEGER PRIMARY KEY REFERENCES direct_turn_acceptances(workflow_id) ON DELETE CASCADE,
+    cancelled_at INTEGER NOT NULL
+);
+";
 
 const MIGRATION_055: &str = r"
 ALTER TABLE direct_turn_acceptances ADD COLUMN live_slot INTEGER

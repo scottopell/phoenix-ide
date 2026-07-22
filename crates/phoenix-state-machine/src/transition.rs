@@ -1563,6 +1563,7 @@ fn handle_core_error_retry(
                 resets_at,
             })
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::AbortLlm)
             .with_effect(Effect::notify_state_change()))
         }
 

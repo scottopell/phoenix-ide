@@ -350,7 +350,7 @@ EVERY durable direct-chat acceptance lookup, replay, reconciliation, or conflict
 resolution SHALL produce one typed disposition.
 
 The accepted-turn disposition family SHALL distinguish PendingRuntime,
-QueuedSteering, and RuntimeAccepted. A successful submission response SHALL
+QueuedSteering, CancelledSteering, and RuntimeAccepted. A successful submission response SHALL
 separately identify whether that request created the acceptance or replayed an
 existing matching acceptance. Conflicting key reuse and terminal rejection SHALL
 remain typed unaccepted request outcomes rather than accepted-turn lifecycle
@@ -407,6 +407,10 @@ for runtime delivery or recipient LLM completion. Runtime delivery SHALL remain
 recoverable owed work, and failure of an immediate delivery notification SHALL
 NOT reverse or delay the accepted response.
 
+WHEN a terminal provider failure settles the conversation, THE SYSTEM SHALL
+persist the terminal state before stopping the durable turn, suppressing owed
+work, and releasing its live slot.
+
 ### REQ-DWF-CHAT-008: Exact-ID Reconciliation Independent of Transcript Window
 
 WHEN Phoenix reconciles a durable direct-chat turn with runtime or transcript
@@ -421,6 +425,11 @@ acceptance or a window-relative guess.
 Exact-ID reconciliation SHALL report durable acceptance independently from
 transcript materialization. A durably accepted turn that is not yet visible in
 the transcript SHALL NOT be reported as unaccepted or absent.
+
+WHEN an accepted queued-steering turn is cancelled, THE SYSTEM SHALL durably
+tombstone its steering lifecycle while atomically removing its queue row. A
+matching replay SHALL report CancelledSteering and SHALL NOT recreate runtime or
+queue delivery.
 
 ### REQ-DWF-CHAT-009: Independent Non-Atomic Fan-Out
 

@@ -38,6 +38,7 @@ pub(crate) enum SendChatDisposition {
     PendingRuntime,
     RuntimeAccepted,
     QueuedSteering,
+    CancelledSteering,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +202,13 @@ impl SendChatApplicationService {
                         SendChatDisposition::QueuedSteering,
                     )
                 }
+                phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => {
+                    SendChatOutcome::accepted(
+                        message_id,
+                        SendChatRequestResult::Replayed,
+                        SendChatDisposition::CancelledSteering,
+                    )
+                }
                 phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
                 | phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
                     kick_runtime_delivery(
@@ -229,7 +237,8 @@ impl SendChatApplicationService {
                             phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
                                 SendChatDisposition::RuntimeAccepted
                             }
-                            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering => {
+                            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering
+                            | phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => {
                                 unreachable!()
                             }
                         },

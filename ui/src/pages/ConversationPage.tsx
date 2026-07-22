@@ -268,8 +268,9 @@ function mergeConversationMessages<T extends { message_id: string; sequence_id: 
   return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
 }
 
-function categorizeReconciledMessage(entry: AcceptedMessageReconciliation): 'accepted' | 'steering_queued' | 'recoverable_inconsistency' | 'failed' | 'persisted_only' {
+function categorizeReconciledMessage(entry: AcceptedMessageReconciliation): 'accepted' | 'steering_queued' | 'cancelled' | 'recoverable_inconsistency' | 'failed' | 'persisted_only' {
   if (entry.acceptance === 'queued_steering') return 'steering_queued';
+  if (entry.acceptance === 'cancelled_steering') return 'cancelled';
   if (entry.acceptance === 'pending_runtime' || entry.acceptance === 'runtime_accepted') return 'accepted';
   if (entry.materialization.status === 'persisted') return 'persisted_only';
   return 'failed';
@@ -662,9 +663,11 @@ function ConversationPageContent({
       markAccepted(localId, phaseEventSeqBeforePost);
     } else if (outcome === 'steering_queued') {
       markSteeringQueued(localId, phaseEventSeqBeforePost);
+    } else if (outcome === 'cancelled') {
+      reconcileAuthoritative([localId]);
     }
     return outcome;
-  }, [conversationId, eventCursorRef, markAccepted, markSteeringQueued, mergePersistedReconciliations]);
+  }, [conversationId, eventCursorRef, markAccepted, markSteeringQueued, mergePersistedReconciliations, reconcileAuthoritative]);
 
   const conversationRouteIdentity = `${slug ?? ''}\u0000${conversationId ?? ''}`;
   const conversationRouteOwnerRef = useRef({ identity: conversationRouteIdentity, generation: 1 });
@@ -1438,7 +1441,10 @@ function ConversationPageContent({
           // accepted status. The entry stays visible until authoritative history
           // contains `message_id == localId`, at which point `pendingMessages`
           // filters it out via the derivation above.
-          if (result.disposition === 'queued_steering') {
+          if (result.disposition === 'cancelled_steering') {
+            reconcileAuthoritative([localId]);
+            rollbackOptimisticPhase();
+          } else if (result.disposition === 'queued_steering') {
             markSteeringQueued(localId, phaseEventSeqBeforePost);
             rollbackOptimisticPhase();
           } else {
@@ -1500,7 +1506,7 @@ function ConversationPageContent({
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued, reconcileExactAcceptedMessage]
+    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued, reconcileAuthoritative, reconcileExactAcceptedMessage]
   );
 
   const sendMessageRef = useRef(sendMessage);

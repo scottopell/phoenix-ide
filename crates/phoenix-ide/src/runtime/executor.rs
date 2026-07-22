@@ -2912,13 +2912,14 @@ where
         to_drain
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn apply_durable_llm_receipt_transition(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
         owed: phoenix_db::OwedTopLevelLlmReceipt,
     ) -> Result<Vec<Event>, String> {
         let mut effects = result.effects.into_iter();
-        let (product, persisted_message) = match effects.next() {
+        let (product, persisted_messages) = match effects.next() {
             Some(Effect::PersistMessage {
                 content,
                 display_data,
@@ -2946,14 +2947,78 @@ where
                     phoenix_db::AcceptedTopLevelLlmProduct::PersistedAssistant(Box::new(
                         message.clone(),
                     )),
-                    Some(message),
+                    vec![message],
+                )
+            }
+            Some(Effect::PersistCheckpoint {
+                data:
+                    CheckpointData::ToolRound {
+                        assistant_message,
+                        tool_results,
+                    },
+            }) => {
+                if !matches!(effects.next(), Some(Effect::PersistState)) {
+                    return Err(
+                        "durable LLM checkpoint did not pair product and state persistence"
+                            .to_string(),
+                    );
+                }
+                let (reserved_broadcast_range, reserved_seqs) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1 + tool_results.len());
+                let _reserved_broadcast_range = reserved_broadcast_range;
+                let agent_content = MessageContent::agent(assistant_message.content);
+                let assistant = crate::db::Message {
+                    message_id: assistant_message.message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: reserved_seqs[0],
+                    message_type: agent_content.message_type(),
+                    content: agent_content,
+                    display_data: assistant_message.display_data,
+                    usage_data: assistant_message.usage,
+                    created_at: assistant_message.created_at,
+                };
+                let tool_messages = tool_results
+                    .iter()
+                    .zip(reserved_seqs.iter().skip(1))
+                    .map(|(result, sequence_id)| {
+                        let content = MessageContent::tool_with_images(
+                            &result.tool_use_id,
+                            result.output(),
+                            result.is_error(),
+                            result.images().to_vec(),
+                        );
+                        crate::db::Message {
+                            message_id: tool_result_message_id(&result.tool_use_id),
+                            conversation_id: self.context.conversation_id.clone(),
+                            sequence_id: *sequence_id,
+                            message_type: content.message_type(),
+                            content,
+                            display_data: merge_duration_into_display_data(
+                                result.display_data(),
+                                result.duration_ms,
+                            ),
+                            usage_data: None,
+                            created_at: Utc::now(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut persisted = Vec::with_capacity(1 + tool_messages.len());
+                persisted.push(assistant.clone());
+                persisted.extend(tool_messages.iter().cloned());
+                (
+                    phoenix_db::AcceptedTopLevelLlmProduct::PersistedCheckpoint {
+                        assistant: Box::new(assistant),
+                        tool_results: tool_messages,
+                    },
+                    persisted,
                 )
             }
             Some(Effect::PersistState) => (
                 phoenix_db::AcceptedTopLevelLlmProduct::StateCheckpoint {
                     conversation_id: self.context.conversation_id.clone(),
                 },
-                None,
+                Vec::new(),
             ),
             _ => {
                 return Err(
@@ -2995,7 +3060,7 @@ where
             }
         }
         if !product_replay {
-            if let Some(message) = persisted_message {
+            for message in persisted_messages {
                 let _ = self.broadcast_tx.send_message(message);
             }
         }
@@ -5028,7 +5093,7 @@ where
             }
 
             let attempt_capture = task_attempt_capture;
-            let request = LlmRequest {
+            let mut request = LlmRequest {
                 system,
                 messages,
                 tools,
@@ -5090,6 +5155,23 @@ where
             };
 
             if let Some(attempt) = durable_attempt.as_ref() {
+                let durable_request: phoenix_llm::DurableLlmRequest = match serde_json::from_str(
+                    &attempt.prepared_request.request_aggregate,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = llm_tx.send(LlmOutcome::NetworkError {
+                            message: format!("failed to decode stored durable LLM request: {error}"),
+                        });
+                        return;
+                    }
+                };
+                request = durable_request.into_attempt(
+                    request
+                        .telemetry
+                        .clone()
+                        .expect("executor LLM requests always carry telemetry"),
+                );
                 let authority = &attempt.authority;
                 let stream_request_id = request_id.clone();
                 let _ = broadcast_tx_for_stream.send_seq(|sequence_id| {
