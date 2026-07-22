@@ -217,18 +217,18 @@ impl Tool for TmuxRunTool {
                 let response =
                     return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd)
                         .await;
-                if parsed.keep_open_on_exit {
-                    register_tmux_wake_if_live(
-                        &ctx,
-                        &server_token,
-                        &target,
-                        TmuxCompletionPolicy::KeepOpen,
-                        response,
-                    )
-                    .await
-                } else {
-                    response
-                }
+                register_tmux_wake_if_live(
+                    &ctx,
+                    &server_token,
+                    &target,
+                    if parsed.keep_open_on_exit {
+                        TmuxCompletionPolicy::KeepOpen
+                    } else {
+                        TmuxCompletionPolicy::CloseAfterCompletion
+                    },
+                    response,
+                )
+                .await
             }
             ValidReadiness::WaitForText { text, timeout } => {
                 wait_for_text_response(
@@ -1337,6 +1337,50 @@ mod tests {
         assert!(v.get("wake_registration").is_none());
         assert!(registrar.register_calls().is_empty());
         kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-exited.sock")).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_close_after_exit_registers_until_terminal_marker() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(18)]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-immediate-close",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "sleep 10",
+                    "name": "tmux-run-immediate-close",
+                    "keep_open_on_exit": false,
+                    "readiness": { "mode": "return_immediately" }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "started");
+        assert!(v.get("wake_registration").is_some());
+        assert!(matches!(
+            registrar.register_calls()[0].resource,
+            WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
+                completion_policy: TmuxCompletionPolicy::CloseAfterCompletion,
+                ..
+            })
+        ));
+        kill_socket(&socket_tmp.path().join("conv-tmux-run-immediate-close.sock")).await;
     }
 
     #[tokio::test]
