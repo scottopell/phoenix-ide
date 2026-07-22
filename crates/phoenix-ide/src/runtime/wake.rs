@@ -454,6 +454,13 @@ async fn adopt_materialized_delivery(
     Ok(())
 }
 
+fn handle_is_idle(handle: &crate::runtime::ConversationHandle) -> bool {
+    matches!(
+        *handle.state_rx.borrow(),
+        crate::state_machine::ConvState::Idle
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 async fn deliver_pending(
     manager: &Arc<RuntimeManager>,
@@ -511,16 +518,7 @@ async fn deliver_pending(
                 phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
             );
             let handle = match manager.try_get_handle(&current.conversation_id).await {
-                Some(handle) => {
-                    if !matches!(
-                        *handle.state_rx.borrow(),
-                        crate::state_machine::ConvState::Idle
-                    ) {
-                        cursor = Some(next_cursor);
-                        continue;
-                    }
-                    handle
-                }
+                Some(handle) => handle,
                 None => match manager.get_or_create(&current.conversation_id).await {
                     Ok(handle) => handle,
                     Err(error) => {
@@ -535,6 +533,10 @@ async fn deliver_pending(
                     }
                 },
             };
+            if !handle_is_idle(&handle) {
+                cursor = Some(next_cursor);
+                continue;
+            }
             if repo
                 .get_delivery_message_link(
                     current.workflow_id,
@@ -636,8 +638,10 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
                 .iter()
                 .enumerate()
                 .map(
-                    |(offset, bytes)| phoenix_core::domain::tool_wire::BashRingLine {
-                        offset: u64::try_from(offset).unwrap_or(u64::MAX),
+                    |(ordinal, bytes)| phoenix_core::domain::tool_wire::BashRingLine {
+                        offset: evidence
+                            .final_tail_start_offset
+                            .saturating_add(u64::try_from(ordinal).unwrap_or(u64::MAX)),
                         bytes: bytes.clone(),
                     },
                 )
@@ -664,9 +668,9 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
                 )
                 .unwrap_or(chrono::DateTime::UNIX_EPOCH)
                 .to_rfc3339(),
-                start_offset: 0,
-                end_offset: u64::try_from(lines.len()).unwrap_or(u64::MAX),
-                truncated_before: false,
+                start_offset: evidence.final_tail_start_offset,
+                end_offset: evidence.final_tail_end_offset,
+                truncated_before: evidence.final_tail_truncated_before,
                 lines,
             })
         }
@@ -756,8 +760,8 @@ async fn inspect_live_bash(
         return InspectionOutcome::LiveRetry;
     };
     let ring = live.ring.lock().await;
-    let final_tail = ring
-        .tail(200)
+    let window = ring.tail(200);
+    let final_tail = window
         .lines
         .into_iter()
         .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
@@ -770,6 +774,9 @@ async fn inspect_live_bash(
         duration_ms: None,
         signal_number: None,
         kill_signal_sent: Some(kill_attempt.signal_sent.as_str().to_string()),
+        final_tail_start_offset: window.start_offset,
+        final_tail_end_offset: window.end_offset,
+        final_tail_truncated_before: window.truncated_before,
         final_tail,
     }))
 }
@@ -808,6 +815,10 @@ impl TerminalInspector for RuntimeRegistryInspector {
                                 FinalCause::Exited { .. } => BashTerminalStatus::Exited,
                                 FinalCause::Killed { .. } => BashTerminalStatus::Killed,
                             };
+                            let final_tail_start_offset = tomb
+                                .final_tail
+                                .first()
+                                .map_or(tomb.next_offset_at_exit, |line| line.offset);
                             let tail = tomb
                                 .final_tail
                                 .iter()
@@ -824,6 +835,9 @@ impl TerminalInspector for RuntimeRegistryInspector {
                                     kill_signal_sent: tomb
                                         .kill_signal_sent
                                         .map(|sig| format!("{sig:?}")),
+                                    final_tail_start_offset,
+                                    final_tail_end_offset: tomb.next_offset_at_exit,
+                                    final_tail_truncated_before: final_tail_start_offset > 0,
                                     final_tail: tail,
                                 },
                             )))
@@ -1075,11 +1089,15 @@ mod tests {
             registered_at: Timestamp(1),
             expires_at: Timestamp(expires_at),
         };
-        match repo.register(&intent, handle, Timestamp(1)).await.unwrap() {
+        let workflow_id = match repo.register(&intent, handle, Timestamp(1)).await.unwrap() {
             WakeRegistrationOutcome::Registered { workflow_id, .. }
             | WakeRegistrationOutcome::Replayed { workflow_id, .. } => workflow_id.0,
             WakeRegistrationOutcome::Conflict => panic!("unexpected conflict"),
-        }
+        };
+        repo.activate_for_test(phoenix_workflow::WorkflowId(workflow_id))
+            .await
+            .unwrap();
+        workflow_id
     }
 
     async fn register_tmux(
@@ -1104,7 +1122,7 @@ mod tests {
             registered_at: Timestamp(1),
             expires_at: Timestamp(expires_at),
         };
-        match repo
+        let workflow_id = match repo
             .register(&intent, window_id, Timestamp(1))
             .await
             .unwrap()
@@ -1112,7 +1130,11 @@ mod tests {
             WakeRegistrationOutcome::Registered { workflow_id, .. }
             | WakeRegistrationOutcome::Replayed { workflow_id, .. } => workflow_id.0,
             WakeRegistrationOutcome::Conflict => panic!("unexpected conflict"),
-        }
+        };
+        repo.activate_for_test(phoenix_workflow::WorkflowId(workflow_id))
+            .await
+            .unwrap();
+        workflow_id
     }
 
     async fn pending_count(repo: &WakeRepository) -> usize {
@@ -1137,6 +1159,9 @@ mod tests {
                 duration_ms: Some(25),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 40,
+                final_tail_end_offset: 42,
+                final_tail_truncated_before: true,
                 final_tail: vec!["first".to_string(), "second".to_string()],
             })),
         );
@@ -1160,14 +1185,14 @@ mod tests {
         assert_eq!(rendered["exit_code"], 0);
         assert_eq!(rendered["duration_ms"], 25);
         assert_eq!(rendered["finished_at"], "1970-01-01T00:00:10+00:00");
-        assert_eq!(rendered["start_offset"], 0);
-        assert_eq!(rendered["end_offset"], 2);
-        assert_eq!(rendered["truncated_before"], false);
+        assert_eq!(rendered["start_offset"], 40);
+        assert_eq!(rendered["end_offset"], 42);
+        assert_eq!(rendered["truncated_before"], true);
         assert_eq!(
             rendered["lines"],
             serde_json::json!([
-                {"offset": 0, "bytes": "first"},
-                {"offset": 1, "bytes": "second"}
+                {"offset": 40, "bytes": "first"},
+                {"offset": 41, "bytes": "second"}
             ])
         );
         assert!(rendered.get("Fired").is_none());
@@ -1207,6 +1232,9 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 1,
+                final_tail_truncated_before: false,
                 final_tail: vec!["done".to_string()],
             })),
         );
@@ -1478,6 +1506,9 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 0,
+                final_tail_truncated_before: false,
                 final_tail: vec![],
             })),
         );
@@ -1657,6 +1688,9 @@ mod tests {
                 duration_ms: Some(1),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 0,
+                final_tail_truncated_before: false,
                 final_tail: vec![],
             })),
         );
@@ -1712,6 +1746,9 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 1,
+                final_tail_truncated_before: false,
                 final_tail: vec!["done".to_string()],
             })),
         );
@@ -1770,6 +1807,9 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 1,
+                final_tail_truncated_before: false,
                 final_tail: vec!["done".to_string()],
             })),
         );
@@ -1806,6 +1846,44 @@ mod tests {
             &wake.content,
             crate::db::MessageContent::User(user) if user.is_meta && user.text.contains("done")
         ));
+    }
+
+    #[tokio::test]
+    async fn newly_obtained_non_idle_runtime_is_not_delivery_eligible() {
+        let (db, _repo) = open_repo().await;
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db,
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let handle = manager.get_or_create("conv").await.unwrap();
+        handle
+            .event_tx
+            .send(crate::state_machine::Event::UserMessage {
+                text: "resume".into(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "user-1".into(),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .await
+            .unwrap();
+        let mut state_rx = handle.state_rx.clone();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while matches!(*state_rx.borrow(), crate::state_machine::ConvState::Idle) {
+                state_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!handle_is_idle(&handle));
     }
 
     #[tokio::test]
@@ -1858,6 +1936,9 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 1,
+                final_tail_truncated_before: false,
                 final_tail: vec!["done".to_string()],
             })),
         );
@@ -1944,6 +2025,9 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 1,
+                final_tail_truncated_before: false,
                 final_tail: vec!["done".to_string()],
             })),
         );

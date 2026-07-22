@@ -2069,6 +2069,7 @@ impl WakeRepository {
              FROM wake_bindings b
              JOIN workflows w ON w.workflow_id = b.workflow_id
              WHERE w.status = 'Active'
+               AND b.activated_at IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM wake_terminal_receipts p WHERE p.workflow_id = b.workflow_id)
              ORDER BY b.workflow_id
              LIMIT ?1",
@@ -2095,6 +2096,7 @@ impl WakeRepository {
              JOIN workflows w ON w.workflow_id = b.workflow_id
              WHERE b.conversation_id = ?1
                AND w.status = 'Active'
+               AND b.activated_at IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM wake_terminal_receipts p WHERE p.workflow_id = b.workflow_id)
              ORDER BY b.workflow_id",
         )
@@ -2124,6 +2126,7 @@ impl WakeRepository {
                 JOIN workflows w ON w.workflow_id = b.workflow_id
                 JOIN json_each(?2) ids ON ids.value = b.contract_id
                 WHERE b.conversation_id = ?1
+                  AND b.activated_at IS NOT NULL
                   AND (
                     (w.status = 'Active' AND b.resolved_at IS NULL)
                     OR EXISTS (
@@ -2153,6 +2156,7 @@ impl WakeRepository {
                 SELECT 1 FROM wake_bindings b
                 JOIN workflows w ON w.workflow_id = b.workflow_id
                 WHERE b.conversation_id = ?1
+                  AND b.activated_at IS NOT NULL
                   AND (
                     (w.status = 'Active' AND b.resolved_at IS NULL)
                     OR EXISTS (
@@ -2191,6 +2195,7 @@ impl WakeRepository {
              FROM wake_bindings b
              JOIN workflows w ON w.workflow_id = b.workflow_id
              WHERE w.status = 'Active'
+               AND b.activated_at IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM wake_terminal_receipts p WHERE p.workflow_id = b.workflow_id)
                AND (
                     NOT EXISTS (
@@ -2256,6 +2261,7 @@ impl WakeRepository {
              FROM wake_bindings b
              JOIN workflows w ON w.workflow_id = b.workflow_id
              WHERE w.status = 'Active'
+               AND b.activated_at IS NOT NULL
                AND b.expires_at <= ?1
                AND NOT EXISTS (SELECT 1 FROM wake_terminal_receipts p WHERE p.workflow_id = b.workflow_id)
              ORDER BY b.workflow_id
@@ -2376,7 +2382,7 @@ impl WakeRepository {
                     p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                     p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                     p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                    p.cancelled_at, b.work_scope_id, b.tmux_completion_policy, b.registering_tool_use_id
+                    p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy, b.registering_tool_use_id
              FROM workflow_deliveries d
              JOIN wake_terminal_receipts p
                ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -2572,6 +2578,15 @@ impl WakeRepository {
         .execute(&self.workflow_repo.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    #[doc(hidden)]
+    pub async fn activate_for_test(&self, workflow_id: WorkflowId) -> DbResult<()> {
+        sqlx::query("UPDATE wake_bindings SET activated_at = created_at WHERE workflow_id = ?1")
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .execute(&self.workflow_repo.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
@@ -3823,6 +3838,20 @@ async fn insert_terminal_receipt_projection_tx(
         cancelled_at,
         tail,
     ) = projection_parts(terminal);
+    let (tail_start_offset, tail_end_offset, tail_truncated_before) = match terminal {
+        WakeTerminalPayload::Fired {
+            evidence: WakeTerminalEvidence::Bash(evidence),
+            ..
+        } => (
+            Some(evidence.final_tail_start_offset),
+            Some(evidence.final_tail_end_offset),
+            Some(evidence.final_tail_truncated_before),
+        ),
+        WakeTerminalPayload::Fired { .. }
+        | WakeTerminalPayload::Cancelled { .. }
+        | WakeTerminalPayload::Expired { .. }
+        | WakeTerminalPayload::Forgotten { .. } => (None, None, None),
+    };
     sqlx::query(
         "UPDATE wake_bindings SET resolved_at = ?2 WHERE workflow_id = ?1 AND resolved_at IS NULL",
     )
@@ -3835,8 +3864,9 @@ async fn insert_terminal_receipt_projection_tx(
             workflow_id, receipt_id, delivery_id, conversation_id, contract_id, resource_kind,
             terminal_kind, resolved_at, bash_handle_id, tmux_server_token, tmux_window_id,
             bash_status, tmux_status, occurred_at, exit_code, duration_ms, signal_number,
-            kill_signal_sent, forgotten_reason, cancelled_reason, cancelled_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
+            kill_signal_sent, forgotten_reason, cancelled_reason, cancelled_at,
+            tail_start_offset, tail_end_offset, tail_truncated_before
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"
     )
     .bind(to_i64(binding.workflow_id.0, "workflow_id")?)
     .bind(to_i64(receipt.receipt_id.0, "receipt_id")?)
@@ -3859,6 +3889,9 @@ async fn insert_terminal_receipt_projection_tx(
     .bind(forgotten_reason)
     .bind(cancelled_reason)
     .bind(cancelled_at.map(|ts| i64::try_from(ts.0)).transpose().map_err(|e| DbError::Serialization(e.to_string()))?)
+    .bind(tail_start_offset.map(i64::try_from).transpose().map_err(|e| DbError::Serialization(e.to_string()))?)
+    .bind(tail_end_offset.map(i64::try_from).transpose().map_err(|e| DbError::Serialization(e.to_string()))?)
+    .bind(tail_truncated_before.map(i64::from))
     .execute(&mut *tx.tx)
     .await?;
     for (ordinal, line) in tail.into_iter().enumerate() {
@@ -4151,7 +4184,7 @@ async fn fetch_pending_delivery_exact_tx(
                 p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                p.cancelled_at, b.work_scope_id, b.tmux_completion_policy
+                p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4192,7 +4225,7 @@ async fn fetch_pending_deliveries_for_conversation_tx(
                 p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                p.cancelled_at, b.work_scope_id, b.tmux_completion_policy
+                p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4236,7 +4269,7 @@ async fn fetch_materialized_pending_batches_for_conversation_tx(
                 p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
-                p.cancelled_reason, p.cancelled_at, b.work_scope_id, b.tmux_completion_policy,
+                p.cancelled_reason, p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy,
                 l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
                 l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
@@ -4299,7 +4332,7 @@ async fn fetch_materialized_pending_deliveries_tx(
                 p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
-                p.cancelled_reason, p.cancelled_at, b.work_scope_id, b.tmux_completion_policy,
+                p.cancelled_reason, p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy,
                 l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
                 l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
@@ -4575,6 +4608,18 @@ fn evidence_from_projection_row(
                 .map(|v| i32::try_from(v).map_err(|e| DbError::Serialization(e.to_string())))
                 .transpose()?,
             kill_signal_sent: row.get("kill_signal_sent"),
+            final_tail_start_offset: to_u64(
+                row.get::<Option<i64>, _>("tail_start_offset").unwrap_or(0),
+                "tail_start_offset",
+            )?,
+            final_tail_end_offset: to_u64(
+                row.get::<Option<i64>, _>("tail_end_offset").unwrap_or(0),
+                "tail_end_offset",
+            )?,
+            final_tail_truncated_before: row
+                .get::<Option<i64>, _>("tail_truncated_before")
+                .unwrap_or(0)
+                != 0,
             final_tail: tail,
         }),
         WakeResourceIdentity::TmuxWindow(identity) => {
@@ -4923,6 +4968,9 @@ mod tests {
             duration_ms: Some(12),
             signal_number: None,
             kill_signal_sent: None,
+            final_tail_start_offset: 0,
+            final_tail_end_offset: 2,
+            final_tail_truncated_before: false,
             final_tail: vec!["done".into(), "ok".into()],
         })
     }
@@ -4966,6 +5014,7 @@ mod tests {
                 .unwrap(),
             WakeRegistrationOutcome::Registered { .. }
         ));
+        repo.activate_for_test(workflow_id).await.unwrap();
         repo.claim_observation_if_eligible(
             workflow_id,
             ProcessIncarnation(1),
@@ -6008,6 +6057,9 @@ mod tests {
                     duration_ms: Some(1),
                     signal_number: None,
                     kill_signal_sent: None,
+                    final_tail_start_offset: 0,
+                    final_tail_end_offset: 0,
+                    final_tail_truncated_before: false,
                     final_tail: vec![],
                 }),
             )
@@ -6082,6 +6134,9 @@ mod tests {
                     duration_ms: Some(12),
                     signal_number: None,
                     kill_signal_sent: None,
+                    final_tail_start_offset: 0,
+                    final_tail_end_offset: 2,
+                    final_tail_truncated_before: false,
                     final_tail: vec!["done".into(), "ok".into()],
                 }),
             )
@@ -7782,6 +7837,12 @@ mod tests {
             .unwrap(),
         );
 
+        repo.activate_for_test(active_a).await.unwrap();
+        repo.activate_for_test(active_b).await.unwrap();
+        repo.activate_for_test(pending).await.unwrap();
+        repo.activate_for_test(expired).await.unwrap();
+        repo.activate_for_test(leased).await.unwrap();
+
         let active = repo.list_active_unresolved(2).await.unwrap();
         assert_eq!(
             active.iter().map(|row| row.workflow_id).collect::<Vec<_>>(),
@@ -7904,6 +7965,7 @@ mod tests {
         ));
 
         let pending_delivery = create_pending_terminal_delivery(&repo, pending).await;
+        repo.activate_for_test(unresolved).await.unwrap();
         let link = materialized_outcome_link(
             materialize_pending(
                 &repo,
@@ -8017,6 +8079,9 @@ mod tests {
                 duration_ms: Some(1),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 0,
+                final_tail_truncated_before: false,
                 final_tail: vec![],
             });
             assert!(matches!(
@@ -8540,6 +8605,9 @@ mod tests {
                     duration_ms: Some(1),
                     signal_number: None,
                     kill_signal_sent: None,
+                    final_tail_start_offset: 0,
+                    final_tail_end_offset: 0,
+                    final_tail_truncated_before: false,
                     final_tail: vec![],
                 }),
             )

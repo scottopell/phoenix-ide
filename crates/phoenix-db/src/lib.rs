@@ -6042,6 +6042,46 @@ impl Database {
             insert_message_tx(&mut tx, msg).await?;
         }
 
+        for msg in tool_results {
+            let MessageContent::Tool(tool) = &msg.content else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&tool.content) else {
+                continue;
+            };
+            if receipt.get("status").and_then(serde_json::Value::as_str) != Some("registered") {
+                continue;
+            }
+            let Some((workflow_id, contract_id)) = receipt
+                .get("workflow_id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|id| i64::try_from(id).ok())
+                .zip(
+                    receipt
+                        .get("contract_id")
+                        .and_then(serde_json::Value::as_str),
+                )
+            else {
+                continue;
+            };
+            sqlx::query(
+                "UPDATE wake_bindings
+                 SET activated_at = ?1
+                 WHERE workflow_id = ?2
+                   AND conversation_id = ?3
+                   AND registering_tool_use_id = ?4
+                   AND contract_id = ?5
+                   AND activated_at IS NULL",
+            )
+            .bind(Utc::now().timestamp())
+            .bind(workflow_id)
+            .bind(conversation_id)
+            .bind(&tool.tool_use_id)
+            .bind(contract_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
         // `updated_at` so list-ordering stays current.
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
@@ -15610,6 +15650,7 @@ mod tests {
             )
             .await
             .unwrap();
+        wake_repo.activate_for_test(workflow_id).await.unwrap();
         let started = wake_repo
             .claim_observation_if_eligible(
                 workflow_id,
@@ -15650,6 +15691,9 @@ mod tests {
                         duration_ms: Some(12),
                         signal_number: None,
                         kill_signal_sent: None,
+                        final_tail_start_offset: 0,
+                        final_tail_end_offset: 1,
+                        final_tail_truncated_before: false,
                         final_tail: vec!["done".into()],
                     },
                 ),
@@ -16022,6 +16066,87 @@ mod tests {
         assert!(
             ids.contains(&"tool-b-result"),
             "second tool result must be durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_tool_round_activates_registered_wake_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-wake", "wake", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let repo = crate::workflow::wake::WakeRepository::new(db.pool.clone());
+        let workflow_id = phoenix_workflow::WorkflowId(44);
+        let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
+            contract_id: "contract-44".into(),
+            conversation_id: "conv-wake".into(),
+            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                stable_key: "conv-wake".into(),
+            },
+            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
+                phoenix_workflow::wake_profile::BashResourceIdentity {
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                        kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                        stable_key: "conv-wake".into(),
+                    },
+                    handle_id: "b-44".into(),
+                },
+            ),
+            registering_tool_use_id: "tool-wake".into(),
+            registered_at: phoenix_workflow::Timestamp(10),
+            expires_at: phoenix_workflow::Timestamp(100),
+        };
+        repo.register_allocated(
+            workflow_id,
+            &intent,
+            "fp-44",
+            phoenix_workflow::Timestamp(10),
+        )
+        .await
+        .unwrap();
+        assert!(repo
+            .list_observation_candidates(phoenix_workflow::Timestamp(20), None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let assistant = Message {
+            message_id: "asst-wake".into(),
+            conversation_id: "conv-wake".into(),
+            sequence_id: 1,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let receipt = Message {
+            message_id: "receipt-wake".into(),
+            conversation_id: "conv-wake".into(),
+            sequence_id: 2,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool(
+                "tool-wake",
+                r#"{"status":"registered","workflow_id":44,"contract_id":"contract-44"}"#,
+                false,
+            ),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        db.persist_tool_round("conv-wake", &assistant, &[receipt])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.list_observation_candidates(phoenix_workflow::Timestamp(20), None, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.workflow_id)
+                .collect::<Vec<_>>(),
+            vec![workflow_id]
         );
     }
 

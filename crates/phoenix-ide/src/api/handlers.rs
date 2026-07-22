@@ -14436,6 +14436,9 @@ mod wake_handler_tests {
                 duration_ms: Some(1),
                 signal_number: None,
                 kill_signal_sent: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 1,
+                final_tail_truncated_before: false,
                 final_tail: vec!["done".into()],
             },
         );
