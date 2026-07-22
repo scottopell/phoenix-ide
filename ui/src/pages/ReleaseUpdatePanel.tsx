@@ -86,7 +86,8 @@ export function ReleaseUpdatePanel({
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [transactionError, setTransactionError] = useState<string | null>(null);
   const [approvalError, setApprovalError] = useState<string | null>(null);
-  const [handoffPending, setHandoffPending] = useState(false);
+  const [handoffTransactionId, setHandoffTransactionId] = useState<string | null>(null);
+  const [reconciliationTransactionId, setReconciliationTransactionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -96,7 +97,6 @@ export function ReleaseUpdatePanel({
   const mounted = useRef(false);
   const snapshotRef = useRef<ReleaseUpdateSnapshot | null>(null);
   const confirmedIdentityRef = useRef<string | null>(null);
-  const committedRefreshRef = useRef<string | null>(null);
   snapshotRef.current = snapshot;
   confirmedIdentityRef.current = confirmedIdentity;
 
@@ -120,19 +120,16 @@ export function ReleaseUpdatePanel({
         : 'Durable transaction status temporarily disappeared');
       return { ...next, transaction: current.transaction };
     }
-    if (next.transaction.kind !== 'unreadable') {
-      setTransactionError(null);
-      if (next.transaction.kind === 'present') setHandoffPending(false);
-    }
+    if (next.transaction.kind !== 'unreadable') setTransactionError(null);
     return next;
   }, []);
 
-  const load = useCallback(async (refresh = false) => {
-    if (loadInFlight.current) return;
+  const load = useCallback(async (refresh = false): Promise<boolean> => {
+    if (loadInFlight.current) return false;
     loadInFlight.current = true;
     try {
       const next = await api.releaseUpdateSnapshot(refresh);
-      if (!mounted.current) return;
+      if (!mounted.current) return false;
       if (next.preview.kind === 'available') {
         const nextIdentity = `${next.preview.tag}:${next.preview.commit}:${next.preview.asset_sha256}`;
         if (confirmedIdentityRef.current !== null && confirmedIdentityRef.current !== nextIdentity) {
@@ -152,8 +149,10 @@ export function ReleaseUpdatePanel({
         ));
       }
       onDeploymentChange?.(next);
+      return true;
     } catch (cause) {
       if (mounted.current) markDiscoveryStale(cause instanceof Error ? cause.message : String(cause));
+      return false;
     } finally {
       if (mounted.current) setLoading(false);
       loadInFlight.current = false;
@@ -168,7 +167,9 @@ export function ReleaseUpdatePanel({
 
   const active = snapshot?.transaction.kind === 'present'
     && !TERMINAL_STATES.has(snapshot.transaction.state);
-  const shouldPollTransaction = snapshot?.transaction.kind === 'none'
+  const shouldPollTransaction = handoffTransactionId !== null
+    || reconciliationTransactionId !== null
+    || snapshot?.transaction.kind === 'none'
     || snapshot?.transaction.kind === 'unreadable'
     || active;
 
@@ -184,13 +185,12 @@ export function ReleaseUpdatePanel({
           if (transaction.kind === 'present') {
             setSnapshot((value) => value ? { ...value, transaction } : value);
             setTransactionError(null);
-            setHandoffPending(false);
-            if (
-              transaction.state === 'committed'
-              && committedRefreshRef.current !== transaction.transaction_id
-            ) {
-              committedRefreshRef.current = transaction.transaction_id;
-              await load();
+            if (transaction.transaction_id === handoffTransactionId) {
+              setHandoffTransactionId(null);
+            }
+            if (transaction.state === 'committed') {
+              setReconciliationTransactionId(transaction.transaction_id);
+              if (await load()) setReconciliationTransactionId(null);
             }
           } else if (current?.transaction.kind === 'present') {
             setTransactionError(transaction.kind === 'unreadable'
@@ -213,7 +213,7 @@ export function ReleaseUpdatePanel({
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [load, shouldPollTransaction]);
+  }, [handoffTransactionId, load, shouldPollTransaction]);
 
   const approve = useCallback(async () => {
     if (!snapshot || snapshot.preview.kind !== 'available' || discoveryError !== null) return;
@@ -226,13 +226,15 @@ export function ReleaseUpdatePanel({
     }
     setApproving(true);
     setApprovalError(null);
+    let approvedTransactionId: string;
     try {
-      await api.approveReleaseUpdate(
+      const approval = await api.approveReleaseUpdate(
         snapshot.preview.tag,
         snapshot.preview.commit,
         snapshot.preview.asset_name,
         snapshot.preview.asset_sha256,
       );
+      approvedTransactionId = approval.transaction_id;
     } catch (cause) {
       if (mounted.current) {
         setApprovalError(cause instanceof Error ? cause.message : String(cause));
@@ -242,11 +244,12 @@ export function ReleaseUpdatePanel({
     }
     if (mounted.current) {
       setConfirming(false);
-      setHandoffPending(true);
+      setHandoffTransactionId(approvedTransactionId);
       setApproving(false);
     }
   }, [confirmedIdentity, discoveryError, snapshot]);
 
+  const handoffPending = handoffTransactionId !== null;
   const approvalStatusSafe = !handoffPending && transactionError === null && (snapshot?.transaction.kind === 'none'
     || (snapshot?.transaction.kind === 'present'
       && TERMINAL_STATES.has(snapshot.transaction.state)
@@ -254,7 +257,8 @@ export function ReleaseUpdatePanel({
   const availablePreview = snapshot?.preview.kind === 'available' ? snapshot.preview : null;
   const committedReleaseIsPreview = snapshot?.transaction.kind === 'present'
     && snapshot.transaction.state === 'committed'
-    && availablePreview?.tag === snapshot.transaction.release_tag;
+    && availablePreview?.tag === snapshot.transaction.release_tag
+    && availablePreview.commit === snapshot.transaction.source_commit;
   const discoveryFreshness = discoveryError && snapshot?.preview.kind === 'available'
     ? 'stale'
     : loading

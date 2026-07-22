@@ -197,6 +197,34 @@ describe('ReleaseUpdatePanel', () => {
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/release-updates')).toHaveLength(1);
   });
 
+  it('polls for the approved transaction when the previous transaction is terminal', async () => {
+    const previous = {
+      kind: 'present' as const, transaction_id: 'tx-previous', state: 'activation_failed_rolled_back',
+      source_commit: snapshot.preview.commit, release_tag: 'v1.0.0', expected_version: '1.0.0',
+      expected_git_sha: snapshot.current_git_sha, created_at: null, updated_at: null,
+      failure: 'verification failed', rollback_failure: null, stale: false,
+    };
+    const initial = { ...snapshot, transaction: previous };
+    const fetchMock = vi.mocked(fetch)
+      .mockImplementationOnce(() => json(initial))
+      .mockImplementationOnce(() => json({ transaction_id: 'tx-handoff' }, 202))
+      .mockImplementationOnce(() => json(previous))
+      .mockImplementationOnce(() => json({ ...previous, transaction_id: 'tx-handoff', state: 'activating' }));
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText(/previous release restored and verified/i);
+    fireEvent.click(screen.getByRole('button', { name: 'Review and install v1.1.0' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Approve and install' }));
+    expect(await screen.findByText(/approval handed off/i)).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(screen.getByText(/approval handed off/i)).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(await screen.findByText(/activating and verifying/i)).toBeInTheDocument();
+    expect(screen.queryByText(/approval handed off/i)).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/transaction'))).toHaveLength(2);
+  });
+
   it('preserves active status when unavailable discovery also has unreadable status', async () => {
     const active = {
       ...snapshot,
@@ -401,6 +429,50 @@ describe('ReleaseUpdatePanel', () => {
     expect(await screen.findByText(/update committed/i)).toBeInTheDocument();
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/release-updates')).toHaveLength(2);
     expect(screen.queryByRole('button', { name: /install v1.1.0/i })).not.toBeInTheDocument();
+  });
+
+  it('retries post-commit reconciliation until a full snapshot succeeds', async () => {
+    const committed = {
+      kind: 'present' as const,
+      transaction_id: 'tx-committed', state: 'committed', source_commit: snapshot.preview.commit,
+      release_tag: 'v1.1.0', expected_version: '1.1.0', expected_git_sha: snapshot.preview.commit,
+      created_at: null, updated_at: null, failure: null, rollback_failure: null, stale: false,
+    };
+    const reconciled = {
+      ...snapshot,
+      current_version: '1.1.0',
+      preview: { ...snapshot.preview, newer_than_current: false },
+      transaction: committed,
+    };
+    const fetchMock = vi.mocked(fetch)
+      .mockImplementationOnce(() => json(snapshot))
+      .mockImplementationOnce(() => json(committed))
+      .mockRejectedValueOnce(new Error('GitHub unavailable'))
+      .mockImplementationOnce(() => json(committed))
+      .mockImplementationOnce(() => json(reconciled));
+    render(<ReleaseUpdatePanel />);
+    await screen.findByText('v1.1.0');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(await screen.findByText(/release information is stale — GitHub unavailable/i)).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    await waitFor(() => expect(screen.queryByText(/release information is stale/i)).not.toBeInTheDocument());
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/release-updates')).toHaveLength(3);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/transaction'))).toHaveLength(2);
+  });
+
+  it('does not suppress a re-cut preview that differs from the committed source identity', async () => {
+    const committed = {
+      kind: 'present' as const,
+      transaction_id: 'tx-committed', state: 'committed', source_commit: '4'.repeat(40),
+      release_tag: snapshot.preview.tag, expected_version: '1.1.0', expected_git_sha: '4'.repeat(40),
+      created_at: null, updated_at: null, failure: null, rollback_failure: null, stale: false,
+    };
+    vi.mocked(fetch).mockImplementation(() => json({ ...snapshot, transaction: committed }));
+    render(<ReleaseUpdatePanel />);
+
+    expect(await screen.findByRole('button', { name: /install v1.1.0/i })).toBeInTheDocument();
   });
 
   it('distinguishes verified rollback from rollback failure', async () => {
