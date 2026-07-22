@@ -349,12 +349,14 @@ conflict decision for that accepted turn.
 EVERY durable direct-chat acceptance lookup, replay, reconciliation, or conflict
 resolution SHALL produce one typed disposition.
 
-The disposition family SHALL distinguish at least RetryableUnaccepted,
-QueuedSteering, RuntimeAccepted, ReplayQueuedSteering,
-ReplayRuntimeAccepted, ConflictingKeyReuse, and TerminalRejected. The profile
-SHALL NOT encode these cases as ambiguous booleans or by omitting fields whose
-absence could mean either replay, steering, conflict, runtime acceptance,
-conflict, or rejection.
+The accepted-turn disposition family SHALL distinguish PendingRuntime,
+QueuedSteering, and RuntimeAccepted. A successful submission response SHALL
+separately identify whether that request created the acceptance or replayed an
+existing matching acceptance. Conflicting key reuse and terminal rejection SHALL
+remain typed unaccepted request outcomes rather than accepted-turn lifecycle
+states. The profile SHALL NOT encode these cases as ambiguous booleans or by
+omitting fields whose absence could mean replay, steering, conflict, runtime
+acceptance, or rejection.
 
 ### REQ-DWF-CHAT-004: Same-Key Convergence and Conflict
 
@@ -400,6 +402,11 @@ Secondary effects MAY add typed owed work, typed failure, or typed suppression,
 but they SHALL NOT retroactively revoke, remap, or replace the already accepted
 turn identity or transform accepted into never-accepted.
 
+A successful submission SHALL return after durable acceptance without waiting
+for runtime delivery or recipient LLM completion. Runtime delivery SHALL remain
+recoverable owed work, and failure of an immediate delivery notification SHALL
+NOT reverse or delay the accepted response.
+
 ### REQ-DWF-CHAT-008: Exact-ID Reconciliation Independent of Transcript Window
 
 WHEN Phoenix reconciles a durable direct-chat turn with runtime or transcript
@@ -410,6 +417,10 @@ message still appearing inside an arbitrary transcript window.
 A missing message in the currently loaded transcript slice SHALL trigger lookup,
 replay, steering, or typed reconciliation by exact identifier rather than a new
 acceptance or a window-relative guess.
+
+Exact-ID reconciliation SHALL report durable acceptance independently from
+transcript materialization. A durably accepted turn that is not yet visible in
+the transcript SHALL NOT be reported as unaccepted or absent.
 
 ### REQ-DWF-CHAT-009: Independent Non-Atomic Fan-Out
 

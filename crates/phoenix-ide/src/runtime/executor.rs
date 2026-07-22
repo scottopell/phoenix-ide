@@ -2705,9 +2705,22 @@ where
                 user_agent,
                 skill_invocation,
             };
+            if let Some(queue_position) = self
+                .steering_queue
+                .iter()
+                .position(|queued| queued.message_id == message_id)
+            {
+                let _ = self
+                    .broadcast_tx
+                    .send_seq(|seq| SseEvent::SteerMessageQueued {
+                        sequence_id: seq,
+                        message_id,
+                        queue_position,
+                    });
+                return Ok(());
+            }
             self.steering_queue.push(entry);
             let queue_position = self.steering_queue.len() - 1;
-            // Persist updated queue
             if let Err(e) = self
                 .storage
                 .update_steering_queue(&self.context.conversation_id, &self.steering_queue)

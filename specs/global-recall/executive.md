@@ -4,7 +4,7 @@
 
 Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. Phoenix supplies a transparent bounded relational snapshot on every Coordinator turn; the Coordinator retains bounded natural-language history search, conversation reading, read-only operational SQLite, and stable reference resolution.
 
-The Coordinator has one mutation capability: a singular text-message action targeting an existing non-Coordinator conversation. That action reuses the normal chat acceptance authority, so each target independently reports delivered, queued as steering, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, or completed the instruction.
+The Coordinator has one mutation capability: a singular text-message action targeting an existing non-Coordinator conversation. That action reuses the normal chat acceptance authority, so each target independently reports accepted with a pending-runtime, runtime-accepted, or queued-steering disposition, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, or completed the instruction.
 
 The `/global` surface is the standard transcript and composer without a separate work view. A compact composer action requests a read-only current-activity briefing through the normal message path while preserving the user's draft.
 
@@ -32,7 +32,7 @@ Natural-language message search, bounded transcript reads, durable reference res
 | **REQ-GR-010:** Keep the Coordinator Surface Chat-Only | ✅ Complete | `/global` mounts only the shared conversation runtime and inline briefing action |
 | **REQ-GR-011:** Inject a Bounded Relational Snapshot | ✅ Complete | Requests append transparent turn-current facts after the cached stable prompt |
 | **REQ-GR-011A:** Bound Database Integrity and Resource Use | ✅ Complete | Application data is readable; SQLite authority and resource budgets protect integrity and stability |
-| **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and Coordinator action share typed delivery, steering, and rejection outcomes |
+| **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and Coordinator action share typed created/replayed acceptance with pending-runtime/runtime-accepted/queued-steering dispositions, return before recipient execution, or report stable rejection |
 
 ## Verification Summary
 

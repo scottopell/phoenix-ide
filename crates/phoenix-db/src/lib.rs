@@ -9102,7 +9102,7 @@ mod tests {
     async fn accepted_pending_direct_turn(db: &Database) {
         WorkflowRepository::new(db.pool().clone())
             .accept_direct_turn(&DirectTurnAcceptanceInput {
-                initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+                initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
                 conversation_id: "conv-direct".to_string(),
                 client_message_id: "msg-direct".to_string(),
                 prepared_fingerprint: "fingerprint".to_string(),

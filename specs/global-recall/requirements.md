@@ -23,7 +23,7 @@ The user must be able to answer:
 3. Why does the item's current state need attention or qualify as open work?
 4. Which source conversations or messages support a Coordinator claim about history?
 5. Which durable conversation received each attempted message?
-6. Was each attempted message delivered, queued as steering, or rejected, and why?
+6. Was each attempted message durably accepted or rejected, and what is its acceptance disposition or rejection reason?
 7. Which current relational facts and timestamps support each status interpretation, and was the raw result truncated?
 
 ## Requirements

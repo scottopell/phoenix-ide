@@ -273,7 +273,7 @@ afterEach(() => {
 
 describe('ConversationPage message delivery reconciliation', () => {
   it('does not overwrite authoritative idle when SSE completes before the chat POST response', async () => {
-    const response = deferred<{ queued: boolean; steering: boolean }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
     const sendMessage = vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const { store } = renderPage(makeConversation());
 
@@ -299,7 +299,7 @@ describe('ConversationPage message delivery reconciliation', () => {
     expect(store.getSnapshot(slug).phase.type).toBe('idle');
 
     await act(async () => {
-      response.resolve({ queued: true, steering: false });
+      response.resolve({ message_id: 'resolved-direct', request_result: 'created', disposition: 'pending_runtime' });
       await response.promise;
     });
 
@@ -322,7 +322,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('optimistically leaves a resumable error while an accepted retry awaits SSE', async () => {
-    const response = deferred<{ queued: boolean; steering: boolean }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const errorState = {
       type: 'error' as const,
@@ -339,13 +339,13 @@ describe('ConversationPage message delivery reconciliation', () => {
     fireEvent.click(sendButton!);
 
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm'));
-    response.resolve({ queued: true, steering: false });
+    response.resolve({ message_id: 'resolved-direct', request_result: 'created', disposition: 'pending_runtime' });
     await response.promise;
     expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm');
   });
 
   it('rolls back an optimistic phase after a steering response despite non-phase SSE traffic', async () => {
-    const response = deferred<{ queued: boolean; steering: boolean }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const { store } = renderPage(makeConversation());
 
@@ -358,7 +358,7 @@ describe('ConversationPage message delivery reconciliation', () => {
       store.dispatch(slug, { type: 'sse_sequence_consumed', sequenceId: 1 });
     });
     await act(async () => {
-      response.resolve({ queued: true, steering: true });
+      response.resolve({ message_id: 'resolved-steering', request_result: 'created', disposition: 'queued_steering' });
       await response.promise;
     });
 
@@ -366,7 +366,7 @@ describe('ConversationPage message delivery reconciliation', () => {
   });
 
   it('rolls back an optimistic phase after a failed POST despite non-phase SSE traffic', async () => {
-    const response = deferred<{ queued: boolean; steering: boolean }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const { store } = renderPage(makeConversation());
 
@@ -386,19 +386,153 @@ describe('ConversationPage message delivery reconciliation', () => {
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
   });
 
-  it('rolls back and reconciles an idempotent direct replay without waiting for SSE', async () => {
-    const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
-      queued: true,
-      steering: false,
-      already_persisted: true,
-    });
-    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
-      conversation_idle: true,
+  it('keeps a transport-failed POST accepted when exact-ID reconcile reports runtime acceptance', async () => {
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
+      conversation_idle: false,
       entries: [{
-        message_id: 'idempotent-replay',
-        status: 'persisted',
-        message: { ...historyMessage, message_id: 'idempotent-replay', sequence_id: 20 },
+        message_id: messageId!,
+        acceptance: 'runtime_accepted',
+        materialization: { status: 'not_persisted' },
       }],
+    }));
+    renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'failed request' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await act(async () => {
+      response.reject(new Error('network failed'));
+      await response.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalledWith(conversationId, [expect.any(String)]));
+    await waitFor(() => {
+      const queue = JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]') as Array<{ status: string }>;
+      expect(queue[0]?.status).toBe('accepted');
+    });
+  });
+
+  it('keeps a transport-failed POST queued when exact-ID reconcile reports queued steering', async () => {
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
+      conversation_idle: false,
+      entries: [{
+        message_id: messageId!,
+        acceptance: 'queued_steering',
+        materialization: { status: 'not_persisted' },
+      }],
+    }));
+    renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'failed queued steering' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await act(async () => {
+      response.reject(new Error('network failed'));
+      await response.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => {
+      const queue = JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]') as Array<{ status: string }>;
+      expect(queue[0]?.status).toBe('steering_queued');
+    });
+  });
+
+  it('merges persisted materialization after transport failure instead of marking failed', async () => {
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
+      conversation_idle: false,
+      entries: [{
+        message_id: messageId!,
+        materialization: {
+          status: 'persisted',
+          message: { ...historyMessage, message_id: 'persisted-after-failure', sequence_id: 21 },
+        },
+      }],
+    }));
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'failed but persisted' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await act(async () => {
+      response.reject(new Error('network failed'));
+      await response.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => {
+      expect(store.getSnapshot(slug).messages.map((message) => message.message_id)).toContain('persisted-after-failure');
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+  });
+
+  it('marks failed only when exact-ID reconcile reports no acceptance and no persisted materialization', async () => {
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
+      conversation_idle: false,
+      entries: [{
+        message_id: messageId!,
+        materialization: { status: 'not_persisted' },
+      }],
+    }));
+    renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'really failed request' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await act(async () => {
+      response.reject(new Error('network failed'));
+      await response.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => {
+      const queue = JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]') as Array<{ status: string }>;
+      expect(queue[0]?.status).toBe('failed');
+    });
+  });
+
+  it('rolls back an optimistic phase after a failed POST despite non-phase SSE traffic', async () => {
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
+    vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
+    vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, [messageId]) => ({
+      conversation_idle: false,
+      entries: [{
+        message_id: messageId!,
+        materialization: { status: 'not_persisted' },
+      }],
+    }));
+    const { store } = renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    fireEvent.change(textbox, { target: { value: 'failed request' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm'));
+
+    act(() => {
+      store.dispatch(slug, { type: 'sse_sequence_consumed', sequenceId: 1 });
+    });
+    await act(async () => {
+      response.reject(new Error('network failed'));
+      await response.promise.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
+  });
+
+  it('keeps direct acceptance local until authoritative history echoes it', async () => {
+    const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
+      message_id: 'idempotent-replay',
+      request_result: 'created',
+      disposition: 'pending_runtime',
     });
     localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
       localId: 'idempotent-replay',
@@ -407,20 +541,21 @@ describe('ConversationPage message delivery reconciliation', () => {
       timestamp: 1,
       status: 'pending',
     }]));
-    const { store } = renderPage(makeConversation());
+    renderPage(makeConversation());
 
     await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
-    await waitFor(() => expect(api.reconcileAcceptedMessages).toHaveBeenCalled());
     await waitFor(() => {
-      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+      const queue = JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]') as Array<{ status: string }>;
+      expect(queue[0]?.status).toBe('accepted');
     });
+    expect(api.reconcileAcceptedMessages).not.toHaveBeenCalled();
   });
 
   it('keeps a fresh direct message retryable while its SSE echo is missing', async () => {
     const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
-      queued: true,
-      steering: false,
+      message_id: 'accepted-without-echo',
+      request_result: 'created',
+      disposition: 'pending_runtime',
     });
     renderPage(makeConversation());
 
@@ -433,13 +568,13 @@ describe('ConversationPage message delivery reconciliation', () => {
       const queue = JSON.parse(
         localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]',
       ) as Array<{ status: string }>;
-      expect(queue[0]?.status).toBe('pending');
+      expect(queue[0]?.status).toBe('accepted');
     });
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('prevents overlapping composer submissions while the first POST is unresolved', async () => {
-    const response = deferred<{ queued: boolean; steering: boolean }>();
+    const response = deferred<{ message_id: string; request_result: 'created' | 'replayed'; disposition: 'pending_runtime' | 'runtime_accepted' | 'queued_steering' }>();
     const sendMessage = vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     renderPage(makeConversation());
 
@@ -454,7 +589,7 @@ describe('ConversationPage message delivery reconciliation', () => {
     expect(
       JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]'),
     ).toHaveLength(1);
-    response.resolve({ queued: true, steering: false });
+    response.resolve({ message_id: 'resolved-direct', request_result: 'created', disposition: 'pending_runtime' });
     await response.promise;
   });
 
@@ -472,8 +607,11 @@ describe('ConversationPage message delivery reconciliation', () => {
       conversation_idle: true,
       entries: [{
         message_id: acceptedId,
-        status: 'persisted',
-        message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+        acceptance: 'runtime_accepted',
+        materialization: {
+          status: 'persisted',
+          message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+        },
       }],
     });
     const { store } = renderPage(makeConversation({
@@ -501,8 +639,11 @@ describe('ConversationPage message delivery reconciliation', () => {
       conversation_idle: true,
       entries: [{
         message_id: acceptedId,
-        status: 'persisted',
-        message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+        acceptance: 'runtime_accepted',
+        materialization: {
+          status: 'persisted',
+          message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+        },
       }],
     });
     const { store } = renderPage(makeConversation({
@@ -538,9 +679,12 @@ describe('ConversationPage message delivery reconciliation', () => {
     vi.mocked(api.reconcileAcceptedMessages).mockImplementation(async (_conversationId, ids) => ({
       conversation_idle: true,
       entries: ids.map((messageId, index) => ({
-        message_id: messageId,
-        status: 'persisted' as const,
-        message: { ...historyMessage, message_id: messageId, sequence_id: index + 20 },
+        message_id: messageId!,
+        acceptance: 'queued_steering' as const,
+        materialization: {
+          status: 'persisted' as const,
+          message: { ...historyMessage, message_id: messageId!, sequence_id: index + 20 },
+        },
       })),
     }));
     const { store } = renderPage(makeConversation({
@@ -580,8 +724,11 @@ describe('ConversationPage message delivery reconciliation', () => {
         conversation_idle: true,
         entries: [{
           message_id: acceptedId,
-          status: 'persisted',
-          message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+          acceptance: 'queued_steering',
+          materialization: {
+            status: 'persisted',
+            message: { ...historyMessage, message_id: acceptedId, sequence_id: 20 },
+          },
         }],
       });
     hooksMockState.useConnection.mockReturnValue({
@@ -634,12 +781,15 @@ describe('ConversationPage message delivery reconciliation', () => {
     vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
       conversation_idle: true,
       entries: acceptedIds.map((messageId, index) => ({
-        message_id: messageId,
-        status: 'persisted',
-        message: {
-          ...historyMessage,
-          message_id: messageId,
-          sequence_id: index + 20,
+        message_id: messageId!,
+        acceptance: 'queued_steering',
+        materialization: {
+          status: 'persisted',
+          message: {
+            ...historyMessage,
+            message_id: messageId!,
+            sequence_id: index + 20,
+          },
         },
       })),
     });

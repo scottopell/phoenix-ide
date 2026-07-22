@@ -1600,7 +1600,7 @@ mod tests {
         let prepared_payload = serde_json::to_string(&prepared).unwrap();
         phoenix_db::WorkflowRepository::new(db.pool().clone())
             .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
-                initial_outcome: phoenix_db::DirectTurnCommittedOutcome::PendingRuntime,
+                initial_outcome: phoenix_db::DirectTurnInitialOutcome::PendingRuntime,
                 conversation_id: "conv".to_string(),
                 client_message_id: "message-recovered".to_string(),
                 prepared_fingerprint: "fingerprint".to_string(),
@@ -1641,11 +1641,11 @@ mod tests {
             .load_pending_direct_turns()
             .await
             .unwrap();
-        assert_eq!(pending_dispatch.len(), 1);
-        assert_eq!(
-            pending_dispatch[0].committed_outcome,
-            phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted
-        );
+        assert!(pending_dispatch.is_empty());
+        assert!(matches!(
+            db.get_conversation("conv").await.unwrap().state,
+            phoenix_core::domain::sm_state::ConvState::LlmRequesting { .. }
+        ));
     }
 
     #[tokio::test]

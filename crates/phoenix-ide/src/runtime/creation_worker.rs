@@ -800,7 +800,7 @@ async fn provision_conversation(
         });
     match phoenix_db::WorkflowRepository::new(manager.db().pool().clone())
         .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
-            initial_outcome: phoenix_db::DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: phoenix_db::DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: job.conversation_id.clone(),
             client_message_id: message_id.clone(),
             prepared_fingerprint,

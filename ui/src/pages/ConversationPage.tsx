@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type AcceptedMessageReconciliation, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -266,6 +266,13 @@ function mergeConversationMessages<T extends { message_id: string; sequence_id: 
   incoming.forEach(upsert);
 
   return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
+}
+
+function categorizeReconciledMessage(entry: AcceptedMessageReconciliation): 'accepted' | 'steering_queued' | 'recoverable_inconsistency' | 'failed' | 'persisted_only' {
+  if (entry.acceptance === 'queued_steering') return 'steering_queued';
+  if (entry.acceptance === 'pending_runtime' || entry.acceptance === 'runtime_accepted') return 'accepted';
+  if (entry.materialization.status === 'persisted') return 'persisted_only';
+  return 'failed';
 }
 
 function ConversationPageContent({
@@ -613,6 +620,52 @@ function ConversationPageContent({
 
   const atomRef = useRef(atom);
   atomRef.current = atom;
+
+  const mergePersistedReconciliations = useCallback((persistedEntries: AcceptedMessageReconciliation[], snapshotStartedAtEventSeq: number) => {
+    const persisted = persistedEntries.flatMap((entry) => (
+      entry.materialization.status === 'persisted'
+        ? [{ message_id: entry.message_id, message: entry.materialization.message }]
+        : []
+    ));
+    const current = atomRef.current;
+    if (
+      persisted.length > 0
+      && conversationId
+      && current.conversationId === conversationId
+      && current.conversation
+    ) {
+      dispatch({
+        type: 'merge_conversation_data',
+        conversationId,
+        conversation: current.conversation,
+        messages: persisted.map((entry) => entry.message),
+        phase: current.phase,
+        contextWindow: current.contextWindow,
+        ...(current.transcriptGeneration !== null && {
+          transcriptGeneration: current.transcriptGeneration,
+        }),
+        transcriptCoverage: current.transcriptCoverage,
+        snapshotStartedAtEventSeq,
+      });
+      reconcileAuthoritative(persisted.map((entry) => entry.message_id));
+    }
+  }, [conversationId, dispatch, reconcileAuthoritative]);
+
+  const reconcileExactAcceptedMessage = useCallback(async (localId: string, phaseEventSeqBeforePost: number) => {
+    if (!conversationId) return 'failed' as const;
+    const response = await api.reconcileAcceptedMessages(conversationId, [localId]);
+    const entry = response.entries.find((candidate) => candidate.message_id === localId);
+    if (!entry) return 'failed' as const;
+    mergePersistedReconciliations([entry], eventCursorRef.current);
+    const outcome = categorizeReconciledMessage(entry);
+    if (outcome === 'accepted') {
+      markAccepted(localId, phaseEventSeqBeforePost);
+    } else if (outcome === 'steering_queued') {
+      markSteeringQueued(localId, phaseEventSeqBeforePost);
+    }
+    return outcome;
+  }, [conversationId, eventCursorRef, markAccepted, markSteeringQueued, mergePersistedReconciliations]);
+
   const conversationRouteIdentity = `${slug ?? ''}\u0000${conversationId ?? ''}`;
   const conversationRouteOwnerRef = useRef({ identity: conversationRouteIdentity, generation: 1 });
   if (conversationRouteOwnerRef.current.identity !== conversationRouteIdentity) {
@@ -721,32 +774,11 @@ function ConversationPageContent({
           });
         }
         const entries = results.flatMap((result) => result.entries);
-        const persisted = entries.filter((entry) => entry.status === 'persisted');
-        const current = atomRef.current;
-        if (
-          persisted.length > 0
-          && current.conversationId === conversationId
-          && current.conversation
-        ) {
-          dispatch({
-            type: 'merge_conversation_data',
-            conversationId,
-            conversation: current.conversation,
-            messages: persisted.map((entry) => entry.message),
-            phase: current.phase,
-            contextWindow: current.contextWindow,
-            ...(current.transcriptGeneration !== null && {
-              transcriptGeneration: current.transcriptGeneration,
-            }),
-            transcriptCoverage: current.transcriptCoverage,
-            snapshotStartedAtEventSeq,
-          });
-          reconcileAuthoritative(persisted.map((entry) => entry.message_id));
-        }
+        mergePersistedReconciliations(entries, snapshotStartedAtEventSeq);
 
         if (results.every((result) => result.conversation_idle)) {
           for (const entry of entries) {
-            if (entry.status === 'absent') {
+            if (entry.acceptance === undefined && entry.materialization.status === 'not_persisted') {
               markRecoverableInconsistency(entry.message_id);
             }
           }
@@ -779,6 +811,7 @@ function ConversationPageContent({
     reconcileAuthoritative,
     dispatch,
     eventCursorRef,
+    mergePersistedReconciliations,
   ]);
 
 
@@ -1401,20 +1434,15 @@ function ConversationPageContent({
             });
           }
           const result = await api.sendMessage(conversationId, text, imgs, files, localId);
-          // Don't touch the queue here. The entry stays `pending` until
-          // `atom.messages` contains a row with `message_id == localId`
-          // (SSE echo), at which point `pendingMessages` filters it out
-          // via the derivation above.
-          //
-          if (result.steering) {
-            // Conversation was busy — message queued server-side for delivery
-            // when the conversation next reaches Idle. Show a "Queued" pill
-            // on the message bubble instead of the normal sending spinner.
+          // Don't touch the queue here for direct acceptance beyond recording
+          // accepted status. The entry stays visible until authoritative history
+          // contains `message_id == localId`, at which point `pendingMessages`
+          // filters it out via the derivation above.
+          if (result.disposition === 'queued_steering') {
             markSteeringQueued(localId, phaseEventSeqBeforePost);
             rollbackOptimisticPhase();
-          } else if (result.already_persisted) {
+          } else {
             markAccepted(localId, phaseEventSeqBeforePost);
-            rollbackOptimisticPhase();
           }
         } else {
           // Offline path: hand the send off to the offline operation queue
@@ -1444,8 +1472,23 @@ function ConversationPageContent({
           throw err;
         }
         console.error('Failed to send message:', err);
-        markFailedRef.current(localId);
-        rollbackOptimisticPhase();
+        try {
+          const reconciledOutcome = await reconcileExactAcceptedMessage(localId, phaseEventSeqBeforePost);
+          if (reconciledOutcome === 'failed') {
+            markFailedRef.current(localId);
+            rollbackOptimisticPhase();
+          } else if (reconciledOutcome === 'steering_queued') {
+            rollbackOptimisticPhase();
+          }
+        } catch (reconcileError) {
+          console.warn('[message-queue] exact-ID reconciliation after send failure failed', {
+            conversationId,
+            messageId: localId,
+            error: reconcileError,
+          });
+          markFailedRef.current(localId);
+          rollbackOptimisticPhase();
+        }
       } finally {
         if (
           optimisticPhaseOwner
@@ -1457,7 +1500,7 @@ function ConversationPageContent({
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued]
+    [conversationId, isArchived, isOnline, queueOperation, dispatch, markAccepted, markSteeringQueued, reconcileExactAcceptedMessage]
   );
 
   const sendMessageRef = useRef(sendMessage);

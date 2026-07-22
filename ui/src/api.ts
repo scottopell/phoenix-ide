@@ -605,10 +605,17 @@ export interface ConversationMessageSliceResponse {
   has_older_messages: boolean;
 }
 
-export type AcceptedMessageReconciliation =
-  | { message_id: string; status: 'persisted'; message: Message }
-  | { message_id: string; status: 'steering_queued' }
-  | { message_id: string; status: 'absent' };
+export type AcceptedMessageAcceptance = 'pending_runtime' | 'runtime_accepted' | 'queued_steering';
+
+export type AcceptedMessageMaterialization =
+  | { status: 'persisted'; message: Message }
+  | { status: 'not_persisted' };
+
+export interface AcceptedMessageReconciliation {
+  message_id: string;
+  acceptance?: AcceptedMessageAcceptance;
+  materialization: AcceptedMessageMaterialization;
+}
 
 export interface ReconcileAcceptedMessagesResponse {
   conversation_idle: boolean;
@@ -1756,7 +1763,11 @@ export const api = {
     images: ImageData[] = [],
     files: FileAttachment[] = [],
     localId: string,
-  ): Promise<{ queued: boolean; steering?: boolean; already_persisted?: boolean }> {
+  ): Promise<{
+    message_id: string;
+    request_result: 'created' | 'replayed';
+    disposition: AcceptedMessageAcceptance;
+  }> {
     const resp = await fetch(`/api/conversations/${convId}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

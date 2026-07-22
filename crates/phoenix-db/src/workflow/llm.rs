@@ -29,9 +29,29 @@ pub enum DirectTurnCommittedOutcome {
     QueuedSteering,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+pub enum DirectTurnInitialOutcome {
+    PendingRuntime,
+    RuntimeAccepted,
+    QueuedSteering {
+        entry: Box<phoenix_core::domain::sm_event::SteerEntry>,
+    },
+}
+
+impl DirectTurnInitialOutcome {
+    fn committed_outcome(&self) -> DirectTurnCommittedOutcome {
+        match self {
+            Self::PendingRuntime => DirectTurnCommittedOutcome::PendingRuntime,
+            Self::RuntimeAccepted => DirectTurnCommittedOutcome::RuntimeAccepted,
+            Self::QueuedSteering { .. } => DirectTurnCommittedOutcome::QueuedSteering,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct DirectTurnAcceptanceInput {
-    pub initial_outcome: DirectTurnCommittedOutcome,
+    pub initial_outcome: DirectTurnInitialOutcome,
+
     pub conversation_id: String,
     pub client_message_id: String,
     pub prepared_fingerprint: String,
@@ -362,12 +382,14 @@ impl WorkflowRepository {
             .bind(to_i64(workflow_id.0, "workflow_id")?)
             .bind(&input.prepared_fingerprint)
             .bind(&input.prepared_payload)
-            .bind(direct_turn_outcome_to_str(&input.initial_outcome))
+            .bind(direct_turn_outcome_to_str(
+                &input.initial_outcome.committed_outcome(),
+            ))
             .bind(to_i64(input.accepted_at.0, "accepted_at")?)
             .bind(if matches!(
                 input.initial_outcome,
-                DirectTurnCommittedOutcome::PendingRuntime
-                    | DirectTurnCommittedOutcome::RuntimeAccepted
+                DirectTurnInitialOutcome::PendingRuntime
+                    | DirectTurnInitialOutcome::RuntimeAccepted
             ) {
                 Some(1_i64)
             } else {
@@ -420,6 +442,22 @@ impl WorkflowRepository {
             .bind(input.snapshot.stopped_at.map(|v| i64::try_from(v).unwrap()))
             .execute(&mut *tx.tx)
             .await?;
+        if let DirectTurnInitialOutcome::QueuedSteering { entry } = &input.initial_outcome {
+            let next_ordinal = sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM steering_messages
+                 WHERE conversation_id = ?1",
+            )
+            .bind(&input.conversation_id)
+            .fetch_one(&mut *tx.tx)
+            .await?;
+            super::super::insert_steering_entry_tx(
+                &mut tx.tx,
+                &input.conversation_id,
+                next_ordinal,
+                entry,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(DirectTurnAcceptanceOutcome::Created(
             DirectTurnAcceptanceRecord {
@@ -428,7 +466,7 @@ impl WorkflowRepository {
                 client_message_id: input.client_message_id.clone(),
                 prepared_fingerprint: input.prepared_fingerprint.clone(),
                 prepared_payload: input.prepared_payload.clone(),
-                committed_outcome: input.initial_outcome.clone(),
+                committed_outcome: input.initial_outcome.committed_outcome(),
                 accepted_at: input.accepted_at,
             },
         ))
@@ -582,16 +620,7 @@ impl WorkflowRepository {
              FROM direct_turn_acceptances a
              JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
              WHERE a.conversation_id = ?1 AND a.client_message_id = ?2
-               AND (
-                   a.committed_outcome = 'PendingRuntime'
-                   OR (
-                       a.committed_outcome = 'RuntimeAccepted'
-                       AND NOT EXISTS (
-                           SELECT 1 FROM top_level_llm_effects e
-                           WHERE e.workflow_id = a.workflow_id
-                       )
-                   )
-               )
+               AND a.committed_outcome = 'PendingRuntime'
                AND w.stopped_at IS NULL",
         )
         .bind(conversation_id)
@@ -615,16 +644,7 @@ impl WorkflowRepository {
                     a.prepared_fingerprint, a.prepared_payload, a.committed_outcome, a.accepted_at
              FROM direct_turn_acceptances a
              JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
-             WHERE (
-                 a.committed_outcome = 'PendingRuntime'
-                 OR (
-                     a.committed_outcome = 'RuntimeAccepted'
-                     AND NOT EXISTS (
-                         SELECT 1 FROM top_level_llm_effects e
-                         WHERE e.workflow_id = a.workflow_id
-                     )
-                 )
-             )
+             WHERE a.committed_outcome = 'PendingRuntime'
                AND w.stopped_at IS NULL
              ORDER BY a.accepted_at, a.conversation_id, a.client_message_id",
         )
@@ -2078,10 +2098,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_steering_acceptance_atomically_persists_queue_entry() {
+        let repo = open_repo().await;
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            text: "steer".to_string(),
+            llm_text: Some("expanded steer".to_string()),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "msg-steer".to_string(),
+            user_agent: Some("ios".to_string()),
+            skill_invocation: None,
+        };
+        let outcome = repo
+            .accept_direct_turn(&DirectTurnAcceptanceInput {
+                initial_outcome: DirectTurnInitialOutcome::QueuedSteering {
+                    entry: Box::new(entry.clone()),
+                },
+                conversation_id: "conv-1".to_string(),
+                client_message_id: "msg-steer".to_string(),
+                prepared_fingerprint: "fp-steer".to_string(),
+                prepared_payload: "{}".to_string(),
+                accepted_at: Timestamp(1),
+                snapshot: snapshot(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DirectTurnAcceptanceOutcome::Created(_)));
+
+        let persisted = sqlx::query(
+            "SELECT message_id, text, llm_text, user_agent FROM steering_messages
+             WHERE conversation_id = 'conv-1' AND ordinal = 0",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted.get::<String, _>("message_id"), entry.message_id);
+        assert_eq!(persisted.get::<String, _>("text"), entry.text);
+        assert_eq!(
+            persisted.get::<Option<String>, _>("llm_text"),
+            entry.llm_text
+        );
+        assert_eq!(
+            persisted.get::<Option<String>, _>("user_agent"),
+            entry.user_agent
+        );
+    }
+
+    #[tokio::test]
     async fn direct_turn_accept_replay_conflict() {
         let repo = open_repo().await;
         let input = DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2146,12 +2213,12 @@ mod tests {
             .unwrap(),
             DirectTurnRuntimeAdmissionOutcome::Conflict
         );
-        assert_eq!(repo.load_pending_direct_turns().await.unwrap().len(), 1);
+        assert!(repo.load_pending_direct_turns().await.unwrap().is_empty());
         assert!(repo
             .load_pending_direct_turn_runtime_admission("conv-1", "msg-1")
             .await
             .unwrap()
-            .is_some());
+            .is_none());
         repo.prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
             workflow_id: WorkflowId(1),
             committed_at: Timestamp(3),
@@ -2190,7 +2257,7 @@ mod tests {
     async fn direct_turn_acceptance_has_one_winner_across_independent_connections() {
         let (_dir, first, second) = open_independent_repos().await;
         let input = DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-race".to_string(),
             prepared_fingerprint: "fp-race".to_string(),
@@ -2245,7 +2312,7 @@ mod tests {
     async fn distinct_direct_turns_race_for_one_conversation_slot() {
         let (_dir, first, second) = open_independent_repos().await;
         let left_input = DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-left".to_string(),
             prepared_fingerprint: "fp-left".to_string(),
@@ -2289,7 +2356,7 @@ mod tests {
     async fn queued_steering_batch_consumption_is_atomic_and_replayable() {
         let repo = open_repo().await;
         let input = DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2341,7 +2408,7 @@ mod tests {
     async fn prepare_and_begin_allocates_authoritative_effect_and_attempt_identity() {
         let repo = open_repo().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2414,7 +2481,7 @@ mod tests {
     async fn runtime_admission_reports_retryable_persistence_while_writer_is_locked() {
         let (_dir, repo, lock_pool) = open_repo_with_lock_pool().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2456,7 +2523,7 @@ mod tests {
     async fn completed_response_reports_retryable_persistence_while_writer_is_locked() {
         let (_dir, repo, lock_pool) = open_repo_with_lock_pool().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2551,7 +2618,7 @@ mod tests {
     async fn stop_before_first_effect_commits_and_releases_live_slot() {
         let repo = open_repo().await;
         let input = DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::RuntimeAccepted,
+            initial_outcome: DirectTurnInitialOutcome::RuntimeAccepted,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
@@ -2594,7 +2661,7 @@ mod tests {
     async fn prepare_begin_recover_accept_owed_and_stop_flow() {
         let repo = open_repo().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnCommittedOutcome::PendingRuntime,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),

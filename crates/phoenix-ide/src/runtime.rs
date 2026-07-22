@@ -3002,64 +3002,6 @@ impl RuntimeManager {
             .map_err(|e| format!("Failed to send event: {e}"))
     }
 
-    /// Queue a steering message to be delivered when the conversation next
-    /// reaches `Idle`. Persists the entry to DB **before** sending to the
-    /// executor channel, so the entry survives a crash between acceptance
-    /// and executor processing.
-    pub async fn enqueue_steer_message(
-        self: &Arc<Self>,
-        conversation_id: &str,
-        event: Event,
-    ) -> Result<(), String> {
-        let Event::SteerMessage {
-            ref text,
-            ref llm_text,
-            ref images,
-            ref files,
-            ref message_id,
-            ref user_agent,
-            ref skill_invocation,
-        } = event
-        else {
-            return Err("enqueue_steer_message expects Event::SteerMessage".into());
-        };
-
-        // Build SteerEntry and persist before touching the executor channel (P1).
-        let new_entry = crate::state_machine::event::SteerEntry {
-            text: text.clone(),
-            llm_text: llm_text.clone(),
-            images: images.clone(),
-            files: files.clone(),
-            message_id: message_id.clone(),
-            user_agent: user_agent.clone(),
-            skill_invocation: skill_invocation.clone(),
-        };
-        let db = self.db();
-        let mut queue = db
-            .get_steering_queue(conversation_id)
-            .await
-            .map_err(|e| format!("Failed to load steering queue for enqueue: {e}"))?;
-        queue.push(new_entry);
-        db.update_steering_queue(conversation_id, &queue)
-            .await
-            .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
-        tracing::info!(
-            conversation_id,
-            message_id,
-            queue_depth = queue.len(),
-            "Persisted steering message before executor delivery"
-        );
-
-        // DB is durable; now update the executor's in-memory queue via channel.
-        let handle = self.get_or_create(conversation_id).await?;
-        deposit_turn_trigger(&handle);
-        handle
-            .event_tx
-            .send(event)
-            .await
-            .map_err(|e| format!("Failed to send steer message: {e}"))
-    }
-
     /// Subscribe to conversation updates
     pub async fn subscribe(
         self: &Arc<Self>,

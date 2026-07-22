@@ -25,12 +25,46 @@ pub(crate) struct SendChatRequest {
     pub expansion_policy: MessageExpansionPolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SendChatRequestResult {
+    Created,
+    Replayed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SendChatDisposition {
+    PendingRuntime,
+    RuntimeAccepted,
+    QueuedSteering,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SendChatOutcome {
-    Delivered,
-    AlreadyPersisted,
-    QueuedAsSteering,
-    Rejected { message: String, code: &'static str },
+    Accepted {
+        message_id: String,
+        request_result: SendChatRequestResult,
+        disposition: SendChatDisposition,
+    },
+    Rejected {
+        message: String,
+        code: &'static str,
+    },
+}
+
+impl SendChatOutcome {
+    fn accepted(
+        message_id: String,
+        request_result: SendChatRequestResult,
+        disposition: SendChatDisposition,
+    ) -> Self {
+        Self::Accepted {
+            message_id,
+            request_result,
+            disposition,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,7 +129,11 @@ impl SendChatApplicationService {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
             receipts.remove(&req.message_id);
-            return Ok(SendChatOutcome::AlreadyPersisted);
+            return Ok(SendChatOutcome::accepted(
+                req.message_id,
+                SendChatRequestResult::Replayed,
+                SendChatDisposition::RuntimeAccepted,
+            ));
         }
         if let Some(receipt) = receipts.get(&req.message_id) {
             return replay_receipt(receipt, &req, &request_fingerprint);
@@ -109,7 +147,11 @@ impl SendChatApplicationService {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
             receipts.remove(&req.message_id);
-            return Ok(SendChatOutcome::QueuedAsSteering);
+            return Ok(SendChatOutcome::accepted(
+                req.message_id,
+                SendChatRequestResult::Replayed,
+                SendChatDisposition::QueuedSteering,
+            ));
         }
         if let Some(accepted) = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
             .load_direct_turn_acceptance(&conversation.id, &req.message_id)
@@ -122,6 +164,7 @@ impl SendChatApplicationService {
             let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
                 serde_json::from_str(&accepted.prepared_payload)
                     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+            let message_id = req.message_id.clone();
             let replay_outcome = match accepted.committed_outcome {
                 phoenix_db::DirectTurnCommittedOutcome::QueuedSteering => {
                     let event = prepared.into_event();
@@ -139,29 +182,32 @@ impl SendChatApplicationService {
                             "accepted direct turn did not decode to a user message".to_string(),
                         ));
                     };
-                    self.runtime
-                        .send_event(
-                            &conversation.id,
-                            Event::SteerMessage {
-                                text,
-                                llm_text,
-                                images,
-                                files,
-                                message_id,
-                                user_agent,
-                                skill_invocation,
-                            },
-                        )
-                        .await
-                        .map_err(SendChatServiceError::Dispatch)?;
-                    SendChatOutcome::QueuedAsSteering
+                    kick_runtime_delivery(
+                        self.runtime.clone(),
+                        conversation.id.clone(),
+                        Event::SteerMessage {
+                            text,
+                            llm_text,
+                            images,
+                            files,
+                            message_id: message_id.clone(),
+                            user_agent,
+                            skill_invocation,
+                        },
+                    );
+                    SendChatOutcome::accepted(
+                        message_id,
+                        SendChatRequestResult::Replayed,
+                        SendChatDisposition::QueuedSteering,
+                    )
                 }
                 phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
                 | phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
-                    self.runtime
-                        .send_event(&conversation.id, prepared.into_event())
-                        .await
-                        .map_err(SendChatServiceError::Dispatch)?;
+                    kick_runtime_delivery(
+                        self.runtime.clone(),
+                        conversation.id.clone(),
+                        prepared.into_event(),
+                    );
                     insert_transient_receipt(
                         &self.db,
                         &mut receipts,
@@ -173,7 +219,21 @@ impl SendChatApplicationService {
                         },
                     )
                     .await;
-                    SendChatOutcome::Delivered
+                    SendChatOutcome::accepted(
+                        message_id,
+                        SendChatRequestResult::Replayed,
+                        match accepted.committed_outcome {
+                            phoenix_db::DirectTurnCommittedOutcome::PendingRuntime => {
+                                SendChatDisposition::PendingRuntime
+                            }
+                            phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
+                                SendChatDisposition::RuntimeAccepted
+                            }
+                            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering => {
+                                unreachable!()
+                            }
+                        },
+                    )
                 }
             };
             return Ok(replay_outcome);
@@ -224,9 +284,20 @@ impl SendChatApplicationService {
                 };
                 let prepared_payload = serde_json::to_string(&prepared)
                     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+                let steering_entry = crate::state_machine::event::SteerEntry {
+                    text: expanded.display_text.clone(),
+                    llm_text: expanded.llm_text.clone(),
+                    images: images.clone(),
+                    files: validated_files.clone(),
+                    message_id: req.message_id.clone(),
+                    user_agent: req.user_agent.clone(),
+                    skill_invocation: expanded.skill_invocation.clone(),
+                };
                 let acceptance = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
                     .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
-                        initial_outcome: phoenix_db::DirectTurnCommittedOutcome::QueuedSteering,
+                        initial_outcome: phoenix_db::DirectTurnInitialOutcome::QueuedSteering {
+                            entry: Box::new(steering_entry),
+                        },
                         conversation_id: conversation.id.clone(),
                         client_message_id: req.message_id.clone(),
                         prepared_fingerprint: request_fingerprint.clone(),
@@ -246,9 +317,13 @@ impl SendChatApplicationService {
                     })
                     .await
                     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-                let acceptance = match acceptance {
-                    phoenix_db::DirectTurnAcceptanceOutcome::Created(record)
-                    | phoenix_db::DirectTurnAcceptanceOutcome::Replayed(record) => record,
+                let (acceptance, request_result) = match acceptance {
+                    phoenix_db::DirectTurnAcceptanceOutcome::Created(record) => {
+                        (record, SendChatRequestResult::Created)
+                    }
+                    phoenix_db::DirectTurnAcceptanceOutcome::Replayed(record) => {
+                        (record, SendChatRequestResult::Replayed)
+                    }
                     phoenix_db::DirectTurnAcceptanceOutcome::RetryablePersistence => {
                         return Err(SendChatServiceError::Dispatch(
                             "direct turn persistence is temporarily busy".to_string(),
@@ -271,10 +346,7 @@ impl SendChatApplicationService {
                     user_agent: req.user_agent,
                     skill_invocation: expanded.skill_invocation,
                 };
-                self.runtime
-                    .enqueue_steer_message(&conversation.id, event)
-                    .await
-                    .map_err(SendChatServiceError::Dispatch)?;
+                kick_runtime_delivery(self.runtime.clone(), conversation.id.clone(), event);
                 insert_transient_receipt(
                     &self.db,
                     &mut receipts,
@@ -295,7 +367,11 @@ impl SendChatApplicationService {
                 {
                     tracing::warn!(conversation_id = %conversation.id, error = ?error, "Message accepted but PR auto-fix baseline recording failed");
                 }
-                return Ok(SendChatOutcome::QueuedAsSteering);
+                return Ok(SendChatOutcome::accepted(
+                    req.message_id,
+                    request_result,
+                    SendChatDisposition::QueuedSteering,
+                ));
             }
             return Ok(SendChatOutcome::Rejected {
                 message: err.to_string(),
@@ -329,7 +405,7 @@ impl SendChatApplicationService {
         };
         let acceptance = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
             .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
-                initial_outcome: phoenix_db::DirectTurnCommittedOutcome::PendingRuntime,
+                initial_outcome: phoenix_db::DirectTurnInitialOutcome::PendingRuntime,
                 conversation_id: conversation.id.clone(),
                 client_message_id: req.message_id.clone(),
                 prepared_fingerprint: request_fingerprint.clone(),
@@ -349,9 +425,9 @@ impl SendChatApplicationService {
             })
             .await
             .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-        match acceptance {
-            phoenix_db::DirectTurnAcceptanceOutcome::Created(_)
-            | phoenix_db::DirectTurnAcceptanceOutcome::Replayed(_) => {}
+        let request_result = match acceptance {
+            phoenix_db::DirectTurnAcceptanceOutcome::Created(_) => SendChatRequestResult::Created,
+            phoenix_db::DirectTurnAcceptanceOutcome::Replayed(_) => SendChatRequestResult::Replayed,
             phoenix_db::DirectTurnAcceptanceOutcome::RetryablePersistence => {
                 return Err(SendChatServiceError::Dispatch(
                     "direct turn persistence is temporarily busy".to_string(),
@@ -360,11 +436,8 @@ impl SendChatApplicationService {
             phoenix_db::DirectTurnAcceptanceOutcome::Conflict => {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
-        }
-        self.runtime
-            .send_event(&conversation.id, event)
-            .await
-            .map_err(SendChatServiceError::Dispatch)?;
+        };
+        kick_runtime_delivery(self.runtime.clone(), conversation.id.clone(), event);
         insert_transient_receipt(
             &self.db,
             &mut receipts,
@@ -385,7 +458,11 @@ impl SendChatApplicationService {
         {
             tracing::warn!(conversation_id = %conversation.id, error = ?error, "Message accepted but PR auto-fix baseline recording failed");
         }
-        Ok(SendChatOutcome::Delivered)
+        Ok(SendChatOutcome::accepted(
+            req.message_id,
+            request_result,
+            SendChatDisposition::PendingRuntime,
+        ))
     }
 
     async fn effective_state(
@@ -483,6 +560,19 @@ async fn expand_message(
         llm_text,
         skill_invocation: expanded.skill_invocation,
     })
+}
+
+fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, event: Event) {
+    runtime.kick_wake_worker();
+    tokio::spawn(async move {
+        if let Err(error) = runtime.send_event(&conversation_id, event).await {
+            tracing::warn!(
+                conversation_id,
+                error = %error,
+                "durably accepted message runtime kick failed; recovery remains owed"
+            );
+        }
+    });
 }
 
 async fn insert_transient_receipt(
@@ -647,11 +737,15 @@ fn replay_receipt(
     {
         return Err(SendChatServiceError::IdempotencyConflict);
     }
-    Ok(if receipt.steering {
-        SendChatOutcome::QueuedAsSteering
-    } else {
-        SendChatOutcome::Delivered
-    })
+    Ok(SendChatOutcome::accepted(
+        req.message_id.clone(),
+        SendChatRequestResult::Replayed,
+        if receipt.steering {
+            SendChatDisposition::QueuedSteering
+        } else {
+            SendChatDisposition::PendingRuntime
+        },
+    ))
 }
 
 fn map_images(images: Vec<ImageAttachment>) -> Vec<ImageData> {
