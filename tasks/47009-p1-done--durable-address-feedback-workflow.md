@@ -15,7 +15,7 @@ The workflow must capture a fresh, exact-PR-head actionable feedback snapshot; b
 - Fence duplicate clicks and duplicate agent dispatch.
 - Define completion outcomes: handed off, superseded by newer PR head/feedback, cancelled, failed, and agent run completed pending refreshed GitHub verification.
 - Preserve GitHub as source of truth; Phoenix stores only the compact agent-actionable snapshot and handoff baseline.
-- Replace the UI's `pr-auto-fix-context` plus `UserMessage` orchestration with a one-request durable Address feedback workflow; keep the legacy context endpoint only as a compatibility surface while no UI caller depends on it.
+- Replace the UI's `pr-auto-fix-context` plus `UserMessage` orchestration with a one-request durable Address feedback workflow and remove the legacy context endpoint surface.
 
 ## Scope boundary
 

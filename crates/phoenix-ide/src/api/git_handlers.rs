@@ -1866,15 +1866,6 @@ pub(crate) async fn capture_pr_auto_fix_context_for_conversation(
     response
 }
 
-pub(crate) async fn create_pr_auto_fix_context(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<PrAutoFixContextResponse>, AppError> {
-    capture_pr_auto_fix_context_for_conversation(&state, &id)
-        .await
-        .map(Json)
-}
-
 fn validate_pr_auto_fix_artifact_path(artifact_path: &str) -> Result<(), AppError> {
     let path = std::path::Path::new(artifact_path);
     if path.is_absolute() {

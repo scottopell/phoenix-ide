@@ -9,8 +9,8 @@ use super::chains::{
     stream_chain, submit_chain_question,
 };
 use super::git_handlers::{
-    create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
-    get_conversation_git_status, get_conversation_pr_status, list_git_branches, pin_associated_pr,
+    get_active_pr_diff, get_conversation_diff, get_conversation_git_status,
+    get_conversation_pr_status, list_git_branches, pin_associated_pr,
     resume_associated_pr_inference,
 };
 use super::global_read;
@@ -380,10 +380,6 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/address-pr-feedback",
             post(address_pr_feedback),
-        )
-        .route(
-            "/api/conversations/:id/pr-auto-fix-context",
-            post(create_pr_auto_fix_context),
         )
         // Project task files available before a conversation exists
         .route("/api/tasks", get(list_project_tasks))
