@@ -278,7 +278,9 @@ impl ResponsesStreamAccumulator {
                     }
                 }
             }
-            "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
+            "response.reasoning.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_summary_text.delta" => {
                 if v.get("delta")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|delta| !delta.is_empty())
@@ -3525,6 +3527,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_text_delta_records_generation_event() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+
+        acc.process_event(
+            "response.reasoning_text.delta",
+            r#"{"type":"response.reasoning_text.delta","delta":"reasoning"}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        let telemetry = acc.telemetry.snapshot(false);
+        assert_eq!(telemetry.generation_event_count, 1);
+        assert_eq!(telemetry.visible_text_event_count, 0);
+        assert!(telemetry.dispatch_to_first_generation_event_ms.is_some());
+    }
+
+    #[tokio::test]
     async fn refusal_delta_records_generated_visible_text() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
@@ -3537,7 +3558,11 @@ mod tests {
         .await
         .unwrap();
 
-        let Some(super::super::TokenChunk::Text(text)) = rx.recv().await else {
+        let Some(super::super::TokenChunk::Text(text)) =
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("refusal delta should be emitted promptly")
+        else {
             panic!("expected refusal delta as text chunk");
         };
         assert_eq!(text, "I can't help with that.");
