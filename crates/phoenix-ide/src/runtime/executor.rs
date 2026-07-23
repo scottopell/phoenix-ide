@@ -3156,10 +3156,17 @@ where
             .storage
             .persist_direct_turn_runtime_acceptance(&acceptance)
             .await?;
-        let product_replay = outcome == phoenix_db::DirectTurnRuntimeAdmissionOutcome::ExactReplay;
-        if outcome != phoenix_db::DirectTurnRuntimeAdmissionOutcome::Committed && !product_replay {
-            return Err(format!("durable direct turn admission failed: {outcome:?}"));
-        }
+        let (persisted_message, product_replay) = match outcome {
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Committed(message) => {
+                (Some(*message), false)
+            }
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay => (None, true),
+            conflict => {
+                return Err(format!(
+                    "durable direct turn admission failed: {conflict:?}"
+                ));
+            }
+        };
         self.state = next_state;
         self.state_updated_at = next_state_updated_at;
         self.manage_deadline(&old_state);
@@ -3167,7 +3174,9 @@ where
             let _ = tx.send(self.state.clone());
         }
         if !product_replay {
-            let _ = self.broadcast_tx.send_message(message);
+            let _ = self
+                .broadcast_tx
+                .send_message(persisted_message.expect("committed admission returns message"));
         }
         let mut generated = Vec::new();
         for effect in effects {
@@ -5748,6 +5757,16 @@ where
                 self.storage
                     .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                     .await?;
+                if !self.state.is_busy() {
+                    self.storage
+                        .stop_active_top_level_llm_for_conversation(
+                            &conv_id,
+                            phoenix_workflow::Timestamp(
+                                u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                            ),
+                        )
+                        .await?;
+                }
 
                 // Broadcast the now-durable rows so connected clients render
                 // the assistant message and each tool result. Tool-result

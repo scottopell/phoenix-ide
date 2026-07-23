@@ -81,8 +81,8 @@ pub trait MessageStore: Send + Sync {
     async fn persist_direct_turn_runtime_acceptance(
         &self,
         _input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
-    ) -> Result<phoenix_db::DirectTurnRuntimeAdmissionOutcome, String> {
-        Ok(phoenix_db::DirectTurnRuntimeAdmissionOutcome::Conflict)
+    ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
+        Ok(phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict)
     }
 
     async fn consume_queued_steering_batch(
@@ -910,7 +910,7 @@ impl MessageStore for DatabaseStorage {
     async fn persist_direct_turn_runtime_acceptance(
         &self,
         input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
-    ) -> Result<phoenix_db::DirectTurnRuntimeAdmissionOutcome, String> {
+    ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
         self.db
             .persist_direct_turn_runtime_acceptance(input)
             .await

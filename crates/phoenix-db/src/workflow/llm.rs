@@ -257,6 +257,13 @@ pub enum ToolIntentTransitionOutcome {
     Conflict,
     RetryablePersistence,
 }
+#[derive(Debug, Clone)]
+pub enum PersistDirectTurnRuntimeAcceptanceOutcome {
+    Committed(Box<crate::Message>),
+    ExactReplay,
+    Conflict,
+    RetryablePersistence,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwedTopLevelLlmReceipt {
@@ -838,7 +845,7 @@ impl WorkflowRepository {
              JOIN workflow_attempts a
                ON a.workflow_id = e.workflow_id AND a.effect_id = e.effect_id
              WHERE e.workflow_id = ?1
-               AND a.status IN ('AuthorityLost', 'ReceiptAccepted')
+               AND a.status IN ('AuthorityLost', 'ObservationRecorded', 'ReceiptAccepted')
                AND NOT EXISTS (
                    SELECT 1 FROM top_level_llm_response_receipts rr
                    WHERE rr.workflow_id = e.workflow_id AND rr.effect_id = e.effect_id
@@ -858,6 +865,15 @@ impl WorkflowRepository {
                 tx.allocate_sequence_value(input.workflow_id, WorkflowSequenceName::Attempt)
                     .await?,
             );
+            sqlx::query(
+                "UPDATE workflow_attempts SET status = 'ReceiptAccepted'
+                 WHERE workflow_id = ?1 AND effect_id = ?2
+                   AND status = 'ObservationRecorded'",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(effect_id.0, "effect_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
             sqlx::query(
                 "UPDATE workflow_effects SET status = 'Eligible'
                  WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'",
@@ -998,15 +1014,6 @@ impl WorkflowRepository {
             })
             .await?;
         if result.outcome == AuthorityOutcome::Authorized {
-            sqlx::query(
-                "UPDATE workflow_attempts SET status = 'ReceiptAccepted'
-                 WHERE workflow_id = ?1 AND attempt_id = ?2
-                   AND status = 'ObservationRecorded'",
-            )
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
-            .execute(&mut *tx.tx)
-            .await?;
             tx.commit().await?;
         } else {
             tx.rollback().await?;
@@ -1700,6 +1707,7 @@ impl WorkflowRepository {
              JOIN direct_turn_acceptances dta ON dta.workflow_id = wf.workflow_id
              WHERE dta.conversation_id = ?1
                AND dta.committed_outcome IN ('PendingRuntime', 'RuntimeAccepted')
+               AND dta.live_slot = 1
                AND wf.status = 'Active' AND w.stopped_at IS NULL
              ORDER BY dta.accepted_at DESC LIMIT 1",
         )

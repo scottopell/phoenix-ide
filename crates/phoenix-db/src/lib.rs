@@ -4285,13 +4285,13 @@ impl Database {
     pub async fn persist_direct_turn_runtime_acceptance(
         &self,
         input: &PersistDirectTurnRuntimeAcceptanceInput,
-    ) -> DbResult<DirectTurnRuntimeAdmissionOutcome> {
+    ) -> DbResult<PersistDirectTurnRuntimeAcceptanceOutcome> {
         if input.admission.disposition != DirectTurnCommittedOutcome::RuntimeAccepted
             || input.message.conversation_id != input.admission.conversation_id
             || input.message.message_id != input.admission.client_message_id
             || input.message.message_type != input.message.content.message_type()
         {
-            return Ok(DirectTurnRuntimeAdmissionOutcome::Conflict);
+            return Ok(PersistDirectTurnRuntimeAcceptanceOutcome::Conflict);
         }
         match self
             .persist_direct_turn_runtime_acceptance_once(input)
@@ -4300,7 +4300,7 @@ impl Database {
             Err(DbError::Sqlx(sqlx::Error::Database(error)))
                 if is_sqlite_busy_retryable(error.as_ref()) =>
             {
-                Ok(DirectTurnRuntimeAdmissionOutcome::RetryablePersistence)
+                Ok(PersistDirectTurnRuntimeAcceptanceOutcome::RetryablePersistence)
             }
             result => result,
         }
@@ -4309,7 +4309,7 @@ impl Database {
     async fn persist_direct_turn_runtime_acceptance_once(
         &self,
         input: &PersistDirectTurnRuntimeAcceptanceInput,
-    ) -> DbResult<DirectTurnRuntimeAdmissionOutcome> {
+    ) -> DbResult<PersistDirectTurnRuntimeAcceptanceOutcome> {
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE direct_turn_acceptances
@@ -4350,9 +4350,9 @@ impl Database {
                 == 1;
             tx.rollback().await?;
             return Ok(if replay {
-                DirectTurnRuntimeAdmissionOutcome::ExactReplay
+                PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay
             } else {
-                DirectTurnRuntimeAdmissionOutcome::Conflict
+                PersistDirectTurnRuntimeAcceptanceOutcome::Conflict
             });
         }
 
@@ -4367,7 +4367,7 @@ impl Database {
             != 0;
         if message_exists {
             tx.rollback().await?;
-            return Ok(DirectTurnRuntimeAdmissionOutcome::Conflict);
+            return Ok(PersistDirectTurnRuntimeAcceptanceOutcome::Conflict);
         }
         let globally_owned =
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
@@ -4399,7 +4399,9 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok(DirectTurnRuntimeAdmissionOutcome::Committed)
+        Ok(PersistDirectTurnRuntimeAcceptanceOutcome::Committed(
+            Box::new(persisted_message),
+        ))
     }
 
     /// Atomically consumes one owed LLM delivery into product state.
@@ -12077,23 +12079,23 @@ mod tests {
             next_state: next_state.clone(),
             state_updated_at: Utc::now(),
         };
-        assert_eq!(
+        assert!(matches!(
             db.persist_direct_turn_runtime_acceptance(&input)
                 .await
                 .unwrap(),
-            DirectTurnRuntimeAdmissionOutcome::Committed
-        );
+            PersistDirectTurnRuntimeAcceptanceOutcome::Committed(_)
+        ));
         assert!(db.message_exists("msg-direct").await.unwrap());
         assert_eq!(
             db.get_conversation("conv-direct").await.unwrap().state,
             next_state
         );
-        assert_eq!(
+        assert!(matches!(
             db.persist_direct_turn_runtime_acceptance(&input)
                 .await
                 .unwrap(),
-            DirectTurnRuntimeAdmissionOutcome::ExactReplay
-        );
+            PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay
+        ));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -12270,7 +12272,7 @@ mod tests {
             repo.stop_active_top_level_llm_for_conversation("conv-direct", Timestamp(5),)
                 .await
                 .unwrap(),
-            Some(phoenix_workflow::CommitOutcome::Committed)
+            None
         );
         let status = sqlx::query_scalar::<_, String>(
             "SELECT status FROM top_level_llm_tool_intents
@@ -12281,7 +12283,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(status, "Suppressed");
+        assert_eq!(status, "Owed");
         let begun_status = sqlx::query_scalar::<_, String>(
             "SELECT status FROM top_level_llm_tool_intents
              WHERE workflow_id = ?1 AND receipt_id = ?2 AND intent_ordinal = 1",
@@ -12291,12 +12293,11 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(begun_status, "Interrupted");
-        assert!(repo
-            .load_owed_top_level_llm_receipts()
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(begun_status, "ExecutionMayHaveBegun");
+        assert_eq!(
+            repo.load_owed_top_level_llm_receipts().await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
