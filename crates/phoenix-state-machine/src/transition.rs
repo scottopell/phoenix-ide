@@ -2184,25 +2184,30 @@ pub fn transition_parent(
             // two cases dispatch differently but share the same pre-checks
             // (mode, "must be the only tool") because they are both the LLM
             // calling propose_task — only the payload differs.
-            if let Some((tool, call)) = tool_calls.iter().find_map(|t| match &t.input {
-                ToolInput::ProposeTask(input) => Some((t, ProposeTaskCall::Typed(input))),
-                ToolInput::Malformed { name, error, .. } if name == "propose_task" => {
-                    Some((t, ProposeTaskCall::Malformed(error.as_str())))
-                }
-                ToolInput::Bash(_)
-                | ToolInput::Think(_)
-                | ToolInput::Patch(_)
-                | ToolInput::KeywordSearch(_)
-                | ToolInput::ReadImage(_)
-                | ToolInput::SpawnAgents(_)
-                | ToolInput::SubmitResult(_)
-                | ToolInput::SubmitError(_)
-                | ToolInput::CommissionReview(_)
-                | ToolInput::ApprovedCommissionReview(_)
-                | ToolInput::AskUserQuestion(_)
-                | ToolInput::Unknown { .. }
-                | ToolInput::Malformed { .. } => None,
-            }) {
+            let propose_task_call = (!context.is_coordinator)
+                .then(|| {
+                    tool_calls.iter().find_map(|t| match &t.input {
+                        ToolInput::ProposeTask(input) => Some((t, ProposeTaskCall::Typed(input))),
+                        ToolInput::Malformed { name, error, .. } if name == "propose_task" => {
+                            Some((t, ProposeTaskCall::Malformed(error.as_str())))
+                        }
+                        ToolInput::Bash(_)
+                        | ToolInput::Think(_)
+                        | ToolInput::Patch(_)
+                        | ToolInput::KeywordSearch(_)
+                        | ToolInput::ReadImage(_)
+                        | ToolInput::SpawnAgents(_)
+                        | ToolInput::SubmitResult(_)
+                        | ToolInput::SubmitError(_)
+                        | ToolInput::CommissionReview(_)
+                        | ToolInput::ApprovedCommissionReview(_)
+                        | ToolInput::AskUserQuestion(_)
+                        | ToolInput::Unknown { .. }
+                        | ToolInput::Malformed { .. } => None,
+                    })
+                })
+                .flatten();
+            if let Some((tool, call)) = propose_task_call {
                 if tool_calls.len() > 1 {
                     let msg = "propose_task must be the only tool in response".to_string();
                     let display_data = make_display_data(&content);
@@ -5111,6 +5116,33 @@ mod tests {
             Effect::BroadcastAssistantMessage { message }
                 if message.display_data.is_none()
         )));
+    }
+
+    #[test]
+    fn coordinator_propose_task_is_a_normal_tool_call_without_filesystem() {
+        use crate::state::{ProposeTaskInput, ToolInput};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let context = ConvContext::coordinator("coordinator", "test-model", 200_000);
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &context,
+            Event::LlmResponse {
+                content: vec![ContentBlock::text("stale tool call")],
+                tool_calls: vec![ToolCall::new(
+                    "propose-1",
+                    ToolInput::ProposeTask(ProposeTaskInput {
+                        task_file: "tasks/12345-p1-ready--stale.md".into(),
+                    }),
+                )],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "coordinator-propose".into(),
+            },
+        )
+        .expect("filesystem-free stale tool response");
+
+        assert!(matches!(result.new_state, ConvState::ToolExecuting { .. }));
     }
 
     #[test]
