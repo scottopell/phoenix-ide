@@ -316,7 +316,76 @@ const MIGRATIONS: &[Migration] = &[
         name: "claim_workflow_deliveries",
         sql: MIGRATION_060,
     },
+    Migration {
+        version: 61,
+        name: "scope_steering_messages_to_conversation",
+        sql: MIGRATION_061,
+    },
 ];
+
+const MIGRATION_061: &str = r"
+CREATE TABLE steering_messages_scoped (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    llm_text TEXT,
+    user_agent TEXT,
+    skill_name TEXT,
+    skill_body TEXT,
+    skill_dir TEXT,
+    PRIMARY KEY (conversation_id, message_id),
+    UNIQUE (conversation_id, ordinal),
+    CHECK ((skill_name IS NULL) = (skill_body IS NULL)
+       AND (skill_name IS NULL) = (skill_dir IS NULL))
+);
+INSERT INTO steering_messages_scoped
+SELECT conversation_id, message_id, ordinal, text, llm_text, user_agent,
+       skill_name, skill_body, skill_dir
+FROM steering_messages;
+
+CREATE TABLE steering_message_files_scoped (
+    conversation_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    file_ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, message_id, file_ordinal),
+    FOREIGN KEY (conversation_id, message_id)
+        REFERENCES steering_messages_scoped(conversation_id, message_id) ON DELETE CASCADE
+);
+INSERT INTO steering_message_files_scoped
+SELECT sm.conversation_id, f.message_id, f.file_ordinal, f.original_name,
+       f.media_type, f.size_bytes, f.stored_path
+FROM steering_message_files f
+JOIN steering_messages sm ON sm.message_id = f.message_id;
+
+CREATE TABLE steering_message_images_scoped (
+    conversation_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    image_ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, message_id, image_ordinal),
+    FOREIGN KEY (conversation_id, message_id)
+        REFERENCES steering_messages_scoped(conversation_id, message_id) ON DELETE CASCADE
+);
+INSERT INTO steering_message_images_scoped
+SELECT sm.conversation_id, i.message_id, i.image_ordinal, i.media_type, i.data
+FROM steering_message_images i
+JOIN steering_messages sm ON sm.message_id = i.message_id;
+
+DROP TABLE steering_message_files;
+DROP TABLE steering_message_images;
+DROP TABLE steering_messages;
+ALTER TABLE steering_messages_scoped RENAME TO steering_messages;
+ALTER TABLE steering_message_files_scoped RENAME TO steering_message_files;
+ALTER TABLE steering_message_images_scoped RENAME TO steering_message_images;
+CREATE INDEX idx_steering_messages_conversation
+    ON steering_messages(conversation_id, ordinal);
+";
 
 const MIGRATION_060: &str = r"
 CREATE TABLE workflow_delivery_claims (

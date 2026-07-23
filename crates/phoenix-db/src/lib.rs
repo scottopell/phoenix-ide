@@ -4826,8 +4826,10 @@ impl Database {
             let message_id: String = row.try_get("message_id")?;
             let files = sqlx::query(
                 "SELECT original_name, media_type, size_bytes, stored_path
-                 FROM steering_message_files WHERE message_id = ?1 ORDER BY file_ordinal",
+                 FROM steering_message_files
+                 WHERE conversation_id = ?1 AND message_id = ?2 ORDER BY file_ordinal",
             )
+            .bind(id)
             .bind(&message_id)
             .map(|r: SqliteRow| FileAttachment {
                 original_name: r.get("original_name"),
@@ -4839,8 +4841,9 @@ impl Database {
             .await?;
             let images = sqlx::query(
                 "SELECT media_type, data FROM steering_message_images
-                 WHERE message_id = ?1 ORDER BY image_ordinal",
+                 WHERE conversation_id = ?1 AND message_id = ?2 ORDER BY image_ordinal",
             )
+            .bind(id)
             .bind(&message_id)
             .map(|r: SqliteRow| ImageData {
                 data: r.get("data"),
@@ -8455,9 +8458,10 @@ async fn insert_steering_entry_tx(
     for (file_ordinal, file) in entry.files.iter().enumerate() {
         sqlx::query(
             "INSERT INTO steering_message_files
-                (message_id, file_ordinal, original_name, media_type, size_bytes, stored_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (conversation_id, message_id, file_ordinal, original_name, media_type, size_bytes, stored_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
+        .bind(conversation_id)
         .bind(&entry.message_id)
         .bind(i64::try_from(file_ordinal).unwrap_or(i64::MAX))
         .bind(&file.original_name)
@@ -8469,9 +8473,11 @@ async fn insert_steering_entry_tx(
     }
     for (image_ordinal, image) in entry.images.iter().enumerate() {
         sqlx::query(
-            "INSERT INTO steering_message_images (message_id, image_ordinal, media_type, data)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO steering_message_images
+                (conversation_id, message_id, image_ordinal, media_type, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
+        .bind(conversation_id)
         .bind(&entry.message_id)
         .bind(i64::try_from(image_ordinal).unwrap_or(i64::MAX))
         .bind(&image.media_type)

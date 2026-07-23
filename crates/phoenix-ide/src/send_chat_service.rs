@@ -117,21 +117,10 @@ impl SendChatApplicationService {
             .await
             .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
         {
-            let validated_files = validate_files(&req).await?;
-            let expanded = expand_request(&self.db, &conversation, &req).await?;
-            let prepared_retry = phoenix_core::domain::sm_event::PreparedDirectTurn {
-                codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
-                text: expanded.display_text,
-                llm_text: expanded.llm_text,
-                images: map_images(req.images.clone()),
-                files: validated_files,
-                message_id: req.message_id.clone(),
-                user_agent: req.user_agent.clone(),
-                skill_invocation: expanded.skill_invocation,
-            };
-            let prepared_retry_payload = serde_json::to_string(&prepared_retry)
-                .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-            if accepted.prepared_fingerprint != sha256_hex(prepared_retry_payload.as_bytes()) {
+            let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
+                serde_json::from_str(&accepted.prepared_payload)
+                    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+            if !prepared_retry_matches_request(&prepared, &req) {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
             let materialized = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
@@ -139,7 +128,7 @@ impl SendChatApplicationService {
                 .await
                 .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
             if materialized.is_some() {
-                receipts.remove(&req.message_id);
+                receipts.remove(&(conversation.id.clone(), req.message_id.clone()));
                 return Ok(SendChatOutcome::accepted(
                     req.message_id,
                     SendChatRequestResult::Replayed,
@@ -173,14 +162,14 @@ impl SendChatApplicationService {
             if message.conversation_id != req.conversation_id || !persisted_matches {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
-            receipts.remove(&req.message_id);
+            receipts.remove(&(conversation.id.clone(), req.message_id.clone()));
             return Ok(SendChatOutcome::accepted(
                 req.message_id,
                 SendChatRequestResult::Replayed,
                 SendChatDisposition::RuntimeAccepted,
             ));
         }
-        if let Some(receipt) = receipts.get(&req.message_id) {
+        if let Some(receipt) = receipts.get(&(conversation.id.clone(), req.message_id.clone())) {
             return replay_receipt(receipt, &req, &request_fingerprint);
         }
         if let Some((queued_conversation_id, queued_entry)) =
@@ -191,7 +180,7 @@ impl SendChatApplicationService {
             {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
-            receipts.remove(&req.message_id);
+            receipts.remove(&(conversation.id.clone(), req.message_id.clone()));
             return Ok(SendChatOutcome::accepted(
                 req.message_id,
                 SendChatRequestResult::Replayed,
@@ -311,7 +300,7 @@ impl SendChatApplicationService {
                 insert_transient_receipt(
                     &self.db,
                     &mut receipts,
-                    req.message_id.clone(),
+                    (conversation.id.clone(), req.message_id.clone()),
                     ChatAcceptanceReceipt {
                         conversation_id: conversation.id.clone(),
                         request_fingerprint,
@@ -403,7 +392,7 @@ impl SendChatApplicationService {
         insert_transient_receipt(
             &self.db,
             &mut receipts,
-            req.message_id.clone(),
+            (conversation.id.clone(), req.message_id.clone()),
             ChatAcceptanceReceipt {
                 conversation_id: conversation.id.clone(),
                 request_fingerprint,
@@ -433,7 +422,7 @@ impl SendChatApplicationService {
         req: &SendChatRequest,
         request_fingerprint: &str,
         accepted: phoenix_db::DirectTurnAcceptanceRecord,
-        receipts: &mut std::collections::HashMap<String, ChatAcceptanceReceipt>,
+        receipts: &mut std::collections::HashMap<(String, String), ChatAcceptanceReceipt>,
     ) -> Result<SendChatOutcome, SendChatServiceError> {
         let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
             serde_json::from_str(&accepted.prepared_payload)
@@ -489,7 +478,7 @@ impl SendChatApplicationService {
                 insert_transient_receipt(
                     &self.db,
                     receipts,
-                    req.message_id.clone(),
+                    (conversation.id.clone(), req.message_id.clone()),
                     ChatAcceptanceReceipt {
                         conversation_id: conversation.id.clone(),
                         request_fingerprint: request_fingerprint.to_string(),
@@ -683,28 +672,25 @@ fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, 
 
 async fn insert_transient_receipt(
     db: &crate::db::Database,
-    receipts: &mut std::collections::HashMap<String, ChatAcceptanceReceipt>,
-    message_id: String,
+    receipts: &mut std::collections::HashMap<(String, String), ChatAcceptanceReceipt>,
+    key: (String, String),
     receipt: ChatAcceptanceReceipt,
 ) {
     const CLEANUP_THRESHOLD: usize = 1_024;
     if receipts.len() >= CLEANUP_THRESHOLD {
-        let candidates = receipts
-            .iter()
-            .map(|(id, receipt)| (id.clone(), receipt.conversation_id.clone()))
-            .collect::<Vec<_>>();
-        for (id, conversation_id) in candidates {
-            let persisted = db.message_exists(&id).await.unwrap_or(false);
+        let candidates = receipts.keys().cloned().collect::<Vec<_>>();
+        for (conversation_id, message_id) in candidates {
+            let persisted = db.message_exists(&message_id).await.unwrap_or(false);
             let queued = db
                 .get_steering_queue(&conversation_id)
                 .await
-                .is_ok_and(|queue| queue.iter().any(|entry| entry.message_id == id));
+                .is_ok_and(|queue| queue.iter().any(|entry| entry.message_id == message_id));
             if persisted || queued {
-                receipts.remove(&id);
+                receipts.remove(&(conversation_id, message_id));
             }
         }
     }
-    receipts.insert(message_id, receipt);
+    receipts.insert(key, receipt);
 }
 
 async fn find_queued_message(
@@ -755,6 +741,23 @@ fn queued_retry_matches(
                     && stored.stored_path == requested.stored_path
             })
         && entry.user_agent == req.user_agent
+}
+
+fn prepared_retry_matches_request(
+    prepared: &phoenix_core::domain::sm_event::PreparedDirectTurn,
+    req: &SendChatRequest,
+) -> bool {
+    prepared.text == req.text
+        && prepared.message_id == req.message_id
+        && prepared.user_agent == req.user_agent
+        && prepared.images == map_images(req.images.clone())
+        && prepared.files
+            == req
+                .files
+                .clone()
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<_>>()
 }
 
 fn persisted_user_message_matches(
@@ -884,12 +887,12 @@ fn transition_code(err: &TransitionError) -> &'static str {
 mod tests {
     use super::{
         persisted_skill_matches, prepared_direct_turn_fingerprint, queued_retry_matches,
-        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest, SendChatServiceError,
+        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest,
     };
     use phoenix_core::domain::db_schema::SkillContent;
 
     #[tokio::test]
-    async fn durable_replay_conflicts_when_reference_expansion_changes() {
+    async fn durable_replay_ignores_reference_changes_after_acceptance() {
         let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
         let cwd = tempfile::tempdir().expect("create temp cwd");
         let reference = cwd.path().join("notes.md");
@@ -925,7 +928,10 @@ mod tests {
 
         assert!(matches!(
             service.send(request).await,
-            Err(SendChatServiceError::IdempotencyConflict)
+            Ok(super::SendChatOutcome::Accepted {
+                request_result: super::SendChatRequestResult::Replayed,
+                ..
+            })
         ));
     }
 

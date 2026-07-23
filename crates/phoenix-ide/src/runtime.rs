@@ -184,7 +184,7 @@ pub struct RuntimeManager {
     runtime_creation_lock: AsyncMutex<()>,
     /// Serializes message-id acceptance and bridges the gap between event
     /// dispatch and durable message persistence for in-process retries.
-    chat_acceptance_receipts: AsyncMutex<HashMap<String, ChatAcceptanceReceipt>>,
+    chat_acceptance_receipts: AsyncMutex<HashMap<(String, String), ChatAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -2984,7 +2984,7 @@ impl RuntimeManager {
 
     pub(crate) async fn lock_chat_acceptance(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<String, ChatAcceptanceReceipt>> {
+    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), ChatAcceptanceReceipt>> {
         self.chat_acceptance_receipts.lock().await
     }
 
