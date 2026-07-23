@@ -3505,7 +3505,7 @@ async fn address_pr_feedback(
                 )))
             }
             crate::address_feedback_workflow::AddressFeedbackWorkflowError::Capture(message) => {
-                AppError::BadRequest(message)
+                AppError::Internal(message)
             }
             crate::address_feedback_workflow::AddressFeedbackWorkflowError::Workflow(message)
             | crate::address_feedback_workflow::AddressFeedbackWorkflowError::Dispatch(message) => {
@@ -3528,6 +3528,7 @@ async fn send_chat(
         .send(crate::send_chat_service::SendChatRequest {
             conversation_id: id,
             text: req.text,
+            display_text: None,
             message_id: req.message_id,
             images: req.images,
             files: req.files,
@@ -3916,6 +3917,7 @@ async fn dispatch_continuation_handoff(
     .send(crate::send_chat_service::SendChatRequest {
         conversation_id: conversation_id.clone(),
         text: intent.handoff,
+        display_text: None,
         message_id: intent.message_id,
         images: Vec::new(),
         files: Vec::new(),

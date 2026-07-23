@@ -18,6 +18,7 @@ pub(crate) enum MessageExpansionPolicy {
 pub(crate) struct SendChatRequest {
     pub conversation_id: String,
     pub text: String,
+    pub display_text: Option<String>,
     pub message_id: String,
     pub images: Vec<ImageAttachment>,
     pub files: Vec<FileAttachment>,
@@ -273,6 +274,13 @@ async fn expand_request(
     conversation: &crate::db::Conversation,
     req: &SendChatRequest,
 ) -> Result<ExpandedDispatchMessage, SendChatServiceError> {
+    if let Some(display_text) = req.display_text.clone() {
+        return Ok(ExpandedDispatchMessage {
+            display_text,
+            llm_text: Some(req.text.clone()),
+            skill_invocation: None,
+        });
+    }
     expand_message(
         db,
         &conversation.id,
@@ -520,6 +528,7 @@ mod tests {
         let request = SendChatRequest {
             conversation_id: "conv-1".to_string(),
             text: "@file:notes.md".to_string(),
+            display_text: None,
             message_id: "message-1".to_string(),
             images: vec![],
             files: vec![],
@@ -547,6 +556,7 @@ mod tests {
         let request = SendChatRequest {
             conversation_id: "conv-1".to_string(),
             text: "/build now".to_string(),
+            display_text: None,
             message_id: "message-1".to_string(),
             images: vec![],
             files: vec![],

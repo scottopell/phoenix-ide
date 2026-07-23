@@ -116,15 +116,26 @@ impl AddressFeedbackWorkflowService {
                 );
                 continue;
             };
-            if snapshot.dispatch.is_some()
-                || matches!(snapshot.status, AddressFeedbackStatus::Failed)
-            {
-                continue;
-            }
             let Ok(workflow_id) = u64::try_from(workflow_id_raw).map(WorkflowId) else {
                 continue;
             };
             let version = u64::try_from(version_raw).unwrap_or(0);
+            if matches!(snapshot.status, AddressFeedbackStatus::Failed) {
+                continue;
+            }
+            if snapshot
+                .dispatch
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.steering)
+            {
+                let _ = self
+                    .finalize_steering_if_delivered(&repo, workflow_id, version, snapshot)
+                    .await;
+                continue;
+            }
+            if snapshot.dispatch.is_some() {
+                continue;
+            }
             let req = AddressFeedbackWorkflowRequest {
                 conversation_id: snapshot.conversation_id.clone(),
                 message_id: snapshot.message_id.clone(),
@@ -229,6 +240,20 @@ impl AddressFeedbackWorkflowService {
                             code: "address_feedback_failed".to_string(),
                         });
                     }
+                    if snapshot
+                        .dispatch
+                        .as_ref()
+                        .is_some_and(|dispatch| dispatch.steering)
+                    {
+                        return self
+                            .finalize_steering_if_delivered(&repo, workflow_id, version, snapshot)
+                            .await
+                            .map(|response| {
+                                response.unwrap_or_else(|| {
+                                    pending_response(workflow_id, req.message_id)
+                                })
+                            });
+                    }
                     if snapshot.model_message.is_some() && snapshot.target.is_some() {
                         return self
                             .dispatch_persisted_snapshot(&repo, workflow_id, version, snapshot, req)
@@ -306,6 +331,67 @@ impl AddressFeedbackWorkflowService {
             .await
     }
 
+    async fn finalize_steering_if_delivered(
+        &self,
+        repo: &WorkflowRepository,
+        workflow_id: WorkflowId,
+        version: u64,
+        snapshot: AddressFeedbackSnapshot,
+    ) -> Result<Option<AddressPrFeedbackResponse>, AddressFeedbackWorkflowError> {
+        if !self
+            .state
+            .db
+            .message_exists(&snapshot.message_id)
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
+            record_pr_auto_fix_context_baseline_for_artifact(
+                self.state.runtime.db(),
+                &snapshot.conversation_id,
+                artifact_path,
+            )
+            .await
+            .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
+        }
+        let dispatch = snapshot
+            .dispatch
+            .clone()
+            .unwrap_or(AddressFeedbackDispatch {
+                queued: true,
+                steering: true,
+                already_persisted: true,
+            });
+        let completed = AddressFeedbackSnapshot {
+            status: AddressFeedbackStatus::HandedOff,
+            dispatch: Some(AddressFeedbackDispatch {
+                queued: dispatch.queued,
+                steering: dispatch.steering,
+                already_persisted: true,
+            }),
+            ..snapshot.clone()
+        };
+        let _ = commit_snapshot(
+            repo,
+            workflow_id,
+            version,
+            version + 1,
+            &completed,
+            phoenix_workflow::WorkflowStatus::Completed,
+        )
+        .await;
+        Ok(Some(response_from_snapshot(
+            workflow_id,
+            completed.message_id.clone(),
+            dispatch.queued,
+            dispatch.steering,
+            false,
+            &completed,
+        )))
+    }
+
     async fn dispatch_persisted_snapshot(
         &self,
         repo: &WorkflowRepository,
@@ -324,6 +410,7 @@ impl AddressFeedbackWorkflowService {
                 .send(SendChatRequest {
                     conversation_id: req.conversation_id,
                     text: model_message,
+                    display_text: Some(display_message(&snapshot)),
                     message_id: req.message_id.clone(),
                     images: Vec::new(),
                     files: Vec::new(),
@@ -503,6 +590,17 @@ async fn load_snapshot(
     let snapshot: AddressFeedbackSnapshot = serde_json::from_slice(&payload)
         .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
     Ok(Some((snapshot, u64::try_from(version).unwrap_or(0))))
+}
+
+fn display_message(snapshot: &AddressFeedbackSnapshot) -> String {
+    if let Some(target) = snapshot.target.as_ref() {
+        return format!(
+            "Address PR #{} feedback using captured context artifact `{}`",
+            target.pr_number,
+            snapshot.artifact_path.as_deref().unwrap_or("unknown")
+        );
+    }
+    "Address PR feedback using captured context".to_string()
 }
 
 fn response_from_completed_snapshot(
