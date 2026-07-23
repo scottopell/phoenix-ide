@@ -7177,6 +7177,7 @@ def _bare_layout() -> dict[str, Path]:
         "environment": root / "config/phoenix.env",
         "transactions": root / "deploy/transactions",
         "status": root / "deploy/status.json",
+        "active": root / "deploy/active",
         "socket": root / "run/supervisor.sock",
         "deployed_sha": root / "deployed.sha",
     }
@@ -7289,6 +7290,119 @@ def _discard_unclaimed_bare_transaction(transaction: Path) -> None:
     shutil.rmtree(transaction)
 
 
+def _apply_bare_env_defaults(env: dict[str, str]) -> None:
+    """Fill the bare-supervisor child env defaults the supervisor cannot infer.
+
+    The supervisor launches Phoenix from a frozen snapshot with no login-shell
+    inheritance, so HOME/PATH and the prod data-dir layout must be materialized
+    into the snapshot here. Shared by deploy and restart so the two paths cannot
+    drift into launching the child with different implicit defaults."""
+    env.setdefault("HOME", str(Path.home()))
+    env.setdefault("PATH", os.environ.get("PATH", os.defpath))
+    env.setdefault("PHOENIX_PORT", str(PROD_PORT))
+    env.setdefault("PHOENIX_DB_PATH", str(Path.home() / ".phoenix-ide/prod.db"))
+    env.setdefault("PHOENIX_LOG_FILE", str(Path.home() / ".phoenix-ide/prod.log"))
+    env.setdefault("PHOENIX_LOG_STDOUT", "false")
+
+
+def _prepare_installed_candidate(layout: dict[str, Path]) -> PreparedCandidate:
+    """Reuse the currently-installed bare binary as the deployment candidate.
+
+    A restart refreshes the environment without rebuilding, so the candidate is
+    the binary already on disk. Its identity is read back from the binary itself
+    and cross-checked against the recorded source commit, mirroring the
+    invariants a freshly built local candidate must satisfy."""
+    binary = layout["binary"]
+    if not binary.is_file():
+        raise SystemExit("no installed bare production binary to restart; run './dev.py prod deploy' first")
+    identity = RuntimeIdentity.from_value(_binary_identity(binary))
+    if not layout["deployed_sha"].is_file():
+        raise SystemExit("installed bare production has no recorded source commit; run './dev.py prod deploy' first")
+    source_commit = layout["deployed_sha"].read_text().strip()
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        raise SystemExit("installed bare production has a malformed source commit; run './dev.py prod deploy' first")
+    if not source_commit.startswith(identity.git_sha.removesuffix("-dirty")):
+        raise SystemExit(
+            f"installed binary identity {identity.git_sha} does not match recorded commit "
+            f"{source_commit[:12]}; run './dev.py prod deploy' first"
+        )
+    return PreparedCandidate(
+        binary=binary,
+        source_kind=ProdSourceKind.INSTALLED_RESTART,
+        source_commit=source_commit,
+        identity=identity,
+    )
+
+
+def _commit_bare_transaction(
+    layout: dict[str, Path],
+    prepared: PreparedCandidate,
+    env_snapshot: dict[str, str],
+    transaction_id: str,
+    previous_running: bool,
+) -> None:
+    """Stage an immutable transaction for `prepared` and activate it through the
+    running supervisor. Shared by deploy (new binary) and restart (installed
+    binary, refreshed env); on activation failure it discards the unclaimed
+    transaction and raises. The supervisor performs the stop/swap/health-check/
+    rollback dance under its activation lock."""
+    transaction = layout["transactions"] / transaction_id
+    transaction.mkdir(parents=True, mode=0o700)
+    candidate = transaction / "candidate-binary"
+    shutil.copy2(prepared.binary, candidate)
+    candidate.chmod(0o600)
+    candidate_env = transaction / "candidate.env"
+    candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
+    candidate_env.chmod(0o600)
+    previous_identity, previous_health_url = _installed_bare_runtime(layout["binary"], layout["environment"])
+    rollback_binary = None
+    rollback_env = None
+    if previous_identity is not None:
+        if not layout["environment"].is_file():
+            raise SystemExit("installed bare production lacks rollback environment")
+        rollback_binary = transaction / "rollback-binary"
+        rollback_env = transaction / "rollback.env"
+        shutil.copy2(layout["binary"], rollback_binary)
+        shutil.copy2(layout["environment"], rollback_env)
+        rollback_binary.chmod(0o600)
+        rollback_env.chmod(0o600)
+    manifest = {
+        "manifest_version": 1,
+        "transaction_id": transaction_id,
+        "expected": prepared.identity.as_dict(),
+        "previous": previous_identity.as_dict() if previous_identity else None,
+        "expected_health_url": _bare_api_health_url(env_snapshot),
+        "previous_health_url": previous_health_url,
+        "candidate_binary": {"name": candidate.name, "sha256": _file_sha256(candidate)},
+        "candidate_environment": {"name": candidate_env.name, "sha256": _file_sha256(candidate_env)},
+        "rollback_binary": {"name": rollback_binary.name, "sha256": _file_sha256(rollback_binary)} if rollback_binary else None,
+        "rollback_environment": {"name": rollback_env.name, "sha256": _file_sha256(rollback_env)} if rollback_env else None,
+        "source_commit": prepared.source_commit,
+        "previous_deployed_sha": layout["deployed_sha"].read_text().strip() if layout["deployed_sha"].exists() else None,
+        "previous_running": previous_running,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    manifest_path = transaction / "manifest.json"
+    _write_json_atomic(manifest_path, manifest)
+    manifest_hash = _file_sha256(manifest_path)
+    for artifact in transaction.iterdir():
+        artifact.chmod(0o400)
+    transaction.chmod(0o500)
+
+    result = subprocess.run([
+        sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]),
+        "activate", "--transaction-id", transaction_id, "--manifest-sha256", manifest_hash,
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        if not layout["active"].exists():
+            _discard_unclaimed_bare_transaction(layout["transactions"] / transaction_id)
+        raise SystemExit(f"bare deployment failed: {(result.stderr or result.stdout).strip()}")
+    response = json.loads(result.stdout)
+    state = response.get("state")
+    if state != "committed":
+        raise SystemExit(f"bare deployment ended in {state}; run ./dev.py prod status")
+
+
 def prod_daemon_deploy(
     release: str | None = None,
     *,
@@ -7305,12 +7419,7 @@ def prod_daemon_deploy(
     env_snapshot = _load_installed_env(layout["environment"]) if controller.enabled else {}
     if not controller.enabled:
         _load_env_file(env_snapshot)
-    env_snapshot.setdefault("HOME", str(Path.home()))
-    env_snapshot.setdefault("PATH", os.environ.get("PATH", os.defpath))
-    env_snapshot.setdefault("PHOENIX_PORT", str(PROD_PORT))
-    env_snapshot.setdefault("PHOENIX_DB_PATH", str(Path.home() / ".phoenix-ide/prod.db"))
-    env_snapshot.setdefault("PHOENIX_LOG_FILE", str(Path.home() / ".phoenix-ide/prod.log"))
-    env_snapshot.setdefault("PHOENIX_LOG_STDOUT", "false")
+    _apply_bare_env_defaults(env_snapshot)
     _preflight_prod_bind_auth(env_snapshot, socket_activated=False)
     transaction_id = controller.transaction_id or uuid.uuid4().hex
 
@@ -7342,62 +7451,8 @@ def prod_daemon_deploy(
         )
         _configure_bare_reboot_persistence(layout)
         previous_running = _bare_child_running(layout)
+        _commit_bare_transaction(layout, prepared, env_snapshot, transaction_id, previous_running)
 
-        transaction = layout["transactions"] / transaction_id
-        transaction.mkdir(parents=True, mode=0o700)
-        candidate = transaction / "candidate-binary"
-        shutil.copy2(prepared.binary, candidate)
-        candidate.chmod(0o600)
-        candidate_env = transaction / "candidate.env"
-        candidate_env.write_text(_serialize_env_snapshot(env_snapshot))
-        candidate_env.chmod(0o600)
-        previous_identity, previous_health_url = _installed_bare_runtime(layout["binary"], layout["environment"])
-        rollback_binary = None
-        rollback_env = None
-        if previous_identity is not None:
-            if not layout["environment"].is_file():
-                raise SystemExit("installed bare production lacks rollback environment")
-            rollback_binary = transaction / "rollback-binary"
-            rollback_env = transaction / "rollback.env"
-            shutil.copy2(layout["binary"], rollback_binary)
-            shutil.copy2(layout["environment"], rollback_env)
-            rollback_binary.chmod(0o600)
-            rollback_env.chmod(0o600)
-        manifest = {
-            "manifest_version": 1,
-            "transaction_id": transaction_id,
-            "expected": prepared.identity.as_dict(),
-            "previous": previous_identity.as_dict() if previous_identity else None,
-            "expected_health_url": _bare_api_health_url(env_snapshot),
-            "previous_health_url": previous_health_url,
-            "candidate_binary": {"name": candidate.name, "sha256": _file_sha256(candidate)},
-            "candidate_environment": {"name": candidate_env.name, "sha256": _file_sha256(candidate_env)},
-            "rollback_binary": {"name": rollback_binary.name, "sha256": _file_sha256(rollback_binary)} if rollback_binary else None,
-            "rollback_environment": {"name": rollback_env.name, "sha256": _file_sha256(rollback_env)} if rollback_env else None,
-            "source_commit": prepared.source_commit,
-            "previous_deployed_sha": layout["deployed_sha"].read_text().strip() if layout["deployed_sha"].exists() else None,
-            "previous_running": previous_running,
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }
-        manifest_path = transaction / "manifest.json"
-        _write_json_atomic(manifest_path, manifest)
-        manifest_hash = _file_sha256(manifest_path)
-        for artifact in transaction.iterdir():
-            artifact.chmod(0o400)
-        transaction.chmod(0o500)
-
-    result = subprocess.run([
-        sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]),
-        "activate", "--transaction-id", transaction_id, "--manifest-sha256", manifest_hash,
-    ], capture_output=True, text=True)
-    if result.returncode != 0:
-        if not layout["active"].exists():
-            _discard_unclaimed_bare_transaction(layout["transactions"] / transaction_id)
-        raise SystemExit(f"bare deployment failed: {(result.stderr or result.stdout).strip()}")
-    response = json.loads(result.stdout)
-    state = response.get("state")
-    if state != "committed":
-        raise SystemExit(f"bare deployment ended in {state}; run ./dev.py prod status")
     print("\n✓ Deployed through persistent bare Linux supervisor")
     print(f"  Transaction: {transaction_id}")
     print(f"  Candidate: {prepared.identity.version} ({prepared.identity.git_sha})")
@@ -7452,6 +7507,36 @@ def prod_daemon_stop():
     if result.returncode != 0:
         raise SystemExit(f"failed to stop supervised Phoenix: {(result.stderr or result.stdout).strip()}")
     print("✓ Phoenix stopped; supervisor remains running")
+
+
+def prod_daemon_restart():
+    """Restart the supervised Phoenix child on the installed binary with a fresh
+    environment snapshot, without rebuilding or re-running pre-deploy checks.
+
+    This is the fast path for iterating on `.phoenix-ide.env`: the running binary
+    is reused verbatim and only the environment is re-snapshotted, then pushed
+    through the same activation transaction as a deploy so a bad env rolls back
+    to the previous one automatically."""
+    import uuid
+
+    layout = _bare_layout()
+    if not layout["socket"].exists():
+        raise SystemExit("no bare Linux supervisor running; run './dev.py prod deploy' first")
+
+    env_snapshot: dict[str, str] = {}
+    _load_env_file(env_snapshot)
+    _apply_bare_env_defaults(env_snapshot)
+    _preflight_prod_bind_auth(env_snapshot, socket_activated=False)
+
+    prepared = _prepare_installed_candidate(layout)
+    previous_running = _bare_child_running(layout)
+    transaction_id = uuid.uuid4().hex
+    _commit_bare_transaction(layout, prepared, env_snapshot, transaction_id, previous_running)
+    print("\n✓ Restarted through persistent bare Linux supervisor")
+    print(f"  Transaction: {transaction_id}")
+    print(f"  Running: {prepared.identity.version} ({prepared.identity.git_sha}) — binary unchanged")
+    print("  Environment: re-snapshotted from .phoenix-ide.env")
+    print(f"  Logs: {Path.home() / '.phoenix-ide/prod.log'}")
 
 
 
@@ -7776,6 +7861,9 @@ def _file_sha256(path: Path) -> str:
 class ProdSourceKind(enum.Enum):
     LOCAL_HEAD = "local_head"
     PUBLISHED_RELEASE = "published_release"
+    # A restart reuses the already-installed binary verbatim; no source is
+    # materialized or rebuilt, only the environment snapshot is refreshed.
+    INSTALLED_RESTART = "installed_restart"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -8689,6 +8777,22 @@ def cmd_prod_stop():
         sys.exit(1)
 
 
+def cmd_prod_restart():
+    """Restart production, re-snapshotting the environment (auto-detects environment)."""
+    env = detect_prod_env()
+
+    if env == "daemon":
+        prod_daemon_restart()
+    elif env in {"launchd", "native"}:
+        raise SystemExit(
+            f"'prod restart' is only implemented for the bare-Linux supervisor backend; "
+            f"on the {env} backend, run './dev.py prod deploy' to pick up .phoenix-ide.env changes"
+        )
+    else:
+        print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _reject_prod_override_command() -> None:
     raise SystemExit(
         "prod set/unset no longer mutate production configuration; "
@@ -8934,6 +9038,10 @@ def main():
     deploy_parser.add_argument("--transaction-id", help=argparse.SUPPRESS)
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
+    prod_sub.add_parser(
+        "restart",
+        help="Restart production on the installed binary, re-snapshotting .phoenix-ide.env (bare-Linux backend)",
+    )
     # Override management
     override_set_parser = prod_sub.add_parser("set", help="Set environment override")
     override_set_parser.add_argument("name", help="Environment variable name (e.g., RUST_LOG)")
@@ -9075,6 +9183,8 @@ def main():
             cmd_prod_status()
         elif args.prod_command == "stop":
             cmd_prod_stop()
+        elif args.prod_command == "restart":
+            cmd_prod_restart()
         elif args.prod_command == "set":
             cmd_prod_override_set(args.name, args.value)
         elif args.prod_command == "unset":
