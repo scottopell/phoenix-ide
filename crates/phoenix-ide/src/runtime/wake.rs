@@ -609,23 +609,49 @@ async fn deliver_pending(
 }
 
 #[derive(serde::Serialize)]
-struct BashWakeObservation<'a> {
+struct BashTombstonedWakeObservation<'a> {
     contract_id: &'a str,
-    handle: &'a str,
-    cmd: &'a str,
-    label: Option<&'a str>,
     status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    final_cause: Option<&'static str>,
-    exit_code: Option<i32>,
-    duration_ms: Option<u64>,
-    signal_number: Option<i32>,
-    kill_signal_sent: Option<&'a str>,
-    finished_at: String,
-    start_offset: u64,
-    end_offset: u64,
-    truncated_before: bool,
-    lines: Vec<phoenix_core::domain::tool_wire::BashRingLine>,
+    #[serde(flatten)]
+    payload: phoenix_core::domain::tool_wire::BashTombstonedPayload,
+}
+
+#[derive(serde::Serialize)]
+struct BashKillPendingWakeObservation<'a> {
+    contract_id: &'a str,
+    status: &'static str,
+    #[serde(flatten)]
+    payload: phoenix_core::domain::tool_wire::BashKillPendingKernelPayload,
+}
+
+fn wake_bash_window(
+    evidence: &phoenix_workflow::wake_profile::BashTerminalEvidence,
+) -> phoenix_core::domain::tool_wire::BashRingWindow {
+    phoenix_core::domain::tool_wire::BashRingWindow {
+        start_offset: evidence.final_tail_start_offset,
+        end_offset: evidence.final_tail_end_offset,
+        truncated_before: evidence.final_tail_truncated_before,
+        lines: evidence
+            .final_tail
+            .iter()
+            .enumerate()
+            .map(
+                |(ordinal, bytes)| phoenix_core::domain::tool_wire::BashRingLine {
+                    offset: evidence
+                        .final_tail_start_offset
+                        .saturating_add(u64::try_from(ordinal).unwrap_or(u64::MAX)),
+                    bytes: bytes.clone(),
+                },
+            )
+            .collect(),
+        partial: None,
+    }
+}
+
+fn timestamp_rfc3339(timestamp: Timestamp) -> String {
+    chrono::DateTime::from_timestamp(i64::try_from(timestamp.0).unwrap_or(i64::MAX), 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+        .to_rfc3339()
 }
 
 fn render_terminal_result(pending: &WakePendingDelivery) -> String {
@@ -634,50 +660,50 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
             contract_id,
             evidence: WakeTerminalEvidence::Bash(evidence),
             ..
-        } => {
-            let lines = evidence
-                .final_tail
-                .iter()
-                .enumerate()
-                .map(
-                    |(ordinal, bytes)| phoenix_core::domain::tool_wire::BashRingLine {
-                        offset: evidence
-                            .final_tail_start_offset
-                            .saturating_add(u64::try_from(ordinal).unwrap_or(u64::MAX)),
-                        bytes: bytes.clone(),
+        } => match evidence.status {
+            BashTerminalStatus::Exited | BashTerminalStatus::Killed => {
+                serde_json::to_string(&BashTombstonedWakeObservation {
+                    contract_id,
+                    status: "tombstoned",
+                    payload: phoenix_core::domain::tool_wire::BashTombstonedPayload {
+                        handle: evidence.identity.handle_id.clone(),
+                        cmd: evidence.cmd.clone(),
+                        label: evidence.label.clone(),
+                        final_cause: match evidence.status {
+                            BashTerminalStatus::Exited => "exited".to_string(),
+                            BashTerminalStatus::Killed => "killed".to_string(),
+                            BashTerminalStatus::KillPendingKernel => unreachable!(),
+                        },
+                        exit_code: evidence.exit_code,
+                        signal_number: evidence.signal_number,
+                        duration_ms: evidence.duration_ms.unwrap_or_default(),
+                        finished_at: timestamp_rfc3339(evidence.occurred_at),
+                        kill_signal_sent: evidence.kill_signal_sent.clone(),
+                        kill_attempted_at: None,
+                        window: wake_bash_window(evidence),
+                        display: None,
+                        signal_sent: None,
                     },
-                )
-                .collect::<Vec<_>>();
-            serde_json::to_string(&BashWakeObservation {
-                contract_id,
-                handle: &evidence.identity.handle_id,
-                cmd: &evidence.cmd,
-                label: evidence.label.as_deref(),
-                status: match evidence.status {
-                    BashTerminalStatus::Exited | BashTerminalStatus::Killed => "tombstoned",
-                    BashTerminalStatus::KillPendingKernel => "kill_pending_kernel",
-                },
-                final_cause: match evidence.status {
-                    BashTerminalStatus::Exited => Some("exited"),
-                    BashTerminalStatus::Killed => Some("killed"),
-                    BashTerminalStatus::KillPendingKernel => None,
-                },
-                exit_code: evidence.exit_code,
-                duration_ms: evidence.duration_ms,
-                signal_number: evidence.signal_number,
-                kill_signal_sent: evidence.kill_signal_sent.as_deref(),
-                finished_at: chrono::DateTime::from_timestamp(
-                    i64::try_from(evidence.occurred_at.0).unwrap_or(i64::MAX),
-                    0,
-                )
-                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
-                .to_rfc3339(),
-                start_offset: evidence.final_tail_start_offset,
-                end_offset: evidence.final_tail_end_offset,
-                truncated_before: evidence.final_tail_truncated_before,
-                lines,
-            })
-        }
+                })
+            }
+            BashTerminalStatus::KillPendingKernel => {
+                serde_json::to_string(&BashKillPendingWakeObservation {
+                    contract_id,
+                    status: "kill_pending_kernel",
+                    payload: phoenix_core::domain::tool_wire::BashKillPendingKernelPayload {
+                        handle: evidence.identity.handle_id.clone(),
+                        cmd: evidence.cmd.clone(),
+                        label: evidence.label.clone(),
+                        window: wake_bash_window(evidence),
+                        kill_signal_sent: evidence.kill_signal_sent.clone().unwrap_or_default(),
+                        kill_attempted_at: timestamp_rfc3339(evidence.occurred_at),
+                        display: None,
+                        signal_sent: None,
+                        waited_ms: None,
+                    },
+                })
+            }
+        },
         terminal => serde_json::to_string(terminal),
     };
     rendered.unwrap_or_else(|_| "Wake completed; inspect display metadata for details.".to_string())
@@ -1386,6 +1412,13 @@ mod tests {
                 ..
             }
         ));
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_terminal_result(&pending[0])).unwrap();
+        assert_eq!(rendered["status"], "kill_pending_kernel");
+        assert_eq!(rendered["kill_attempted_at"], "1970-01-01T00:00:09+00:00");
+        assert_eq!(rendered["kill_signal_sent"], "TERM");
+        assert!(rendered.get("finished_at").is_none());
+        assert!(rendered.get("final_cause").is_none());
     }
 
     #[tokio::test]
