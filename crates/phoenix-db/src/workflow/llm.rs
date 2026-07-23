@@ -1580,6 +1580,64 @@ impl WorkflowRepository {
         )
     }
 
+    pub async fn claim_workflow_delivery(
+        &self,
+        workflow_id: WorkflowId,
+        delivery_id: DeliveryId,
+        process_incarnation: ProcessIncarnation,
+        claimed_at: Timestamp,
+    ) -> DbResult<bool> {
+        let claimed = sqlx::query(
+            "INSERT INTO workflow_delivery_claims (
+                 workflow_id, delivery_id, process_incarnation, claimed_at
+             )
+             SELECT ?1, ?2, ?3, ?4
+             WHERE EXISTS (
+                 SELECT 1 FROM workflow_deliveries
+                 WHERE workflow_id = ?1 AND delivery_id = ?2
+                   AND runtime_acceptance_status = 'Owed'
+             )
+             ON CONFLICT(workflow_id, delivery_id) DO NOTHING",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(to_i64(delivery_id.0, "delivery_id")?)
+        .bind(to_i64(process_incarnation.0, "process_incarnation")?)
+        .bind(to_i64(claimed_at.0, "claimed_at")?)
+        .execute(&self.pool)
+        .await?;
+        Ok(claimed.rows_affected() == 1)
+    }
+
+    pub async fn release_workflow_delivery_claim(
+        &self,
+        workflow_id: WorkflowId,
+        delivery_id: DeliveryId,
+        process_incarnation: ProcessIncarnation,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "DELETE FROM workflow_delivery_claims
+             WHERE workflow_id = ?1 AND delivery_id = ?2 AND process_incarnation = ?3",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(to_i64(delivery_id.0, "delivery_id")?)
+        .bind(to_i64(process_incarnation.0, "process_incarnation")?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn reclaim_workflow_delivery_claims(
+        &self,
+        process_incarnation: ProcessIncarnation,
+    ) -> DbResult<u64> {
+        let deleted =
+            sqlx::query("DELETE FROM workflow_delivery_claims WHERE process_incarnation <> ?1")
+                .bind(to_i64(process_incarnation.0, "process_incarnation")?)
+                .execute(&self.pool)
+                .await?;
+        Ok(deleted.rows_affected())
+    }
+
     pub async fn interrupt_begun_top_level_llm_tools(
         &self,
         process_incarnation: ProcessIncarnation,
@@ -1589,9 +1647,13 @@ impl WorkflowRepository {
              SET status = 'Interrupted'
              WHERE ti.status = 'ExecutionMayHaveBegun'
                AND EXISTS (
-                   SELECT 1 FROM workflow_attempts a
-                   WHERE a.workflow_id = ti.workflow_id
-                     AND a.receipt_id = ti.receipt_id
+                   SELECT 1
+                   FROM workflow_receipts r
+                   JOIN workflow_attempts a
+                     ON a.workflow_id = r.workflow_id
+                    AND a.attempt_id = r.attempt_id
+                   WHERE r.workflow_id = ti.workflow_id
+                     AND r.receipt_id = ti.receipt_id
                      AND a.process_incarnation <> ?1
                )",
         )
@@ -3198,6 +3260,36 @@ mod tests {
             repo.load_owed_top_level_llm_receipts().await.unwrap().len(),
             1
         );
+        assert!(repo
+            .claim_workflow_delivery(
+                WorkflowId(1),
+                DeliveryId(1),
+                ProcessIncarnation(7),
+                Timestamp(6),
+            )
+            .await
+            .unwrap());
+        assert!(!repo
+            .claim_workflow_delivery(
+                WorkflowId(1),
+                DeliveryId(1),
+                ProcessIncarnation(7),
+                Timestamp(7),
+            )
+            .await
+            .unwrap());
+        repo.release_workflow_delivery_claim(WorkflowId(1), DeliveryId(1), ProcessIncarnation(7))
+            .await
+            .unwrap();
+        assert!(repo
+            .claim_workflow_delivery(
+                WorkflowId(1),
+                DeliveryId(1),
+                ProcessIncarnation(7),
+                Timestamp(8),
+            )
+            .await
+            .unwrap());
         let tool_transition = ToolIntentTransitionInput {
             workflow_id: WorkflowId(1),
             receipt_id: ReceiptId(1),

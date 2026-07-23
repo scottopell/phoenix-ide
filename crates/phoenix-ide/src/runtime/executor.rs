@@ -8497,7 +8497,7 @@ fn render_rejected_tool_call(tool: &ToolCall) -> String {
     }
 }
 
-fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKind {
+pub(crate) fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKind {
     // Explicit match arms — no catch-all. The compiler enforces exhaustiveness.
     match kind {
         phoenix_llm::LlmErrorKind::Auth => crate::db::ErrorKind::Auth,

@@ -311,7 +311,24 @@ const MIGRATIONS: &[Migration] = &[
         name: "link_direct_turn_materialization",
         sql: MIGRATION_059,
     },
+    Migration {
+        version: 60,
+        name: "claim_workflow_deliveries",
+        sql: MIGRATION_060,
+    },
 ];
+
+const MIGRATION_060: &str = r"
+CREATE TABLE workflow_delivery_claims (
+    workflow_id INTEGER NOT NULL,
+    delivery_id INTEGER NOT NULL,
+    process_incarnation INTEGER NOT NULL CHECK (process_incarnation >= 0),
+    claimed_at INTEGER NOT NULL CHECK (claimed_at >= 0),
+    PRIMARY KEY (workflow_id, delivery_id),
+    FOREIGN KEY (workflow_id, delivery_id)
+        REFERENCES workflow_deliveries(workflow_id, delivery_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+";
 
 const MIGRATION_059: &str = r"
 ALTER TABLE direct_turn_acceptances

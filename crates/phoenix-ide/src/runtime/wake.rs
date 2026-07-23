@@ -158,6 +158,10 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .map_err(|error| error.to_string())?;
         self.run_once().await?;
         phoenix_db::WorkflowRepository::new(manager.db().pool().clone())
+            .reclaim_workflow_delivery_claims(super::process_incarnation())
+            .await
+            .map_err(|error| error.to_string())?;
+        phoenix_db::WorkflowRepository::new(manager.db().pool().clone())
             .interrupt_begun_top_level_llm_tools(super::process_incarnation())
             .await
             .map_err(|error| error.to_string())?;
@@ -386,12 +390,32 @@ async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> R
         .await
         .map_err(|error| error.to_string())?
     {
+        let incarnation = super::process_incarnation();
+        if !repo
+            .claim_workflow_delivery(
+                owed.workflow.workflow_id,
+                owed.delivery.delivery_id,
+                incarnation,
+                Timestamp(u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            continue;
+        }
         let durable: phoenix_llm::DurableLlmResponse =
             serde_json::from_str(&owed.llm_receipt.response_aggregate)
                 .map_err(|error| error.to_string())?;
         let handle = match manager.get_or_create(&owed.workflow.conversation_id).await {
             Ok(handle) => handle,
             Err(error) => {
+                repo.release_workflow_delivery_claim(
+                    owed.workflow.workflow_id,
+                    owed.delivery.delivery_id,
+                    incarnation,
+                )
+                .await
+                .map_err(|release_error| release_error.to_string())?;
                 tracing::warn!(%error, "owed LLM receipt runtime unavailable");
                 continue;
             }
@@ -420,6 +444,13 @@ async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> R
                 .unwrap_or_else(|| format!("llm-receipt-{}", owed.receipt.receipt_id.0)),
         };
         if let Err(error) = handle.event_tx.send(event).await {
+            repo.release_workflow_delivery_claim(
+                owed.workflow.workflow_id,
+                owed.delivery.delivery_id,
+                incarnation,
+            )
+            .await
+            .map_err(|release_error| release_error.to_string())?;
             tracing::warn!(error = %error, "owed LLM receipt runtime channel closed");
         }
     }
@@ -572,12 +603,17 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                 }
             }
             Err(error) => {
+                let error_kind = super::executor::llm_error_to_db_error(error.kind);
+                let recovery_in_progress = error.recovery_in_progress;
+                let resets_at = error.quota.as_ref().and_then(|quota| quota.resets_at);
+                let message = error.message;
+                let attempt = u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX);
                 repo.record_top_level_llm_failure(&phoenix_db::RecordTopLevelLlmFailureInput {
                     authority,
                     observed_at: Timestamp(
                         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
                     ),
-                    outcome_payload: error.to_string().into_bytes(),
+                    outcome_payload: message.as_bytes().to_vec(),
                 })
                 .await
                 .map_err(|error| error.to_string())?;
@@ -587,11 +623,11 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                 if let Err(send_error) = handle
                     .event_tx
                     .send(phoenix_core::domain::sm_event::Event::LlmError {
-                        message: error.to_string(),
-                        error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidResponse,
-                        attempt: 1,
-                        recovery_in_progress: false,
-                        resets_at: None,
+                        message,
+                        error_kind,
+                        attempt,
+                        recovery_in_progress,
+                        resets_at,
                     })
                     .await
                 {
