@@ -435,13 +435,16 @@ the report and the wiring share one source of truth and cannot disagree.
 THE SYSTEM SHALL identify deployment snapshots, managed-resource samples, and
 disk samples as point-in-time measurements.
 
-WHEN the user requests a general refresh
-THE SYSTEM SHALL re-sample the general deployment snapshot and SHALL trigger a
-fresh managed-resource sample rather than serving cached values.
+WHEN the user requests a deployment-facts refresh
+THE SYSTEM SHALL re-sample the deployment snapshot without requiring resource or
+disk samples to reload.
 
-WHEN the user requests a disk-only refresh
-THE SYSTEM SHALL re-sample disk values without requiring the general deployment
-snapshot to reload.
+WHEN the user requests a disk refresh
+THE SYSTEM SHALL re-sample disk values without requiring deployment facts or
+resource samples to reload.
+
+WHILE the page is visible, THE SYSTEM SHALL refresh managed-resource samples on
+their demand-driven cadence independently of either manual refresh action.
 
 **Rationale:** Memory, CPU, and disk sizes drift continuously. A value with no
 notion of when it was taken invites the reader to trust a stale number. Sampled

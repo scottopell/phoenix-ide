@@ -13,7 +13,7 @@ import type { ConversationUsageDetail } from './generated/ConversationUsageDetai
 // Phoenix API Client
 
 export class ApiResponseError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly code?: string) {
     super(message);
     this.name = 'ApiResponseError';
   }
@@ -1200,13 +1200,15 @@ export const api = {
     });
     if (!resp.ok) {
       let detail = 'Failed to start release update';
+      let code: string | undefined;
       try {
-        const body = (await resp.json()) as { error?: string };
+        const body = (await resp.json()) as { error?: string; code?: string };
         if (body.error) detail = body.error;
+        code = body.code;
       } catch {
         // keep fallback
       }
-      throw new ApiResponseError(detail, resp.status);
+      throw new ApiResponseError(detail, resp.status, code);
     }
     return resp.json();
   },

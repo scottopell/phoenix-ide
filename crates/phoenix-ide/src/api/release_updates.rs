@@ -718,7 +718,10 @@ pub async fn approve(
         Err(error) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": error })),
+                Json(serde_json::json!({
+                    "error": error,
+                    "code": "release_discovery_failed"
+                })),
             )
                 .into_response()
         }

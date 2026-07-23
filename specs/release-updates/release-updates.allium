@@ -93,6 +93,7 @@ entity UpdateController {
     discovery_trigger: DiscoveryTrigger?
     transaction_observation: TransactionObservation
     transaction_polling: Boolean
+    committed_reconciliation_pending: Boolean
 
     transitions connection {
         connected -> disconnected
@@ -182,10 +183,27 @@ rule TransientTransactionSampleRetainsActiveStatus {
     ensures: controller.transaction_polling = true
 }
 
-rule TerminalTransactionStopsPolling {
+rule CommittedTransactionPollsUntilReconciled {
+    when: CommittedTransactionNeedsReconciliation(controller)
+    requires: controller.installation != null
+    requires: controller.installation.state = committed
+    ensures: controller.committed_reconciliation_pending = true
+    ensures: controller.transaction_polling = true
+}
+
+rule SuccessfulCommittedReconciliationStopsPolling {
+    when: CommittedTransactionReconciled(controller)
+    requires: controller.installation != null
+    requires: controller.installation.state = committed
+    requires: controller.committed_reconciliation_pending
+    ensures: controller.committed_reconciliation_pending = false
+    ensures: controller.transaction_polling = false
+}
+
+rule NoncommittedTerminalTransactionStopsPolling {
     when: TransactionTerminalObserved(controller)
     requires: controller.installation != null
-    requires: controller.installation.state in { committed, rolled_back, rollback_failed, rejected, failed }
+    requires: controller.installation.state in { rolled_back, rollback_failed, rejected, failed }
     ensures: controller.transaction_observation = readable
     ensures: controller.transaction_polling = false
 }

@@ -236,7 +236,8 @@ export function ReleaseUpdatePanel({
       approvedTransactionId = approval.transaction_id;
     } catch (cause) {
       if (mounted.current) {
-        if (cause instanceof ApiResponseError && cause.status === 409) {
+        if (cause instanceof ApiResponseError
+          && (cause.status === 409 || cause.code === 'release_discovery_failed')) {
           markDiscoveryStale(cause.message);
           setApprovalError(null);
         } else {
