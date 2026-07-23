@@ -85,6 +85,15 @@ pub trait MessageStore: Send + Sync {
         Ok(phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict)
     }
 
+    async fn persist_queued_steering_message(
+        &self,
+        _conversation_id: &str,
+        _client_message_id: &str,
+        _message: &Message,
+    ) -> Result<phoenix_db::PersistQueuedSteeringMessageOutcome, String> {
+        Ok(phoenix_db::PersistQueuedSteeringMessageOutcome::LegacyQueueEntry)
+    }
+
     async fn consume_queued_steering_batch(
         &self,
         _conversation_id: &str,
@@ -928,6 +937,18 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
         self.db
             .persist_direct_turn_runtime_acceptance(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_queued_steering_message(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        message: &Message,
+    ) -> Result<phoenix_db::PersistQueuedSteeringMessageOutcome, String> {
+        self.db
+            .persist_queued_steering_message(conversation_id, client_message_id, message)
             .await
             .map_err(|error| error.to_string())
     }

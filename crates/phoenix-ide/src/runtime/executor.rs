@@ -4308,6 +4308,72 @@ where
         }))
     }
 
+    async fn persist_message_effect(
+        &self,
+        content: MessageContent,
+        display_data: Option<serde_json::Value>,
+        usage_data: Option<crate::db::UsageData>,
+        message_id: String,
+        idempotent: bool,
+    ) -> Result<Option<crate::db::Message>, String> {
+        let sequence_id = self.broadcast_tx.next_seq();
+        let proposed = crate::db::Message {
+            message_id: message_id.clone(),
+            conversation_id: self.context.conversation_id.clone(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data,
+            usage_data,
+            created_at: Utc::now(),
+        };
+        if !idempotent {
+            return self
+                .storage
+                .add_message_with_seq(
+                    &message_id,
+                    &self.context.conversation_id,
+                    sequence_id,
+                    &proposed.content,
+                    proposed.display_data.as_ref(),
+                    proposed.usage_data.as_ref(),
+                )
+                .await
+                .map(Some);
+        }
+
+        match self
+            .storage
+            .persist_queued_steering_message(&self.context.conversation_id, &message_id, &proposed)
+            .await?
+        {
+            phoenix_db::PersistQueuedSteeringMessageOutcome::Committed(message) => {
+                Ok(Some(*message))
+            }
+            phoenix_db::PersistQueuedSteeringMessageOutcome::ExactReplay => Ok(None),
+            phoenix_db::PersistQueuedSteeringMessageOutcome::LegacyQueueEntry => {
+                if self.storage.message_exists(&message_id).await? {
+                    Ok(None)
+                } else {
+                    self.storage
+                        .add_message_with_seq(
+                            &message_id,
+                            &self.context.conversation_id,
+                            sequence_id,
+                            &proposed.content,
+                            proposed.display_data.as_ref(),
+                            proposed.usage_data.as_ref(),
+                        )
+                        .await
+                        .map(Some)
+                }
+            }
+            phoenix_db::PersistQueuedSteeringMessageOutcome::Conflict => Err(format!(
+                "queued steering materialization lost authority for {message_id}"
+            )),
+        }
+    }
+
     /// Execute an effect and optionally return a generated event
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
@@ -4319,42 +4385,26 @@ where
                 message_id,
                 idempotent,
             } => {
-                // Idempotent path: skip if already persisted. Prevents double-
-                // insert (and seq gap) when a SteerDrainedUserMessages re-fires
-                // after crash recovery before ClearSteeringQueueEntries ran.
-                // Gated to idempotent=true so non-replayable persists pay no
-                // extra query.
-                if idempotent && self.storage.message_exists(&message_id).await? {
-                    tracing::debug!(
-                        message_id = %message_id,
-                        "Skipping PersistMessage; message already exists"
-                    );
-                    return Ok(None);
+                let msg = Box::pin(self.persist_message_effect(
+                    content,
+                    display_data,
+                    usage_data,
+                    message_id.clone(),
+                    idempotent,
+                ))
+                .await?;
+                if let Some(msg) = msg {
+                    if idempotent {
+                        tracing::info!(
+                            conversation_id = %self.context.conversation_id,
+                            client_message_id = %message_id,
+                            materialized_message_id = %msg.message_id,
+                            sequence_id = msg.sequence_id,
+                            "Persisted drained steering message"
+                        );
+                    }
+                    let _ = self.broadcast_tx.send_message(msg);
                 }
-
-                let seq = self.broadcast_tx.next_seq();
-                let msg = self
-                    .storage
-                    .add_message_with_seq(
-                        &message_id,
-                        &self.context.conversation_id,
-                        seq,
-                        &content,
-                        display_data.as_ref(),
-                        usage_data.as_ref(),
-                    )
-                    .await?;
-                if idempotent {
-                    tracing::info!(
-                        conversation_id = %self.context.conversation_id,
-                        message_id = %message_id,
-                        sequence_id = seq,
-                        "Persisted drained steering message"
-                    );
-                }
-
-                // Broadcast to clients (display_data already computed at effect creation)
-                let _ = self.broadcast_tx.send_message(msg);
                 Ok(None)
             }
 

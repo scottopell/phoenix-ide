@@ -4404,6 +4404,95 @@ impl Database {
         ))
     }
 
+    /// Persists a queued steering message using its target-scoped acceptance identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when message persistence or materialization linking fails.
+    pub async fn persist_queued_steering_message(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        message: &Message,
+    ) -> DbResult<PersistQueuedSteeringMessageOutcome> {
+        if message.conversation_id != conversation_id
+            || message.message_id != client_message_id
+            || message.message_type != message.content.message_type()
+        {
+            return Ok(PersistQueuedSteeringMessageOutcome::Conflict);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let acceptance = sqlx::query_as::<_, (i64, String, Option<String>)>(
+            "SELECT workflow_id, committed_outcome, materialized_message_id
+             FROM direct_turn_acceptances
+             WHERE conversation_id = ?1 AND client_message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(client_message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((workflow_id, committed_outcome, materialized_message_id)) = acceptance else {
+            tx.rollback().await?;
+            return Ok(PersistQueuedSteeringMessageOutcome::LegacyQueueEntry);
+        };
+
+        if let Some(materialized_message_id) = materialized_message_id {
+            let replay = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM messages
+                 WHERE message_id = ?1 AND conversation_id = ?2",
+            )
+            .bind(materialized_message_id)
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await?
+                == 1;
+            tx.rollback().await?;
+            return Ok(if replay {
+                PersistQueuedSteeringMessageOutcome::ExactReplay
+            } else {
+                PersistQueuedSteeringMessageOutcome::Conflict
+            });
+        }
+        if committed_outcome != "QueuedSteering" {
+            tx.rollback().await?;
+            return Ok(PersistQueuedSteeringMessageOutcome::Conflict);
+        }
+
+        let mut persisted_message = message.clone();
+        let globally_owned =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                .bind(client_message_id)
+                .fetch_one(&mut *tx)
+                .await?
+                != 0;
+        if globally_owned {
+            persisted_message.message_id = format!("direct-turn-{workflow_id}-{client_message_id}");
+        }
+        insert_message_tx(&mut tx, &persisted_message).await?;
+        let linked = sqlx::query(
+            "UPDATE direct_turn_acceptances
+             SET materialized_message_id = ?3
+             WHERE workflow_id = ?1 AND conversation_id = ?2
+               AND client_message_id = ?4 AND committed_outcome = 'QueuedSteering'
+               AND materialized_message_id IS NULL",
+        )
+        .bind(workflow_id)
+        .bind(conversation_id)
+        .bind(&persisted_message.message_id)
+        .bind(client_message_id)
+        .execute(&mut *tx)
+        .await?;
+        if linked.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PersistQueuedSteeringMessageOutcome::Conflict);
+        }
+        tx.commit().await?;
+        Ok(PersistQueuedSteeringMessageOutcome::Committed(Box::new(
+            persisted_message,
+        )))
+    }
+
     /// Atomically consumes one owed LLM delivery into product state.
     ///
     /// # Errors
@@ -12101,6 +12190,103 @@ mod tests {
                 .await
                 .unwrap(),
             PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_steering_materialization_rewrites_cross_target_message_id_collision() {
+        let db = Database::open_in_memory().await.unwrap();
+        for conversation_id in ["conv-owner", "conv-steering"] {
+            db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        db.add_message(
+            "shared-client-id",
+            "conv-owner",
+            &MessageContent::user("owner"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let repo = WorkflowRepository::new(db.pool().clone());
+        let acceptance = repo
+            .accept_direct_turn(&DirectTurnAcceptanceInput {
+                initial_outcome: DirectTurnInitialOutcome::QueuedSteering {
+                    entry: Box::new(phoenix_core::domain::sm_event::SteerEntry {
+                        message_id: "shared-client-id".to_string(),
+                        text: "steer".to_string(),
+                        llm_text: None,
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        user_agent: None,
+                        skill_invocation: None,
+                    }),
+                },
+                conversation_id: "conv-steering".to_string(),
+                client_message_id: "shared-client-id".to_string(),
+                prepared_fingerprint: "steering-fingerprint".to_string(),
+                prepared_payload: "{}".to_string(),
+                accepted_at: Timestamp(1),
+                snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                    turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                        conversation_id: "conv-steering".to_string(),
+                        accepted_turn_id: "shared-client-id".to_string(),
+                        generation: 1,
+                    },
+                    accepted_assistant_message_id: None,
+                    stopped_at: None,
+                },
+            })
+            .await
+            .unwrap();
+        let workflow_id = match acceptance {
+            DirectTurnAcceptanceOutcome::Created(record) => record.workflow_id,
+            other @ (DirectTurnAcceptanceOutcome::Replayed(_)
+            | DirectTurnAcceptanceOutcome::RetryablePersistence
+            | DirectTurnAcceptanceOutcome::Conflict) => {
+                panic!("unexpected acceptance: {other:?}")
+            }
+        };
+        let proposed = Message {
+            message_id: "shared-client-id".to_string(),
+            conversation_id: "conv-steering".to_string(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::user("steer"),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let persisted = db
+            .persist_queued_steering_message("conv-steering", "shared-client-id", &proposed)
+            .await
+            .unwrap();
+        let materialized_id = match persisted {
+            PersistQueuedSteeringMessageOutcome::Committed(message) => message.message_id.clone(),
+            other @ (PersistQueuedSteeringMessageOutcome::ExactReplay
+            | PersistQueuedSteeringMessageOutcome::LegacyQueueEntry
+            | PersistQueuedSteeringMessageOutcome::Conflict) => {
+                panic!("unexpected persistence outcome: {other:?}")
+            }
+        };
+        assert_eq!(
+            materialized_id,
+            format!("direct-turn-{}-shared-client-id", workflow_id.0)
+        );
+        assert_eq!(
+            repo.load_direct_turn_materialized_message_id("conv-steering", "shared-client-id")
+                .await
+                .unwrap(),
+            Some(materialized_id)
+        );
+        assert!(matches!(
+            db.persist_queued_steering_message("conv-steering", "shared-client-id", &proposed)
+                .await
+                .unwrap(),
+            PersistQueuedSteeringMessageOutcome::ExactReplay
         ));
     }
 

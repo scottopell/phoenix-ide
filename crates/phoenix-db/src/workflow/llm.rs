@@ -265,6 +265,14 @@ pub enum PersistDirectTurnRuntimeAcceptanceOutcome {
     RetryablePersistence,
 }
 
+#[derive(Debug, Clone)]
+pub enum PersistQueuedSteeringMessageOutcome {
+    Committed(Box<crate::Message>),
+    ExactReplay,
+    LegacyQueueEntry,
+    Conflict,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwedTopLevelLlmReceipt {
     pub workflow: TopLevelLlmWorkflowRecord,
