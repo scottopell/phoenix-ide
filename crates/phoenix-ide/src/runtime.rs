@@ -1877,6 +1877,7 @@ impl RuntimeManager {
             let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
                 work_scope,
                 Some(&actor),
+                conv.runtime_role == crate::work_scope::RuntimeRole::User,
                 self.bash_handles(),
                 self.tmux_registry(),
                 self.browser_sessions(),

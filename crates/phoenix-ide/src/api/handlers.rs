@@ -3040,10 +3040,19 @@ async fn get_work_scope_inventory(
     let work_scope = crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
         .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
     let actor = work_scope_actor(&state, &work_scope, &query.conversation_id).await?;
+    let tmux_visible = state
+        .runtime
+        .db()
+        .get_conversation(&query.conversation_id)
+        .await
+        .is_ok_and(|conversation| {
+            conversation.runtime_role == crate::work_scope::RuntimeRole::User
+        });
 
     let mut inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
         &work_scope,
         Some(&actor),
+        tmux_visible,
         state.runtime.bash_handles(),
         state.runtime.tmux_registry(),
         state.runtime.browser_sessions(),
@@ -4713,6 +4722,7 @@ async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::
     let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
         &scope,
         None,
+        true,
         state.runtime.bash_handles(),
         state.runtime.tmux_registry(),
         state.runtime.browser_sessions(),

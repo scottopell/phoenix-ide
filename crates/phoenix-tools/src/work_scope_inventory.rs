@@ -31,6 +31,7 @@ use crate::tmux::registry::{ServerStatus, TmuxRegistry};
 pub async fn assemble_inventory(
     work_scope: &ResourceScopeKey,
     actor: Option<&EffectiveResourceAccess>,
+    tmux_visible: bool,
     bash_handles: &Arc<BashHandleRegistry>,
     tmux_registry: &Arc<TmuxRegistry>,
     browser_sessions: &Arc<BrowserSessionManager>,
@@ -38,12 +39,10 @@ pub async fn assemble_inventory(
     WorkScopeInventory {
         scope_key: work_scope.stable_key(),
         bash: assemble_bash(work_scope, actor, bash_handles).await,
-        tmux: if actor.is_some_and(|access| {
-            access.authority() == phoenix_core::work_scope::ResourceAuthority::Restricted
-        }) {
-            None
-        } else {
+        tmux: if tmux_visible {
             assemble_tmux(work_scope, tmux_registry).await
+        } else {
+            None
         },
         browser: assemble_browser(work_scope, actor, browser_sessions).await,
         health_sampled_at: None,
@@ -184,7 +183,7 @@ mod tests {
         ));
         let browser = BrowserSessionManager::new();
 
-        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, true, &bash, &tmux, &browser).await;
         assert_eq!(inv.scope_key, scope().stable_key());
         assert!(inv.bash.is_empty());
         assert!(inv.tmux.is_none());
@@ -210,7 +209,7 @@ mod tests {
             "/tmp/phoenix-inv-test".into(),
         ));
         let browser = BrowserSessionManager::new();
-        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, true, &bash, &tmux, &browser).await;
 
         assert_eq!(inv.bash.len(), 1);
         let h = &inv.bash[0];
@@ -250,7 +249,8 @@ mod tests {
         let browser = BrowserSessionManager::new();
         let actor = EffectiveResourceAccess::new("sibling-a", ResourceAuthority::Restricted);
 
-        let inventory = assemble_inventory(&scope(), Some(&actor), &bash, &tmux, &browser).await;
+        let inventory =
+            assemble_inventory(&scope(), Some(&actor), false, &bash, &tmux, &browser).await;
 
         assert_eq!(inventory.bash.len(), 1);
         assert_eq!(inventory.bash[0].cmd, "secret-sibling-a");
@@ -278,7 +278,7 @@ mod tests {
             "/tmp/phoenix-inv-test".into(),
         ));
         let browser = BrowserSessionManager::new();
-        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, true, &bash, &tmux, &browser).await;
         assert_eq!(inv.bash[0].state, BashHandleState::KillPendingKernel);
     }
 
@@ -309,7 +309,7 @@ mod tests {
             "/tmp/phoenix-inv-test".into(),
         ));
         let browser = BrowserSessionManager::new();
-        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, true, &bash, &tmux, &browser).await;
         let h = &inv.bash[0];
         assert_eq!(h.state, BashHandleState::Tombstoned);
         assert_eq!(h.duration_ms, Some(7));
@@ -352,7 +352,7 @@ mod tests {
             "/tmp/phoenix-inv-test".into(),
         ));
         let browser = BrowserSessionManager::new();
-        let inv = assemble_inventory(&scope(), None, &bash, &tmux, &browser).await;
+        let inv = assemble_inventory(&scope(), None, true, &bash, &tmux, &browser).await;
         let h = &inv.bash[0];
         assert_eq!(h.state, BashHandleState::Tombstoned);
         // A signal kill projects the failure outcome: a recorded signal, no
