@@ -363,7 +363,7 @@ impl SendChatApplicationService {
                 conversation_id: conversation.id.clone(),
                 client_message_id: req.message_id.clone(),
                 prepared_fingerprint,
-                prepared_payload,
+                prepared_payload: prepared_payload.clone(),
                 accepted_at: phoenix_workflow::Timestamp(
                     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
                 ),
@@ -388,7 +388,52 @@ impl SendChatApplicationService {
                 ));
             }
             phoenix_db::DirectTurnAcceptanceOutcome::Conflict => {
-                return Err(SendChatServiceError::IdempotencyConflict);
+                let queued = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+                    .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+                        initial_outcome: phoenix_db::DirectTurnInitialOutcome::QueuedSteering {
+                            entry: Box::new(steer_entry_from_prepared(&prepared)),
+                        },
+                        conversation_id: conversation.id.clone(),
+                        client_message_id: req.message_id.clone(),
+                        prepared_fingerprint: prepared_direct_turn_fingerprint(&prepared_payload),
+                        prepared_payload,
+                        accepted_at: phoenix_workflow::Timestamp(
+                            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                        ),
+                        snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                            turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                                conversation_id: conversation.id.clone(),
+                                accepted_turn_id: req.message_id.clone(),
+                                generation: 0,
+                            },
+                            accepted_assistant_message_id: None,
+                            stopped_at: None,
+                        },
+                    })
+                    .await
+                    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+                if matches!(queued, phoenix_db::DirectTurnAcceptanceOutcome::Conflict) {
+                    return Err(SendChatServiceError::IdempotencyConflict);
+                }
+                let steer = steer_entry_from_prepared(&prepared);
+                kick_runtime_delivery(
+                    self.runtime.clone(),
+                    conversation.id.clone(),
+                    Event::SteerMessage {
+                        text: steer.text,
+                        llm_text: steer.llm_text,
+                        images: steer.images,
+                        files: steer.files,
+                        message_id: steer.message_id,
+                        user_agent: steer.user_agent,
+                        skill_invocation: steer.skill_invocation,
+                    },
+                );
+                return Ok(SendChatOutcome::accepted(
+                    req.message_id,
+                    SendChatRequestResult::Created,
+                    SendChatDisposition::QueuedSteering,
+                ));
             }
         };
         kick_runtime_delivery(self.runtime.clone(), conversation.id.clone(), event);
@@ -652,6 +697,19 @@ fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, 
                 return;
             }
         }
+        if matches!(event, Event::SteerMessage { .. })
+            && repo
+                .load_direct_turn_acceptance(&conversation_id, &message_id)
+                .await
+                .is_ok_and(|acceptance| {
+                    acceptance.is_some_and(|record| {
+                        record.committed_outcome
+                            == phoenix_db::DirectTurnCommittedOutcome::CancelledSteering
+                    })
+                })
+        {
+            return;
+        }
         if let Err(error) = runtime.send_event(&conversation_id, event).await {
             if let Err(release_error) = repo
                 .release_direct_turn_runtime_delivery(
@@ -744,6 +802,20 @@ fn queued_retry_matches(
                     && stored.stored_path == requested.stored_path
             })
         && entry.user_agent == req.user_agent
+}
+
+fn steer_entry_from_prepared(
+    prepared: &phoenix_core::domain::sm_event::PreparedDirectTurn,
+) -> phoenix_core::domain::sm_event::SteerEntry {
+    phoenix_core::domain::sm_event::SteerEntry {
+        text: prepared.text.clone(),
+        llm_text: prepared.llm_text.clone(),
+        images: prepared.images.clone(),
+        files: prepared.files.clone(),
+        message_id: prepared.message_id.clone(),
+        user_agent: prepared.user_agent.clone(),
+        skill_invocation: prepared.skill_invocation.clone(),
+    }
 }
 
 fn prepared_retry_matches_request(

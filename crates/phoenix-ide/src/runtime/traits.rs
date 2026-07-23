@@ -142,6 +142,15 @@ pub trait MessageStore: Send + Sync {
         Ok(phoenix_db::AcceptTopLevelLlmProductOutcome::StaleAuthority)
     }
 
+    async fn release_workflow_delivery_claim(
+        &self,
+        _workflow_id: phoenix_workflow::WorkflowId,
+        _delivery_id: phoenix_workflow::DeliveryId,
+        _process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn stop_active_top_level_llm_for_conversation(
         &self,
         _conversation_id: &str,
@@ -861,6 +870,18 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<phoenix_db::AcceptTopLevelLlmProductOutcome, String> {
         self.db
             .accept_top_level_llm_product(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn release_workflow_delivery_claim(
+        &self,
+        workflow_id: phoenix_workflow::WorkflowId,
+        delivery_id: phoenix_workflow::DeliveryId,
+        process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .release_workflow_delivery_claim(workflow_id, delivery_id, process_incarnation)
             .await
             .map_err(|error| error.to_string())
     }

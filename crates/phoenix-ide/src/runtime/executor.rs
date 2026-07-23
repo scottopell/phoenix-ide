@@ -3075,6 +3075,13 @@ where
         }
         drop(reserved_broadcast_range);
         if outcome != phoenix_db::AcceptTopLevelLlmProductOutcome::Committed && !product_replay {
+            self.storage
+                .release_workflow_delivery_claim(
+                    owed.workflow.workflow_id,
+                    owed.delivery.delivery_id,
+                    super::process_incarnation(),
+                )
+                .await?;
             return Err(format!(
                 "durable LLM product acceptance failed: {outcome:?}"
             ));
