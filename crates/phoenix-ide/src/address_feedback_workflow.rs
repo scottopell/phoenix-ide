@@ -54,6 +54,8 @@ struct AddressFeedbackSnapshot {
     target: Option<AddressFeedbackTarget>,
     head_oid: Option<String>,
     artifact_path: Option<String>,
+    #[serde(default)]
+    context_json: Option<String>,
     model_message: Option<String>,
     dispatch: Option<AddressFeedbackDispatch>,
 }
@@ -162,8 +164,14 @@ impl AddressFeedbackWorkflowService {
             capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
                 .await
                 .map_err(map_app_error_for_capture)?;
-        let model_message =
-            render_address_feedback_xml(&capture, head_oid.as_deref(), req.guidance.as_deref());
+        let context_json =
+            read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
+        let model_message = render_address_feedback_xml(
+            &capture,
+            head_oid.as_deref(),
+            Some(context_json.as_str()),
+            req.guidance.as_deref(),
+        );
         let snapshot = AddressFeedbackSnapshot {
             conversation_id: req.conversation_id.clone(),
             message_id: req.message_id.clone(),
@@ -178,6 +186,7 @@ impl AddressFeedbackWorkflowService {
             }),
             head_oid,
             artifact_path: Some(capture.artifact_path),
+            context_json: Some(context_json),
             model_message: Some(model_message),
             dispatch: None,
         };
@@ -261,8 +270,14 @@ impl AddressFeedbackWorkflowService {
                     return Err(map_app_error_for_capture(error));
                 }
             };
-        let model_message =
-            render_address_feedback_xml(&capture, head_oid.as_deref(), req.guidance.as_deref());
+        let context_json =
+            read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
+        let model_message = render_address_feedback_xml(
+            &capture,
+            head_oid.as_deref(),
+            Some(context_json.as_str()),
+            req.guidance.as_deref(),
+        );
         let captured = AddressFeedbackSnapshot {
             status: AddressFeedbackStatus::Captured,
             target: Some(AddressFeedbackTarget {
@@ -273,6 +288,7 @@ impl AddressFeedbackWorkflowService {
             }),
             head_oid,
             artifact_path: Some(capture.artifact_path),
+            context_json: Some(context_json),
             model_message: Some(model_message),
             dispatch: None,
             ..snapshot
@@ -347,6 +363,33 @@ impl AddressFeedbackWorkflowService {
                 });
             }
         };
+        if steering && !already_persisted {
+            let queued = AddressFeedbackSnapshot {
+                dispatch: Some(AddressFeedbackDispatch {
+                    queued,
+                    steering,
+                    already_persisted,
+                }),
+                ..snapshot.clone()
+            };
+            let _ = commit_snapshot(
+                repo,
+                workflow_id,
+                version,
+                version + 1,
+                &queued,
+                phoenix_workflow::WorkflowStatus::Active,
+            )
+            .await;
+            return Ok(response_from_snapshot(
+                workflow_id,
+                req.message_id,
+                queued.dispatch.as_ref().map(|d| d.queued).unwrap_or(true),
+                true,
+                false,
+                &queued,
+            ));
+        }
         if matches!(outcome, SendChatOutcome::Delivered) {
             wait_for_message_durable(&self.state.db, &snapshot.message_id).await?;
         }
@@ -467,6 +510,12 @@ fn response_from_completed_snapshot(
     message_id: &str,
     snapshot: &AddressFeedbackSnapshot,
 ) -> Option<AddressPrFeedbackResponse> {
+    if !matches!(
+        snapshot.status,
+        AddressFeedbackStatus::HandedOff | AddressFeedbackStatus::DuplicateNoOp
+    ) {
+        return None;
+    }
     let dispatch = snapshot.dispatch.as_ref()?;
     Some(response_from_snapshot(
         workflow_id,
@@ -503,6 +552,33 @@ fn response_from_snapshot(
             .as_ref()
             .map(|target| target.repo_name.clone()),
     }
+}
+
+async fn read_context_json(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    artifact_path: &str,
+) -> Result<String, AddressFeedbackWorkflowError> {
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let base = match conv.conv_mode {
+        phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
+        | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. } => {
+            worktree_path.to_string()
+        }
+        _ => conv.cwd,
+    };
+    let path = std::path::Path::new(artifact_path);
+    if path.is_absolute() || artifact_path.split('/').any(|part| part == "..") {
+        return Err(AddressFeedbackWorkflowError::Workflow(
+            "invalid PR context artifact path".to_string(),
+        ));
+    }
+    tokio::fs::read_to_string(std::path::Path::new(base.as_str()).join(path))
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))
 }
 
 async fn local_head_oid(
@@ -589,6 +665,10 @@ fn intent_fingerprint(
 ) -> Result<String, AddressFeedbackWorkflowError> {
     let mut stable = snapshot.clone();
     stable.user_agent = None;
+    stable.artifact_path = None;
+    stable.context_json = None;
+    stable.model_message = None;
+    stable.dispatch = None;
     snapshot_fingerprint(&stable)
 }
 
@@ -629,11 +709,12 @@ fn now_ts() -> Timestamp {
 fn render_address_feedback_xml(
     capture: &crate::api::PrAutoFixContextResponse,
     head_oid: Option<&str>,
+    context_json: Option<&str>,
     guidance: Option<&str>,
 ) -> String {
     let guidance = guidance.unwrap_or("Address the captured PR feedback and failing checks. Use the context artifact as the source of truth for this request.");
     format!(
-        "<address_pr_feedback>\n  <target repo_owner=\"{}\" repo_name=\"{}\" pr_number=\"{}\"{} />\n  <context artifact=\"{}\" />\n  <guidance>{}</guidance>\n  <instruction>{}</instruction>\n</address_pr_feedback>",
+        "<address_pr_feedback>\n  <target repo_owner=\"{}\" repo_name=\"{}\" pr_number=\"{}\"{} />\n  <context artifact=\"{}\"><![CDATA[{}]]></context>\n  <guidance>{}</guidance>\n  <instruction>{}</instruction>\n</address_pr_feedback>",
         escape_xml(&capture.repo_owner),
         escape_xml(&capture.repo_name),
         capture.pr_number,
@@ -641,9 +722,14 @@ fn render_address_feedback_xml(
             .map(|oid| format!(" head_oid=\"{}\"", escape_xml(oid)))
             .unwrap_or_default(),
         escape_xml(&capture.artifact_path),
+        cdata_escape(context_json.unwrap_or("")),
         escape_xml(guidance),
         escape_xml(&capture.message),
     )
+}
+
+fn cdata_escape(value: &str) -> String {
+    value.replace("]]>", "]]]]><![CDATA[>")
 }
 
 fn escape_xml(value: &str) -> String {
@@ -707,12 +793,17 @@ mod tests {
             repo_name: "r\"epo".to_string(),
             message: "legacy".to_string(),
         };
-        let rendered =
-            render_address_feedback_xml(&capture, Some("abc123"), Some("fix <all> & \"now\""));
+        let rendered = render_address_feedback_xml(
+            &capture,
+            Some("abc123"),
+            Some("{\"k\":\"]]>\"}"),
+            Some("fix <all> & \"now\""),
+        );
         assert!(rendered.contains("repo_owner=\"o&lt;wner\""));
         assert!(rendered.contains("repo_name=\"r&quot;epo\""));
         assert!(rendered.contains("artifact=\".phoenix/pr-context/a&amp;b.json\""));
         assert!(rendered.contains("fix &lt;all&gt; &amp; &quot;now&quot;"));
+        assert!(rendered.contains("<![CDATA[{\"k\":\"]]]]><![CDATA[>\"}]]>"));
         assert!(rendered.contains("<instruction>legacy</instruction>"));
     }
 
