@@ -524,6 +524,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
             root_conversation_id: recovery.workflow.conversation_id.clone(),
             request_id: request_id.clone(),
             retry_attempt: u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX),
+            attempt_capture: phoenix_llm::LlmAttemptCapture::default(),
         });
         match llm.complete(&request).await {
             Ok(response) => {

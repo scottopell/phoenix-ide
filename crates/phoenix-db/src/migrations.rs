@@ -434,10 +434,6 @@ WHERE committed_outcome IN ('PendingRuntime', 'RuntimeAccepted');
 CREATE UNIQUE INDEX direct_turn_acceptances_one_live_per_conversation
 ON direct_turn_acceptances(conversation_id) WHERE live_slot = 1;
 ";
-WHERE committed_outcome IN ('PendingRuntime', 'RuntimeAccepted');
-CREATE UNIQUE INDEX direct_turn_acceptances_one_live_per_conversation
-ON direct_turn_acceptances(conversation_id) WHERE live_slot = 1;
-";
 
 const MIGRATION_054: &str = r"
 CREATE UNIQUE INDEX direct_turn_acceptances_client_message_id_unique
@@ -476,7 +472,6 @@ CREATE INDEX IF NOT EXISTS idx_llm_request_metrics_root ON llm_request_metrics(r
 ";
 
 const MIGRATION_053: &str = r"
-||||||| parent of b9d6af8f9 (refactor: normalize durable llm profile schema)
 CREATE TABLE direct_turn_acceptances (
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     client_message_id TEXT NOT NULL CHECK (client_message_id <> ''),

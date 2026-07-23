@@ -308,12 +308,6 @@ pub trait StateStore: Send + Sync {
 
     /// Update the steering queue for a conversation. Persists the FIFO queue
     /// of pending steering messages to the DB.
-    async fn update_steering_queue(
-        &self,
-        conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String>;
-
     /// Remove specific drained entries from the persisted steering queue,
     /// preserving any concurrently-enqueued entries. Implementations must be
     /// atomic re: `enqueue_steer_message`'s read-modify-write to avoid losing

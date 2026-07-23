@@ -58,7 +58,7 @@ impl PromptCacheKey {
 }
 
 /// Content-free correlation fields attached to one provider attempt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LlmRequestTelemetry {
     pub conversation_id: String,
     pub root_conversation_id: String,
@@ -300,7 +300,7 @@ impl ProviderStreamTelemetry {
 }
 
 /// LLM request
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LlmRequest {
     pub system: Vec<SystemContent>,
     pub messages: Vec<LlmMessage>,
@@ -770,7 +770,6 @@ mod attempt_capture_tests {
         assert!(!metrics.stream.completed);
     }
 }
-||||||| parent of d849132ae (feat: add lossless durable llm codecs)
 
 #[cfg(test)]
 mod durable_codec_tests {
