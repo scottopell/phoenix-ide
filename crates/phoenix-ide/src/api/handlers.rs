@@ -3026,10 +3026,15 @@ async fn work_scope_actor(
         crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
         _ => crate::work_scope::ResourceAuthority::Work,
     };
-    Ok(crate::work_scope::EffectiveResourceAccess::new(
-        conversation.id,
-        authority,
-    ))
+    Ok(
+        if authority == crate::work_scope::ResourceAuthority::Restricted
+            && conversation.runtime_role == crate::work_scope::RuntimeRole::User
+        {
+            crate::work_scope::EffectiveResourceAccess::shared_restricted(conversation.id)
+        } else {
+            crate::work_scope::EffectiveResourceAccess::new(conversation.id, authority)
+        },
+    )
 }
 
 async fn get_work_scope_inventory(

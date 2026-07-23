@@ -1879,7 +1879,13 @@ impl RuntimeManager {
                 ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
                 _ => crate::work_scope::ResourceAuthority::Work,
             };
-            let actor = crate::work_scope::EffectiveResourceAccess::new(&conv_id, authority);
+            let actor = if authority == crate::work_scope::ResourceAuthority::Restricted
+                && conv.runtime_role == crate::work_scope::RuntimeRole::User
+            {
+                crate::work_scope::EffectiveResourceAccess::shared_restricted(&conv_id)
+            } else {
+                crate::work_scope::EffectiveResourceAccess::new(&conv_id, authority)
+            };
             let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
                 work_scope,
                 Some(&actor),

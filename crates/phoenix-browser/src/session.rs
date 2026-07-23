@@ -913,14 +913,10 @@ enum KillSessionOutcome {
 }
 
 fn session_key(work_scope: &ResourceScopeKey, actor: &EffectiveResourceAccess) -> String {
-    match actor.authority() {
-        ResourceAuthority::Work => work_scope.stable_key(),
-        ResourceAuthority::Restricted => format!(
-            "{}:restricted:{}",
-            work_scope.stable_key(),
-            actor.conversation_id()
-        ),
-    }
+    actor.restricted_private_key().map_or_else(
+        || work_scope.stable_key(),
+        |private_key| format!("{}:restricted:{private_key}", work_scope.stable_key()),
+    )
 }
 
 /// Global manager for all browser sessions

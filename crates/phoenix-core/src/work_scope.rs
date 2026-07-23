@@ -161,6 +161,7 @@ pub enum ResourceAuthority {
 pub struct EffectiveResourceAccess {
     conversation_id: String,
     authority: ResourceAuthority,
+    restricted_private: bool,
 }
 
 impl EffectiveResourceAccess {
@@ -169,6 +170,16 @@ impl EffectiveResourceAccess {
         Self {
             conversation_id: conversation_id.into(),
             authority,
+            restricted_private: authority == ResourceAuthority::Restricted,
+        }
+    }
+
+    #[must_use]
+    pub fn shared_restricted(conversation_id: impl Into<String>) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            authority: ResourceAuthority::Restricted,
+            restricted_private: false,
         }
     }
 
@@ -197,7 +208,20 @@ impl EffectiveResourceAccess {
 
     #[must_use]
     pub fn with_authority(&self, authority: ResourceAuthority) -> Self {
-        Self::new(self.conversation_id.clone(), authority)
+        Self {
+            conversation_id: self.conversation_id.clone(),
+            authority,
+            restricted_private: authority == ResourceAuthority::Restricted
+                && self.restricted_private,
+        }
+    }
+
+    /// Stable key for resources private to restricted sub-agents. User-facing
+    /// Explore conversations return `None` and therefore share scope resources.
+    #[must_use]
+    pub fn restricted_private_key(&self) -> Option<&str> {
+        self.restricted_private
+            .then_some(self.conversation_id.as_str())
     }
 }
 
