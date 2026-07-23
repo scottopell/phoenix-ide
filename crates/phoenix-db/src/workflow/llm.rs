@@ -1595,7 +1595,21 @@ impl WorkflowRepository {
              WHERE EXISTS (
                  SELECT 1 FROM workflow_deliveries
                  WHERE workflow_id = ?1 AND delivery_id = ?2
-                   AND runtime_acceptance_status = 'Owed'
+                   AND (
+                       runtime_acceptance_status = 'Owed'
+                       OR (
+                           runtime_acceptance_status = 'Accepted'
+                           AND EXISTS (
+                               SELECT 1 FROM top_level_llm_tool_intents ti
+                               JOIN workflow_receipts r
+                                 ON r.workflow_id = ti.workflow_id
+                                AND r.receipt_id = ti.receipt_id
+                               WHERE ti.workflow_id = workflow_deliveries.workflow_id
+                                 AND r.effect_id = workflow_deliveries.effect_id
+                                 AND ti.status = 'Owed'
+                           )
+                       )
+                   )
              )
              ON CONFLICT(workflow_id, delivery_id) DO NOTHING",
         )
