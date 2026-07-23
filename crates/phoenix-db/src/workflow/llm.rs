@@ -708,6 +708,10 @@ impl WorkflowRepository {
              SET runtime_delivery_incarnation = ?3
              WHERE conversation_id = ?1 AND client_message_id = ?2
                AND committed_outcome IN ('PendingRuntime', 'RuntimeAccepted', 'QueuedSteering')
+               AND NOT EXISTS (
+                   SELECT 1 FROM direct_turn_steering_cancellations c
+                   WHERE c.workflow_id = direct_turn_acceptances.workflow_id
+               )
                AND (runtime_delivery_incarnation IS NULL OR runtime_delivery_incarnation <> ?3)",
         )
         .bind(conversation_id)
@@ -2443,6 +2447,41 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_steering_cannot_be_claimed_for_runtime_delivery() {
+        let repo = open_repo().await;
+        repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::QueuedSteering {
+                entry: Box::new(phoenix_core::domain::sm_event::SteerEntry {
+                    text: "steer".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "msg-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }),
+            },
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-steer".to_string(),
+            prepared_fingerprint: "fp-steer".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        })
+        .await
+        .unwrap();
+        assert!(repo
+            .cancel_queued_steering("conv-1", "msg-steer")
+            .await
+            .unwrap());
+
+        assert!(!repo
+            .claim_direct_turn_runtime_delivery("conv-1", "msg-steer", ProcessIncarnation(7),)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
