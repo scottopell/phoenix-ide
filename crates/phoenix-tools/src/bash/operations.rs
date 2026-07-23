@@ -517,7 +517,7 @@ async fn run_run(
     let handle_id;
     {
         let mut handles = handles_arc.write().await;
-        if let Err(e) = handles.check_cap_for_actor(cap, &ctx.resource_access).await {
+        if let Err(e) = handles.check_cap(cap).await {
             return BashError::HandleCapReached(e).into_tool_output();
         }
         handle_id = handles.allocate_handle_id();

@@ -218,25 +218,6 @@ impl ResourceScopeKeyHandles {
             .collect()
     }
 
-    /// Enforce the live-handle cap against resources visible to `actor`.
-    ///
-    /// # Errors
-    /// Returns [`BashHandleError::HandleCapReached`] with an actor-filtered summary.
-    pub async fn check_cap_for_actor(
-        &self,
-        cap: usize,
-        actor: &EffectiveResourceAccess,
-    ) -> Result<(), BashHandleError> {
-        if self.live_count_for_actor(actor).await >= cap {
-            Err(BashHandleError::HandleCapReached {
-                cap,
-                live_handles: self.live_summary_for_actor(actor).await,
-            })
-        } else {
-            Ok(())
-        }
-    }
-
     /// REQ-BASH-005: enforce the cap before allocating a new handle id /
     /// spawning a process.
     ///
