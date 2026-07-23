@@ -2,177 +2,139 @@
 
 ## Product thesis
 
-Phoenix share mode becomes the live multiplayer surface for humans working with
-one LLM agent. A shared Phoenix conversation is a shared cockpit where any
-participant with the share link can follow the live transcript, send steering
-messages, answer prompts, and approve agent decisions. Phoenix records who did
-what and preserves a single authoritative event order.
+Phoenix share mode is the live multiplayer surface for humans working with one
+LLM agent. Anyone who joins a live shared conversation can see the same history,
+submit messages, and answer agent prompts. Phoenix attributes each human action
+and preserves one durable server-defined order.
 
-Native collaboration favors real co-driving over strict turn-taking. Multiple
-participants may steer at once; Phoenix serializes accepted actions at the server
-boundary and makes queued human intent visible in the transcript.
+Collaboration does not create a runtime, tool actor, or work environment per
+participant. Participants submit actions to one conversation; that conversation
+continues to own agent execution and its existing work environment.
 
 ## User Stories
 
-### Story 1: Co-Drive From the Share Link
+### Story 1: Work Together From the Shared URL
 
-As a developer pairing with coworkers, I want the shared Phoenix URL to become
-the place where we all co-drive the same agent session so that nobody has to
-screen-share one browser tab or copy suggestions through the owner.
+As a developer pairing with coworkers, I want the shared Phoenix URL to be where
+we all work with the same agent so that nobody must screen-share one browser or
+relay suggestions through its owner.
 
-### Story 2: Let Collaboration Be Messy
+### Story 2: Contribute Without Turn-Taking Ceremony
 
-As a collaborator, I want to send my own instruction when I have useful context,
-even if another participant is also steering, so that Phoenix supports energetic
-pairing and group debugging rather than forcing a meeting protocol.
+As a collaborator, I want to send useful context even when another participant is
+also steering so that Phoenix supports natural group work rather than imposing a
+baton or active-driver role.
 
-### Story 3: Preserve Accountability
+### Story 3: Know Who Did What
 
-As a reviewer of a collaborative conversation, I want human messages and
-approvals to identify their contributor so that the transcript explains who made
-each steering decision.
-
-### Story 4: Support Any Practical Group Size
-
-As a conversation owner, I do not want Phoenix to impose an arbitrary participant
-limit. Most sessions involve a pair or trio, but demos, incident rooms, and team
-reviews may have more active participants.
+As a participant or later reviewer, I want every human message and decision to
+identify its contributor so that the conversation remains understandable and
+accountable.
 
 ## Requirements
 
-### REQ-COLLAB-001: Share Link Grants Live Co-Driving
+### REQ-COLLAB-001: Live Share Is the Multiplayer Entry Point
 
 WHEN a participant opens a valid live share URL
-THE SYSTEM SHALL show the conversation history and live updates
-AND SHALL expose the co-driving controls that let the participant send human
-instructions and answer or approve agent prompts
+THE SYSTEM SHALL show conversation history and live updates
+AND SHALL allow the participant to establish a contributor identity
+AND, after identity is established, SHALL expose message and pending-decision
+controls supported by the shared conversation
 
-THE SYSTEM SHALL treat the live share URL as the collaboration entry point rather
-than creating a separate co-driver mode beside share mode
+THE SYSTEM SHALL NOT require a separate co-driver mode, driver role, or baton
 
-**Rationale:** Multiplayer should evolve the feature users already understand:
-share this conversation. A separate co-driver mode would split the journey and
-make the main collaborative path feel bolted on.
-
----
-
-### REQ-COLLAB-002: Contributor Identity on Entry
-
-WHEN a participant joins a live shared conversation
-THE SYSTEM SHALL establish a contributor identity for that browser session before
-accepting conversation-advancing actions
-
-THE SYSTEM SHALL render contributor identity on accepted human instructions,
-prompt answers, approval decisions, and other conversation-advancing human
-actions
-
-**Rationale:** A shared link can invite many humans. Phoenix needs enough identity
-to make the transcript accountable even when the link itself is the access path.
+**Rationale:** Multiplayer should evolve the share journey users already
+understand. Collaboration is a property of the live shared conversation, not a
+second product beside it.
 
 ---
 
-### REQ-COLLAB-003: Multiple Active Drivers
+### REQ-COLLAB-002: Durable Contributor Identity
 
-WHILE a live shared conversation is open
-THE SYSTEM SHALL allow multiple participants to submit conversation-advancing
-actions without requiring a single active driver or baton
+WHEN a participant establishes an identity in a live shared conversation
+THE SYSTEM SHALL issue or recognize a stable opaque contributor identifier
+AND SHALL associate a display label with that identifier
+AND SHALL bind subsequent shared mutations to that contributor
 
-THE SYSTEM SHALL NOT impose an arbitrary upper limit on active participants
+THE SYSTEM SHALL NOT use a display label, browser user-agent string, IP address,
+or SSE connection as contributor identity
 
-**Rationale:** Real collaboration can be chaotic. Phoenix should support the
-natural flow where several people may send useful context, queue a next step, or
-respond to the agent without first negotiating turn ownership in the product.
-
----
-
-### REQ-COLLAB-004: Server-Ordered Human Actions
-
-WHEN multiple participants submit conversation-advancing actions near the same
-time
-THE SYSTEM SHALL serialize accepted actions at the server boundary into one
-authoritative conversation order
-
-THE SYSTEM SHALL display accepted queued human actions in that order to every
-connected participant
-
-**Rationale:** Concurrent steering is acceptable, but the conversation still needs
-one durable history. Server ordering avoids client-side disagreement about what
-the agent saw and when.
+**Rationale:** Labels can collide or change, network connections are temporary,
+and user-agent strings identify software rather than people. Durable attribution
+needs a stable identifier distinct from presentation.
 
 ---
 
-### REQ-COLLAB-005: State-Aware Acceptance
+### REQ-COLLAB-003: Attributed Durable Message Submission
 
-WHEN a submitted human action no longer applies to the conversation state where
-it was composed
-THE SYSTEM SHALL either queue it for the next valid human-input point or reject it
-with an explanation visible to the submitting participant
+WHEN a live share participant submits a message
+THE SYSTEM SHALL durably accept, replay, conflict, queue, cancel, reconcile, and
+materialize that message through the same conversation message-submission
+contract used by the owner
+AND SHALL preserve the contributor identifier with the accepted human turn and
+its materialized transcript message
 
-THE SYSTEM SHALL NOT silently drop a participant's submitted instruction or
-approval decision
+WHEN multiple participants submit messages near the same time
+THE SYSTEM SHALL allow each distinct valid message to be accepted
+AND SHALL expose the server-defined accepted or queued outcome for each message
+AND SHALL NOT require one participant to become the active driver
 
-**Rationale:** A messy multi-driver model must be honest. If Phoenix cannot apply
-an action safely, the contributor should know whether it is queued or rejected.
-
----
-
-### REQ-COLLAB-006: Shared Approval Semantics
-
-WHEN the agent is waiting for task approval, prompt answers, continuation, or a
-similar human decision
-THE SYSTEM SHALL allow any live share participant with an established contributor
-identity to submit a decision
-
-THE SYSTEM SHALL accept the first valid decision that reaches the server for a
-single-choice prompt
-AND SHALL reject later conflicting decisions with a visible explanation
-
-**Rationale:** Shared approval is part of co-driving. For decisions that can only
-have one answer, Phoenix should use clear first-valid server acceptance rather
-than forcing a driver role.
+**Rationale:** Message identity, ordering, retry, queueing, and crash recovery are
+conversation concerns. Collaboration adds provenance and another authorized HTTP
+entry point; it does not need a second queue or delivery protocol.
 
 ---
 
-### REQ-COLLAB-007: Runtime Start Follows Co-Driving Authority
+### REQ-COLLAB-004: Attributed Single-Choice Decisions
 
-WHEN a live share participant submits a conversation-advancing action and the
-conversation has no live runtime
-THE SYSTEM SHALL start or wake the runtime as needed to process that accepted
-action
+WHEN the agent is waiting for a task decision, question response, continuation,
+or another single-choice human decision
+THE SYSTEM SHALL allow any identified live share participant to submit a valid
+decision
+AND SHALL atomically accept at most one decision for that pending decision
+AND SHALL persist the winning contributor identifier with the decision
+AND SHALL reject later conflicting submissions with a visible explanation
 
-THE SYSTEM SHALL NOT start or wake the runtime merely because a participant opens
-a conversation export or other non-live read-only artifact
+WHEN the winning submission is retried
+THE SYSTEM SHALL replay the accepted result without applying the decision again
 
-**Rationale:** In multiplayer share mode, live participants are allowed to steer
-the agent. Passive exported artifacts remain side-effect free.
-
----
-
-### REQ-COLLAB-008: Awareness Signals Support Steering
-
-THE SYSTEM MAY show presence, typing state, reactions, pointers such as "look
-here", and help requests
-
-THE SYSTEM SHALL keep awareness signals separate from conversation-advancing
-actions unless a participant explicitly converts a signal into an agent-steering
-message or approval decision
-
-**Rationale:** Awareness tools help collaborators coordinate on a call, but they
-are supporting signals. They must not become a hidden control plane for the
-agent.
+**Rationale:** Messages can queue, but a one-shot decision has one winner. Atomic
+acceptance and contributor attribution make simultaneous human decisions
+unambiguous and retry-safe.
 
 ---
 
-### REQ-COLLAB-009: Collaboration State Replays After Reconnect
+### REQ-COLLAB-005: Share Authority Is Conversation-Scoped
 
-WHEN a participant reconnects to a live shared conversation
-THE SYSTEM SHALL restore conversation history, accepted queued actions,
-contributor attribution, and durable collaboration metadata needed to continue
-co-driving
+WHERE a request presents a valid live share token and established contributor
+identity
+THE SYSTEM SHALL authorize only the supported shared-conversation mutations for
+the conversation named by that token
 
-THE SYSTEM SHALL NOT rely on an SSE connection as the only copy of accepted human
-actions or contributor attribution
+THE SYSTEM SHALL NOT turn a share participant into a runtime actor, tool actor,
+resource owner, or holder of work-environment authority
+AND SHALL NOT expose owner-only lifecycle, settings, resource, filesystem,
+terminal, browser, or repository controls through share authority
 
-**Rationale:** Collaboration state affects what the agent sees and how the
-transcript is interpreted. It must survive refresh, reconnect, and server restart
-semantics.
+WHEN the owner revokes the live share token
+THE SYSTEM SHALL reject subsequent reads and mutations authorized by that token
+
+**Rationale:** Collaborators steer one existing conversation. The conversation's
+runtime retains tool and work-environment authority; possession of a shared URL
+does not grant direct control of the underlying resources.
+
+---
+
+### REQ-COLLAB-006: Reconnect Restores Authoritative Outcomes
+
+WHEN a live share participant reconnects after an ambiguous submission outcome
+THE SYSTEM SHALL reconcile submitted message identities against durable
+acceptance independently of transcript visibility
+AND SHALL restore materialized messages, queued-message outcomes, and contributor
+attribution from durable state
+
+THE SYSTEM SHALL NOT treat SSE receipt or absence as acceptance authority
+
+**Rationale:** A disconnect can happen after server acceptance but before the
+browser sees a response. Reconnect must converge on durable server state without
+duplicating or losing a participant's action.

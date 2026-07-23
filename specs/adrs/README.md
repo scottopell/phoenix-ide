@@ -34,7 +34,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [020](020_durable-workflow-core-matches-one-scheduler-and-durable-acknowledgement.md) | Durable-workflow core matches one scheduler authority and durable acknowledgement | Accepted | REQ-DWF-002, REQ-DWF-006, REQ-DWF-014, REQ-DWF-017, REQ-DWF-029–042, wake and creation profile reshaping |
 | [021](021_coordinator-surface-is-chat-only.md) | The Coordinator surface is chat-only | Accepted | REQ-GR-001, REQ-GR-004, REQ-GR-005, REQ-GR-010, REQ-GR-011 |
 | [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Accepted | REQ-GR-001–005, REQ-GR-007–011A |
-| [023](023_native-collaboration-evolves-share-mode-into-multi-driver-co-driving.md) | Native collaboration evolves share mode into multi-driver co-driving | Accepted | REQ-COLLAB-001 through REQ-COLLAB-010 |
+| [023](023_native-collaboration-reuses-durable-conversation-acceptance.md) | Native collaboration extends share mode and reuses durable conversation acceptance | Accepted | REQ-COLLAB-001 through REQ-COLLAB-010 |
 
 ## For agents: which decisions bind your task
 
@@ -62,7 +62,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 022, then 021 for chat-only UI history |
-| Specifying native collaboration, live share co-driving, multi-driver ordering, or contributor attribution | 023 |
+| Specifying native collaboration, writable live share, contributor attribution, or shared decisions | 023 |
 
 ## Decision dependencies
 
@@ -90,7 +90,7 @@ ADR-000 (adopt spEARS v2 for new work)
           └── ADR-019 (Durable-workflow core matches one scheduler authority and durable acknowledgement)
       └── ADR-021 (The Coordinator surface is chat-only)
           └── ADR-022 (The Coordinator uses bounded relational evidence)
-      └── ADR-023 (Native collaboration evolves share mode into multi-driver co-driving)
+      └── ADR-023 (Native collaboration extends share mode and reuses durable conversation acceptance)
 ```
 
 ## Conventions
