@@ -97,6 +97,19 @@ describe('ReleaseUpdatePanel', () => {
     expect(fetchMock).toHaveBeenLastCalledWith('/api/release-updates/transaction');
   });
 
+  it('shows the sample time for an unavailable discovery without a last-good candidate', async () => {
+    const unavailable = {
+      ...snapshot,
+      preview: { kind: 'unavailable' as const, reason: 'GitHub unavailable' },
+      sampled_at: '2026-06-01T00:05:00Z',
+    };
+    vi.mocked(fetch).mockImplementationOnce(() => json(unavailable));
+    render(<ReleaseUpdatePanel />);
+
+    expect(await screen.findByText(/release information unavailable — GitHub unavailable/i)).toBeInTheDocument();
+    expect(screen.getByText(/^Unavailable ·/)).toBeInTheDocument();
+  });
+
   it('preserves the last-good candidate when discovery returns unavailable', async () => {
     const unavailable = {
       ...snapshot,

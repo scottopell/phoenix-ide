@@ -98,8 +98,10 @@ export function ReleaseUpdatePanel({
   const [discoveryCheckedAt, setDiscoveryCheckedAt] = useState<string | null>(null);
   const loadInFlight = useRef(false);
   const mounted = useRef(false);
+  const snapshotRef = useRef<ReleaseDiscoverySnapshot | null>(null);
   const transactionRef = useRef<ReleaseTransactionStatus | null>(null);
   const confirmedIdentityRef = useRef<string | null>(null);
+  snapshotRef.current = snapshot;
   transactionRef.current = transaction;
   confirmedIdentityRef.current = confirmedIdentity;
 
@@ -142,6 +144,9 @@ export function ReleaseUpdatePanel({
         setSnapshot(nextDiscovery);
       } else {
         markDiscoveryStale(next.preview.reason);
+        if (snapshotRef.current?.preview.kind !== 'available') {
+          setDiscoveryCheckedAt(next.sampled_at);
+        }
         setSnapshot((current) => current?.preview.kind === 'available'
           ? { ...nextDiscovery, preview: current.preview }
           : nextDiscovery);
