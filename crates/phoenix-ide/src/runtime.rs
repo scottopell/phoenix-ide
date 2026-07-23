@@ -662,6 +662,14 @@ impl SseBroadcaster {
         self.last_seq.fetch_max(seq, Ordering::AcqRel);
     }
 
+    pub fn rewind_unused_reserved_range(&self, start: i64, count: usize) {
+        let count = i64::try_from(count).expect("reserved range count fits i64");
+        let end = start + count - 1;
+        let _ = self
+            .last_seq
+            .compare_exchange(end, start - 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+
     /// Highest `sequence_id` emitted so far. Used to seed `SseEvent::Init`'s
     /// `last_sequence_id` so the client's `applyIfNewer` guard starts at the
     /// correct floor.

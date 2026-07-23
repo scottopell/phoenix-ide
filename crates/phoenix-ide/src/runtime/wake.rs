@@ -1659,6 +1659,7 @@ mod tests {
         let (db, _repo) = open_repo().await;
         let prepared = phoenix_core::domain::sm_event::PreparedDirectTurn {
             codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            expand_references: false,
             text: "recovered".to_string(),
             llm_text: None,
             images: vec![],

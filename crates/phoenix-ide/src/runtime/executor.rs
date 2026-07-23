@@ -2939,7 +2939,7 @@ where
         owed: phoenix_db::OwedTopLevelLlmReceipt,
     ) -> Result<Vec<Event>, String> {
         let mut effects = result.effects.into_iter();
-        let (product, persisted_messages) = match effects.next() {
+        let (product, persisted_messages, reserved_broadcast_range) = match effects.next() {
             Some(Effect::PersistMessage {
                 content,
                 display_data,
@@ -2968,6 +2968,7 @@ where
                         message.clone(),
                     )),
                     vec![message],
+                    None,
                 )
             }
             Some(Effect::PersistCheckpoint {
@@ -2986,7 +2987,6 @@ where
                 let (reserved_broadcast_range, reserved_seqs) = self
                     .broadcast_tx
                     .reserve_next_persisted_message_range(1 + tool_results.len());
-                let _reserved_broadcast_range = reserved_broadcast_range;
                 let agent_content = MessageContent::agent(assistant_message.content);
                 let assistant = crate::db::Message {
                     message_id: assistant_message.message_id,
@@ -3032,6 +3032,7 @@ where
                         tool_results: tool_messages,
                     },
                     persisted,
+                    Some(reserved_broadcast_range),
                 )
             }
             Some(Effect::PersistState) => (
@@ -3039,6 +3040,7 @@ where
                     conversation_id: self.context.conversation_id.clone(),
                 },
                 Vec::new(),
+                None,
             ),
             _ => {
                 return Err(
@@ -3065,6 +3067,13 @@ where
             })
             .await?;
         let product_replay = outcome == phoenix_db::AcceptTopLevelLlmProductOutcome::ExactReplay;
+        if product_replay && !persisted_messages.is_empty() {
+            self.broadcast_tx.rewind_unused_reserved_range(
+                persisted_messages[0].sequence_id,
+                persisted_messages.len(),
+            );
+        }
+        drop(reserved_broadcast_range);
         if outcome != phoenix_db::AcceptTopLevelLlmProductOutcome::Committed && !product_replay {
             return Err(format!(
                 "durable LLM product acceptance failed: {outcome:?}"

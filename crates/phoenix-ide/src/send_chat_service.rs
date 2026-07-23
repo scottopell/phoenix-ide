@@ -223,6 +223,8 @@ impl SendChatApplicationService {
                 let prepared = phoenix_core::domain::sm_event::PreparedDirectTurn {
                     codec_version:
                         phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+                    expand_references: req.expansion_policy
+                        == MessageExpansionPolicy::ExpandReferences,
                     text: expanded.display_text.clone(),
                     llm_text: expanded.llm_text.clone(),
                     images: images.clone(),
@@ -334,6 +336,7 @@ impl SendChatApplicationService {
         let images = map_images(req.images);
         let prepared = phoenix_core::domain::sm_event::PreparedDirectTurn {
             codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            expand_references: req.expansion_policy == MessageExpansionPolicy::ExpandReferences,
             text: expanded.display_text.clone(),
             llm_text: expanded.llm_text.clone(),
             images: images.clone(),
@@ -748,6 +751,8 @@ fn prepared_retry_matches_request(
     req: &SendChatRequest,
 ) -> bool {
     prepared.text == req.text
+        && prepared.expand_references
+            == (req.expansion_policy == MessageExpansionPolicy::ExpandReferences)
         && prepared.message_id == req.message_id
         && prepared.user_agent == req.user_agent
         && prepared.images == map_images(req.images.clone())
@@ -939,6 +944,7 @@ mod tests {
     fn prepared_fingerprint_changes_when_expansion_changes() {
         let base = phoenix_core::domain::sm_event::PreparedDirectTurn {
             codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            expand_references: true,
             text: "@ref".to_string(),
             llm_text: Some("first expansion".to_string()),
             images: Vec::new(),

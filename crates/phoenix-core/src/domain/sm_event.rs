@@ -30,6 +30,7 @@ pub const PREPARED_DIRECT_TURN_CODEC_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedDirectTurn {
     pub codec_version: u32,
+    pub expand_references: bool,
     pub text: String,
     pub llm_text: Option<String>,
     pub images: Vec<ImageData>,
@@ -861,6 +862,7 @@ mod prepared_direct_turn_tests {
     fn prepared_direct_turn_round_trips_and_rebuilds_user_event() {
         let prepared = PreparedDirectTurn {
             codec_version: PREPARED_DIRECT_TURN_CODEC_VERSION,
+            expand_references: true,
             text: "hello".to_string(),
             llm_text: Some("expanded hello".to_string()),
             images: vec![],

@@ -2775,6 +2775,19 @@ async fn reconcile_accepted_messages(
                     AcceptedMessageAcceptanceDisposition::CancelledSteering
                 }
             });
+        let acceptance = if acceptance.is_none()
+            && state
+                .db
+                .get_steering_queue(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .iter()
+                .any(|entry| entry.message_id == message_id)
+        {
+            Some(AcceptedMessageAcceptanceDisposition::QueuedSteering)
+        } else {
+            acceptance
+        };
         let persisted_id = workflow_repo
             .load_direct_turn_materialized_message_id(&id, &message_id)
             .await
@@ -7793,7 +7806,10 @@ pub(crate) mod hard_delete_cascade_tests {
             response.entries[0].materialization,
             AcceptedMessageMaterialization::Persisted { .. }
         ));
-        assert!(response.entries[1].acceptance.is_none());
+        assert!(matches!(
+            response.entries[1].acceptance,
+            Some(AcceptedMessageAcceptanceDisposition::QueuedSteering)
+        ));
         assert!(matches!(
             response.entries[1].materialization,
             AcceptedMessageMaterialization::NotPersisted

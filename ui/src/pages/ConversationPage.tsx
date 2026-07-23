@@ -1499,6 +1499,8 @@ function ConversationPageContent({
             rollbackOptimisticPhase();
           } else if (reconciledOutcome === 'steering_queued') {
             rollbackOptimisticPhase();
+          } else if (reconciledOutcome === 'persisted_only') {
+            rollbackOptimisticPhase();
           }
         } catch (reconcileError) {
           console.warn('[message-queue] exact-ID reconciliation after send failure failed', {

@@ -778,6 +778,7 @@ async fn provision_conversation(
     })?;
     let prepared_turn = phoenix_core::domain::sm_event::PreparedDirectTurn {
         codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+        expand_references: false,
         text: display_text.clone(),
         llm_text: llm_text.clone(),
         images: images.clone(),
