@@ -231,10 +231,22 @@ impl LlmServiceImpl {
         headers
     }
 
+    fn begin_provider_attempt(&self, request: &LlmRequest, transport: super::LlmTransport) {
+        if let Some(telemetry) = &request.telemetry {
+            telemetry.attempt_capture.begin(
+                telemetry,
+                self.spec.backend.header_value(),
+                &self.spec.id,
+                transport,
+            );
+        }
+    }
+
     async fn complete_inner(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         match self.spec.backend.api_format() {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
+                self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
                 // Build headers AFTER resolve so any per-request state the
                 // credential refresh updates (notably the codex account_id
                 // pulled from auth.json) is reflected in this request's
@@ -252,6 +264,7 @@ impl LlmServiceImpl {
             }
             ApiFormat::OpenAIResponses => {
                 let key = self.auth.resolve().await?.credential;
+                self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
                 let headers = self.headers_for_provider();
                 openai::complete(
                     &self.spec,
@@ -275,6 +288,7 @@ impl LlmServiceImpl {
         match self.spec.backend.api_format() {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
+                self.begin_provider_attempt(request, super::LlmTransport::HttpSse);
                 let headers = self.headers_for_provider();
                 anthropic::complete_streaming(
                     &self.spec,
@@ -289,6 +303,12 @@ impl LlmServiceImpl {
             }
             ApiFormat::OpenAIResponses => {
                 let key = self.auth.resolve().await?.credential;
+                let transport = if self.use_codex_backend {
+                    super::LlmTransport::Websocket
+                } else {
+                    super::LlmTransport::HttpSse
+                };
+                self.begin_provider_attempt(request, transport);
                 let headers = self.headers_for_provider();
                 openai::complete_streaming(
                     &self.spec,
@@ -318,6 +338,39 @@ mod tests {
     use crate::all_models;
     use crate::registry::{AuthStyle, StaticCredential};
 
+    #[derive(Debug)]
+    struct MissingCredential;
+
+    #[async_trait::async_trait]
+    impl crate::registry::CredentialSource for MissingCredential {
+        async fn get(&self) -> Option<String> {
+            None
+        }
+
+        async fn invalidate(&self) -> bool {
+            false
+        }
+    }
+
+    fn request_with_capture() -> (LlmRequest, crate::LlmAttemptCapture) {
+        let attempt_capture = crate::LlmAttemptCapture::new();
+        let request = LlmRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            telemetry: Some(crate::LlmRequestTelemetry {
+                conversation_id: "conversation".to_string(),
+                root_conversation_id: "root".to_string(),
+                request_id: "request".to_string(),
+                retry_attempt: 1,
+                attempt_capture: attempt_capture.clone(),
+            }),
+            cache_key: crate::PromptCacheKey::stable("test"),
+        };
+        (request, attempt_capture)
+    }
+
     fn make_service(
         anthropic_base_url: Option<&str>,
         openai_base_url: Option<&str>,
@@ -342,6 +395,34 @@ mod tests {
         let mut t = BTreeMap::new();
         t.insert("disable_data_logging".to_string(), "true".to_string());
         t
+    }
+
+    #[tokio::test]
+    async fn local_auth_failure_does_not_finalize_provider_attempt() {
+        let spec = all_models()
+            .into_iter()
+            .find(|model| model.id == "claude-sonnet-5")
+            .expect("claude-sonnet-5 must be in the model registry");
+        let service: Arc<dyn LlmService> = Arc::new(LlmServiceImpl::new(
+            spec,
+            LlmAuth::new(Arc::new(MissingCredential), AuthStyle::ApiKey),
+            None,
+            None,
+            vec![],
+            BTreeMap::new(),
+        ));
+        let service =
+            crate::LoggingService::new(service, "anthropic", crate::LlmTransport::HttpSse);
+        let (request, capture) = request_with_capture();
+        let (chunk_tx, _chunk_rx) = mpsc::channel(1);
+
+        let error = service
+            .complete_streaming(&request, &chunk_tx)
+            .await
+            .expect_err("missing local credential should fail");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::Auth);
+        assert_eq!(capture.finalized(), None);
     }
 
     #[test]

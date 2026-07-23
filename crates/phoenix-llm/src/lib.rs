@@ -321,11 +321,8 @@ impl LoggingService {
     }
 
     fn finalize_capture(
-        &self,
         span: &tracing::Span,
         request: &LlmRequest,
-        streaming: bool,
-        duration: std::time::Duration,
         result: &Result<LlmResponse, LlmError>,
     ) {
         let Some(telemetry) = request.telemetry.as_ref() else {
@@ -351,15 +348,9 @@ impl LoggingService {
             Ok(response) => Some(response.stream_telemetry.clone()),
             Err(_) => None,
         };
-        let _ = telemetry.attempt_capture.finalize(LlmAttemptFinalization {
-            telemetry,
-            provider: self.provider,
-            model: &self.model_id,
-            fallback_transport: self.fallback_transport_for(streaming),
-            total_duration: duration,
-            stream,
-            outcome,
-        });
+        let _ = telemetry
+            .attempt_capture
+            .finalize(LlmAttemptFinalization { stream, outcome });
         if let Some(metrics) = telemetry.attempt_capture.finalized() {
             Self::record_stream_telemetry(span, &metrics.stream);
         }
@@ -389,19 +380,21 @@ impl LoggingService {
 impl LlmService for LoggingService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(request, false);
-        if let Some(telemetry) = &request.telemetry {
-            telemetry.attempt_capture.begin(
-                telemetry,
-                self.provider,
-                &self.model_id,
-                self.fallback_transport_for(false),
-            );
+        if self.streaming_transport == LlmTransport::InProcess {
+            if let Some(telemetry) = &request.telemetry {
+                telemetry.attempt_capture.begin(
+                    telemetry,
+                    self.provider,
+                    &self.model_id,
+                    self.fallback_transport_for(false),
+                );
+            }
         }
         let start = std::time::Instant::now();
         let result = self.inner.complete(request).instrument(span.clone()).await;
         let duration = start.elapsed();
         Self::record_outcome(&span, &result);
-        self.finalize_capture(&span, request, false, duration, &result);
+        Self::finalize_capture(&span, request, &result);
 
         match &result {
             Ok(response) => {
@@ -436,13 +429,15 @@ impl LlmService for LoggingService {
         chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let span = self.request_span(request, true);
-        if let Some(telemetry) = &request.telemetry {
-            telemetry.attempt_capture.begin(
-                telemetry,
-                self.provider,
-                &self.model_id,
-                self.fallback_transport_for(true),
-            );
+        if self.streaming_transport == LlmTransport::InProcess {
+            if let Some(telemetry) = &request.telemetry {
+                telemetry.attempt_capture.begin(
+                    telemetry,
+                    self.provider,
+                    &self.model_id,
+                    self.fallback_transport_for(true),
+                );
+            }
         }
         let start = std::time::Instant::now();
 
@@ -453,7 +448,7 @@ impl LlmService for LoggingService {
             .await;
         let duration = start.elapsed();
         Self::record_outcome(&span, &result);
-        self.finalize_capture(&span, request, true, duration, &result);
+        Self::finalize_capture(&span, request, &result);
 
         match &result {
             Ok(response) => {

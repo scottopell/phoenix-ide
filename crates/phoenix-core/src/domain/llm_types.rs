@@ -4,7 +4,6 @@ pub const LLM_SOURCE_HEADER: &str = "phoenix-ide";
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 /// Identifier for `OpenAI`'s `prompt_cache_key` Responses-API field. Required
 /// on every `LlmRequest` so callers must explicitly choose a caching strategy
@@ -146,12 +145,7 @@ pub struct LlmAttemptMetrics {
 }
 
 #[derive(Debug, Clone)]
-pub struct LlmAttemptFinalization<'a> {
-    pub telemetry: &'a LlmRequestTelemetry,
-    pub provider: &'a str,
-    pub model: &'a str,
-    pub fallback_transport: LlmTransport,
-    pub total_duration: Duration,
+pub struct LlmAttemptFinalization {
     pub stream: Option<ProviderStreamTelemetry>,
     pub outcome: LlmAttemptOutcome,
 }
@@ -262,34 +256,27 @@ impl LlmAttemptCapture {
     }
 
     #[must_use]
-    pub fn finalize(&self, finalization: LlmAttemptFinalization<'_>) -> LlmAttemptMetrics {
-        let transport = self
-            .0
-            .lock()
-            .ok()
-            .and_then(|state| state.transport)
-            .unwrap_or(finalization.fallback_transport);
-        let progress = self.0.lock().ok().and_then(|state| state.progress.clone());
+    pub fn finalize(&self, finalization: LlmAttemptFinalization) -> Option<LlmAttemptMetrics> {
+        let mut state = self.0.lock().ok()?;
+        let identity = state.identity.clone()?;
         let metrics = LlmAttemptMetrics {
-            conversation_id: finalization.telemetry.conversation_id.clone(),
-            root_conversation_id: finalization.telemetry.root_conversation_id.clone(),
-            request_id: finalization.telemetry.request_id.clone(),
-            retry_attempt: finalization.telemetry.retry_attempt,
-            provider: finalization.provider.to_string(),
-            model: finalization.model.to_string(),
-            transport,
-            total_duration_ms: u64::try_from(finalization.total_duration.as_millis())
+            conversation_id: identity.conversation_id,
+            root_conversation_id: identity.root_conversation_id,
+            request_id: identity.request_id,
+            retry_attempt: identity.retry_attempt,
+            provider: identity.provider,
+            model: identity.model,
+            transport: state.transport.unwrap_or(identity.fallback_transport),
+            total_duration_ms: u64::try_from(identity.started_at.elapsed().as_millis())
                 .unwrap_or(u64::MAX),
             stream: finalization
                 .stream
-                .or(progress)
+                .or_else(|| state.progress.clone())
                 .unwrap_or_else(ProviderStreamTelemetry::non_streaming),
             outcome: finalization.outcome,
         };
-        if let Ok(mut state) = self.0.lock() {
-            state.finalized = Some(metrics.clone());
-        }
-        metrics
+        state.finalized = Some(metrics.clone());
+        Some(metrics)
     }
 }
 
@@ -687,6 +674,20 @@ mod attempt_capture_tests {
         let capture = LlmAttemptCapture::new();
 
         assert_eq!(capture.finalize_cancelled(), None);
+        assert_eq!(capture.finalized(), None);
+    }
+
+    #[test]
+    fn finalization_without_provider_dispatch_is_not_an_attempt() {
+        let capture = LlmAttemptCapture::new();
+
+        assert_eq!(
+            capture.finalize(LlmAttemptFinalization {
+                stream: None,
+                outcome: LlmAttemptOutcome::AuthError,
+            }),
+            None
+        );
         assert_eq!(capture.finalized(), None);
     }
 
