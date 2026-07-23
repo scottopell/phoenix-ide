@@ -296,7 +296,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_cancelled_steering_disposition",
         sql: MIGRATION_056,
     },
+    Migration {
+        version: 57,
+        name: "scope_direct_turn_message_ids_to_conversation",
+        sql: MIGRATION_057,
+    },
 ];
+
+const MIGRATION_057: &str = r"
+DROP INDEX direct_turn_acceptances_client_message_id_unique;
+";
 
 const MIGRATION_056: &str = r"
 CREATE TABLE direct_turn_steering_cancellations (

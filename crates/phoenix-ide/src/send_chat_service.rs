@@ -134,6 +134,19 @@ impl SendChatApplicationService {
             if accepted.prepared_fingerprint != sha256_hex(prepared_retry_payload.as_bytes()) {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
+            if self
+                .db
+                .get_message_by_id(&req.message_id)
+                .await
+                .is_ok_and(|message| message.conversation_id == conversation.id)
+            {
+                receipts.remove(&req.message_id);
+                return Ok(SendChatOutcome::accepted(
+                    req.message_id,
+                    SendChatRequestResult::Replayed,
+                    SendChatDisposition::RuntimeAccepted,
+                ));
+            }
             return self
                 .replay_durable_acceptance(
                     &conversation,

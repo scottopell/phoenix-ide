@@ -376,20 +376,6 @@ impl WorkflowRepository {
             tx.commit().await?;
             return Ok(classify_direct_turn_replay(existing, input));
         }
-        let globally_owned = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM direct_turn_acceptances
-             WHERE client_message_id = ?1 AND conversation_id <> ?2",
-        )
-        .bind(&input.client_message_id)
-        .bind(&input.conversation_id)
-        .fetch_one(&mut *tx.tx)
-        .await?
-            != 0;
-        if globally_owned {
-            tx.commit().await?;
-            return Ok(DirectTurnAcceptanceOutcome::Conflict);
-        }
-
         let workflow_id = allocate_global_workflow_id(&mut tx).await?;
         let create = CreateWorkflowWithExternalAcceptance {
             workflow_id,
@@ -445,17 +431,6 @@ impl WorkflowRepository {
                 .await?
                 {
                     return Ok(classify_direct_turn_replay(existing, input));
-                }
-                let globally_owned = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM direct_turn_acceptances
-                     WHERE client_message_id = ?1",
-                )
-                .bind(&input.client_message_id)
-                .fetch_one(&self.pool)
-                .await?
-                    != 0;
-                if globally_owned {
-                    return Ok(DirectTurnAcceptanceOutcome::Conflict);
                 }
                 let live_slot_taken = sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM direct_turn_acceptances
@@ -642,6 +617,22 @@ impl WorkflowRepository {
             }
         }
         for message_id in drained_message_ids {
+            if message_id != owner_message_id {
+                sqlx::query(
+                    "UPDATE direct_turn_acceptances
+                     SET committed_outcome = 'RuntimeAccepted'
+                     WHERE conversation_id = ?1 AND client_message_id = ?2
+                       AND committed_outcome = 'QueuedSteering'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM direct_turn_steering_cancellations c
+                           WHERE c.workflow_id = direct_turn_acceptances.workflow_id
+                       )",
+                )
+                .bind(conversation_id)
+                .bind(message_id)
+                .execute(&mut *tx.tx)
+                .await?;
+            }
             sqlx::query(
                 "DELETE FROM steering_messages
                  WHERE conversation_id = ?1 AND message_id = ?2",
@@ -2396,10 +2387,10 @@ mod tests {
             .unwrap();
         let mut other_conversation = input.clone();
         other_conversation.conversation_id = "conv-2".to_string();
-        assert_eq!(
+        assert!(matches!(
             repo.accept_direct_turn(&other_conversation).await.unwrap(),
-            DirectTurnAcceptanceOutcome::Conflict
-        );
+            DirectTurnAcceptanceOutcome::Created(_)
+        ));
         let mut conflict = input.clone();
         conflict.prepared_fingerprint = "fp-2".to_string();
         assert_eq!(
@@ -2557,6 +2548,50 @@ mod tests {
                 .workflow_id,
             record.workflow_id
         );
+    }
+
+    #[tokio::test]
+    async fn queued_steering_batch_finalizes_every_drained_acceptance() {
+        let repo = open_repo().await;
+        for (message_id, accepted_at) in [("msg-1", 1), ("msg-2", 2)] {
+            repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+                initial_outcome: DirectTurnInitialOutcome::QueuedSteering {
+                    entry: Box::new(phoenix_core::domain::sm_event::SteerEntry {
+                        text: message_id.to_string(),
+                        llm_text: None,
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        message_id: message_id.to_string(),
+                        user_agent: None,
+                        skill_invocation: None,
+                    }),
+                },
+                conversation_id: "conv-1".to_string(),
+                client_message_id: message_id.to_string(),
+                prepared_fingerprint: format!("fp-{message_id}"),
+                prepared_payload: "{}".to_string(),
+                accepted_at: Timestamp(accepted_at),
+                snapshot: snapshot(),
+            })
+            .await
+            .unwrap();
+        }
+        let drained = vec!["msg-1".to_string(), "msg-2".to_string()];
+
+        repo.consume_queued_steering_batch("conv-1", "msg-2", &drained)
+            .await
+            .unwrap();
+
+        for message_id in drained {
+            assert_eq!(
+                repo.load_direct_turn_acceptance("conv-1", &message_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .committed_outcome,
+                DirectTurnCommittedOutcome::RuntimeAccepted
+            );
+        }
     }
 
     #[tokio::test]

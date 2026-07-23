@@ -435,13 +435,9 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
         let durable_request: phoenix_llm::DurableLlmRequest =
             serde_json::from_str(&recovery.prepared_request.request_aggregate)
                 .map_err(|error| error.to_string())?;
-        let Some(llm) = manager
+        let llm = manager
             .model_registry()
-            .get(&recovery.prepared_request.model)
-        else {
-            tracing::error!(model = %recovery.prepared_request.model, "recovered LLM model is unavailable");
-            continue;
-        };
+            .get(&recovery.prepared_request.model);
         let begun = repo
             .begin_recovered_top_level_llm_attempt(
                 recovery.workflow.workflow_id,
@@ -452,6 +448,39 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
             .await
             .map_err(|error| error.to_string())?;
         let Some(authority) = begun.authority else {
+            continue;
+        };
+        let Some(llm) = llm else {
+            let attempt = u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX);
+            let message = format!(
+                "Recovered LLM model '{}' is unavailable",
+                recovery.prepared_request.model
+            );
+            repo.record_top_level_llm_failure(&phoenix_db::RecordTopLevelLlmFailureInput {
+                authority,
+                observed_at: Timestamp(
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                ),
+                outcome_payload: message.as_bytes().to_vec(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            let handle = manager
+                .get_or_create(&recovery.workflow.conversation_id)
+                .await?;
+            if let Err(error) = handle
+                .event_tx
+                .send(phoenix_core::domain::sm_event::Event::LlmError {
+                    message,
+                    error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                    attempt,
+                    recovery_in_progress: false,
+                    resets_at: None,
+                })
+                .await
+            {
+                tracing::warn!(%error, "unavailable recovered model runtime channel closed");
+            }
             continue;
         };
         let request_id = uuid::Uuid::new_v4().to_string();
