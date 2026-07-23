@@ -4028,18 +4028,26 @@ async fn continue_conversation(
 
     match outcome {
         ContinueOutcome::Created(new_conv) => {
-            let wake_repo =
-                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
-            wake_repo
-                .transfer_active_for_continuation(
-                    &id,
-                    &new_conv.id,
-                    phoenix_workflow::Timestamp(
-                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                    ),
-                )
+            let parent = state
+                .runtime
+                .db()
+                .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
+            let wake_repo =
+                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
+            if parent.work_scope_id == new_conv.work_scope_id {
+                wake_repo
+                    .transfer_active_for_continuation(
+                        &id,
+                        &new_conv.id,
+                        phoenix_workflow::Timestamp(
+                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
             tracing::info!(
                 parent_id = %id,
                 continuation_id = %new_conv.id,
@@ -4080,18 +4088,26 @@ async fn continue_conversation(
             }))
         }
         ContinueOutcome::AlreadyContinued(existing) => {
-            let wake_repo =
-                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
-            wake_repo
-                .transfer_active_for_continuation(
-                    &id,
-                    &existing.id,
-                    phoenix_workflow::Timestamp(
-                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                    ),
-                )
+            let parent = state
+                .runtime
+                .db()
+                .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
+            let wake_repo =
+                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
+            if parent.work_scope_id == existing.work_scope_id {
+                wake_repo
+                    .transfer_active_for_continuation(
+                        &id,
+                        &existing.id,
+                        phoenix_workflow::Timestamp(
+                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+            }
             tracing::info!(
                 parent_id = %id,
                 existing_continuation = %existing.id,
@@ -4504,8 +4520,7 @@ pub(super) async fn run_resource_cleanup_cascade(
     // Step 3: tmux server. Preserve iff the scope is still owned by a live
     // conversation other than this one (REQ-TMUX-WS-002).
     let legacy_worktree_path = conv.conv_mode.worktree_path().map(std::path::Path::new);
-    let legacy_conversation_id =
-        matches!(conv.conv_mode, crate::db::ConvMode::Direct).then_some(conv.id.as_str());
+    let legacy_conversation_id = legacy_worktree_path.is_none().then_some(conv.id.as_str());
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
         state.runtime.tmux_registry(),
         &work_scope,
