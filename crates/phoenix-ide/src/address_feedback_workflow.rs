@@ -49,6 +49,7 @@ struct AddressFeedbackSnapshot {
     conversation_id: String,
     message_id: String,
     guidance: Option<String>,
+    user_agent: Option<String>,
     status: AddressFeedbackStatus,
     target: Option<AddressFeedbackTarget>,
     head_oid: Option<String>,
@@ -126,7 +127,7 @@ impl AddressFeedbackWorkflowService {
                 conversation_id: snapshot.conversation_id.clone(),
                 message_id: snapshot.message_id.clone(),
                 guidance: snapshot.guidance.clone(),
-                user_agent: None,
+                user_agent: snapshot.user_agent.clone(),
             };
             let result = if snapshot.model_message.is_some() && snapshot.target.is_some() {
                 self.dispatch_persisted_snapshot(&repo, workflow_id, version, snapshot, req)
@@ -159,6 +160,7 @@ impl AddressFeedbackWorkflowService {
             conversation_id: req.conversation_id.clone(),
             message_id: req.message_id.clone(),
             guidance: req.guidance.clone(),
+            user_agent: req.user_agent.clone(),
             status: AddressFeedbackStatus::Accepted,
             target: None,
             head_oid: None,
@@ -166,7 +168,7 @@ impl AddressFeedbackWorkflowService {
             model_message: None,
             dispatch: None,
         };
-        let intent_fingerprint = snapshot_fingerprint(&initial)?;
+        let intent_fingerprint = intent_fingerprint(&initial)?;
         let repo = WorkflowRepository::new(self.state.db.pool().clone());
         let create = CreateWorkflowWithExternalAcceptance {
             workflow_id,
@@ -198,6 +200,13 @@ impl AddressFeedbackWorkflowService {
                     {
                         return Ok(response);
                     }
+                    if matches!(snapshot.status, AddressFeedbackStatus::Failed) {
+                        return Err(AddressFeedbackWorkflowError::Rejected {
+                            message: "Address feedback workflow previously failed before handoff"
+                                .to_string(),
+                            code: "address_feedback_failed".to_string(),
+                        });
+                    }
                     if snapshot.model_message.is_some() && snapshot.target.is_some() {
                         return self
                             .dispatch_persisted_snapshot(&repo, workflow_id, version, snapshot, req)
@@ -209,11 +218,23 @@ impl AddressFeedbackWorkflowService {
             ExternalAcceptanceOutcome::Created(_) => {}
         }
 
-        let head_oid = local_head_oid(&self.state.db, &req.conversation_id).await?;
+        let head_oid = match local_head_oid(&self.state.db, &req.conversation_id).await {
+            Ok(head_oid) => head_oid,
+            Err(error) => {
+                fail_workflow(&self.state.db, &repo, workflow_id, 0, &initial).await;
+                return Err(error);
+            }
+        };
         let capture =
-            capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
+            match capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
                 .await
-                .map_err(map_app_error_for_capture)?;
+            {
+                Ok(capture) => capture,
+                Err(error) => {
+                    fail_workflow(&self.state.db, &repo, workflow_id, 0, &initial).await;
+                    return Err(map_app_error_for_capture(error));
+                }
+            };
         let model_message =
             render_address_feedback_xml(&capture, head_oid.as_deref(), req.guidance.as_deref());
 
@@ -436,6 +457,21 @@ impl AddressFeedbackWorkflowService {
     }
 }
 
+async fn fail_workflow(
+    db: &crate::db::Database,
+    repo: &WorkflowRepository,
+    workflow_id: WorkflowId,
+    version: u64,
+    snapshot: &AddressFeedbackSnapshot,
+) {
+    let failed = AddressFeedbackSnapshot {
+        status: AddressFeedbackStatus::Failed,
+        ..snapshot.clone()
+    };
+    let _ = commit_snapshot(repo, workflow_id, version, version + 1, &failed).await;
+    let _ = set_workflow_status(db, workflow_id, phoenix_workflow::WorkflowStatus::Failed).await;
+}
+
 async fn wait_for_message_durable(
     db: &crate::db::Database,
     message_id: &str,
@@ -627,6 +663,14 @@ fn encode_snapshot(
 ) -> Result<Vec<u8>, AddressFeedbackWorkflowError> {
     serde_json::to_vec(snapshot)
         .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))
+}
+
+fn intent_fingerprint(
+    snapshot: &AddressFeedbackSnapshot,
+) -> Result<String, AddressFeedbackWorkflowError> {
+    let mut stable = snapshot.clone();
+    stable.user_agent = None;
+    snapshot_fingerprint(&stable)
 }
 
 fn snapshot_fingerprint(

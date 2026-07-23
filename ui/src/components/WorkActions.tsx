@@ -200,6 +200,7 @@ export function WorkControlBar({
       const response = await api.addressPrFeedback(conversationId, messageId);
       if (response.no_op) {
         setAddressSubmitted(true);
+        await prStatusHandle.refresh();
         return;
       }
       setAddressSubmitted(true);
