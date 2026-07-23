@@ -576,6 +576,7 @@ impl WakeRepository {
                 WakeRegistrationOutcome::Conflict
             });
         }
+        retire_inactive_resource_bindings_tx(&mut tx, input, now).await?;
         if fetch_unresolved_resource_binding_tx(&mut tx, input)
             .await?
             .is_some()
@@ -2382,7 +2383,7 @@ impl WakeRepository {
                     p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                     p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                     p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                    p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy, b.registering_tool_use_id
+                    p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, b.work_scope_id, b.tmux_completion_policy, b.registering_tool_use_id
              FROM workflow_deliveries d
              JOIN wake_terminal_receipts p
                ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -3544,6 +3545,39 @@ fn replay_receipt(existing: &WakeBindingRecord) -> WakeRegistrationReceipt {
     }
 }
 
+async fn retire_inactive_resource_bindings_tx(
+    tx: &mut WorkflowTx<'_>,
+    input: &WakeRegistrationIntent,
+    now: Timestamp,
+) -> DbResult<()> {
+    sqlx::query(
+        "DELETE FROM workflows
+         WHERE workflow_id IN (
+             SELECT b.workflow_id
+             FROM wake_bindings b
+             WHERE b.profile_kind = 'wake'
+               AND b.profile_version = ?1
+               AND b.conversation_id = ?2
+               AND b.resource_kind = ?3
+               AND COALESCE(b.bash_handle_id, '') = ?4
+               AND COALESCE(b.tmux_server_token, '') = ?5
+               AND COALESCE(b.tmux_window_id, '') = ?6
+               AND b.activated_at IS NULL
+               AND b.created_at < ?7
+         )",
+    )
+    .bind(i64::from(wake_profile::PROTOCOL_VERSION))
+    .bind(&input.conversation_id)
+    .bind(resource_kind_str(&input.resource))
+    .bind(bash_handle_id(&input.resource).unwrap_or_default())
+    .bind(tmux_server_token(&input.resource).unwrap_or_default())
+    .bind(tmux_window_id(&input.resource).unwrap_or_default())
+    .bind(to_i64(now.0, "registered_at")?)
+    .execute(&mut *tx.tx)
+    .await?;
+    Ok(())
+}
+
 async fn fetch_existing_binding_tx(
     tx: &mut WorkflowTx<'_>,
     input: &WakeRegistrationIntent,
@@ -3838,6 +3872,16 @@ async fn insert_terminal_receipt_projection_tx(
         cancelled_at,
         tail,
     ) = projection_parts(terminal);
+    let (bash_cmd, bash_label) = match terminal {
+        WakeTerminalPayload::Fired {
+            evidence: WakeTerminalEvidence::Bash(evidence),
+            ..
+        } => (Some(evidence.cmd.as_str()), evidence.label.as_deref()),
+        WakeTerminalPayload::Fired { .. }
+        | WakeTerminalPayload::Cancelled { .. }
+        | WakeTerminalPayload::Expired { .. }
+        | WakeTerminalPayload::Forgotten { .. } => (None, None),
+    };
     let (tail_start_offset, tail_end_offset, tail_truncated_before) = match terminal {
         WakeTerminalPayload::Fired {
             evidence: WakeTerminalEvidence::Bash(evidence),
@@ -3865,8 +3909,8 @@ async fn insert_terminal_receipt_projection_tx(
             terminal_kind, resolved_at, bash_handle_id, tmux_server_token, tmux_window_id,
             bash_status, tmux_status, occurred_at, exit_code, duration_ms, signal_number,
             kill_signal_sent, forgotten_reason, cancelled_reason, cancelled_at,
-            tail_start_offset, tail_end_offset, tail_truncated_before
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"
+            tail_start_offset, tail_end_offset, tail_truncated_before, bash_cmd, bash_label
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
     )
     .bind(to_i64(binding.workflow_id.0, "workflow_id")?)
     .bind(to_i64(receipt.receipt_id.0, "receipt_id")?)
@@ -3892,6 +3936,8 @@ async fn insert_terminal_receipt_projection_tx(
     .bind(tail_start_offset.map(i64::try_from).transpose().map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(tail_end_offset.map(i64::try_from).transpose().map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(tail_truncated_before.map(i64::from))
+    .bind(bash_cmd)
+    .bind(bash_label)
     .execute(&mut *tx.tx)
     .await?;
     for (ordinal, line) in tail.into_iter().enumerate() {
@@ -4184,7 +4230,7 @@ async fn fetch_pending_delivery_exact_tx(
                 p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy
+                p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, b.work_scope_id, b.tmux_completion_policy
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4225,7 +4271,7 @@ async fn fetch_pending_deliveries_for_conversation_tx(
                 p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.forgotten_reason, p.cancelled_reason,
-                p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy
+                p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, b.work_scope_id, b.tmux_completion_policy
          FROM workflow_deliveries d
          JOIN wake_terminal_receipts p
            ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
@@ -4269,7 +4315,7 @@ async fn fetch_materialized_pending_batches_for_conversation_tx(
                 p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
-                p.cancelled_reason, p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy,
+                p.cancelled_reason, p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, b.work_scope_id, b.tmux_completion_policy,
                 l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
                 l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
@@ -4332,7 +4378,7 @@ async fn fetch_materialized_pending_deliveries_tx(
                 p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.forgotten_reason,
-                p.cancelled_reason, p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, b.work_scope_id, b.tmux_completion_policy,
+                p.cancelled_reason, p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, b.work_scope_id, b.tmux_completion_policy,
                 l.workflow_id AS link_workflow_id, l.delivery_id AS link_delivery_id,
                 l.conversation_id AS link_conversation_id, l.message_id AS link_message_id,
                 l.registering_tool_use_id, l.terminal_kind, l.auto_resume,
@@ -4584,6 +4630,8 @@ fn evidence_from_projection_row(
     Ok(match resource {
         WakeResourceIdentity::Bash(identity) => WakeTerminalEvidence::Bash(BashTerminalEvidence {
             identity,
+            cmd: row.get::<Option<String>, _>("bash_cmd").unwrap_or_default(),
+            label: row.get("bash_label"),
             status: match row.get::<String, _>("bash_status").as_str() {
                 "Exited" => wake_types::BashTerminalStatus::Exited,
                 "Killed" => wake_types::BashTerminalStatus::Killed,
@@ -4962,6 +5010,8 @@ mod tests {
                 work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
                 handle_id: "b-1".into(),
             },
+            cmd: "test command".to_string(),
+            label: None,
             status: wake_types::BashTerminalStatus::Exited,
             occurred_at: Timestamp(occurred_at),
             exit_code: Some(0),
@@ -6051,6 +6101,8 @@ mod tests {
                         work_scope: second_intent.registration_scope.clone(),
                         handle_id: "b-second-workflow".into(),
                     },
+                    cmd: "test command".to_string(),
+                    label: None,
                     status: wake_types::BashTerminalStatus::Exited,
                     occurred_at: Timestamp(19),
                     exit_code: Some(0),
@@ -6128,6 +6180,8 @@ mod tests {
                         work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
                         handle_id: "b-2".into(),
                     },
+                    cmd: "test command".to_string(),
+                    label: None,
                     status: wake_types::BashTerminalStatus::Exited,
                     occurred_at: Timestamp(19),
                     exit_code: Some(0),
@@ -6174,6 +6228,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inactive_registration_does_not_block_retry_on_same_resource() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let first = WorkflowId(300);
+        let second = WorkflowId(301);
+        let first_intent = intent();
+        assert!(matches!(
+            repo.register_allocated(first, &first_intent, "fp-first", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let mut retry = first_intent.clone();
+        retry.contract_id = "contract-retry".to_string();
+        retry.registering_tool_use_id = "tool-retry".to_string();
+
+        assert!(matches!(
+            repo.register_allocated(second, &retry, "fp-second", Timestamp(11))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { workflow_id, .. } if workflow_id == second
+        ));
+        assert!(repo.fetch_binding(first).await.unwrap().is_none());
+        assert!(repo.fetch_binding(second).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn duplicate_concurrent_registration_replays_single_winner() {
         let (_dir, first, second) = open_repo_pair().await;
         let input = intent();
@@ -6216,10 +6296,14 @@ mod tests {
     async fn different_contract_on_unresolved_resource_returns_conflict() {
         let (_dir, repo, _) = open_repo_pair().await;
         let input = intent();
-        assert!(matches!(
-            repo.register(&input, "fp-1", Timestamp(10)).await.unwrap(),
-            WakeRegistrationOutcome::Registered { .. }
-        ));
+        let workflow_id = match repo.register(&input, "fp-1", Timestamp(10)).await.unwrap() {
+            WakeRegistrationOutcome::Registered { workflow_id, .. } => workflow_id,
+            other @ (WakeRegistrationOutcome::Replayed { .. }
+            | WakeRegistrationOutcome::Conflict) => {
+                panic!("expected registration, got {other:?}")
+            }
+        };
+        repo.activate_for_test(workflow_id).await.unwrap();
         let mut duplicate_resource = input;
         duplicate_resource.contract_id = "different-contract".to_string();
         duplicate_resource.registering_tool_use_id = "different-tool".to_string();
@@ -8073,6 +8157,8 @@ mod tests {
                     work_scope: input.registration_scope,
                     handle_id: format!("b-{workflow_id}"),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: wake_types::BashTerminalStatus::Exited,
                 occurred_at: Timestamp(19),
                 exit_code: Some(0),
@@ -8599,6 +8685,8 @@ mod tests {
                         work_scope: input.registration_scope.clone(),
                         handle_id: "b-wt".into(),
                     },
+                    cmd: "test command".to_string(),
+                    label: None,
                     status: wake_types::BashTerminalStatus::Exited,
                     occurred_at: Timestamp(19),
                     exit_code: Some(0),

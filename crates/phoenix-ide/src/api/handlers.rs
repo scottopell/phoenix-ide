@@ -14344,6 +14344,9 @@ mod wake_handler_tests {
             phoenix_db::workflow::wake::WakeRegistrationOutcome::Registered { .. }
                 | phoenix_db::workflow::wake::WakeRegistrationOutcome::Replayed { .. }
         ));
+        repo.activate_for_test(phoenix_workflow::WorkflowId(workflow_id))
+            .await
+            .expect("activate wake");
     }
 
     async fn cancel_via_router(
@@ -14430,6 +14433,8 @@ mod wake_handler_tests {
                     ),
                     handle_id: "b-6100".into(),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: phoenix_workflow::wake_profile::BashTerminalStatus::Exited,
                 occurred_at: phoenix_workflow::Timestamp(19),
                 exit_code: Some(0),

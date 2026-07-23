@@ -306,7 +306,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "gate_wakes_on_checkpoint_and_preserve_tail_windows",
         sql: MIGRATION_058,
     },
+    Migration {
+        version: 59,
+        name: "persist_bash_wake_command_identity",
+        sql: MIGRATION_059,
+    },
 ];
+
+const MIGRATION_059: &str = r"
+ALTER TABLE wake_terminal_receipts ADD COLUMN bash_cmd TEXT;
+ALTER TABLE wake_terminal_receipts ADD COLUMN bash_label TEXT;
+";
 
 const MIGRATION_058: &str = r"
 ALTER TABLE wake_bindings ADD COLUMN activated_at INTEGER CHECK (activated_at IS NULL OR activated_at >= 0);

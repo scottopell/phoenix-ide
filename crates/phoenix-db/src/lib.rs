@@ -15685,6 +15685,8 @@ mod tests {
                             ),
                             handle_id: "b-del".into(),
                         },
+                        cmd: "test command".to_string(),
+                        label: None,
                         status: phoenix_workflow::wake_profile::BashTerminalStatus::Exited,
                         occurred_at: phoenix_workflow::Timestamp(19),
                         exit_code: Some(0),

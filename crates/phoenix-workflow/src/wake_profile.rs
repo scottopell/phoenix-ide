@@ -132,6 +132,11 @@ pub enum TmuxTerminalStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BashTerminalEvidence {
     pub identity: BashResourceIdentity,
+    // owned: pre-command-identity evidence had no command metadata
+    #[serde(default)]
+    pub cmd: String,
+    #[serde(default)]
+    pub label: Option<String>,
     pub status: BashTerminalStatus,
     pub occurred_at: Timestamp,
     pub exit_code: Option<i32>,
@@ -209,6 +214,7 @@ pub enum WakeForgottenReason {
     TmuxHandleMissing,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeTerminalPayload {
     Fired {

@@ -612,6 +612,8 @@ async fn deliver_pending(
 struct BashWakeObservation<'a> {
     contract_id: &'a str,
     handle: &'a str,
+    cmd: &'a str,
+    label: Option<&'a str>,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     final_cause: Option<&'static str>,
@@ -649,6 +651,8 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
             serde_json::to_string(&BashWakeObservation {
                 contract_id,
                 handle: &evidence.identity.handle_id,
+                cmd: &evidence.cmd,
+                label: evidence.label.as_deref(),
                 status: match evidence.status {
                     BashTerminalStatus::Exited | BashTerminalStatus::Killed => "tombstoned",
                     BashTerminalStatus::KillPendingKernel => "kill_pending_kernel",
@@ -705,6 +709,7 @@ impl WakeClock for SystemClock {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InspectionOutcome {
     LiveRetry,
@@ -768,6 +773,8 @@ async fn inspect_live_bash(
         .collect();
     InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
         identity: identity.clone(),
+        cmd: handle.cmd.clone(),
+        label: handle.label.clone(),
         status: BashTerminalStatus::KillPendingKernel,
         occurred_at: system_time_to_timestamp(kill_attempt.attempted_at),
         exit_code: None,
@@ -827,6 +834,8 @@ impl TerminalInspector for RuntimeRegistryInspector {
                             Ok(InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(
                                 BashTerminalEvidence {
                                     identity: identity.clone(),
+                                    cmd: handle.cmd.clone(),
+                                    label: handle.label.clone(),
                                     status,
                                     occurred_at: system_time_to_timestamp(tomb.finished_at),
                                     exit_code: tomb.exit_code,
@@ -834,7 +843,7 @@ impl TerminalInspector for RuntimeRegistryInspector {
                                     signal_number: tomb.signal_number,
                                     kill_signal_sent: tomb
                                         .kill_signal_sent
-                                        .map(|sig| format!("{sig:?}")),
+                                        .map(|sig| sig.as_str().to_string()),
                                     final_tail_start_offset,
                                     final_tail_end_offset: tomb.next_offset_at_exit,
                                     final_tail_truncated_before: final_tail_start_offset > 0,
@@ -1153,6 +1162,8 @@ mod tests {
                     work_scope: conv_scope(),
                     handle_id: "b-1".to_string(),
                 },
+                cmd: "cargo test".to_string(),
+                label: Some("tests".to_string()),
                 status: BashTerminalStatus::Exited,
                 occurred_at: Timestamp(10),
                 exit_code: Some(0),
@@ -1180,6 +1191,8 @@ mod tests {
             serde_json::from_str(&render_terminal_result(&pending)).unwrap();
         assert_eq!(rendered["contract_id"], "contract-b-1");
         assert_eq!(rendered["handle"], "b-1");
+        assert_eq!(rendered["cmd"], "cargo test");
+        assert_eq!(rendered["label"], "tests");
         assert_eq!(rendered["status"], "tombstoned");
         assert_eq!(rendered["final_cause"], "exited");
         assert_eq!(rendered["exit_code"], 0);
@@ -1226,6 +1239,8 @@ mod tests {
                     work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: BashTerminalStatus::Exited,
                 occurred_at: Timestamp(10),
                 exit_code: Some(0),
@@ -1500,6 +1515,8 @@ mod tests {
                     work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: BashTerminalStatus::Exited,
                 occurred_at: Timestamp(10),
                 exit_code: Some(0),
@@ -1682,6 +1699,8 @@ mod tests {
                     work_scope: conv_scope(),
                     handle_id: "b-1".to_string(),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: BashTerminalStatus::Exited,
                 occurred_at: Timestamp(13),
                 exit_code: Some(0),
@@ -1740,6 +1759,8 @@ mod tests {
                     work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: BashTerminalStatus::Exited,
                 occurred_at: Timestamp(11),
                 exit_code: Some(0),
@@ -1801,6 +1822,8 @@ mod tests {
                     work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: BashTerminalStatus::Exited,
                 occurred_at: Timestamp(10),
                 exit_code: Some(0),
@@ -1930,6 +1953,8 @@ mod tests {
                     work_scope: conv_scope(),
                     handle_id: "b-fired".to_string(),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: BashTerminalStatus::Exited,
                 occurred_at: Timestamp(10),
                 exit_code: Some(0),
@@ -2019,6 +2044,8 @@ mod tests {
                     work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
+                cmd: "test command".to_string(),
+                label: None,
                 status: BashTerminalStatus::Exited,
                 occurred_at: Timestamp(10),
                 exit_code: Some(0),

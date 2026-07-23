@@ -35,6 +35,8 @@ pub enum RecoveryReason {
     ErrorDismissed,
     /// Last agent message is `tool_use` only, needs continuation
     InterruptedMidTurn,
+    /// Adopted wake results are ready for the agent to consume.
+    AdoptedWakeResult,
     /// Too many consecutive auto-continue restarts (liveness bound)
     RestartLoopDetected,
     /// Durable wake work is still owed; the wake worker owns resumption.
@@ -59,11 +61,11 @@ impl RecoveryDecision {
         }
     }
 
-    fn auto_continue() -> Self {
+    fn auto_continue(reason: RecoveryReason) -> Self {
         Self {
             state: ConvState::LlmRequesting { attempt: 1 },
             needs_auto_continue: true,
-            reason: RecoveryReason::InterruptedMidTurn,
+            reason,
         }
     }
 }
@@ -120,7 +122,7 @@ pub fn suppress_auto_continue_for_owed_wake(
     decision: RecoveryDecision,
     has_owed_wake_work: bool,
 ) -> RecoveryDecision {
-    if has_owed_wake_work && decision.needs_auto_continue {
+    if has_owed_wake_work && decision.reason == RecoveryReason::InterruptedMidTurn {
         RecoveryDecision::idle(RecoveryReason::WakeDeliveryPending)
     } else {
         decision
@@ -157,7 +159,7 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
         .filter_map(wake_terminal_object)
         .any(|terminal| !terminal.contains_key("Cancelled"))
     {
-        return RecoveryDecision::auto_continue();
+        return RecoveryDecision::auto_continue(RecoveryReason::AdoptedWakeResult);
     }
 
     if !matches!(last_msg.message_type, MessageType::Tool) {
@@ -195,7 +197,7 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
         if consecutive_restarts >= MAX_CONSECUTIVE_RESTARTS {
             RecoveryDecision::idle(RecoveryReason::RestartLoopDetected)
         } else {
-            RecoveryDecision::auto_continue()
+            RecoveryDecision::auto_continue(RecoveryReason::InterruptedMidTurn)
         }
     }
 }
@@ -474,7 +476,7 @@ mod tests {
         let decision = should_auto_continue(&messages);
 
         assert!(decision.needs_auto_continue);
-        assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+        assert_eq!(decision.reason, RecoveryReason::AdoptedWakeResult);
     }
 
     #[test]
@@ -1029,7 +1031,7 @@ mod proptests {
                 RecoveryReason::UserQuestionDismissed | RecoveryReason::ErrorDismissed => {
                     prop_assert!(!decision.needs_auto_continue);
                 }
-                RecoveryReason::InterruptedMidTurn => {
+                RecoveryReason::InterruptedMidTurn | RecoveryReason::AdoptedWakeResult => {
                     prop_assert!(decision.needs_auto_continue);
                 }
                 RecoveryReason::RestartLoopDetected | RecoveryReason::WakeDeliveryPending => {
@@ -1046,8 +1048,10 @@ mod owed_wake_tests {
 
     #[test]
     fn owed_wake_for_interrupted_tool_suppresses_restart_auto_continue() {
-        let decision =
-            suppress_auto_continue_for_owed_wake(RecoveryDecision::auto_continue(), true);
+        let decision = suppress_auto_continue_for_owed_wake(
+            RecoveryDecision::auto_continue(RecoveryReason::InterruptedMidTurn),
+            true,
+        );
         assert_eq!(decision.state, ConvState::Idle);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::WakeDeliveryPending);
@@ -1139,8 +1143,17 @@ mod owed_wake_tests {
     }
 
     #[test]
+    fn adopted_wake_result_is_not_suppressed_by_pending_sibling() {
+        let decision = RecoveryDecision::auto_continue(RecoveryReason::AdoptedWakeResult);
+        assert_eq!(
+            suppress_auto_continue_for_owed_wake(decision.clone(), true),
+            decision
+        );
+    }
+
+    #[test]
     fn no_owed_wake_preserves_restart_auto_continue() {
-        let decision = RecoveryDecision::auto_continue();
+        let decision = RecoveryDecision::auto_continue(RecoveryReason::InterruptedMidTurn);
         assert_eq!(
             suppress_auto_continue_for_owed_wake(decision.clone(), false),
             decision
