@@ -7305,7 +7305,7 @@ def _apply_bare_env_defaults(env: dict[str, str]) -> None:
     env.setdefault("PHOENIX_LOG_STDOUT", "false")
 
 
-def _prepare_installed_candidate(layout: dict[str, Path]) -> PreparedCandidate:
+def _prepare_installed_candidate(layout: dict[str, Path]) -> "PreparedCandidate":
     """Reuse the currently-installed bare binary as the deployment candidate.
 
     A restart refreshes the environment without rebuilding, so the candidate is
@@ -7336,7 +7336,7 @@ def _prepare_installed_candidate(layout: dict[str, Path]) -> PreparedCandidate:
 
 def _commit_bare_transaction(
     layout: dict[str, Path],
-    prepared: PreparedCandidate,
+    prepared: "PreparedCandidate",
     env_snapshot: dict[str, str],
     transaction_id: str,
     previous_running: bool,

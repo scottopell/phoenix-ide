@@ -37,7 +37,8 @@ jobs:
       - name: Compute check plan
         id: plan
         run: |
-          ./dev.py check-plan --format github-env | tee check-plan.env
+          ./dev.py check-plan --format github-env > check-plan.env
+          cat check-plan.env
           cat check-plan.env >> "$GITHUB_OUTPUT"
 
   check-rust:

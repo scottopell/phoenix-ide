@@ -197,6 +197,14 @@ class CheckPlanTests(unittest.TestCase):
                 )
             self.assertIn(expected, workflow)
 
+    def test_workflow_check_plan_fails_closed(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn(
+            "./dev.py check-plan --format github-env > check-plan.env",
+            workflow,
+        )
+        self.assertNotIn("check-plan --format github-env |", workflow)
+
 
 def workflow_order(group):
     return {
