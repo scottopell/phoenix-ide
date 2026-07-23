@@ -230,9 +230,6 @@ impl Tool for TmuxRunTool {
                     response,
                 )
                 .await;
-                if !parsed.keep_open_on_exit && !response_has_wake_registration(&response) {
-                    let _ = kill_window(&config_path, &socket_path, &target.window_id).await;
-                }
                 response
             }
             ValidReadiness::WaitForText { text, timeout } => {
@@ -1396,6 +1393,48 @@ mod tests {
             })
         ));
         kill_socket(&socket_tmp.path().join("conv-tmux-run-immediate-close.sock")).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_close_wake_conflict_does_not_kill_running_command() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Conflict]);
+        let ctx = ctx_with_registrar(
+            "tmux-run-immediate-conflict",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+            Some(registrar.clone()),
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "sleep 10",
+                    "name": "tmux-run-immediate-conflict",
+                    "keep_open_on_exit": false,
+                    "readiness": { "mode": "return_immediately" }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        assert!(result.output().contains("wake registration conflicted"));
+        assert!(result.output().contains("window_id"));
+        assert_eq!(registrar.register_calls().len(), 1);
+        kill_socket(
+            &socket_tmp
+                .path()
+                .join("conv-tmux-run-immediate-conflict.sock"),
+        )
+        .await;
     }
 
     #[tokio::test]
