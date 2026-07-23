@@ -301,7 +301,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "scope_direct_turn_message_ids_to_conversation",
         sql: MIGRATION_057,
     },
+    Migration {
+        version: 58,
+        name: "claim_direct_turn_runtime_delivery",
+        sql: MIGRATION_058,
+    },
 ];
+
+const MIGRATION_058: &str = r"
+ALTER TABLE direct_turn_acceptances ADD COLUMN runtime_delivery_incarnation INTEGER;
+";
 
 const MIGRATION_057: &str = r"
 DROP INDEX direct_turn_acceptances_client_message_id_unique;

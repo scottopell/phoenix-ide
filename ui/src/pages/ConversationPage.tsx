@@ -781,6 +781,10 @@ function ConversationPageContent({
 
         if (results.every((result) => result.conversation_idle)) {
           for (const entry of entries) {
+            if (entry.acceptance === 'cancelled_steering') {
+              reconcileAuthoritative([entry.message_id]);
+              continue;
+            }
             if (entry.acceptance === undefined && entry.materialization.status === 'not_persisted') {
               markRecoverableInconsistency(entry.message_id);
             }

@@ -613,6 +613,54 @@ async fn expand_message(
 fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, event: Event) {
     runtime.kick_wake_worker();
     tokio::spawn(async move {
+        let message_id = match &event {
+            Event::UserMessage { message_id, .. } | Event::SteerMessage { message_id, .. } => {
+                message_id.as_str()
+            }
+            Event::CreationProvisioned { .. }
+            | Event::CreationRequestResume { .. }
+            | Event::UserCancel { .. }
+            | Event::LlmResponse { .. }
+            | Event::LlmError { .. }
+            | Event::RetryTimeout { .. }
+            | Event::ToolComplete { .. }
+            | Event::ToolAborted { .. }
+            | Event::SpawnAgentsComplete { .. }
+            | Event::SubAgentResult { .. }
+            | Event::ContinuationResponse { .. }
+            | Event::ContinuationFailed { .. }
+            | Event::UserTriggerContinuation
+            | Event::TaskApprovalDecided { .. }
+            | Event::CommissionReviewApprovalDecided { .. }
+            | Event::TaskHandoffComplete { .. }
+            | Event::UserQuestionResponse { .. }
+            | Event::UserQuestionDismissed
+            | Event::DismissError
+            | Event::GraceTurnExhausted { .. }
+            | Event::CredentialBecameAvailable
+            | Event::CredentialHelperFailed { .. }
+            | Event::TaskResolved { .. }
+            | Event::CancelSteerMessage { .. }
+            | Event::SteerDrainedUserMessages { .. }
+            | Event::WakeBatchAdopted
+            | Event::Shutdown => return,
+        };
+        let repo = phoenix_db::WorkflowRepository::new(runtime.db().pool().clone());
+        match repo
+            .claim_direct_turn_runtime_delivery(
+                &conversation_id,
+                message_id,
+                crate::runtime::process_incarnation(),
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(%conversation_id, %error, "failed to claim direct-turn runtime delivery");
+                return;
+            }
+        }
         if let Err(error) = runtime.send_event(&conversation_id, event).await {
             tracing::warn!(
                 conversation_id,

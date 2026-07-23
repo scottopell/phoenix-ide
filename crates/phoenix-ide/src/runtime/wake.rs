@@ -602,7 +602,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
 async fn deliver_pending_direct_turns(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
     for pending in repo
-        .load_pending_direct_turns()
+        .claim_recoverable_direct_turns(super::process_incarnation())
         .await
         .map_err(|error| error.to_string())?
     {

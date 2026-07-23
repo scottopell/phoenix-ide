@@ -674,6 +674,64 @@ impl WorkflowRepository {
         .transpose()
     }
 
+    pub async fn claim_direct_turn_runtime_delivery(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        process_incarnation: ProcessIncarnation,
+    ) -> DbResult<bool> {
+        let claimed = sqlx::query(
+            "UPDATE direct_turn_acceptances
+             SET runtime_delivery_incarnation = ?3
+             WHERE conversation_id = ?1 AND client_message_id = ?2
+               AND committed_outcome IN ('PendingRuntime', 'RuntimeAccepted')
+               AND (runtime_delivery_incarnation IS NULL OR runtime_delivery_incarnation <> ?3)",
+        )
+        .bind(conversation_id)
+        .bind(client_message_id)
+        .bind(to_i64(process_incarnation.0, "process_incarnation")?)
+        .execute(&self.pool)
+        .await?;
+        Ok(claimed.rows_affected() == 1)
+    }
+
+    pub async fn claim_recoverable_direct_turns(
+        &self,
+        process_incarnation: ProcessIncarnation,
+    ) -> DbResult<Vec<DirectTurnAcceptanceRecord>> {
+        let incarnation = to_i64(process_incarnation.0, "process_incarnation")?;
+        let rows = sqlx::query(
+            "UPDATE direct_turn_acceptances AS a
+             SET runtime_delivery_incarnation = ?1
+             WHERE a.committed_outcome IN ('PendingRuntime', 'RuntimeAccepted')
+               AND (a.runtime_delivery_incarnation IS NULL OR a.runtime_delivery_incarnation <> ?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs cj
+                   WHERE cj.conversation_id = a.conversation_id
+                     AND cj.message_id = a.client_message_id
+               )
+               AND EXISTS (
+                   SELECT 1 FROM top_level_llm_workflows w
+                   WHERE w.workflow_id = a.workflow_id AND w.stopped_at IS NULL
+               )
+               AND (
+                   a.committed_outcome = 'PendingRuntime'
+                   OR NOT EXISTS (
+                       SELECT 1 FROM top_level_llm_effects e
+                       WHERE e.workflow_id = a.workflow_id
+                   )
+               )
+             RETURNING conversation_id, client_message_id, workflow_id,
+                       prepared_fingerprint, prepared_payload, committed_outcome, accepted_at",
+        )
+        .bind(incarnation)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| direct_turn_record_from_row(&row))
+            .collect()
+    }
+
     pub async fn load_pending_direct_turns(&self) -> DbResult<Vec<DirectTurnAcceptanceRecord>> {
         let rows = sqlx::query(
             "SELECT a.conversation_id, a.client_message_id, a.workflow_id,
@@ -2665,6 +2723,54 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_claims_once_and_includes_runtime_accepted_without_effect() {
+        let repo = open_repo().await;
+        let input = DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-1".to_string(),
+            prepared_fingerprint: "fp-1".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        };
+        let DirectTurnAcceptanceOutcome::Created(record) =
+            repo.accept_direct_turn(&input).await.unwrap()
+        else {
+            panic!("direct turn was not created");
+        };
+        repo.commit_direct_turn_runtime_admission(&DirectTurnRuntimeAdmissionInput {
+            workflow_id: record.workflow_id,
+            conversation_id: input.conversation_id.clone(),
+            client_message_id: input.client_message_id.clone(),
+            generation: Generation(4),
+            disposition: DirectTurnCommittedOutcome::RuntimeAccepted,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.claim_recoverable_direct_turns(ProcessIncarnation(7))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(repo
+            .claim_recoverable_direct_turns(ProcessIncarnation(7))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repo.claim_recoverable_direct_turns(ProcessIncarnation(8))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

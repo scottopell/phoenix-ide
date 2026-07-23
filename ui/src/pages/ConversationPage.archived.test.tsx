@@ -807,6 +807,43 @@ describe('ConversationPage message delivery reconciliation', () => {
     });
   });
 
+  it('removes remotely cancelled steering during idle reconciliation', async () => {
+    const cancelledId = 'cancelled-remotely';
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: cancelledId,
+      conversationId,
+      text: 'cancelled elsewhere',
+      timestamp: 1,
+      status: 'steering_queued',
+      acceptedAfterEventSeq: 0,
+    }]));
+    vi.mocked(api.reconcileAcceptedMessages).mockResolvedValue({
+      conversation_idle: true,
+      entries: [{
+        message_id: cancelledId,
+        acceptance: 'cancelled_steering',
+        materialization: { status: 'not_persisted' },
+      }],
+    });
+    const { store } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+
+    await screen.findByText('keep this history visible');
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 5,
+      });
+    });
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+  });
+
   it('compacts accepted steering entries after newer authoritative idle history contains their IDs', async () => {
     const acceptedIds = ['accepted-1', 'accepted-2'];
     localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify(acceptedIds.map((localId) => ({

@@ -3896,11 +3896,26 @@ async fn dispatch_continuation_handoff(
     })
     .await;
     match dispatch {
+        Ok(crate::send_chat_service::SendChatOutcome::Accepted {
+            disposition: crate::send_chat_service::SendChatDisposition::CancelledSteering,
+            ..
+        }) => {
+            if let Err(error) = state
+                .db
+                .delete_continuation_dispatch_intent(&parent_id)
+                .await
+            {
+                return (
+                    ContinueConversationStatus::DispatchFailed,
+                    Some(error.to_string()),
+                );
+            }
+            (
+                ContinueConversationStatus::DispatchFailed,
+                Some("continuation handoff was cancelled before materialization".to_string()),
+            )
+        }
         Ok(crate::send_chat_service::SendChatOutcome::Accepted { .. }) => {
-            // Channel delivery is not durable acceptance. The outbox intent stays
-            // pending until the message INSERT trigger consumes it, so a crash
-            // before executor persistence remains replayable.
-            // Some accepted outcomes are already durable before runtime materializes them.
             (ContinueConversationStatus::Accepted, None)
         }
         Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {
