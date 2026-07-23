@@ -2775,16 +2775,33 @@ async fn reconcile_accepted_messages(
                     AcceptedMessageAcceptanceDisposition::CancelledSteering
                 }
             });
-        let materialization = match state.db.get_message_by_id(&message_id).await {
-            Ok(message) if message.conversation_id == id => {
-                AcceptedMessageMaterialization::Persisted {
-                    message: Box::new(super::wire::EnrichedMessage::from(&message)),
+        let persisted_id = workflow_repo
+            .load_direct_turn_materialized_message_id(&id, &message_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        let materialization = match persisted_id {
+            Some(persisted_id) => match state.db.get_message_by_id(&persisted_id).await {
+                Ok(message) if message.conversation_id == id => {
+                    AcceptedMessageMaterialization::Persisted {
+                        message: Box::new(super::wire::EnrichedMessage::from(&message)),
+                    }
                 }
-            }
-            Ok(_) | Err(crate::db::DbError::MessageNotFound(_)) => {
-                AcceptedMessageMaterialization::NotPersisted
-            }
-            Err(error) => return Err(AppError::Internal(error.to_string())),
+                Ok(_) | Err(crate::db::DbError::MessageNotFound(_)) => {
+                    AcceptedMessageMaterialization::NotPersisted
+                }
+                Err(error) => return Err(AppError::Internal(error.to_string())),
+            },
+            None => match state.db.get_message_by_id(&message_id).await {
+                Ok(message) if message.conversation_id == id => {
+                    AcceptedMessageMaterialization::Persisted {
+                        message: Box::new(super::wire::EnrichedMessage::from(&message)),
+                    }
+                }
+                Ok(_) | Err(crate::db::DbError::MessageNotFound(_)) => {
+                    AcceptedMessageMaterialization::NotPersisted
+                }
+                Err(error) => return Err(AppError::Internal(error.to_string())),
+            },
         };
         entries.push(AcceptedMessageReconciliation {
             message_id,
@@ -3704,6 +3721,26 @@ async fn cancel_conversation(
             ok: true,
             no_op: false,
         }));
+    }
+
+    if matches!(conversation.state, ConvState::Idle) {
+        let repo = phoenix_db::WorkflowRepository::new(state.runtime.db().pool().clone());
+        if repo
+            .stop_active_top_level_llm_for_conversation(
+                &id,
+                phoenix_workflow::Timestamp(
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                ),
+            )
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .is_some()
+        {
+            return Ok(Json(CancelResponse {
+                ok: true,
+                no_op: false,
+            }));
+        }
     }
 
     if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {

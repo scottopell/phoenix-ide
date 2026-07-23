@@ -342,6 +342,22 @@ impl WorkflowRepository {
         Ok(updated > 0)
     }
 
+    pub async fn load_direct_turn_materialized_message_id(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+    ) -> DbResult<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT materialized_message_id FROM direct_turn_acceptances
+             WHERE conversation_id = ?1 AND client_message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(client_message_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
     pub async fn load_direct_turn_acceptance(
         &self,
         conversation_id: &str,
@@ -684,7 +700,7 @@ impl WorkflowRepository {
             "UPDATE direct_turn_acceptances
              SET runtime_delivery_incarnation = ?3
              WHERE conversation_id = ?1 AND client_message_id = ?2
-               AND committed_outcome IN ('PendingRuntime', 'RuntimeAccepted')
+               AND committed_outcome IN ('PendingRuntime', 'RuntimeAccepted', 'QueuedSteering')
                AND (runtime_delivery_incarnation IS NULL OR runtime_delivery_incarnation <> ?3)",
         )
         .bind(conversation_id)
@@ -693,6 +709,26 @@ impl WorkflowRepository {
         .execute(&self.pool)
         .await?;
         Ok(claimed.rows_affected() == 1)
+    }
+
+    pub async fn release_direct_turn_runtime_delivery(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        process_incarnation: ProcessIncarnation,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE direct_turn_acceptances
+             SET runtime_delivery_incarnation = NULL
+             WHERE conversation_id = ?1 AND client_message_id = ?2
+               AND runtime_delivery_incarnation = ?3",
+        )
+        .bind(conversation_id)
+        .bind(client_message_id)
+        .bind(to_i64(process_incarnation.0, "process_incarnation")?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn claim_recoverable_direct_turns(
@@ -1544,6 +1580,27 @@ impl WorkflowRepository {
         )
     }
 
+    pub async fn interrupt_begun_top_level_llm_tools(
+        &self,
+        process_incarnation: ProcessIncarnation,
+    ) -> DbResult<u64> {
+        let updated = sqlx::query(
+            "UPDATE top_level_llm_tool_intents AS ti
+             SET status = 'Interrupted'
+             WHERE ti.status = 'ExecutionMayHaveBegun'
+               AND EXISTS (
+                   SELECT 1 FROM workflow_attempts a
+                   WHERE a.workflow_id = ti.workflow_id
+                     AND a.receipt_id = ti.receipt_id
+                     AND a.process_incarnation <> ?1
+               )",
+        )
+        .bind(to_i64(process_incarnation.0, "process_incarnation")?)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected())
+    }
+
     pub async fn load_owed_top_level_llm_receipt_for_conversation(
         &self,
         conversation_id: &str,
@@ -1566,7 +1623,7 @@ impl WorkflowRepository {
              JOIN top_level_llm_workflows w ON w.workflow_id = wf.workflow_id
              JOIN direct_turn_acceptances dta ON dta.workflow_id = wf.workflow_id
              WHERE dta.conversation_id = ?1
-               AND dta.committed_outcome = 'RuntimeAccepted'
+               AND dta.committed_outcome IN ('PendingRuntime', 'RuntimeAccepted')
                AND wf.status = 'Active' AND w.stopped_at IS NULL
              ORDER BY dta.accepted_at DESC LIMIT 1",
         )

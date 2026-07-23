@@ -157,6 +157,10 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .await
             .map_err(|error| error.to_string())?;
         self.run_once().await?;
+        phoenix_db::WorkflowRepository::new(manager.db().pool().clone())
+            .interrupt_begun_top_level_llm_tools(super::process_incarnation())
+            .await
+            .map_err(|error| error.to_string())?;
         recover_top_level_llm_attempts(&manager).await?;
         deliver_owed_top_level_llm_receipts(&manager).await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;

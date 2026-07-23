@@ -4336,7 +4336,7 @@ impl Database {
             let replay = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM direct_turn_acceptances a
                  JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
-                 JOIN messages m ON m.message_id = a.client_message_id
+                 JOIN messages m ON m.message_id = a.materialized_message_id
                  WHERE a.workflow_id = ?1 AND a.conversation_id = ?2
                    AND a.client_message_id = ?3 AND a.committed_outcome = 'RuntimeAccepted'
                    AND w.turn_generation = ?4",
@@ -4356,17 +4356,41 @@ impl Database {
             });
         }
 
-        let message_exists =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
-                .bind(&input.message.message_id)
-                .fetch_one(&mut *tx)
-                .await?
-                != 0;
+        let mut persisted_message = input.message.clone();
+        let message_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND conversation_id = ?2",
+        )
+        .bind(&persisted_message.message_id)
+        .bind(&persisted_message.conversation_id)
+        .fetch_one(&mut *tx)
+        .await?
+            != 0;
         if message_exists {
             tx.rollback().await?;
             return Ok(DirectTurnRuntimeAdmissionOutcome::Conflict);
         }
-        insert_message_tx(&mut tx, &input.message).await?;
+        let globally_owned =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                .bind(&persisted_message.message_id)
+                .fetch_one(&mut *tx)
+                .await?
+                != 0;
+        if globally_owned {
+            persisted_message.message_id = format!(
+                "direct-turn-{}-{}",
+                input.admission.workflow_id.0, input.admission.client_message_id
+            );
+        }
+        insert_message_tx(&mut tx, &persisted_message).await?;
+        sqlx::query(
+            "UPDATE direct_turn_acceptances
+             SET materialized_message_id = ?2
+             WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(input.admission.workflow_id.0).unwrap_or(i64::MAX))
+        .bind(&persisted_message.message_id)
+        .execute(&mut *tx)
+        .await?;
         update_conversation_state_at_tx(
             &mut tx,
             &input.admission.conversation_id,
@@ -4612,14 +4636,20 @@ impl Database {
             input.state_updated_at,
         )
         .await?;
-        sqlx::query(
-            "UPDATE top_level_llm_tool_intents SET status = 'Owed'
-             WHERE workflow_id = ?1 AND receipt_id = ?2 AND status = 'PendingAcceptance'",
-        )
-        .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
-        .bind(i64::try_from(input.receipt_id.0).unwrap_or(i64::MAX))
-        .execute(&mut *tx)
-        .await?;
+        if matches!(
+            input.product,
+            AcceptedTopLevelLlmProduct::PersistedAssistant(_)
+        ) || matches!(input.next_state, ConvState::ToolExecuting { .. })
+        {
+            sqlx::query(
+                "UPDATE top_level_llm_tool_intents SET status = 'Owed'
+                 WHERE workflow_id = ?1 AND receipt_id = ?2 AND status = 'PendingAcceptance'",
+            )
+            .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+            .bind(i64::try_from(input.receipt_id.0).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(AcceptTopLevelLlmProductOutcome::Committed)
     }

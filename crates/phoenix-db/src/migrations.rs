@@ -306,7 +306,24 @@ const MIGRATIONS: &[Migration] = &[
         name: "claim_direct_turn_runtime_delivery",
         sql: MIGRATION_058,
     },
+    Migration {
+        version: 59,
+        name: "link_direct_turn_materialization",
+        sql: MIGRATION_059,
+    },
 ];
+
+const MIGRATION_059: &str = r"
+ALTER TABLE direct_turn_acceptances
+ADD COLUMN materialized_message_id TEXT REFERENCES messages(message_id);
+UPDATE direct_turn_acceptances
+SET materialized_message_id = client_message_id
+WHERE EXISTS (
+    SELECT 1 FROM messages m
+    WHERE m.message_id = direct_turn_acceptances.client_message_id
+      AND m.conversation_id = direct_turn_acceptances.conversation_id
+);
+";
 
 const MIGRATION_058: &str = r"
 ALTER TABLE direct_turn_acceptances ADD COLUMN runtime_delivery_incarnation INTEGER;

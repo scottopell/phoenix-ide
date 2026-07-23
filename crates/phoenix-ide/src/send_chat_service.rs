@@ -134,12 +134,11 @@ impl SendChatApplicationService {
             if accepted.prepared_fingerprint != sha256_hex(prepared_retry_payload.as_bytes()) {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
-            if self
-                .db
-                .get_message_by_id(&req.message_id)
+            let materialized = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+                .load_direct_turn_materialized_message_id(&conversation.id, &req.message_id)
                 .await
-                .is_ok_and(|message| message.conversation_id == conversation.id)
-            {
+                .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+            if materialized.is_some() {
                 receipts.remove(&req.message_id);
                 return Ok(SendChatOutcome::accepted(
                     req.message_id,
@@ -615,7 +614,7 @@ fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, 
     tokio::spawn(async move {
         let message_id = match &event {
             Event::UserMessage { message_id, .. } | Event::SteerMessage { message_id, .. } => {
-                message_id.as_str()
+                message_id.clone()
             }
             Event::CreationProvisioned { .. }
             | Event::CreationRequestResume { .. }
@@ -649,7 +648,7 @@ fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, 
         match repo
             .claim_direct_turn_runtime_delivery(
                 &conversation_id,
-                message_id,
+                &message_id,
                 crate::runtime::process_incarnation(),
             )
             .await
@@ -662,11 +661,22 @@ fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, 
             }
         }
         if let Err(error) = runtime.send_event(&conversation_id, event).await {
+            if let Err(release_error) = repo
+                .release_direct_turn_runtime_delivery(
+                    &conversation_id,
+                    &message_id,
+                    crate::runtime::process_incarnation(),
+                )
+                .await
+            {
+                tracing::warn!(%conversation_id, %release_error, "failed to release direct-turn delivery claim");
+            }
             tracing::warn!(
                 conversation_id,
                 error = %error,
                 "durably accepted message runtime kick failed; recovery remains owed"
             );
+            runtime.kick_wake_worker();
         }
     });
 }
