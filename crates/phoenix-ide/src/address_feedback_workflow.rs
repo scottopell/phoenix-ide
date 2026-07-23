@@ -156,19 +156,32 @@ impl AddressFeedbackWorkflowService {
             NonEmptyExternalKey::new(req.message_id.clone()).ok_or_else(|| {
                 AddressFeedbackWorkflowError::Workflow("empty idempotency key".to_string())
             })?;
-        let initial = AddressFeedbackSnapshot {
+
+        let head_oid = local_head_oid(&self.state.db, &req.conversation_id).await?;
+        let capture =
+            capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
+                .await
+                .map_err(map_app_error_for_capture)?;
+        let model_message =
+            render_address_feedback_xml(&capture, head_oid.as_deref(), req.guidance.as_deref());
+        let snapshot = AddressFeedbackSnapshot {
             conversation_id: req.conversation_id.clone(),
             message_id: req.message_id.clone(),
             guidance: req.guidance.clone(),
             user_agent: req.user_agent.clone(),
-            status: AddressFeedbackStatus::Accepted,
-            target: None,
-            head_oid: None,
-            artifact_path: None,
-            model_message: None,
+            status: AddressFeedbackStatus::Captured,
+            target: Some(AddressFeedbackTarget {
+                repo_owner: capture.repo_owner,
+                repo_name: capture.repo_name,
+                pr_number: capture.pr_number,
+                head_oid: head_oid.clone(),
+            }),
+            head_oid,
+            artifact_path: Some(capture.artifact_path),
+            model_message: Some(model_message),
             dispatch: None,
         };
-        let intent_fingerprint = intent_fingerprint(&initial)?;
+        let intent_fingerprint = intent_fingerprint(&snapshot)?;
         let repo = WorkflowRepository::new(self.state.db.pool().clone());
         let create = CreateWorkflowWithExternalAcceptance {
             workflow_id,
@@ -178,7 +191,7 @@ impl AddressFeedbackWorkflowService {
             idempotency_key,
             intent_fingerprint,
             snapshot_codec: SNAPSHOT_CODEC,
-            snapshot_payload: encode_snapshot(&initial)?,
+            snapshot_payload: encode_snapshot(&snapshot)?,
             receipt_handle: req.message_id.as_bytes().to_vec(),
             disposition_handle: req.conversation_id.as_bytes().to_vec(),
             now: now_ts(),
@@ -189,7 +202,7 @@ impl AddressFeedbackWorkflowService {
             .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
         match accepted {
             ExternalAcceptanceOutcome::Conflict => {
-                return Err(AddressFeedbackWorkflowError::IdempotencyConflict);
+                Err(AddressFeedbackWorkflowError::IdempotencyConflict)
             }
             ExternalAcceptanceOutcome::Replayed(_) => {
                 if let Some((snapshot, version)) =
@@ -214,122 +227,13 @@ impl AddressFeedbackWorkflowService {
                     }
                     return Ok(pending_response(workflow_id, req.message_id));
                 }
+                Ok(pending_response(workflow_id, req.message_id))
             }
-            ExternalAcceptanceOutcome::Created(_) => {}
+            ExternalAcceptanceOutcome::Created(_) => {
+                self.dispatch_persisted_snapshot(&repo, workflow_id, 0, snapshot, req)
+                    .await
+            }
         }
-
-        let head_oid = match local_head_oid(&self.state.db, &req.conversation_id).await {
-            Ok(head_oid) => head_oid,
-            Err(error) => {
-                fail_workflow(&self.state.db, &repo, workflow_id, 0, &initial).await;
-                return Err(error);
-            }
-        };
-        let capture =
-            match capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
-                .await
-            {
-                Ok(capture) => capture,
-                Err(error) => {
-                    fail_workflow(&self.state.db, &repo, workflow_id, 0, &initial).await;
-                    return Err(map_app_error_for_capture(error));
-                }
-            };
-        let model_message =
-            render_address_feedback_xml(&capture, head_oid.as_deref(), req.guidance.as_deref());
-
-        let captured = AddressFeedbackSnapshot {
-            status: AddressFeedbackStatus::Captured,
-            target: Some(AddressFeedbackTarget {
-                repo_owner: capture.repo_owner.clone(),
-                repo_name: capture.repo_name.clone(),
-                pr_number: capture.pr_number,
-                head_oid: head_oid.clone(),
-            }),
-            head_oid,
-            artifact_path: Some(capture.artifact_path.clone()),
-            model_message: Some(model_message.clone()),
-            ..initial.clone()
-        };
-        commit_snapshot(&repo, workflow_id, 0, 1, &captured).await?;
-
-        let outcome =
-            SendChatApplicationService::new(self.state.db.clone(), self.state.runtime.clone())
-                .send(SendChatRequest {
-                    conversation_id: req.conversation_id,
-                    text: model_message,
-                    message_id: req.message_id.clone(),
-                    images: Vec::new(),
-                    files: Vec::new(),
-                    user_agent: req.user_agent,
-                    expansion_policy: MessageExpansionPolicy::LiteralText,
-                })
-                .await
-                .map_err(map_dispatch_error)?;
-        let (queued, steering, no_op, already_persisted) = match outcome {
-            SendChatOutcome::Delivered => (true, false, false, false),
-            SendChatOutcome::QueuedAsSteering => (true, true, false, false),
-            SendChatOutcome::AlreadyPersisted => (true, false, true, true),
-            SendChatOutcome::Rejected { message, code } => {
-                let failed = AddressFeedbackSnapshot {
-                    status: AddressFeedbackStatus::Failed,
-                    ..captured
-                };
-                let _ = commit_snapshot(&repo, workflow_id, 1, 2, &failed).await;
-                let _ = set_workflow_status(
-                    &self.state.db,
-                    workflow_id,
-                    phoenix_workflow::WorkflowStatus::Failed,
-                )
-                .await;
-                return Err(AddressFeedbackWorkflowError::Rejected {
-                    message,
-                    code: code.to_string(),
-                });
-            }
-        };
-        if matches!(outcome, SendChatOutcome::Delivered) {
-            wait_for_message_durable(&self.state.db, &captured.message_id).await?;
-        }
-        record_pr_auto_fix_context_baseline_for_artifact(
-            self.state.runtime.db(),
-            &captured.conversation_id,
-            captured.artifact_path.as_deref().unwrap_or_default(),
-        )
-        .await
-        .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
-        let handed_off = AddressFeedbackSnapshot {
-            status: if no_op {
-                AddressFeedbackStatus::DuplicateNoOp
-            } else {
-                AddressFeedbackStatus::HandedOff
-            },
-            dispatch: Some(AddressFeedbackDispatch {
-                queued,
-                steering,
-                already_persisted,
-            }),
-            ..captured
-        };
-        let _ = commit_snapshot(&repo, workflow_id, 1, 2, &handed_off).await;
-        let _ = set_workflow_status(
-            &self.state.db,
-            workflow_id,
-            phoenix_workflow::WorkflowStatus::Completed,
-        )
-        .await;
-
-        Ok(AddressPrFeedbackResponse {
-            workflow_id: workflow_id.0,
-            message_id: req.message_id,
-            queued,
-            steering,
-            no_op,
-            artifact_path: Some(capture.artifact_path),
-            pr_number: Some(capture.pr_number),
-            repo_owner: Some(capture.repo_owner),
-            repo_name: Some(capture.repo_name),
-        })
     }
 
     async fn capture_and_dispatch(
@@ -340,11 +244,23 @@ impl AddressFeedbackWorkflowService {
         snapshot: AddressFeedbackSnapshot,
         req: AddressFeedbackWorkflowRequest,
     ) -> Result<AddressPrFeedbackResponse, AddressFeedbackWorkflowError> {
-        let head_oid = local_head_oid(&self.state.db, &req.conversation_id).await?;
+        let head_oid = match local_head_oid(&self.state.db, &req.conversation_id).await {
+            Ok(head_oid) => head_oid,
+            Err(error) => {
+                fail_workflow(repo, workflow_id, version, &snapshot).await;
+                return Err(error);
+            }
+        };
         let capture =
-            capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
+            match capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
                 .await
-                .map_err(map_app_error_for_capture)?;
+            {
+                Ok(capture) => capture,
+                Err(error) => {
+                    fail_workflow(repo, workflow_id, version, &snapshot).await;
+                    return Err(map_app_error_for_capture(error));
+                }
+            };
         let model_message =
             render_address_feedback_xml(&capture, head_oid.as_deref(), req.guidance.as_deref());
         let captured = AddressFeedbackSnapshot {
@@ -361,7 +277,15 @@ impl AddressFeedbackWorkflowService {
             dispatch: None,
             ..snapshot
         };
-        commit_snapshot(repo, workflow_id, version, version + 1, &captured).await?;
+        commit_snapshot(
+            repo,
+            workflow_id,
+            version,
+            version + 1,
+            &captured,
+            phoenix_workflow::WorkflowStatus::Active,
+        )
+        .await?;
         self.dispatch_persisted_snapshot(repo, workflow_id, version + 1, captured, req)
             .await
     }
@@ -401,13 +325,16 @@ impl AddressFeedbackWorkflowService {
                     status: AddressFeedbackStatus::Failed,
                     ..snapshot
                 };
-                let _ = commit_snapshot(repo, workflow_id, version, version + 1, &failed).await;
-                let _ = set_workflow_status(
-                    &self.state.db,
+                let _ = commit_snapshot(
+                    repo,
                     workflow_id,
+                    version,
+                    version + 1,
+                    &failed,
                     phoenix_workflow::WorkflowStatus::Failed,
                 )
                 .await;
+
                 return Err(AddressFeedbackWorkflowError::Rejected {
                     message,
                     code: code.to_string(),
@@ -439,13 +366,16 @@ impl AddressFeedbackWorkflowService {
             }),
             ..snapshot.clone()
         };
-        let _ = commit_snapshot(repo, workflow_id, version, version + 1, &completed).await;
-        let _ = set_workflow_status(
-            &self.state.db,
+        let _ = commit_snapshot(
+            repo,
             workflow_id,
+            version,
+            version + 1,
+            &completed,
             phoenix_workflow::WorkflowStatus::Completed,
         )
         .await;
+
         Ok(response_from_snapshot(
             workflow_id,
             req.message_id,
@@ -458,7 +388,6 @@ impl AddressFeedbackWorkflowService {
 }
 
 async fn fail_workflow(
-    db: &crate::db::Database,
     repo: &WorkflowRepository,
     workflow_id: WorkflowId,
     version: u64,
@@ -468,8 +397,15 @@ async fn fail_workflow(
         status: AddressFeedbackStatus::Failed,
         ..snapshot.clone()
     };
-    let _ = commit_snapshot(repo, workflow_id, version, version + 1, &failed).await;
-    let _ = set_workflow_status(db, workflow_id, phoenix_workflow::WorkflowStatus::Failed).await;
+    let _ = commit_snapshot(
+        repo,
+        workflow_id,
+        version,
+        version + 1,
+        &failed,
+        phoenix_workflow::WorkflowStatus::Failed,
+    )
+    .await;
 }
 
 async fn wait_for_message_durable(
@@ -485,30 +421,6 @@ async fn wait_for_message_durable(
     Err(AddressFeedbackWorkflowError::Workflow(format!(
         "message {message_id} was accepted but did not become durable before workflow completion"
     )))
-}
-
-async fn set_workflow_status(
-    db: &crate::db::Database,
-    workflow_id: WorkflowId,
-    status: phoenix_workflow::WorkflowStatus,
-) -> Result<(), AddressFeedbackWorkflowError> {
-    sqlx::query("UPDATE workflows SET status = ? WHERE workflow_id = ?")
-        .bind(match status {
-            phoenix_workflow::WorkflowStatus::Active => "Active",
-            phoenix_workflow::WorkflowStatus::Cancelling => "Cancelling",
-            phoenix_workflow::WorkflowStatus::ManualResolution => "ManualResolution",
-            phoenix_workflow::WorkflowStatus::Incompatible => "Incompatible",
-            phoenix_workflow::WorkflowStatus::Cancelled => "Cancelled",
-            phoenix_workflow::WorkflowStatus::DeletionPending => "DeletionPending",
-            phoenix_workflow::WorkflowStatus::Deleted => "Deleted",
-            phoenix_workflow::WorkflowStatus::Completed => "Completed",
-            phoenix_workflow::WorkflowStatus::Failed => "Failed",
-        })
-        .bind(i64::try_from(workflow_id.0).unwrap_or(i64::MAX))
-        .execute(db.pool())
-        .await
-        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
-    Ok(())
 }
 
 fn pending_response(workflow_id: WorkflowId, message_id: String) -> AddressPrFeedbackResponse {
@@ -618,6 +530,7 @@ async fn commit_snapshot(
     expected_version: u64,
     transition_id: u64,
     snapshot: &AddressFeedbackSnapshot,
+    status: phoenix_workflow::WorkflowStatus,
 ) -> Result<(), AddressFeedbackWorkflowError> {
     let outcome = repo
         .commit_transition_head_cas(&phoenix_db::workflow::CommitTransitionHeadCas {
@@ -625,7 +538,7 @@ async fn commit_snapshot(
             expected_version: phoenix_workflow::Version(expected_version),
             transition_id: phoenix_workflow::TransitionId(transition_id),
             generation: phoenix_workflow::Generation(0),
-            next_status: phoenix_workflow::WorkflowStatus::Active,
+            next_status: status,
             event_codec: SNAPSHOT_CODEC,
             event_payload: encode_snapshot(snapshot)?,
             next_snapshot_codec: SNAPSHOT_CODEC,
