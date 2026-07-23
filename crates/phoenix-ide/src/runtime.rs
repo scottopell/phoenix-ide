@@ -1779,9 +1779,15 @@ impl RuntimeManager {
         Ok(())
     }
 
-    fn authoritative_worktree_scope_candidate_key(conv: &crate::db::Conversation) -> (u8, String) {
+    fn authoritative_worktree_scope_candidate_key(
+        conv: &crate::db::Conversation,
+    ) -> (u8, u8, String) {
+        let owner_rank = u8::from(
+            conv.runtime_role != crate::work_scope::RuntimeRole::User
+                || matches!(conv.conv_mode, ConvMode::Explore { .. }),
+        );
         let inheritor_rank = u8::from(conv.continued_in_conv_id.is_some());
-        (inheritor_rank, conv.id.clone())
+        (owner_rank, inheritor_rank, conv.id.clone())
     }
 
     async fn authoritative_conversation_for_scope(

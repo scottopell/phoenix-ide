@@ -2448,13 +2448,14 @@ impl WakeRepository {
     ) -> DbResult<bool> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let continuation = sqlx::query_scalar::<_, String>(
-            "WITH RECURSIVE continuation_chain(id, continued_in_conv_id, depth) AS (
-                 SELECT id, continued_in_conv_id, 0 FROM conversations WHERE id = ?1
+            "WITH RECURSIVE continuation_chain(id, continued_in_conv_id, work_scope_id, depth) AS (
+                 SELECT id, continued_in_conv_id, work_scope_id, 0 FROM conversations WHERE id = ?1
                  UNION ALL
-                 SELECT c.id, c.continued_in_conv_id, chain.depth + 1
+                 SELECT c.id, c.continued_in_conv_id, c.work_scope_id, chain.depth + 1
                  FROM conversations c
                  JOIN continuation_chain chain ON c.id = chain.continued_in_conv_id
                  WHERE chain.depth < 100
+                   AND c.work_scope_id = chain.work_scope_id
              )
              SELECT id FROM continuation_chain
              WHERE continued_in_conv_id IS NULL AND depth > 0

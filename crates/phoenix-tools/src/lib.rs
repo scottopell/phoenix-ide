@@ -498,6 +498,7 @@ impl ToolContext {
             bash_progress_sink: None,
             tool_use_id: None,
             wake_registrar: None,
+            llm_metrics_tx: None,
         }
     }
 
