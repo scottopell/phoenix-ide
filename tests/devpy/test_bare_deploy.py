@@ -286,5 +286,96 @@ class BareDeployCommandTests(unittest.TestCase):
             self.assertFalse(manifest["previous_running"])
 
 
+    def test_prod_restart_routes_daemon_to_supervisor(self):
+        with mock.patch.object(self.dev, "detect_prod_env", return_value="daemon"), \
+             mock.patch.object(self.dev, "prod_daemon_restart") as restart:
+            self.dev.cmd_prod_restart()
+        restart.assert_called_once_with()
+
+    def test_prod_restart_rejects_non_daemon_backend_with_deploy_hint(self):
+        for backend in ("launchd", "native"):
+            with mock.patch.object(self.dev, "detect_prod_env", return_value=backend):
+                with self.assertRaisesRegex(SystemExit, "prod deploy"):
+                    self.dev.cmd_prod_restart()
+
+    def test_prepare_installed_candidate_reuses_binary_and_recorded_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "bin/phoenix-ide"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("installed binary")
+            (root / "deployed.sha").write_text("c" * 40 + "\n")
+            layout = {"binary": binary, "deployed_sha": root / "deployed.sha"}
+            identity = self.dev.RuntimeIdentity("0.10.0", "c" * 12)
+            with mock.patch.object(self.dev, "_binary_identity", return_value=identity):
+                prepared = self.dev._prepare_installed_candidate(layout)
+            self.assertEqual(prepared.binary, binary)
+            self.assertEqual(prepared.source_kind, self.dev.ProdSourceKind.INSTALLED_RESTART)
+            self.assertEqual(prepared.source_commit, "c" * 40)
+            self.assertEqual(prepared.identity, identity)
+
+    def test_prepare_installed_candidate_rejects_identity_commit_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "bin/phoenix-ide"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("installed binary")
+            # Recorded commit does not begin with the binary's embedded SHA.
+            (root / "deployed.sha").write_text("d" * 40 + "\n")
+            layout = {"binary": binary, "deployed_sha": root / "deployed.sha"}
+            identity = self.dev.RuntimeIdentity("0.10.0", "c" * 12)
+            with mock.patch.object(self.dev, "_binary_identity", return_value=identity):
+                with self.assertRaisesRegex(SystemExit, "does not match recorded commit"):
+                    self.dev._prepare_installed_candidate(layout)
+
+    def test_daemon_restart_resnapshots_env_and_reuses_installed_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            socket = root / "run/supervisor.sock"
+            socket.parent.mkdir(parents=True)
+            socket.touch()
+            binary = root / "bin/phoenix-ide"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("installed binary")
+            layout = {"root": root, "socket": socket, "binary": binary}
+            candidate = self.dev.PreparedCandidate(
+                binary=binary,
+                source_kind=self.dev.ProdSourceKind.INSTALLED_RESTART,
+                source_commit="c" * 40,
+                identity=self.dev.RuntimeIdentity("0.10.0", "c" * 12),
+            )
+
+            def load_env(env, filename=".phoenix-ide.env"):
+                env["DDTOOL_AUTH_LOGIN_MODE"] = "device"
+                return filename
+
+            with mock.patch.object(self.dev, "_bare_layout", return_value=layout), \
+                 mock.patch.object(self.dev, "_load_env_file", side_effect=load_env), \
+                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+                 mock.patch.object(self.dev, "_prepare_installed_candidate", return_value=candidate), \
+                 mock.patch.object(self.dev, "_bare_child_running", return_value=True), \
+                 mock.patch.object(self.dev, "prod_build", side_effect=AssertionError("must not rebuild on restart")), \
+                 mock.patch.object(self.dev, "_prepare_local_candidate", side_effect=AssertionError("must not rebuild on restart")), \
+                 mock.patch.object(self.dev, "_commit_bare_transaction") as commit, \
+                 mock.patch("uuid.uuid4", return_value=mock.Mock(hex="e" * 32)):
+                self.dev.prod_daemon_restart()
+
+            commit.assert_called_once()
+            call_layout, call_prepared, call_env, call_txid, call_prev = commit.call_args.args
+            self.assertIs(call_prepared, candidate)
+            self.assertEqual(call_txid, "e" * 32)
+            self.assertTrue(call_prev)
+            # Environment is re-read from .phoenix-ide.env, then defaults applied.
+            self.assertEqual(call_env["DDTOOL_AUTH_LOGIN_MODE"], "device")
+            self.assertEqual(call_env["PHOENIX_LOG_STDOUT"], "false")
+
+    def test_daemon_restart_without_supervisor_directs_to_deploy(self):
+        with tempfile.TemporaryDirectory() as td:
+            layout = {"socket": Path(td) / "absent.sock"}
+            with mock.patch.object(self.dev, "_bare_layout", return_value=layout):
+                with self.assertRaisesRegex(SystemExit, "prod deploy"):
+                    self.dev.prod_daemon_restart()
+
+
 if __name__ == "__main__":
     unittest.main()
