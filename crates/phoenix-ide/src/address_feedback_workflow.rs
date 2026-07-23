@@ -321,6 +321,12 @@ impl AddressFeedbackWorkflowService {
             SendChatOutcome::QueuedAsSteering => (true, true, false, false),
             SendChatOutcome::AlreadyPersisted => (true, false, true, true),
             SendChatOutcome::Rejected { message, code } => {
+                if code == "steering_queue_full" {
+                    return Err(AddressFeedbackWorkflowError::Rejected {
+                        message,
+                        code: code.to_string(),
+                    });
+                }
                 let failed = AddressFeedbackSnapshot {
                     status: AddressFeedbackStatus::Failed,
                     ..snapshot
