@@ -34,11 +34,31 @@ Read [references/development-loop.md](references/development-loop.md) for comman
 
 These are compact reminders, not replacements for `AGENTS.md` or normative specs.
 
+## Reasoning about async test completion
+
+Before waiting, identify the completion contract:
+
+1. What work does the awaited call own?
+2. What does successful return guarantee?
+3. Can work continue after it returns?
+4. What observable state proves the behavior?
+
+If successful return establishes the postcondition, assert it immediately: inspect a buffered channel with `try_recv`, query an awaited database write, or read resulting state/captured calls. A second wait incorrectly implies that work remains pending.
+
+If work intentionally outlives the call, observe the owning lifecycle boundary: a task handle, channel message, notification, lifecycle event, persisted transition, or readiness marker. The signal must be causally downstream of the behavior under test, not merely evidence that something ran.
+
+If no completion signal exists, do not substitute sleeps or short polling. Treat that as a testability gap and expose the narrowest real lifecycle event or domain state.
+
+A timeout is an outer liveness guard, never synchronization. Use one only around genuinely outstanding work, assume CI may be heavily CPU- and I/O-starved, and prefer virtual time when timer behavior itself is under test. The test must pass because the observable condition occurred—not because a duration elapsed.
+
+A good async test can explain who owns pending work, what marks completion, why the observation proves the behavior, and what any remaining timeout guards. If those answers are unclear, the test likely asserts at the wrong boundary.
+
 ## Choose the validation that proves the claim
 
 | Change | Minimum evidence before broad check |
 |---|---|
 | Rust logic/state transition | Focused unit/property/integration test |
+| Async/concurrent behavior | Test the owning lifecycle boundary: assert established postconditions immediately, or await an explicit completion signal when work outlives the call. Use wall-clock time only as an outer liveness bound. |
 | React behavior | Focused Vitest test; browser journey when layout, focus, timing, or interaction matters |
 | SSE wire shape | Rust parity tests, `./dev.py codegen`, TypeScript/schema checks |
 | Persistence/migration | Schema/migration tests plus old-row/crash-recovery path |
