@@ -38,7 +38,13 @@ pub async fn assemble_inventory(
     WorkScopeInventory {
         scope_key: work_scope.stable_key(),
         bash: assemble_bash(work_scope, actor, bash_handles).await,
-        tmux: assemble_tmux(work_scope, tmux_registry).await,
+        tmux: if actor.is_some_and(|access| {
+            access.authority() == phoenix_core::work_scope::ResourceAuthority::Restricted
+        }) {
+            None
+        } else {
+            assemble_tmux(work_scope, tmux_registry).await
+        },
         browser: assemble_browser(work_scope, actor, browser_sessions).await,
         health_sampled_at: None,
         health: None,

@@ -206,11 +206,14 @@ impl ResourceScopeKeyHandles {
             .collect()
     }
 
-    pub fn remove_created_by(&mut self, conversation_id: &str) -> Vec<Arc<Handle>> {
+    pub fn remove_restricted_created_by(&mut self, conversation_id: &str) -> Vec<Arc<Handle>> {
         let ids: Vec<_> = self
             .handles
             .iter()
-            .filter(|(_, handle)| handle.creator_conversation_id == conversation_id)
+            .filter(|(_, handle)| {
+                handle.creator_conversation_id == conversation_id
+                    && handle.authority == phoenix_core::work_scope::ResourceAuthority::Restricted
+            })
             .map(|(id, _)| id.clone())
             .collect();
         ids.into_iter()
@@ -529,7 +532,7 @@ pub async fn cascade_bash_on_delete(
         let handles = entry
             .write()
             .await
-            .remove_created_by(actor.conversation_id());
+            .remove_restricted_created_by(actor.conversation_id());
         return kill_selected_handles(registry, work_scope, handles).await;
     }
     if actor.authority() == phoenix_core::work_scope::ResourceAuthority::Restricted {

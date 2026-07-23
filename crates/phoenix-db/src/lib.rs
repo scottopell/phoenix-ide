@@ -4154,6 +4154,11 @@ impl Database {
                 ));
             }
         } else if cleanup.status == "deletion_pending" {
+            let work_scope_id: Option<String> =
+                sqlx::query_scalar("SELECT work_scope_id FROM conversations WHERE id = ?1")
+                    .bind(&cleanup.conversation_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
             let deleted = sqlx::query(
                 "DELETE FROM conversations
                  WHERE id = ?1 AND EXISTS (
@@ -4177,6 +4182,18 @@ impl Database {
                 return Err(DbError::Serialization(
                     "creation cleanup claim was lost".to_string(),
                 ));
+            }
+            if let Some(work_scope_id) = work_scope_id {
+                sqlx::query(
+                    "DELETE FROM work_scopes
+                     WHERE id = ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM conversations WHERE work_scope_id = ?1
+                       )",
+                )
+                .bind(work_scope_id)
+                .execute(&mut *tx)
+                .await?;
             }
         } else if cleanup.status == "failed" {
             sqlx::query(
