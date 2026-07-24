@@ -647,29 +647,39 @@ async fn deliver_pending_direct_turns(manager: &Arc<RuntimeManager>) -> Result<(
         .await
         .map_err(|error| error.to_string())?
     {
-        let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
-            match serde_json::from_str(&pending.prepared_payload) {
-                Ok(prepared) => prepared,
-                Err(error) => {
+        let event = match pending.committed_outcome {
+            phoenix_db::DirectTurnCommittedOutcome::PendingRuntime => {
+                let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
+                    match serde_json::from_str(&pending.prepared_payload) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            tracing::error!(
+                                workflow_id = pending.workflow_id.0,
+                                conversation_id = %pending.conversation_id,
+                                error = %error,
+                                "pending direct turn has an unreadable prepared payload"
+                            );
+                            continue;
+                        }
+                    };
+                if prepared.codec_version
+                    != phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION
+                {
                     tracing::error!(
                         workflow_id = pending.workflow_id.0,
-                        conversation_id = %pending.conversation_id,
-                        error = %error,
-                        "pending direct turn has an unreadable prepared payload"
+                        codec_version = prepared.codec_version,
+                        "pending direct turn uses an unsupported codec version"
                     );
                     continue;
                 }
-            };
-        if prepared.codec_version
-            != phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION
-        {
-            tracing::error!(
-                workflow_id = pending.workflow_id.0,
-                codec_version = prepared.codec_version,
-                "pending direct turn uses an unsupported codec version"
-            );
-            continue;
-        }
+                prepared.into_event()
+            }
+            phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
+                phoenix_core::domain::sm_event::Event::ResumeDurableLlmRequest
+            }
+            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering
+            | phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => continue,
+        };
         let handle = match manager.get_or_create(&pending.conversation_id).await {
             Ok(handle) => handle,
             Err(error) => {
@@ -682,18 +692,42 @@ async fn deliver_pending_direct_turns(manager: &Arc<RuntimeManager>) -> Result<(
                 continue;
             }
         };
-        if !matches!(
-            *handle.state_rx.borrow(),
-            crate::state_machine::ConvState::Idle | crate::state_machine::ConvState::Error { .. }
-        ) {
+        let state_accepts_delivery = match pending.committed_outcome {
+            phoenix_db::DirectTurnCommittedOutcome::PendingRuntime => matches!(
+                *handle.state_rx.borrow(),
+                crate::state_machine::ConvState::Idle
+                    | crate::state_machine::ConvState::Error { .. }
+            ),
+            phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => matches!(
+                *handle.state_rx.borrow(),
+                crate::state_machine::ConvState::LlmRequesting { .. }
+            ),
+            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering
+            | phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => false,
+        };
+        if !state_accepts_delivery {
+            repo.release_direct_turn_runtime_delivery(
+                &pending.conversation_id,
+                &pending.client_message_id,
+                super::process_incarnation(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             continue;
         }
-        if let Err(error) = handle.event_tx.send(prepared.into_event()).await {
+        if let Err(error) = handle.event_tx.send(event).await {
+            repo.release_direct_turn_runtime_delivery(
+                &pending.conversation_id,
+                &pending.client_message_id,
+                super::process_incarnation(),
+            )
+            .await
+            .map_err(|release_error| release_error.to_string())?;
             tracing::warn!(
                 workflow_id = pending.workflow_id.0,
                 conversation_id = %pending.conversation_id,
                 error = %error,
-                "pending direct turn runtime channel closed"
+                "recoverable direct turn runtime channel closed"
             );
         }
     }

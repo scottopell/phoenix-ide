@@ -269,6 +269,10 @@ pub enum Event {
     /// already-adopted turn without persisting another message or state row.
     WakeBatchAdopted,
 
+    /// Internal recovery edge for a direct turn whose accepting message and
+    /// `LlmRequesting` state committed before its LLM effect was prepared.
+    ResumeDurableLlmRequest,
+
     /// Sent by `RuntimeManager::evict_runtime` (e.g. after a model upgrade)
     /// to cleanly terminate a running runtime that is being replaced.
     /// The executor returns from `run()` immediately on receipt, which drops
@@ -313,6 +317,7 @@ impl Event {
             Event::CancelSteerMessage { .. } => "CancelSteerMessage",
             Event::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
             Event::WakeBatchAdopted => "WakeBatchAdopted",
+            Event::ResumeDurableLlmRequest => "ResumeDurableLlmRequest",
             Event::Shutdown => "Shutdown",
         }
     }
@@ -627,6 +632,7 @@ impl TryFrom<Event> for ParentEvent {
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
             | Event::WakeBatchAdopted
+            | Event::ResumeDurableLlmRequest
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "ParentEvent",
@@ -758,6 +764,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::CancelSteerMessage { .. }
             | Event::SteerDrainedUserMessages { .. }
             | Event::WakeBatchAdopted
+            | Event::ResumeDurableLlmRequest
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",

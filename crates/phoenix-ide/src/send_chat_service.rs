@@ -412,8 +412,17 @@ impl SendChatApplicationService {
                     })
                     .await
                     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-                if matches!(queued, phoenix_db::DirectTurnAcceptanceOutcome::Conflict) {
-                    return Err(SendChatServiceError::IdempotencyConflict);
+                match queued {
+                    phoenix_db::DirectTurnAcceptanceOutcome::Created(_)
+                    | phoenix_db::DirectTurnAcceptanceOutcome::Replayed(_) => {}
+                    phoenix_db::DirectTurnAcceptanceOutcome::RetryablePersistence => {
+                        return Err(SendChatServiceError::Dispatch(
+                            "queued steering persistence is temporarily busy".to_string(),
+                        ));
+                    }
+                    phoenix_db::DirectTurnAcceptanceOutcome::Conflict => {
+                        return Err(SendChatServiceError::IdempotencyConflict);
+                    }
                 }
                 let steer = steer_entry_from_prepared(&prepared);
                 kick_runtime_delivery(
@@ -679,6 +688,7 @@ fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, 
             | Event::CancelSteerMessage { .. }
             | Event::SteerDrainedUserMessages { .. }
             | Event::WakeBatchAdopted
+            | Event::ResumeDurableLlmRequest
             | Event::Shutdown => return,
         };
         let repo = phoenix_db::WorkflowRepository::new(runtime.db().pool().clone());

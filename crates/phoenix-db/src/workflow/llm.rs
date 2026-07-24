@@ -771,9 +771,13 @@ impl WorkflowRepository {
                )
                AND (
                    a.committed_outcome = 'PendingRuntime'
-                   OR NOT EXISTS (
-                       SELECT 1 FROM top_level_llm_effects e
-                       WHERE e.workflow_id = a.workflow_id
+                   OR (
+                       a.live_slot = 1
+                       AND a.materialized_message_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM top_level_llm_effects e
+                           WHERE e.workflow_id = a.workflow_id
+                       )
                    )
                )
              RETURNING conversation_id, client_message_id, workflow_id,
@@ -2841,6 +2845,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_claims_only_the_materialized_steering_batch_owner() {
+        let repo = open_repo().await;
+        for (message_id, accepted_at) in [("msg-1", 1), ("msg-2", 2)] {
+            repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+                initial_outcome: DirectTurnInitialOutcome::QueuedSteering {
+                    entry: Box::new(phoenix_core::domain::sm_event::SteerEntry {
+                        text: message_id.to_string(),
+                        llm_text: None,
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        message_id: message_id.to_string(),
+                        user_agent: None,
+                        skill_invocation: None,
+                    }),
+                },
+                conversation_id: "conv-1".to_string(),
+                client_message_id: message_id.to_string(),
+                prepared_fingerprint: format!("fp-{message_id}"),
+                prepared_payload: "{}".to_string(),
+                accepted_at: Timestamp(accepted_at),
+                snapshot: snapshot(),
+            })
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO messages
+                 (message_id, conversation_id, message_type, content, sequence_id)
+                 VALUES (?1, 'conv-1', 'user', '{}', ?2)",
+            )
+            .bind(message_id)
+            .bind(i64::try_from(accepted_at).unwrap())
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE direct_turn_acceptances SET materialized_message_id = ?1
+                 WHERE conversation_id = 'conv-1' AND client_message_id = ?1",
+            )
+            .bind(message_id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        }
+        let drained = vec!["msg-1".to_string(), "msg-2".to_string()];
+        repo.consume_queued_steering_batch("conv-1", "msg-2", &drained)
+            .await
+            .unwrap();
+
+        let claimed = repo
+            .claim_recoverable_direct_turns(ProcessIncarnation(9))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].client_message_id, "msg-2");
+    }
+
+    #[tokio::test]
     async fn prepare_and_begin_allocates_authoritative_effect_and_attempt_identity() {
         let repo = open_repo().await;
         repo.accept_direct_turn(&DirectTurnAcceptanceInput {
@@ -2937,6 +2998,23 @@ mod tests {
             generation: Generation(4),
             disposition: DirectTurnCommittedOutcome::RuntimeAccepted,
         })
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO messages
+             (message_id, conversation_id, message_type, content, sequence_id)
+             VALUES ('msg-1', 'conv-1', 'user', '{}', 1)",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE direct_turn_acceptances SET materialized_message_id = 'msg-1'
+             WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(record.workflow_id.0).unwrap())
+        .execute(&repo.pool)
         .await
         .unwrap();
 

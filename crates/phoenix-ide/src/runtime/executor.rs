@@ -46,6 +46,12 @@ const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty 
 const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
 const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
 
+#[derive(Clone, Copy)]
+enum LlmDispatchOwnership {
+    DurableDirectTurn,
+    AdoptedWakeBatch,
+}
+
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortTaskOnDrop {
@@ -2620,7 +2626,9 @@ where
             state_updated_at: self.state_updated_at,
             presentation_mode: self.state.presentation_mode().to_string(),
         });
-        self.execute_effect(Effect::RequestLlm).await.map(|_| ())
+        self.dispatch_llm_request(LlmDispatchOwnership::AdoptedWakeBatch)
+            .await
+            .map(|_| ())
     }
 
     async fn canonicalize_llm_response_event(&self, event: Event) -> Result<Event, String> {
@@ -2769,6 +2777,18 @@ where
 
         if matches!(event, Event::WakeBatchAdopted) {
             return self.process_adopted_wake_batch().await;
+        }
+
+        if matches!(event, Event::ResumeDurableLlmRequest) {
+            if !matches!(self.state, ConvState::LlmRequesting { .. }) {
+                return Err(format!(
+                    "cannot resume durable LLM request from {}",
+                    self.state.variant_name()
+                ));
+            }
+            self.dispatch_llm_request(LlmDispatchOwnership::DurableDirectTurn)
+                .await?;
+            return Ok(());
         }
 
         // Check if this is a SubAgentResult that needs buffering
@@ -4416,7 +4436,10 @@ where
                     .await?;
                 Ok(None)
             }
-            Effect::RequestLlm => self.dispatch_llm_request().await,
+            Effect::RequestLlm => {
+                self.dispatch_llm_request(LlmDispatchOwnership::DurableDirectTurn)
+                    .await
+            }
 
             Effect::CompleteCreation { job_id, claim } => {
                 match self.storage.complete_creation_job(&job_id, &claim).await {
@@ -4884,7 +4907,10 @@ where
     /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
     /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
-    async fn dispatch_llm_request(&mut self) -> Result<Option<Event>, String> {
+    async fn dispatch_llm_request(
+        &mut self,
+        ownership: LlmDispatchOwnership,
+    ) -> Result<Option<Event>, String> {
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
         // have their own lifetime cap below (REQ-PROJ-008); this branch
         // only fires for parent conversations. The counter is reset at
@@ -5015,6 +5041,7 @@ where
         if !is_sub_agent
             && self.storage.requires_durable_top_level_llm()
             && durable_workflow.is_none()
+            && matches!(ownership, LlmDispatchOwnership::DurableDirectTurn)
         {
             return Err(
                 "top-level LLM dispatch requires an accepted durable direct turn".to_string(),
