@@ -289,7 +289,7 @@ fn tail_has_statement(mut tail: *const c_char) -> bool {
     }
     unsafe {
         while *tail != 0 {
-            let byte = (*tail).cast_unsigned();
+            let byte = tail.cast::<u8>().read();
             if !byte.is_ascii_whitespace() && byte != b';' {
                 return true;
             }
@@ -490,6 +490,16 @@ mod tests {
                 "{sql}"
             );
         }
+        assert!(matches!(
+            execute_coordinator_query(path.to_str().unwrap(), "SELECT 1; SELECT 2"),
+            Err(CoordinatorQueryError::MultipleStatements)
+        ));
+    }
+
+    #[test]
+    fn distinguishes_trailing_delimiters_from_another_statement() {
+        let (_dir, path) = fixture();
+        execute_coordinator_query(path.to_str().unwrap(), "SELECT 1; \t\n;").unwrap();
         assert!(matches!(
             execute_coordinator_query(path.to_str().unwrap(), "SELECT 1; SELECT 2"),
             Err(CoordinatorQueryError::MultipleStatements)
