@@ -3508,6 +3508,9 @@ async fn address_pr_feedback(
                     "idempotency_conflict",
                 )))
             }
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::NotFound(message) => {
+                AppError::NotFound(message)
+            }
             crate::address_feedback_workflow::AddressFeedbackWorkflowError::Capture(message)
             | crate::address_feedback_workflow::AddressFeedbackWorkflowError::Workflow(message)
             | crate::address_feedback_workflow::AddressFeedbackWorkflowError::Dispatch(message) => {

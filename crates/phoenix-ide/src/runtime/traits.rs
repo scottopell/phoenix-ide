@@ -82,6 +82,15 @@ pub trait MessageStore: Send + Sync {
     /// recovery (re-drain after partial steering-queue drain).
     async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
 
+    /// Notify workflow integrations after a message is durably persisted.
+    async fn after_message_persisted(
+        &self,
+        _conversation_id: &str,
+        _message_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Complete an async creation job using the authority that enqueued the initial turn.
     async fn complete_creation_job(
         &self,
@@ -639,6 +648,28 @@ impl MessageStore for DatabaseStorage {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn after_message_persisted(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<(), String> {
+        if let Err(error) = crate::address_feedback_workflow::notify_message_persisted(
+            &self.db,
+            conversation_id,
+            message_id,
+        )
+        .await
+        {
+            tracing::warn!(
+                %conversation_id,
+                %message_id,
+                ?error,
+                "message persisted but address feedback finalization failed"
+            );
+        }
+        Ok(())
     }
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {

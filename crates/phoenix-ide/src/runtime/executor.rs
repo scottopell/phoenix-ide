@@ -3879,6 +3879,9 @@ where
                         usage_data.as_ref(),
                     )
                     .await?;
+                self.storage
+                    .after_message_persisted(&self.context.conversation_id, &message_id)
+                    .await?;
                 if idempotent {
                     tracing::info!(
                         conversation_id = %self.context.conversation_id,

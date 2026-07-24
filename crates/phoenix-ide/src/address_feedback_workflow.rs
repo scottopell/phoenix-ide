@@ -38,6 +38,8 @@ pub(crate) enum AddressFeedbackWorkflowError {
     Capture(String),
     #[error("Address feedback dispatch failed: {0}")]
     Dispatch(String),
+    #[error("Address feedback target not found: {0}")]
+    NotFound(String),
     #[error("message_id was already used for a different target or payload")]
     IdempotencyConflict,
     #[error("Address feedback rejected: {message}")]
@@ -71,6 +73,12 @@ enum AddressFeedbackStatus {
     Failed,
 }
 
+impl AddressFeedbackStatus {
+    fn is_duplicate_no_op(&self) -> bool {
+        matches!(self, Self::DuplicateNoOp)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AddressFeedbackTarget {
     repo_owner: String,
@@ -98,7 +106,10 @@ impl AddressFeedbackWorkflowService {
     pub(crate) async fn recover_pending(&self) {
         let repo = WorkflowRepository::new(self.state.db.pool().clone());
         let rows = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
-            "SELECT workflow_id, snapshot_payload, version FROM workflows WHERE profile_kind = ? AND profile_version = ? AND status = 'Active'",
+            "SELECT w.workflow_id, w.snapshot_payload, w.version
+             FROM workflows w
+             JOIN workflow_external_acceptance_bindings b ON b.workflow_id = w.workflow_id
+             WHERE b.profile_kind = ? AND b.profile_version = ? AND w.status = 'Active'",
         )
         .bind(PROFILE_KIND)
         .bind(i64::from(PROFILE_VERSION))
@@ -369,61 +380,31 @@ impl AddressFeedbackWorkflowService {
 
     async fn finalize_steering_if_delivered(
         &self,
-        repo: &WorkflowRepository,
+        _repo: &WorkflowRepository,
         workflow_id: WorkflowId,
-        version: u64,
+        _version: u64,
         snapshot: AddressFeedbackSnapshot,
     ) -> Result<Option<AddressPrFeedbackResponse>, AddressFeedbackWorkflowError> {
-        if !self
-            .state
-            .db
-            .message_exists(&snapshot.message_id)
-            .await
-            .unwrap_or(false)
-        {
-            return Ok(None);
-        }
-        if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
-            record_pr_auto_fix_context_baseline_for_artifact(
-                self.state.runtime.db(),
-                &snapshot.conversation_id,
-                artifact_path,
-            )
-            .await
-            .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
-        }
-        let dispatch = snapshot
-            .dispatch
-            .clone()
-            .unwrap_or(AddressFeedbackDispatch {
-                queued: true,
-                steering: true,
-                already_persisted: true,
-            });
-        let completed = AddressFeedbackSnapshot {
-            status: AddressFeedbackStatus::HandedOff,
-            dispatch: Some(AddressFeedbackDispatch {
-                queued: dispatch.queued,
-                steering: dispatch.steering,
-                already_persisted: true,
-            }),
-            ..snapshot.clone()
-        };
-        commit_snapshot(
-            repo,
-            workflow_id,
-            version,
-            version + 1,
-            &completed,
-            phoenix_workflow::WorkflowStatus::Completed,
+        let Some(completed) = finalize_persisted_message_inner(
+            &self.state.db,
+            &snapshot.conversation_id,
+            &snapshot.message_id,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(None);
+        };
+        let dispatch = completed.dispatch.as_ref().ok_or_else(|| {
+            AddressFeedbackWorkflowError::Workflow(
+                "completed workflow snapshot has no dispatch".to_string(),
+            )
+        })?;
         Ok(Some(response_from_snapshot(
             workflow_id,
             completed.message_id.clone(),
             dispatch.queued,
             dispatch.steering,
-            false,
+            completed.status.is_duplicate_no_op(),
             false,
             &completed,
         )))
@@ -488,52 +469,7 @@ impl AddressFeedbackWorkflowService {
                 });
             }
         };
-        if steering && !already_persisted {
-            let queued = AddressFeedbackSnapshot {
-                dispatch: Some(AddressFeedbackDispatch {
-                    queued,
-                    steering,
-                    already_persisted,
-                }),
-                ..snapshot.clone()
-            };
-            commit_snapshot(
-                repo,
-                workflow_id,
-                version,
-                version + 1,
-                &queued,
-                phoenix_workflow::WorkflowStatus::Active,
-            )
-            .await?;
-            return Ok(response_from_snapshot(
-                workflow_id,
-                req.message_id,
-                queued.dispatch.as_ref().map(|d| d.queued).unwrap_or(true),
-                true,
-                false,
-                true,
-                &queued,
-            ));
-        }
-        if matches!(outcome, SendChatOutcome::Delivered) {
-            wait_for_message_durable(&self.state.db, &snapshot.message_id).await?;
-        }
-        if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
-            record_pr_auto_fix_context_baseline_for_artifact(
-                self.state.runtime.db(),
-                &snapshot.conversation_id,
-                artifact_path,
-            )
-            .await
-            .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
-        }
-        let completed = AddressFeedbackSnapshot {
-            status: if no_op {
-                AddressFeedbackStatus::DuplicateNoOp
-            } else {
-                AddressFeedbackStatus::HandedOff
-            },
+        let accepted = AddressFeedbackSnapshot {
             dispatch: Some(AddressFeedbackDispatch {
                 queued,
                 steering,
@@ -546,21 +482,112 @@ impl AddressFeedbackWorkflowService {
             workflow_id,
             version,
             version + 1,
-            &completed,
-            phoenix_workflow::WorkflowStatus::Completed,
+            &accepted,
+            phoenix_workflow::WorkflowStatus::Active,
         )
         .await?;
-
+        if let Some(completed) = finalize_persisted_message_inner(
+            &self.state.db,
+            &accepted.conversation_id,
+            &accepted.message_id,
+        )
+        .await?
+        {
+            return Ok(response_from_snapshot(
+                workflow_id,
+                req.message_id,
+                queued,
+                steering,
+                no_op,
+                false,
+                &completed,
+            ));
+        }
         Ok(response_from_snapshot(
             workflow_id,
             req.message_id,
             queued,
             steering,
-            no_op,
             false,
-            &completed,
+            true,
+            &accepted,
         ))
     }
+}
+
+pub(crate) async fn notify_message_persisted(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<(), AddressFeedbackWorkflowError> {
+    let _ = finalize_persisted_message_inner(db, conversation_id, message_id).await?;
+    Ok(())
+}
+
+async fn finalize_persisted_message_inner(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<Option<AddressFeedbackSnapshot>, AddressFeedbackWorkflowError> {
+    if !db.message_exists(message_id).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let target_scope = format!("conversation:{conversation_id}");
+    let Some((workflow_id_raw, payload, version_raw)) = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
+        "SELECT w.workflow_id, w.snapshot_payload, w.version
+             FROM workflows w
+             JOIN workflow_external_acceptance_bindings b ON b.workflow_id = w.workflow_id
+             WHERE b.profile_kind = ? AND b.profile_version = ?
+               AND b.target_scope = ? AND b.idempotency_key = ?
+               AND w.status = 'Active'
+             LIMIT 1",
+    )
+    .bind(PROFILE_KIND)
+    .bind(i64::from(PROFILE_VERSION))
+    .bind(target_scope)
+    .bind(message_id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|error| AddressFeedbackWorkflowError::Workflow(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let workflow_id = u64::try_from(workflow_id_raw)
+        .map(WorkflowId)
+        .map_err(|error| AddressFeedbackWorkflowError::Workflow(error.to_string()))?;
+    let version = u64::try_from(version_raw).unwrap_or(0);
+    let snapshot: AddressFeedbackSnapshot = serde_json::from_slice(&payload)
+        .map_err(|error| AddressFeedbackWorkflowError::Workflow(error.to_string()))?;
+    let Some(dispatch) = snapshot.dispatch.clone() else {
+        return Ok(None);
+    };
+    if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
+        record_pr_auto_fix_context_baseline_for_artifact(db, conversation_id, artifact_path)
+            .await
+            .map_err(|error| AddressFeedbackWorkflowError::Workflow(format!("{error:?}")))?;
+    }
+    let completed = AddressFeedbackSnapshot {
+        status: if dispatch.already_persisted {
+            AddressFeedbackStatus::DuplicateNoOp
+        } else {
+            AddressFeedbackStatus::HandedOff
+        },
+        dispatch: Some(AddressFeedbackDispatch {
+            already_persisted: true,
+            ..dispatch
+        }),
+        ..snapshot
+    };
+    commit_snapshot(
+        &WorkflowRepository::new(db.pool().clone()),
+        workflow_id,
+        version,
+        version + 1,
+        &completed,
+        phoenix_workflow::WorkflowStatus::Completed,
+    )
+    .await?;
+    Ok(Some(completed))
 }
 
 async fn fail_workflow(
@@ -582,21 +609,6 @@ async fn fail_workflow(
         phoenix_workflow::WorkflowStatus::Failed,
     )
     .await;
-}
-
-async fn wait_for_message_durable(
-    db: &crate::db::Database,
-    message_id: &str,
-) -> Result<(), AddressFeedbackWorkflowError> {
-    for _ in 0..50 {
-        if db.get_message_by_id(message_id).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    Err(AddressFeedbackWorkflowError::Workflow(format!(
-        "message {message_id} was accepted but did not become durable before workflow completion"
-    )))
 }
 
 fn pending_response(workflow_id: WorkflowId, message_id: String) -> AddressPrFeedbackResponse {
@@ -621,7 +633,13 @@ async fn find_active_by_fingerprint(
 ) -> Result<Option<(WorkflowId, AddressFeedbackSnapshot)>, AddressFeedbackWorkflowError> {
     let target_scope = format!("conversation:{conversation_id}");
     let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
-        "SELECT workflow_id, snapshot_payload FROM workflows WHERE profile_kind = ? AND profile_version = ? AND target_scope = ? AND intent_fingerprint = ? AND status = 'Active' LIMIT 1",
+        "SELECT w.workflow_id, w.snapshot_payload
+         FROM workflows w
+         JOIN workflow_external_acceptance_bindings b ON b.workflow_id = w.workflow_id
+         WHERE b.profile_kind = ? AND b.profile_version = ?
+           AND b.target_scope = ? AND b.intent_fingerprint = ?
+           AND w.status = 'Active'
+         LIMIT 1",
     )
     .bind(PROFILE_KIND)
     .bind(i64::from(PROFILE_VERSION))
@@ -760,7 +778,11 @@ async fn persist_durable_context_artifact(
     if absolute_path.exists() {
         return Ok(durable_path);
     }
-    tokio::fs::write(&absolute_path, contents)
+    let temporary_path = absolute_path.with_extension("json.tmp");
+    tokio::fs::write(&temporary_path, contents)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    tokio::fs::rename(&temporary_path, &absolute_path)
         .await
         .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
     Ok(durable_path)
@@ -896,7 +918,6 @@ fn intent_fingerprint(
     stable.message_id.clear();
     stable.artifact_path = None;
     stable.instruction = None;
-    stable.model_message = None;
     stable.dispatch = None;
     snapshot_fingerprint(&stable)
 }
@@ -976,10 +997,7 @@ fn map_app_error_for_capture(error: crate::api::AppError) -> AddressFeedbackWork
             message,
             code: "pr_context_unavailable".to_string(),
         },
-        crate::api::AppError::NotFound(message) => AddressFeedbackWorkflowError::Rejected {
-            message,
-            code: "conversation_not_found".to_string(),
-        },
+        crate::api::AppError::NotFound(message) => AddressFeedbackWorkflowError::NotFound(message),
         crate::api::AppError::Conflict(conflict) => AddressFeedbackWorkflowError::Rejected {
             message: conflict.error,
             code: conflict.error_type,
@@ -999,8 +1017,8 @@ fn map_dispatch_error(error: SendChatServiceError) -> AddressFeedbackWorkflowErr
         SendChatServiceError::IdempotencyConflict => {
             AddressFeedbackWorkflowError::IdempotencyConflict
         }
-        other @ (SendChatServiceError::NotFound(_)
-        | SendChatServiceError::AttachmentValidation(_)
+        SendChatServiceError::NotFound(message) => AddressFeedbackWorkflowError::NotFound(message),
+        other @ (SendChatServiceError::AttachmentValidation(_)
         | SendChatServiceError::Expansion { .. }
         | SendChatServiceError::Internal(_)
         | SendChatServiceError::Dispatch(_)) => {
@@ -1034,6 +1052,41 @@ mod tests {
         assert!(rendered.contains("fix &lt;all&gt; &amp; &quot;now&quot;"));
         assert!(rendered.contains("<![CDATA[{\"k\":\"]]]]><![CDATA[>\"}]]>"));
         assert!(rendered.contains("<instruction>legacy</instruction>"));
+    }
+
+    fn fingerprint_snapshot(model_message: &str) -> AddressFeedbackSnapshot {
+        AddressFeedbackSnapshot {
+            conversation_id: "conversation".to_string(),
+            message_id: "message".to_string(),
+            guidance: Some("guidance".to_string()),
+            user_agent: Some("agent".to_string()),
+            status: AddressFeedbackStatus::Captured,
+            target: Some(AddressFeedbackTarget {
+                repo_owner: "owner".to_string(),
+                repo_name: "repo".to_string(),
+                pr_number: 42,
+            }),
+            head_oid: Some("head".to_string()),
+            artifact_path: Some("artifact".to_string()),
+            instruction: Some("instruction".to_string()),
+            model_message: Some(model_message.to_string()),
+            dispatch: None,
+        }
+    }
+
+    #[test]
+    fn intent_fingerprint_changes_with_captured_evidence() {
+        let first = intent_fingerprint(&fingerprint_snapshot("evidence-one")).unwrap();
+        let second = intent_fingerprint(&fingerprint_snapshot("evidence-two")).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn missing_conversation_errors_remain_not_found() {
+        let error = map_app_error_for_capture(crate::api::AppError::NotFound(
+            "missing conversation".to_string(),
+        ));
+        assert!(matches!(error, AddressFeedbackWorkflowError::NotFound(_)));
     }
 
     #[test]
