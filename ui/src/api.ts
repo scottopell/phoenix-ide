@@ -320,6 +320,7 @@ export interface AddressPrFeedbackResponse {
   queued: boolean;
   steering?: boolean;
   no_op?: boolean;
+  pending?: boolean;
   artifact_path?: string;
   pr_number?: number;
   repo_owner?: string;

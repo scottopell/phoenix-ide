@@ -199,7 +199,10 @@ export function WorkControlBar({
     try {
       const response = await api.addressPrFeedback(conversationId, messageId);
       if (response.no_op) {
-        setAddressSubmitted(true);
+        setAddressSubmitted(!!response.pending);
+        if (!response.pending) {
+          setAddressMessageId(null);
+        }
         await prStatusHandle.refresh();
         return;
       }

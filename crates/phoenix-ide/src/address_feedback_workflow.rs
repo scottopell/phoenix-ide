@@ -42,6 +42,8 @@ pub(crate) enum AddressFeedbackWorkflowError {
     IdempotencyConflict,
     #[error("Address feedback rejected: {message}")]
     Rejected { message: String, code: String },
+    #[error("Address feedback retry required: {message}")]
+    Retry { message: String, code: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,8 +56,7 @@ struct AddressFeedbackSnapshot {
     target: Option<AddressFeedbackTarget>,
     head_oid: Option<String>,
     artifact_path: Option<String>,
-    #[serde(default)]
-    context_json: Option<String>,
+    instruction: Option<String>,
     model_message: Option<String>,
     dispatch: Option<AddressFeedbackDispatch>,
 }
@@ -177,6 +178,7 @@ impl AddressFeedbackWorkflowService {
                 .map_err(map_app_error_for_capture)?;
         let context_json =
             read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
+        let instruction = capture.message.clone();
         let model_message = render_address_feedback_xml(
             &capture,
             head_oid.as_deref(),
@@ -197,7 +199,7 @@ impl AddressFeedbackWorkflowService {
             }),
             head_oid,
             artifact_path: Some(capture.artifact_path),
-            context_json: Some(context_json),
+            instruction: Some(instruction),
             model_message: Some(model_message),
             dispatch: None,
         };
@@ -297,6 +299,7 @@ impl AddressFeedbackWorkflowService {
             };
         let context_json =
             read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
+        let instruction = capture.message.clone();
         let model_message = render_address_feedback_xml(
             &capture,
             head_oid.as_deref(),
@@ -313,7 +316,7 @@ impl AddressFeedbackWorkflowService {
             }),
             head_oid,
             artifact_path: Some(capture.artifact_path),
-            context_json: Some(context_json),
+            instruction: Some(instruction),
             model_message: Some(model_message),
             dispatch: None,
             ..snapshot
@@ -373,7 +376,7 @@ impl AddressFeedbackWorkflowService {
             }),
             ..snapshot.clone()
         };
-        let _ = commit_snapshot(
+        commit_snapshot(
             repo,
             workflow_id,
             version,
@@ -381,12 +384,13 @@ impl AddressFeedbackWorkflowService {
             &completed,
             phoenix_workflow::WorkflowStatus::Completed,
         )
-        .await;
+        .await?;
         Ok(Some(response_from_snapshot(
             workflow_id,
             completed.message_id.clone(),
             dispatch.queued,
             dispatch.steering,
+            false,
             false,
             &completed,
         )))
@@ -434,7 +438,7 @@ impl AddressFeedbackWorkflowService {
                     status: AddressFeedbackStatus::Failed,
                     ..snapshot
                 };
-                let _ = commit_snapshot(
+                commit_snapshot(
                     repo,
                     workflow_id,
                     version,
@@ -442,7 +446,7 @@ impl AddressFeedbackWorkflowService {
                     &failed,
                     phoenix_workflow::WorkflowStatus::Failed,
                 )
-                .await;
+                .await?;
 
                 return Err(AddressFeedbackWorkflowError::Rejected {
                     message,
@@ -459,7 +463,7 @@ impl AddressFeedbackWorkflowService {
                 }),
                 ..snapshot.clone()
             };
-            let _ = commit_snapshot(
+            commit_snapshot(
                 repo,
                 workflow_id,
                 version,
@@ -467,13 +471,14 @@ impl AddressFeedbackWorkflowService {
                 &queued,
                 phoenix_workflow::WorkflowStatus::Active,
             )
-            .await;
+            .await?;
             return Ok(response_from_snapshot(
                 workflow_id,
                 req.message_id,
                 queued.dispatch.as_ref().map(|d| d.queued).unwrap_or(true),
                 true,
                 false,
+                true,
                 &queued,
             ));
         }
@@ -502,7 +507,7 @@ impl AddressFeedbackWorkflowService {
             }),
             ..snapshot.clone()
         };
-        let _ = commit_snapshot(
+        commit_snapshot(
             repo,
             workflow_id,
             version,
@@ -510,7 +515,7 @@ impl AddressFeedbackWorkflowService {
             &completed,
             phoenix_workflow::WorkflowStatus::Completed,
         )
-        .await;
+        .await?;
 
         Ok(response_from_snapshot(
             workflow_id,
@@ -518,6 +523,7 @@ impl AddressFeedbackWorkflowService {
             queued,
             steering,
             no_op,
+            false,
             &completed,
         ))
     }
@@ -566,6 +572,7 @@ fn pending_response(workflow_id: WorkflowId, message_id: String) -> AddressPrFee
         queued: true,
         steering: false,
         no_op: true,
+        pending: true,
         artifact_path: None,
         pr_number: None,
         repo_owner: None,
@@ -621,6 +628,7 @@ fn response_from_completed_snapshot(
         dispatch.queued,
         dispatch.steering,
         true,
+        false,
         snapshot,
     ))
 }
@@ -631,6 +639,7 @@ fn response_from_snapshot(
     queued: bool,
     steering: bool,
     no_op: bool,
+    pending: bool,
     snapshot: &AddressFeedbackSnapshot,
 ) -> AddressPrFeedbackResponse {
     AddressPrFeedbackResponse {
@@ -639,6 +648,7 @@ fn response_from_snapshot(
         queued,
         steering,
         no_op,
+        pending,
         artifact_path: snapshot.artifact_path.clone(),
         pr_number: snapshot.target.as_ref().map(|target| target.pr_number),
         repo_owner: snapshot
@@ -728,7 +738,11 @@ async fn commit_snapshot(
         .await
         .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
     match outcome {
-        CommitOutcome::Committed | CommitOutcome::VersionConflict => Ok(()),
+        CommitOutcome::Committed => Ok(()),
+        CommitOutcome::VersionConflict => Err(AddressFeedbackWorkflowError::Retry {
+            message: "Address feedback workflow changed; retry the request.".to_string(),
+            code: "address_feedback_retry".to_string(),
+        }),
         CommitOutcome::InvalidPlan | CommitOutcome::UnsupportedCodec => {
             Err(AddressFeedbackWorkflowError::Workflow(format!(
                 "invalid workflow transition: {outcome:?}"
@@ -764,7 +778,7 @@ fn intent_fingerprint(
     let mut stable = snapshot.clone();
     stable.user_agent = None;
     stable.artifact_path = None;
-    stable.context_json = None;
+    stable.instruction = None;
     stable.model_message = None;
     stable.dispatch = None;
     snapshot_fingerprint(&stable)
