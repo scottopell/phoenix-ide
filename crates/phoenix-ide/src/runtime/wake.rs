@@ -689,6 +689,13 @@ async fn deliver_pending_direct_turns(manager: &Arc<RuntimeManager>) -> Result<(
                     error = %error,
                     "pending direct turn runtime could not be constructed"
                 );
+                repo.release_direct_turn_runtime_delivery(
+                    &pending.conversation_id,
+                    &pending.client_message_id,
+                    super::process_incarnation(),
+                )
+                .await
+                .map_err(|release_error| release_error.to_string())?;
                 continue;
             }
         };

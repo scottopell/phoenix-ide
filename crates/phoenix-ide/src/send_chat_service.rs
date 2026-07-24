@@ -123,18 +123,6 @@ impl SendChatApplicationService {
             if !prepared_retry_matches_request(&prepared, &req) {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
-            let materialized = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
-                .load_direct_turn_materialized_message_id(&conversation.id, &req.message_id)
-                .await
-                .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-            if materialized.is_some() {
-                receipts.remove(&(conversation.id.clone(), req.message_id.clone()));
-                return Ok(SendChatOutcome::accepted(
-                    req.message_id,
-                    SendChatRequestResult::Replayed,
-                    SendChatDisposition::RuntimeAccepted,
-                ));
-            }
             return self
                 .replay_durable_acceptance(
                     &conversation,
@@ -1046,6 +1034,99 @@ mod tests {
                 .map(|entry| entry.text),
             Some("first target".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn materialized_queued_replay_preserves_queued_disposition() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-materialized-queued",
+                "queued",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let prepared = phoenix_core::domain::sm_event::PreparedDirectTurn {
+            codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            expand_references: true,
+            text: "queued".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "queued-id".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let repo = phoenix_db::WorkflowRepository::new(state.db.pool().clone());
+        repo.accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+            initial_outcome: phoenix_db::DirectTurnInitialOutcome::QueuedSteering {
+                entry: Box::new(phoenix_core::domain::sm_event::SteerEntry {
+                    text: prepared.text.clone(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: prepared.message_id.clone(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }),
+            },
+            conversation_id: "conv-materialized-queued".to_string(),
+            client_message_id: "queued-id".to_string(),
+            prepared_fingerprint: "fingerprint".to_string(),
+            prepared_payload: serde_json::to_string(&prepared).unwrap(),
+            accepted_at: phoenix_workflow::Timestamp(1),
+            snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                    conversation_id: "conv-materialized-queued".to_string(),
+                    accepted_turn_id: "queued-id".to_string(),
+                    generation: 0,
+                },
+                accepted_assistant_message_id: None,
+                stopped_at: None,
+            },
+        })
+        .await
+        .unwrap();
+        let proposed = crate::db::Message {
+            message_id: "queued-id".to_string(),
+            conversation_id: "conv-materialized-queued".to_string(),
+            sequence_id: 1,
+            message_type: crate::db::MessageType::User,
+            content: crate::db::MessageContent::user("queued"),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        };
+        state
+            .db
+            .persist_queued_steering_message("conv-materialized-queued", "queued-id", &proposed)
+            .await
+            .unwrap();
+
+        let outcome = SendChatApplicationService::new(state.db.clone(), state.runtime.clone())
+            .send(SendChatRequest {
+                conversation_id: "conv-materialized-queued".to_string(),
+                text: "queued".to_string(),
+                message_id: "queued-id".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::ExpandReferences,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            super::SendChatOutcome::Accepted {
+                disposition: super::SendChatDisposition::QueuedSteering,
+                ..
+            }
+        ));
     }
 
     #[test]

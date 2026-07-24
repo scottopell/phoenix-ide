@@ -3685,6 +3685,41 @@ async fn cancel_wake(
     Ok(axum::Json(SuccessResponse { success: true }))
 }
 
+async fn stop_idle_durable_turn(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<Option<Json<CancelResponse>>, AppError> {
+    let repo = phoenix_db::WorkflowRepository::new(state.runtime.db().pool().clone());
+    match repo
+        .stop_active_top_level_llm_for_conversation(
+            conversation_id,
+            phoenix_workflow::Timestamp(
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+            ),
+        )
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        Some(phoenix_workflow::CommitOutcome::Committed) => Ok(Some(Json(CancelResponse {
+            ok: true,
+            no_op: false,
+        }))),
+        Some(phoenix_workflow::CommitOutcome::VersionConflict) => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation changed while cancellation was committing".to_string(),
+                "cancel_conflict",
+            ))))
+        }
+        Some(
+            phoenix_workflow::CommitOutcome::InvalidPlan
+            | phoenix_workflow::CommitOutcome::UnsupportedCodec,
+        ) => Err(AppError::Internal(
+            "Durable cancellation transition was rejected".to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3737,22 +3772,8 @@ async fn cancel_conversation(
     }
 
     if matches!(conversation.state, ConvState::Idle) {
-        let repo = phoenix_db::WorkflowRepository::new(state.runtime.db().pool().clone());
-        if repo
-            .stop_active_top_level_llm_for_conversation(
-                &id,
-                phoenix_workflow::Timestamp(
-                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
-                ),
-            )
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?
-            .is_some()
-        {
-            return Ok(Json(CancelResponse {
-                ok: true,
-                no_op: false,
-            }));
+        if let Some(response) = stop_idle_durable_turn(&state, &id).await? {
+            return Ok(response);
         }
     }
 

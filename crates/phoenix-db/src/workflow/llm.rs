@@ -1718,6 +1718,8 @@ impl WorkflowRepository {
     ) -> DbResult<Option<CommitOutcome>> {
         let row = sqlx::query(
             "SELECT wf.workflow_id, wf.version, wf.generation,
+                    dta.client_message_id AS accepted_turn_id,
+                    w.turn_generation, w.accepted_assistant_message_id,
                     COALESCE((
                         SELECT MAX(e.call_ordinal) FROM top_level_llm_effects e
                         WHERE e.workflow_id = wf.workflow_id
@@ -1738,17 +1740,15 @@ impl WorkflowRepository {
             return Ok(None);
         };
         let workflow_id = WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?);
-        let current = self
-            .load_active_top_level_llm_workflow(conversation_id)
-            .await?
-            .ok_or_else(|| DbError::Serialization("active LLM workflow disappeared".to_string()))?;
+        let accepted_turn_id: String = row.get("accepted_turn_id");
+        let turn_generation = to_u64(row.get("turn_generation"), "turn_generation")?;
         let next_snapshot = TopLevelLlmSnapshot {
             turn_ref: TopLevelTurnRef {
-                conversation_id: current.conversation_id.clone(),
-                accepted_turn_id: current.accepted_turn_id.clone(),
-                generation: current.turn_generation.0,
+                conversation_id: conversation_id.to_string(),
+                accepted_turn_id: accepted_turn_id.clone(),
+                generation: turn_generation,
             },
-            accepted_assistant_message_id: current.accepted_assistant_message_id,
+            accepted_assistant_message_id: row.get("accepted_assistant_message_id"),
             stopped_at: Some(stopped_at.0),
         };
         let mut tx = self.begin_tx().await?;
@@ -1766,8 +1766,8 @@ impl WorkflowRepository {
             next_status: WorkflowStatus::Cancelled,
             event_payload: serde_json::to_vec(&llm_profile::TopLevelLlmEvent::ResponseCancelled {
                 key: LlmEffectKey {
-                    accepted_turn_id: current.accepted_turn_id.clone(),
-                    generation: current.turn_generation.0,
+                    accepted_turn_id,
+                    generation: turn_generation,
                     call_ordinal: to_u64(row.get("call_ordinal"), "call_ordinal")?,
                 },
                 reason: "stop".to_string(),
@@ -3244,10 +3244,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_before_first_effect_commits_and_releases_live_slot() {
+    async fn stop_pending_runtime_before_first_effect_commits_and_releases_live_slot() {
         let repo = open_repo().await;
         let input = DirectTurnAcceptanceInput {
-            initial_outcome: DirectTurnInitialOutcome::RuntimeAccepted,
+            initial_outcome: DirectTurnInitialOutcome::PendingRuntime,
             conversation_id: "conv-1".to_string(),
             client_message_id: "msg-1".to_string(),
             prepared_fingerprint: "fp-1".to_string(),
