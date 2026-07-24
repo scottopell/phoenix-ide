@@ -827,6 +827,7 @@ impl WorkflowRepository {
              JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id
              JOIN workflows wf ON wf.workflow_id = w.workflow_id
              WHERE dta.conversation_id = ?1 AND dta.committed_outcome = 'RuntimeAccepted'
+               AND dta.live_slot = 1
                AND w.stopped_at IS NULL AND wf.status = 'Active'
              ORDER BY dta.accepted_at DESC LIMIT 1",
         )
@@ -2955,6 +2956,39 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].client_message_id, "msg-2");
+    }
+
+    #[tokio::test]
+    async fn active_workflow_lookup_excludes_completed_live_slot() {
+        let repo = open_repo().await;
+        repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::RuntimeAccepted,
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-1".to_string(),
+            prepared_fingerprint: "fp-1".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        })
+        .await
+        .unwrap();
+        assert!(repo
+            .load_active_top_level_llm_workflow("conv-1")
+            .await
+            .unwrap()
+            .is_some());
+        sqlx::query(
+            "UPDATE direct_turn_acceptances SET live_slot = NULL
+             WHERE conversation_id = 'conv-1' AND client_message_id = 'msg-1'",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        assert!(repo
+            .load_active_top_level_llm_workflow("conv-1")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

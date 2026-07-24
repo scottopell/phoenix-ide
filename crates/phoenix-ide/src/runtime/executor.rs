@@ -2118,7 +2118,27 @@ where
         if let ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. } = &self.state
         {
             tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
-            if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
+            let resume_result = if self.context.is_sub_agent {
+                self.dispatch_llm_request(LlmDispatchOwnership::DurableDirectTurn)
+                    .await
+            } else {
+                match self
+                    .storage
+                    .active_top_level_llm_workflow(&self.context.conversation_id)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        self.dispatch_llm_request(LlmDispatchOwnership::DurableDirectTurn)
+                            .await
+                    }
+                    Ok(None) => {
+                        self.dispatch_llm_request(LlmDispatchOwnership::AdoptedWakeBatch)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            if let Err(e) = resume_result {
                 tracing::error!(error = %e, "Failed to resume LLM request");
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
@@ -5074,11 +5094,12 @@ where
         let working_dir = self.context.working_dir.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
-        let durable_workflow = if is_sub_agent {
-            None
-        } else {
-            storage.active_top_level_llm_workflow(&conv_id).await?
-        };
+        let durable_workflow =
+            if is_sub_agent || matches!(ownership, LlmDispatchOwnership::AdoptedWakeBatch) {
+                None
+            } else {
+                storage.active_top_level_llm_workflow(&conv_id).await?
+            };
         if !is_sub_agent
             && self.storage.requires_durable_top_level_llm()
             && durable_workflow.is_none()
