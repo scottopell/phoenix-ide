@@ -1043,33 +1043,6 @@ impl WorkflowRepository {
         Ok(result.outcome)
     }
 
-    pub async fn acknowledge_recovered_top_level_llm_failure(
-        &self,
-        authority: &LocalAttemptAuthority,
-    ) -> DbResult<bool> {
-        let updated = sqlx::query(
-            "UPDATE workflow_attempts SET status = 'AuthorityLost'
-             WHERE workflow_id = ?1 AND effect_id = ?2 AND attempt_id = ?3
-               AND declared_workflow_version = ?4 AND generation = ?5
-               AND process_incarnation = ?6 AND status = 'ObservationRecorded'",
-        )
-        .bind(to_i64(authority.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(authority.effect_id.0, "effect_id")?)
-        .bind(to_i64(authority.attempt_id.0, "attempt_id")?)
-        .bind(to_i64(
-            authority.declared_workflow_version.0,
-            "declared_workflow_version",
-        )?)
-        .bind(to_i64(authority.generation.0, "generation")?)
-        .bind(to_i64(
-            authority.process_incarnation.0,
-            "process_incarnation",
-        )?)
-        .execute(&self.pool)
-        .await?;
-        Ok(updated.rows_affected() == 1)
-    }
-
     pub async fn begin_recovered_top_level_llm_attempt(
         &self,
         workflow_id: WorkflowId,
@@ -3070,15 +3043,6 @@ mod tests {
             .unwrap();
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].recorded_outcome_payload, Some(failure_payload));
-        assert!(repo
-            .acknowledge_recovered_top_level_llm_failure(&observed[0].attempt.authority)
-            .await
-            .unwrap());
-        assert!(repo
-            .recover_top_level_llm_attempts(ProcessIncarnation(10))
-            .await
-            .unwrap()
-            .is_empty());
         let retry = repo
             .prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
                 committed_at: Timestamp(4),

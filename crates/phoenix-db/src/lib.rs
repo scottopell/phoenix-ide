@@ -4778,21 +4778,62 @@ impl Database {
         Ok(AcceptTopLevelLlmProductOutcome::Committed)
     }
 
-    /// Update conversation state with an explicit `state_updated_at`. The
-    /// runtime threads its in-memory entry timestamp here so the DB row and
-    /// the `StateChange` wire event share one value (REQ-WPV-001) — no
-    /// clock-drift between the two `now()` reads. `updated_at` stays `now()`
-    /// (NOT the phase-entry time): it is a monotonic last-modified marker, and
-    /// effects can persist other rows before `PersistState` runs, so binding
-    /// it to the (earlier) phase-entry stamp would let `updated_at` regress.
+    /// Persist recovered policy state and consume its failure observation atomically.
     ///
     /// # Errors
     ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
+    /// Returns a [`DbError`] if serialization or the transaction fails.
+    pub async fn persist_recovered_failure_state(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        authority: &LocalAttemptAuthority,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        let state_json = serde_json::to_string(state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let updated = sqlx::query(
+            "UPDATE workflow_attempts SET status = 'AuthorityLost'
+             WHERE workflow_id = ?1 AND effect_id = ?2 AND attempt_id = ?3
+               AND declared_workflow_version = ?4 AND generation = ?5
+               AND process_incarnation = ?6 AND status = 'ObservationRecorded'",
+        )
+        .bind(i64::try_from(authority.workflow_id.0).unwrap_or(i64::MAX))
+        .bind(i64::try_from(authority.effect_id.0).unwrap_or(i64::MAX))
+        .bind(i64::try_from(authority.attempt_id.0).unwrap_or(i64::MAX))
+        .bind(i64::try_from(authority.declared_workflow_version.0).unwrap_or(i64::MAX))
+        .bind(i64::try_from(authority.generation.0).unwrap_or(i64::MAX))
+        .bind(i64::try_from(authority.process_incarnation.0).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(state_json)
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Update conversation state with an explicit phase-entry timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the database write fails.
     ///
     /// # Panics
     ///
-    /// Panics if persisted JSON columns cannot be (de)serialized.
+    /// Panics if conversation state serialization fails.
     pub async fn update_conversation_state_at(
         &self,
         id: &str,

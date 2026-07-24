@@ -1671,6 +1671,8 @@ where
         String,
         phoenix_core::domain::creation_protocol::CreationClaim,
     )>,
+    recovered_failure_authority:
+        Option<phoenix_core::domain::llm_types::DurableLlmFailureAuthority>,
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
@@ -1941,6 +1943,7 @@ where
             state,
             state_updated_at: Utc::now(),
             startup_creation_completion: None,
+            recovered_failure_authority: None,
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
@@ -2818,6 +2821,7 @@ where
         }
 
         if let Event::ResumeDurableLlmFailure { failure, authority } = event {
+            self.recovered_failure_authority = Some(authority);
             let error_event = Event::LlmError {
                 message: failure.message,
                 error_kind: failure.error_kind,
@@ -2825,11 +2829,11 @@ where
                 recovery_in_progress: failure.recovery_in_progress,
                 resets_at: failure.resets_at,
             };
-            Box::pin(self.process_event(error_event)).await?;
-            self.storage
-                .acknowledge_recovered_top_level_llm_failure(&authority)
-                .await?;
-            return Ok(());
+            let result = Box::pin(self.process_event(error_event)).await;
+            if result.is_err() {
+                self.recovered_failure_authority = None;
+            }
+            return result;
         }
 
         // Check if this is a SubAgentResult that needs buffering
@@ -3222,7 +3226,9 @@ where
             })
             .await?;
         let product_replay = outcome == phoenix_db::AcceptTopLevelLlmProductOutcome::ExactReplay;
-        if product_replay && !persisted_messages.is_empty() {
+        if outcome != phoenix_db::AcceptTopLevelLlmProductOutcome::Committed
+            && !persisted_messages.is_empty()
+        {
             self.broadcast_tx.rewind_unused_reserved_range(
                 persisted_messages[0].sequence_id,
                 persisted_messages.len(),
@@ -4575,7 +4581,32 @@ where
                 Ok(None)
             }
 
-            Effect::PersistState => self.persist_state_effect(true).await,
+            Effect::PersistState => {
+                let recovered_authority = self.recovered_failure_authority.take();
+                let is_recovered_failure = recovered_authority.is_some();
+                let result = if let Some(authority) = recovered_authority {
+                    self.storage
+                        .persist_recovered_failure_state(
+                            &self.context.conversation_id,
+                            &self.state,
+                            self.state_updated_at,
+                            &authority,
+                        )
+                        .await
+                        .map(|()| None)
+                } else {
+                    self.persist_state_effect(true).await
+                };
+                if result.is_ok() && is_recovered_failure {
+                    let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                        sequence_id: seq,
+                        state: self.state.clone(),
+                        presentation_mode: self.state.presentation_mode().to_string(),
+                        state_updated_at: self.state_updated_at,
+                    });
+                }
+                result
+            }
 
             Effect::CompleteDurableToolIntent { tool_use_id } => {
                 self.storage

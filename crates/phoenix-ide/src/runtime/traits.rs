@@ -169,8 +169,11 @@ pub trait MessageStore: Send + Sync {
         Ok(())
     }
 
-    async fn acknowledge_recovered_top_level_llm_failure(
+    async fn persist_recovered_failure_state(
         &self,
+        _conversation_id: &str,
+        _state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
         _authority: &phoenix_core::domain::llm_types::DurableLlmFailureAuthority,
     ) -> Result<(), String> {
         Ok(())
@@ -429,6 +432,18 @@ impl<T: MessageStore + StateStore> Storage for T {}
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn persist_recovered_failure_state(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        authority: &phoenix_core::domain::llm_types::DurableLlmFailureAuthority,
+    ) -> Result<(), String> {
+        (**self)
+            .persist_recovered_failure_state(conversation_id, state, state_updated_at, authority)
+            .await
+    }
+
     async fn add_message(
         &self,
         message_id: &str,
@@ -915,27 +930,35 @@ impl MessageStore for DatabaseStorage {
             .map_err(|error| error.to_string())
     }
 
-    async fn acknowledge_recovered_top_level_llm_failure(
+    async fn persist_recovered_failure_state(
         &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
         authority: &phoenix_core::domain::llm_types::DurableLlmFailureAuthority,
     ) -> Result<(), String> {
-        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
-            .acknowledge_recovered_top_level_llm_failure(&phoenix_db::LocalAttemptAuthority {
-                workflow_id: phoenix_workflow::WorkflowId(authority.workflow_id),
-                effect_id: phoenix_workflow::EffectId(authority.effect_id),
-                attempt_id: phoenix_workflow::AttemptId(authority.attempt_id),
-                declared_workflow_version: phoenix_workflow::Version(
-                    authority.declared_workflow_version,
-                ),
-                generation: phoenix_workflow::Generation(authority.generation),
-                process_incarnation: phoenix_workflow::ProcessIncarnation(
-                    authority.process_incarnation,
-                ),
-            })
+        self.db
+            .persist_recovered_failure_state(
+                conversation_id,
+                state,
+                state_updated_at,
+                &phoenix_db::LocalAttemptAuthority {
+                    workflow_id: phoenix_workflow::WorkflowId(authority.workflow_id),
+                    effect_id: phoenix_workflow::EffectId(authority.effect_id),
+                    attempt_id: phoenix_workflow::AttemptId(authority.attempt_id),
+                    declared_workflow_version: phoenix_workflow::Version(
+                        authority.declared_workflow_version,
+                    ),
+                    generation: phoenix_workflow::Generation(authority.generation),
+                    process_incarnation: phoenix_workflow::ProcessIncarnation(
+                        authority.process_incarnation,
+                    ),
+                },
+            )
             .await
             .map_err(|error| error.to_string())?
             .then_some(())
-            .ok_or_else(|| "recorded LLM failure acknowledgment lost authority".to_string())
+            .ok_or_else(|| "recorded LLM failure persistence lost authority".to_string())
     }
 
     async fn stop_active_top_level_llm_for_conversation(
