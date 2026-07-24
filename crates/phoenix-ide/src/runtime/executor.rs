@@ -5727,18 +5727,7 @@ where
                 // this write is a no-op — worktree_path == conv.cwd already.
                 // For legacy Managed conversations whose cwd was the repo root,
                 // this is load-bearing: it moves cwd to the new worktree path.
-                self.context
-                    .set_filesystem_root(std::path::PathBuf::from(&approval_result.worktree_path));
-
-                // Refresh in-memory mode_context so downstream checks
-                // (e.g. spawn_agents Work-parent guard) observe Work mode
-                // for the rest of this runtime's lifetime. Without this,
-                // mode_context stays the Explore value set at runtime start.
-                self.context.mode_context = Some(ModeContext::Work {
-                    branch_name: approval_result.branch_name.clone(),
-                    base_branch: approval_result.base_branch.clone(),
-                    worktree_path: approval_result.worktree_path.clone(),
-                });
+                promote_runtime_context_to_work(&mut self.context, &approval_result);
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -5957,6 +5946,18 @@ where
             successor_conv_id: response.successor_conv_id,
         }))
     }
+}
+
+fn promote_runtime_context_to_work(context: &mut ConvContext, approval: &TaskApprovalResult) {
+    let worktree_path = std::path::PathBuf::from(&approval.worktree_path);
+    context.set_filesystem_root(worktree_path.clone());
+    context.resource_authority = crate::work_scope::ResourceAuthority::Work;
+    context.work_scope_worktree = Some(worktree_path);
+    context.mode_context = Some(ModeContext::Work {
+        branch_name: approval.branch_name.clone(),
+        base_branch: approval.base_branch.clone(),
+        worktree_path: approval.worktree_path.clone(),
+    });
 }
 
 /// Result of a successful task approval
@@ -9612,16 +9613,53 @@ mod explore_prompt_cache_shape_tests {
     }
 }
 
-// ============================================================
-// Mode-context refresh on Explore -> Work promotion
-// ============================================================
-//
-// Regression test for task 03002: after a Managed conversation
-// approves its task and is promoted to Work mode, the in-memory
-// `context.mode_context` must reflect Work (not the stale Explore
-// value from runtime startup). The `spawn_agents` Work-parent guard
-// reads this field; a stale Explore value rejects legitimate
-// `mode: "work"` sub-agent requests from a Work-mode parent.
+#[cfg(test)]
+mod runtime_context_promotion_tests {
+    use super::*;
+
+    #[test]
+    fn promotion_refreshes_filesystem_and_resource_context() {
+        let old_root = std::path::PathBuf::from("/repo");
+        let mut context = ConvContext::new("conv", old_root, "model", 200_000);
+        context.resource_authority = crate::work_scope::ResourceAuthority::Restricted;
+        context.work_scope_worktree = None;
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        });
+        let approval = TaskApprovalResult {
+            task_id: "123".to_string(),
+            task_title: "Approved task".to_string(),
+            branch_name: "task-123-approved".to_string(),
+            first_task: true,
+            task_file: "tasks/123-p1-ready--approved.md".to_string(),
+            worktree_path: "/repo/.phoenix/worktrees/conv".to_string(),
+            base_branch: "main".to_string(),
+        };
+
+        promote_runtime_context_to_work(&mut context, &approval);
+
+        let promoted_path = std::path::PathBuf::from(&approval.worktree_path);
+        assert_eq!(
+            context.execution_environment.working_dir(),
+            Some(promoted_path.as_path())
+        );
+        assert_eq!(
+            context.resource_authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(context.work_scope_worktree.as_ref(), Some(&promoted_path));
+        assert!(matches!(
+            context.mode_context,
+            Some(ModeContext::Work {
+                branch_name,
+                base_branch,
+                worktree_path,
+            }) if branch_name == approval.branch_name
+                && base_branch == approval.base_branch
+                && worktree_path == approval.worktree_path
+        ));
+    }
+}
 
 #[cfg(test)]
 mod steer_drain_detector_tests {

@@ -541,6 +541,7 @@ pub async fn cascade_bash_on_delete(
             return report;
         };
         let handles = entry.write().await.remove_for_actor(actor);
+        let inventory_changed = !handles.is_empty();
         for handle in handles {
             if let Some(group_id) = handle.live_pgid().await {
                 record_handle_in_report(
@@ -561,7 +562,9 @@ pub async fn cascade_bash_on_delete(
                 }
             }
         }
-        registry.emit_lifecycle(work_scope, BashLifecyclePhase::Terminal);
+        if inventory_changed {
+            registry.emit_lifecycle(work_scope, BashLifecyclePhase::Terminal);
+        }
         return report;
     }
     let mut report = CascadeBashReport::default();
@@ -624,6 +627,9 @@ async fn kill_selected_handles(
     handles: Vec<Arc<Handle>>,
 ) -> CascadeBashReport {
     let mut report = CascadeBashReport::default();
+    if handles.is_empty() {
+        return report;
+    }
     for handle in handles {
         if let Some(group_id) = handle.live_pgid().await {
             record_handle_in_report(
