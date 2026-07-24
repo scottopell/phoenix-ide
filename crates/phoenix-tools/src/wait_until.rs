@@ -56,14 +56,15 @@ impl Tool for WaitUntilTool {
                     "properties": {
                         "kind": {
                             "type": "string",
-                            "enum": ["Bash", "TmuxPane", "SubAgent"]
+                            "const": "Bash"
                         },
                         "id": {
                             "type": "string",
                             "description": "Handle identifier within the tagged kind."
                         }
                     },
-                    "required": ["kind", "id"]
+                    "required": ["kind", "id"],
+                    "additionalProperties": false
                 },
                 "condition": {
                     "type": "string",
@@ -364,8 +365,12 @@ mod tests {
             json!(["kind", "id"])
         );
         assert_eq!(
-            schema["properties"]["handle"]["properties"]["kind"]["enum"],
-            json!(["Bash", "TmuxPane", "SubAgent"])
+            schema["properties"]["handle"]["properties"]["kind"]["const"],
+            json!("Bash")
+        );
+        assert_eq!(
+            schema["properties"]["handle"]["additionalProperties"],
+            json!(false)
         );
         assert_eq!(
             schema["properties"]["condition"]["enum"],

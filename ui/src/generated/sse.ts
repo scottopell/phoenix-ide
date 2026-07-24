@@ -90,6 +90,10 @@ export type SseWakeContractRegisteredData = Omit<
   Extract<SseWireEvent, { type: 'wake_contract_registered' }>,
   'type'
 >;
+export type SseWakeContractTerminalData = Omit<
+  Extract<SseWireEvent, { type: 'wake_contract_terminal' }>,
+  'type'
+>;
 export type { LlmAttemptReason } from './LlmAttemptReason';
 export type SseConversationBecameTerminalData = Omit<
   Extract<SseWireEvent, { type: 'conversation_became_terminal' }>,

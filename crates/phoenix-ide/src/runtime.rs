@@ -1001,6 +1001,16 @@ pub enum MessageSnapshotMode {
     Suffix,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum WakeContractTerminalKind {
+    Fired,
+    Cancelled,
+    Expired,
+    Forgotten,
+}
+
 /// Events sent to SSE clients.
 ///
 /// Every variant carries a `sequence_id` drawn from the conversation's single
@@ -1154,6 +1164,14 @@ pub enum SseEvent {
         resource_kind: String,
         handle_id: String,
         expires_at: u64,
+    },
+    WakeContractTerminal {
+        sequence_id: i64,
+        workflow_id: u64,
+        contract_id: String,
+        receipt_id: u64,
+        delivery_id: u64,
+        terminal_kind: WakeContractTerminalKind,
     },
     /// Emitted once when a conversation's `is_terminal()` first becomes true.
     /// Consumed by the terminal subsystem to tear down any active PTY session.

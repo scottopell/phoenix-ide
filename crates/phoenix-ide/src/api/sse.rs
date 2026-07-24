@@ -322,6 +322,22 @@ mod tests {
                 "handle_id": handle_id,
                 "expires_at": expires_at,
             }),
+            SseEvent::WakeContractTerminal {
+                sequence_id,
+                workflow_id,
+                contract_id,
+                receipt_id,
+                delivery_id,
+                terminal_kind,
+            } => json!({
+                "type": "wake_contract_terminal",
+                "sequence_id": sequence_id,
+                "workflow_id": workflow_id,
+                "contract_id": contract_id,
+                "receipt_id": receipt_id,
+                "delivery_id": delivery_id,
+                "terminal_kind": terminal_kind,
+            }),
             SseEvent::ConversationBecameTerminal { sequence_id } => json!({
                 "type": "conversation_became_terminal",
                 "sequence_id": sequence_id,
@@ -821,6 +837,19 @@ mod tests {
     #[test]
     fn parity_agent_done() {
         let event = SseEvent::AgentDone { sequence_id: 16 };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_wake_contract_terminal() {
+        let event = SseEvent::WakeContractTerminal {
+            sequence_id: 17,
+            workflow_id: 10,
+            contract_id: "contract-10".to_string(),
+            receipt_id: 20,
+            delivery_id: 30,
+            terminal_kind: crate::runtime::WakeContractTerminalKind::Fired,
+        };
         assert_parity(&event);
     }
 

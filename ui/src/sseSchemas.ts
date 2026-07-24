@@ -38,6 +38,7 @@ import type {
   SseLlmAttemptData as WireLlmAttemptData,
   SseAgentDoneData as WireAgentDoneData,
   SseWakeContractRegisteredData as WireWakeContractRegisteredData,
+  SseWakeContractTerminalData as WireWakeContractTerminalData,
   SseConversationBecameTerminalData as WireConversationBecameTerminalData,
   SseConversationUpdateData as WireConversationUpdateData,
   SseErrorData as WireErrorData,
@@ -335,6 +336,15 @@ export const SseWakeContractRegisteredDataSchema = v.looseObject({
   handle_id: v.string(),
   expires_at: v.number(),
 }) satisfies v.GenericSchema<unknown, WireWakeContractRegisteredData>;
+
+export const SseWakeContractTerminalDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  workflow_id: v.number(),
+  contract_id: v.string(),
+  receipt_id: v.number(),
+  delivery_id: v.number(),
+  terminal_kind: v.picklist(['fired', 'cancelled', 'expired', 'forgotten']),
+}) satisfies v.GenericSchema<unknown, WireWakeContractTerminalData>;
 
 /** `conversation_became_terminal`: carries only the sequence_id today.
  *  Wired up as a no-op in the UI but validated so that if the server starts

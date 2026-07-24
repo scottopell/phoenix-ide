@@ -464,6 +464,16 @@ fn handle_is_idle(handle: &crate::runtime::ConversationHandle) -> bool {
     )
 }
 
+fn sort_pending_for_materialization(pending: &mut [WakePendingDelivery]) {
+    pending.sort_by_key(|delivery| {
+        (
+            terminal_resolved_at(&delivery.receipt.terminal),
+            delivery.workflow_id,
+            delivery.receipt.receipt_id,
+        )
+    });
+}
+
 #[allow(clippy::too_many_lines)]
 async fn deliver_pending(
     manager: &Arc<RuntimeManager>,
@@ -545,10 +555,11 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             }
-            let conversation_pending = repo
+            let mut conversation_pending = repo
                 .list_pending(&current.conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
+            sort_pending_for_materialization(&mut conversation_pending);
             let mut unmaterialized = Vec::new();
             for delivery in &conversation_pending {
                 if repo
@@ -600,6 +611,16 @@ async fn deliver_pending(
                         let _ = handle
                             .broadcast_tx
                             .send_message(link.linked_message.message.clone());
+                        let _ = handle.broadcast_tx.send_seq(|sequence_id| {
+                            crate::runtime::SseEvent::WakeContractTerminal {
+                                sequence_id,
+                                workflow_id: delivery.workflow_id.0,
+                                contract_id: delivery.receipt.contract_id.clone(),
+                                receipt_id: delivery.receipt.receipt_id.0,
+                                delivery_id: delivery.canonical_delivery.delivery_id.0,
+                                terminal_kind: terminal_kind(&delivery.receipt.terminal),
+                            }
+                        });
                     }
                     MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {}
                     MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
@@ -676,6 +697,38 @@ struct BashWakeResolutionObservation<'a> {
     resolved_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+fn terminal_resolved_at(
+    terminal: &phoenix_workflow::wake_profile::WakeTerminalPayload,
+) -> Timestamp {
+    match terminal {
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Fired { resolved_at, .. }
+        | phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { resolved_at, .. }
+        | phoenix_workflow::wake_profile::WakeTerminalPayload::Expired { resolved_at, .. }
+        | phoenix_workflow::wake_profile::WakeTerminalPayload::Forgotten { resolved_at, .. } => {
+            *resolved_at
+        }
+    }
+}
+
+fn terminal_kind(
+    terminal: &phoenix_workflow::wake_profile::WakeTerminalPayload,
+) -> crate::runtime::WakeContractTerminalKind {
+    match terminal {
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Fired { .. } => {
+            crate::runtime::WakeContractTerminalKind::Fired
+        }
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. } => {
+            crate::runtime::WakeContractTerminalKind::Cancelled
+        }
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Expired { .. } => {
+            crate::runtime::WakeContractTerminalKind::Expired
+        }
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Forgotten { .. } => {
+            crate::runtime::WakeContractTerminalKind::Forgotten
+        }
+    }
 }
 
 fn render_terminal_result(pending: &WakePendingDelivery) -> String {
@@ -1975,6 +2028,7 @@ mod tests {
         ));
         let handle = manager.get_or_create("conv").await.unwrap();
         let _ = handle.broadcast_tx.next_seq();
+        let mut event_rx = handle.broadcast_tx.subscribe();
         let _ = handle.broadcast_tx.next_seq();
         let _ = handle.broadcast_tx.next_seq();
 
@@ -1989,6 +2043,33 @@ mod tests {
             &wake.content,
             crate::db::MessageContent::User(user) if user.is_meta && user.text.contains("done")
         ));
+        let terminal = loop {
+            match event_rx.try_recv() {
+                Ok(crate::runtime::SseEvent::WakeContractTerminal {
+                    workflow_id,
+                    contract_id,
+                    receipt_id,
+                    delivery_id,
+                    terminal_kind,
+                    ..
+                }) => {
+                    break (
+                        workflow_id,
+                        contract_id,
+                        receipt_id,
+                        delivery_id,
+                        terminal_kind,
+                    )
+                }
+                Ok(_) => {}
+                Err(error) => panic!("terminal event missing: {error}"),
+            }
+        };
+        assert_eq!(terminal.0, workflow_id);
+        assert_eq!(terminal.1, "contract-b-1");
+        assert!(terminal.2 > 0);
+        assert!(terminal.3 > 0);
+        assert_eq!(terminal.4, crate::runtime::WakeContractTerminalKind::Fired);
     }
 
     #[tokio::test]
@@ -2055,8 +2136,8 @@ mod tests {
     #[tokio::test]
     async fn mixed_materialized_batch_uses_batch_auto_resume_decision() {
         let (db, repo) = open_repo().await;
-        let cancelled_id = register_bash(&repo, "b-cancelled", 50).await;
         let fired_id = register_bash(&repo, "b-fired", 50).await;
+        let cancelled_id = register_bash(&repo, "b-cancelled", 50).await;
         let (kick_tx, _) = watch::channel(0u64);
         ProductionWakeRegistrar::new(repo.clone(), kick_tx)
             .cancel(CancelWakeInput {
@@ -2101,6 +2182,12 @@ mod tests {
 
         let pending = repo.list_pending("conv").await.unwrap();
         assert_eq!(pending.len(), 2);
+        assert!(matches!(
+            pending[0].receipt.terminal,
+            phoenix_workflow::wake_profile::WakeTerminalPayload::Fired { .. }
+        ));
+        let mut pending = pending;
+        sort_pending_for_materialization(&mut pending);
         for (index, delivery) in pending.iter().enumerate() {
             let auto_resume = !matches!(
                 delivery.receipt.terminal,

@@ -4,6 +4,7 @@ import { api, isTerminalConversationState, type Conversation } from '../api';
 import {
   SseAgentDoneDataSchema,
   SseWakeContractRegisteredDataSchema,
+  SseWakeContractTerminalDataSchema,
   SseErrorDataSchema,
   SseInitDataSchema,
   SseLlmAttemptDataSchema,
@@ -295,6 +296,16 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
       source.addEventListener('wake_contract_registered', (event) => {
         const raw: unknown = JSON.parse(event.data);
         const res = v.safeParse(SseWakeContractRegisteredDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: { type: 'sse_sequence_consumed', sequenceId: res.output.sequence_id },
+        });
+      });
+
+      source.addEventListener('wake_contract_terminal', (event) => {
+        const raw: unknown = JSON.parse(event.data);
+        const res = v.safeParse(SseWakeContractTerminalDataSchema, raw);
         if (!res.success) return;
         dispatch({
           type: 'atom',

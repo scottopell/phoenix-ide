@@ -57,7 +57,7 @@ use crate::chain_runtime::ChainSseEvent;
 use crate::db::{ErrorKind, Message, MessageType, UsageData};
 use crate::runtime::{
     user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation,
-    MessageSnapshotMode, SseEvent,
+    MessageSnapshotMode, SseEvent, WakeContractTerminalKind,
 };
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -347,6 +347,15 @@ pub enum SseWireEvent {
         handle_id: String,
         expires_at: u64,
     },
+    /// Durable wake reached a terminal state and was materialized.
+    WakeContractTerminal {
+        sequence_id: i64,
+        workflow_id: u64,
+        contract_id: String,
+        receipt_id: u64,
+        delivery_id: u64,
+        terminal_kind: WakeContractTerminalKind,
+    },
     /// Conversation hit a terminal state — the terminal subsystem uses this
     /// to tear down PTYs.
     ConversationBecameTerminal { sequence_id: i64 },
@@ -427,6 +436,7 @@ impl SseWireEvent {
             SseWireEvent::Token { .. } => "token",
             SseWireEvent::AgentDone { .. } => "agent_done",
             SseWireEvent::WakeContractRegistered { .. } => "wake_contract_registered",
+            SseWireEvent::WakeContractTerminal { .. } => "wake_contract_terminal",
             SseWireEvent::ConversationBecameTerminal { .. } => "conversation_became_terminal",
             SseWireEvent::ConversationUpdate { .. } => "conversation_update",
             SseWireEvent::Error { .. } => "error",
@@ -563,6 +573,22 @@ impl From<SseEvent> for SseWireEvent {
                 handle_id,
                 expires_at,
             },
+            SseEvent::WakeContractTerminal {
+                sequence_id,
+                workflow_id,
+                contract_id,
+                receipt_id,
+                delivery_id,
+                terminal_kind,
+            } => SseWireEvent::WakeContractTerminal {
+                sequence_id,
+                workflow_id,
+                contract_id,
+                receipt_id,
+                delivery_id,
+                terminal_kind,
+            },
+
             SseEvent::ConversationBecameTerminal { sequence_id } => {
                 SseWireEvent::ConversationBecameTerminal { sequence_id }
             }

@@ -17,6 +17,7 @@ import {
   SseConversationUpdateDataSchema,
   SseAgentDoneDataSchema,
   SseWakeContractRegisteredDataSchema,
+  SseWakeContractTerminalDataSchema,
   SseConversationBecameTerminalDataSchema,
   SseErrorDataSchema,
   SseConversationHardDeletedDataSchema,
@@ -422,6 +423,21 @@ export function useConnection({
               SseWakeContractRegisteredDataSchema,
               e,
               'wake_contract_registered',
+              stampedDispatch,
+            );
+            if (res.ok) {
+              stampedDispatch({
+                type: 'sse_sequence_consumed',
+                sequenceId: res.data.sequence_id,
+              });
+            }
+          });
+
+          on('wake_contract_terminal', (e) => {
+            const res = parseEvent(
+              SseWakeContractTerminalDataSchema,
+              e,
+              'wake_contract_terminal',
               stampedDispatch,
             );
             if (res.ok) {
