@@ -108,8 +108,8 @@ pub trait MessageStore: Send + Sync {
         _conversation_id: &str,
         _owner_message_id: &str,
         _drained_message_ids: &[String],
-    ) -> Result<(), String> {
-        Ok(())
+    ) -> Result<phoenix_db::QueuedSteeringBatchOwnership, String> {
+        Ok(phoenix_db::QueuedSteeringBatchOwnership::LegacyUnowned)
     }
 
     fn requires_durable_top_level_llm(&self) -> bool {
@@ -465,6 +465,17 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
                 client_message_id,
                 process_incarnation,
             )
+            .await
+    }
+
+    async fn consume_queued_steering_batch(
+        &self,
+        conversation_id: &str,
+        owner_message_id: &str,
+        drained_message_ids: &[String],
+    ) -> Result<phoenix_db::QueuedSteeringBatchOwnership, String> {
+        (**self)
+            .consume_queued_steering_batch(conversation_id, owner_message_id, drained_message_ids)
             .await
     }
 
@@ -830,7 +841,7 @@ impl MessageStore for DatabaseStorage {
         conversation_id: &str,
         owner_message_id: &str,
         drained_message_ids: &[String],
-    ) -> Result<(), String> {
+    ) -> Result<phoenix_db::QueuedSteeringBatchOwnership, String> {
         phoenix_db::WorkflowRepository::new(self.db.pool().clone())
             .consume_queued_steering_batch(conversation_id, owner_message_id, drained_message_ids)
             .await

@@ -331,6 +331,12 @@ pub struct StopTopLevelLlmInput {
     pub suppression_reason: SuppressionReason,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedSteeringBatchOwnership {
+    DurableDirectTurn,
+    LegacyUnowned,
+}
+
 impl WorkflowRepository {
     pub async fn cancel_queued_steering(
         &self,
@@ -596,7 +602,7 @@ impl WorkflowRepository {
         conversation_id: &str,
         owner_message_id: &str,
         drained_message_ids: &[String],
-    ) -> DbResult<()> {
+    ) -> DbResult<QueuedSteeringBatchOwnership> {
         let mut tx = self.begin_tx().await?;
         let updated = sqlx::query(
             "UPDATE direct_turn_acceptances
@@ -617,7 +623,7 @@ impl WorkflowRepository {
         .bind(owner_message_id)
         .execute(&mut *tx.tx)
         .await?;
-        if updated.rows_affected() == 0 {
+        let ownership = if updated.rows_affected() == 0 {
             let replay = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM direct_turn_acceptances a
                  JOIN top_level_llm_workflows w ON w.workflow_id = a.workflow_id
@@ -634,24 +640,28 @@ impl WorkflowRepository {
             .fetch_one(&mut *tx.tx)
             .await?
                 == 1;
-            if !replay {
-                let legacy_without_acceptance = sqlx::query_scalar::<_, i64>(
+            if replay {
+                QueuedSteeringBatchOwnership::DurableDirectTurn
+            } else {
+                let acceptance_count = sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM direct_turn_acceptances
                      WHERE conversation_id = ?1 AND client_message_id = ?2",
                 )
                 .bind(conversation_id)
                 .bind(owner_message_id)
                 .fetch_one(&mut *tx.tx)
-                .await?
-                    == 0;
-                if !legacy_without_acceptance {
+                .await?;
+                if acceptance_count != 0 {
                     tx.rollback().await?;
                     return Err(DbError::Serialization(format!(
                         "queued steering turn {owner_message_id} cannot own the drained batch"
                     )));
                 }
+                QueuedSteeringBatchOwnership::LegacyUnowned
             }
-        }
+        } else {
+            QueuedSteeringBatchOwnership::DurableDirectTurn
+        };
         for message_id in drained_message_ids {
             if message_id != owner_message_id {
                 sqlx::query(
@@ -679,7 +689,7 @@ impl WorkflowRepository {
             .await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(ownership)
     }
 
     pub async fn load_pending_direct_turn_runtime_admission(
@@ -2835,6 +2845,19 @@ mod tests {
                 .unwrap()
                 .workflow_id,
             record.workflow_id
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_queued_steering_batch_reports_unowned_dispatch() {
+        let repo = open_repo().await;
+        let drained = vec!["legacy-msg".to_string()];
+
+        assert_eq!(
+            repo.consume_queued_steering_batch("conv-1", "legacy-msg", &drained)
+                .await
+                .unwrap(),
+            QueuedSteeringBatchOwnership::LegacyUnowned
         );
     }
 

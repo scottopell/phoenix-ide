@@ -8,6 +8,8 @@ use phoenix_core::domain::skill_invocation::SkillInvocation;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+const MAX_STEER_QUEUE_DEPTH: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageExpansionPolicy {
     ExpandReferences,
@@ -196,7 +198,6 @@ impl SendChatApplicationService {
                 err,
                 TransitionError::AgentBusy | TransitionError::CancellationInProgress
             ) {
-                const MAX_STEER_QUEUE_DEPTH: usize = 5;
                 if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
                     return Ok(SendChatOutcome::Rejected {
                         message:
@@ -376,6 +377,14 @@ impl SendChatApplicationService {
                 ));
             }
             phoenix_db::DirectTurnAcceptanceOutcome::Conflict => {
+                if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
+                    return Ok(SendChatOutcome::Rejected {
+                        message:
+                            "Steering queue is full; try again once a queued message has been delivered."
+                                .to_string(),
+                        code: "steering_queue_full",
+                    });
+                }
                 let queued = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
                     .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
                         initial_outcome: phoenix_db::DirectTurnInitialOutcome::QueuedSteering {
@@ -1102,6 +1111,82 @@ mod tests {
                 .unwrap()
                 .map(|entry| entry.text),
             Some("first target".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn live_slot_conflict_does_not_overfill_steering_queue() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        state
+            .db
+            .create_conversation("conv-full", "full", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let repo = phoenix_db::WorkflowRepository::new(state.db.pool().clone());
+        repo.accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+            initial_outcome: phoenix_db::DirectTurnInitialOutcome::RuntimeAccepted,
+            conversation_id: "conv-full".to_string(),
+            client_message_id: "active-turn".to_string(),
+            prepared_fingerprint: "active".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: phoenix_workflow::Timestamp(1),
+            snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                    conversation_id: "conv-full".to_string(),
+                    accepted_turn_id: "active-turn".to_string(),
+                    generation: 0,
+                },
+                accepted_assistant_message_id: None,
+                stopped_at: None,
+            },
+        })
+        .await
+        .unwrap();
+        let queue = (0..super::MAX_STEER_QUEUE_DEPTH)
+            .map(|index| phoenix_core::domain::sm_event::SteerEntry {
+                text: format!("queued {index}"),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: format!("queued-{index}"),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .collect::<Vec<_>>();
+        state
+            .db
+            .update_steering_queue("conv-full", &queue)
+            .await
+            .unwrap();
+
+        let outcome = SendChatApplicationService::new(state.db.clone(), state.runtime.clone())
+            .send(SendChatRequest {
+                conversation_id: "conv-full".to_string(),
+                text: "overflow".to_string(),
+                message_id: "overflow".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            super::SendChatOutcome::Rejected {
+                code: "steering_queue_full",
+                ..
+            }
+        ));
+        assert_eq!(
+            state
+                .db
+                .get_steering_queue("conv-full")
+                .await
+                .unwrap()
+                .len(),
+            super::MAX_STEER_QUEUE_DEPTH
         );
     }
 

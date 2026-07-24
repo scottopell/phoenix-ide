@@ -1673,6 +1673,7 @@ where
     )>,
     recovered_failure_authority:
         Option<phoenix_core::domain::llm_types::DurableLlmFailureAuthority>,
+    active_llm_dispatch_ownership: LlmDispatchOwnership,
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
@@ -1944,6 +1945,7 @@ where
             state_updated_at: Utc::now(),
             startup_creation_completion: None,
             recovered_failure_authority: None,
+            active_llm_dispatch_ownership: LlmDispatchOwnership::DurableDirectTurn,
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
@@ -2629,6 +2631,7 @@ where
     }
 
     async fn process_adopted_wake_batch(&mut self) -> Result<(), String> {
+        self.active_llm_dispatch_ownership = LlmDispatchOwnership::AdoptedWakeBatch;
         self.parent_tool_cycle_count = 0;
         if !matches!(self.state, ConvState::Idle) {
             tracing::debug!(
@@ -3407,6 +3410,9 @@ where
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        if matches!(self.state, ConvState::Idle) {
+            self.active_llm_dispatch_ownership = LlmDispatchOwnership::DurableDirectTurn;
+        }
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
         // an empty steering drain re-enters the same state) and reach here
@@ -3644,13 +3650,22 @@ where
         }
         for effect in drain_result.effects {
             if matches!(effect, Effect::ClearSteeringQueueEntries { .. }) {
-                self.storage
+                self.active_llm_dispatch_ownership = match self
+                    .storage
                     .consume_queued_steering_batch(
                         &self.context.conversation_id,
                         &owner_message_id,
                         &drained_message_ids,
                     )
-                    .await?;
+                    .await?
+                {
+                    phoenix_db::QueuedSteeringBatchOwnership::DurableDirectTurn => {
+                        LlmDispatchOwnership::DurableDirectTurn
+                    }
+                    phoenix_db::QueuedSteeringBatchOwnership::LegacyUnowned => {
+                        LlmDispatchOwnership::AdoptedWakeBatch
+                    }
+                };
                 continue;
             }
             if let Some(gen_event) = self.execute_effect(effect).await? {
@@ -4642,7 +4657,7 @@ where
                 Ok(None)
             }
             Effect::RequestLlm => {
-                self.dispatch_llm_request(LlmDispatchOwnership::DurableDirectTurn)
+                self.dispatch_llm_request(self.active_llm_dispatch_ownership)
                     .await
             }
 
@@ -5116,6 +5131,7 @@ where
         &mut self,
         ownership: LlmDispatchOwnership,
     ) -> Result<Option<Event>, String> {
+        self.active_llm_dispatch_ownership = ownership;
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
         // have their own lifetime cap below (REQ-PROJ-008); this branch
         // only fires for parent conversations. The counter is reset at
@@ -9226,6 +9242,54 @@ mod steering_replay_sequence_tests {
 
         assert!(persisted.is_none());
         assert_eq!(runtime.broadcast_tx.current_seq(), 7);
+    }
+
+    #[tokio::test]
+    async fn adopted_wake_ownership_survives_non_idle_tool_round() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut runtime = test_runtime(
+            storage,
+            SseBroadcaster::new(16, 0),
+            temp_dir.path().to_path_buf(),
+        );
+        runtime.active_llm_dispatch_ownership = LlmDispatchOwnership::AdoptedWakeBatch;
+
+        runtime
+            .apply_transition_result(crate::state_machine::transition::TransitionResult::new(
+                ConvState::LlmRequesting { attempt: 0 },
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            runtime.active_llm_dispatch_ownership,
+            LlmDispatchOwnership::AdoptedWakeBatch
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_completion_resets_adopted_wake_ownership() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut runtime = test_runtime(
+            storage,
+            SseBroadcaster::new(16, 0),
+            temp_dir.path().to_path_buf(),
+        );
+        runtime.active_llm_dispatch_ownership = LlmDispatchOwnership::AdoptedWakeBatch;
+
+        runtime
+            .apply_transition_result(crate::state_machine::transition::TransitionResult::new(
+                ConvState::Idle,
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            runtime.active_llm_dispatch_ownership,
+            LlmDispatchOwnership::DurableDirectTurn
+        ));
     }
 
     #[tokio::test]
