@@ -556,9 +556,24 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
         let durable_request: phoenix_llm::DurableLlmRequest =
             serde_json::from_str(&recovery.prepared_request.request_aggregate)
                 .map_err(|error| error.to_string())?;
-        let llm = manager
+        let routing_identity = manager
             .model_registry()
-            .get(&recovery.prepared_request.model);
+            .model_routing_identity(&recovery.prepared_request.model);
+        let expected_identity = (
+            recovery.prepared_request.provider.as_str(),
+            recovery.prepared_request.backend.as_str(),
+        );
+        let routing_matches = routing_identity
+            .as_ref()
+            .map(|(provider, backend)| (provider.as_str(), backend.as_str()))
+            == Some(expected_identity);
+        let llm = routing_matches
+            .then(|| {
+                manager
+                    .model_registry()
+                    .get(&recovery.prepared_request.model)
+            })
+            .flatten();
         let begun = repo
             .begin_recovered_top_level_llm_attempt(
                 recovery.workflow.workflow_id,
@@ -573,10 +588,19 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
         };
         let Some(llm) = llm else {
             let attempt = u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX);
-            let message = format!(
-                "Recovered LLM model '{}' is unavailable",
-                recovery.prepared_request.model
-            );
+            let message = if routing_matches {
+                format!(
+                    "Recovered LLM model '{}' is unavailable",
+                    recovery.prepared_request.model
+                )
+            } else {
+                format!(
+                    "Recovered LLM routing changed for model '{}': stored {}/{}",
+                    recovery.prepared_request.model,
+                    recovery.prepared_request.provider,
+                    recovery.prepared_request.backend
+                )
+            };
             let failure = durable_failure(
                 message.clone(),
                 phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,

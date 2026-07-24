@@ -134,28 +134,30 @@ impl SendChatApplicationService {
                 .await;
         }
         if let Ok(message) = self.db.get_message_by_id(&req.message_id).await {
-            let persisted_matches = match &message.content {
-                phoenix_core::domain::db_schema::MessageContent::Skill(skill) => {
-                    persisted_skill_matches(skill, &req)
+            if message.conversation_id == conversation.id {
+                let persisted_matches = match &message.content {
+                    phoenix_core::domain::db_schema::MessageContent::Skill(skill) => {
+                        persisted_skill_matches(skill, &req)
+                    }
+                    content @ phoenix_core::domain::db_schema::MessageContent::User(_) => {
+                        persisted_user_message_matches(content, &req)
+                    }
+                    phoenix_core::domain::db_schema::MessageContent::Agent(_)
+                    | phoenix_core::domain::db_schema::MessageContent::Tool(_)
+                    | phoenix_core::domain::db_schema::MessageContent::System(_)
+                    | phoenix_core::domain::db_schema::MessageContent::Error(_)
+                    | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
+                };
+                if !persisted_matches {
+                    return Err(SendChatServiceError::IdempotencyConflict);
                 }
-                content @ phoenix_core::domain::db_schema::MessageContent::User(_) => {
-                    persisted_user_message_matches(content, &req)
-                }
-                phoenix_core::domain::db_schema::MessageContent::Agent(_)
-                | phoenix_core::domain::db_schema::MessageContent::Tool(_)
-                | phoenix_core::domain::db_schema::MessageContent::System(_)
-                | phoenix_core::domain::db_schema::MessageContent::Error(_)
-                | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
-            };
-            if message.conversation_id != req.conversation_id || !persisted_matches {
-                return Err(SendChatServiceError::IdempotencyConflict);
+                receipts.remove(&(conversation.id.clone(), req.message_id.clone()));
+                return Ok(SendChatOutcome::accepted(
+                    req.message_id,
+                    SendChatRequestResult::Replayed,
+                    SendChatDisposition::RuntimeAccepted,
+                ));
             }
-            receipts.remove(&(conversation.id.clone(), req.message_id.clone()));
-            return Ok(SendChatOutcome::accepted(
-                req.message_id,
-                SendChatRequestResult::Replayed,
-                SendChatDisposition::RuntimeAccepted,
-            ));
         }
         if let Some(receipt) = receipts.get(&(conversation.id.clone(), req.message_id.clone())) {
             return replay_receipt(receipt, &req, &request_fingerprint);
@@ -1015,6 +1017,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn persisted_message_replay_is_scoped_to_the_target_conversation() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        for conversation_id in ["conv-owner", "conv-target"] {
+            state
+                .db
+                .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        state
+            .db
+            .add_message(
+                "shared-client-id",
+                "conv-owner",
+                &phoenix_core::domain::db_schema::MessageContent::user("owner payload"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let service = SendChatApplicationService::new(state.db.clone(), state.runtime.clone());
+
+        let outcome = service
+            .send(SendChatRequest {
+                conversation_id: "conv-target".to_string(),
+                text: "target payload".to_string(),
+                message_id: "shared-client-id".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                expansion_policy: MessageExpansionPolicy::LiteralText,
+            })
+            .await
+            .expect("the same client id is independent in another conversation");
+
+        assert!(matches!(
+            outcome,
+            super::SendChatOutcome::Accepted {
+                request_result: super::SendChatRequestResult::Created,
+                ..
+            }
+        ));
+        assert!(phoenix_db::WorkflowRepository::new(state.db.pool().clone())
+            .load_direct_turn_acceptance("conv-target", "shared-client-id")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

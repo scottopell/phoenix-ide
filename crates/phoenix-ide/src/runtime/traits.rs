@@ -208,10 +208,12 @@ pub trait MessageStore: Send + Sync {
     #[allow(dead_code)]
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String>;
 
-    /// Returns true if a message with the given `message_id` already exists.
-    /// Used by `PersistMessage` to make persistence idempotent across crash
-    /// recovery (re-drain after partial steering-queue drain).
-    async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
+    /// Returns true if the message identity exists in the target conversation.
+    async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String>;
 
     /// Complete an async creation job using the authority that enqueued the initial turn.
     async fn complete_creation_job(
@@ -444,6 +446,17 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
             .await
     }
 
+    async fn persist_queued_steering_message(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        message: &Message,
+    ) -> Result<phoenix_db::PersistQueuedSteeringMessageOutcome, String> {
+        (**self)
+            .persist_queued_steering_message(conversation_id, client_message_id, message)
+            .await
+    }
+
     async fn add_message(
         &self,
         message_id: &str,
@@ -510,8 +523,14 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).get_message_by_id(message_id).await
     }
 
-    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
-        (**self).message_exists(message_id).await
+    async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String> {
+        (**self)
+            .message_exists_in_conversation(conversation_id, message_id)
+            .await
     }
 
     async fn stop_active_top_level_llm_for_conversation(
@@ -1080,9 +1099,13 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
+    async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String> {
         self.db
-            .message_exists(message_id)
+            .message_exists_in_conversation(conversation_id, message_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -1307,20 +1330,15 @@ impl LlmClient for RegistryLlmClient {
     }
 
     fn durable_provider(&self) -> String {
-        self.registry.provider_display_name(&self.model_id)
+        self.registry
+            .model_routing_identity(&self.model_id)
+            .map_or_else(|| "Unknown".to_string(), |(provider, _)| provider)
     }
 
     fn durable_backend(&self) -> String {
-        self.registry.get(&self.model_id).map_or_else(
-            || "unavailable".to_string(),
-            |service| {
-                if service.uses_codex_bridge() {
-                    "codex_bridge".to_string()
-                } else {
-                    "direct".to_string()
-                }
-            },
-        )
+        self.registry
+            .model_routing_identity(&self.model_id)
+            .map_or_else(|| "unavailable".to_string(), |(_, backend)| backend)
     }
 
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {

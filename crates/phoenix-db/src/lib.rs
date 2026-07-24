@@ -4592,7 +4592,7 @@ impl Database {
                     call_ordinal: u64::try_from(receipt.get::<i64, _>("call_ordinal"))
                         .map_err(|_| DbError::Serialization("negative call_ordinal".to_string()))?,
                 },
-                assistant_message_id,
+                assistant_message_id: assistant_message_id.clone(),
             },
         )
         .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -4774,6 +4774,18 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+        let mut snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot =
+            serde_json::from_slice(workflow.get("snapshot_payload"))
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+        snapshot.accepted_assistant_message_id = assistant_message_id;
+        sqlx::query("UPDATE workflows SET snapshot_payload = ?2 WHERE workflow_id = ?1")
+            .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+            .bind(
+                serde_json::to_vec(&snapshot)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+            )
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(AcceptTopLevelLlmProductOutcome::Committed)
     }
@@ -7615,6 +7627,26 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         let count: i64 = row.get(0);
+        Ok(count > 0)
+    }
+
+    /// Check whether a message identity exists in one conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the query fails.
+    pub async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> DbResult<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count > 0)
     }
 
@@ -12545,6 +12577,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(accepted_head.as_deref(), Some("assistant-1"));
+        let snapshot_payload: Vec<u8> =
+            sqlx::query_scalar("SELECT snapshot_payload FROM workflows WHERE workflow_id = ?1")
+                .bind(i64::try_from(WorkflowId(1).0).unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot =
+            serde_json::from_slice(&snapshot_payload).unwrap();
+        assert_eq!(
+            snapshot.accepted_assistant_message_id.as_deref(),
+            Some("assistant-1")
+        );
         assert!(matches!(
             transition_event,
             phoenix_workflow::llm_profile::TopLevelLlmEvent::ResponseAccepted { .. }

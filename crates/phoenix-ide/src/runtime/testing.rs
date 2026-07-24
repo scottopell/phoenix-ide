@@ -494,6 +494,7 @@ pub struct InMemoryStorage {
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
     stopped_top_level_llm: Mutex<Vec<String>>,
+    queued_steering_outcome: Mutex<Option<phoenix_db::PersistQueuedSteeringMessageOutcome>>,
 }
 
 #[allow(dead_code)]
@@ -511,6 +512,7 @@ impl InMemoryStorage {
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
             stopped_top_level_llm: Mutex::new(Vec::new()),
+            queued_steering_outcome: Mutex::new(None),
         }
     }
 
@@ -534,6 +536,13 @@ impl InMemoryStorage {
 
     pub fn stopped_top_level_llm(&self) -> Vec<String> {
         self.stopped_top_level_llm.lock().unwrap().clone()
+    }
+
+    pub fn set_queued_steering_outcome(
+        &self,
+        outcome: phoenix_db::PersistQueuedSteeringMessageOutcome,
+    ) {
+        *self.queued_steering_outcome.lock().unwrap() = Some(outcome);
     }
 
     /// Read back the persisted fork proposals (test-only).
@@ -610,6 +619,20 @@ impl MessageStore for InMemoryStorage {
             .unwrap()
             .push(conversation_id.to_string());
         Ok(Some(phoenix_workflow::CommitOutcome::Committed))
+    }
+
+    async fn persist_queued_steering_message(
+        &self,
+        _conversation_id: &str,
+        _client_message_id: &str,
+        _message: &Message,
+    ) -> Result<phoenix_db::PersistQueuedSteeringMessageOutcome, String> {
+        Ok(self
+            .queued_steering_outcome
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(phoenix_db::PersistQueuedSteeringMessageOutcome::LegacyQueueEntry))
     }
 
     async fn add_message(
@@ -735,11 +758,21 @@ impl MessageStore for InMemoryStorage {
         Ok(self.get_all_messages(conv_id))
     }
 
-    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
-        let messages = self.messages.lock().unwrap();
-        Ok(messages
-            .values()
-            .any(|msgs| msgs.iter().any(|m| m.message_id == message_id)))
+    async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message.message_id == message_id)
+            }))
     }
 
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {

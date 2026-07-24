@@ -4523,9 +4523,19 @@ where
             phoenix_db::PersistQueuedSteeringMessageOutcome::Committed(message) => {
                 Ok(Some(*message))
             }
-            phoenix_db::PersistQueuedSteeringMessageOutcome::ExactReplay => Ok(None),
+            phoenix_db::PersistQueuedSteeringMessageOutcome::ExactReplay => {
+                self.broadcast_tx
+                    .rewind_unused_reserved_range(sequence_id, 1);
+                Ok(None)
+            }
             phoenix_db::PersistQueuedSteeringMessageOutcome::LegacyQueueEntry => {
-                if self.storage.message_exists(&message_id).await? {
+                if self
+                    .storage
+                    .message_exists_in_conversation(&self.context.conversation_id, &message_id)
+                    .await?
+                {
+                    self.broadcast_tx
+                        .rewind_unused_reserved_range(sequence_id, 1);
                     Ok(None)
                 } else {
                     self.storage
@@ -4541,9 +4551,13 @@ where
                         .map(Some)
                 }
             }
-            phoenix_db::PersistQueuedSteeringMessageOutcome::Conflict => Err(format!(
-                "queued steering materialization lost authority for {message_id}"
-            )),
+            phoenix_db::PersistQueuedSteeringMessageOutcome::Conflict => {
+                self.broadcast_tx
+                    .rewind_unused_reserved_range(sequence_id, 1);
+                Err(format!(
+                    "queued steering materialization lost authority for {message_id}"
+                ))
+            }
         }
     }
 
@@ -9135,6 +9149,57 @@ mod test_git_helpers {
                 .stdout,
         )
         .to_string()
+    }
+}
+
+#[cfg(test)]
+mod steering_replay_sequence_tests {
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::ConvContext;
+    use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn exact_steering_replay_rewinds_unused_sse_sequence() {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_queued_steering_outcome(
+            phoenix_db::PersistQueuedSteeringMessageOutcome::ExactReplay,
+        );
+        let broadcaster = SseBroadcaster::new(16, 7);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let event_tx_dup = mpsc::channel(1).0;
+        let runtime = ConversationRuntime::new(
+            ConvContext::new("conv", std::env::temp_dir(), "test-model", 200_000),
+            ConvState::Idle,
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcaster,
+        );
+
+        let persisted = runtime
+            .persist_message_effect(
+                MessageContent::user("replayed"),
+                None,
+                None,
+                "steer-id".to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(persisted.is_none());
+        assert_eq!(runtime.broadcast_tx.current_seq(), 7);
     }
 }
 
