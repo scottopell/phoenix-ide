@@ -443,13 +443,24 @@ impl ToolInput {
         }
     }
 
-    /// Parse from tool name and JSON value.
+    /// Parse a tool call emitted by a model, rejecting runtime-only authority edges.
+    #[must_use]
+    pub fn from_model_name_and_value(name: &str, value: Value) -> Self {
+        if name == "approved_commission_review" {
+            return Self::Malformed {
+                name: name.to_string(),
+                input: value,
+                error:
+                    "approved_commission_review is runtime-only and cannot be emitted by the model"
+                        .to_string(),
+            };
+        }
+        Self::from_name_and_value(name, value)
+    }
+
+    /// Parse a trusted tool name and JSON value.
     ///
-    /// Returns `ToolInput::Malformed` (carrying the serde error) when the
-    /// tool name matches a registered tool but the payload fails to parse,
-    /// and `ToolInput::Unknown` only when the tool name itself is not
-    /// registered. The two cases are structurally distinct so callers can
-    /// surface a malformed-known input separately from an unsupported tool.
+    /// Registered tools with invalid payloads become `Malformed`; unknown names become `Unknown`.
     #[must_use]
     pub fn from_name_and_value(name: &str, value: Value) -> Self {
         fn parse<T>(name: &str, value: Value) -> ToolInput
@@ -518,6 +529,17 @@ mod tests {
         assert_eq!(name, "bash");
         assert_eq!(input["op"], "run");
         assert_eq!(input["command"], "bad");
+    }
+
+    #[test]
+    fn model_cannot_emit_runtime_only_commission_approval() {
+        assert!(matches!(
+            ToolInput::from_model_name_and_value(
+                "approved_commission_review",
+                serde_json::json!({"review_id": "review-1"}),
+            ),
+            ToolInput::Malformed { .. }
+        ));
     }
 
     /// A known tool name with a payload that fails to deserialize must produce

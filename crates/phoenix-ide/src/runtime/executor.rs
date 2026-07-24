@@ -2691,18 +2691,10 @@ where
                 .filter(|(id, _, _)| owed_tool_use_ids.contains(*id))
                 .map(|(id, name, input)| crate::state_machine::state::ToolCall {
                     id: id.to_string(),
-                    input: if name == "approved_commission_review" {
-                        crate::state_machine::state::ToolInput::Malformed {
-                            name: name.to_string(),
-                            input: input.clone(),
-                            error: "approved_commission_review is runtime-only and cannot be emitted by the model".to_string(),
-                        }
-                    } else {
-                        crate::state_machine::state::ToolInput::from_name_and_value(
-                            name,
-                            input.clone(),
-                        )
-                    },
+                    input: crate::state_machine::state::ToolInput::from_model_name_and_value(
+                        name,
+                        input.clone(),
+                    ),
                 })
                 .collect(),
             content: durable.response.content,
@@ -5453,15 +5445,8 @@ where
                         .tool_uses()
                         .into_iter()
                         .map(|(id, name, input)| {
-                            let typed_input = if name == "approved_commission_review" {
-                                ToolInput::Malformed {
-                                    name: name.to_string(),
-                                    input: input.clone(),
-                                    error: "approved_commission_review is runtime-only and cannot be emitted by the model".to_string(),
-                                }
-                            } else {
-                                ToolInput::from_name_and_value(name, input.clone())
-                            };
+                            let typed_input =
+                                ToolInput::from_model_name_and_value(name, input.clone());
                             ToolCall::new(id.to_string(), typed_input)
                         })
                         .collect();

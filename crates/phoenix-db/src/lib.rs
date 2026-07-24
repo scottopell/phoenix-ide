@@ -4447,12 +4447,20 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?
                 == 1;
+            if replay {
+                sqlx::query(
+                    "DELETE FROM continuation_dispatch_intents
+                     WHERE successor_conversation_id = ?1 AND message_id = ?2",
+                )
+                .bind(conversation_id)
+                .bind(client_message_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Ok(PersistQueuedSteeringMessageOutcome::ExactReplay);
+            }
             tx.rollback().await?;
-            return Ok(if replay {
-                PersistQueuedSteeringMessageOutcome::ExactReplay
-            } else {
-                PersistQueuedSteeringMessageOutcome::Conflict
-            });
+            return Ok(PersistQueuedSteeringMessageOutcome::Conflict);
         }
         if committed_outcome != "QueuedSteering" {
             tx.rollback().await?;
@@ -4487,6 +4495,14 @@ impl Database {
             tx.rollback().await?;
             return Ok(PersistQueuedSteeringMessageOutcome::Conflict);
         }
+        sqlx::query(
+            "DELETE FROM continuation_dispatch_intents
+             WHERE successor_conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(client_message_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(PersistQueuedSteeringMessageOutcome::Committed(Box::new(
             persisted_message,
@@ -12200,6 +12216,7 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn queued_steering_materialization_rewrites_cross_target_message_id_collision() {
         let db = Database::open_in_memory().await.unwrap();
@@ -12257,6 +12274,15 @@ mod tests {
                 panic!("unexpected acceptance: {other:?}")
             }
         };
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, created_at
+             ) VALUES ('conv-owner', 'conv-steering', 'shared-client-id', 'handoff', 'now')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
         let proposed = Message {
             message_id: "shared-client-id".to_string(),
             conversation_id: "conv-steering".to_string(),
@@ -12289,12 +12315,39 @@ mod tests {
                 .unwrap(),
             Some(materialized_id)
         );
+        let remaining_intents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM continuation_dispatch_intents
+             WHERE successor_conversation_id = 'conv-steering'
+               AND message_id = 'shared-client-id'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining_intents, 0);
+        sqlx::query(
+            "INSERT INTO continuation_dispatch_intents (
+                 parent_conversation_id, successor_conversation_id, message_id,
+                 handoff, created_at
+             ) VALUES ('conv-owner', 'conv-steering', 'shared-client-id', 'handoff', 'later')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
         assert!(matches!(
             db.persist_queued_steering_message("conv-steering", "shared-client-id", &proposed)
                 .await
                 .unwrap(),
             PersistQueuedSteeringMessageOutcome::ExactReplay
         ));
+        let remaining_after_replay: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM continuation_dispatch_intents
+             WHERE successor_conversation_id = 'conv-steering'
+               AND message_id = 'shared-client-id'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining_after_replay, 0);
     }
 
     #[allow(clippy::too_many_lines)]

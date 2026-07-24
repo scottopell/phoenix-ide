@@ -463,7 +463,7 @@ async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> R
                 .map(
                     |(id, name, input)| phoenix_core::domain::sm_state::ToolCall {
                         id: id.to_string(),
-                        input: phoenix_core::domain::sm_state::ToolInput::from_name_and_value(
+                        input: phoenix_core::domain::sm_state::ToolInput::from_model_name_and_value(
                             name,
                             input.clone(),
                         ),
@@ -495,6 +495,23 @@ async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> R
 #[allow(clippy::too_many_lines)]
 async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     use sha2::Digest as _;
+
+    fn durable_failure(
+        message: String,
+        error_kind: phoenix_core::domain::db_schema::ErrorKind,
+        attempt: u32,
+        recovery_in_progress: bool,
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> phoenix_core::domain::llm_types::DurableLlmFailureEvent {
+        phoenix_core::domain::llm_types::DurableLlmFailureEvent {
+            codec_version: 1,
+            message,
+            error_kind,
+            attempt,
+            recovery_in_progress,
+            resets_at,
+        }
+    }
 
     let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
     for recovery in repo
@@ -560,12 +577,19 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                 "Recovered LLM model '{}' is unavailable",
                 recovery.prepared_request.model
             );
+            let failure = durable_failure(
+                message.clone(),
+                phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                attempt,
+                false,
+                None,
+            );
             repo.record_top_level_llm_failure(&phoenix_db::RecordTopLevelLlmFailureInput {
                 authority,
                 observed_at: Timestamp(
                     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
                 ),
-                outcome_payload: message.as_bytes().to_vec(),
+                outcome_payload: serde_json::to_vec(&failure).map_err(|error| error.to_string())?,
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -679,12 +703,20 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                 let resets_at = error.quota.as_ref().and_then(|quota| quota.resets_at);
                 let message = error.message;
                 let attempt = u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX);
+                let failure = durable_failure(
+                    message.clone(),
+                    error_kind.clone(),
+                    attempt,
+                    recovery_in_progress,
+                    resets_at,
+                );
                 repo.record_top_level_llm_failure(&phoenix_db::RecordTopLevelLlmFailureInput {
                     authority,
                     observed_at: Timestamp(
                         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
                     ),
-                    outcome_payload: message.as_bytes().to_vec(),
+                    outcome_payload: serde_json::to_vec(&failure)
+                        .map_err(|error| error.to_string())?,
                 })
                 .await
                 .map_err(|error| error.to_string())?;
