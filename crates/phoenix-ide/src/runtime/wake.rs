@@ -167,6 +167,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .map_err(|error| error.to_string())?;
         recover_top_level_llm_attempts(&manager).await?;
         deliver_owed_top_level_llm_receipts(&manager).await?;
+        deliver_owed_top_level_llm_tools(&manager).await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
         deliver_pending_direct_turns(&manager).await?;
         let _ = ready_tx.send(());
@@ -188,6 +189,9 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                         }
                         if let Err(error) = deliver_owed_top_level_llm_receipts(manager).await {
                             tracing::warn!(error = %error, "owed LLM receipt delivery failed; retrying");
+                        }
+                        if let Err(error) = deliver_owed_top_level_llm_tools(manager).await {
+                            tracing::warn!(error = %error, "owed LLM tool delivery failed; retrying");
                         }
                         if let Err(error) = deliver_pending_direct_turns(manager).await {
                             tracing::warn!(error = %error, retry_in = ?error_backoff, "direct-turn recovery failed; retrying");
@@ -381,6 +385,37 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             }
         }
     }
+}
+
+async fn deliver_owed_top_level_llm_tools(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    for conversation_id in repo
+        .load_conversations_with_owed_top_level_llm_tools()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let handle = match manager.get_or_create(&conversation_id).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(conversation_id, error = %error, "owed LLM tool runtime unavailable");
+                continue;
+            }
+        };
+        if !matches!(
+            *handle.state_rx.borrow(),
+            crate::state_machine::ConvState::ToolExecuting { .. }
+        ) {
+            continue;
+        }
+        if let Err(error) = handle
+            .event_tx
+            .send(phoenix_core::domain::sm_event::Event::ResumeDurableToolExecution)
+            .await
+        {
+            tracing::warn!(conversation_id, error = %error, "owed LLM tool runtime channel closed");
+        }
+    }
+    Ok(())
 }
 
 async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> Result<(), String> {

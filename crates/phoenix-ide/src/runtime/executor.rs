@@ -2791,6 +2791,20 @@ where
             return Ok(());
         }
 
+        if matches!(event, Event::ResumeDurableToolExecution) {
+            let ConvState::ToolExecuting { current_tool, .. } = &self.state else {
+                return Err(format!(
+                    "cannot resume durable tool execution from {}",
+                    self.state.variant_name()
+                ));
+            };
+            self.execute_effect(Effect::ExecuteTool {
+                tool: current_tool.clone(),
+            })
+            .await?;
+            return Ok(());
+        }
+
         // Check if this is a SubAgentResult that needs buffering
         if let Event::SubAgentResult { .. } = &event {
             if !self.can_handle_sub_agent_result() {
@@ -3176,6 +3190,8 @@ where
             usage_data,
             created_at: Utc::now(),
         };
+        let pending_conversation_id = pending.conversation_id.clone();
+        let pending_client_message_id = pending.client_message_id.clone();
         let acceptance = phoenix_db::PersistDirectTurnRuntimeAcceptanceInput {
             admission: phoenix_db::DirectTurnRuntimeAdmissionInput {
                 workflow_id: pending.workflow_id,
@@ -3197,10 +3213,20 @@ where
                 (Some(*message), false)
             }
             phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay => (None, true),
-            conflict => {
-                return Err(format!(
-                    "durable direct turn admission failed: {conflict:?}"
-                ));
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::RetryablePersistence => {
+                self.storage
+                    .release_direct_turn_runtime_delivery(
+                        &pending_conversation_id,
+                        &pending_client_message_id,
+                        super::process_incarnation(),
+                    )
+                    .await?;
+                return Err(
+                    "direct-turn runtime acceptance persistence is temporarily busy".to_string(),
+                );
+            }
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict => {
+                return Err("durable direct turn admission conflicted".to_string());
             }
         };
         self.state = next_state;

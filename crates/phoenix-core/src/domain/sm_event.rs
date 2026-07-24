@@ -273,6 +273,10 @@ pub enum Event {
     /// `LlmRequesting` state committed before its LLM effect was prepared.
     ResumeDurableLlmRequest,
 
+    /// Internal recovery edge for an owed durable tool intent whose accepted
+    /// LLM response is already reflected in persisted `ToolExecuting` state.
+    ResumeDurableToolExecution,
+
     /// Sent by `RuntimeManager::evict_runtime` (e.g. after a model upgrade)
     /// to cleanly terminate a running runtime that is being replaced.
     /// The executor returns from `run()` immediately on receipt, which drops
@@ -318,6 +322,7 @@ impl Event {
             Event::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
             Event::WakeBatchAdopted => "WakeBatchAdopted",
             Event::ResumeDurableLlmRequest => "ResumeDurableLlmRequest",
+            Event::ResumeDurableToolExecution => "ResumeDurableToolExecution",
             Event::Shutdown => "Shutdown",
         }
     }
@@ -633,6 +638,7 @@ impl TryFrom<Event> for ParentEvent {
             | Event::CancelSteerMessage { .. }
             | Event::WakeBatchAdopted
             | Event::ResumeDurableLlmRequest
+            | Event::ResumeDurableToolExecution
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "ParentEvent",
@@ -765,6 +771,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::SteerDrainedUserMessages { .. }
             | Event::WakeBatchAdopted
             | Event::ResumeDurableLlmRequest
+            | Event::ResumeDurableToolExecution
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",

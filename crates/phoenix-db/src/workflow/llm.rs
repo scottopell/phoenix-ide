@@ -1390,18 +1390,7 @@ impl WorkflowRepository {
              JOIN top_level_llm_workflows w ON w.workflow_id = wr.workflow_id
              JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id
              JOIN workflow_receipts r ON r.workflow_id = wr.workflow_id AND r.receipt_id = wr.receipt_id
-             WHERE (
-                 d.runtime_acceptance_status = 'Owed'
-                 OR (
-                     d.runtime_acceptance_status = 'Accepted'
-                     AND EXISTS (
-                         SELECT 1 FROM top_level_llm_tool_intents ti
-                         WHERE ti.workflow_id = wr.workflow_id
-                           AND ti.receipt_id = wr.receipt_id
-                           AND ti.status = 'Owed'
-                     )
-                 )
-             )
+             WHERE d.runtime_acceptance_status = 'Owed'
                AND w.stopped_at IS NULL
              ORDER BY w.workflow_id, wr.receipt_id"
         )
@@ -1502,6 +1491,20 @@ impl WorkflowRepository {
             });
         }
         Ok(out)
+    }
+
+    pub async fn load_conversations_with_owed_top_level_llm_tools(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT dta.conversation_id
+             FROM top_level_llm_tool_intents ti
+             JOIN direct_turn_acceptances dta ON dta.workflow_id = ti.workflow_id
+             JOIN top_level_llm_workflows w ON w.workflow_id = ti.workflow_id
+             WHERE ti.status = 'Owed' AND w.stopped_at IS NULL
+             ORDER BY dta.conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn load_owed_top_level_llm_tool_intent(
@@ -3636,6 +3639,26 @@ mod tests {
                 .await
                 .unwrap(),
             ToolIntentTransitionOutcome::Committed
+        );
+        sqlx::query(
+            "UPDATE workflow_deliveries
+             SET status = 'Accepted', runtime_acceptance_status = 'Accepted',
+                 accepted_by_transition_id = 1
+             WHERE workflow_id = 1 AND delivery_id = 1",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        assert!(repo
+            .load_owed_top_level_llm_receipts()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repo.load_conversations_with_owed_top_level_llm_tools()
+                .await
+                .unwrap(),
+            vec!["conv-1".to_string()]
         );
         assert_eq!(
             repo.transition_top_level_llm_tool_intent(&tool_transition)

@@ -85,6 +85,15 @@ pub trait MessageStore: Send + Sync {
         Ok(phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict)
     }
 
+    async fn release_direct_turn_runtime_delivery(
+        &self,
+        _conversation_id: &str,
+        _client_message_id: &str,
+        _process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn persist_queued_steering_message(
         &self,
         _conversation_id: &str,
@@ -937,6 +946,22 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
         self.db
             .persist_direct_turn_runtime_acceptance(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn release_direct_turn_runtime_delivery(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .release_direct_turn_runtime_delivery(
+                conversation_id,
+                client_message_id,
+                process_incarnation,
+            )
             .await
             .map_err(|error| error.to_string())
     }

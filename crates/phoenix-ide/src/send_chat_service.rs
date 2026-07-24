@@ -398,9 +398,13 @@ impl SendChatApplicationService {
                     })
                     .await
                     .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-                match queued {
-                    phoenix_db::DirectTurnAcceptanceOutcome::Created(_)
-                    | phoenix_db::DirectTurnAcceptanceOutcome::Replayed(_) => {}
+                let request_result = match queued {
+                    phoenix_db::DirectTurnAcceptanceOutcome::Created(_) => {
+                        SendChatRequestResult::Created
+                    }
+                    phoenix_db::DirectTurnAcceptanceOutcome::Replayed(_) => {
+                        SendChatRequestResult::Replayed
+                    }
                     phoenix_db::DirectTurnAcceptanceOutcome::RetryablePersistence => {
                         return Err(SendChatServiceError::Dispatch(
                             "queued steering persistence is temporarily busy".to_string(),
@@ -409,7 +413,7 @@ impl SendChatApplicationService {
                     phoenix_db::DirectTurnAcceptanceOutcome::Conflict => {
                         return Err(SendChatServiceError::IdempotencyConflict);
                     }
-                }
+                };
                 let steer = steer_entry_from_prepared(&prepared);
                 kick_runtime_delivery(
                     self.runtime.clone(),
@@ -426,7 +430,7 @@ impl SendChatApplicationService {
                 );
                 return Ok(SendChatOutcome::accepted(
                     req.message_id,
-                    SendChatRequestResult::Created,
+                    request_result,
                     SendChatDisposition::QueuedSteering,
                 ));
             }
@@ -513,11 +517,22 @@ impl SendChatApplicationService {
             ),
             phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
             | phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
-                kick_runtime_delivery(
-                    self.runtime.clone(),
-                    conversation.id.clone(),
-                    prepared.into_event(),
-                );
+                let should_deliver =
+                    matches!(
+                        accepted.committed_outcome,
+                        phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
+                    ) || phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+                        .load_active_top_level_llm_workflow(&conversation.id)
+                        .await
+                        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
+                        .is_some();
+                if should_deliver {
+                    kick_runtime_delivery(
+                        self.runtime.clone(),
+                        conversation.id.clone(),
+                        prepared.into_event(),
+                    );
+                }
                 insert_transient_receipt(
                     &self.db,
                     receipts,
@@ -675,6 +690,7 @@ fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, 
             | Event::SteerDrainedUserMessages { .. }
             | Event::WakeBatchAdopted
             | Event::ResumeDurableLlmRequest
+            | Event::ResumeDurableToolExecution
             | Event::Shutdown => return,
         };
         let repo = phoenix_db::WorkflowRepository::new(runtime.db().pool().clone());
