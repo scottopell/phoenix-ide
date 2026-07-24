@@ -116,7 +116,9 @@ AND update any toClipboard with actual matched text
 WHEN all matching attempts fail
 THE SYSTEM SHALL return an "old text not found" error
 AND identify the failing patch's 1-based position in the patches array and its operation
-AND search within explicit file-size, anchor-size, and candidate-work bounds for current-file regions containing distinctive surviving anchor lines
+AND search within explicit file-size, anchor-size, and candidate-work bounds for current-file regions containing surviving anchor lines
+AND treat repeated current-file lines as insufficient evidence
+AND require confidence-producing lines to occur in anchor order within the returned snippet, unless one surviving line is globally unique
 AND return a bounded, deterministic list of line-numbered current-file snippets when reliable candidates exist
 AND identify the snippets as advisory evidence that does not authorize an approximate or non-unique edit
 AND instruct the agent to copy exact current text from a candidate and retry

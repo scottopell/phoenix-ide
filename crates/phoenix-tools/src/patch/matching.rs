@@ -16,7 +16,6 @@ const MAX_CANDIDATE_LOCATIONS: usize = 3;
 const MAX_CANDIDATE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CANDIDATE_ANCHOR_BYTES: usize = 16 * 1024;
 const MIN_DISTINCTIVE_LINE_CHARS: usize = 8;
-const CANDIDATE_CLUSTER_LINE_GAP: usize = 12;
 const MAX_CANDIDATE_HITS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,63 +124,81 @@ fn anchor_not_found_diagnostics(content: &str, old_text: &str) -> AnchorNotFound
             .or_insert(next_index);
     }
 
-    let mut hits = Vec::new();
-    for (line_index, content_line) in content_lines.iter().enumerate() {
-        if let Some(anchor_index) = anchor_index_by_line.get(content_line.trim()) {
-            if hits.len() == MAX_CANDIDATE_HITS {
-                return AnchorNotFoundDiagnostics {
-                    candidates: Vec::new(),
-                };
-            }
-            hits.push((line_index, *anchor_index));
+    let mut content_line_counts: HashMap<&str, usize> = HashMap::new();
+    for content_line in &content_lines {
+        let trimmed = content_line.trim();
+        if anchor_index_by_line.contains_key(trimmed) {
+            *content_line_counts.entry(trimmed).or_default() += 1;
         }
     }
 
-    let total_hits = hits.len();
-    let mut clusters: Vec<Vec<(usize, usize)>> = Vec::new();
-    for hit in hits {
-        if let Some(cluster) = clusters.last_mut() {
-            if hit
-                .0
-                .saturating_sub(cluster.last().expect("cluster is non-empty").0)
-                <= CANDIDATE_CLUSTER_LINE_GAP
-            {
-                cluster.push(hit);
-                continue;
+    let mut unique_hit_count = 0;
+    let hit_by_content_line: Vec<Option<usize>> = content_lines
+        .iter()
+        .map(|content_line| {
+            let trimmed = content_line.trim();
+            if content_line_counts.get(trimmed) == Some(&1) {
+                unique_hit_count += 1;
+                anchor_index_by_line.get(trimmed).copied()
+            } else {
+                None
             }
-        }
-        clusters.push(vec![hit]);
-    }
-
-    let mut ranked: Vec<(usize, usize, usize)> = clusters
-        .into_iter()
-        .filter_map(|cluster| {
-            let mut anchor_indexes: Vec<usize> = cluster.iter().map(|(_, index)| *index).collect();
-            anchor_indexes.sort_unstable();
-            anchor_indexes.dedup();
-            let score = anchor_indexes.len();
-            let first_line = cluster.first()?.0;
-            let last_line = cluster.last()?.0;
-            let globally_unique_strong_line = score == 1 && total_hits == 1;
-            (score >= 2 || globally_unique_strong_line).then_some((score, first_line, last_line))
         })
         .collect();
-    ranked.sort_by_key(|(score, first_line, _)| (std::cmp::Reverse(*score), *first_line));
-    ranked.truncate(MAX_CANDIDATE_LOCATIONS);
+    if unique_hit_count > MAX_CANDIDATE_HITS {
+        return AnchorNotFoundDiagnostics {
+            candidates: Vec::new(),
+        };
+    }
+
+    let mut ranked: Vec<(usize, usize)> = (0..content_lines.len())
+        .filter_map(|window_start| {
+            let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
+            let score = ordered_anchor_coverage(&hit_by_content_line[window_start..window_end]);
+            (score >= 2 || (score == 1 && unique_hit_count == 1)).then_some((score, window_start))
+        })
+        .collect();
+    ranked.sort_by_key(|(score, window_start)| (std::cmp::Reverse(*score), *window_start));
+    ranked.dedup_by_key(|(_, window_start)| *window_start);
+
+    let mut selected = Vec::new();
+    for (score, window_start) in ranked {
+        let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
+        if selected.iter().all(|(_, selected_start): &(usize, usize)| {
+            let selected_end = (*selected_start + MAX_SNIPPET_LINES).min(content_lines.len());
+            window_end <= *selected_start || window_start >= selected_end
+        }) {
+            selected.push((score, window_start));
+            if selected.len() == MAX_CANDIDATE_LOCATIONS {
+                break;
+            }
+        }
+    }
 
     AnchorNotFoundDiagnostics {
-        candidates: ranked
+        candidates: selected
             .into_iter()
-            .map(|(_, first_line, last_line)| {
-                let snippet_start = first_line.saturating_sub(1);
-                let snippet_end = (last_line + 2).min(content_lines.len());
+            .map(|(_, window_start)| {
+                let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
                 AnchorCandidateLocation {
-                    start_line: snippet_start + 1,
-                    snippet: bounded_candidate_snippet(&content_lines[snippet_start..snippet_end]),
+                    start_line: window_start + 1,
+                    snippet: bounded_candidate_snippet(&content_lines[window_start..window_end]),
                 }
             })
             .collect(),
     }
+}
+
+fn ordered_anchor_coverage(hits: &[Option<usize>]) -> usize {
+    let mut coverage = 0;
+    let mut previous_anchor_index = None;
+    for anchor_index in hits.iter().flatten() {
+        if previous_anchor_index.is_none_or(|previous| *anchor_index > previous) {
+            coverage += 1;
+            previous_anchor_index = Some(*anchor_index);
+        }
+    }
+    coverage
 }
 
 fn bounded_candidate_snippet(lines: &[&str]) -> String {
@@ -634,6 +651,47 @@ mod tests {
         };
 
         assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn reversed_surviving_lines_are_not_reported() {
+        let content = "second_distinct_line();\ncontext\nfirst_distinct_line();\n";
+        let old_text = "first_distinct_line();\nstale\nsecond_distinct_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn supporting_hits_outside_one_snippet_are_not_combined() {
+        let filler = "filler\n".repeat(MAX_SNIPPET_LINES);
+        let content = format!("first_distinct_line();\n{filler}second_distinct_line();\n");
+        let old_text = "first_distinct_line();\nstale\nsecond_distinct_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(&content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn repeated_boilerplate_does_not_raise_candidate_confidence() {
+        let content = "common boilerplate line\nsite one\ncommon boilerplate line\nsite two\n";
+        let old_text = "common boilerplate line\nstale\nsite two";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert_eq!(diagnostics.candidates.len(), 1);
+        assert!(diagnostics.candidates[0].snippet.contains("site two"));
     }
 
     #[test]

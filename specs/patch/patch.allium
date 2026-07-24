@@ -175,10 +175,12 @@ rule MatchNotFound {
     @guidance
         -- Candidate diagnostics are advisory evidence, not a match result. Search
         -- is bounded by file bytes, anchor bytes, and total surviving-line hits.
-        -- A candidate requires multiple distinctive surviving anchor lines in one
-        -- nearby region, or one globally unique distinctive surviving line. Up to
-        -- three deterministic, line-numbered snippets are returned. If confidence
-        -- or work bounds fail, candidates is empty and the caller requests a read.
+        -- A candidate requires multiple globally unique surviving anchor lines in
+        -- anchor order within the emitted five-line window, or one globally unique
+        -- surviving line across the diagnostic search. Up to three deterministic,
+        -- non-overlapping line-numbered snippets are returned. Repeated lines do not
+        -- contribute confidence. If confidence or work bounds fail, candidates is
+        -- empty and the caller requests a read.
 }
 
 rule MatchNotUnique {
