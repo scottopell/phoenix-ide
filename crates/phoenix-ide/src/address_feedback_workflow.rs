@@ -172,10 +172,17 @@ impl AddressFeedbackWorkflowService {
             })?;
 
         let head_oid = local_head_oid(&self.state.db, &req.conversation_id).await?;
-        let capture =
+        let mut capture =
             capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
                 .await
                 .map_err(map_app_error_for_capture)?;
+        capture.artifact_path = persist_durable_context_artifact(
+            &self.state.db,
+            &req.conversation_id,
+            workflow_id,
+            &capture.artifact_path,
+        )
+        .await?;
         let context_json =
             read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
         let instruction = capture.message.clone();
@@ -205,6 +212,12 @@ impl AddressFeedbackWorkflowService {
         };
         let intent_fingerprint = intent_fingerprint(&snapshot)?;
         let repo = WorkflowRepository::new(self.state.db.pool().clone());
+        if let Some((existing_id, existing_snapshot)) =
+            find_active_by_fingerprint(&self.state.db, &req.conversation_id, &intent_fingerprint)
+                .await?
+        {
+            return Ok(pending_response(existing_id, existing_snapshot.message_id));
+        }
         let create = CreateWorkflowWithExternalAcceptance {
             workflow_id,
             profile: profile_ref(),
@@ -287,7 +300,7 @@ impl AddressFeedbackWorkflowService {
                 return Err(error);
             }
         };
-        let capture =
+        let mut capture =
             match capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
                 .await
             {
@@ -297,6 +310,13 @@ impl AddressFeedbackWorkflowService {
                     return Err(map_app_error_for_capture(error));
                 }
             };
+        capture.artifact_path = persist_durable_context_artifact(
+            &self.state.db,
+            &req.conversation_id,
+            workflow_id,
+            &capture.artifact_path,
+        )
+        .await?;
         let context_json =
             read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
         let instruction = capture.message.clone();
@@ -418,7 +438,7 @@ impl AddressFeedbackWorkflowService {
                     message_id: req.message_id.clone(),
                     images: Vec::new(),
                     files: Vec::new(),
-                    user_agent: req.user_agent,
+                    user_agent: snapshot.user_agent.clone(),
                     expansion_policy: MessageExpansionPolicy::LiteralText,
                 })
                 .await
@@ -580,6 +600,33 @@ fn pending_response(workflow_id: WorkflowId, message_id: String) -> AddressPrFee
     }
 }
 
+async fn find_active_by_fingerprint(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    intent_fingerprint: &str,
+) -> Result<Option<(WorkflowId, AddressFeedbackSnapshot)>, AddressFeedbackWorkflowError> {
+    let target_scope = format!("conversation:{conversation_id}");
+    let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT workflow_id, snapshot_payload FROM workflows WHERE profile_kind = ? AND profile_version = ? AND target_scope = ? AND intent_fingerprint = ? AND status = 'Active' LIMIT 1",
+    )
+    .bind(PROFILE_KIND)
+    .bind(i64::from(PROFILE_VERSION))
+    .bind(target_scope)
+    .bind(intent_fingerprint)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let Some((workflow_id_raw, payload)) = rows else {
+        return Ok(None);
+    };
+    let Ok(workflow_id) = u64::try_from(workflow_id_raw).map(WorkflowId) else {
+        return Ok(None);
+    };
+    let snapshot: AddressFeedbackSnapshot = serde_json::from_slice(&payload)
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    Ok(Some((workflow_id, snapshot)))
+}
+
 async fn load_snapshot(
     db: &crate::db::Database,
     workflow_id: WorkflowId,
@@ -660,6 +707,37 @@ fn response_from_snapshot(
             .as_ref()
             .map(|target| target.repo_name.clone()),
     }
+}
+
+async fn persist_durable_context_artifact(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    workflow_id: WorkflowId,
+    artifact_path: &str,
+) -> Result<String, AddressFeedbackWorkflowError> {
+    let contents = read_context_json(db, conversation_id, artifact_path).await?;
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let base = match conv.conv_mode {
+        phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
+        | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. } => {
+            worktree_path.to_string()
+        }
+        _ => conv.cwd,
+    };
+    let durable_path = format!(".phoenix/address-feedback-workflows/{}.json", workflow_id.0);
+    let absolute_path = std::path::Path::new(base.as_str()).join(&durable_path);
+    if let Some(parent) = absolute_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    }
+    tokio::fs::write(&absolute_path, contents)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    Ok(durable_path)
 }
 
 async fn read_context_json(
@@ -777,6 +855,7 @@ fn intent_fingerprint(
 ) -> Result<String, AddressFeedbackWorkflowError> {
     let mut stable = snapshot.clone();
     stable.user_agent = None;
+    stable.message_id.clear();
     stable.artifact_path = None;
     stable.instruction = None;
     stable.model_message = None;
