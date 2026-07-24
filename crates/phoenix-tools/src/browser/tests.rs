@@ -639,9 +639,14 @@ async fn test_eval_promise_chain_awaited() {
 
     let (ctx, manager) = test_context("test-eval-promise");
     let nav_tool = BrowserNavigateTool;
-    nav_tool
+    let navigation = nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
+    assert!(
+        navigation.is_success(),
+        "Navigation failed: {}",
+        navigation.output()
+    );
 
     let eval_tool = BrowserEvalTool;
 

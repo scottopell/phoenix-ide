@@ -181,7 +181,9 @@ SELECT c.id AS current_conversation_id,
        c.archived, c.user_initiated, c.parent_conversation_id,
        c.cm_task_id, c.cm_task_title, c.cm_branch_name, c.cm_base_branch
 FROM leaves JOIN conversations c ON c.id = leaves.current_id
-WHERE leaves.root_id NOT IN (SELECT conversation_id FROM coordinator)
+WHERE leaves.root_id NOT IN (
+  SELECT id FROM conversations WHERE coordinator_head = 1
+)
 ORDER BY CASE WHEN json_extract(c.state, '$.type') IN
   ('llm_request','llm_stream','tool_execution','executing','sub_agents_running')
   THEN 0 ELSE 1 END,

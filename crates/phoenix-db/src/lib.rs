@@ -1088,11 +1088,15 @@ impl Database {
     ) -> (WorkScopeId, AuthorityKind, EnvironmentContext) {
         let scope_id = WorkScopeId::new();
         let context = Self::environment_for_mode(cwd, cm);
-        let authority_kind = match cm.kind {
+        let authority_kind = Self::authority_for_mode(cm);
+        (scope_id, authority_kind, context)
+    }
+
+    fn authority_for_mode(cm: &ConvModeCols<'_>) -> AuthorityKind {
+        match cm.kind {
             "work" | "branch" => AuthorityKind::Work,
             _ => AuthorityKind::RestrictedExplore,
-        };
-        (scope_id, authority_kind, context)
+        }
     }
 
     async fn work_scope_exists(
@@ -12136,6 +12140,15 @@ mod tests {
             .unwrap();
         assert_eq!(a.feedback_identities, vec!["repo-a".to_string()]);
         assert_eq!(b.feedback_identities, vec!["repo-b".to_string()]);
+    }
+
+    #[test]
+    fn direct_mode_receives_restricted_authority() {
+        let cm = conv_mode_columns(&ConvMode::Direct);
+        assert_eq!(
+            Database::authority_for_mode(&cm),
+            AuthorityKind::RestrictedExplore
+        );
     }
 
     #[tokio::test]
