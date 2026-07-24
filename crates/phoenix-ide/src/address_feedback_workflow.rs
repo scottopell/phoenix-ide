@@ -176,6 +176,7 @@ impl AddressFeedbackWorkflowService {
             capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
                 .await
                 .map_err(map_app_error_for_capture)?;
+        let original_artifact_path = capture.artifact_path.clone();
         capture.artifact_path = persist_durable_context_artifact(
             &self.state.db,
             &req.conversation_id,
@@ -185,7 +186,9 @@ impl AddressFeedbackWorkflowService {
         .await?;
         let context_json =
             read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
-        let instruction = capture.message.clone();
+        let instruction = capture
+            .message
+            .replace(&original_artifact_path, &capture.artifact_path);
         let model_message = render_address_feedback_xml(
             &capture,
             head_oid.as_deref(),
@@ -216,6 +219,11 @@ impl AddressFeedbackWorkflowService {
             find_active_by_fingerprint(&self.state.db, &req.conversation_id, &intent_fingerprint)
                 .await?
         {
+            if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
+                let _ =
+                    remove_context_artifact(&self.state.db, &req.conversation_id, artifact_path)
+                        .await;
+            }
             return Ok(pending_response(existing_id, existing_snapshot.message_id));
         }
         let create = CreateWorkflowWithExternalAcceptance {
@@ -310,6 +318,7 @@ impl AddressFeedbackWorkflowService {
                     return Err(map_app_error_for_capture(error));
                 }
             };
+        let original_artifact_path = capture.artifact_path.clone();
         capture.artifact_path = persist_durable_context_artifact(
             &self.state.db,
             &req.conversation_id,
@@ -319,7 +328,9 @@ impl AddressFeedbackWorkflowService {
         .await?;
         let context_json =
             read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
-        let instruction = capture.message.clone();
+        let instruction = capture
+            .message
+            .replace(&original_artifact_path, &capture.artifact_path);
         let model_message = render_address_feedback_xml(
             &capture,
             head_oid.as_deref(),
@@ -734,10 +745,37 @@ async fn persist_durable_context_artifact(
             .await
             .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
     }
+    if absolute_path.exists() {
+        return Ok(durable_path);
+    }
     tokio::fs::write(&absolute_path, contents)
         .await
         .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
     Ok(durable_path)
+}
+
+async fn remove_context_artifact(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    artifact_path: &str,
+) -> Result<(), AddressFeedbackWorkflowError> {
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let base = match conv.conv_mode {
+        phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
+        | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. } => {
+            worktree_path.to_string()
+        }
+        _ => conv.cwd,
+    };
+    let path = std::path::Path::new(artifact_path);
+    if path.is_absolute() || artifact_path.split('/').any(|part| part == "..") {
+        return Ok(());
+    }
+    let _ = tokio::fs::remove_file(std::path::Path::new(base.as_str()).join(path)).await;
+    Ok(())
 }
 
 async fn read_context_json(

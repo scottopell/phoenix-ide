@@ -1876,7 +1876,7 @@ fn validate_pr_auto_fix_artifact_path(artifact_path: &str) -> Result<(), AppErro
 
     let components = path.components().collect::<Vec<_>>();
     let valid_prefix = matches!(components.first(), Some(std::path::Component::Normal(part)) if *part == ".phoenix")
-        && matches!(components.get(1), Some(std::path::Component::Normal(part)) if *part == "pr-context")
+        && matches!(components.get(1), Some(std::path::Component::Normal(part)) if *part == "pr-context" || *part == "address-feedback-workflows")
         && components.len() > 2;
     let only_normal_components = components
         .iter()
