@@ -4866,22 +4866,6 @@ impl Database {
         Ok(())
     }
 
-    /// Return the owning conversation for a globally unique steering message id.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn steering_conversation_id_for_message(
-        &self,
-        message_id: &str,
-    ) -> DbResult<Option<String>> {
-        sqlx::query_scalar("SELECT conversation_id FROM steering_messages WHERE message_id = ?1")
-            .bind(message_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(Into::into)
-    }
-
     /// Load a conversation's pending steering queue (FIFO) from the normalized
     /// tables, rehydrating each entry's attachments and skill invocation.
     ///
@@ -13253,19 +13237,6 @@ mod tests {
 
         let queue = db.get_steering_queue("conv-s").await.unwrap();
         assert_eq!(queue.len(), 2);
-        assert_eq!(
-            db.steering_conversation_id_for_message("sa")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("conv-s")
-        );
-        assert_eq!(
-            db.steering_conversation_id_for_message("missing")
-                .await
-                .unwrap(),
-            None
-        );
         assert_eq!(queue[0].message_id, "sa");
         assert_eq!(queue[0].llm_text.as_deref(), Some("first-expanded"));
         assert_eq!(queue[0].images.len(), 1);
@@ -13288,10 +13259,6 @@ mod tests {
         db.remove_steering_entries("conv-s", &["sa".to_string()])
             .await
             .unwrap();
-        assert_eq!(
-            db.steering_conversation_id_for_message("sa").await.unwrap(),
-            None
-        );
         let queue = db.get_steering_queue("conv-s").await.unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].message_id, "sb");

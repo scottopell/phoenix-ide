@@ -648,7 +648,10 @@ function ConversationPageContent({
         transcriptCoverage: current.transcriptCoverage,
         snapshotStartedAtEventSeq,
       });
-      reconcileAuthoritative(persisted.map((entry) => entry.message_id));
+      reconcileAuthoritative(persisted.flatMap((entry) => [
+        entry.message_id,
+        entry.message.message_id,
+      ]));
     }
   }, [conversationId, dispatch, reconcileAuthoritative]);
 

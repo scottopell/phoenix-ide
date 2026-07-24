@@ -172,12 +172,10 @@ impl SendChatApplicationService {
         if let Some(receipt) = receipts.get(&(conversation.id.clone(), req.message_id.clone())) {
             return replay_receipt(receipt, &req, &request_fingerprint);
         }
-        if let Some((queued_conversation_id, queued_entry)) =
-            find_queued_message(&self.db, &req.message_id).await?
+        if let Some(queued_entry) =
+            find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
         {
-            if queued_conversation_id != req.conversation_id
-                || !queued_retry_matches(&queued_entry, &req)
-            {
+            if !queued_retry_matches(&queued_entry, &req) {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
             receipts.remove(&(conversation.id.clone(), req.message_id.clone()));
@@ -766,25 +764,17 @@ async fn insert_transient_receipt(
 
 async fn find_queued_message(
     db: &crate::db::Database,
+    conversation_id: &str,
     message_id: &str,
-) -> Result<Option<(String, phoenix_core::domain::sm_event::SteerEntry)>, SendChatServiceError> {
-    let Some(conversation_id) = db
-        .steering_conversation_id_for_message(message_id)
+) -> Result<Option<phoenix_core::domain::sm_event::SteerEntry>, SendChatServiceError> {
+    db.get_steering_queue(conversation_id)
         .await
-        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    let entry = db
-        .get_steering_queue(&conversation_id)
-        .await
-        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-        .into_iter()
-        .find(|entry| entry.message_id == message_id)
-        .ok_or_else(|| {
-            SendChatServiceError::Internal("steering message disappeared during lookup".to_string())
-        })?;
-    Ok(Some((conversation_id, entry)))
+        .map_err(|error| SendChatServiceError::Internal(error.to_string()))
+        .map(|queue| {
+            queue
+                .into_iter()
+                .find(|entry| entry.message_id == message_id)
+        })
 }
 
 fn queued_retry_matches(
@@ -973,8 +963,8 @@ fn transition_code(err: &TransitionError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        persisted_skill_matches, prepared_direct_turn_fingerprint, queued_retry_matches,
-        MessageExpansionPolicy, SendChatApplicationService, SendChatRequest,
+        find_queued_message, persisted_skill_matches, prepared_direct_turn_fingerprint,
+        queued_retry_matches, MessageExpansionPolicy, SendChatApplicationService, SendChatRequest,
     };
     use phoenix_core::domain::db_schema::SkillContent;
 
@@ -1020,6 +1010,42 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn queued_replay_lookup_is_scoped_to_the_target_conversation() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        for conversation_id in ["conv-a", "conv-b"] {
+            db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        db.update_steering_queue(
+            "conv-a",
+            &[phoenix_core::domain::sm_event::SteerEntry {
+                text: "first target".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "shared-id".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert!(find_queued_message(&db, "conv-b", "shared-id")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            find_queued_message(&db, "conv-a", "shared-id")
+                .await
+                .unwrap()
+                .map(|entry| entry.text),
+            Some("first target".to_string())
+        );
     }
 
     #[test]

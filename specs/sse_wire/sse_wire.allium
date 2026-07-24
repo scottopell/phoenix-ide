@@ -571,7 +571,7 @@ rule EphemeralEventAppendedToReplayRing {
         "token", "state_change", "message_updated", "agent_done",
         "conversation_update", "conversation_became_terminal", "error",
         "browser_session_state", "steer_message_queued",
-        "rate_limit_snapshot", "llm_first_byte", "llm_attempt"
+        "rate_limit_snapshot", "llm_stream_started", "llm_first_byte", "llm_attempt"
     }
 
     let ring = ReplayRing{conversation_id: conv_id}

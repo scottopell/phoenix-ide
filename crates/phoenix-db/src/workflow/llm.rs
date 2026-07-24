@@ -1717,7 +1717,11 @@ impl WorkflowRepository {
         stopped_at: Timestamp,
     ) -> DbResult<Option<CommitOutcome>> {
         let row = sqlx::query(
-            "SELECT wf.workflow_id, wf.version, wf.generation
+            "SELECT wf.workflow_id, wf.version, wf.generation,
+                    COALESCE((
+                        SELECT MAX(e.call_ordinal) FROM top_level_llm_effects e
+                        WHERE e.workflow_id = wf.workflow_id
+                    ), 0) AS call_ordinal
              FROM workflows wf
              JOIN top_level_llm_workflows w ON w.workflow_id = wf.workflow_id
              JOIN direct_turn_acceptances dta ON dta.workflow_id = wf.workflow_id
@@ -1764,7 +1768,7 @@ impl WorkflowRepository {
                 key: LlmEffectKey {
                     accepted_turn_id: current.accepted_turn_id.clone(),
                     generation: current.turn_generation.0,
-                    call_ordinal: 0,
+                    call_ordinal: to_u64(row.get("call_ordinal"), "call_ordinal")?,
                 },
                 reason: "stop".to_string(),
             })
@@ -3262,6 +3266,25 @@ mod tests {
                 .unwrap(),
             Some(CommitOutcome::Committed)
         );
+        let cancelled_payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT event_payload FROM workflow_transitions
+             WHERE workflow_id = 1 ORDER BY transition_id DESC LIMIT 1",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let cancelled: llm_profile::TopLevelLlmEvent =
+            serde_json::from_slice(&cancelled_payload).unwrap();
+        assert!(matches!(
+            cancelled,
+            llm_profile::TopLevelLlmEvent::ResponseCancelled {
+                key: LlmEffectKey {
+                    call_ordinal: 0,
+                    ..
+                },
+                ..
+            }
+        ));
 
         let next = DirectTurnAcceptanceInput {
             client_message_id: "msg-2".to_string(),
@@ -3279,6 +3302,78 @@ mod tests {
         assert!(matches!(
             repo.accept_direct_turn(&next).await.unwrap(),
             DirectTurnAcceptanceOutcome::Created(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_the_latest_prepared_call_ordinal() {
+        let repo = open_repo().await;
+        repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::RuntimeAccepted,
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-1".to_string(),
+            prepared_fingerprint: "fp-1".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE top_level_llm_workflows SET next_call_ordinal = 3 WHERE workflow_id = 1",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        repo.prepare_top_level_llm_request(&PrepareTopLevelLlmRequestInput {
+            workflow_id: WorkflowId(1),
+            effect_id: EffectId(1),
+            expected_version: Version(0),
+            transition_id: TransitionId(2),
+            generation: Generation(0),
+            committed_at: Timestamp(2),
+            snapshot: snapshot(),
+            prepared_request: PreparedLlmRequest {
+                codec_version: 1,
+                request_fingerprint: "req-3".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                backend: "responses".to_string(),
+                request_aggregate: "{\"messages\":[]}".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO workflow_sequences (workflow_id, sequence_name, next_value)
+             VALUES (1, 'transition', 3)
+             ON CONFLICT(workflow_id, sequence_name) DO UPDATE SET next_value = 3",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+        repo.stop_active_top_level_llm_for_conversation("conv-1", Timestamp(3))
+            .await
+            .unwrap();
+        let payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT event_payload FROM workflow_transitions
+             WHERE workflow_id = 1 ORDER BY transition_id DESC LIMIT 1",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let event: llm_profile::TopLevelLlmEvent = serde_json::from_slice(&payload).unwrap();
+        assert!(matches!(
+            event,
+            llm_profile::TopLevelLlmEvent::ResponseCancelled {
+                key: LlmEffectKey {
+                    call_ordinal: 3,
+                    ..
+                },
+                ..
+            }
         ));
     }
 
