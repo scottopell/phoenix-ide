@@ -325,10 +325,10 @@ pub fn pr_auto_fix_instruction(lang: LlmLanguage, artifact_path: &str) -> String
     let prefix = pr_auto_fix_instruction_prefix();
     match lang {
         LlmLanguage::PhoenixNative => format!(
-            "{prefix}{artifact_path}`. That file is a point-in-time actionable snapshot of the failing CI checks (with failure logs inline where Phoenix could extract them) and unresolved/actionable review feedback. Use it as your starting point; if a failing check has no inline log, fetch the current logs yourself before fixing. Review-thread items carry a `thread_id` (a `PRRT_…` node id) — pass that, not the comment `id`, to the `resolveReviewThread` GraphQL mutation when marking threads resolved. Fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed."
+            "{prefix}{artifact_path}`. That file is a point-in-time actionable snapshot of the failing CI checks (with failure logs inline where Phoenix could extract them) and unresolved/actionable review feedback. Use it as your starting point; if a failing check has no inline log, fetch the current logs yourself before fixing. Review-thread items carry a `thread_id` (a `PRRT_…` node id) — pass that, not the comment `id`, to the `resolveReviewThread` GraphQL mutation when marking threads resolved. Treat `thread_id` as an opaque string: copy it exactly, including any trailing `_` or `-`, and quote the shell variable. Before mutating, query `node(id: $id)` for `isResolved` and `viewerCanResolve`; skip threads already resolved. If GitHub rejects a mutation, report the exact ID and GraphQL error instead of inferring that an ID is stale, truncated, or forbidden. Fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed."
         ),
         LlmLanguage::Caveman => format!(
-            "{prefix}{artifact_path}`. File is actionable snapshot: failed CI (logs inline when Phoenix grab them) and unresolved/actionable review feedback. No inline log? Fetch current log yourself. Review-thread item carry `thread_id` (`PRRT_…` node id) — feed that, not comment `id`, to `resolveReviewThread` mutation when mark thread resolved. Fix in this cave. Run focused tests. Commit changes. Say what changed."
+            "{prefix}{artifact_path}`. File is actionable snapshot: failed CI (logs inline when Phoenix grab them) and unresolved/actionable review feedback. No inline log? Fetch current log yourself. Review-thread item carry `thread_id` (`PRRT_…` node id) — feed that, not comment `id`, to `resolveReviewThread` mutation when mark thread resolved. ID is opaque: copy exact, keep trailing `_` or `-`, quote shell variable. First query `node(id: $id)` for `isResolved` and `viewerCanResolve`; skip resolved thread. Mutation fail? Show exact ID and GraphQL error. Do not guess stale, truncated, or forbidden. Fix in this cave. Run focused tests. Commit changes. Say what changed."
         ),
     }
 }
@@ -631,6 +631,12 @@ mod tests {
         // a per-comment id is rejected by resolveReviewThread.
         assert!(native.contains("thread_id"));
         assert!(native.contains("resolveReviewThread"));
+        assert!(native.contains("opaque string"));
+        assert!(native.contains("trailing `_` or `-`"));
+        assert!(native.contains("node(id: $id)"));
+        assert!(native.contains("isResolved"));
+        assert!(native.contains("viewerCanResolve"));
+        assert!(native.contains("exact ID and GraphQL error"));
 
         let caveman =
             pr_auto_fix_instruction(LlmLanguage::Caveman, ".phoenix/pr-context/pr-7.json");
@@ -642,6 +648,12 @@ mod tests {
         assert!(!caveman.to_lowercase().contains("push"));
         assert!(caveman.contains("thread_id"));
         assert!(caveman.contains("resolveReviewThread"));
+        assert!(caveman.contains("opaque"));
+        assert!(caveman.contains("trailing `_` or `-`"));
+        assert!(caveman.contains("node(id: $id)"));
+        assert!(caveman.contains("isResolved"));
+        assert!(caveman.contains("viewerCanResolve"));
+        assert!(caveman.contains("exact ID and GraphQL error"));
     }
 
     #[test]
