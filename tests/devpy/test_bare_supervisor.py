@@ -393,11 +393,21 @@ class BareSupervisorLinuxIntegrationTests(unittest.TestCase):
             "--root", str(self.root),
             "run",
         ], start_new_session=True)
+        socket_path = self.root / "run/supervisor.sock"
         deadline = time.monotonic() + 5
-        while not (self.root / "run/supervisor.sock").exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if not (self.root / "run/supervisor.sock").exists():
-            self.fail("supervisor socket did not appear")
+        while True:
+            if self.process.poll() is not None:
+                self.fail(f"supervisor exited before readiness: {self.process.returncode}")
+            try:
+                supervisor.request(
+                    socket_path,
+                    {"protocol_version": 1, "action": "status"},
+                )
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                if time.monotonic() >= deadline:
+                    self.fail("supervisor did not accept requests before deadline")
+                time.sleep(0.02)
 
     def tearDown(self):
         if self.process.poll() is None:

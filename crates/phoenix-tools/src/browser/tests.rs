@@ -3181,7 +3181,6 @@ async fn cascade_preserves_when_inheritor_scope_matches() {
         &scope,
         &work_actor("owner"),
         Some(&scope),
-        false,
     )
     .await;
 
@@ -3218,7 +3217,6 @@ async fn cascade_tears_down_when_no_inheritor() {
         &scope,
         &work_actor("owner"),
         None,
-        false,
     )
     .await;
 
@@ -3249,7 +3247,6 @@ async fn cascade_tears_down_when_inheritor_scope_differs() {
         &parent,
         &work_actor("owner"),
         Some(&child),
-        false,
     )
     .await;
 

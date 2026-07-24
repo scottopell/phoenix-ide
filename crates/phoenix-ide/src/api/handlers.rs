@@ -4388,7 +4388,7 @@ async fn scope_still_owned_after_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
-) -> Result<(bool, bool), AppError> {
+) -> Result<bool, AppError> {
     let id = conv.id.as_str();
 
     if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
@@ -4396,10 +4396,7 @@ async fn scope_still_owned_after_delete(
             Ok(continuation) => {
                 let cont_scope = conversation_work_scope(&continuation)?;
                 if &cont_scope == work_scope {
-                    return Ok((
-                        true,
-                        !matches!(continuation.conv_mode, crate::db::ConvMode::Explore { .. }),
-                    ));
+                    return Ok(true);
                 }
             }
             Err(e) => {
@@ -4428,18 +4425,9 @@ async fn scope_still_owned_after_delete(
         })?)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let survivors = conversations
-        .into_iter()
-        .filter(|candidate| {
-            candidate.id != id && crate::runtime::conversation_owns_work_scope(candidate)
-        })
-        .collect::<Vec<_>>();
-    Ok((
-        !survivors.is_empty(),
-        survivors
-            .iter()
-            .any(|candidate| !matches!(candidate.conv_mode, crate::db::ConvMode::Explore { .. })),
-    ))
+    Ok(conversations.into_iter().any(|candidate| {
+        candidate.id != id && crate::runtime::conversation_owns_work_scope(&candidate)
+    }))
 }
 
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
@@ -4480,8 +4468,7 @@ pub(super) async fn run_resource_cleanup_cascade(
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
     // terminal, browser) so they all honor the same any-live-owner signal.
-    let (scope_still_owned, has_work_survivor) =
-        scope_still_owned_after_delete(state, conv, &work_scope).await?;
+    let scope_still_owned = scope_still_owned_after_delete(state, conv, &work_scope).await?;
     let inheritor_scope = scope_still_owned.then_some(&work_scope);
 
     // Step 2: bash handles. Preserve iff the scope is still owned by a live
@@ -4582,7 +4569,6 @@ pub(super) async fn run_resource_cleanup_cascade(
             },
         ),
         inheritor_scope,
-        has_work_survivor,
     )
     .await;
 

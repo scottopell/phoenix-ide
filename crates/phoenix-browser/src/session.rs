@@ -826,23 +826,15 @@ pub async fn cascade_browser_on_delete(
     work_scope: &ResourceScopeKey,
     actor: &EffectiveResourceAccess,
     inheritor_scope: Option<&ResourceScopeKey>,
-    has_work_survivor: bool,
 ) {
     if inheritor_scope == Some(work_scope) {
-        if !(has_work_survivor && actor.authority() == ResourceAuthority::Work) {
+        if actor.authority() == ResourceAuthority::Restricted {
             manager.kill_session_for_actor(work_scope, actor).await;
         }
         return;
     }
     if actor.authority() == ResourceAuthority::Restricted {
         manager.kill_session_for_actor(work_scope, actor).await;
-        return;
-    }
-    if inheritor_scope == Some(work_scope) {
-        tracing::debug!(
-            work_scope = %work_scope,
-            "browser: skipping session kill — scope inherited by continuation"
-        );
         return;
     }
     manager.kill_session(work_scope).await;

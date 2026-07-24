@@ -5487,8 +5487,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, CASE WHEN ?21 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22)",
+                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
+                 VALUES (?1, ?2, ?3, CASE WHEN ?21 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22, ?23)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5518,6 +5518,9 @@ impl Database {
                 parent.runtime_role.as_str()
             })
             .bind(continuation_work_scope_id.as_ref().map(WorkScopeId::as_str))
+            .bind(
+                (parent.runtime_role == RuntimeRole::SubAgent).then_some(parent.cwd.as_str()),
+            )
             .execute(&mut *tx)
             .await;
 
@@ -16017,6 +16020,30 @@ mod tests {
         assert_eq!(child.cwd, "/tmp/worktree/subdir");
         assert_eq!(
             db.get_conversation(&child.id).await.unwrap().cwd,
+            "/tmp/worktree/subdir"
+        );
+
+        db.update_conversation_state(
+            &child.id,
+            &ConvState::ContextExhausted {
+                summary: "continue child".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let continuation = match db.continue_conversation(&child.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            ContinueOutcome::AlreadyContinued(conversation) => {
+                panic!("unexpected existing continuation: {conversation:?}")
+            }
+            ContinueOutcome::ParentNotContextExhausted { state_variant } => {
+                panic!("parent unexpectedly not exhausted: {state_variant}")
+            }
+        };
+        assert_eq!(continuation.cwd, "/tmp/worktree/subdir");
+        assert_eq!(
+            db.get_conversation(&continuation.id).await.unwrap().cwd,
             "/tmp/worktree/subdir"
         );
     }
