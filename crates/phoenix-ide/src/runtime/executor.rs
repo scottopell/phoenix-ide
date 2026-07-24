@@ -6509,8 +6509,8 @@ fn strip_unavailable_tool_blocks(
 
     // Second pass: filter out stripped tool_use/tool_result blocks.
     // For ToolSearchToolResult, remove individual bad references but keep the block
-    // (it's paired with a ServerToolUse that we must not orphan).
-    messages
+    // paired with its ServerToolUse until terminal normalization flattens both.
+    let normalized: Vec<LlmMessage> = messages
         .into_iter()
         .map(|msg| {
             let filtered: Vec<ContentBlock> = msg
@@ -6573,7 +6573,13 @@ fn strip_unavailable_tool_blocks(
         })
         // Drop messages that became empty after filtering
         .filter(|msg| !msg.content.is_empty())
-        .collect()
+        .collect();
+
+    if flatten_results {
+        flatten_tool_blocks(normalized)
+    } else {
+        normalized
+    }
 }
 
 #[cfg(test)]
@@ -7240,18 +7246,18 @@ mod strip_tool_blocks_tests {
 
         let out = strip_unavailable_tool_blocks(msgs, &terminal, true);
 
-        let result = out[0]
+        assert_no_tool_blocks(&out);
+        let flattened = out[0]
             .content
             .iter()
-            .find_map(|block| match block {
-                ContentBlock::ToolSearchToolResult { content, .. } => Some(content),
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             })
-            .expect("server tool result remains paired with its server tool use");
-        assert!(
-            result.tool_references.is_empty(),
-            "ordinary tool references must not survive a terminal-only request"
-        );
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flattened.contains("server tool call"), "got: {flattened}");
+        assert!(flattened.contains("tool search result"), "got: {flattened}");
     }
 
     #[test]
