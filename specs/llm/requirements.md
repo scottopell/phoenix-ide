@@ -22,8 +22,9 @@ AND include usage statistics when available
 
 ### REQ-LLM-002: Backend-compatible endpoint support
 
-WHEN an Anthropic or OpenAI-compatible base URL is configured
+WHEN an Anthropic, OpenAI Responses-compatible, or OpenAI Chat Completions-compatible endpoint is configured
 THE SYSTEM SHALL use the configured URL as the exact request endpoint
+AND SHALL route each model only to an endpoint matching its declared wire format
 AND SHALL NOT append hidden provider-specific path suffixes
 
 WHEN no base URL override is configured
@@ -96,6 +97,11 @@ THE SYSTEM SHALL send:
 - Conversation message history
 - Tool definitions
 - Model-specific parameters
+
+WHEN a model uses the Chat Completions backend
+THE SYSTEM SHALL translate system, user, assistant, tool-call, tool-result, text, and image content to Chat Completions-compatible messages
+AND SHALL preserve model-issued tool call IDs across normalization and subsequent tool-result history
+AND SHALL log unsupported provider-specific content blocks before dropping them
 
 WHEN request includes images
 THE SYSTEM SHALL encode appropriately for provider
@@ -204,6 +210,13 @@ THE SYSTEM SHALL parse into common format containing:
 
 WHEN response indicates tool use
 THE SYSTEM SHALL extract tool name, ID, and JSON input for each tool
+
+WHEN a Chat Completions response contains private reasoning content alongside final content
+THE SYSTEM SHALL omit private reasoning from user-visible normalized content
+AND SHALL preserve final text and tool calls
+
+WHEN a Chat Completions response reports cached prompt tokens
+THE SYSTEM SHALL split cached tokens from uncached input tokens without double counting
 
 **Rationale:** Normalized responses enable provider-agnostic state machine logic.
 
@@ -344,6 +357,17 @@ THE SYSTEM SHALL fall back to the non-streaming request path
 
 WHEN streaming connection is interrupted mid-response
 THE SYSTEM SHALL treat it as a retryable network error
+
+WHEN a Chat Completions streaming request is sent
+THE SYSTEM SHALL request a terminal usage chunk
+AND SHALL accumulate text, tool-call fragments, finish reason, and usage into the final normalized response
+
+WHEN a Chat Completions stream returns an inline error payload
+THE SYSTEM SHALL classify and surface that error
+AND SHALL NOT normalize it as an empty successful response
+
+WHEN a Chat Completions stream ends without a terminal finish reason or completion sentinel
+THE SYSTEM SHALL reject the incomplete stream as an invalid response
 
 **Rationale:** Token-by-token streaming enables progressive display of LLM output (REQ-BED-025). The provider layer must deliver partial content while still producing the same final response type for the state machine.
 

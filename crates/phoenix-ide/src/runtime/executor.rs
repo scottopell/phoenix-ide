@@ -4716,6 +4716,7 @@ where
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
         let llm_client = self.llm_client.clone();
+        let max_output_tokens = llm_client.max_output_tokens();
         let tool_executor = self.tool_executor.clone();
         let clearable_names = self.clearable_names.clone();
         let clear_watermark_cache = self.clear_watermark_cache.clone();

@@ -176,7 +176,9 @@ you (prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy
 | `ANTHROPIC_API_KEY` | Direct Anthropic API key | — |
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API base URL | — |
 | `OPENAI_API_KEY` | Direct OpenAI API key | — |
-| `OPENAI_BASE_URL` | Override the OpenAI API base URL | — |
+| `OPENAI_BASE_URL` | Legacy OpenAI endpoint override; routed only when its path matches the selected OpenAI wire format | — |
+| `OPENAI_RESPONSES_BASE_URL` | Exact endpoint for OpenAI Responses-compatible models | — |
+| `OPENAI_CHAT_COMPLETIONS_BASE_URL` | Exact endpoint for OpenAI Chat Completions-compatible models | — |
 | `DEFAULT_MODEL` | Preferred default model ID (used only if it actually registers) | first registered model |
 | `PHOENIX_LLM_MODELS` | Inline JSON array of additional model specs to add to the built-in registry | — |
 | `LLM_API_KEY_HELPER` | Command that prints a fresh API key/token on stdout (e.g. `claude` OAuth helper) | — |
@@ -202,8 +204,10 @@ model object has this shape:
     "id": "provider-compatible/model-id",
     "api_name": "optional-wire-model-name",
     "backend": "anthropic",
+    "family": "anthropic",
     "description": "Human-readable picker text",
     "context_window": 200000,
+    "max_output_tokens": 16384,
     "recommended": false,
     "supports_tool_search": false
   }
@@ -212,8 +216,11 @@ model object has this shape:
 
 `api_name` may be omitted; when absent Phoenix sends `id` as the wire model
 name. `backend` selects both route/auth family and wire protocol. Supported
-values are `anthropic` (Anthropic Messages-compatible) and `openai_responses`
-(OpenAI Responses-compatible).
+values are `anthropic` (Anthropic Messages-compatible), `openai_responses`
+(OpenAI Responses-compatible), and `openai_chat_completions` (OpenAI Chat
+Completions-compatible). `family` controls the user-facing provider label and
+defaults from `backend`; set it when model ownership differs from wire format.
+`max_output_tokens` is optional and defaults to a context-safe cap.
 
 Example Anthropic-compatible provider POC:
 
@@ -223,6 +230,15 @@ ANTHROPIC_BASE_URL=https://provider.example/v1/messages
 LLM_CUSTOM_HEADERS=source: my-provider-poc
 DEFAULT_MODEL=example/provider-model
 PHOENIX_LLM_MODELS=[{"id":"example/provider-model","backend":"anthropic","description":"Example Anthropic-compatible POC","context_window":200000,"recommended":false,"supports_tool_search":false}]
+```
+
+Example Chat Completions-compatible provider POC:
+
+```env
+OPENAI_API_KEY=provider-api-key
+OPENAI_CHAT_COMPLETIONS_BASE_URL=https://provider.example/v1/chat/completions
+DEFAULT_MODEL=example/chat-model
+PHOENIX_LLM_MODELS=[{"id":"example/chat-model","api_name":"provider/example/chat-model","backend":"openai_chat_completions","family":"Google","description":"Example Chat Completions-compatible POC","context_window":128000,"max_output_tokens":8192,"recommended":false,"supports_tool_search":false}]
 ```
 
 ### TLS

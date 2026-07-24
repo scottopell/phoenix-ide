@@ -67,7 +67,9 @@ impl DiscoveredModels {
         match backend {
             ModelBackend::Anthropic => self.anthropic_listed,
             ModelBackend::OpenAIResponses => self.openai_responses_listed,
-            ModelBackend::Mock => false,
+            // Chat Completions models bypass discovery filtering; they always
+            // appear as configured regardless of what the gateway listing returns.
+            ModelBackend::OpenAIChatCompletions | ModelBackend::Mock => false,
         }
     }
 
@@ -76,7 +78,8 @@ impl DiscoveredModels {
         match backend {
             ModelBackend::Anthropic => &self.anthropic,
             ModelBackend::OpenAIResponses => &self.openai_responses,
-            ModelBackend::Mock => empty_ids(),
+            // Chat Completions has no dedicated discovery bucket.
+            ModelBackend::OpenAIChatCompletions | ModelBackend::Mock => empty_ids(),
         }
     }
 }

@@ -1175,6 +1175,7 @@ mod tests {
             id: "test-model".into(),
             api_name: "test-model-api".into(),
             backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
             description: "test".into(),
             context_window: 200_000,
             max_output_tokens: None,

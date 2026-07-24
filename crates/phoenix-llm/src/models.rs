@@ -4,6 +4,11 @@ use std::collections::HashSet;
 
 use phoenix_core::domain::llm_types::ModelEffort;
 
+/// Default maximum output tokens when a model does not declare a smaller cap.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+const EXTERNAL_MODEL_DEFAULT_OUTPUT_RESERVE: usize = 2_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffortCapabilities {
     Unsupported,
@@ -169,6 +174,8 @@ pub enum ModelBackend {
     Anthropic,
     /// `OpenAI` Responses-compatible backend.
     OpenAIResponses,
+    /// `OpenAI` Chat Completions-compatible backend.
+    OpenAIChatCompletions,
     /// In-process deterministic mock backend.
     Mock,
 }
@@ -179,7 +186,7 @@ impl ModelBackend {
     pub fn display_name(self) -> &'static str {
         match self {
             ModelBackend::Anthropic => "Anthropic",
-            ModelBackend::OpenAIResponses => "OpenAI",
+            ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => "OpenAI",
             ModelBackend::Mock => "Mock",
         }
     }
@@ -189,16 +196,25 @@ impl ModelBackend {
     pub fn header_value(self) -> &'static str {
         match self {
             ModelBackend::Anthropic => "anthropic",
-            ModelBackend::OpenAIResponses => "openai",
+            ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => "openai",
             ModelBackend::Mock => "mock",
         }
     }
 
     #[must_use]
+    pub fn default_family(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::OpenAIResponses | Self::OpenAIChatCompletions => "OpenAI",
+            Self::Mock => "Mock",
+        }
+    }
+
     pub(crate) fn api_format(self) -> ApiFormat {
         match self {
             ModelBackend::Anthropic | ModelBackend::Mock => ApiFormat::Anthropic,
             ModelBackend::OpenAIResponses => ApiFormat::OpenAIResponses,
+            ModelBackend::OpenAIChatCompletions => ApiFormat::OpenAIChatCompletions,
         }
     }
 }
@@ -210,6 +226,8 @@ enum ExternalBackend {
     Anthropic,
     #[serde(rename = "openai_responses")]
     OpenAIResponses,
+    #[serde(rename = "openai_chat_completions")]
+    OpenAIChatCompletions,
 }
 
 impl From<ExternalBackend> for ModelBackend {
@@ -217,6 +235,7 @@ impl From<ExternalBackend> for ModelBackend {
         match value {
             ExternalBackend::Anthropic => ModelBackend::Anthropic,
             ExternalBackend::OpenAIResponses => ModelBackend::OpenAIResponses,
+            ExternalBackend::OpenAIChatCompletions => ModelBackend::OpenAIChatCompletions,
         }
     }
 }
@@ -228,6 +247,8 @@ pub(crate) enum ApiFormat {
     Anthropic,
     /// `OpenAI` Responses API
     OpenAIResponses,
+    /// `OpenAI` Chat Completions API
+    OpenAIChatCompletions,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -235,6 +256,7 @@ struct ExternalModelSpec {
     id: String,
     api_name: Option<String>,
     backend: ExternalBackend,
+    family: Option<String>,
     description: String,
     context_window: usize,
     max_output_tokens: Option<u32>,
@@ -269,6 +291,8 @@ pub struct ModelSpec {
     pub api_name: String,
     /// Backend route + wire protocol for this model.
     pub backend: ModelBackend,
+    /// User-facing provider family.
+    pub family: String,
     /// Human-readable description
     pub description: String,
     /// Platform-API context window ceiling. **Not** route-aware — the codex
@@ -278,6 +302,8 @@ pub struct ModelSpec {
     /// (which know whether they're on a bridge route) can still read it
     /// directly when needed; external callers must go through the method.
     pub(super) context_window: usize,
+    /// Operator-declared output ceiling for this route. `None` means use the
+    /// provider default/output-shape fallback for the active backend.
     pub(super) max_output_tokens: Option<u32>,
     /// Recommended for most users (shown by default in UI)
     pub recommended: bool,
@@ -313,6 +339,15 @@ impl ModelSpec {
     #[must_use]
     pub const fn output_token_limit(&self) -> Option<u32> {
         self.max_output_tokens
+    }
+
+    /// Provider compatibility-header value. A prefixed wire model name is the
+    /// routing authority; bare names fall back to the backend family.
+    #[must_use]
+    pub fn provider_header_value(&self) -> &str {
+        self.api_name
+            .split_once('/')
+            .map_or_else(|| self.backend.header_value(), |(prefix, _)| prefix)
     }
 
     #[must_use]
@@ -416,6 +451,14 @@ fn external_model_spec_from_config(
     if spec.context_window == 0 {
         return Err(format!("model '{id}' has invalid context_window 0"));
     }
+    let backend: ModelBackend = spec.backend.into();
+    let family = match spec.family {
+        Some(value) if value.trim().is_empty() => {
+            return Err(format!("model '{id}' has an empty family"));
+        }
+        Some(value) => value.trim().to_string(),
+        None => backend.default_family().to_string(),
+    };
     if let Some(max_output_tokens) = spec.max_output_tokens {
         if max_output_tokens == 0
             || usize::try_from(max_output_tokens).unwrap_or(usize::MAX) >= spec.context_window
@@ -426,6 +469,15 @@ fn external_model_spec_from_config(
             ));
         }
     }
+    let effective_output_limit = spec.max_output_tokens.unwrap_or(
+        u32::try_from(
+            spec.context_window
+                .saturating_sub(EXTERNAL_MODEL_DEFAULT_OUTPUT_RESERVE)
+                .max(1),
+        )
+        .unwrap_or(u32::MAX)
+        .min(DEFAULT_MAX_OUTPUT_TOKENS),
+    );
     if spec
         .effort_capabilities
         .as_ref()
@@ -433,7 +485,7 @@ fn external_model_spec_from_config(
             matches!(capabilities, ExternalEffortCapabilities::Supported { levels, .. }
             if levels.iter().any(|level| level.needs_extended_output_headroom()))
         })
-        && spec.max_output_tokens.is_none_or(|limit| limit < 64_000)
+        && effective_output_limit < 64_000
     {
         return Err(format!(
             "model '{id}' declares xhigh/max effort but max_output_tokens is below 64000"
@@ -456,7 +508,8 @@ fn external_model_spec_from_config(
     Ok(ModelSpec {
         id,
         api_name,
-        backend: spec.backend.into(),
+        backend,
+        family,
         description,
         context_window: spec.context_window,
         max_output_tokens: spec.max_output_tokens,
@@ -502,6 +555,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-opus-4-8".into(),
             api_name: "claude-opus-4-8".into(),
             backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
             description: "Claude Opus 4.8 (most capable, slower)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -514,6 +568,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-opus-4-7".into(),
             api_name: "claude-opus-4-7".into(),
             backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
             description: "Claude Opus 4.7 (legacy)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -526,6 +581,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-opus-4-6".into(),
             api_name: "claude-opus-4-6".into(),
             backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
             description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -538,6 +594,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-sonnet-5".into(),
             api_name: "claude-sonnet-5".into(),
             backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
             description: "Claude Sonnet 5 (balanced performance)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -550,6 +607,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-sonnet-4-6".into(),
             api_name: "claude-sonnet-4-6".into(),
             backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
             description: "Claude Sonnet 4.6 (legacy)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -562,6 +620,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-haiku-4-5".into(),
             api_name: "claude-haiku-4-5-20251001".into(),
             backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
             max_output_tokens: None,
@@ -580,6 +639,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.6-sol".into(),
             api_name: "gpt-5.6-sol".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
             description: "GPT-5.6 Sol (frontier, 1M context)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -592,6 +652,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.6-luna".into(),
             api_name: "gpt-5.6-luna".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
             description: "GPT-5.6 Luna (frontier, 1M context)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -604,6 +665,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.6-terra".into(),
             api_name: "gpt-5.6-terra".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
             description: "GPT-5.6 Terra (frontier, 1M context)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -616,6 +678,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.5".into(),
             api_name: "gpt-5.5".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
             description: "GPT-5.5 (frontier, 1M context)".into(),
             context_window: 1_000_000,
             max_output_tokens: None,
@@ -628,6 +691,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.4".into(),
             api_name: "gpt-5.4".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
             description: "GPT-5.4 (frontier, native computer use)".into(),
             context_window: 400_000,
             max_output_tokens: None,
@@ -640,6 +704,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.4-mini".into(),
             api_name: "gpt-5.4-mini".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
             description: "GPT-5.4 Mini (fast, efficient)".into(),
             context_window: 400_000,
             max_output_tokens: None,
@@ -648,11 +713,26 @@ pub fn all_models() -> Vec<ModelSpec> {
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_gpt_54(),
         },
+        // GPT-5 Codex models (responses API)
+        ModelSpec {
+            id: "gpt-5.3-codex".into(),
+            api_name: "gpt-5.3-codex".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-5.3 Codex (latest code model)".into(),
+            context_window: 200_000,
+            max_output_tokens: None,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: EffortCapabilities::unknown(),
+        },
         // Mock model for frontend development without API keys
         ModelSpec {
             id: "mock".into(),
             api_name: "mock".into(),
             backend: ModelBackend::Mock,
+            family: "Mock".into(),
             description: "Mock (lorem ipsum for UI dev)".into(),
             context_window: 200_000,
             max_output_tokens: None,
@@ -786,6 +866,31 @@ mod tests {
         .expect("top-level external model array parses");
 
         assert!(models.is_empty());
+    }
+
+    #[test]
+    fn parses_chat_backend_with_independent_family_and_output_cap() {
+        let models = parse_external_models(
+            r#"[{"id":"example/chat-model","api_name":"provider/example/chat-model","backend":"openai_chat_completions","family":"Example AI","description":"Compatible chat model","context_window":128000,"max_output_tokens":8192,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("chat model config should parse");
+
+        let model = &models[0];
+        assert_eq!(model.backend, ModelBackend::OpenAIChatCompletions);
+        assert_eq!(model.backend.api_format(), ApiFormat::OpenAIChatCompletions);
+        assert_eq!(model.family, "Example AI");
+        assert_eq!(model.provider_header_value(), "provider");
+        assert_eq!(model.output_token_limit(), Some(8_192));
+    }
+
+    #[test]
+    fn rejects_empty_family_and_output_cap_outside_context_window() {
+        for raw in [
+            r#"[{"id":"bad-family","backend":"openai_chat_completions","family":" ","description":"Bad","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"bad-output","backend":"openai_chat_completions","description":"Bad","context_window":8192,"max_output_tokens":8192,"recommended":false,"supports_tool_search":false}]"#,
+        ] {
+            assert!(parse_external_models(raw).unwrap().is_empty());
+        }
     }
 
     #[test]
