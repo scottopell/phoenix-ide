@@ -120,10 +120,12 @@ AND search within explicit file-size, anchor-size, and candidate-work bounds for
 AND treat repeated current-file lines as insufficient evidence
 AND require confidence-producing lines to occur in anchor order within the returned snippet, unless one surviving line is globally unique
 AND return a bounded, deterministic list of line-numbered current-file snippets when reliable candidates exist
-AND preserve the candidate snippets' exact current-file bytes, including line endings
-AND omit a candidate rather than truncate a line that would no longer be directly reusable as oldText
-AND identify the snippets as advisory evidence that does not authorize an approximate or non-unique edit
-AND instruct the agent to retry with exact current text and the request's original uniqueness semantics
+AND preserve the candidate context snippets' exact current-file bytes, including line endings
+AND omit a candidate rather than truncate a line or emit content that conflicts with its output boundary
+AND identify the snippets as advisory location context rather than directly reusable oldText or authorization for an approximate or non-unique edit
+AND instruct replace callers to select only the intended stale span's exact current text, excluding unrelated context
+AND instruct insert callers to select only the intended anchor's exact current text and preserve whether insertion occurs before or after that entire anchor
+AND instruct the agent to retry with the request's original uniqueness semantics
 
 WHEN no reliable candidate exists or the candidate search exceeds its bounds
 THE SYSTEM SHALL omit candidate snippets

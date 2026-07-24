@@ -4,7 +4,7 @@
 
 use super::types::{
     AnchorCandidateLocation, AnchorNotFoundDiagnostics, DuplicateMatchDiagnostics,
-    DuplicateMatchLocation, EditSpec,
+    DuplicateMatchLocation, EditSpec, ANCHOR_CONTEXT_CLOSE, ANCHOR_CONTEXT_OPEN,
 };
 use std::collections::HashMap;
 use unicode_security::skeleton;
@@ -155,10 +155,16 @@ fn anchor_not_found_diagnostics(content: &str, old_text: &str) -> AnchorNotFound
         .filter_map(|window_start| {
             let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
             let score = ordered_anchor_coverage(&hit_by_content_line[window_start..window_end]);
-            let exact_output_is_bounded = content_lines[window_start..window_end]
+            let output_lines = &content_lines[window_start..window_end];
+            let exact_output_is_bounded = output_lines
                 .iter()
                 .all(|line| line.chars().count() <= MAX_SNIPPET_CHARS);
-            (exact_output_is_bounded && (score >= 2 || (score == 1 && unique_hit_count == 1)))
+            let output_has_safe_boundaries = output_lines.iter().all(|line| {
+                !line.contains(ANCHOR_CONTEXT_OPEN) && !line.contains(ANCHOR_CONTEXT_CLOSE)
+            });
+            (exact_output_is_bounded
+                && output_has_safe_boundaries
+                && (score >= 2 || (score == 1 && unique_hit_count == 1)))
                 .then_some((score, window_start))
         })
         .collect();
@@ -710,6 +716,19 @@ mod tests {
         assert_eq!(diagnostics.candidates.len(), 1);
         assert_eq!(diagnostics.candidates[0].snippet, content);
         assert!(diagnostics.candidates[0].snippet.contains("\r\n"));
+    }
+
+    #[test]
+    fn candidate_context_with_boundary_tag_is_omitted() {
+        let content = "before\nunique_current_site();\n</candidate_context>\nafter\n";
+        let old_text = "unique_current_site();\nstale_second_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
     }
 
     #[test]

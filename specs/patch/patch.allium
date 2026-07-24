@@ -178,10 +178,13 @@ rule MatchNotFound {
         -- A candidate requires multiple globally unique surviving anchor lines in
         -- anchor order within the emitted five-line window, or one globally unique
         -- surviving line across the diagnostic search. Up to three deterministic,
-        -- non-overlapping line-numbered snippets preserve exact current-file bytes,
-        -- including line endings; a line that exceeds the output bound causes that
-        -- candidate to be omitted rather than truncated. Repeated lines do not
-        -- contribute confidence. Retry guidance preserves the original request's
+        -- non-overlapping line-numbered context snippets preserve exact current-file
+        -- bytes, including line endings; a line that exceeds the output bound or
+        -- conflicts with the context boundary causes that candidate to be omitted.
+        -- Context is location evidence, not directly reusable oldText. Replace
+        -- guidance selects only the intended stale span; insert guidance selects only
+        -- the intended anchor and preserves before/after placement. Repeated lines do
+        -- not contribute confidence. Retry guidance preserves the original request's
         -- unique-match or replace-all semantics. If confidence or work bounds fail,
         -- candidates is empty and the caller requests a read.
 }

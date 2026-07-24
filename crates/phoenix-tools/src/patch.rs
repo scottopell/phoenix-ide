@@ -703,7 +703,7 @@ mod tests {
         assert!(!result.is_success(), "expected error: {}", result.output());
         assert_eq!(
             result.output(),
-            "Patch 1 (replace) failed: oldText not found in file. The anchor is stale, but these bounded current-file regions may contain the intended site:\n- exact current text around line 1 (between candidate tags):\n<candidate>before\nfn target() {\n    let current = 2;\n    finish();\n}\n</candidate>\nCandidates are advisory and do not authorize an edit. Retry with exact current text as oldText. The replacement still requires one unique match."
+            "Patch 1 (replace) failed: oldText not found in file. The anchor is stale, but these bounded current-file context regions may contain the intended site:\n- context around line 1 (between candidate_context tags):\n<candidate_context>before\nfn target() {\n    let current = 2;\n    finish();\n}\n</candidate_context>\nContext regions are advisory location evidence, not oldText and not authorization to edit. Use the context to locate the intended stale span, then retry with only that span's exact current text as oldText. Do not include unrelated surrounding context. The replacement still requires one unique match."
         );
         assert_eq!(fs::read_to_string(test_file).unwrap(), current);
     }

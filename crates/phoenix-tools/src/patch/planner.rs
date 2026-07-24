@@ -141,6 +141,17 @@ impl PatchPlanner {
         })
     }
 
+    fn retry_requirement(operation: Operation) -> AnchorRetryRequirement {
+        match operation {
+            Operation::Replace => AnchorRetryRequirement::Replace,
+            Operation::InsertBefore => AnchorRetryRequirement::InsertBefore,
+            Operation::InsertAfter => AnchorRetryRequirement::InsertAfter,
+            Operation::AppendEof | Operation::PrependBof | Operation::Overwrite => {
+                unreachable!("non-anchor operation cannot reach anchor matching")
+            }
+        }
+    }
+
     fn locate_anchor(
         original: &str,
         old_text: &str,
@@ -152,7 +163,7 @@ impl PatchPlanner {
                 patch_number,
                 operation,
                 diagnostics,
-                retry_requirement: AnchorRetryRequirement::Unique,
+                retry_requirement: Self::retry_requirement(operation),
             },
             MatchError::NotUnique(diagnostics) => PatchError::AnchorNotUnique {
                 patch_number,
@@ -980,13 +991,46 @@ mod tests {
                 diagnostics: AnchorNotFoundDiagnostics {
                     candidates: Vec::new(),
                 },
-                retry_requirement: AnchorRetryRequirement::Unique,
+                retry_requirement: AnchorRetryRequirement::InsertAfter,
             }
         );
         assert_eq!(
             err.to_string(),
-            "Patch 2 (insert_after) failed: oldText not found in file. No reliable nearby current text was found. Re-read the file before retrying. Retry with exact current text as oldText. The replacement still requires one unique match."
+            "Patch 2 (insert_after) failed: oldText not found in file. No reliable nearby current text was found. Re-read the file before retrying. Use the context to locate the intended anchor, then retry with only that anchor's exact current text as oldText. The insertion occurs immediately after the entire unique anchor."
         );
+    }
+
+    #[test]
+    fn insert_not_found_guidance_preserves_anchor_position() {
+        for (operation, position) in [
+            (Operation::InsertBefore, "immediately before"),
+            (Operation::InsertAfter, "immediately after"),
+        ] {
+            let mut planner = PatchPlanner::new();
+            let error = planner
+                .plan(
+                    &path("test.txt"),
+                    Some("before\nunique_anchor();\nafter\n"),
+                    &[PatchRequest {
+                        operation,
+                        old_text: Some("unique_anchor();\nstale".to_string()),
+                        new_text: Some("inserted".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    }],
+                )
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(position), "{error}");
+            assert!(
+                error.contains("only that anchor's exact current text"),
+                "{error}"
+            );
+            assert!(error.contains("not oldText"), "{error}");
+        }
     }
 
     #[test]
