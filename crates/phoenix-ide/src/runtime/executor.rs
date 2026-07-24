@@ -6485,29 +6485,27 @@ fn strip_unavailable_tool_blocks(
     // tool is hidden for new calls; preserve their result text without sending
     // undeclared tool_use/tool_result blocks to the provider.
     let mut stripped_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut flatten_result_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut flatten_result_calls: std::collections::HashMap<String, (String, serde_json::Value)> =
+        std::collections::HashMap::new();
     for msg in &messages {
         for block in &msg.content {
-            if let ContentBlock::ToolUse { id, name, .. } = block {
+            if let ContentBlock::ToolUse { id, name, input } = block {
                 if !available_tools.contains(name.as_str()) {
                     stripped_ids.insert(id.clone());
                     if flatten_results || name == "commission_review" {
-                        flatten_result_ids.insert(id.clone());
+                        flatten_result_calls.insert(id.clone(), (name.clone(), input.clone()));
                     }
                 }
             }
         }
     }
 
-    if stripped_ids.is_empty() {
-        return messages;
+    if !stripped_ids.is_empty() {
+        tracing::debug!(
+            count = stripped_ids.len(),
+            "Stripping tool_use/tool_result blocks for unavailable tools"
+        );
     }
-
-    tracing::debug!(
-        count = stripped_ids.len(),
-        "Stripping tool_use/tool_result blocks for unavailable tools"
-    );
 
     // Second pass: filter out stripped tool_use/tool_result blocks.
     // For ToolSearchToolResult, remove individual bad references but keep the block
@@ -6530,9 +6528,9 @@ fn strip_unavailable_tool_blocks(
                         ref tool_use_id,
                         ref content,
                         ref images,
-                        ..
+                        is_error
                     } => {
-                        if flatten_result_ids.contains(tool_use_id) {
+                        if let Some((name, input)) = flatten_result_calls.get(tool_use_id) {
                             if !images.is_empty() {
                                 tracing::debug!(
                                     count = images.len(),
@@ -6540,7 +6538,10 @@ fn strip_unavailable_tool_blocks(
                                 );
                             }
                             Some(ContentBlock::Text {
-                                text: format!("[historical tool result]\n{content}"),
+                                text: format!(
+                                    "[historical tool result]\ntool: {name}\ninput: {input}\nstatus: {}\noutput:\n{content}",
+                                    if is_error { "error" } else { "success" }
+                                ),
                             })
                         } else if stripped_ids.contains(tool_use_id) {
                             None
@@ -7190,24 +7191,33 @@ mod strip_tool_blocks_tests {
         let terminal: std::collections::HashSet<&str> =
             ["submit_result", "submit_error"].into_iter().collect();
         let msgs = vec![
-            assistant(vec![tool_use("search-1", "search")]),
+            assistant(vec![ContentBlock::ToolUse {
+                id: "search-1".to_string(),
+                name: "search".to_string(),
+                input: serde_json::json!({ "pattern": "needle", "path": "src" }),
+            }]),
             user(vec![ContentBlock::ToolResult {
                 tool_use_id: "search-1".to_string(),
                 content: "important finding".to_string(),
                 images: Vec::new(),
-                is_error: false,
+                is_error: true,
             }]),
         ];
 
         let out = strip_unavailable_tool_blocks(msgs, &terminal, true);
 
         assert_eq!(out.len(), 1);
-        assert!(matches!(
-            &out[0].content[0],
-            ContentBlock::Text { text }
-                if text.contains("historical tool result")
-                    && text.contains("important finding")
-        ));
+        let ContentBlock::Text { text } = &out[0].content[0] else {
+            panic!("expected flattened text, got {:?}", out[0].content[0]);
+        };
+        assert!(text.contains("historical tool result"), "got: {text}");
+        assert!(text.contains("tool: search"), "got: {text}");
+        assert!(
+            text.contains(r#"input: {"pattern":"needle","path":"src"}"#),
+            "got: {text}"
+        );
+        assert!(text.contains("status: error"), "got: {text}");
+        assert!(text.contains("important finding"), "got: {text}");
         assert!(!out
             .iter()
             .flat_map(|message| &message.content)
@@ -7217,6 +7227,31 @@ mod strip_tool_blocks_tests {
                     ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
                 )
             }));
+    }
+
+    #[test]
+    fn grace_normalization_filters_server_tool_only_references() {
+        let terminal: std::collections::HashSet<&str> =
+            ["submit_result", "submit_error"].into_iter().collect();
+        let msgs = vec![assistant(vec![
+            server_tool_use("srv1", "tool_search_tool_regex"),
+            tool_search_result("srv1", &["search", "read_file"]),
+        ])];
+
+        let out = strip_unavailable_tool_blocks(msgs, &terminal, true);
+
+        let result = out[0]
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolSearchToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("server tool result remains paired with its server tool use");
+        assert!(
+            result.tool_references.is_empty(),
+            "ordinary tool references must not survive a terminal-only request"
+        );
     }
 
     #[test]
