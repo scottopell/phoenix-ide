@@ -728,6 +728,18 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
                 })
             }
         },
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled {
+            contract_id,
+            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(identity),
+            reason,
+            resolved_at,
+        } => serde_json::to_string(&BashWakeResolutionObservation {
+            contract_id,
+            handle: &identity.handle_id,
+            status: "cancelled",
+            resolved_at: timestamp_rfc3339(*resolved_at),
+            reason: Some(format!("{reason:?}")),
+        }),
         phoenix_workflow::wake_profile::WakeTerminalPayload::Expired {
             contract_id,
             resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(identity),
@@ -2039,6 +2051,7 @@ mod tests {
             .unwrap();
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn mixed_materialized_batch_uses_batch_auto_resume_decision() {
         let (db, repo) = open_repo().await;
@@ -2110,6 +2123,12 @@ mod tests {
             pending[0].receipt.terminal,
             phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
         ));
+        let cancelled: serde_json::Value =
+            serde_json::from_str(&render_terminal_result(&pending[0])).unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["handle"], "b-cancelled");
+        assert_eq!(cancelled["reason"], "ExplicitCancel");
+        assert!(cancelled.get("Cancelled").is_none());
 
         let manager = Arc::new(crate::runtime::RuntimeManager::new(
             db,
