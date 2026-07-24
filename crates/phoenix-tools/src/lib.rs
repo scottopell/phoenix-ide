@@ -722,9 +722,12 @@ fn browser_tools() -> Vec<Arc<dyn Tool>> {
 /// `agents` is the working-directory's discovered named-agent catalog (sorted
 /// by name), captured into `SpawnAgentsTool` so its `agent_type` enum reflects
 /// what's available (REQ-AG-004). Empty when none are discovered.
-fn parent_coordination_tools(agents: Vec<phoenix_agents::AgentDefinition>) -> Vec<Arc<dyn Tool>> {
+fn parent_coordination_tools(
+    agents: Vec<phoenix_agents::AgentDefinition>,
+    model_ids: Vec<String>,
+) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(SpawnAgentsTool::with_agents(agents)),
+        Arc::new(SpawnAgentsTool::with_catalogs(agents, model_ids)),
         Arc::new(AskUserQuestionTool),
         Arc::new(SkillTool),
     ]
@@ -793,13 +796,16 @@ impl ToolRegistry {
     pub fn explore(
         tasks_dir_name: &str,
         agents: Vec<phoenix_agents::AgentDefinition>,
+        model_ids: Vec<String>,
         policy: ExploreToolPolicy,
     ) -> Self {
         match policy.bash() {
             ExploreBashCapability::Sandboxed => {
-                Self::explore_with_sandbox(tasks_dir_name, agents, policy)
+                Self::explore_with_sandbox(tasks_dir_name, agents, model_ids, policy)
             }
-            ExploreBashCapability::Unavailable => Self::explore_no_sandbox(tasks_dir_name, agents),
+            ExploreBashCapability::Unavailable => {
+                Self::explore_no_sandbox(tasks_dir_name, agents, model_ids)
+            }
         }
     }
 
@@ -824,10 +830,11 @@ impl ToolRegistry {
     pub fn explore_no_sandbox(
         tasks_dir_name: &str,
         agents: Vec<phoenix_agents::AgentDefinition>,
+        model_ids: Vec<String>,
     ) -> Self {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
-        tools.extend(parent_coordination_tools(agents));
+        tools.extend(parent_coordination_tools(agents, model_ids));
         tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
             tasks_dir_name,
         )));
@@ -842,6 +849,7 @@ impl ToolRegistry {
     pub fn explore_with_sandbox(
         tasks_dir_name: &str,
         agents: Vec<phoenix_agents::AgentDefinition>,
+        model_ids: Vec<String>,
         policy: ExploreToolPolicy,
     ) -> Self {
         debug_assert!(policy.has_sandboxed_bash());
@@ -849,7 +857,7 @@ impl ToolRegistry {
         tools.extend(browser_tools());
         tools.push(Arc::new(SandboxedBashTool));
         if policy.allow_top_level_spawn_agents() {
-            tools.extend(parent_coordination_tools(agents));
+            tools.extend(parent_coordination_tools(agents, model_ids));
         } else {
             tools.extend(explore_coordination_tools());
         }
@@ -864,14 +872,14 @@ impl ToolRegistry {
     #[cfg(test)] // Only used in tests now; production uses mode-aware constructors
     #[must_use]
     pub fn standard() -> Self {
-        Self::new_with_options(false, Vec::new())
+        Self::new_with_options(false, Vec::new(), Vec::new())
     }
 
     /// Create tool registry for Direct mode.
     /// Full tool suite -- same as Work mode.
     #[must_use]
-    pub fn direct(agents: Vec<phoenix_agents::AgentDefinition>) -> Self {
-        Self::new_with_options(false, agents)
+    pub fn direct(agents: Vec<phoenix_agents::AgentDefinition>, model_ids: Vec<String>) -> Self {
+        Self::new_with_options(false, agents, model_ids)
     }
 
     /// Add `propose_task` to a writing-mode registry (Work, Branch, or
@@ -945,7 +953,11 @@ impl ToolRegistry {
     ///
     /// `agents` feeds the parent `spawn_agents` tool's `agent_type` enum; it is
     /// unused for sub-agents (which cannot spawn).
-    fn new_with_options(is_sub_agent: bool, agents: Vec<phoenix_agents::AgentDefinition>) -> Self {
+    fn new_with_options(
+        is_sub_agent: bool,
+        agents: Vec<phoenix_agents::AgentDefinition>,
+        model_ids: Vec<String>,
+    ) -> Self {
         let mut tools = read_only_tools();
         tools.extend(write_tools());
         tools.extend(browser_tools());
@@ -957,7 +969,7 @@ impl ToolRegistry {
             // Parent conversations can read the terminal, spawn sub-agents,
             // ask user questions, and invoke skills.
             tools.extend(parent_terminal_tools());
-            tools.extend(parent_coordination_tools(agents));
+            tools.extend(parent_coordination_tools(agents, model_ids));
         }
 
         Self { tools }
@@ -1033,7 +1045,7 @@ impl ToolRegistry {
     /// Legacy constructor - use mode-aware constructors instead
     #[deprecated(note = "Use ToolRegistry::explore_*() or standard() instead")]
     pub fn new(_working_dir: PathBuf, _llm_selector: Arc<dyn LlmSelector>) -> Self {
-        Self::new_with_options(false, Vec::new())
+        Self::new_with_options(false, Vec::new(), Vec::new())
     }
 
     /// Legacy constructor - use `for_subagent()` instead
@@ -1150,14 +1162,14 @@ mod tests {
         .collect();
 
         let registries: Vec<(&str, ToolRegistry)> = vec![
-            ("direct", ToolRegistry::direct(Vec::new())),
+            ("direct", ToolRegistry::direct(Vec::new(), Vec::new())),
             (
                 "explore_no_sandbox",
-                ToolRegistry::explore("tasks", Vec::new(), no_sandbox_policy()),
+                ToolRegistry::explore("tasks", Vec::new(), Vec::new(), no_sandbox_policy()),
             ),
             (
                 "explore_with_sandbox",
-                ToolRegistry::explore("tasks", Vec::new(), sandbox_policy()),
+                ToolRegistry::explore("tasks", Vec::new(), Vec::new(), sandbox_policy()),
             ),
             (
                 "subagent_explore",
@@ -1194,7 +1206,7 @@ mod tests {
             &["terminal_last_command", "terminal_command_history"];
 
         // Direct: full suite, no propose_task, no sub-agent submission tools.
-        let direct = names(&ToolRegistry::direct(Vec::new()));
+        let direct = names(&ToolRegistry::direct(Vec::new(), Vec::new()));
         assert!(direct.contains("bash"));
         assert!(direct.contains("patch"));
         assert!(direct.contains("tmux_run"));
@@ -1214,7 +1226,7 @@ mod tests {
         // propose_task on top of the full suite; the base `direct()` stays
         // propose_task-free above.
         let direct_fork = names(
-            &ToolRegistry::direct(Vec::new())
+            &ToolRegistry::direct(Vec::new(), Vec::new())
                 .with_propose_task()
                 .with_commission_review(),
         );
@@ -1226,6 +1238,7 @@ mod tests {
         // Explore (sandbox): read-only/planning tools + sandboxed bash.
         let work = names(&ToolRegistry::explore(
             "tasks",
+            Vec::new(),
             Vec::new(),
             sandbox_policy(),
         ));
@@ -1251,6 +1264,7 @@ mod tests {
         // only sees what's in the repo here.
         let explore = names(&ToolRegistry::explore(
             "tasks",
+            Vec::new(),
             Vec::new(),
             no_sandbox_policy(),
         ));
@@ -1336,7 +1350,7 @@ mod tests {
     #[test]
     fn bash_input_schema_flows_through_to_subagent_registries() {
         for (label, registry) in [
-            ("direct", ToolRegistry::direct(Vec::new())),
+            ("direct", ToolRegistry::direct(Vec::new(), Vec::new())),
             (
                 "subagent_explore",
                 ToolRegistry::for_subagent_explore(sandbox_policy()),

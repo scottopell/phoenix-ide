@@ -1592,6 +1592,31 @@ fn path_is_within(path: &str, root: &str) -> bool {
     }
 }
 
+fn nonblank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LlmToolSurface {
+    Full,
+    SubAgentTerminal,
+}
+
+impl LlmToolSurface {
+    fn callable_tools(
+        self,
+        tools: Vec<phoenix_llm::ToolDefinition>,
+    ) -> Vec<phoenix_llm::ToolDefinition> {
+        match self {
+            Self::Full => tools,
+            Self::SubAgentTerminal => tools
+                .into_iter()
+                .filter(|tool| matches!(tool.name.as_str(), "submit_result" | "submit_error"))
+                .collect(),
+        }
+    }
+}
+
 /// Default cap on consecutive LLM requests within a single parent-conversation
 /// user turn. Distinct from sub-agent `max_turns`: this resets on every
 /// `Event::UserMessage`, so a long conversation is never penalised — only a
@@ -3676,43 +3701,30 @@ where
             ) => Some(worktree_path.as_str()),
             _ => None,
         };
-        if let Some(worktree_root) = parent_worktree_path {
-            for (task, &(_, mode)) in input.tasks.iter().zip(&resolved_tasks) {
-                if mode != SubAgentMode::Work {
-                    continue;
-                }
-                let Some(override_cwd) = task.cwd.as_deref() else {
-                    continue;
-                };
-                if !path_is_within(override_cwd, worktree_root) {
-                    let result = ToolResult::error(
-                        tool_use_id.clone(),
-                        format!(
-                            "Work sub-agent cwd '{override_cwd}' must be inside the parent's \
-                             worktree '{worktree_root}'. Omit `cwd` to inherit the worktree, \
-                             or pass an absolute path that resolves under it."
-                        ),
-                    );
-                    return Ok(Some(Event::ToolComplete {
-                        tool_use_id,
-                        result,
-                    }));
-                }
-            }
-        }
-
         // Resolve and validate every spec BEFORE sending any spawn request.
         // Model validation can fail per-task; doing it inside the send loop
         // would leave earlier tasks already spawned (and untracked, since the
         // tool call then reports failure instead of SpawnAgentsComplete) when a
         // later task's effective model is unknown. Build-and-validate first,
         // then send the whole batch.
-        let parent_cwd = self.context.working_dir.to_string_lossy().to_string();
         let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
         for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
-            let cwd = task.cwd.clone().unwrap_or_else(|| parent_cwd.clone());
-            let cwd = match crate::conversation_cwd::validate_conversation_cwd(&cwd) {
+            let cwd_override = nonblank(task.cwd.as_deref());
+            let cwd_path = cwd_override.map_or_else(
+                || self.context.working_dir.clone(),
+                |cwd| {
+                    let path = std::path::Path::new(cwd);
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        self.context.working_dir.join(path)
+                    }
+                },
+            );
+            let cwd = match crate::conversation_cwd::validate_conversation_cwd(
+                cwd_path.to_string_lossy(),
+            ) {
                 Ok(valid) => valid.into_raw(),
                 Err(e) => {
                     let result = ToolResult::error(
@@ -3726,15 +3738,31 @@ where
                 }
             };
 
+            if mode == SubAgentMode::Work
+                && parent_worktree_path.is_some_and(|root| !path_is_within(&cwd, root))
+            {
+                let worktree_root = parent_worktree_path.expect("checked as present");
+                let result = ToolResult::error(
+                    tool_use_id.clone(),
+                    format!(
+                        "Work sub-agent cwd '{cwd}' must be inside the parent's worktree \
+                         '{worktree_root}'. Omit `cwd` to inherit the worktree, or pass a path \
+                         that resolves under it."
+                    ),
+                );
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id,
+                    result,
+                }));
+            }
+
             // Resolve model: task field > agent default > mode default
             // (REQ-AG-005, REQ-PROJ-008). An explicit model from either the
             // task or the agent definition must exist in the registry.
-            let explicit_model = task
-                .model
-                .clone()
-                .or_else(|| agent.and_then(|a| a.model.clone()));
+            let explicit_model = nonblank(task.model.as_deref())
+                .or_else(|| agent.and_then(|definition| nonblank(definition.model.as_deref())));
             let resolved_model = if let Some(model) = explicit_model {
-                if self.llm_registry.get(&model).is_none() {
+                if self.llm_registry.get(model).is_none() {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
                         format!(
@@ -3748,7 +3776,7 @@ where
                         result,
                     }));
                 }
-                model
+                model.to_string()
             } else {
                 match mode {
                     SubAgentMode::Explore => self
@@ -3763,6 +3791,13 @@ where
                 SubAgentMode::Explore => 20,
                 SubAgentMode::Work => 50,
             });
+
+            tracing::debug!(
+                mode = ?mode,
+                model_source = if explicit_model.is_some() { "override" } else { "default" },
+                cwd_source = if cwd_override.is_some() { "override" } else { "parent" },
+                "resolved sub-agent spawn defaults"
+            );
 
             specs.push(SubAgentSpec {
                 agent_id: uuid::Uuid::new_v4().to_string(),
@@ -4347,78 +4382,89 @@ where
             }
         }
 
-        // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
-        // finite turn budget. Grace turn mechanism gives the model one extra LLM
-        // turn to call submit_result or submit_error before hard-stopping.
-        if self.context.max_turns > 0 {
-            self.llm_turn_count += 1;
-            if self.llm_turn_count > self.context.max_turns {
-                if self.grace_turn_granted {
-                    // Second hit: hard stop with partial result extraction
-                    // (REQ-BED-026 SubAgentTurnLimitHardStop)
-                    tracing::info!(
-                        conv_id = %self.context.conversation_id,
-                        turns = self.llm_turn_count,
-                        max = self.context.max_turns,
-                        "Sub-agent grace turn exhausted, extracting partial results"
-                    );
-
-                    self.handle_grace_turn_hard_stop().await;
-                    return Ok(None);
-                }
-
-                // First hit: grant grace turn (REQ-BED-026 SubAgentTurnLimitGraceTurn)
-                self.grace_turn_granted = true;
-                tracing::info!(
-                    conv_id = %self.context.conversation_id,
-                    turns = self.llm_turn_count,
-                    max = self.context.max_turns,
-                    "Sub-agent reached turn limit, granting grace turn"
-                );
-                self.grace_turn_started_at = Some(Utc::now());
-
-                // Inject a meta user message with mode-specific terminal guidance.
-                // Uses UserContent::meta() so it appears in the LLM context
-                // via the existing User message path (not System, which is
-                // UI-only bookkeeping and not sent to the LLM).
-                let msg_id = uuid::Uuid::new_v4().to_string();
-                let grace_prompt = if matches!(
-                    &self.context.mode_context,
-                    Some(ModeContext::Explore { .. })
-                ) {
-                    "You have reached your turn limit. Only submit_result or submit_error can \
-                         produce a useful terminal outcome from this grace turn. Call submit_result \
-                         with whatever findings you have so far, or call submit_error if you are \
-                         blocked and do not have useful findings to report. Other tool calls will \
-                         not help complete this grace turn."
-                } else {
-                    "You have reached your turn limit. Only submit_result or submit_error can \
-                         produce a useful terminal outcome from this grace turn. If your assigned \
-                         task required code changes and you have not made them, call submit_error \
-                         and include the useful analysis, plan, blockers, and any partial progress \
-                         for the parent. Only call submit_result if the assigned implementation is \
-                         actually complete."
-                };
-                let content = MessageContent::User(crate::db::UserContent::meta(grace_prompt));
-                if let Err(e) = self
-                    .storage
-                    .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
-                    .await
-                {
-                    tracing::warn!(error = %e, "Failed to persist grace turn message");
-                }
-
-                // Allow the normal LLM request to proceed (don't return, don't
-                // send UserCancel). The meta message will appear in the next
-                // build_llm_messages call as a user-role message.
-            }
-        }
-
         let retry_attempt = match self.state {
             ConvState::LlmRequesting { attempt }
             | ConvState::SeededLlmRequesting { attempt, .. } => attempt,
             _ => 1,
         };
+        let mut tool_surface = LlmToolSurface::Full;
+
+        // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
+        // finite turn budget. Grace turn mechanism gives the model one extra LLM
+        // turn to call submit_result or submit_error before hard-stopping.
+        if self.context.max_turns > 0 {
+            if !(self.grace_turn_granted && retry_attempt > 1) {
+                self.llm_turn_count += 1;
+            }
+            if self.llm_turn_count > self.context.max_turns {
+                if self.grace_turn_granted {
+                    if retry_attempt == 1 {
+                        // A new LLM cycle after the grace response is the hard stop.
+                        // Provider retries of the grace request retain its terminal
+                        // surface and do not consume another application turn.
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            turns = self.llm_turn_count,
+                            max = self.context.max_turns,
+                            "Sub-agent grace turn exhausted, extracting partial results"
+                        );
+
+                        self.handle_grace_turn_hard_stop().await;
+                        return Ok(None);
+                    }
+                } else {
+                    // First hit: grant grace turn (REQ-BED-026 SubAgentTurnLimitGraceTurn)
+                    self.grace_turn_granted = true;
+                    tracing::info!(
+                        conv_id = %self.context.conversation_id,
+                        turns = self.llm_turn_count,
+                        max = self.context.max_turns,
+                        "Sub-agent reached turn limit, granting grace turn"
+                    );
+                    self.grace_turn_started_at = Some(Utc::now());
+                    tool_surface = LlmToolSurface::SubAgentTerminal;
+
+                    // Inject a meta user message with mode-specific terminal guidance.
+                    // Uses UserContent::meta() so it appears in the LLM context
+                    // via the existing User message path (not System, which is
+                    // UI-only bookkeeping and not sent to the LLM).
+                    let msg_id = uuid::Uuid::new_v4().to_string();
+                    let grace_prompt = if matches!(
+                        &self.context.mode_context,
+                        Some(ModeContext::Explore { .. })
+                    ) {
+                        "You have reached your turn limit. Only submit_result or submit_error can \
+                         produce a useful terminal outcome from this grace turn. Call submit_result \
+                         with whatever findings you have so far, or call submit_error if you are \
+                         blocked and do not have useful findings to report. Other tool calls will \
+                         not help complete this grace turn."
+                    } else {
+                        "You have reached your turn limit. Only submit_result or submit_error can \
+                         produce a useful terminal outcome from this grace turn. If your assigned \
+                         task required code changes and you have not made them, call submit_error \
+                         and include the useful analysis, plan, blockers, and any partial progress \
+                         for the parent. Only call submit_result if the assigned implementation is \
+                         actually complete."
+                    };
+                    let content = MessageContent::User(crate::db::UserContent::meta(grace_prompt));
+                    if let Err(e) = self
+                        .storage
+                        .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "Failed to persist grace turn message");
+                    }
+
+                    // Allow the normal LLM request to proceed (don't return, don't
+                    // send UserCancel). The meta message will appear in the next
+                    // build_llm_messages call as a user-role message.
+                }
+            }
+        }
+
+        if self.grace_turn_granted && retry_attempt > 1 {
+            tool_surface = LlmToolSurface::SubAgentTerminal;
+        }
 
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
         // physically cannot send a ToolExecOutcome or other type.
@@ -4455,6 +4501,7 @@ where
         let is_coordinator = self.context.is_coordinator;
         let coordinator_read_service = self.coordinator_read_service.clone();
         let explore_bash = self.context.explore_bash;
+        let request_tool_surface = tool_surface;
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -4569,11 +4616,11 @@ where
 
             // Build tool definitions before the mode prompt so Explore prose can
             // describe the same tool surface the model receives.
-            let mut tools = tool_executor.definitions_for_language(llm_language).await;
+            let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
             let _commission_review_approval = maybe_precompute_commission_review_tools(
                 &working_dir,
                 mode_context.as_ref(),
-                &mut tools,
+                &mut available_tools,
             );
             let explore_bash_capability =
                 if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
@@ -4598,10 +4645,13 @@ where
                 )
             };
 
-            // Build request — normalize messages against current tool set
-            let tool_names: std::collections::HashSet<&str> =
-                tools.iter().map(|t| t.name.as_str()).collect();
-            let messages = strip_unavailable_tool_blocks(messages, &tool_names);
+            // Historical tool blocks are normalized against the full registry:
+            // narrowing a grace turn's callable surface must not erase the useful
+            // research history the model needs to summarize.
+            let available_tool_names: std::collections::HashSet<&str> =
+                available_tools.iter().map(|tool| tool.name.as_str()).collect();
+            let messages = strip_unavailable_tool_blocks(messages, &available_tool_names);
+            let tools = request_tool_surface.callable_tools(available_tools);
 
             let mut system = vec![SystemContent::cached(&system_prompt)];
             if is_coordinator {
@@ -10816,6 +10866,168 @@ mod steer_drain_detector_tests {
     }
 }
 
+#[cfg(test)]
+mod subagent_grace_tool_surface_tests {
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::ConvContext;
+    use crate::system_prompt::ModeContext;
+    use crate::tools::{BrowserSessionManager, ToolOutput};
+    use phoenix_llm::{ContentBlock, LlmResponse, ModelRegistry, Usage};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    fn terminal_tools() -> Arc<MockToolExecutor> {
+        Arc::new(
+            MockToolExecutor::new()
+                .with_tool("search", ToolOutput::success("found"))
+                .with_tool("submit_result", ToolOutput::success("submitted"))
+                .with_tool("submit_error", ToolOutput::success("submitted")),
+        )
+    }
+
+    #[tokio::test]
+    async fn grace_request_advertises_only_terminal_tools() {
+        let cwd = TempDir::new().expect("cwd");
+        let mut context = ConvContext::new(
+            "grace-tools",
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+        );
+        context.is_sub_agent = true;
+        context.max_turns = 1;
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        });
+
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("findings")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let tools = terminal_tools();
+        let storage = Arc::new(InMemoryStorage::new());
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            llm.clone(),
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+        runtime.llm_turn_count = 1;
+
+        runtime
+            .dispatch_llm_request()
+            .await
+            .expect("grace dispatch");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while llm.recorded_requests().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "request not recorded"
+            );
+            tokio::task::yield_now().await;
+        }
+        let request = llm.recorded_requests().remove(0);
+        let names: Vec<&str> = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["submit_result", "submit_error"]);
+        assert!(request.messages.iter().any(|message| {
+            format!("{message:?}").contains("Only submit_result or submit_error")
+        }));
+
+        if let Some(task) = runtime.llm_task_handle.take() {
+            task.abort();
+        }
+    }
+    #[tokio::test]
+    async fn grace_retry_retains_terminal_tool_surface() {
+        let cwd = TempDir::new().expect("cwd");
+        let mut context = ConvContext::new(
+            "grace-retry-tools",
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+        );
+        context.is_sub_agent = true;
+        context.max_turns = 1;
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("findings")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 2 },
+            Arc::new(InMemoryStorage::new()),
+            llm.clone(),
+            terminal_tools(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+        runtime.llm_turn_count = 2;
+        runtime.grace_turn_granted = true;
+
+        runtime
+            .dispatch_llm_request()
+            .await
+            .expect("grace retry dispatch");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while llm.recorded_requests().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "retry request not recorded"
+            );
+            tokio::task::yield_now().await;
+        }
+        let request = llm.recorded_requests().remove(0);
+        let names: Vec<&str> = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["submit_result", "submit_error"]);
+        assert_eq!(
+            runtime.llm_turn_count, 2,
+            "retry must not spend another turn"
+        );
+
+        if let Some(task) = runtime.llm_task_handle.take() {
+            task.abort();
+        }
+    }
+}
+
+// ============================================================
+// Work-sub-agent cwd-scoping guard}
+
 // ============================================================
 // Work-sub-agent cwd-scoping guard (REQ-PROJ-008)
 // ============================================================
@@ -11174,6 +11386,66 @@ mod work_subagent_cwd_guard_tests {
             other => panic!("expected ToolComplete with model error, got {other:?}"),
         }
         assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn blank_model_and_cwd_use_defaults() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let mut rt = runtime_in_direct_mode(parent.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inspect".to_string(),
+                    cwd: Some("  ".to_string()),
+                    mode: Some(SubAgentMode::Explore),
+                    model: Some(String::new()),
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                let message = tool_result_text(&result);
+                assert!(!message.contains("Unknown model"), "got: {message}");
+                assert!(!message.contains("working directory"), "got: {message}");
+                assert!(message.contains("not configured"), "got: {message}");
+            }
+            other => panic!("expected missing-channel ToolComplete, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relative_cwd_resolves_from_parent_working_directory() {
+        let parent = TempDir::new().expect("parent tempdir");
+        std::fs::create_dir(parent.path().join("nested")).expect("nested dir");
+        let mut rt = runtime_in_direct_mode(parent.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inspect".to_string(),
+                    cwd: Some("nested".to_string()),
+                    mode: Some(SubAgentMode::Explore),
+                    model: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                let message = tool_result_text(&result);
+                assert!(!message.contains("working directory"), "got: {message}");
+                assert!(message.contains("not configured"), "got: {message}");
+            }
+            other => panic!("expected missing-channel ToolComplete, got {other:?}"),
+        }
     }
 
     /// `agent_type` resolves against the catalog frozen on the runtime, not a

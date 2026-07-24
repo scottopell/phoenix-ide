@@ -25,10 +25,9 @@
 --   - Worktree creation / branch lifecycle (see projects.allium).
 --   - Tool implementations (bash, patch, etc.).
 --
--- Requirement traceability: REQ-SA-001 .. REQ-SA-008, REQ-PROJ-008.
--- (REQ-SA-007 is superseded by REQ-PROJ-008; REQ-SA-008 read_first
---  injection is not implemented in the spawn handler — tracked in
---  requirements.md status.)
+-- Requirement traceability: REQ-SA-001 .. REQ-SA-008, REQ-SA-011,
+-- REQ-PROJ-008. REQ-SA-007 is superseded by REQ-PROJ-008; REQ-SA-008
+-- read_first injection is outside this spawn-resolution model.
 
 use "../bedrock/bedrock.allium" as bedrock
 use "../projects/projects.allium" as projects
@@ -337,7 +336,7 @@ rule SubAgentSpecsResolved {
         --     else                  => explore   (REQ-PROJ-008 default)
         --
         --   resolve_model_id(t, parent):
-        --     t.model.present        => t.model
+        --     t.model.nonblank       => t.model
         --     resolve_agent(t).model => agent.model
         --     resolve_mode(t)=explore =>
         --         LlmRegistry.cheap_model_for_provider(parent.model_id)
@@ -358,8 +357,9 @@ rule SubAgentSpecsResolved {
         --         config.default_max_turns_work (50)
         --
         --   resolve_cwd(t, parent):
-        --     t.cwd.present => t.cwd
-        --     else          => parent.working_dir
+        --     t.cwd.blank_or_absent => parent.working_dir
+        --     t.cwd.absolute        => t.cwd
+        --     t.cwd.relative        => parent.working_dir / t.cwd
         --
         --   validate_cwd(resolve_cwd(t, parent)) must prove the path is an
         --   existing directory after canonicalisation and that the canonical

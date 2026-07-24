@@ -51,6 +51,13 @@ only the architectural seams.
 - **Timeout** is a 20-minute wall-clock safety-net set when the parent
   enters `awaiting_sub_agents`; `max_turns` (per-mode default 20/50) is
   the primary budget.
+- **Grace dispatch** narrows the callable request surface to
+  `submit_result` / `submit_error` while retaining completed ordinary-tool
+  history for synthesis. The admission guard remains a malformed-response
+  backstop.
+- **Spawn defaults** treat blank model/cwd overrides as absent, resolve relative
+  cwd values from the parent conversation, and render model overrides from the
+  same registry snapshot used for executor validation.
 - **Sub-agent wake handle** is the child conversation / agent id. Wake contracts
   can wait on that handle reaching terminal state, but the wake payload is not a
   parent-to-child continuation channel and does not grant more budget.
@@ -75,9 +82,10 @@ only the architectural seams.
 | **REQ-SA-007:** Model Tier Selection | ✅ Superseded | Replaced by REQ-PROJ-008 mode defaults + explicit `model` override |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
 | **REQ-SA-009:** Terminal Handle Identity for Wake Contracts | Proposed | Child conversation / agent id is the sub-agent wake handle |
-| **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Work grace prompt routes unfinished required edits through `submit_error` |
+| **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Grace request advertises terminal tools only; Work guidance routes unfinished required edits through `submit_error` |
+| **REQ-SA-011:** Spawn Override Defaults and Path Base | ✅ Complete | Blank overrides inherit; relative cwd is parent-relative; model enum is registry-backed |
 
-**Progress:** 8 of 10 implemented (one explicitly superseded; one deferred; one proposed for wake runtime).
+**Progress:** 9 of 11 implemented (one explicitly superseded; one deferred; one proposed for wake runtime).
 
 ## Deferred refinements
 

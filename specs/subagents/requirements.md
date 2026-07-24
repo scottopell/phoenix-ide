@@ -144,6 +144,10 @@ explicit model override:
 - Work mode inherits the parent's model.
 - The `model` field on the task spec allows explicit override with any
   registry model id; unknown ids are rejected at spawn time.
+- The tool schema exposes the deployment's registered model ids from the same
+  registry snapshot used for spawn-time validation.
+- An omitted or blank `model` selects the mode default rather than an invalid
+  explicit override.
 
 **Rationale:** Mode-based defaults cover the same cost/capability
 trade-off that tiers addressed, while the explicit model override handles
@@ -236,3 +240,35 @@ work commonly completes by reporting findings rather than edits
 **Rationale:** The grace turn exists to force a terminal answer, not to relabel
 unfinished Work as success. Parent synthesis is safer when incomplete
 implementation is structurally visible in the terminal payload.
+
+WHEN any sub-agent receives its turn-limit grace request
+THE SYSTEM SHALL expose only `submit_result` and `submit_error` as callable tools
+AND SHALL preserve completed ordinary-tool history as context for the terminal answer
+
+WHEN a retryable provider failure occurs during the grace request
+THE SYSTEM SHALL retain the terminal-only tool surface on the retry
+
+**Rationale:** A prose instruction cannot make an advertised ordinary tool
+uncallable. The request capability and reducer admission rule must agree so a
+model cannot spend its only grace response on an action Phoenix must reject.
+
+---
+
+### REQ-SA-011: Spawn Override Defaults and Path Base
+
+WHEN `model` or `cwd` is omitted, blank, or whitespace-only in a sub-agent task
+THE SYSTEM SHALL use the documented mode or parent default
+
+WHEN a task supplies a relative `cwd` override
+THE SYSTEM SHALL resolve it from the parent conversation's working directory
+AND SHALL validate the resolved path with the same existence, non-root, symlink,
+and Work-worktree containment rules as an absolute override
+
+WHEN a task supplies a model override
+THE SYSTEM SHALL constrain the LLM-visible choices to the model ids registered for
+that conversation
+AND SHALL reject an unknown or stale id before spawning any task in the batch
+
+**Rationale:** Defaults should be the easiest valid representation. Empty
+placeholder strings and server-process-relative paths must not turn inheritance
+into a validation failure or move a child outside the parent's project context.

@@ -2314,6 +2314,7 @@ impl RuntimeManager {
             registry,
             self.mcp_manager.clone(),
             Arc::from(Vec::new()),
+            Arc::from(Vec::new()),
         );
 
         // 6. Create runtime with parent notification
@@ -2625,6 +2626,7 @@ impl RuntimeManager {
         } else {
             Arc::from(phoenix_agents::discover_agents(&context.working_dir))
         };
+        let available_model_ids = self.llm_registry.available_models();
         let is_coordinator = !is_sub_agent
             && self
                 .db
@@ -2642,6 +2644,7 @@ impl RuntimeManager {
                 registry,
                 self.mcp_manager.clone(),
                 agent_catalog.clone(),
+                Arc::from(available_model_ids.clone()),
             )
         } else {
             use crate::db::ConvMode;
@@ -2664,6 +2667,7 @@ impl RuntimeManager {
                     ConvMode::Explore { .. } => ToolRegistry::explore(
                         &context.tasks_dir_name,
                         agent_catalog.to_vec(),
+                        available_model_ids.clone(),
                         ExploreToolPolicy::from_platform(&self.platform),
                     ),
                     ConvMode::Direct => {
@@ -2671,7 +2675,10 @@ impl RuntimeManager {
                         // fork proposal) is offered only when the working dir is
                         // inside a git repo — a fork cuts from the repository's
                         // default branch (REQ-PROJ-036).
-                        let registry = ToolRegistry::direct(agent_catalog.to_vec());
+                        let registry = ToolRegistry::direct(
+                            agent_catalog.to_vec(),
+                            available_model_ids.clone(),
+                        );
                         if phoenix_core::git::detect_git_repo_root(&context.working_dir).is_some() {
                             registry.with_propose_task().with_commission_review()
                         } else {
@@ -2682,7 +2689,7 @@ impl RuntimeManager {
                         // Full tool suite plus `propose_task` (non-blocking fork
                         // proposal — REQ-PROJ-036). Work/Branch always sit on git
                         // history, so the tool is always offered.
-                        ToolRegistry::direct(agent_catalog.to_vec())
+                        ToolRegistry::direct(agent_catalog.to_vec(), available_model_ids.clone())
                             .with_propose_task()
                             .with_commission_review()
                     }
@@ -2691,6 +2698,7 @@ impl RuntimeManager {
                     registry,
                     self.mcp_manager.clone(),
                     agent_catalog.clone(),
+                    Arc::from(available_model_ids.clone()),
                 )
             }
         };

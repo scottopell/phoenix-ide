@@ -107,6 +107,7 @@ impl Tool for SubmitErrorTool {
 #[derive(Default)]
 pub struct SpawnAgentsTool {
     agents: Vec<AgentDefinition>,
+    model_ids: Vec<String>,
 }
 
 impl SpawnAgentsTool {
@@ -114,7 +115,10 @@ impl SpawnAgentsTool {
     /// schema. Used by tests and any caller without a discovered catalog.
     #[must_use]
     pub fn new() -> Self {
-        Self { agents: Vec::new() }
+        Self {
+            agents: Vec::new(),
+            model_ids: Vec::new(),
+        }
     }
 
     /// A spawn tool whose schema exposes the given named agents as the
@@ -122,7 +126,18 @@ impl SpawnAgentsTool {
     /// contract) for the rendered schema to be cache-stable (REQ-AG-008).
     #[must_use]
     pub fn with_agents(agents: Vec<AgentDefinition>) -> Self {
-        Self { agents }
+        Self {
+            agents,
+            model_ids: Vec::new(),
+        }
+    }
+
+    /// A spawn tool whose model override enum and executor validation share the
+    /// same registry-backed model IDs. The caller supplies a sorted snapshot so
+    /// the schema remains stable for the conversation.
+    #[must_use]
+    pub fn with_catalogs(agents: Vec<AgentDefinition>, model_ids: Vec<String>) -> Self {
+        Self { agents, model_ids }
     }
 }
 
@@ -165,7 +180,7 @@ impl Tool for SpawnAgentsTool {
             },
             "cwd": {
                 "type": "string",
-                "description": "Working directory (defaults to parent's cwd)"
+                "description": "Working directory override. Omit or leave blank to inherit the parent's cwd. Relative paths resolve from the parent's cwd."
             },
             "mode": {
                 "type": "string",
@@ -174,7 +189,7 @@ impl Tool for SpawnAgentsTool {
             },
             "model": {
                 "type": "string",
-                "description": "LLM model override. When set, it must be one of the model IDs available in this environment's model registry. Defaults based on mode."
+                "description": "LLM model override. Omit or leave blank to use the mode default. When set, choose one of the model IDs available in this environment's model registry."
             },
             "max_turns": {
                 "type": "integer",
@@ -182,6 +197,10 @@ impl Tool for SpawnAgentsTool {
                 "description": "Maximum LLM turns before forced completion. Defaults to 20 (explore) or 50 (work)."
             }
         });
+
+        if !self.model_ids.is_empty() {
+            task_props["model"]["enum"] = json!(self.model_ids);
+        }
 
         // REQ-AG-004: surface discovered named agents as a typed agent_type
         // enum. Omitted entirely when none are discovered, so the schema is a
@@ -390,6 +409,19 @@ mod tests {
         );
         assert!(desc.contains("docs-writer: Writes docs"));
         assert!(desc.contains("security-reviewer: Finds vulns"));
+    }
+
+    #[test]
+    fn schema_exposes_registry_model_ids() {
+        let schema = SpawnAgentsTool::with_catalogs(
+            Vec::new(),
+            vec!["gpt-a".to_string(), "gpt-b".to_string()],
+        )
+        .input_schema();
+        assert_eq!(
+            schema["properties"]["tasks"]["items"]["properties"]["model"]["enum"],
+            json!(["gpt-a", "gpt-b"])
+        );
     }
 
     #[test]
