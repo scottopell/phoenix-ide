@@ -359,12 +359,17 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: None,
+            effort: None,
             telemetry: Some(crate::LlmRequestTelemetry {
                 conversation_id: "conversation".to_string(),
                 root_conversation_id: "root".to_string(),
                 request_id: "request".to_string(),
                 retry_attempt: 1,
                 attempt_capture: attempt_capture.clone(),
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort {
+                    source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
+                    level: None,
+                },
             }),
             cache_key: crate::PromptCacheKey::stable("test"),
         };
