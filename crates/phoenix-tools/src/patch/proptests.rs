@@ -8,6 +8,7 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 
 use super::interpreter::VirtualFs;
+use super::matching::{find_unique_match, MatchError};
 use super::planner::PatchPlanner;
 use super::types::*;
 use proptest::prelude::*;
@@ -508,7 +509,8 @@ fn test_replace_not_found() {
         result,
         Err(PatchError::AnchorNotFound {
             patch_number: 1,
-            operation: Operation::Replace
+            operation: Operation::Replace,
+            ..
         })
     ));
 }
@@ -761,4 +763,32 @@ fn test_truncate_helper_edge_cases() {
     assert_eq!(truncate_to_char_boundary(s, 3), "a"); // Can't fit emoji, just 'a'
     assert_eq!(truncate_to_char_boundary(s, 5), "a\u{1F600}"); // Fits emoji
     assert_eq!(truncate_to_char_boundary(s, 6), s); // Fits all
+}
+
+proptest! {
+    #[test]
+    fn prop_not_found_diagnostics_are_deterministic_and_bounded(
+        prefix in "[a-z]{8,24}",
+        stale in "[A-Z]{8,24}",
+        current in "[0-9]{8,24}",
+    ) {
+        let surviving = format!("unique_{prefix}_line");
+        let content = format!("before\n{surviving}\ncurrent_{current}\nafter\n");
+        let old_text = format!("{surviving}\nstale_{stale}");
+
+        let first = find_unique_match(&content, &old_text).unwrap_err();
+        let second = find_unique_match(&content, &old_text).unwrap_err();
+        prop_assert_eq!(&first, &second);
+
+        let MatchError::NotFound(diagnostics) = first else {
+            prop_assert!(false, "expected not found");
+            return Ok(());
+        };
+        prop_assert!(diagnostics.candidates.len() <= 3);
+        for candidate in diagnostics.candidates {
+            prop_assert!(candidate.snippet.lines().count() <= 5);
+            prop_assert!(candidate.snippet.lines().all(|line| line.chars().count() <= 260));
+            prop_assert!(candidate.snippet.is_char_boundary(candidate.snippet.len()));
+        }
+    }
 }

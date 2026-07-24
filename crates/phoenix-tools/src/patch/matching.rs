@@ -2,12 +2,22 @@
 //!
 //! Implements exact matching with fuzzy fallbacks for common whitespace issues.
 
-use super::types::{DuplicateMatchDiagnostics, DuplicateMatchLocation, EditSpec};
+use super::types::{
+    AnchorCandidateLocation, AnchorNotFoundDiagnostics, DuplicateMatchDiagnostics,
+    DuplicateMatchLocation, EditSpec,
+};
+use std::collections::HashMap;
 use unicode_security::skeleton;
 
 const MAX_DUPLICATE_LOCATIONS: usize = 5;
 const MAX_SNIPPET_LINES: usize = 5;
 const MAX_SNIPPET_CHARS: usize = 240;
+const MAX_CANDIDATE_LOCATIONS: usize = 3;
+const MAX_CANDIDATE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CANDIDATE_ANCHOR_BYTES: usize = 16 * 1024;
+const MIN_DISTINCTIVE_LINE_CHARS: usize = 8;
+const CANDIDATE_CLUSTER_LINE_GAP: usize = 12;
+const MAX_CANDIDATE_HITS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MatchOutcome {
@@ -17,7 +27,7 @@ enum MatchOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum MatchError {
-    NotFound,
+    NotFound(AnchorNotFoundDiagnostics),
     NotUnique(DuplicateMatchDiagnostics),
 }
 
@@ -78,9 +88,115 @@ pub(super) fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpe
         };
     }
 
-    duplicate.map_or(Err(MatchError::NotFound), |diagnostics| {
-        Err(MatchError::NotUnique(diagnostics))
-    })
+    duplicate.map_or_else(
+        || {
+            Err(MatchError::NotFound(anchor_not_found_diagnostics(
+                content, old_text,
+            )))
+        },
+        |diagnostics| Err(MatchError::NotUnique(diagnostics)),
+    )
+}
+
+fn anchor_not_found_diagnostics(content: &str, old_text: &str) -> AnchorNotFoundDiagnostics {
+    if content.len() > MAX_CANDIDATE_FILE_BYTES || old_text.len() > MAX_CANDIDATE_ANCHOR_BYTES {
+        return AnchorNotFoundDiagnostics {
+            candidates: Vec::new(),
+        };
+    }
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    let anchor_lines: Vec<&str> = old_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.chars().count() >= MIN_DISTINCTIVE_LINE_CHARS)
+        .collect();
+    if anchor_lines.is_empty() {
+        return AnchorNotFoundDiagnostics {
+            candidates: Vec::new(),
+        };
+    }
+
+    let mut anchor_index_by_line: HashMap<&str, usize> = HashMap::new();
+    for anchor_line in anchor_lines {
+        let next_index = anchor_index_by_line.len();
+        anchor_index_by_line
+            .entry(anchor_line)
+            .or_insert(next_index);
+    }
+
+    let mut hits = Vec::new();
+    for (line_index, content_line) in content_lines.iter().enumerate() {
+        if let Some(anchor_index) = anchor_index_by_line.get(content_line.trim()) {
+            if hits.len() == MAX_CANDIDATE_HITS {
+                return AnchorNotFoundDiagnostics {
+                    candidates: Vec::new(),
+                };
+            }
+            hits.push((line_index, *anchor_index));
+        }
+    }
+
+    let total_hits = hits.len();
+    let mut clusters: Vec<Vec<(usize, usize)>> = Vec::new();
+    for hit in hits {
+        if let Some(cluster) = clusters.last_mut() {
+            if hit
+                .0
+                .saturating_sub(cluster.last().expect("cluster is non-empty").0)
+                <= CANDIDATE_CLUSTER_LINE_GAP
+            {
+                cluster.push(hit);
+                continue;
+            }
+        }
+        clusters.push(vec![hit]);
+    }
+
+    let mut ranked: Vec<(usize, usize, usize)> = clusters
+        .into_iter()
+        .filter_map(|cluster| {
+            let mut anchor_indexes: Vec<usize> = cluster.iter().map(|(_, index)| *index).collect();
+            anchor_indexes.sort_unstable();
+            anchor_indexes.dedup();
+            let score = anchor_indexes.len();
+            let first_line = cluster.first()?.0;
+            let last_line = cluster.last()?.0;
+            let globally_unique_strong_line = score == 1 && total_hits == 1;
+            (score >= 2 || globally_unique_strong_line).then_some((score, first_line, last_line))
+        })
+        .collect();
+    ranked.sort_by_key(|(score, first_line, _)| (std::cmp::Reverse(*score), *first_line));
+    ranked.truncate(MAX_CANDIDATE_LOCATIONS);
+
+    AnchorNotFoundDiagnostics {
+        candidates: ranked
+            .into_iter()
+            .map(|(_, first_line, last_line)| {
+                let snippet_start = first_line.saturating_sub(1);
+                let snippet_end = (last_line + 2).min(content_lines.len());
+                AnchorCandidateLocation {
+                    start_line: snippet_start + 1,
+                    snippet: bounded_candidate_snippet(&content_lines[snippet_start..snippet_end]),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn bounded_candidate_snippet(lines: &[&str]) -> String {
+    let mut output = String::new();
+    for (index, line) in lines.iter().take(MAX_SNIPPET_LINES).enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let mut chars = line.chars();
+        output.extend(chars.by_ref().take(MAX_SNIPPET_CHARS));
+        if chars.next().is_some() {
+            output.push_str("...[line shortened]");
+        }
+    }
+    output
 }
 
 fn find_exact_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
@@ -470,7 +586,95 @@ mod tests {
     fn test_no_match() {
         let content = "hello world";
         let err = find_unique_match(content, "foo").unwrap_err();
-        assert_eq!(err, MatchError::NotFound);
+        assert!(matches!(err, MatchError::NotFound(_)));
+    }
+
+    #[test]
+    fn stale_multiline_anchor_reports_bounded_current_region() {
+        let content = "before\nfn target() {\n    let current = 2;\n    finish();\n}\nafter\n";
+        let old_text = "fn target() {\n    let stale = 1;\n    finish();\n}";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert_eq!(diagnostics.candidates.len(), 1);
+        assert_eq!(diagnostics.candidates[0].start_line, 1);
+        assert_eq!(
+            diagnostics.candidates[0].snippet,
+            "before\nfn target() {\n    let current = 2;\n    finish();\n}"
+        );
+    }
+
+    #[test]
+    fn one_unique_distinctive_surviving_line_is_actionable() {
+        let content = "before\nunique_current_site();\nafter\n";
+        let old_text = "unique_current_site();\nstale_second_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert_eq!(diagnostics.candidates.len(), 1);
+        assert!(diagnostics.candidates[0]
+            .snippet
+            .contains("unique_current_site();"));
+    }
+
+    #[test]
+    fn repeated_single_surviving_line_is_not_reported() {
+        let content = "shared_line();\nfirst\nshared_line();\nsecond\n";
+        let old_text = "shared_line();\nstale_line();";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn candidate_diagnostics_are_bounded_and_utf8_safe() {
+        let long_line = "é".repeat(MAX_SNIPPET_CHARS + 50);
+        let content = format!("prefix\n{long_line}\nunique_survivor();\nsuffix\n");
+        let old_text = format!("{long_line}\nstale\nunique_survivor();");
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(&content, &old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        let candidate = &diagnostics.candidates[0];
+        assert!(candidate.snippet.contains("...[line shortened]"));
+        assert!(candidate.snippet.lines().count() <= MAX_SNIPPET_LINES);
+        assert!(candidate.snippet.is_char_boundary(candidate.snippet.len()));
+    }
+
+    #[test]
+    fn oversized_inputs_skip_candidate_search() {
+        let content = "x".repeat(MAX_CANDIDATE_FILE_BYTES + 1);
+        let MatchError::NotFound(diagnostics) =
+            find_unique_match(&content, "missing anchor").unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn excessive_candidate_hits_skip_diagnostics() {
+        let content = "common surviving line\n".repeat(MAX_CANDIDATE_HITS + 1);
+        let old_text = "common surviving line\nstale line";
+        let MatchError::NotFound(diagnostics) = find_unique_match(&content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert!(diagnostics.candidates.is_empty());
     }
 
     #[test]
@@ -486,7 +690,7 @@ mod tests {
                 assert_eq!(diagnostics.reported[1].start_line, 1);
                 assert_eq!(diagnostics.reported[0].snippet, "hello hello");
             }
-            other @ MatchError::NotFound => panic!("unexpected error: {other:?}"),
+            other @ MatchError::NotFound(_) => panic!("unexpected error: {other:?}"),
         }
     }
 
@@ -549,7 +753,7 @@ mod tests {
                 assert_eq!(diagnostics.reported[1].start_line, 3);
                 assert!(diagnostics.reported[0].snippet.contains("\tindented line"));
             }
-            other @ MatchError::NotFound => {
+            other @ MatchError::NotFound(_) => {
                 panic!("expected fuzzy duplicate diagnostics, got {other:?}")
             }
         }
@@ -567,7 +771,7 @@ mod tests {
                 assert_eq!(diagnostics.reported[1].start_line, 3);
                 assert!(diagnostics.reported[0].snippet.contains("say \"hello\""));
             }
-            other @ MatchError::NotFound => {
+            other @ MatchError::NotFound(_) => {
                 panic!("expected normalised duplicate diagnostics, got {other:?}")
             }
         }
@@ -669,7 +873,7 @@ mod tests {
         // edit that would insert before the ellipsis.
         let content = "x\u{2026}y";
         let err = find_unique_match(content, "..").unwrap_err();
-        assert_eq!(err, MatchError::NotFound);
+        assert!(matches!(err, MatchError::NotFound(_)));
     }
 
     #[test]
@@ -677,6 +881,6 @@ mod tests {
         // Normalisation can't help if the text simply isn't there
         let content = "hello world";
         let err = find_unique_match(content, "goodbye").unwrap_err();
-        assert_eq!(err, MatchError::NotFound);
+        assert!(matches!(err, MatchError::NotFound(_)));
     }
 }

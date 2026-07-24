@@ -116,9 +116,16 @@ AND update any toClipboard with actual matched text
 WHEN all matching attempts fail
 THE SYSTEM SHALL return an "old text not found" error
 AND identify the failing patch's 1-based position in the patches array and its operation
+AND search within explicit file-size, anchor-size, and candidate-work bounds for current-file regions containing distinctive surviving anchor lines
+AND return a bounded, deterministic list of line-numbered current-file snippets when reliable candidates exist
+AND identify the snippets as advisory evidence that does not authorize an approximate or non-unique edit
+AND instruct the agent to copy exact current text from a candidate and retry
+
+WHEN no reliable candidate exists or the candidate search exceeds its bounds
+THE SYSTEM SHALL omit candidate snippets
 AND instruct the agent to re-read the file and retry that patch with current text
 
-**Rationale:** LLMs occasionally generate patches with minor whitespace differences. Safe recovery improves reliability without compromising precision.
+**Rationale:** LLMs occasionally generate patches with minor whitespace differences or stale surrounding text. Safe matching recovery improves reliability without compromising precision. When a stale anchor cannot be applied, bounded current-file evidence lets the agent repair it without an otherwise mandatory read/search round; conservative omission is safer than a misleading candidate, and every retry still passes through the unique-anchor requirement.
 
 ---
 

@@ -5,6 +5,8 @@
 //! for property-based testing.
 
 use super::matching::{find_all_exact, find_unique_match, MatchError};
+#[cfg(test)]
+use super::types::AnchorNotFoundDiagnostics;
 use super::types::{Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest, Reindent};
 use similar::TextDiff;
 use std::collections::HashMap;
@@ -143,9 +145,10 @@ impl PatchPlanner {
         operation: Operation,
     ) -> Result<super::types::EditSpec, PatchError> {
         find_unique_match(original, old_text).map_err(|error| match error {
-            MatchError::NotFound => PatchError::AnchorNotFound {
+            MatchError::NotFound(diagnostics) => PatchError::AnchorNotFound {
                 patch_number,
                 operation,
+                diagnostics,
             },
             MatchError::NotUnique(diagnostics) => PatchError::AnchorNotUnique {
                 patch_number,
@@ -153,6 +156,17 @@ impl PatchPlanner {
                 diagnostics,
             },
         })
+    }
+
+    fn replace_all_miss(original: &str, old_text: &str, patch_number: usize) -> PatchError {
+        match find_unique_match(original, old_text) {
+            Err(MatchError::NotFound(diagnostics)) => PatchError::AnchorNotFound {
+                patch_number,
+                operation: Operation::Replace,
+                diagnostics,
+            },
+            _ => PatchError::ReplaceAllInexact,
+        }
     }
 
     /// Build a list of edits from patch requests.
@@ -249,13 +263,7 @@ impl PatchPlanner {
                         // fuzzy/near match": replaceAll is exact-only, so a near
                         // match would otherwise surface as a misleading "not
                         // found". find_unique_match runs the full fuzzy cascade.
-                        return match find_unique_match(original, old_text) {
-                            Err(MatchError::NotFound) => Err(PatchError::AnchorNotFound {
-                                patch_number: patch_index + 1,
-                                operation: patch.operation,
-                            }),
-                            _ => Err(PatchError::ReplaceAllInexact),
-                        };
+                        return Err(Self::replace_all_miss(original, old_text, patch_index + 1));
                     }
                     for spec in specs {
                         edits.push(Edit {
@@ -896,6 +904,9 @@ mod tests {
             PatchError::AnchorNotFound {
                 patch_number: 1,
                 operation: Operation::Replace,
+                diagnostics: AnchorNotFoundDiagnostics {
+                    candidates: Vec::new(),
+                },
             }
         );
     }
@@ -935,11 +946,14 @@ mod tests {
             PatchError::AnchorNotFound {
                 patch_number: 2,
                 operation: Operation::InsertAfter,
+                diagnostics: AnchorNotFoundDiagnostics {
+                    candidates: Vec::new(),
+                },
             }
         );
         assert_eq!(
             err.to_string(),
-            "Patch 2 (insert_after) failed: oldText not found in file. Re-read the file and retry this patch with current text."
+            "Patch 2 (insert_after) failed: oldText not found in file. No reliable nearby current text was found. Re-read the file and retry this patch with current text."
         );
     }
 

@@ -21,6 +21,15 @@ value Edit {
     replacement: String
 }
 
+value AnchorCandidate {
+    start_line: Integer
+    snippet: String
+}
+
+value AnchorNotFoundDiagnostics {
+    candidates: List<AnchorCandidate>
+}
+
 value Reindent {
     strip: String?        -- prefix to remove from each non-empty line
     add: String?          -- prefix to add to each non-empty line
@@ -91,6 +100,10 @@ entity MatchAttempt {
 --   position_of(patch: PatchRequest) -> Integer
 --       Returns the patch's 1-based position in the enclosing PlanRequested
 --       patches sequence.
+--   bounded_anchor_candidates(content: String, old_text: String)
+--       -> AnchorNotFoundDiagnostics
+--       Returns deterministic bounded advisory current-file regions, or an empty
+--       candidate list when confidence or work limits are not satisfied.
 
 rule ExactMatchSucceeds {
     when: attempt: MatchAttempt.created
@@ -158,6 +171,14 @@ rule MatchNotFound {
     requires: attempt.trimmed_duplicate = null
     requires: attempt.normalised_duplicate = null
     ensures: attempt.result = not_found
+    ensures: attempt.diagnostics = bounded_anchor_candidates(attempt.content, attempt.old_text)
+    @guidance
+        -- Candidate diagnostics are advisory evidence, not a match result. Search
+        -- is bounded by file bytes, anchor bytes, and total surviving-line hits.
+        -- A candidate requires multiple distinctive surviving anchor lines in one
+        -- nearby region, or one globally unique distinctive surviving line. Up to
+        -- three deterministic, line-numbered snippets are returned. If confidence
+        -- or work bounds fail, candidates is empty and the caller requests a read.
 }
 
 rule MatchNotUnique {
