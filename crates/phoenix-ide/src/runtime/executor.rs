@@ -12480,6 +12480,37 @@ mod retry_timer_epoch_tests {
         true
     }
 
+    #[tokio::test]
+    async fn terminal_llm_error_releases_durable_live_slot() {
+        let mut rt = runtime_requesting();
+        rt.process_event(Event::LlmError {
+            message: "bad credentials".to_string(),
+            error_kind: crate::db::ErrorKind::Auth,
+            attempt: 0,
+            recovery_in_progress: false,
+            resets_at: None,
+        })
+        .await
+        .expect("terminal error transition and durable cleanup");
+
+        assert!(matches!(rt.state, ConvState::Error { .. }));
+        assert_eq!(
+            rt.storage.stopped_top_level_llm(),
+            vec!["conv-retry".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_llm_error_keeps_durable_live_slot() {
+        let mut rt = runtime_requesting();
+        rt.process_event(retryable_llm_error())
+            .await
+            .expect("retryable error transition");
+
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.storage.stopped_top_level_llm().is_empty());
+    }
+
     /// A retryable `LlmError` schedules a backoff timer (bumping
     /// `retry_generation`); cancelling the turn bumps the generation again so
     /// any fire from the old timer is stale and can never cross the turn

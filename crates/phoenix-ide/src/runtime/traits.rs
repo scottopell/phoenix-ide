@@ -499,6 +499,16 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).message_exists(message_id).await
     }
 
+    async fn stop_active_top_level_llm_for_conversation(
+        &self,
+        conversation_id: &str,
+        stopped_at: phoenix_workflow::Timestamp,
+    ) -> Result<Option<phoenix_workflow::CommitOutcome>, String> {
+        (**self)
+            .stop_active_top_level_llm_for_conversation(conversation_id, stopped_at)
+            .await
+    }
+
     async fn complete_creation_job(
         &self,
         job_id: &str,

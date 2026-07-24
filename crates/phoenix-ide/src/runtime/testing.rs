@@ -493,6 +493,7 @@ pub struct InMemoryStorage {
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
+    stopped_top_level_llm: Mutex<Vec<String>>,
 }
 
 #[allow(dead_code)]
@@ -509,6 +510,7 @@ impl InMemoryStorage {
             last_prompt_tokens: Mutex::new(HashMap::new()),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
+            stopped_top_level_llm: Mutex::new(Vec::new()),
         }
     }
 
@@ -528,6 +530,10 @@ impl InMemoryStorage {
     /// Make `set_clear_watermark` return an error (test the write-failure path).
     pub fn set_fail_watermark_write(&self, fail: bool) {
         *self.fail_watermark_write.lock().unwrap() = fail;
+    }
+
+    pub fn stopped_top_level_llm(&self) -> Vec<String> {
+        self.stopped_top_level_llm.lock().unwrap().clone()
     }
 
     /// Read back the persisted fork proposals (test-only).
@@ -594,6 +600,18 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn stop_active_top_level_llm_for_conversation(
+        &self,
+        conversation_id: &str,
+        _stopped_at: phoenix_workflow::Timestamp,
+    ) -> Result<Option<phoenix_workflow::CommitOutcome>, String> {
+        self.stopped_top_level_llm
+            .lock()
+            .unwrap()
+            .push(conversation_id.to_string());
+        Ok(Some(phoenix_workflow::CommitOutcome::Committed))
+    }
+
     async fn add_message(
         &self,
         message_id: &str,
