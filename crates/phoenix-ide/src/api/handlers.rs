@@ -3497,6 +3497,10 @@ async fn address_pr_feedback(
             crate::address_feedback_workflow::AddressFeedbackWorkflowError::Rejected {
                 message,
                 code,
+            }
+            | crate::address_feedback_workflow::AddressFeedbackWorkflowError::Retry {
+                message,
+                code,
             } => AppError::Conflict(Box::new(ConflictErrorResponse::new(message, &code))),
             crate::address_feedback_workflow::AddressFeedbackWorkflowError::IdempotencyConflict => {
                 AppError::Conflict(Box::new(ConflictErrorResponse::new(
