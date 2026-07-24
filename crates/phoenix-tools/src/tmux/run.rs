@@ -449,8 +449,7 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            let response = if exited || (close_after_completion && status == "readiness_timed_out")
-            {
+            let response = if exited {
                 response
             } else {
                 let completion_policy = if close_after_completion {
@@ -475,7 +474,7 @@ async fn wait_for_text_response(
                     return registered;
                 }
             };
-            if close_after_completion && (exited || status == "readiness_timed_out") {
+            if close_after_completion && exited {
                 let _ = kill_window(config_path, socket_path, &target.window_id).await;
             }
             return response;

@@ -797,13 +797,13 @@ fn conversation_resource_scope(
     }
 }
 
-fn conversation_work_scope(conv: &crate::db::Conversation) -> crate::work_scope::ResourceScopeKey {
-    let scope = conversation_resource_scope(conv);
-    assert!(
-        scope.work_scope_id().is_some(),
-        "operation requires work scope"
-    );
-    scope
+fn conversation_work_scope(
+    conv: &crate::db::Conversation,
+) -> Result<crate::work_scope::ResourceScopeKey, AppError> {
+    conv.work_scope_id
+        .clone()
+        .map(crate::work_scope::ResourceScopeKey::Work)
+        .ok_or_else(|| AppError::Forbidden("conversation has no work scope".to_string()))
 }
 
 fn sidebar_cached_pr_summary(
@@ -3095,7 +3095,7 @@ async fn stop_conversation_browser_session(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-    let work_scope = conversation_work_scope(&conversation);
+    let work_scope = conversation_work_scope(&conversation)?;
     let actor = crate::work_scope::EffectiveResourceAccess::new(
         conversation.id.clone(),
         match conversation.conv_mode {
@@ -4394,7 +4394,7 @@ async fn scope_still_owned_after_delete(
     if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
         match state.runtime.db().get_conversation(cont_id).await {
             Ok(continuation) => {
-                let cont_scope = conversation_work_scope(&continuation);
+                let cont_scope = conversation_work_scope(&continuation)?;
                 if &cont_scope == work_scope {
                     return Ok((
                         true,
@@ -4475,7 +4475,7 @@ pub(super) async fn run_resource_cleanup_cascade(
     conv: &crate::db::Conversation,
 ) -> Result<(), AppError> {
     let id = conv.id.as_str();
-    let work_scope = conversation_work_scope(conv);
+    let work_scope = conversation_work_scope(conv)?;
 
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,

@@ -67,6 +67,10 @@ fn refresh_commission_review_approval_for_outcome(
     {
         return;
     }
+    if context.execution_environment.working_dir().is_none() {
+        context.commission_review_approval = None;
+        return;
+    }
 
     context.commission_review_approval = Some(resolve_commission_review_approval(context));
 }
