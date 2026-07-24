@@ -260,6 +260,7 @@ pub struct AddressPrFeedbackRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AddressPrFeedbackResponse {
     pub workflow_id: u64,
     pub message_id: String,

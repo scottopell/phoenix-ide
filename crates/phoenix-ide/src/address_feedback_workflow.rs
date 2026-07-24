@@ -76,7 +76,6 @@ struct AddressFeedbackTarget {
     repo_owner: String,
     repo_name: String,
     pr_number: u64,
-    head_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,7 +204,6 @@ impl AddressFeedbackWorkflowService {
                 repo_owner: capture.repo_owner,
                 repo_name: capture.repo_name,
                 pr_number: capture.pr_number,
-                head_oid: head_oid.clone(),
             }),
             head_oid,
             artifact_path: Some(capture.artifact_path),
@@ -219,10 +217,15 @@ impl AddressFeedbackWorkflowService {
             find_active_by_fingerprint(&self.state.db, &req.conversation_id, &intent_fingerprint)
                 .await?
         {
-            if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
-                let _ =
-                    remove_context_artifact(&self.state.db, &req.conversation_id, artifact_path)
-                        .await;
+            if existing_id != workflow_id {
+                if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
+                    let _ = remove_context_artifact(
+                        &self.state.db,
+                        &req.conversation_id,
+                        artifact_path,
+                    )
+                    .await;
+                }
             }
             return Ok(pending_response(existing_id, existing_snapshot.message_id));
         }
@@ -343,7 +346,6 @@ impl AddressFeedbackWorkflowService {
                 repo_owner: capture.repo_owner,
                 repo_name: capture.repo_name,
                 pr_number: capture.pr_number,
-                head_oid: head_oid.clone(),
             }),
             head_oid,
             artifact_path: Some(capture.artifact_path),
@@ -427,6 +429,7 @@ impl AddressFeedbackWorkflowService {
         )))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_persisted_snapshot(
         &self,
         repo: &WorkflowRepository,
@@ -691,6 +694,7 @@ fn response_from_completed_snapshot(
     ))
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 fn response_from_snapshot(
     workflow_id: WorkflowId,
     message_id: String,
@@ -720,6 +724,20 @@ fn response_from_snapshot(
     }
 }
 
+fn conversation_filesystem_base(
+    cwd: String,
+    conv_mode: phoenix_core::domain::db_schema::ConvMode,
+) -> String {
+    match conv_mode {
+        phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
+        | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. } => {
+            worktree_path.to_string()
+        }
+        phoenix_core::domain::db_schema::ConvMode::Explore { .. }
+        | phoenix_core::domain::db_schema::ConvMode::Direct => cwd,
+    }
+}
+
 async fn persist_durable_context_artifact(
     db: &crate::db::Database,
     conversation_id: &str,
@@ -731,13 +749,7 @@ async fn persist_durable_context_artifact(
         .get_conversation(conversation_id)
         .await
         .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
-    let base = match conv.conv_mode {
-        phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
-        | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. } => {
-            worktree_path.to_string()
-        }
-        _ => conv.cwd,
-    };
+    let base = conversation_filesystem_base(conv.cwd, conv.conv_mode);
     let durable_path = format!(".phoenix/address-feedback-workflows/{}.json", workflow_id.0);
     let absolute_path = std::path::Path::new(base.as_str()).join(&durable_path);
     if let Some(parent) = absolute_path.parent() {
@@ -763,13 +775,7 @@ async fn remove_context_artifact(
         .get_conversation(conversation_id)
         .await
         .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
-    let base = match conv.conv_mode {
-        phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
-        | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. } => {
-            worktree_path.to_string()
-        }
-        _ => conv.cwd,
-    };
+    let base = conversation_filesystem_base(conv.cwd, conv.conv_mode);
     let path = std::path::Path::new(artifact_path);
     if path.is_absolute() || artifact_path.split('/').any(|part| part == "..") {
         return Ok(());
@@ -787,13 +793,7 @@ async fn read_context_json(
         .get_conversation(conversation_id)
         .await
         .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
-    let base = match conv.conv_mode {
-        phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
-        | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. } => {
-            worktree_path.to_string()
-        }
-        _ => conv.cwd,
-    };
+    let base = conversation_filesystem_base(conv.cwd, conv.conv_mode);
     let path = std::path::Path::new(artifact_path);
     if path.is_absolute() || artifact_path.split('/').any(|part| part == "..") {
         return Err(AddressFeedbackWorkflowError::Workflow(
