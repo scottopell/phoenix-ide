@@ -175,6 +175,7 @@ pub struct RecoverTopLevelLlmAttempt {
     pub workflow: TopLevelLlmWorkflowRecord,
     pub prepared_request: TopLevelLlmPreparedRequestRecord,
     pub attempt: LocalAttemptRecord,
+    pub recorded_outcome_payload: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1039,6 +1040,33 @@ impl WorkflowRepository {
         Ok(result.outcome)
     }
 
+    pub async fn acknowledge_recovered_top_level_llm_failure(
+        &self,
+        authority: &LocalAttemptAuthority,
+    ) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE workflow_attempts SET status = 'AuthorityLost'
+             WHERE workflow_id = ?1 AND effect_id = ?2 AND attempt_id = ?3
+               AND declared_workflow_version = ?4 AND generation = ?5
+               AND process_incarnation = ?6 AND status = 'ObservationRecorded'",
+        )
+        .bind(to_i64(authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(authority.effect_id.0, "effect_id")?)
+        .bind(to_i64(authority.attempt_id.0, "attempt_id")?)
+        .bind(to_i64(
+            authority.declared_workflow_version.0,
+            "declared_workflow_version",
+        )?)
+        .bind(to_i64(authority.generation.0, "generation")?)
+        .bind(to_i64(
+            authority.process_incarnation.0,
+            "process_incarnation",
+        )?)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     pub async fn begin_recovered_top_level_llm_attempt(
         &self,
         workflow_id: WorkflowId,
@@ -1102,13 +1130,18 @@ impl WorkflowRepository {
                     p.codec_version, p.request_fingerprint, p.provider, p.model, p.backend, p.request_aggregate,
                     e.effect_id, e.call_ordinal,
                     a.attempt_id, a.ordinal, a.declared_workflow_version, a.generation,
-                    a.process_incarnation, a.status, l.lease_until
+                    a.process_incarnation, a.status, l.lease_until,
+                    o.observation_payload
              FROM top_level_llm_workflows w
              JOIN direct_turn_acceptances dta ON dta.workflow_id = w.workflow_id
              JOIN top_level_llm_effects e ON e.workflow_id = w.workflow_id
              JOIN top_level_llm_prepared_requests p ON p.workflow_id = e.workflow_id AND p.effect_id = e.effect_id
              JOIN workflow_attempts a ON a.workflow_id = e.workflow_id AND a.effect_id = e.effect_id
              LEFT JOIN workflow_reclaimable_leases l ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
+             LEFT JOIN workflow_authoritative_observations o
+               ON o.workflow_id = a.workflow_id AND o.effect_id = a.effect_id
+              AND o.attempt_id = a.attempt_id
+              AND o.observation_codec_family = 'llm.failure'
              WHERE a.status IN ('Begun', 'ObservationRecorded')
                AND a.process_incarnation <> ?1
                AND w.stopped_at IS NULL
@@ -1158,6 +1191,7 @@ impl WorkflowRepository {
                             })
                             .transpose()?,
                     },
+                    recorded_outcome_payload: row.get("observation_payload"),
                 })
             })
             .collect()
@@ -2968,16 +3002,41 @@ mod tests {
         assert_eq!(prepared.prepared_request.effect_id, EffectId(1));
         assert_eq!(prepared.prepared_request.call_ordinal, 0);
         assert_eq!(prepared.authority.attempt_id, AttemptId(1));
+        let failure_payload =
+            serde_json::to_vec(&phoenix_core::domain::llm_types::DurableLlmFailureEvent {
+                codec_version: 1,
+                message: "network error".to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Network,
+                attempt: 1,
+                recovery_in_progress: false,
+                resets_at: None,
+            })
+            .unwrap();
         assert_eq!(
             repo.record_top_level_llm_failure(&RecordTopLevelLlmFailureInput {
                 authority: prepared.authority,
                 observed_at: Timestamp(3),
-                outcome_payload: b"network error".to_vec(),
+                outcome_payload: failure_payload.clone(),
             })
             .await
             .unwrap(),
             AuthorityOutcome::Authorized
         );
+        let observed = repo
+            .recover_top_level_llm_attempts(ProcessIncarnation(10))
+            .await
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].recorded_outcome_payload, Some(failure_payload));
+        assert!(repo
+            .acknowledge_recovered_top_level_llm_failure(&observed[0].attempt.authority)
+            .await
+            .unwrap());
+        assert!(repo
+            .recover_top_level_llm_attempts(ProcessIncarnation(10))
+            .await
+            .unwrap()
+            .is_empty());
         let retry = repo
             .prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
                 committed_at: Timestamp(4),

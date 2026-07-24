@@ -691,6 +691,7 @@ fn kick_runtime_delivery(runtime: Arc<RuntimeManager>, conversation_id: String, 
             | Event::WakeBatchAdopted
             | Event::ResumeDurableLlmRequest
             | Event::ResumeDurableToolExecution
+            | Event::ResumeDurableLlmFailure { .. }
             | Event::Shutdown => return,
         };
         let repo = phoenix_db::WorkflowRepository::new(runtime.db().pool().clone());

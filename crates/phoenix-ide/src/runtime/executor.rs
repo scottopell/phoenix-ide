@@ -2805,6 +2805,21 @@ where
             return Ok(());
         }
 
+        if let Event::ResumeDurableLlmFailure { failure, authority } = event {
+            let error_event = Event::LlmError {
+                message: failure.message,
+                error_kind: failure.error_kind,
+                attempt: failure.attempt,
+                recovery_in_progress: failure.recovery_in_progress,
+                resets_at: failure.resets_at,
+            };
+            Box::pin(self.process_event(error_event)).await?;
+            self.storage
+                .acknowledge_recovered_top_level_llm_failure(&authority)
+                .await?;
+            return Ok(());
+        }
+
         // Check if this is a SubAgentResult that needs buffering
         if let Event::SubAgentResult { .. } = &event {
             if !self.can_handle_sub_agent_result() {
@@ -5147,6 +5162,7 @@ where
             }
         });
 
+        let state_for_task = self.state.clone();
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let task_attempt_capture = attempt_capture.clone();
         let forwarder_abort = forwarder_handle.abort_handle();
@@ -5468,7 +5484,29 @@ where
                         observed_at: phoenix_workflow::Timestamp(
                             u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
                         ),
-                        outcome_payload: format!("{llm_outcome:?}").into_bytes(),
+                        outcome_payload: match phoenix_state_machine::llm_outcome_to_event(
+                            llm_outcome.clone(),
+                            &state_for_task,
+                        ) {
+                            Event::LlmError {
+                                message,
+                                error_kind,
+                                attempt,
+                                recovery_in_progress,
+                                resets_at,
+                            } => serde_json::to_vec(
+                                &phoenix_core::domain::llm_types::DurableLlmFailureEvent {
+                                    codec_version: 1,
+                                    message,
+                                    error_kind,
+                                    attempt,
+                                    recovery_in_progress,
+                                    resets_at,
+                                },
+                            )
+                            .expect("durable LLM failure event has a total codec"),
+                            _ => unreachable!("non-response LLM outcome must map to LlmError"),
+                        },
                     };
                     match storage.record_top_level_llm_failure(&failure).await {
                         Ok(phoenix_workflow::AuthorityOutcome::Authorized) => {}

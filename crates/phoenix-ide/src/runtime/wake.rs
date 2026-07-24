@@ -502,6 +502,40 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
         .await
         .map_err(|error| error.to_string())?
     {
+        if let Some(payload) = recovery.recorded_outcome_payload.as_deref() {
+            let failure: phoenix_core::domain::llm_types::DurableLlmFailureEvent =
+                serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+            if failure.codec_version != 1 {
+                return Err(format!(
+                    "unsupported durable LLM failure codec {}",
+                    failure.codec_version
+                ));
+            }
+            let handle = manager
+                .get_or_create(&recovery.workflow.conversation_id)
+                .await?;
+            let authority = &recovery.attempt.authority;
+            if let Err(error) = handle
+                .event_tx
+                .send(
+                    phoenix_core::domain::sm_event::Event::ResumeDurableLlmFailure {
+                        failure,
+                        authority: phoenix_core::domain::llm_types::DurableLlmFailureAuthority {
+                            workflow_id: authority.workflow_id.0,
+                            effect_id: authority.effect_id.0,
+                            attempt_id: authority.attempt_id.0,
+                            declared_workflow_version: authority.declared_workflow_version.0,
+                            generation: authority.generation.0,
+                            process_incarnation: authority.process_incarnation.0,
+                        },
+                    },
+                )
+                .await
+            {
+                tracing::warn!(%error, "recorded LLM failure runtime channel closed");
+            }
+            continue;
+        }
         let durable_request: phoenix_llm::DurableLlmRequest =
             serde_json::from_str(&recovery.prepared_request.request_aggregate)
                 .map_err(|error| error.to_string())?;

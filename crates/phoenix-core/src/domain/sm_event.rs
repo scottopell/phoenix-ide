@@ -277,6 +277,11 @@ pub enum Event {
     /// LLM response is already reflected in persisted `ToolExecuting` state.
     ResumeDurableToolExecution,
 
+    ResumeDurableLlmFailure {
+        failure: crate::domain::llm_types::DurableLlmFailureEvent,
+        authority: crate::domain::llm_types::DurableLlmFailureAuthority,
+    },
+
     /// Sent by `RuntimeManager::evict_runtime` (e.g. after a model upgrade)
     /// to cleanly terminate a running runtime that is being replaced.
     /// The executor returns from `run()` immediately on receipt, which drops
@@ -323,6 +328,7 @@ impl Event {
             Event::WakeBatchAdopted => "WakeBatchAdopted",
             Event::ResumeDurableLlmRequest => "ResumeDurableLlmRequest",
             Event::ResumeDurableToolExecution => "ResumeDurableToolExecution",
+            Event::ResumeDurableLlmFailure { .. } => "ResumeDurableLlmFailure",
             Event::Shutdown => "Shutdown",
         }
     }
@@ -639,6 +645,7 @@ impl TryFrom<Event> for ParentEvent {
             | Event::WakeBatchAdopted
             | Event::ResumeDurableLlmRequest
             | Event::ResumeDurableToolExecution
+            | Event::ResumeDurableLlmFailure { .. }
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "ParentEvent",
@@ -772,6 +779,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::WakeBatchAdopted
             | Event::ResumeDurableLlmRequest
             | Event::ResumeDurableToolExecution
+            | Event::ResumeDurableLlmFailure { .. }
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",

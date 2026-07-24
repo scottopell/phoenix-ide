@@ -570,6 +570,26 @@ pub const DURABLE_LLM_REQUEST_CODEC_VERSION: u32 = 1;
 pub const DURABLE_LLM_RESPONSE_CODEC_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurableLlmFailureEvent {
+    pub codec_version: u32,
+    pub message: String,
+    pub error_kind: crate::domain::db_schema::ErrorKind,
+    pub attempt: u32,
+    pub recovery_in_progress: bool,
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableLlmFailureAuthority {
+    pub workflow_id: u64,
+    pub effect_id: u64,
+    pub attempt_id: u64,
+    pub declared_workflow_version: u64,
+    pub generation: u64,
+    pub process_incarnation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DurableLlmRequest {
     pub system: Vec<SystemContent>,
     pub messages: Vec<LlmMessage>,

@@ -3344,7 +3344,8 @@ pub fn handle_outcome(
 
 /// Convert `LlmOutcome` to the equivalent `Event` for delegation to `transition()`.
 #[allow(clippy::too_many_lines)] // Pure-data dispatch over a wide LlmOutcome enum
-fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
+#[must_use]
+pub fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
     match outcome {
         LlmOutcome::Response {
             content,

@@ -31,7 +31,10 @@ pub use state::{ConvContext, ConvState, StepResult};
 // Re-exports for split state types (used by future callers that adopt the split API)
 #[allow(unused_imports)]
 pub use state::{CoreState, ParentState, SubAgentState};
-pub use transition::{check_user_message_acceptable, handle_outcome, transition, TransitionError};
+pub use transition::{
+    check_user_message_acceptable, handle_outcome, llm_outcome_to_event, transition,
+    TransitionError,
+};
 
 // Re-exports for atomic persistence types (used by runtime/executor)
 pub use effect::tool_result_message_id;

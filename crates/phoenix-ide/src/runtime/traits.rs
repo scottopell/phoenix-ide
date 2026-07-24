@@ -169,6 +169,13 @@ pub trait MessageStore: Send + Sync {
         Ok(())
     }
 
+    async fn acknowledge_recovered_top_level_llm_failure(
+        &self,
+        _authority: &phoenix_core::domain::llm_types::DurableLlmFailureAuthority,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn stop_active_top_level_llm_for_conversation(
         &self,
         _conversation_id: &str,
@@ -896,6 +903,29 @@ impl MessageStore for DatabaseStorage {
             .release_workflow_delivery_claim(workflow_id, delivery_id, process_incarnation)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn acknowledge_recovered_top_level_llm_failure(
+        &self,
+        authority: &phoenix_core::domain::llm_types::DurableLlmFailureAuthority,
+    ) -> Result<(), String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .acknowledge_recovered_top_level_llm_failure(&phoenix_db::LocalAttemptAuthority {
+                workflow_id: phoenix_workflow::WorkflowId(authority.workflow_id),
+                effect_id: phoenix_workflow::EffectId(authority.effect_id),
+                attempt_id: phoenix_workflow::AttemptId(authority.attempt_id),
+                declared_workflow_version: phoenix_workflow::Version(
+                    authority.declared_workflow_version,
+                ),
+                generation: phoenix_workflow::Generation(authority.generation),
+                process_incarnation: phoenix_workflow::ProcessIncarnation(
+                    authority.process_incarnation,
+                ),
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .then_some(())
+            .ok_or_else(|| "recorded LLM failure acknowledgment lost authority".to_string())
     }
 
     async fn stop_active_top_level_llm_for_conversation(

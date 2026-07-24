@@ -12440,9 +12440,17 @@ mod tests {
             transition_event,
             phoenix_workflow::llm_profile::TopLevelLlmEvent::ResponseAccepted { .. }
         ));
-        let owed_after_product = repo.load_owed_top_level_llm_receipts().await.unwrap();
-        assert_eq!(owed_after_product.len(), 1);
-        assert_eq!(owed_after_product[0].receipt.receipt_id, receipt_id);
+        assert!(repo
+            .load_owed_top_level_llm_receipts()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repo.load_conversations_with_owed_top_level_llm_tools()
+                .await
+                .unwrap(),
+            vec!["conv-direct".to_string()]
+        );
         assert!(repo
             .claim_workflow_delivery(
                 WorkflowId(1),
@@ -12494,9 +12502,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(begun_status, "ExecutionMayHaveBegun");
+        assert!(repo
+            .load_owed_top_level_llm_receipts()
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            repo.load_owed_top_level_llm_receipts().await.unwrap().len(),
-            1
+            repo.load_conversations_with_owed_top_level_llm_tools()
+                .await
+                .unwrap(),
+            vec!["conv-direct".to_string()]
         );
     }
 
