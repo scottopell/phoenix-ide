@@ -325,10 +325,10 @@ pub fn pr_auto_fix_instruction(lang: LlmLanguage, artifact_path: &str) -> String
     let prefix = pr_auto_fix_instruction_prefix();
     match lang {
         LlmLanguage::PhoenixNative => format!(
-            "{prefix}{artifact_path}`. That file is a point-in-time actionable snapshot of the failing CI checks (with failure logs inline where Phoenix could extract them) and unresolved/actionable review feedback. Use it as your starting point; if a failing check has no inline log, fetch the current logs yourself before fixing. Review-thread items carry a `thread_id` (a `PRRT_…` node id) — pass that, not the comment `id`, to the `resolveReviewThread` GraphQL mutation when marking threads resolved. Immediately before resolving threads, extract the `thread_id` values directly from this named artifact; do not reconstruct IDs or reuse IDs from memory or prior snapshots. Fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed."
+            "{prefix}{artifact_path}`. That file is a point-in-time actionable snapshot of the failing CI checks (with failure logs inline where Phoenix could extract them) and unresolved/actionable review feedback. Use it as your starting point; if a failing check has no inline log, fetch the current logs yourself before fixing. Review-thread items carry a `thread_id` (a `PRRT_…` node id) — pass that, not the comment `id`, to the `resolveReviewThread` GraphQL mutation when marking threads resolved. Happy path after addressing the findings: `jq -r '.feedback.items[] | select(.source == \"review_thread\" and .resolved == false) | .thread_id // empty' '{artifact_path}' | while IFS= read -r id; do gh api graphql -f id=\"$id\" -f query='mutation($id:ID!){{resolveReviewThread(input:{{threadId:$id}}){{thread{{id isResolved}}}}}}'; done`. Fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed."
         ),
         LlmLanguage::Caveman => format!(
-            "{prefix}{artifact_path}`. File is actionable snapshot: failed CI (logs inline when Phoenix grab them) and unresolved/actionable review feedback. No inline log? Fetch current log yourself. Review-thread item carry `thread_id` (`PRRT_…` node id) — feed that, not comment `id`, to `resolveReviewThread` mutation when mark thread resolved. Right before resolve, extract `thread_id` from this named file. Do not rebuild ID or reuse one from memory or older snapshot. Fix in this cave. Run focused tests. Commit changes. Say what changed."
+            "{prefix}{artifact_path}`. File is actionable snapshot: failed CI (logs inline when Phoenix grab them) and unresolved/actionable review feedback. No inline log? Fetch current log yourself. Review-thread item carry `thread_id` (`PRRT_…` node id) — feed that, not comment `id`, to `resolveReviewThread` mutation when mark thread resolved. Happy path after fix: `jq -r '.feedback.items[] | select(.source == \"review_thread\" and .resolved == false) | .thread_id // empty' '{artifact_path}' | while IFS= read -r id; do gh api graphql -f id=\"$id\" -f query='mutation($id:ID!){{resolveReviewThread(input:{{threadId:$id}}){{thread{{id isResolved}}}}}}'; done`. Fix in this cave. Run focused tests. Commit changes. Say what changed."
         ),
     }
 }
@@ -631,9 +631,11 @@ mod tests {
         // a per-comment id is rejected by resolveReviewThread.
         assert!(native.contains("thread_id"));
         assert!(native.contains("resolveReviewThread"));
-        assert!(native.contains("extract the `thread_id` values directly from this named artifact"));
-        assert!(native.contains("do not reconstruct IDs"));
-        assert!(native.contains("prior snapshots"));
+        assert!(native.contains("Happy path after addressing the findings"));
+        assert!(native.contains(".feedback.items[]"));
+        assert!(native.contains(".thread_id // empty"));
+        assert!(native.contains("-f id=\"$id\""));
+        assert!(native.contains("mutation($id:ID!)"));
 
         let caveman =
             pr_auto_fix_instruction(LlmLanguage::Caveman, ".phoenix/pr-context/pr-7.json");
@@ -645,9 +647,11 @@ mod tests {
         assert!(!caveman.to_lowercase().contains("push"));
         assert!(caveman.contains("thread_id"));
         assert!(caveman.contains("resolveReviewThread"));
-        assert!(caveman.contains("extract `thread_id` from this named file"));
-        assert!(caveman.contains("Do not rebuild ID"));
-        assert!(caveman.contains("older snapshot"));
+        assert!(caveman.contains("Happy path after fix"));
+        assert!(caveman.contains(".feedback.items[]"));
+        assert!(caveman.contains(".thread_id // empty"));
+        assert!(caveman.contains("-f id=\"$id\""));
+        assert!(caveman.contains("mutation($id:ID!)"));
     }
 
     #[test]
