@@ -117,7 +117,10 @@ pub struct AnchorNotFoundDiagnostics {
 impl std::fmt::Display for AnchorNotFoundDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.candidates.is_empty() {
-            return write!(f, "No reliable nearby current text was found.");
+            return write!(
+                f,
+                "No reliable nearby current text was found. Re-read the file before retrying."
+            );
         }
 
         writeln!(
@@ -127,13 +130,12 @@ impl std::fmt::Display for AnchorNotFoundDiagnostics {
         for candidate in &self.candidates {
             writeln!(
                 f,
-                "- exact current text around line {}:",
+                "- exact current text around line {} (between candidate tags):",
                 candidate.start_line
             )?;
+            f.write_str("<candidate>")?;
             f.write_str(&candidate.snippet)?;
-            if !candidate.snippet.ends_with(['\n', '\r']) {
-                writeln!(f)?;
-            }
+            writeln!(f, "</candidate>")?;
         }
         write!(f, "Candidates are advisory and do not authorize an edit.")
     }
@@ -278,5 +280,50 @@ mod tests {
         assert_eq!(req.operation, Operation::Replace);
         assert_eq!(req.old_text, Some("hello".to_string()));
         assert_eq!(req.new_text, Some("world".to_string()));
+    }
+
+    #[test]
+    fn empty_candidate_diagnostics_require_a_reread() {
+        let diagnostics = AnchorNotFoundDiagnostics {
+            candidates: Vec::new(),
+        };
+
+        assert!(diagnostics.to_string().contains("Re-read the file"));
+    }
+
+    #[test]
+    fn candidate_without_final_newline_keeps_boundary_visible() {
+        let diagnostics = AnchorNotFoundDiagnostics {
+            candidates: vec![AnchorCandidateLocation {
+                start_line: 4,
+                snippet: "target();".to_string(),
+            }],
+        };
+
+        let output = diagnostics.to_string();
+        assert!(
+            output.contains("<candidate>target();</candidate>"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("<candidate>target();\n</candidate>"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn candidate_with_final_newline_preserves_it_before_boundary() {
+        let diagnostics = AnchorNotFoundDiagnostics {
+            candidates: vec![AnchorCandidateLocation {
+                start_line: 4,
+                snippet: "target();\n".to_string(),
+            }],
+        };
+
+        let output = diagnostics.to_string();
+        assert!(
+            output.contains("<candidate>target();\n</candidate>"),
+            "{output}"
+        );
     }
 }

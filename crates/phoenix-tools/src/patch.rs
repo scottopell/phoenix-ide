@@ -703,7 +703,7 @@ mod tests {
         assert!(!result.is_success(), "expected error: {}", result.output());
         assert_eq!(
             result.output(),
-            "Patch 1 (replace) failed: oldText not found in file. The anchor is stale, but these bounded current-file regions may contain the intended site:\n- exact current text around line 1:\nbefore\nfn target() {\n    let current = 2;\n    finish();\n}\nCandidates are advisory and do not authorize an edit. Retry with exact current text as oldText. The replacement still requires one unique match."
+            "Patch 1 (replace) failed: oldText not found in file. The anchor is stale, but these bounded current-file regions may contain the intended site:\n- exact current text around line 1 (between candidate tags):\n<candidate>before\nfn target() {\n    let current = 2;\n    finish();\n}\n</candidate>\nCandidates are advisory and do not authorize an edit. Retry with exact current text as oldText. The replacement still requires one unique match."
         );
         assert_eq!(fs::read_to_string(test_file).unwrap(), current);
     }

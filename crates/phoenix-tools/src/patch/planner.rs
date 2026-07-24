@@ -985,7 +985,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "Patch 2 (insert_after) failed: oldText not found in file. No reliable nearby current text was found. Retry with exact current text as oldText. The replacement still requires one unique match."
+            "Patch 2 (insert_after) failed: oldText not found in file. No reliable nearby current text was found. Re-read the file before retrying. Retry with exact current text as oldText. The replacement still requires one unique match."
         );
     }
 
