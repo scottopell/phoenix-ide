@@ -6516,37 +6516,37 @@ fn strip_unavailable_tool_blocks(
             let filtered: Vec<ContentBlock> = msg
                 .content
                 .into_iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolUse { ref id, .. } => {
-                        if stripped_ids.contains(id) {
-                            None
-                        } else {
-                            Some(block)
-                        }
-                    }
+                .flat_map(|block| match block {
+                    ContentBlock::ToolUse { ref id, .. } if stripped_ids.contains(id) => Vec::new(),
                     ContentBlock::ToolResult {
-                        ref tool_use_id,
-                        ref content,
-                        ref images,
-                        is_error
+                        tool_use_id,
+                        content,
+                        images,
+                        is_error,
                     } => {
-                        if let Some((name, input)) = flatten_result_calls.get(tool_use_id) {
-                            if !images.is_empty() {
-                                tracing::debug!(
-                                    count = images.len(),
-                                    "dropping images while flattening an unavailable historical tool result"
-                                );
-                            }
-                            Some(ContentBlock::Text {
+                        if let Some((name, input)) = flatten_result_calls.get(&tool_use_id) {
+                            let mut flattened = Vec::with_capacity(1 + images.len());
+                            flattened.push(ContentBlock::Text {
                                 text: format!(
                                     "[historical tool result]\ntool: {name}\ninput: {input}\nstatus: {}\noutput:\n{content}",
                                     if is_error { "error" } else { "success" }
                                 ),
-                            })
-                        } else if stripped_ids.contains(tool_use_id) {
-                            None
+                            });
+                            flattened.extend(
+                                images
+                                    .into_iter()
+                                    .map(|source| ContentBlock::Image { source }),
+                            );
+                            flattened
+                        } else if stripped_ids.contains(&tool_use_id) {
+                            Vec::new()
                         } else {
-                            Some(block)
+                            vec![ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                images,
+                                is_error,
+                            }]
                         }
                     }
                     // Filter individual unavailable references but keep the block
@@ -6557,13 +6557,13 @@ fn strip_unavailable_tool_blocks(
                         content
                             .tool_references
                             .retain(|r| available_tools.contains(r.tool_name.as_str()));
-                        Some(ContentBlock::ToolSearchToolResult {
+                        vec![ContentBlock::ToolSearchToolResult {
                             tool_use_id,
                             content,
-                        })
+                        }]
                     }
                     // ServerToolUse blocks are server-side — never strip
-                    _ => Some(block),
+                    _ => vec![block],
                 })
                 .collect();
             LlmMessage {
@@ -7233,6 +7233,39 @@ mod strip_tool_blocks_tests {
                     ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
                 )
             }));
+    }
+
+    #[test]
+    fn grace_normalization_preserves_tool_result_images_after_context_text() {
+        let terminal: std::collections::HashSet<&str> =
+            ["submit_result", "submit_error"].into_iter().collect();
+        let image = ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "visual-evidence".to_string(),
+        };
+        let msgs = vec![
+            assistant(vec![tool_use("image-1", "read_image")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "image-1".to_string(),
+                content: "screenshot details".to_string(),
+                images: vec![image.clone()],
+                is_error: false,
+            }]),
+        ];
+
+        let out = strip_unavailable_tool_blocks(msgs, &terminal, true);
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0].content[0],
+            ContentBlock::Text { text }
+                if text.contains("tool: read_image") && text.contains("screenshot details")
+        ));
+        assert_eq!(
+            out[0].content.get(1),
+            Some(&ContentBlock::Image { source: image }),
+            "visual evidence follows its flattened result context"
+        );
     }
 
     #[test]
