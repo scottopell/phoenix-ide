@@ -73,7 +73,6 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             .register(&intent, &prepared_fingerprint, now)
             .await
             .map_err(|e| e.to_string())?;
-        self.kick();
         Ok(match outcome {
             WakeRegistrationOutcome::Registered {
                 workflow_id,
@@ -111,6 +110,10 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             WakeCancellationOutcome::Replayed { .. } => RegisteredWake::CancelReplayed,
             WakeCancellationOutcome::Stale => RegisteredWake::CancelStale,
         })
+    }
+
+    fn notify_activation_committed(&self) {
+        self.kick();
     }
 
     async fn rekey_work_scope(
@@ -477,11 +480,16 @@ async fn deliver_pending(
             break;
         }
         let page_len = pending.len();
+        let mut processed_conversations = std::collections::HashSet::new();
         for row in pending {
             let next_cursor = WakePendingGlobalCursor {
                 workflow_id: row.workflow_id,
                 delivery_id: row.delivery_id,
             };
+            if !processed_conversations.insert(row.conversation_id.clone()) {
+                cursor = Some(next_cursor);
+                continue;
+            }
             let current = repo
                 .get_pending_exact(row.workflow_id, row.delivery_id, &row.conversation_id)
                 .await
@@ -537,67 +545,73 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             }
-            if repo
-                .get_delivery_message_link(
-                    current.workflow_id,
-                    current.canonical_delivery.delivery_id,
-                )
+            let conversation_pending = repo
+                .list_pending(&current.conversation_id)
                 .await
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                adopt_materialized_delivery(manager, &handle, repo, &current.conversation_id, now)
-                    .await?;
-                cursor = Some(next_cursor);
-                continue;
-            }
-            let (sequence_guard, sequence_ids) =
-                handle.broadcast_tx.reserve_next_persisted_message_range(1);
-            let sequence_id = sequence_ids[0];
-            match repo
-                .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
-                    workflow_id: current.workflow_id,
-                    delivery_id: current.canonical_delivery.delivery_id,
-                    conversation_id: current.conversation_id.clone(),
-                    rendered_content: rendered,
-                    display_data,
-                    auto_resume,
-                    created_at: now,
-                    sequence_id: Some(sequence_id),
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                MaterializePendingDeliveryMessageOutcome::Materialized(link) => {
-                    let _ = handle
-                        .broadcast_tx
-                        .send_message(link.linked_message.message.clone());
-                    adopt_materialized_delivery(
-                        manager,
-                        &handle,
-                        repo,
-                        &current.conversation_id,
-                        now,
+                .map_err(|error| error.to_string())?;
+            let mut unmaterialized = Vec::new();
+            for delivery in &conversation_pending {
+                if repo
+                    .get_delivery_message_link(
+                        delivery.workflow_id,
+                        delivery.canonical_delivery.delivery_id,
                     )
-                    .await?;
-                }
-                MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
-                    adopt_materialized_delivery(
-                        manager,
-                        &handle,
-                        repo,
-                        &current.conversation_id,
-                        now,
-                    )
-                    .await?;
-                }
-                MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
-                    repo.suppress_pending_for_archived_conversation(&current, now)
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+                {
+                    unmaterialized.push(delivery);
                 }
             }
-            drop(sequence_guard);
+            let reserved = (!unmaterialized.is_empty()).then(|| {
+                handle
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(unmaterialized.len())
+            });
+            let sequence_ids = reserved
+                .as_ref()
+                .map(|(_, sequence_ids)| sequence_ids.clone())
+                .unwrap_or_default();
+            for (delivery, sequence_id) in unmaterialized.into_iter().zip(sequence_ids) {
+                let display_data = Some(serde_json::json!({
+                    "type": "wake_result",
+                    "adopted": false,
+                    "terminal": &delivery.receipt.terminal,
+                }));
+                let auto_resume = !matches!(
+                    delivery.receipt.terminal,
+                    phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
+                );
+                match repo
+                    .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
+                        workflow_id: delivery.workflow_id,
+                        delivery_id: delivery.canonical_delivery.delivery_id,
+                        conversation_id: delivery.conversation_id.clone(),
+                        rendered_content: render_terminal_result(delivery),
+                        display_data,
+                        auto_resume,
+                        created_at: now,
+                        sequence_id: Some(sequence_id),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    MaterializePendingDeliveryMessageOutcome::Materialized(link) => {
+                        let _ = handle
+                            .broadcast_tx
+                            .send_message(link.linked_message.message.clone());
+                    }
+                    MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {}
+                    MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
+                        repo.suppress_pending_for_archived_conversation(delivery, now)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            drop(reserved);
+            adopt_materialized_delivery(manager, &handle, repo, &current.conversation_id, now)
+                .await?;
             cursor = Some(next_cursor);
         }
         if page_len < OBSERVATION_BATCH_LIMIT {
@@ -644,7 +658,7 @@ fn wake_bash_window(
                 },
             )
             .collect(),
-        partial: None,
+        partial: evidence.final_tail_partial.clone(),
     }
 }
 
@@ -652,6 +666,16 @@ fn timestamp_rfc3339(timestamp: Timestamp) -> String {
     chrono::DateTime::from_timestamp(i64::try_from(timestamp.0).unwrap_or(i64::MAX), 0)
         .unwrap_or(chrono::DateTime::UNIX_EPOCH)
         .to_rfc3339()
+}
+
+#[derive(serde::Serialize)]
+struct BashWakeResolutionObservation<'a> {
+    contract_id: &'a str,
+    handle: &'a str,
+    status: &'static str,
+    resolved_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 fn render_terminal_result(pending: &WakePendingDelivery) -> String {
@@ -704,6 +728,29 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
                 })
             }
         },
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Expired {
+            contract_id,
+            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(identity),
+            resolved_at,
+        } => serde_json::to_string(&BashWakeResolutionObservation {
+            contract_id,
+            handle: &identity.handle_id,
+            status: "expired",
+            resolved_at: timestamp_rfc3339(*resolved_at),
+            reason: None,
+        }),
+        phoenix_workflow::wake_profile::WakeTerminalPayload::Forgotten {
+            contract_id,
+            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(identity),
+            reason,
+            resolved_at,
+        } => serde_json::to_string(&BashWakeResolutionObservation {
+            contract_id,
+            handle: &identity.handle_id,
+            status: "forgotten",
+            resolved_at: timestamp_rfc3339(*resolved_at),
+            reason: Some(format!("{reason:?}")),
+        }),
         terminal => serde_json::to_string(terminal),
     };
     rendered.unwrap_or_else(|_| "Wake completed; inspect display metadata for details.".to_string())
@@ -792,6 +839,7 @@ async fn inspect_live_bash(
     };
     let ring = live.ring.lock().await;
     let window = ring.tail(200);
+    let final_tail_partial = ring.partial_str();
     let final_tail = window
         .lines
         .into_iter()
@@ -810,6 +858,7 @@ async fn inspect_live_bash(
         final_tail_start_offset: window.start_offset,
         final_tail_end_offset: window.end_offset,
         final_tail_truncated_before: window.truncated_before,
+        final_tail_partial,
         final_tail,
     }))
 }
@@ -873,6 +922,7 @@ impl TerminalInspector for RuntimeRegistryInspector {
                                     final_tail_start_offset,
                                     final_tail_end_offset: tomb.next_offset_at_exit,
                                     final_tail_truncated_before: final_tail_start_offset > 0,
+                                    final_tail_partial: None,
                                     final_tail: tail,
                                 },
                             )))
@@ -1199,6 +1249,7 @@ mod tests {
                 final_tail_start_offset: 40,
                 final_tail_end_offset: 42,
                 final_tail_truncated_before: true,
+                final_tail_partial: None,
                 final_tail: vec!["first".to_string(), "second".to_string()],
             })),
         );
@@ -1276,6 +1327,7 @@ mod tests {
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
+                final_tail_partial: None,
                 final_tail: vec!["done".to_string()],
             })),
         );
@@ -1380,6 +1432,11 @@ mod tests {
                 .mark_kill_pending_kernel(KillSignal::Term, attempted_at)
                 .await
         );
+        let live = handle.state().await;
+        let phoenix_tools::bash::handle::HandleState::Live(live) = live.as_ref() else {
+            panic!("expected live handle");
+        };
+        live.ring.lock().await.append(b"unterminated");
         bash.get_or_create(&scope)
             .await
             .write()
@@ -1417,6 +1474,7 @@ mod tests {
         assert_eq!(rendered["status"], "kill_pending_kernel");
         assert_eq!(rendered["kill_attempted_at"], "1970-01-01T00:00:09+00:00");
         assert_eq!(rendered["kill_signal_sent"], "TERM");
+        assert_eq!(rendered["partial"], "unterminated");
         assert!(rendered.get("finished_at").is_none());
         assert!(rendered.get("final_cause").is_none());
     }
@@ -1445,6 +1503,12 @@ mod tests {
                 ..
             }
         ));
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_terminal_result(&pending[0])).unwrap();
+        assert_eq!(rendered["status"], "forgotten");
+        assert_eq!(rendered["handle"], "missing");
+        assert_eq!(rendered["reason"], "PhoenixRestart");
+        assert!(rendered.get("Forgotten").is_none());
 
         worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 1);
@@ -1559,6 +1623,7 @@ mod tests {
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 0,
                 final_tail_truncated_before: false,
+                final_tail_partial: None,
                 final_tail: vec![],
             })),
         );
@@ -1641,7 +1706,9 @@ mod tests {
             }
         );
         assert_eq!(conflict, RegisteredWake::Conflict);
-        assert_eq!(*kick_rx.borrow(), 3);
+        assert_eq!(*kick_rx.borrow(), 0);
+        registrar.notify_activation_committed();
+        assert_eq!(*kick_rx.borrow(), 1);
     }
 
     #[tokio::test]
@@ -1743,6 +1810,7 @@ mod tests {
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 0,
                 final_tail_truncated_before: false,
+                final_tail_partial: None,
                 final_tail: vec![],
             })),
         );
@@ -1761,6 +1829,11 @@ mod tests {
             pending[0].receipt.terminal,
             phoenix_workflow::wake_profile::WakeTerminalPayload::Expired { .. }
         ));
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_terminal_result(&pending[0])).unwrap();
+        assert_eq!(rendered["status"], "expired");
+        assert_eq!(rendered["handle"], "b-1");
+        assert!(rendered.get("Expired").is_none());
     }
 
     #[tokio::test]
@@ -1803,6 +1876,7 @@ mod tests {
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
+                final_tail_partial: None,
                 final_tail: vec!["done".to_string()],
             })),
         );
@@ -1866,6 +1940,7 @@ mod tests {
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
+                final_tail_partial: None,
                 final_tail: vec!["done".to_string()],
             })),
         );
@@ -1997,6 +2072,7 @@ mod tests {
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
+                final_tail_partial: None,
                 final_tail: vec!["done".to_string()],
             })),
         );
@@ -2088,6 +2164,7 @@ mod tests {
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
+                final_tail_partial: None,
                 final_tail: vec!["done".to_string()],
             })),
         );

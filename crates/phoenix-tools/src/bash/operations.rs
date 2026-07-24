@@ -2023,6 +2023,8 @@ mod tests {
             Ok(RegisteredWake::CancelStale)
         }
 
+        fn notify_activation_committed(&self) {}
+
         async fn rekey_work_scope(
             &self,
             _conversation_id: &str,

@@ -181,6 +181,7 @@ impl RegisteredWake {
 pub trait WakeRegistrar: Send + Sync {
     async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String>;
     async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String>;
+    fn notify_activation_committed(&self);
     async fn rekey_work_scope(
         &self,
         conversation_id: &str,
@@ -1693,6 +1694,8 @@ mod wake_registrar_seam_tests {
             self.calls.lock().await.push("cancel".to_string());
             Ok(RegisteredWake::CancelStale)
         }
+
+        fn notify_activation_committed(&self) {}
 
         async fn rekey_work_scope(
             &self,

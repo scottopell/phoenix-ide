@@ -14444,6 +14444,7 @@ mod wake_handler_tests {
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
+                final_tail_partial: None,
                 final_tail: vec!["done".into()],
             },
         );

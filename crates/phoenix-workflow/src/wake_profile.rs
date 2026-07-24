@@ -150,6 +150,9 @@ pub struct BashTerminalEvidence {
     pub final_tail_end_offset: u64,
     #[serde(default)]
     pub final_tail_truncated_before: bool,
+    // owned: pre-partial evidence had no unterminated output fragment
+    #[serde(default)]
+    pub final_tail_partial: Option<String>,
     pub final_tail: Vec<String>,
 }
 

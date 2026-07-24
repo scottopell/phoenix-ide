@@ -5543,6 +5543,9 @@ where
                 self.storage
                     .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                     .await?;
+                if let Some(registrar) = &self.wake_registrar {
+                    registrar.notify_activation_committed();
+                }
 
                 // Broadcast the now-durable rows so connected clients render
                 // the assistant message and each tool result. Tool-result
@@ -9313,7 +9316,10 @@ mod context_exhausted_preserves_worktree_tests {
     use std::time::Duration;
     use tokio::sync::{broadcast, mpsc};
 
-    struct RecordingWakeRegistrar(std::sync::Mutex<Vec<phoenix_workflow::WorkflowId>>);
+    struct RecordingWakeRegistrar {
+        cancelled: std::sync::Mutex<Vec<phoenix_workflow::WorkflowId>>,
+        activation_notifications: std::sync::atomic::AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl crate::tools::WakeRegistrar for RecordingWakeRegistrar {
@@ -9328,8 +9334,13 @@ mod context_exhausted_preserves_worktree_tests {
             &self,
             input: crate::tools::CancelWakeInput,
         ) -> Result<crate::tools::RegisteredWake, String> {
-            self.0.lock().unwrap().push(input.workflow_id);
+            self.cancelled.lock().unwrap().push(input.workflow_id);
             Ok(crate::tools::RegisteredWake::Cancelled)
+        }
+
+        fn notify_activation_committed(&self) {
+            self.activation_notifications
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         async fn rekey_work_scope(
@@ -9359,13 +9370,62 @@ mod context_exhausted_preserves_worktree_tests {
     }
 
     #[tokio::test]
+    async fn successful_tool_checkpoint_notifies_wake_activation() {
+        use crate::db::{ToolOutcome, ToolResult};
+        use crate::state_machine::{AssistantMessage, CheckpointData};
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runtime, _) = build_runtime(storage, "activation", temp.path().to_path_buf());
+        let registrar = Arc::new(RecordingWakeRegistrar {
+            cancelled: std::sync::Mutex::new(vec![]),
+            activation_notifications: std::sync::atomic::AtomicUsize::new(0),
+        });
+        runtime.wake_registrar = Some(registrar.clone());
+        let checkpoint = CheckpointData::tool_round(
+            AssistantMessage::new(
+                "agent-1".into(),
+                vec![phoenix_llm::ContentBlock::ToolUse {
+                    id: "tool-1".into(),
+                    name: "wait_until".into(),
+                    input: serde_json::json!({}),
+                }],
+                None,
+                None,
+            ),
+            vec![ToolResult {
+                tool_use_id: "tool-1".into(),
+                outcome: ToolOutcome::Success {
+                    output: "ok".into(),
+                    display_data: None,
+                    images: vec![],
+                },
+                duration_ms: None,
+            }],
+        )
+        .unwrap();
+
+        runtime.persist_checkpoint(checkpoint).await.unwrap();
+
+        assert_eq!(
+            registrar
+                .activation_notifications
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn parked_sub_agent_registration_remains_cancellable() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(InMemoryStorage::new());
         let (mut runtime, _) = build_runtime(storage, "parked-child", temp.path().to_path_buf());
         runtime.context.is_sub_agent = true;
         runtime.state = ConvState::Idle;
-        let registrar = Arc::new(RecordingWakeRegistrar(std::sync::Mutex::new(vec![])));
+        let registrar = Arc::new(RecordingWakeRegistrar {
+            cancelled: std::sync::Mutex::new(vec![]),
+            activation_notifications: std::sync::atomic::AtomicUsize::new(0),
+        });
         runtime.wake_registrar = Some(registrar.clone());
         runtime.publish_wake_registration(WakeRegistrationNotice {
             workflow_id: 11,
@@ -9384,7 +9444,7 @@ mod context_exhausted_preserves_worktree_tests {
             .unwrap();
 
         assert_eq!(
-            *registrar.0.lock().unwrap(),
+            *registrar.cancelled.lock().unwrap(),
             vec![phoenix_workflow::WorkflowId(11)]
         );
         assert!(runtime.registered_wake_workflows.is_empty());
@@ -9412,7 +9472,10 @@ mod context_exhausted_preserves_worktree_tests {
         };
         let (mut runtime, _) =
             build_runtime_with_state(storage, "cancel-wakes", temp.path().to_path_buf(), state);
-        let registrar = Arc::new(RecordingWakeRegistrar(std::sync::Mutex::new(vec![])));
+        let registrar = Arc::new(RecordingWakeRegistrar {
+            cancelled: std::sync::Mutex::new(vec![]),
+            activation_notifications: std::sync::atomic::AtomicUsize::new(0),
+        });
         runtime.wake_registrar = Some(registrar.clone());
         runtime.registered_wake_workflows.extend([
             phoenix_workflow::WorkflowId(11),
@@ -9428,7 +9491,7 @@ mod context_exhausted_preserves_worktree_tests {
             .unwrap();
 
         assert_eq!(
-            *registrar.0.lock().unwrap(),
+            *registrar.cancelled.lock().unwrap(),
             vec![
                 phoenix_workflow::WorkflowId(11),
                 phoenix_workflow::WorkflowId(12)
