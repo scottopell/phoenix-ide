@@ -18,6 +18,7 @@ pub(crate) enum MessageExpansionPolicy {
 pub(crate) struct SendChatRequest {
     pub conversation_id: String,
     pub text: String,
+    pub display_text: Option<String>,
     pub message_id: String,
     pub images: Vec<ImageAttachment>,
     pub files: Vec<FileAttachment>,
@@ -273,6 +274,13 @@ async fn expand_request(
     conversation: &crate::db::Conversation,
     req: &SendChatRequest,
 ) -> Result<ExpandedDispatchMessage, SendChatServiceError> {
+    if let Some(display_text) = req.display_text.clone() {
+        return Ok(ExpandedDispatchMessage {
+            display_text,
+            llm_text: Some(req.text.clone()),
+            skill_invocation: None,
+        });
+    }
     expand_message(
         db,
         &conversation.id,
@@ -368,11 +376,21 @@ async fn find_queued_message(
     Ok(Some((conversation_id, entry)))
 }
 
+fn requested_display_text(req: &SendChatRequest) -> &str {
+    req.display_text.as_deref().unwrap_or(&req.text)
+}
+
+fn requested_llm_text(req: &SendChatRequest) -> Option<&str> {
+    req.display_text.as_ref().map(|_| req.text.as_str())
+}
+
 fn queued_retry_matches(
     entry: &phoenix_core::domain::sm_event::SteerEntry,
     req: &SendChatRequest,
 ) -> bool {
-    entry.text == req.text
+    entry.text == requested_display_text(req)
+        && requested_llm_text(req)
+            .is_none_or(|llm_text| entry.llm_text.as_deref() == Some(llm_text))
         && entry.images.len() == req.images.len()
         && entry
             .images
@@ -402,7 +420,8 @@ fn persisted_user_message_matches(
     let phoenix_core::domain::db_schema::MessageContent::User(user) = content else {
         return false;
     };
-    user.text == req.text
+    user.text == requested_display_text(req)
+        && requested_llm_text(req).is_none_or(|llm_text| user.llm_text.as_deref() == Some(llm_text))
         && user.images.len() == req.images.len()
         && user
             .images
@@ -520,6 +539,7 @@ mod tests {
         let request = SendChatRequest {
             conversation_id: "conv-1".to_string(),
             text: "@file:notes.md".to_string(),
+            display_text: None,
             message_id: "message-1".to_string(),
             images: vec![],
             files: vec![],
@@ -543,10 +563,41 @@ mod tests {
     }
 
     #[test]
+    fn queued_retry_matches_display_text_and_model_text_when_display_override_is_used() {
+        let request = SendChatRequest {
+            conversation_id: "conv-1".to_string(),
+            text: "<address_pr_feedback>large model payload</address_pr_feedback>".to_string(),
+            display_text: Some("Address PR #7 feedback".to_string()),
+            message_id: "message-1".to_string(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            expansion_policy: MessageExpansionPolicy::LiteralText,
+        };
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            text: "Address PR #7 feedback".to_string(),
+            llm_text: Some(
+                "<address_pr_feedback>large model payload</address_pr_feedback>".to_string(),
+            ),
+            images: vec![],
+            files: vec![],
+            message_id: request.message_id.clone(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        assert!(queued_retry_matches(&entry, &request));
+
+        let mut conflicting = request.clone();
+        conflicting.text = "<address_pr_feedback>different</address_pr_feedback>".to_string();
+        assert!(!queued_retry_matches(&entry, &conflicting));
+    }
+
+    #[test]
     fn persisted_skill_retry_matches_expanded_invocation() {
         let request = SendChatRequest {
             conversation_id: "conv-1".to_string(),
             text: "/build now".to_string(),
+            display_text: None,
             message_id: "message-1".to_string(),
             images: vec![],
             files: vec![],

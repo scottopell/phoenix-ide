@@ -1,0 +1,1097 @@
+use phoenix_db::workflow::{CreateWorkflowWithExternalAcceptance, WorkflowRepository};
+use phoenix_workflow::{
+    AcceptanceProfile, CodecRef, CommitOutcome, ExternalAcceptanceEnabled,
+    ExternalAcceptanceOutcome, NonEmptyExternalKey, ProfileRef, RuntimeAcceptanceDisabled, ScopeId,
+    SupportedCodecRegistry, Timestamp, WorkflowId,
+};
+use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
+
+use crate::api::{
+    capture_pr_auto_fix_context_for_conversation, record_pr_auto_fix_context_baseline_for_artifact,
+    AddressPrFeedbackResponse,
+};
+use crate::send_chat_service::{
+    MessageExpansionPolicy, SendChatApplicationService, SendChatOutcome, SendChatRequest,
+    SendChatServiceError,
+};
+
+const PROFILE_KIND: &str = "address-pr-feedback";
+const PROFILE_VERSION: u32 = 1;
+const SNAPSHOT_CODEC: CodecRef = CodecRef {
+    family: "address-pr-feedback.snapshot.v1",
+    version: 1,
+};
+#[derive(Debug, Clone)]
+pub(crate) struct AddressFeedbackWorkflowRequest {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub guidance: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AddressFeedbackWorkflowError {
+    #[error("durable workflow registry is unavailable: {0}")]
+    Workflow(String),
+    #[error("PR context capture failed: {0}")]
+    Capture(String),
+    #[error("Address feedback dispatch failed: {0}")]
+    Dispatch(String),
+    #[error("Address feedback target not found: {0}")]
+    NotFound(String),
+    #[error("message_id was already used for a different target or payload")]
+    IdempotencyConflict,
+    #[error("Address feedback rejected: {message}")]
+    Rejected { message: String, code: String },
+    #[error("Address feedback retry required: {message}")]
+    Retry { message: String, code: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AddressFeedbackSnapshot {
+    conversation_id: String,
+    message_id: String,
+    guidance: Option<String>,
+    user_agent: Option<String>,
+    status: AddressFeedbackStatus,
+    target: Option<AddressFeedbackTarget>,
+    head_oid: Option<String>,
+    artifact_path: Option<String>,
+    instruction: Option<String>,
+    model_message: Option<String>,
+    dispatch: Option<AddressFeedbackDispatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AddressFeedbackStatus {
+    Accepted,
+    Captured,
+    HandedOff,
+    DuplicateNoOp,
+    Failed,
+}
+
+impl AddressFeedbackStatus {
+    fn is_duplicate_no_op(&self) -> bool {
+        matches!(self, Self::DuplicateNoOp)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AddressFeedbackTarget {
+    repo_owner: String,
+    repo_name: String,
+    pr_number: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AddressFeedbackDispatch {
+    queued: bool,
+    steering: bool,
+    already_persisted: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct AddressFeedbackWorkflowService {
+    state: crate::api::AppState,
+}
+
+impl AddressFeedbackWorkflowService {
+    pub(crate) fn new(state: crate::api::AppState) -> Self {
+        Self { state }
+    }
+
+    pub(crate) async fn recover_pending(&self) {
+        let repo = WorkflowRepository::new(self.state.db.pool().clone());
+        let rows = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
+            "SELECT w.workflow_id, w.snapshot_payload, w.version
+             FROM workflows w
+             JOIN workflow_external_acceptance_bindings b ON b.workflow_id = w.workflow_id
+             WHERE b.profile_kind = ? AND b.profile_version = ? AND w.status = 'Active'",
+        )
+        .bind(PROFILE_KIND)
+        .bind(i64::from(PROFILE_VERSION))
+        .fetch_all(self.state.db.pool())
+        .await;
+        let Ok(rows) = rows else {
+            tracing::warn!(error = ?rows.err(), "failed to load pending address feedback workflows");
+            return;
+        };
+        for (workflow_id_raw, payload, version_raw) in rows {
+            let Ok(snapshot) = serde_json::from_slice::<AddressFeedbackSnapshot>(&payload) else {
+                tracing::warn!(
+                    workflow_id = workflow_id_raw,
+                    "skipping unreadable address feedback workflow snapshot"
+                );
+                continue;
+            };
+            let Ok(workflow_id) = u64::try_from(workflow_id_raw).map(WorkflowId) else {
+                continue;
+            };
+            let version = u64::try_from(version_raw).unwrap_or(0);
+            if matches!(snapshot.status, AddressFeedbackStatus::Failed) {
+                continue;
+            }
+            if snapshot
+                .dispatch
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.steering)
+            {
+                let _ = self
+                    .finalize_steering_if_delivered(&repo, workflow_id, version, snapshot)
+                    .await;
+                continue;
+            }
+            if snapshot.dispatch.is_some() {
+                continue;
+            }
+            let req = AddressFeedbackWorkflowRequest {
+                conversation_id: snapshot.conversation_id.clone(),
+                message_id: snapshot.message_id.clone(),
+                guidance: snapshot.guidance.clone(),
+                user_agent: snapshot.user_agent.clone(),
+            };
+            let result = if snapshot.model_message.is_some() && snapshot.target.is_some() {
+                self.dispatch_persisted_snapshot(&repo, workflow_id, version, snapshot, req)
+                    .await
+            } else {
+                self.capture_and_dispatch(&repo, workflow_id, version, snapshot, req)
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::warn!(workflow_id = workflow_id_raw, error = ?error, "failed to recover address feedback workflow");
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn submit(
+        &self,
+        req: AddressFeedbackWorkflowRequest,
+    ) -> Result<AddressPrFeedbackResponse, AddressFeedbackWorkflowError> {
+        let workflow_id = workflow_id_for(&req.conversation_id, &req.message_id);
+        let target_scope = ScopeId::new(format!("conversation:{}", req.conversation_id))
+            .ok_or_else(|| {
+                AddressFeedbackWorkflowError::Workflow("empty target scope".to_string())
+            })?;
+        let idempotency_key =
+            NonEmptyExternalKey::new(req.message_id.clone()).ok_or_else(|| {
+                AddressFeedbackWorkflowError::Workflow("empty idempotency key".to_string())
+            })?;
+
+        let head_oid = local_head_oid(&self.state.db, &req.conversation_id).await?;
+        let mut capture =
+            capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
+                .await
+                .map_err(map_app_error_for_capture)?;
+        let original_artifact_path = capture.artifact_path.clone();
+        capture.artifact_path = persist_durable_context_artifact(
+            &self.state.db,
+            &req.conversation_id,
+            workflow_id,
+            &capture.artifact_path,
+        )
+        .await?;
+        let context_json =
+            read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
+        let instruction = capture
+            .message
+            .replace(&original_artifact_path, &capture.artifact_path);
+        let model_message = render_address_feedback_xml(
+            &capture,
+            head_oid.as_deref(),
+            Some(context_json.as_str()),
+            req.guidance.as_deref(),
+        );
+        let snapshot = AddressFeedbackSnapshot {
+            conversation_id: req.conversation_id.clone(),
+            message_id: req.message_id.clone(),
+            guidance: req.guidance.clone(),
+            user_agent: req.user_agent.clone(),
+            status: AddressFeedbackStatus::Captured,
+            target: Some(AddressFeedbackTarget {
+                repo_owner: capture.repo_owner,
+                repo_name: capture.repo_name,
+                pr_number: capture.pr_number,
+            }),
+            head_oid,
+            artifact_path: Some(capture.artifact_path),
+            instruction: Some(instruction),
+            model_message: Some(model_message),
+            dispatch: None,
+        };
+        let intent_fingerprint = intent_fingerprint(&snapshot)?;
+        let repo = WorkflowRepository::new(self.state.db.pool().clone());
+        if let Some((existing_id, existing_snapshot)) =
+            find_active_by_fingerprint(&self.state.db, &req.conversation_id, &intent_fingerprint)
+                .await?
+        {
+            if existing_id != workflow_id {
+                if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
+                    let _ = remove_context_artifact(
+                        &self.state.db,
+                        &req.conversation_id,
+                        artifact_path,
+                    )
+                    .await;
+                }
+            }
+            return Ok(pending_response(existing_id, existing_snapshot.message_id));
+        }
+        let create = CreateWorkflowWithExternalAcceptance {
+            workflow_id,
+            profile: profile_ref(),
+            acceptance: acceptance_profile().erase(),
+            target_scope,
+            idempotency_key,
+            intent_fingerprint,
+            snapshot_codec: SNAPSHOT_CODEC,
+            snapshot_payload: encode_snapshot(&snapshot)?,
+            receipt_handle: req.message_id.as_bytes().to_vec(),
+            disposition_handle: req.conversation_id.as_bytes().to_vec(),
+            now: now_ts(),
+        };
+        let accepted = repo
+            .create_workflow_with_external_acceptance(&create)
+            .await
+            .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
+        match accepted {
+            ExternalAcceptanceOutcome::Conflict => {
+                Err(AddressFeedbackWorkflowError::IdempotencyConflict)
+            }
+            ExternalAcceptanceOutcome::Replayed(_) => {
+                if let Some((snapshot, version)) =
+                    load_snapshot(&self.state.db, workflow_id).await?
+                {
+                    if let Some(response) =
+                        response_from_completed_snapshot(workflow_id, &req.message_id, &snapshot)
+                    {
+                        return Ok(response);
+                    }
+                    if matches!(snapshot.status, AddressFeedbackStatus::Failed) {
+                        return Err(AddressFeedbackWorkflowError::Rejected {
+                            message: "Address feedback workflow previously failed before handoff"
+                                .to_string(),
+                            code: "address_feedback_failed".to_string(),
+                        });
+                    }
+                    if snapshot
+                        .dispatch
+                        .as_ref()
+                        .is_some_and(|dispatch| dispatch.steering)
+                    {
+                        return self
+                            .finalize_steering_if_delivered(&repo, workflow_id, version, snapshot)
+                            .await
+                            .map(|response| {
+                                response.unwrap_or_else(|| {
+                                    pending_response(workflow_id, req.message_id)
+                                })
+                            });
+                    }
+                    if snapshot.model_message.is_some() && snapshot.target.is_some() {
+                        return self
+                            .dispatch_persisted_snapshot(&repo, workflow_id, version, snapshot, req)
+                            .await;
+                    }
+                    return Ok(pending_response(workflow_id, req.message_id));
+                }
+                Ok(pending_response(workflow_id, req.message_id))
+            }
+            ExternalAcceptanceOutcome::Created(_) => {
+                self.dispatch_persisted_snapshot(&repo, workflow_id, 0, snapshot, req)
+                    .await
+            }
+        }
+    }
+
+    async fn capture_and_dispatch(
+        &self,
+        repo: &WorkflowRepository,
+        workflow_id: WorkflowId,
+        version: u64,
+        snapshot: AddressFeedbackSnapshot,
+        req: AddressFeedbackWorkflowRequest,
+    ) -> Result<AddressPrFeedbackResponse, AddressFeedbackWorkflowError> {
+        let head_oid = match local_head_oid(&self.state.db, &req.conversation_id).await {
+            Ok(head_oid) => head_oid,
+            Err(error) => {
+                fail_workflow(repo, workflow_id, version, &snapshot).await;
+                return Err(error);
+            }
+        };
+        let mut capture =
+            match capture_pr_auto_fix_context_for_conversation(&self.state, &req.conversation_id)
+                .await
+            {
+                Ok(capture) => capture,
+                Err(error) => {
+                    fail_workflow(repo, workflow_id, version, &snapshot).await;
+                    return Err(map_app_error_for_capture(error));
+                }
+            };
+        let original_artifact_path = capture.artifact_path.clone();
+        capture.artifact_path = persist_durable_context_artifact(
+            &self.state.db,
+            &req.conversation_id,
+            workflow_id,
+            &capture.artifact_path,
+        )
+        .await?;
+        let context_json =
+            read_context_json(&self.state.db, &req.conversation_id, &capture.artifact_path).await?;
+        let instruction = capture
+            .message
+            .replace(&original_artifact_path, &capture.artifact_path);
+        let model_message = render_address_feedback_xml(
+            &capture,
+            head_oid.as_deref(),
+            Some(context_json.as_str()),
+            req.guidance.as_deref(),
+        );
+        let captured = AddressFeedbackSnapshot {
+            status: AddressFeedbackStatus::Captured,
+            target: Some(AddressFeedbackTarget {
+                repo_owner: capture.repo_owner,
+                repo_name: capture.repo_name,
+                pr_number: capture.pr_number,
+            }),
+            head_oid,
+            artifact_path: Some(capture.artifact_path),
+            instruction: Some(instruction),
+            model_message: Some(model_message),
+            dispatch: None,
+            ..snapshot
+        };
+        commit_snapshot(
+            repo,
+            workflow_id,
+            version,
+            version + 1,
+            &captured,
+            phoenix_workflow::WorkflowStatus::Active,
+        )
+        .await?;
+        self.dispatch_persisted_snapshot(repo, workflow_id, version + 1, captured, req)
+            .await
+    }
+
+    async fn finalize_steering_if_delivered(
+        &self,
+        _repo: &WorkflowRepository,
+        workflow_id: WorkflowId,
+        _version: u64,
+        snapshot: AddressFeedbackSnapshot,
+    ) -> Result<Option<AddressPrFeedbackResponse>, AddressFeedbackWorkflowError> {
+        let Some(completed) = finalize_persisted_message_inner(
+            &self.state.db,
+            &snapshot.conversation_id,
+            &snapshot.message_id,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let dispatch = completed.dispatch.as_ref().ok_or_else(|| {
+            AddressFeedbackWorkflowError::Workflow(
+                "completed workflow snapshot has no dispatch".to_string(),
+            )
+        })?;
+        Ok(Some(response_from_snapshot(
+            workflow_id,
+            completed.message_id.clone(),
+            dispatch.queued,
+            dispatch.steering,
+            completed.status.is_duplicate_no_op(),
+            false,
+            &completed,
+        )))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn dispatch_persisted_snapshot(
+        &self,
+        repo: &WorkflowRepository,
+        workflow_id: WorkflowId,
+        version: u64,
+        snapshot: AddressFeedbackSnapshot,
+        req: AddressFeedbackWorkflowRequest,
+    ) -> Result<AddressPrFeedbackResponse, AddressFeedbackWorkflowError> {
+        let model_message = snapshot.model_message.clone().ok_or_else(|| {
+            AddressFeedbackWorkflowError::Workflow(
+                "workflow snapshot has no model message".to_string(),
+            )
+        })?;
+        let outcome =
+            SendChatApplicationService::new(self.state.db.clone(), self.state.runtime.clone())
+                .send(SendChatRequest {
+                    conversation_id: req.conversation_id,
+                    text: model_message,
+                    display_text: Some(display_message(&snapshot)),
+                    message_id: req.message_id.clone(),
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    user_agent: snapshot.user_agent.clone(),
+                    expansion_policy: MessageExpansionPolicy::LiteralText,
+                })
+                .await
+                .map_err(map_dispatch_error)?;
+        let (queued, steering, no_op, already_persisted) = match outcome {
+            SendChatOutcome::Delivered => (true, false, false, false),
+            SendChatOutcome::QueuedAsSteering => (true, true, false, false),
+            SendChatOutcome::AlreadyPersisted => (true, false, true, true),
+            SendChatOutcome::Rejected { message, code } => {
+                if code == "steering_queue_full" {
+                    return Err(AddressFeedbackWorkflowError::Rejected {
+                        message,
+                        code: code.to_string(),
+                    });
+                }
+                let failed = AddressFeedbackSnapshot {
+                    status: AddressFeedbackStatus::Failed,
+                    ..snapshot
+                };
+                commit_snapshot(
+                    repo,
+                    workflow_id,
+                    version,
+                    version + 1,
+                    &failed,
+                    phoenix_workflow::WorkflowStatus::Failed,
+                )
+                .await?;
+
+                return Err(AddressFeedbackWorkflowError::Rejected {
+                    message,
+                    code: code.to_string(),
+                });
+            }
+        };
+        let accepted = AddressFeedbackSnapshot {
+            dispatch: Some(AddressFeedbackDispatch {
+                queued,
+                steering,
+                already_persisted,
+            }),
+            ..snapshot.clone()
+        };
+        commit_snapshot(
+            repo,
+            workflow_id,
+            version,
+            version + 1,
+            &accepted,
+            phoenix_workflow::WorkflowStatus::Active,
+        )
+        .await?;
+        if let Some(completed) = finalize_persisted_message_inner(
+            &self.state.db,
+            &accepted.conversation_id,
+            &accepted.message_id,
+        )
+        .await?
+        {
+            return Ok(response_from_snapshot(
+                workflow_id,
+                req.message_id,
+                queued,
+                steering,
+                no_op,
+                false,
+                &completed,
+            ));
+        }
+        Ok(response_from_snapshot(
+            workflow_id,
+            req.message_id,
+            queued,
+            steering,
+            false,
+            true,
+            &accepted,
+        ))
+    }
+}
+
+pub(crate) async fn notify_message_persisted(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<(), AddressFeedbackWorkflowError> {
+    let _ = finalize_persisted_message_inner(db, conversation_id, message_id).await?;
+    Ok(())
+}
+
+async fn finalize_persisted_message_inner(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<Option<AddressFeedbackSnapshot>, AddressFeedbackWorkflowError> {
+    if !db.message_exists(message_id).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let target_scope = format!("conversation:{conversation_id}");
+    let Some((workflow_id_raw, payload, version_raw)) = sqlx::query_as::<_, (i64, Vec<u8>, i64)>(
+        "SELECT w.workflow_id, w.snapshot_payload, w.version
+             FROM workflows w
+             JOIN workflow_external_acceptance_bindings b ON b.workflow_id = w.workflow_id
+             WHERE b.profile_kind = ? AND b.profile_version = ?
+               AND b.target_scope = ? AND b.idempotency_key = ?
+               AND w.status = 'Active'
+             LIMIT 1",
+    )
+    .bind(PROFILE_KIND)
+    .bind(i64::from(PROFILE_VERSION))
+    .bind(target_scope)
+    .bind(message_id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|error| AddressFeedbackWorkflowError::Workflow(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let workflow_id = u64::try_from(workflow_id_raw)
+        .map(WorkflowId)
+        .map_err(|error| AddressFeedbackWorkflowError::Workflow(error.to_string()))?;
+    let version = u64::try_from(version_raw).unwrap_or(0);
+    let snapshot: AddressFeedbackSnapshot = serde_json::from_slice(&payload)
+        .map_err(|error| AddressFeedbackWorkflowError::Workflow(error.to_string()))?;
+    let Some(dispatch) = snapshot.dispatch.clone() else {
+        return Ok(None);
+    };
+    if let Some(artifact_path) = snapshot.artifact_path.as_deref() {
+        record_pr_auto_fix_context_baseline_for_artifact(db, conversation_id, artifact_path)
+            .await
+            .map_err(|error| AddressFeedbackWorkflowError::Workflow(format!("{error:?}")))?;
+    }
+    let completed = AddressFeedbackSnapshot {
+        status: if dispatch.already_persisted {
+            AddressFeedbackStatus::DuplicateNoOp
+        } else {
+            AddressFeedbackStatus::HandedOff
+        },
+        dispatch: Some(AddressFeedbackDispatch {
+            already_persisted: true,
+            ..dispatch
+        }),
+        ..snapshot
+    };
+    commit_snapshot(
+        &WorkflowRepository::new(db.pool().clone()),
+        workflow_id,
+        version,
+        version + 1,
+        &completed,
+        phoenix_workflow::WorkflowStatus::Completed,
+    )
+    .await?;
+    Ok(Some(completed))
+}
+
+async fn fail_workflow(
+    repo: &WorkflowRepository,
+    workflow_id: WorkflowId,
+    version: u64,
+    snapshot: &AddressFeedbackSnapshot,
+) {
+    let failed = AddressFeedbackSnapshot {
+        status: AddressFeedbackStatus::Failed,
+        ..snapshot.clone()
+    };
+    let _ = commit_snapshot(
+        repo,
+        workflow_id,
+        version,
+        version + 1,
+        &failed,
+        phoenix_workflow::WorkflowStatus::Failed,
+    )
+    .await;
+}
+
+fn pending_response(workflow_id: WorkflowId, message_id: String) -> AddressPrFeedbackResponse {
+    AddressPrFeedbackResponse {
+        workflow_id: workflow_id.0,
+        message_id,
+        queued: true,
+        steering: false,
+        no_op: true,
+        pending: true,
+        artifact_path: None,
+        pr_number: None,
+        repo_owner: None,
+        repo_name: None,
+    }
+}
+
+async fn find_active_by_fingerprint(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    intent_fingerprint: &str,
+) -> Result<Option<(WorkflowId, AddressFeedbackSnapshot)>, AddressFeedbackWorkflowError> {
+    let target_scope = format!("conversation:{conversation_id}");
+    let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT w.workflow_id, w.snapshot_payload
+         FROM workflows w
+         JOIN workflow_external_acceptance_bindings b ON b.workflow_id = w.workflow_id
+         WHERE b.profile_kind = ? AND b.profile_version = ?
+           AND b.target_scope = ? AND b.intent_fingerprint = ?
+           AND w.status = 'Active'
+         LIMIT 1",
+    )
+    .bind(PROFILE_KIND)
+    .bind(i64::from(PROFILE_VERSION))
+    .bind(target_scope)
+    .bind(intent_fingerprint)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let Some((workflow_id_raw, payload)) = rows else {
+        return Ok(None);
+    };
+    let Ok(workflow_id) = u64::try_from(workflow_id_raw).map(WorkflowId) else {
+        return Ok(None);
+    };
+    let snapshot: AddressFeedbackSnapshot = serde_json::from_slice(&payload)
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    Ok(Some((workflow_id, snapshot)))
+}
+
+async fn load_snapshot(
+    db: &crate::db::Database,
+    workflow_id: WorkflowId,
+) -> Result<Option<(AddressFeedbackSnapshot, u64)>, AddressFeedbackWorkflowError> {
+    let Some((payload, version)) = sqlx::query_as::<_, (Vec<u8>, i64)>(
+        "SELECT snapshot_payload, version FROM workflows WHERE workflow_id = ?",
+    )
+    .bind(i64::try_from(workflow_id.0).unwrap_or(i64::MAX))
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let snapshot: AddressFeedbackSnapshot = serde_json::from_slice(&payload)
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    Ok(Some((snapshot, u64::try_from(version).unwrap_or(0))))
+}
+
+fn display_message(snapshot: &AddressFeedbackSnapshot) -> String {
+    if let Some(target) = snapshot.target.as_ref() {
+        return format!(
+            "Address PR #{} feedback using captured context artifact `{}`",
+            target.pr_number,
+            snapshot.artifact_path.as_deref().unwrap_or("unknown")
+        );
+    }
+    "Address PR feedback using captured context".to_string()
+}
+
+fn response_from_completed_snapshot(
+    workflow_id: WorkflowId,
+    message_id: &str,
+    snapshot: &AddressFeedbackSnapshot,
+) -> Option<AddressPrFeedbackResponse> {
+    if !matches!(
+        snapshot.status,
+        AddressFeedbackStatus::HandedOff | AddressFeedbackStatus::DuplicateNoOp
+    ) {
+        return None;
+    }
+    let dispatch = snapshot.dispatch.as_ref()?;
+    Some(response_from_snapshot(
+        workflow_id,
+        message_id.to_string(),
+        dispatch.queued,
+        dispatch.steering,
+        true,
+        false,
+        snapshot,
+    ))
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn response_from_snapshot(
+    workflow_id: WorkflowId,
+    message_id: String,
+    queued: bool,
+    steering: bool,
+    no_op: bool,
+    pending: bool,
+    snapshot: &AddressFeedbackSnapshot,
+) -> AddressPrFeedbackResponse {
+    AddressPrFeedbackResponse {
+        workflow_id: workflow_id.0,
+        message_id,
+        queued,
+        steering,
+        no_op,
+        pending,
+        artifact_path: snapshot.artifact_path.clone(),
+        pr_number: snapshot.target.as_ref().map(|target| target.pr_number),
+        repo_owner: snapshot
+            .target
+            .as_ref()
+            .map(|target| target.repo_owner.clone()),
+        repo_name: snapshot
+            .target
+            .as_ref()
+            .map(|target| target.repo_name.clone()),
+    }
+}
+
+fn conversation_filesystem_base(
+    cwd: String,
+    conv_mode: phoenix_core::domain::db_schema::ConvMode,
+) -> String {
+    match conv_mode {
+        phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
+        | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. } => {
+            worktree_path.to_string()
+        }
+        phoenix_core::domain::db_schema::ConvMode::Explore { .. }
+        | phoenix_core::domain::db_schema::ConvMode::Direct => cwd,
+    }
+}
+
+async fn persist_durable_context_artifact(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    workflow_id: WorkflowId,
+    artifact_path: &str,
+) -> Result<String, AddressFeedbackWorkflowError> {
+    let contents = read_context_json(db, conversation_id, artifact_path).await?;
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let base = conversation_filesystem_base(conv.cwd, conv.conv_mode);
+    let durable_path = format!(".phoenix/address-feedback-workflows/{}.json", workflow_id.0);
+    let absolute_path = std::path::Path::new(base.as_str()).join(&durable_path);
+    if let Some(parent) = absolute_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    }
+    if absolute_path.exists() {
+        return Ok(durable_path);
+    }
+    let temporary_path = absolute_path.with_extension("json.tmp");
+    tokio::fs::write(&temporary_path, contents)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    tokio::fs::rename(&temporary_path, &absolute_path)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    Ok(durable_path)
+}
+
+async fn remove_context_artifact(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    artifact_path: &str,
+) -> Result<(), AddressFeedbackWorkflowError> {
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let base = conversation_filesystem_base(conv.cwd, conv.conv_mode);
+    let path = std::path::Path::new(artifact_path);
+    if path.is_absolute() || artifact_path.split('/').any(|part| part == "..") {
+        return Ok(());
+    }
+    let _ = tokio::fs::remove_file(std::path::Path::new(base.as_str()).join(path)).await;
+    Ok(())
+}
+
+async fn read_context_json(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    artifact_path: &str,
+) -> Result<String, AddressFeedbackWorkflowError> {
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let base = conversation_filesystem_base(conv.cwd, conv.conv_mode);
+    let path = std::path::Path::new(artifact_path);
+    if path.is_absolute() || artifact_path.split('/').any(|part| part == "..") {
+        return Err(AddressFeedbackWorkflowError::Workflow(
+            "invalid PR context artifact path".to_string(),
+        ));
+    }
+    tokio::fs::read_to_string(std::path::Path::new(base.as_str()).join(path))
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))
+}
+
+async fn local_head_oid(
+    db: &crate::db::Database,
+    conversation_id: &str,
+) -> Result<Option<String>, AddressFeedbackWorkflowError> {
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    let (phoenix_core::domain::db_schema::ConvMode::Work { worktree_path, .. }
+    | phoenix_core::domain::db_schema::ConvMode::Branch { worktree_path, .. }) = conv.conv_mode
+    else {
+        return Ok(None);
+    };
+    let output = phoenix_core::git::command()
+        .current_dir(worktree_path.as_str())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(e.to_string()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!oid.is_empty()).then_some(oid))
+}
+
+async fn commit_snapshot(
+    repo: &WorkflowRepository,
+    workflow_id: WorkflowId,
+    expected_version: u64,
+    transition_id: u64,
+    snapshot: &AddressFeedbackSnapshot,
+    status: phoenix_workflow::WorkflowStatus,
+) -> Result<(), AddressFeedbackWorkflowError> {
+    let outcome = repo
+        .commit_transition_head_cas(&phoenix_db::workflow::CommitTransitionHeadCas {
+            workflow_id,
+            expected_version: phoenix_workflow::Version(expected_version),
+            transition_id: phoenix_workflow::TransitionId(transition_id),
+            generation: phoenix_workflow::Generation(0),
+            next_status: status,
+            event_codec: SNAPSHOT_CODEC,
+            event_payload: encode_snapshot(snapshot)?,
+            next_snapshot_codec: SNAPSHOT_CODEC,
+            next_snapshot_payload: encode_snapshot(snapshot)?,
+            committed_at: now_ts(),
+        })
+        .await
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))?;
+    match outcome {
+        CommitOutcome::Committed => Ok(()),
+        CommitOutcome::VersionConflict => Err(AddressFeedbackWorkflowError::Retry {
+            message: "Address feedback workflow changed; retry the request.".to_string(),
+            code: "address_feedback_retry".to_string(),
+        }),
+        CommitOutcome::InvalidPlan | CommitOutcome::UnsupportedCodec => {
+            Err(AddressFeedbackWorkflowError::Workflow(format!(
+                "invalid workflow transition: {outcome:?}"
+            )))
+        }
+    }
+}
+
+fn profile_ref() -> ProfileRef {
+    ProfileRef {
+        profile_kind: PROFILE_KIND.to_string(),
+        profile_version: PROFILE_VERSION,
+    }
+}
+
+fn acceptance_profile() -> AcceptanceProfile<RuntimeAcceptanceDisabled, ExternalAcceptanceEnabled> {
+    AcceptanceProfile::new(
+        profile_ref(),
+        SupportedCodecRegistry::new([SNAPSHOT_CODEC]).expect("snapshot codec is non-empty"),
+    )
+}
+
+fn encode_snapshot(
+    snapshot: &AddressFeedbackSnapshot,
+) -> Result<Vec<u8>, AddressFeedbackWorkflowError> {
+    serde_json::to_vec(snapshot)
+        .map_err(|e| AddressFeedbackWorkflowError::Workflow(format!("{e:?}")))
+}
+
+fn intent_fingerprint(
+    snapshot: &AddressFeedbackSnapshot,
+) -> Result<String, AddressFeedbackWorkflowError> {
+    let mut stable = snapshot.clone();
+    stable.user_agent = None;
+    stable.message_id.clear();
+    stable.artifact_path = None;
+    stable.instruction = None;
+    stable.dispatch = None;
+    snapshot_fingerprint(&stable)
+}
+
+fn snapshot_fingerprint(
+    snapshot: &AddressFeedbackSnapshot,
+) -> Result<String, AddressFeedbackWorkflowError> {
+    let encoded = encode_snapshot(snapshot)?;
+    Ok(hex_sha256(&encoded))
+}
+
+fn workflow_id_for(conversation_id: &str, message_id: &str) -> WorkflowId {
+    let digest =
+        sha2::Sha256::digest(format!("{PROFILE_KIND}\0{conversation_id}\0{message_id}").as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let value = (u64::from_be_bytes(bytes) & i64::MAX as u64).max(1);
+    WorkflowId(value)
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "{byte:02x}");
+            out
+        })
+}
+
+fn now_ts() -> Timestamp {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Timestamp(u64::try_from(millis).unwrap_or(u64::MAX))
+}
+
+fn render_address_feedback_xml(
+    capture: &crate::api::PrAutoFixContextResponse,
+    head_oid: Option<&str>,
+    context_json: Option<&str>,
+    guidance: Option<&str>,
+) -> String {
+    let guidance = guidance.unwrap_or("Address the captured PR feedback and failing checks. Use the context artifact as the source of truth for this request.");
+    format!(
+        "<address_pr_feedback>\n  <target repo_owner=\"{}\" repo_name=\"{}\" pr_number=\"{}\"{} />\n  <context artifact=\"{}\"><![CDATA[{}]]></context>\n  <guidance>{}</guidance>\n  <instruction>{}</instruction>\n</address_pr_feedback>",
+        escape_xml(&capture.repo_owner),
+        escape_xml(&capture.repo_name),
+        capture.pr_number,
+        head_oid
+            .map(|oid| format!(" head_oid=\"{}\"", escape_xml(oid)))
+            .unwrap_or_default(),
+        escape_xml(&capture.artifact_path),
+        cdata_escape(context_json.unwrap_or("")),
+        escape_xml(guidance),
+        escape_xml(&capture.message),
+    )
+}
+
+fn cdata_escape(value: &str) -> String {
+    value.replace("]]>", "]]]]><![CDATA[>")
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn map_app_error_for_capture(error: crate::api::AppError) -> AddressFeedbackWorkflowError {
+    match error {
+        crate::api::AppError::BadRequest(message) => AddressFeedbackWorkflowError::Rejected {
+            message,
+            code: "pr_context_unavailable".to_string(),
+        },
+        crate::api::AppError::NotFound(message) => AddressFeedbackWorkflowError::NotFound(message),
+        crate::api::AppError::Conflict(conflict) => AddressFeedbackWorkflowError::Rejected {
+            message: conflict.error,
+            code: conflict.error_type,
+        },
+        other @ (crate::api::AppError::TypedBadRequest { .. }
+        | crate::api::AppError::Forbidden(_)
+        | crate::api::AppError::Internal(_)
+        | crate::api::AppError::TypedInternal { .. }
+        | crate::api::AppError::UnprocessableEntity(_)) => {
+            AddressFeedbackWorkflowError::Capture(format!("{other:?}"))
+        }
+    }
+}
+
+fn map_dispatch_error(error: SendChatServiceError) -> AddressFeedbackWorkflowError {
+    match error {
+        SendChatServiceError::IdempotencyConflict => {
+            AddressFeedbackWorkflowError::IdempotencyConflict
+        }
+        SendChatServiceError::NotFound(message) => AddressFeedbackWorkflowError::NotFound(message),
+        other @ (SendChatServiceError::AttachmentValidation(_)
+        | SendChatServiceError::Expansion { .. }
+        | SendChatServiceError::Internal(_)
+        | SendChatServiceError::Dispatch(_)) => {
+            AddressFeedbackWorkflowError::Dispatch(other.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml_message_escapes_target_context_and_guidance() {
+        let capture = crate::api::PrAutoFixContextResponse {
+            artifact_path: ".phoenix/pr-context/a&b.json".to_string(),
+            pr_number: 42,
+            repo_owner: "o<wner".to_string(),
+            repo_name: "r\"epo".to_string(),
+            message: "legacy".to_string(),
+        };
+        let rendered = render_address_feedback_xml(
+            &capture,
+            Some("abc123"),
+            Some("{\"k\":\"]]>\"}"),
+            Some("fix <all> & \"now\""),
+        );
+        assert!(rendered.contains("repo_owner=\"o&lt;wner\""));
+        assert!(rendered.contains("repo_name=\"r&quot;epo\""));
+        assert!(rendered.contains("artifact=\".phoenix/pr-context/a&amp;b.json\""));
+        assert!(rendered.contains("fix &lt;all&gt; &amp; &quot;now&quot;"));
+        assert!(rendered.contains("<![CDATA[{\"k\":\"]]]]><![CDATA[>\"}]]>"));
+        assert!(rendered.contains("<instruction>legacy</instruction>"));
+    }
+
+    fn fingerprint_snapshot(model_message: &str) -> AddressFeedbackSnapshot {
+        AddressFeedbackSnapshot {
+            conversation_id: "conversation".to_string(),
+            message_id: "message".to_string(),
+            guidance: Some("guidance".to_string()),
+            user_agent: Some("agent".to_string()),
+            status: AddressFeedbackStatus::Captured,
+            target: Some(AddressFeedbackTarget {
+                repo_owner: "owner".to_string(),
+                repo_name: "repo".to_string(),
+                pr_number: 42,
+            }),
+            head_oid: Some("head".to_string()),
+            artifact_path: Some("artifact".to_string()),
+            instruction: Some("instruction".to_string()),
+            model_message: Some(model_message.to_string()),
+            dispatch: None,
+        }
+    }
+
+    #[test]
+    fn intent_fingerprint_changes_with_captured_evidence() {
+        let first = intent_fingerprint(&fingerprint_snapshot("evidence-one")).unwrap();
+        let second = intent_fingerprint(&fingerprint_snapshot("evidence-two")).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn missing_conversation_errors_remain_not_found() {
+        let error = map_app_error_for_capture(crate::api::AppError::NotFound(
+            "missing conversation".to_string(),
+        ));
+        assert!(matches!(error, AddressFeedbackWorkflowError::NotFound(_)));
+    }
+
+    #[test]
+    fn workflow_id_is_stable_for_same_request() {
+        assert_eq!(workflow_id_for("c", "m"), workflow_id_for("c", "m"));
+        assert_ne!(workflow_id_for("c", "m"), workflow_id_for("c", "other"));
+    }
+}

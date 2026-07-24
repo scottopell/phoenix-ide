@@ -210,6 +210,7 @@ impl Tool for SendConversationMessage {
         let request = SendChatRequest {
             conversation_id: conversation_id.clone(),
             text: parsed.message,
+            display_text: None,
             message_id: parsed.message_id.clone(),
             images: Vec::new(),
             files: Vec::new(),

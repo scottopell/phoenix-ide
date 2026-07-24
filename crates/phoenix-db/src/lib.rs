@@ -6141,9 +6141,9 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
-        // Conversation + wake-owned workflow roots + messages (FK CASCADE) and
-        // the standalone FTS prune run in one transaction. The FTS table has no
-        // FK cascade, and wake workflow foundation tables do not point back to
+        // Conversation + conversation-owned workflow roots + messages (FK CASCADE)
+        // and the standalone FTS prune run in one transaction. The FTS table has no
+        // FK cascade, and workflow foundation tables do not all point back to
         // conversations, so without the shared transaction a crash could leave
         // either orphaned index rows or invisible orphan workflow rows after a
         // hard delete.
@@ -6155,6 +6155,19 @@ impl Database {
              )",
         )
         .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        let target_scope = format!("conversation:{id}");
+        sqlx::query(
+            "DELETE FROM workflows
+             WHERE workflow_id IN (
+                 SELECT workflow_id
+                 FROM workflow_external_acceptance_bindings
+                 WHERE profile_kind = 'address-pr-feedback'
+                   AND target_scope = ?1
+             )",
+        )
+        .bind(target_scope)
         .execute(&mut *tx)
         .await?;
         let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
@@ -14815,6 +14828,95 @@ mod tests {
         assert_eq!(binding_exists, 0);
         assert_eq!(receipt_exists, 0);
         assert_eq!(link_exists, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_conversation_removes_address_feedback_workflows() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation_with_project(
+            "conv-address-del",
+            "conv-address-del",
+            "/tmp",
+            true,
+            None,
+            Some("claude-opus-test"),
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
+        let repo = crate::workflow::WorkflowRepository::new(db.pool.clone());
+        let profile = phoenix_workflow::ProfileRef {
+            profile_kind: "address-pr-feedback".to_string(),
+            profile_version: 1,
+        };
+        let create = crate::workflow::CreateWorkflowWithExternalAcceptance {
+            workflow_id: phoenix_workflow::WorkflowId(9_202),
+            profile: profile.clone(),
+            acceptance: phoenix_workflow::ErasedAcceptanceProfile::from_parts(
+                profile,
+                phoenix_workflow::SupportedCodecRegistry::new([
+                    phoenix_workflow::CodecRef {
+                        family: "address-pr-feedback.snapshot.v1",
+                        version: 1,
+                    },
+                    phoenix_workflow::CodecRef {
+                        family: "address-pr-feedback.event.v1",
+                        version: 1,
+                    },
+                    phoenix_workflow::CodecRef {
+                        family: "address-pr-feedback.receipt.v1",
+                        version: 1,
+                    },
+                ])
+                .unwrap(),
+                false,
+                true,
+            ),
+            target_scope: phoenix_workflow::ScopeId::new("conversation:conv-address-del").unwrap(),
+            idempotency_key: phoenix_workflow::NonEmptyExternalKey::new("message-address-del")
+                .unwrap(),
+            intent_fingerprint: "address-fp-del".to_string(),
+            snapshot_codec: phoenix_workflow::CodecRef {
+                family: "address-pr-feedback.snapshot.v1",
+                version: 1,
+            },
+            snapshot_payload: br#"{"conversation_id":"conv-address-del"}"#.to_vec(),
+            receipt_handle: b"message-address-del".to_vec(),
+            disposition_handle: b"conv-address-del".to_vec(),
+            now: phoenix_workflow::Timestamp(10),
+        };
+        let created = repo
+            .create_workflow_with_external_acceptance(&create)
+            .await
+            .unwrap();
+        assert!(matches!(
+            created,
+            phoenix_workflow::ExternalAcceptanceOutcome::Created(_)
+        ));
+
+        db.delete_conversation("conv-address-del").await.unwrap();
+
+        assert!(db.get_conversation("conv-address-del").await.is_err());
+        let workflow_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE workflow_id = ?1")
+                .bind(9_202_i64)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let binding_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_external_acceptance_bindings WHERE workflow_id = ?1",
+        )
+        .bind(9_202_i64)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(workflow_exists, 0);
+        assert_eq!(binding_exists, 0);
     }
 
     // ==================== Fork Proposal Tests ====================

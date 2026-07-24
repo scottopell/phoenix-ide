@@ -38,7 +38,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'idle',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: { status: 'loading', prStatus: null },
   },
   'cached-open-stable': {
@@ -46,7 +45,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'idle',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: ready(openPr({
       refresh: {
         state: 'unavailable',
@@ -63,7 +61,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'idle',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: ready(openPr({
       feedback_freshness: { state: 'new', count: 3 },
       feedback_coverage: { kind: 'incomplete', surfaces: ['review_threads'] },
@@ -74,7 +71,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'idle',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: ready(openPr({
       check_state: 'passing',
       feedback_freshness: { state: 'edited', count: 1 },
@@ -85,7 +81,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'idle',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: ready(openPr({ display_state: 'merged', state: 'MERGED', check_state: 'passing' })),
   },
   'no-pr-dirty-review': {
@@ -93,7 +88,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'idle',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: ready({
       found: false,
       refresh: {
@@ -110,7 +104,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'idle',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: ready({
       found: false,
       refresh: {
@@ -132,7 +125,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'idle',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: ready({
       found: false,
       unavailable_reason: 'not_authenticated',
@@ -150,7 +142,6 @@ const byId: Record<WorkActionsScenarioId, Omit<WorkActionsScenario, 'id' | 'titl
     convModeLabel: 'Work',
     phaseType: 'error',
     continuedInConvId: null,
-    canSendMessage: true,
     prState: ready(openPr({ check_state: 'failing' })),
   },
 };

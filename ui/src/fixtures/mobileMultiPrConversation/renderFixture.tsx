@@ -117,7 +117,6 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
             convModeLabel="Work"
             phaseType="idle"
             continuedInConvId={null}
-            onSendMessage={async () => undefined}
             prStatusHandle={prStatusHandle}
           />
           <section className="mobile-multi-pr-conversation-fixture-input" aria-label="Message input preview">

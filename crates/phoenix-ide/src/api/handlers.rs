@@ -9,8 +9,8 @@ use super::chains::{
     stream_chain, submit_chain_question,
 };
 use super::git_handlers::{
-    create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
-    get_conversation_git_status, get_conversation_pr_status, list_git_branches, pin_associated_pr,
+    get_active_pr_diff, get_conversation_diff, get_conversation_git_status,
+    get_conversation_pr_status, list_git_branches, pin_associated_pr,
     resume_associated_pr_inference,
 };
 use super::global_read;
@@ -21,11 +21,11 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
-    CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
-    CodeSearchResponse, ConflictErrorResponse, ContinueConversationRequest,
-    ContinueConversationResponse, ContinueConversationStatus, ConversationListResponse,
-    ConversationMessageRangeResponse, ConversationMessageSliceResponse,
+    AcceptedMessageDisposition, AcceptedMessageReconciliation, AddressPrFeedbackRequest,
+    AddressPrFeedbackResponse, AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse,
+    CodeSearchEntry, CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse,
+    ContinueConversationRequest, ContinueConversationResponse, ContinueConversationStatus,
+    ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
@@ -100,6 +100,12 @@ const STREAMING_ROUTES: &[&str] = &[
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
+    let recovery_state = state.clone();
+    tokio::spawn(async move {
+        crate::address_feedback_workflow::AddressFeedbackWorkflowService::new(recovery_state)
+            .recover_pending()
+            .await;
+    });
     // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
     // from `spa_routes::SPA_ROUTES` — the single source of truth shared with the
     // auth exemption (`auth::is_exempt_path`) so the two cannot drift. Adding a
@@ -378,8 +384,8 @@ pub fn create_router(state: AppState) -> Router {
             post(resume_associated_pr_inference),
         )
         .route(
-            "/api/conversations/:id/pr-auto-fix-context",
-            post(create_pr_auto_fix_context),
+            "/api/conversations/:id/address-pr-feedback",
+            post(address_pr_feedback),
         )
         // Project task files available before a conversation exists
         .route("/api/tasks", get(list_project_tasks))
@@ -3470,6 +3476,54 @@ async fn upload_conversation_attachments(
     Ok(Json(AttachmentUploadResponse { files }))
 }
 
+async fn address_pr_feedback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AddressPrFeedbackRequest>,
+) -> Result<Json<AddressPrFeedbackResponse>, AppError> {
+    let message_id = req.message_id;
+    if message_id.is_empty() {
+        return Err(AppError::BadRequest("message_id is required".to_string()));
+    }
+    let service =
+        crate::address_feedback_workflow::AddressFeedbackWorkflowService::new(state.clone());
+    let response = service
+        .submit(
+            crate::address_feedback_workflow::AddressFeedbackWorkflowRequest {
+                conversation_id: id,
+                message_id,
+                guidance: req.guidance,
+                user_agent: req.user_agent,
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::Rejected {
+                message,
+                code,
+            }
+            | crate::address_feedback_workflow::AddressFeedbackWorkflowError::Retry {
+                message,
+                code,
+            } => AppError::Conflict(Box::new(ConflictErrorResponse::new(message, &code))),
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::IdempotencyConflict => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    error.to_string(),
+                    "idempotency_conflict",
+                )))
+            }
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::NotFound(message) => {
+                AppError::NotFound(message)
+            }
+            crate::address_feedback_workflow::AddressFeedbackWorkflowError::Capture(message)
+            | crate::address_feedback_workflow::AddressFeedbackWorkflowError::Workflow(message)
+            | crate::address_feedback_workflow::AddressFeedbackWorkflowError::Dispatch(message) => {
+                AppError::Internal(message)
+            }
+        })?;
+    Ok(Json(response))
+}
+
 async fn send_chat(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3483,6 +3537,7 @@ async fn send_chat(
         .send(crate::send_chat_service::SendChatRequest {
             conversation_id: id,
             text: req.text,
+            display_text: None,
             message_id: req.message_id,
             images: req.images,
             files: req.files,
@@ -3871,6 +3926,7 @@ async fn dispatch_continuation_handoff(
     .send(crate::send_chat_service::SendChatRequest {
         conversation_id: conversation_id.clone(),
         text: intent.handoff,
+        display_text: None,
         message_id: intent.message_id,
         images: Vec::new(),
         files: Vec::new(),

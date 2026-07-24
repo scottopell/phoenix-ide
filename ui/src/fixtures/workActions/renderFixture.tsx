@@ -33,7 +33,6 @@ export function WorkActionsFixture({ scenario }: Props) {
                 convModeLabel={scenario.convModeLabel}
                 phaseType={scenario.phaseType}
                 continuedInConvId={scenario.continuedInConvId}
-                {...(scenario.canSendMessage ? { onSendMessage: async () => {} } : {})}
                 prStatusHandle={handle}
               />
             </section>
