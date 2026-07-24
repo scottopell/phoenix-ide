@@ -3765,7 +3765,7 @@ where
             let explicit_model = nonblank(task.model.as_deref())
                 .or_else(|| agent.and_then(|definition| nonblank(definition.model.as_deref())));
             let resolved_model = if let Some(model) = explicit_model {
-                if !frozen_model_ids.contains(model) {
+                if !frozen_model_ids.contains(model) || self.llm_registry.get(model).is_none() {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
                         format!(
@@ -4396,7 +4396,7 @@ where
         // finite turn budget. Grace turn mechanism gives the model one extra LLM
         // turn to call submit_result or submit_error before hard-stopping.
         if self.context.max_turns > 0 {
-            if !(self.grace_turn_granted && retry_attempt > 1) {
+            if retry_attempt == 1 {
                 self.llm_turn_count += 1;
             }
             if self.llm_turn_count > self.context.max_turns {
@@ -4648,13 +4648,14 @@ where
                 )
             };
 
-            // Historical tool blocks are normalized against the full registry:
-            // narrowing a grace turn's callable surface must not erase the useful
-            // research history the model needs to summarize.
-            let available_tool_names: std::collections::HashSet<&str> =
-                available_tools.iter().map(|tool| tool.name.as_str()).collect();
-            let messages = strip_unavailable_tool_blocks(messages, &available_tool_names);
             let tools = request_tool_surface.callable_tools(available_tools);
+            let callable_tool_names: std::collections::HashSet<&str> =
+                tools.iter().map(|tool| tool.name.as_str()).collect();
+            let messages = strip_unavailable_tool_blocks(
+                messages,
+                &callable_tool_names,
+                request_tool_surface == LlmToolSurface::SubAgentTerminal,
+            );
 
             let mut system = vec![SystemContent::cached(&system_prompt)];
             if is_coordinator {
@@ -6475,6 +6476,7 @@ fn normalize_task_file_repo_relative(
 fn strip_unavailable_tool_blocks(
     messages: Vec<LlmMessage>,
     available_tools: &std::collections::HashSet<&str>,
+    flatten_results: bool,
 ) -> Vec<LlmMessage> {
     use phoenix_llm::ContentBlock;
 
@@ -6490,7 +6492,7 @@ fn strip_unavailable_tool_blocks(
             if let ContentBlock::ToolUse { id, name, .. } = block {
                 if !available_tools.contains(name.as_str()) {
                     stripped_ids.insert(id.clone());
-                    if name == "commission_review" {
+                    if flatten_results || name == "commission_review" {
                         flatten_result_ids.insert(id.clone());
                     }
                 }
@@ -6527,11 +6529,18 @@ fn strip_unavailable_tool_blocks(
                     ContentBlock::ToolResult {
                         ref tool_use_id,
                         ref content,
+                        ref images,
                         ..
                     } => {
                         if flatten_result_ids.contains(tool_use_id) {
+                            if !images.is_empty() {
+                                tracing::debug!(
+                                    count = images.len(),
+                                    "dropping images while flattening an unavailable historical tool result"
+                                );
+                            }
                             Some(ContentBlock::Text {
-                                text: format!("[historical commission_review result]\n{content}"),
+                                text: format!("[historical tool result]\n{content}"),
                             })
                         } else if stripped_ids.contains(tool_use_id) {
                             None
@@ -7121,7 +7130,7 @@ mod strip_tool_blocks_tests {
             assistant(vec![ContentBlock::text("x"), tool_use("t1", "bash")]),
             user(vec![tool_result("t1")]),
         ];
-        let out = strip_unavailable_tool_blocks(msgs.clone(), &available);
+        let out = strip_unavailable_tool_blocks(msgs.clone(), &available, false);
         assert_eq!(out.len(), msgs.len());
         assert_eq!(out[0].content.len(), 2);
         assert_eq!(out[1].content.len(), 1);
@@ -7138,7 +7147,7 @@ mod strip_tool_blocks_tests {
             ]),
             user(vec![tool_result("keep"), tool_result("drop")]),
         ];
-        let out = strip_unavailable_tool_blocks(msgs, &available);
+        let out = strip_unavailable_tool_blocks(msgs, &available, false);
         // Assistant: text + the bash tool_use survive; propose_task tool_use is gone
         assert_eq!(out[0].content.len(), 2);
         assert!(out[0]
@@ -7165,15 +7174,49 @@ mod strip_tool_blocks_tests {
             }]),
         ];
 
-        let out = strip_unavailable_tool_blocks(msgs, &available);
+        let out = strip_unavailable_tool_blocks(msgs, &available, false);
 
         assert_eq!(out.len(), 1);
         assert!(matches!(
             &out[0].content[0],
             ContentBlock::Text { text }
-                if text.contains("historical commission_review result")
+                if text.contains("historical tool result")
                     && text.contains("review finding summary")
         ));
+    }
+
+    #[test]
+    fn grace_normalization_flattens_all_unavailable_tool_results() {
+        let terminal: std::collections::HashSet<&str> =
+            ["submit_result", "submit_error"].into_iter().collect();
+        let msgs = vec![
+            assistant(vec![tool_use("search-1", "search")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "search-1".to_string(),
+                content: "important finding".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+        ];
+
+        let out = strip_unavailable_tool_blocks(msgs, &terminal, true);
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0].content[0],
+            ContentBlock::Text { text }
+                if text.contains("historical tool result")
+                    && text.contains("important finding")
+        ));
+        assert!(!out
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                )
+            }));
     }
 
     #[test]
@@ -7187,7 +7230,7 @@ mod strip_tool_blocks_tests {
             server_tool_use("srv1", "tool_search_tool_regex"),
             tool_search_result("srv1", &["bash", "removed_tool", "other"]),
         ])];
-        let out = strip_unavailable_tool_blocks(msgs, &available);
+        let out = strip_unavailable_tool_blocks(msgs, &available, false);
         assert_eq!(out.len(), 1);
 
         let ts_block = out[0]
@@ -7224,7 +7267,7 @@ mod strip_tool_blocks_tests {
             user(vec![tool_result("t1")]),
             assistant(vec![ContentBlock::text("survives")]),
         ];
-        let out = strip_unavailable_tool_blocks(msgs, &available);
+        let out = strip_unavailable_tool_blocks(msgs, &available, false);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0].content[0], ContentBlock::Text { text } if text == "survives"));
     }
@@ -10961,6 +11004,76 @@ mod subagent_grace_tool_surface_tests {
         }
     }
     #[tokio::test]
+    async fn normal_provider_retry_does_not_enter_grace_phase() {
+        let cwd = TempDir::new().expect("cwd");
+        let mut context = ConvContext::new(
+            "normal-retry-tools",
+            cwd.path().to_path_buf(),
+            "test-model",
+            200_000,
+        );
+        context.is_sub_agent = true;
+        context.max_turns = 1;
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("continuing")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 2 },
+            Arc::new(InMemoryStorage::new()),
+            llm.clone(),
+            terminal_tools(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+        runtime.llm_turn_count = 1;
+
+        runtime
+            .dispatch_llm_request()
+            .await
+            .expect("normal retry dispatch");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while llm.recorded_requests().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "retry request not recorded"
+            );
+            tokio::task::yield_now().await;
+        }
+        let request = llm.recorded_requests().remove(0);
+        let names: Vec<&str> = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"search"),
+            "normal retry lost ordinary tools"
+        );
+        assert!(!runtime.grace_turn_granted);
+        assert_eq!(
+            runtime.llm_turn_count, 1,
+            "retry must not spend another turn"
+        );
+
+        if let Some(task) = runtime.llm_task_handle.take() {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn grace_retry_retains_terminal_tool_surface() {
         let cwd = TempDir::new().expect("cwd");
         let mut context = ConvContext::new(
@@ -11392,7 +11505,7 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
-    async fn explicit_model_is_validated_against_frozen_schema_snapshot() {
+    async fn advertised_model_removed_from_live_registry_is_rejected() {
         let parent = TempDir::new().expect("parent tempdir");
         let mut rt = runtime_in_direct_mode(parent.path());
         assert!(
@@ -11417,8 +11530,10 @@ mod work_subagent_cwd_guard_tests {
         match result {
             Some(Event::ToolComplete { result, .. }) => {
                 let message = tool_result_text(&result);
-                assert!(!message.contains("Unknown model"), "got: {message}");
-                assert!(message.contains("not configured"), "got: {message}");
+                assert!(
+                    message.contains("Unknown model 'test-model'"),
+                    "got: {message}"
+                );
             }
             other => panic!("expected missing-channel ToolComplete, got {other:?}"),
         }
