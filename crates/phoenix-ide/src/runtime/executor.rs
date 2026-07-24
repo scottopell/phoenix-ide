@@ -3707,6 +3707,9 @@ where
         // tool call then reports failure instead of SpawnAgentsComplete) when a
         // later task's effective model is unknown. Build-and-validate first,
         // then send the whole batch.
+        let frozen_model_ids = self.tool_executor.subagent_model_ids();
+        let frozen_model_ids: std::collections::HashSet<&str> =
+            frozen_model_ids.iter().map(String::as_str).collect();
         let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
         for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
@@ -3762,13 +3765,13 @@ where
             let explicit_model = nonblank(task.model.as_deref())
                 .or_else(|| agent.and_then(|definition| nonblank(definition.model.as_deref())));
             let resolved_model = if let Some(model) = explicit_model {
-                if self.llm_registry.get(model).is_none() {
+                if !frozen_model_ids.contains(model) {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
                         format!(
                             "Unknown model '{}'. Available: {:?}",
                             model,
-                            self.llm_registry.available_models()
+                            frozen_model_ids.iter().copied().collect::<Vec<_>>()
                         ),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -11075,7 +11078,7 @@ mod work_subagent_cwd_guard_tests {
             ConvState::Idle,
             storage,
             Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()),
+            Arc::new(MockToolExecutor::new().with_subagent_models(vec!["test-model".to_string()])),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
@@ -11386,6 +11389,39 @@ mod work_subagent_cwd_guard_tests {
             other => panic!("expected ToolComplete with model error, got {other:?}"),
         }
         assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_model_is_validated_against_frozen_schema_snapshot() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let mut rt = runtime_in_direct_mode(parent.path());
+        assert!(
+            rt.llm_registry.get("test-model").is_none(),
+            "test requires the live registry to disagree with the frozen snapshot"
+        );
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inspect".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Explore),
+                    model: Some("test-model".to_string()),
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                let message = tool_result_text(&result);
+                assert!(!message.contains("Unknown model"), "got: {message}");
+                assert!(message.contains("not configured"), "got: {message}");
+            }
+            other => panic!("expected missing-channel ToolComplete, got {other:?}"),
+        }
     }
 
     #[tokio::test]

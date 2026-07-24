@@ -198,9 +198,10 @@ impl Tool for SpawnAgentsTool {
             }
         });
 
-        if !self.model_ids.is_empty() {
-            task_props["model"]["enum"] = json!(self.model_ids);
-        }
+        task_props["model"]["anyOf"] = json!([
+            { "enum": self.model_ids },
+            { "pattern": "^\\s*$" }
+        ]);
 
         // REQ-AG-004: surface discovered named agents as a typed agent_type
         // enum. Omitted entirely when none are discovered, so the schema is a
@@ -419,9 +420,26 @@ mod tests {
         )
         .input_schema();
         assert_eq!(
-            schema["properties"]["tasks"]["items"]["properties"]["model"]["enum"],
-            json!(["gpt-a", "gpt-b"])
+            schema["properties"]["tasks"]["items"]["properties"]["model"]["anyOf"][0],
+            json!({ "enum": ["gpt-a", "gpt-b"] })
         );
+    }
+
+    #[test]
+    fn schema_model_constraint_includes_blank_default() {
+        let schema =
+            SpawnAgentsTool::with_catalogs(Vec::new(), vec!["gpt-a".to_string()]).input_schema();
+        let model = &schema["properties"]["tasks"]["items"]["properties"]["model"];
+        assert_eq!(model["anyOf"][0], json!({ "enum": ["gpt-a"] }));
+        assert_eq!(model["anyOf"][1], json!({ "pattern": "^\\s*$" }));
+    }
+
+    #[test]
+    fn empty_catalog_constrains_model_to_blank_default() {
+        let schema = SpawnAgentsTool::new().input_schema();
+        let model = &schema["properties"]["tasks"]["items"]["properties"]["model"];
+        assert_eq!(model["anyOf"][0], json!({ "enum": [] }));
+        assert_eq!(model["anyOf"][1], json!({ "pattern": "^\\s*$" }));
     }
 
     #[test]

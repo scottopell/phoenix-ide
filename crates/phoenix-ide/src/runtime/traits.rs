@@ -282,6 +282,13 @@ pub trait ToolExecutor: Send + Sync {
         std::collections::HashSet::new()
     }
 
+    /// Frozen model IDs advertised by the conversation's `spawn_agents`
+    /// schema. Spawn-time validation uses this same snapshot so schema and
+    /// executor acceptance cannot drift if the live registry changes.
+    fn subagent_model_ids(&self) -> Arc<[String]> {
+        Arc::from(Vec::new())
+    }
+
     /// Replace the tool set (e.g., Explore -> Work mode transition).
     /// Default is a no-op for test doubles that don't need dynamic swapping.
     fn upgrade_to_work_mode(&self) {
@@ -554,6 +561,10 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
         language: crate::llm_language::LlmLanguage,
     ) -> Vec<phoenix_llm::ToolDefinition> {
         (**self).definitions_for_language(language).await
+    }
+
+    fn subagent_model_ids(&self) -> Arc<[String]> {
+        (**self).subagent_model_ids()
     }
 
     fn upgrade_to_work_mode(&self) {
@@ -1066,6 +1077,10 @@ impl ToolExecutor for ToolRegistryExecutor {
         }
 
         defs
+    }
+
+    fn subagent_model_ids(&self) -> Arc<[String]> {
+        self.model_ids.clone()
     }
 
     fn upgrade_to_work_mode(&self) {
