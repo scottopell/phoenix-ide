@@ -876,6 +876,7 @@ mod tests {
         let intent = WakeRegistrationIntent {
             contract_id: format!("contract-{handle}"),
             conversation_id: "conv".to_string(),
+            root_conversation_id: "conv".to_string(),
             registration_scope: scope.clone(),
             resource: WakeResourceIdentity::Bash(BashResourceIdentity {
                 work_scope: scope.clone(),
@@ -902,6 +903,7 @@ mod tests {
         let intent = WakeRegistrationIntent {
             contract_id: format!("contract-{window_id}"),
             conversation_id: "conv".to_string(),
+            root_conversation_id: "conv".to_string(),
             registration_scope: scope.clone(),
             resource: WakeResourceIdentity::TmuxWindow(TmuxResourceIdentity {
                 work_scope: scope.clone(),

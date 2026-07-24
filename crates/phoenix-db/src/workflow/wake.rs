@@ -115,6 +115,7 @@ pub struct WakeBindingRecord {
     pub registering_tool_use_id: String,
     pub expires_at: Timestamp,
     pub prepared_fingerprint: String,
+    fingerprint_needs_scope_upgrade: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,8 +540,34 @@ impl WakeRepository {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let existing = fetch_existing_binding_tx(&mut tx, input).await?;
         if let Some(existing) = existing {
+            let exact_replay = existing.prepared_fingerprint == prepared_fingerprint;
+            let migrated_replay = existing.fingerprint_needs_scope_upgrade
+                && existing.registration_scope == input.registration_scope
+                && existing.conversation_id == input.conversation_id
+                && existing.resource == input.resource
+                && input.root_conversation_id == input.conversation_id
+                && existing.registering_tool_use_id == input.registering_tool_use_id;
+            if migrated_replay {
+                sqlx::query(
+                    "UPDATE wake_bindings
+                     SET prepared_fingerprint = ?1, fingerprint_needs_scope_upgrade = 0
+                     WHERE workflow_id = ?2 AND fingerprint_needs_scope_upgrade = 1",
+                )
+                .bind(prepared_fingerprint)
+                .bind(to_i64(existing.workflow_id.0, "workflow_id")?)
+                .execute(&mut *tx.tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE workflow_external_acceptance_bindings
+                     SET intent_fingerprint = ?1 WHERE workflow_id = ?2",
+                )
+                .bind(prepared_fingerprint)
+                .bind(to_i64(existing.workflow_id.0, "workflow_id")?)
+                .execute(&mut *tx.tx)
+                .await?;
+            }
             tx.commit().await?;
-            return Ok(if existing.prepared_fingerprint == prepared_fingerprint {
+            return Ok(if exact_replay || migrated_replay {
                 WakeRegistrationOutcome::Replayed {
                     workflow_id: existing.workflow_id,
                     receipt: replay_receipt(&existing),
@@ -681,7 +708,7 @@ impl WakeRepository {
             "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                     work_scope_id, resource_kind, bash_handle_id,
                     tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-                    expires_at, prepared_fingerprint
+                    expires_at, prepared_fingerprint, fingerprint_needs_scope_upgrade
              FROM wake_bindings
              WHERE conversation_id = ?1 AND contract_id = ?2
              LIMIT 1",
@@ -3391,7 +3418,7 @@ async fn fetch_existing_binding_tx(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 work_scope_id, resource_kind, bash_handle_id,
                 tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-                expires_at, prepared_fingerprint
+                expires_at, prepared_fingerprint, fingerprint_needs_scope_upgrade
          FROM wake_bindings
          WHERE profile_kind = 'wake' AND profile_version = ?1 AND conversation_id = ?2
            AND contract_id = ?3 AND resource_kind = ?4
@@ -3419,7 +3446,7 @@ async fn fetch_binding_by_workflow_tx(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 work_scope_id, resource_kind, bash_handle_id,
                 tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-                expires_at, prepared_fingerprint
+                expires_at, prepared_fingerprint, fingerprint_needs_scope_upgrade
          FROM wake_bindings WHERE workflow_id = ?1",
     )
     .bind(i64::try_from(workflow_id.0).map_err(|e| DbError::Serialization(e.to_string()))?)
@@ -3496,6 +3523,7 @@ fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeBindingRecord
                 .map_err(|e| DbError::Serialization(e.to_string()))?,
         ),
         prepared_fingerprint: row.get("prepared_fingerprint"),
+        fingerprint_needs_scope_upgrade: row.get::<i64, _>("fingerprint_needs_scope_upgrade") != 0,
     })
 }
 
@@ -4704,6 +4732,7 @@ mod tests {
         WakeRegistrationIntent {
             contract_id: "contract-2".into(),
             conversation_id: "conv-1".into(),
+            root_conversation_id: "conv-1".into(),
             registration_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             resource: WakeResourceIdentity::TmuxWindow(wake_types::TmuxResourceIdentity {
                 work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
@@ -4795,6 +4824,7 @@ mod tests {
         WakeRegistrationIntent {
             contract_id: "contract-1".into(),
             conversation_id: "conv-1".into(),
+            root_conversation_id: "conv-1".into(),
             registration_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             resource: WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
                 work_scope: wake_types::WorkScopeIdentity("conv-1".into()),
@@ -7404,6 +7434,7 @@ mod tests {
         let pending_input = WakeRegistrationIntent {
             contract_id: "contract-p".into(),
             conversation_id: pending_conv.into(),
+            root_conversation_id: pending_conv.into(),
             registration_scope: wake_types::WorkScopeIdentity("conv-1".into()),
             resource: WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
                 work_scope: wake_types::WorkScopeIdentity("conv-1".into()),

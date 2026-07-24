@@ -833,6 +833,7 @@ CREATE TABLE wake_bindings (
     expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
     resolved_at INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),
     prepared_fingerprint TEXT NOT NULL CHECK (prepared_fingerprint <> ''),
+    fingerprint_needs_scope_upgrade INTEGER NOT NULL DEFAULT 0 CHECK (fingerprint_needs_scope_upgrade IN (0, 1)),
     observe_effect_id INTEGER NOT NULL CHECK (observe_effect_id >= 1),
     created_at INTEGER NOT NULL CHECK (created_at >= 0),
     tmux_completion_policy TEXT NOT NULL DEFAULT 'KeepOpen' CHECK (tmux_completion_policy IN ('KeepOpen', 'CloseAfterCompletion')),
@@ -867,7 +868,9 @@ INSERT INTO wake_bindings
 SELECT old.workflow_id, old.conversation_id, old.contract_id, old.profile_kind, old.profile_version,
        mapped.work_scope_id,
        old.resource_kind, old.bash_handle_id, old.tmux_server_token, old.tmux_window_id, old.registering_tool_use_id,
-       old.expires_at, old.resolved_at, old.prepared_fingerprint, old.observe_effect_id, old.created_at, old.tmux_completion_policy
+       old.expires_at, old.resolved_at, old.prepared_fingerprint,
+       CASE WHEN old.resolved_at IS NULL THEN 1 ELSE 0 END,
+       old.observe_effect_id, old.created_at, old.tmux_completion_policy
 FROM wake_bindings_old old
 JOIN migration_052_wake_scope_map mapped ON mapped.workflow_id = old.workflow_id;
 
@@ -4438,7 +4441,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO wake_bindings (workflow_id, conversation_id, contract_id, profile_kind, profile_version, scope_kind, scope_stable_key, resource_kind, bash_handle_id, registering_tool_use_id, expires_at, resolved_at, prepared_fingerprint, observe_effect_id, created_at) VALUES (52, 'branch-root', 'contract', 'wake', 1, 'Worktree', 'worktree:/tmp/migration-wake', 'Bash', 'b-52', 'tool-52', 100, 2, 'fingerprint', 1, 1)")
+        sqlx::query("INSERT INTO wake_bindings (workflow_id, conversation_id, contract_id, profile_kind, profile_version, scope_kind, scope_stable_key, resource_kind, bash_handle_id, registering_tool_use_id, expires_at, resolved_at, prepared_fingerprint, observe_effect_id, created_at) VALUES (52, 'branch-root', 'contract', 'wake', 1, 'Worktree', 'worktree:/tmp/migration-wake', 'Bash', 'b-52', 'tool-52', 100, NULL, 'fingerprint', 1, 1)")
             .execute(&pool)
             .await
             .unwrap();
@@ -4672,6 +4675,56 @@ mod tests {
         assert_eq!(wake_ownership.0, legacy_worktree_scope);
         assert_ne!(wake_ownership.0, wake_ownership.1);
         assert_eq!(wake_ownership.2, "branch-root");
+        let migrated_fingerprint: (String, i64) = sqlx::query_as(
+            "SELECT prepared_fingerprint, fingerprint_needs_scope_upgrade
+             FROM wake_bindings WHERE workflow_id = 52",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(migrated_fingerprint, ("fingerprint".to_string(), 1));
+        let replay_intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
+            contract_id: "contract".to_string(),
+            conversation_id: "branch-root".to_string(),
+            root_conversation_id: "branch-root".to_string(),
+            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
+                wake_ownership.0.clone(),
+            ),
+            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
+                phoenix_workflow::wake_profile::BashResourceIdentity {
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
+                        wake_ownership.0.clone(),
+                    ),
+                    handle_id: "b-52".to_string(),
+                },
+            ),
+            registering_tool_use_id: "tool-52".to_string(),
+            registered_at: phoenix_workflow::Timestamp(3),
+            expires_at: phoenix_workflow::Timestamp(100),
+        };
+        let replay = crate::workflow::wake::WakeRepository::new(pool.clone())
+            .register(
+                &replay_intent,
+                "opaque-fingerprint",
+                phoenix_workflow::Timestamp(3),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay,
+            crate::workflow::wake::WakeRegistrationOutcome::Replayed {
+                workflow_id: phoenix_workflow::WorkflowId(52),
+                ..
+            }
+        ));
+        let upgraded_fingerprint: (String, i64) = sqlx::query_as(
+            "SELECT prepared_fingerprint, fingerprint_needs_scope_upgrade
+             FROM wake_bindings WHERE workflow_id = 52",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(upgraded_fingerprint, ("opaque-fingerprint".to_string(), 0));
         let preserved_tail: String = sqlx::query_scalar(
             "SELECT line FROM wake_terminal_receipt_tails WHERE workflow_id = 52 AND receipt_id = 1 AND ordinal = 0",
         )

@@ -5142,8 +5142,9 @@ impl Database {
                 .expect("approved task title is non-empty"),
         };
         let cm = conv_mode_columns(&work_mode);
-        let (work_scope_id, authority_kind, environment) =
-            Self::new_scope_for_conversation(&approval.worktree_path, &cm);
+        let work_scope_id = parent.work_scope_id.clone().ok_or_else(|| {
+            DbError::Serialization("task handoff parent has no work scope".into())
+        })?;
         let seed_message_id = uuid::Uuid::new_v4().to_string();
         let seeded_state = serde_json::to_string(&ConvState::SeededLlmRequesting {
             seed_message_id: seed_message_id.clone(),
@@ -5159,11 +5160,17 @@ impl Database {
         let handoff_summary_str = serde_json::to_string(&handoff_summary.to_stored_json()).unwrap();
 
         let mut tx = self.pool.begin().await?;
-        Self::insert_work_scope_environment_tx(
+        sqlx::query(
+            "UPDATE work_scopes SET authority_kind = 'work', updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(&now_str)
+        .bind(work_scope_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        Self::update_work_scope_environment_tx(
             &mut tx,
             &work_scope_id,
-            authority_kind,
-            environment,
+            Self::environment_for_mode(&approval.worktree_path, &cm),
             &now_str,
         )
         .await?;
@@ -14668,6 +14675,42 @@ mod tests {
         }
     }
 
+    async fn assert_handoff_scope_promoted(
+        db: &Database,
+        scope_id: &WorkScopeId,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+    ) {
+        let scope_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(scope_count, 1);
+        let promoted_scope: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT authority_kind, environment_kind, worktree_path, branch_name, base_branch
+             FROM work_scopes WHERE id = ?1",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            promoted_scope,
+            (
+                "work".to_string(),
+                "allocated_worktree".to_string(),
+                Some(approval.worktree_path.clone()),
+                Some(approval.branch_name.clone()),
+                Some(approval.base_branch.clone()),
+            )
+        );
+    }
+
     #[tokio::test]
     async fn test_create_task_approval_handoff_links_parent_to_work_successor() {
         let db = Database::open_in_memory().await.unwrap();
@@ -14701,6 +14744,11 @@ mod tests {
             .create_task_approval_handoff_conversation("handoff-parent", &approval)
             .await
             .unwrap();
+
+        let parent_before_reload = db.get_conversation("handoff-parent").await.unwrap();
+        assert_eq!(successor.work_scope_id, parent_before_reload.work_scope_id);
+        assert_handoff_scope_promoted(&db, successor.work_scope_id.as_ref().unwrap(), &approval)
+            .await;
 
         let parent = db.get_conversation("handoff-parent").await.unwrap();
         assert_eq!(
@@ -15343,6 +15391,7 @@ mod tests {
         let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
             contract_id: "contract-del".into(),
             conversation_id: "conv-del".into(),
+            root_conversation_id: "conv-del".into(),
             registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
                 work_scope_id.as_str().into(),
             ),

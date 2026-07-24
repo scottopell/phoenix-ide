@@ -93,6 +93,7 @@ pub enum WakeResourceIdentity {
 pub struct WakeRegistrationIntent {
     pub contract_id: String,
     pub conversation_id: String,
+    pub root_conversation_id: String,
     pub registration_scope: WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
     pub registering_tool_use_id: String,

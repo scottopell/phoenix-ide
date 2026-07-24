@@ -128,6 +128,7 @@ impl RegisterWakeInput {
         WakeRegistrationIntent {
             contract_id: self.contract_id,
             conversation_id: self.conversation_id,
+            root_conversation_id: self.root_conversation_id,
             registration_scope: self.registration_scope,
             resource: self.resource,
             registering_tool_use_id: self.registering_tool_use_id,

@@ -13670,6 +13670,7 @@ mod wake_handler_tests {
         let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
             contract_id: contract_id.to_string(),
             conversation_id: conversation_id.to_string(),
+            root_conversation_id: conversation_id.to_string(),
             registration_scope: wake_scope.clone(),
             resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
                 phoenix_workflow::wake_profile::BashResourceIdentity {
