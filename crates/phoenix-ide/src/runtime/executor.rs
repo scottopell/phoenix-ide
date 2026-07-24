@@ -5293,6 +5293,21 @@ where
         }
     }
 
+    fn tool_execution_metrics_and_round(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>,
+            String,
+        ),
+        String,
+    > {
+        Ok((
+            self.create_tool_llm_metrics_sink(),
+            self.current_tool_round_id()?,
+        ))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
@@ -5359,8 +5374,7 @@ where
                     progress,
                 });
         });
-        let llm_metrics_tx = self.create_tool_llm_metrics_sink();
-        let tool_round_id = self.current_tool_round_id()?;
+        let (llm_metrics_tx, tool_round_id) = self.tool_execution_metrics_and_round()?;
         let tool_ctx = match &self.context.execution_environment {
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
