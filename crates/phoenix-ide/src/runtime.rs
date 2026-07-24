@@ -562,6 +562,7 @@ struct QueuedBroadcast {
 #[derive(Debug, Default)]
 struct BroadcastGate {
     reserved_until: Option<i64>,
+    reserved_remaining: std::collections::BTreeSet<i64>,
     queued: Vec<QueuedBroadcast>,
 }
 
@@ -743,12 +744,11 @@ impl SseBroadcaster {
     fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
         {
             let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-            if gate
-                .reserved_until
-                .is_some_and(|reserved_until| seq > reserved_until)
-            {
-                gate.queued.push(QueuedBroadcast { event, seq, op });
-                return Ok(self.tx.receiver_count());
+            if let Some(reserved_until) = gate.reserved_until {
+                if gate.reserved_remaining.remove(&seq) || seq > reserved_until {
+                    gate.queued.push(QueuedBroadcast { event, seq, op });
+                    return Ok(self.tx.receiver_count());
+                }
             }
         }
         self.send_with_ring_raw(event, seq, op)
@@ -772,6 +772,7 @@ impl SseBroadcaster {
             seqs.push(self.next_seq_unlocked());
         }
         gate.reserved_until = seqs.last().copied();
+        gate.reserved_remaining = seqs.iter().copied().collect();
         (
             ReservedBroadcastRange {
                 broadcaster: self.clone(),
@@ -783,7 +784,17 @@ impl SseBroadcaster {
 
     fn release_reserved_range(&self) {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        let reserved_remaining = std::mem::take(&mut gate.reserved_remaining);
         let mut queued = std::mem::take(&mut gate.queued);
+        queued.extend(
+            reserved_remaining
+                .into_iter()
+                .map(|sequence_id| QueuedBroadcast {
+                    event: SseEvent::SequenceBarrier { sequence_id },
+                    seq: sequence_id,
+                    op: RingOp::Append,
+                }),
+        );
         queued.sort_by_key(|entry| entry.seq);
         for QueuedBroadcast { event, seq, op } in queued {
             let _ = self.send_with_ring_raw(event, seq, op);
@@ -1164,6 +1175,9 @@ pub enum SseEvent {
         resource_kind: String,
         handle_id: String,
         expires_at: u64,
+    },
+    SequenceBarrier {
+        sequence_id: i64,
     },
     WakeContractTerminal {
         sequence_id: i64,
@@ -3974,6 +3988,27 @@ mod broadcaster_tests {
             queued,
             SseEvent::Token { sequence_id, ref text, .. } if sequence_id == second_seq + 1 && text == "queued"
         ));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn reserved_sequence_barrier_closes_gap_before_queued_event() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let b = SseBroadcaster::new(16, 0);
+        let mut rx = b.subscribe();
+        let (guard, reserved_seqs) = b.reserve_next_persisted_message_range(2);
+        let _ = b.send_seq(|seq| token_event(seq, "queued"));
+
+        let _ = b.send_message(test_message(reserved_seqs[0], "materialized"));
+        drop(guard);
+
+        assert!(matches!(rx.try_recv().unwrap(), SseEvent::Message { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SseEvent::SequenceBarrier { sequence_id } if sequence_id == reserved_seqs[1]
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), SseEvent::Token { .. }));
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 

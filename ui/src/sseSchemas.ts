@@ -38,6 +38,7 @@ import type {
   SseLlmAttemptData as WireLlmAttemptData,
   SseAgentDoneData as WireAgentDoneData,
   SseWakeContractRegisteredData as WireWakeContractRegisteredData,
+  SseSequenceBarrierData as WireSequenceBarrierData,
   SseWakeContractTerminalData as WireWakeContractTerminalData,
   SseConversationBecameTerminalData as WireConversationBecameTerminalData,
   SseConversationUpdateData as WireConversationUpdateData,
@@ -336,6 +337,10 @@ export const SseWakeContractRegisteredDataSchema = v.looseObject({
   handle_id: v.string(),
   expires_at: v.number(),
 }) satisfies v.GenericSchema<unknown, WireWakeContractRegisteredData>;
+
+export const SseSequenceBarrierDataSchema = v.looseObject({
+  sequence_id: v.number(),
+}) satisfies v.GenericSchema<unknown, WireSequenceBarrierData>;
 
 export const SseWakeContractTerminalDataSchema = v.looseObject({
   sequence_id: v.number(),

@@ -337,7 +337,9 @@ pub enum SseWireEvent {
         request_id: String,
     },
     /// Agent reached an idle state and is no longer working.
-    AgentDone { sequence_id: i64 },
+    AgentDone {
+        sequence_id: i64,
+    },
     /// Explicit durable wait registration accepted.
     WakeContractRegistered {
         sequence_id: i64,
@@ -346,6 +348,9 @@ pub enum SseWireEvent {
         resource_kind: String,
         handle_id: String,
         expires_at: u64,
+    },
+    SequenceBarrier {
+        sequence_id: i64,
     },
     /// Durable wake reached a terminal state and was materialized.
     WakeContractTerminal {
@@ -358,7 +363,9 @@ pub enum SseWireEvent {
     },
     /// Conversation hit a terminal state — the terminal subsystem uses this
     /// to tear down PTYs.
-    ConversationBecameTerminal { sequence_id: i64 },
+    ConversationBecameTerminal {
+        sequence_id: i64,
+    },
     /// Partial conversation metadata update.
     ConversationUpdate {
         sequence_id: i64,
@@ -391,7 +398,10 @@ pub enum SseWireEvent {
     /// fires when it's removed (kill or idle cleanup). The
     /// `conversation_id` is implied by the per-conversation broadcaster
     /// scope and not re-emitted on the wire.
-    BrowserSessionState { sequence_id: i64, active: bool },
+    BrowserSessionState {
+        sequence_id: i64,
+        active: bool,
+    },
     /// Bounded ephemeral output snapshot for the active bash invocation.
     BashToolProgress {
         sequence_id: i64,
@@ -436,6 +446,7 @@ impl SseWireEvent {
             SseWireEvent::Token { .. } => "token",
             SseWireEvent::AgentDone { .. } => "agent_done",
             SseWireEvent::WakeContractRegistered { .. } => "wake_contract_registered",
+            SseWireEvent::SequenceBarrier { .. } => "sequence_barrier",
             SseWireEvent::WakeContractTerminal { .. } => "wake_contract_terminal",
             SseWireEvent::ConversationBecameTerminal { .. } => "conversation_became_terminal",
             SseWireEvent::ConversationUpdate { .. } => "conversation_update",
@@ -573,6 +584,9 @@ impl From<SseEvent> for SseWireEvent {
                 handle_id,
                 expires_at,
             },
+            SseEvent::SequenceBarrier { sequence_id } => {
+                SseWireEvent::SequenceBarrier { sequence_id }
+            }
             SseEvent::WakeContractTerminal {
                 sequence_id,
                 workflow_id,

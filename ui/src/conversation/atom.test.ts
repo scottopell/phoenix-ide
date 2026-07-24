@@ -547,6 +547,32 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(6);
     });
 
+    it('fresh connect consumes pending wake terminal sequence before following events', () => {
+      const payload = makeInitPayload({
+        phase: { type: 'awaiting_llm' },
+        lastAppliedEventSeq: 7,
+        pendingAnchorSequenceId: 5,
+        pendingEvents: [
+          {
+            type: 'wake_contract_terminal',
+            sequence_id: 6,
+            workflow_id: 42,
+            contract_id: 'wake-42',
+            receipt_id: 43,
+            delivery_id: 44,
+            terminal_kind: 'fired',
+          },
+          stateChangeEntry(7, { type: 'llm_requesting', attempt: 1 }),
+        ],
+      });
+
+      const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+
+      expect(next.lastAppliedEventSeq).toBe(7);
+      expect(next.phase.type).toBe('llm_requesting');
+      expect(next.eventGap).toBeNull();
+    });
+
     it('fresh connect with pending state_change updates phase to latest pending state', () => {
       const payload = makeInitPayload({
         phase: { type: 'awaiting_llm' },

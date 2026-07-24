@@ -322,6 +322,10 @@ mod tests {
                 "handle_id": handle_id,
                 "expires_at": expires_at,
             }),
+            SseEvent::SequenceBarrier { sequence_id } => json!({
+                "type": "sequence_barrier",
+                "sequence_id": sequence_id,
+            }),
             SseEvent::WakeContractTerminal {
                 sequence_id,
                 workflow_id,
@@ -837,6 +841,12 @@ mod tests {
     #[test]
     fn parity_agent_done() {
         let event = SseEvent::AgentDone { sequence_id: 16 };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_sequence_barrier() {
+        let event = SseEvent::SequenceBarrier { sequence_id: 17 };
         assert_parity(&event);
     }
 

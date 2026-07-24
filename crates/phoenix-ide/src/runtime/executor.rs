@@ -1741,6 +1741,7 @@ where
     llm_registry: Arc<ModelRegistry>,
     wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
     registered_wake_workflows: std::collections::BTreeSet<phoenix_workflow::WorkflowId>,
+    wake_cancellations_owed: std::collections::BTreeSet<phoenix_workflow::WorkflowId>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
@@ -2004,6 +2005,7 @@ where
             llm_registry,
             wake_registrar: None,
             registered_wake_workflows: std::collections::BTreeSet::new(),
+            wake_cancellations_owed: std::collections::BTreeSet::new(),
             terminals,
             event_rx,
             event_tx,
@@ -2594,6 +2596,38 @@ where
             });
     }
 
+    async fn cancel_parked_wake(&mut self, workflow_id: u64) -> Result<(), String> {
+        let registrar = self
+            .wake_registrar
+            .clone()
+            .ok_or_else(|| "parked wake completed without a wake registrar".to_string())?;
+        let workflow_id = phoenix_workflow::types::WorkflowId(workflow_id);
+        let timestamp = phoenix_workflow::types::Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        self.wake_cancellations_owed.insert(workflow_id);
+        if let Err(error) = registrar
+            .cancel(crate::tools::CancelWakeInput {
+                workflow_id,
+                timestamp,
+                reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+            })
+            .await
+        {
+            tracing::warn!(
+                %error,
+                workflow_id = workflow_id.0,
+                "wake cancellation remains owed after parked tool completed during cancellation"
+            );
+        } else {
+            self.wake_cancellations_owed.remove(&workflow_id);
+        }
+        Ok(())
+    }
+
     async fn process_outcome(&mut self, mut outcome: EffectOutcome) -> Result<(), String> {
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
@@ -2616,24 +2650,7 @@ where
         ) = (&self.state, &outcome)
         {
             if &result.tool_use_id == tool_use_id {
-                let registrar = self
-                    .wake_registrar
-                    .as_ref()
-                    .ok_or_else(|| "parked wake completed without a wake registrar".to_string())?;
-                let timestamp = phoenix_workflow::types::Timestamp(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                );
-                registrar
-                    .cancel(crate::tools::CancelWakeInput {
-                        workflow_id: phoenix_workflow::types::WorkflowId(registration.workflow_id),
-                        timestamp,
-                        reason:
-                            phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
-                    })
-                    .await?;
+                self.cancel_parked_wake(registration.workflow_id).await?;
                 if let EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark { result, .. }) =
                     outcome
                 {
@@ -2736,10 +2753,10 @@ where
     #[allow(clippy::too_many_lines)]
     async fn cancel_wake_workflows(
         registrar: &dyn crate::tools::WakeRegistrar,
-        workflow_ids: std::collections::BTreeSet<phoenix_workflow::WorkflowId>,
+        workflow_ids: &mut std::collections::BTreeSet<phoenix_workflow::WorkflowId>,
         timestamp: phoenix_workflow::Timestamp,
     ) -> Result<(), String> {
-        for workflow_id in workflow_ids {
+        for workflow_id in workflow_ids.clone() {
             registrar
                 .cancel(crate::tools::CancelWakeInput {
                     workflow_id,
@@ -2747,12 +2764,15 @@ where
                     reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
                 })
                 .await?;
+            workflow_ids.remove(&workflow_id);
         }
         Ok(())
     }
 
     async fn cancel_registered_wakes(&mut self) -> Result<(), String> {
-        if self.registered_wake_workflows.is_empty() {
+        self.wake_cancellations_owed
+            .append(&mut self.registered_wake_workflows);
+        if self.wake_cancellations_owed.is_empty() {
             return Ok(());
         }
         let registrar = self
@@ -2767,7 +2787,7 @@ where
         );
         Self::cancel_wake_workflows(
             registrar.as_ref(),
-            std::mem::take(&mut self.registered_wake_workflows),
+            &mut self.wake_cancellations_owed,
             timestamp,
         )
         .await
@@ -9335,6 +9355,49 @@ mod context_exhausted_preserves_worktree_tests {
         activation_notifications: std::sync::atomic::AtomicUsize,
     }
 
+    struct FailingWakeRegistrar {
+        cancelled: std::sync::Mutex<Vec<phoenix_workflow::WorkflowId>>,
+        fail_once_for: std::sync::Mutex<std::collections::BTreeSet<phoenix_workflow::WorkflowId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::WakeRegistrar for FailingWakeRegistrar {
+        async fn register(
+            &self,
+            _input: crate::tools::RegisterWakeInput,
+        ) -> Result<crate::tools::RegisteredWake, String> {
+            unreachable!("registration is not under test")
+        }
+
+        async fn cancel(
+            &self,
+            input: crate::tools::CancelWakeInput,
+        ) -> Result<crate::tools::RegisteredWake, String> {
+            self.cancelled.lock().unwrap().push(input.workflow_id);
+            if self
+                .fail_once_for
+                .lock()
+                .unwrap()
+                .remove(&input.workflow_id)
+            {
+                Err("injected cancellation failure".to_string())
+            } else {
+                Ok(crate::tools::RegisteredWake::Cancelled)
+            }
+        }
+
+        fn notify_activation_committed(&self) {}
+
+        async fn rekey_work_scope(
+            &self,
+            _conversation_id: &str,
+            _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+            _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+        ) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::tools::WakeRegistrar for RecordingWakeRegistrar {
         async fn register(
@@ -9512,6 +9575,97 @@ mod context_exhausted_preserves_worktree_tests {
             ]
         );
         assert!(runtime.registered_wake_workflows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_sibling_wake_cancellation_remains_owed_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let (mut runtime, _) = build_runtime(storage, "cancel-retry", temp.path().to_path_buf());
+        let workflow_11 = phoenix_workflow::WorkflowId(11);
+        let workflow_12 = phoenix_workflow::WorkflowId(12);
+        let registrar = Arc::new(FailingWakeRegistrar {
+            cancelled: std::sync::Mutex::new(vec![]),
+            fail_once_for: std::sync::Mutex::new([workflow_12].into_iter().collect()),
+        });
+        runtime.wake_registrar = Some(registrar.clone());
+        runtime
+            .registered_wake_workflows
+            .extend([workflow_11, workflow_12]);
+
+        assert_eq!(
+            runtime.cancel_registered_wakes().await,
+            Err("injected cancellation failure".to_string())
+        );
+        assert!(runtime.registered_wake_workflows.is_empty());
+        assert_eq!(
+            runtime.wake_cancellations_owed,
+            [workflow_12].into_iter().collect()
+        );
+
+        runtime.cancel_registered_wakes().await.unwrap();
+
+        assert!(runtime.wake_cancellations_owed.is_empty());
+        assert_eq!(
+            *registrar.cancelled.lock().unwrap(),
+            vec![workflow_11, workflow_12, workflow_12]
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_tool_cancel_failure_preserves_outcome_and_cancellation_debt() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        let state = ConvState::CancellingTool {
+            tool_use_id: "wait-1".to_string(),
+            skipped_tools: vec![],
+            completed_results: vec![],
+            assistant_message: phoenix_core::domain::sm_state::AssistantMessage::new(
+                "round-1".to_string(),
+                vec![phoenix_llm::ContentBlock::ToolUse {
+                    id: "wait-1".to_string(),
+                    name: "wait_until".to_string(),
+                    input: serde_json::json!({}),
+                }],
+                None,
+                None,
+            ),
+            pending_sub_agents: vec![],
+        };
+        let (mut runtime, _) = build_runtime_with_state(
+            storage,
+            "park-cancel-failure",
+            temp.path().to_path_buf(),
+            state,
+        );
+        let workflow_id = phoenix_workflow::WorkflowId(21);
+        runtime.wake_registrar = Some(Arc::new(FailingWakeRegistrar {
+            cancelled: std::sync::Mutex::new(vec![]),
+            fail_once_for: std::sync::Mutex::new([workflow_id].into_iter().collect()),
+        }));
+
+        runtime
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark {
+                result: phoenix_core::domain::db_schema::ToolResult::success(
+                    "wait-1".to_string(),
+                    "registered".to_string(),
+                ),
+                registration: WakeRegistrationNotice {
+                    workflow_id: workflow_id.0,
+                    contract_id: "wake-21".to_string(),
+                    resource_kind: "Bash".to_string(),
+                    handle_id: "b-21".to_string(),
+                    expires_at: 600,
+                },
+            }))
+            .await
+            .unwrap();
+
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(
+            runtime.wake_cancellations_owed,
+            [workflow_id].into_iter().collect()
+        );
     }
 
     #[allow(clippy::type_complexity)]

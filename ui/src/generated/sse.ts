@@ -90,6 +90,10 @@ export type SseWakeContractRegisteredData = Omit<
   Extract<SseWireEvent, { type: 'wake_contract_registered' }>,
   'type'
 >;
+export type SseSequenceBarrierData = Omit<
+  Extract<SseWireEvent, { type: 'sequence_barrier' }>,
+  'type'
+>;
 export type SseWakeContractTerminalData = Omit<
   Extract<SseWireEvent, { type: 'wake_contract_terminal' }>,
   'type'

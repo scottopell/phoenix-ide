@@ -17,6 +17,8 @@ import {
   SseSteerMessageQueuedDataSchema,
   SseRateLimitSnapshotDataSchema,
   SseWakeContractRegisteredDataSchema,
+  SseSequenceBarrierDataSchema,
+  SseWakeContractTerminalDataSchema,
   SseWorkScopeUpdateDataSchema,
   SseErrorDataSchema,
 } from '../sseSchemas';
@@ -1095,6 +1097,22 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
     }
     case 'wake_contract_registered': {
       const res = v.safeParse(SseWakeContractRegisteredDataSchema, entry);
+      if (!res.success) return atom;
+      return conversationReducer(atom, {
+        type: 'sse_sequence_consumed',
+        sequenceId: res.output.sequence_id,
+      });
+    }
+    case 'sequence_barrier': {
+      const res = v.safeParse(SseSequenceBarrierDataSchema, entry);
+      if (!res.success) return atom;
+      return conversationReducer(atom, {
+        type: 'sse_sequence_consumed',
+        sequenceId: res.output.sequence_id,
+      });
+    }
+    case 'wake_contract_terminal': {
+      const res = v.safeParse(SseWakeContractTerminalDataSchema, entry);
       if (!res.success) return atom;
       return conversationReducer(atom, {
         type: 'sse_sequence_consumed',
