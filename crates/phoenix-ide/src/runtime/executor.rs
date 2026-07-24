@@ -6167,6 +6167,10 @@ where
                             &self.context.conversation_id,
                             &crate::tools::work_scope_identity(&old_scope)?,
                             &crate::tools::work_scope_identity(&new_scope)?,
+                            crate::tools::WakeScopeRekeyResources {
+                                bash: bash_moved,
+                                tmux_window: tmux_moved,
+                            },
                         )
                         .await?
                 } else {
@@ -9393,6 +9397,7 @@ mod context_exhausted_preserves_worktree_tests {
             _conversation_id: &str,
             _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
             _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+            _resources: crate::tools::WakeScopeRekeyResources,
         ) -> Result<u64, String> {
             Ok(0)
         }
@@ -9425,6 +9430,7 @@ mod context_exhausted_preserves_worktree_tests {
             _conversation_id: &str,
             _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
             _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+            _resources: crate::tools::WakeScopeRekeyResources,
         ) -> Result<u64, String> {
             Ok(0)
         }

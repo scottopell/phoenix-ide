@@ -177,6 +177,12 @@ impl RegisteredWake {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeScopeRekeyResources {
+    pub bash: bool,
+    pub tmux_window: bool,
+}
+
 #[async_trait]
 pub trait WakeRegistrar: Send + Sync {
     async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String>;
@@ -187,6 +193,7 @@ pub trait WakeRegistrar: Send + Sync {
         conversation_id: &str,
         old_scope: &WorkScopeIdentity,
         new_scope: &WorkScopeIdentity,
+        resources: WakeScopeRekeyResources,
     ) -> Result<u64, String>;
 }
 
@@ -1702,6 +1709,7 @@ mod wake_registrar_seam_tests {
             _conversation_id: &str,
             _old_scope: &WorkScopeIdentity,
             _new_scope: &WorkScopeIdentity,
+            _resources: crate::WakeScopeRekeyResources,
         ) -> Result<u64, String> {
             self.calls.lock().await.push("rekey".to_string());
             Ok(0)

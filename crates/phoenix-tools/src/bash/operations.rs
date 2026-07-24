@@ -2030,6 +2030,7 @@ mod tests {
             _conversation_id: &str,
             _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
             _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+            _resources: crate::WakeScopeRekeyResources,
         ) -> Result<u64, String> {
             Ok(0)
         }

@@ -121,10 +121,17 @@ impl WakeRegistrar for ProductionWakeRegistrar {
         conversation_id: &str,
         old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
         new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
+        resources: crate::tools::WakeScopeRekeyResources,
     ) -> Result<u64, String> {
         let moved = self
             .repo
-            .rekey_active_work_scope(conversation_id, old_scope, new_scope)
+            .rekey_active_work_scope(
+                conversation_id,
+                old_scope,
+                new_scope,
+                resources.bash,
+                resources.tmux_window,
+            )
             .await
             .map_err(|error| error.to_string())?;
         if moved > 0 {

@@ -286,6 +286,7 @@ mod tests {
             _conversation_id: &str,
             _old_scope: &WorkScopeIdentity,
             _new_scope: &WorkScopeIdentity,
+            _resources: crate::WakeScopeRekeyResources,
         ) -> Result<u64, String> {
             Ok(0)
         }
