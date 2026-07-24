@@ -34,6 +34,13 @@ fn resolve_endpoint(base_url_override: Option<&str>) -> String {
     )
 }
 
+fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
+    base_url_override.map_or_else(
+        || "https://api.openai.com/v1/chat/completions".to_string(),
+        std::string::ToString::to_string,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Responses API
 // ---------------------------------------------------------------------------
@@ -2238,6 +2245,849 @@ pub(crate) struct ResponsesApiUsage {
     pub(crate) input_tokens_details: ResponsesApiInputTokensDetails,
 }
 
+// ===========================================================================
+// Chat Completions API
+// ===========================================================================
+
+/// Complete using the `OpenAI` Chat Completions API (non-streaming).
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_chat(
+    spec: &ModelSpec,
+    api_key: &str,
+    base_url_override: Option<&str>,
+    custom_headers: &[(String, String)],
+    request_tags: &BTreeMap<String, String>,
+    request: &LlmRequest,
+) -> Result<LlmResponse, LlmError> {
+    let url = resolve_chat_endpoint(base_url_override);
+    let mut chat_request = translate_to_chat_request(&spec.api_name, request);
+    if !request_tags.is_empty() {
+        chat_request.tags = Some(request_tags.clone());
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_mins(5))
+        .build()
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
+
+    let mut builder = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json");
+    builder = apply_source_header(builder, custom_headers);
+    let response = builder.json(&chat_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
+
+    if !status.is_success() {
+        return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
+    }
+
+    let chat_response: ChatCompletionsResponse = serde_json::from_str(&body).map_err(|e| {
+        LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
+    })?;
+
+    normalize_chat_response(chat_response, &spec.api_name)
+}
+
+/// Complete using the `OpenAI` Chat Completions API (streaming).
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_streaming_chat(
+    spec: &ModelSpec,
+    api_key: &str,
+    base_url_override: Option<&str>,
+    custom_headers: &[(String, String)],
+    request_tags: &BTreeMap<String, String>,
+    request: &LlmRequest,
+    chunk_tx: &tokio::sync::mpsc::Sender<super::TokenChunk>,
+) -> Result<LlmResponse, LlmError> {
+    use futures::StreamExt;
+
+    let url = resolve_chat_endpoint(base_url_override);
+    let mut chat_request = translate_to_chat_request(&spec.api_name, request);
+    chat_request.stream = Some(true);
+    chat_request.stream_options = Some(ChatStreamOptions {
+        include_usage: true,
+    });
+    if !request_tags.is_empty() {
+        chat_request.tags = Some(request_tags.clone());
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_mins(10))
+        .build()
+        .map_err(|e| LlmError::network(format!("Failed to create HTTP client: {e}")))?;
+
+    let mut builder = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream");
+    builder = apply_source_header(builder, custom_headers);
+    let dispatch_at = Instant::now();
+    let response = builder.json(&chat_request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            LlmError::network(format!("Request timeout: {e}"))
+        } else if e.is_connect() {
+            LlmError::network(format!("Connection failed: {e}"))
+        } else {
+            LlmError::network(format!("Request failed: {e}"))
+        }
+    })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
+        return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
+    }
+
+    let mut acc = ChatStreamAccumulator::new(dispatch_at, request);
+    let mut sse = super::sse::SseParser::new();
+    let mut stream = response.bytes_stream();
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
+        for event in sse.push(&chunk) {
+            if let Err(e) = acc.process_event(&event.data, chunk_tx).await {
+                tracing::error!(
+                    data_len = event.data.len(),
+                    "chat SSE event processing failed; dumping parser diagnostics"
+                );
+                tracing::error!(diagnostics = ?sse.diagnostics(), "chat SSE parser diagnostics");
+                return Err(e);
+            }
+            if acc.done {
+                break 'outer;
+            }
+        }
+    }
+
+    for event in sse.finish() {
+        acc.process_event(&event.data, chunk_tx).await?;
+    }
+
+    acc.into_response()
+}
+
+/// Translate `LlmRequest` to `ChatCompletionsRequest`.
+#[allow(clippy::too_many_lines)] // single-pass message translation
+fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatCompletionsRequest {
+    use super::types::ImageSource;
+
+    let mut messages = Vec::new();
+
+    if !request.system.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(ChatContent::Text(
+                request
+                    .system
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+
+    for msg in &request.messages {
+        let role = match msg.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        let mut text_blocks: Vec<&str> = Vec::new();
+        let mut ordered_parts: Vec<ChatContentPart> = Vec::new();
+        let mut has_image = false;
+        let mut tool_calls: Vec<ChatToolCall> = Vec::new();
+        let mut tool_results: Vec<&super::types::ContentBlock> = Vec::new();
+
+        for block in &msg.content {
+            match block {
+                super::types::ContentBlock::Text { text } => {
+                    text_blocks.push(text);
+                    ordered_parts.push(ChatContentPart::Text { text: text.clone() });
+                }
+                super::types::ContentBlock::Image { source } => {
+                    let ImageSource::Base64 { media_type, data } = source;
+                    has_image = true;
+                    ordered_parts.push(ChatContentPart::ImageUrl {
+                        image_url: ChatImageUrl {
+                            url: format!("data:{media_type};base64,{data}"),
+                        },
+                    });
+                }
+                super::types::ContentBlock::ToolUse { id, name, input } => {
+                    tool_calls.push(ChatToolCall {
+                        id: id.clone(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: name.clone(),
+                            arguments: serde_json::to_string(input)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        },
+                    });
+                }
+                super::types::ContentBlock::ToolResult { .. } => tool_results.push(block),
+                super::types::ContentBlock::ServerToolUse { id, .. }
+                | super::types::ContentBlock::McpToolUse { id, .. } => {
+                    tracing::debug!(
+                        block_type = block.type_tag(),
+                        block_id = %id,
+                        role,
+                        "dropping Anthropic server block in chat completions translation \
+                         — no Chat Completions wire equivalent"
+                    );
+                }
+                super::types::ContentBlock::ToolSearchToolResult { tool_use_id, .. }
+                | super::types::ContentBlock::WebSearchToolResult { tool_use_id, .. }
+                | super::types::ContentBlock::WebFetchToolResult { tool_use_id, .. }
+                | super::types::ContentBlock::CodeExecutionToolResult { tool_use_id, .. }
+                | super::types::ContentBlock::BashCodeExecutionToolResult { tool_use_id, .. }
+                | super::types::ContentBlock::TextEditorCodeExecutionToolResult {
+                    tool_use_id,
+                    ..
+                }
+                | super::types::ContentBlock::McpToolResult { tool_use_id, .. } => {
+                    tracing::debug!(
+                        block_type = block.type_tag(),
+                        tool_use_id = %tool_use_id,
+                        role,
+                        "dropping Anthropic server block in chat completions translation \
+                         — no Chat Completions wire equivalent"
+                    );
+                }
+            }
+        }
+
+        if !text_blocks.is_empty() || has_image || !tool_calls.is_empty() {
+            let content = if !has_image && !text_blocks.is_empty() {
+                Some(ChatContent::Text(text_blocks.join("\n")))
+            } else if has_image {
+                Some(ChatContent::Parts(ordered_parts))
+            } else {
+                None
+            };
+
+            messages.push(ChatMessage {
+                role: role.to_string(),
+                content,
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+                tool_call_id: None,
+            });
+        }
+
+        for block in tool_results {
+            if let super::types::ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                images,
+                is_error,
+            } = block
+            {
+                if !images.is_empty() {
+                    tracing::debug!(
+                        n = images.len(),
+                        "dropping images from chat completions tool result \
+                         — unsupported by this wire format"
+                    );
+                }
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(ChatContent::Text(if *is_error {
+                        format!("Error: {content}")
+                    } else {
+                        content.clone()
+                    })),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+            }
+        }
+    }
+
+    let tools = if request.tools.is_empty() {
+        None
+    } else {
+        Some(
+            request
+                .tools
+                .iter()
+                .map(|tool| ChatTool {
+                    r#type: "function".to_string(),
+                    function: ChatFunction {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.input_schema.clone(),
+                    },
+                })
+                .collect(),
+        )
+    };
+
+    let has_tools = !request.tools.is_empty();
+    ChatCompletionsRequest {
+        model: api_name.to_string(),
+        messages,
+        tools,
+        max_tokens: request.max_tokens,
+        stream: None,
+        stream_options: None,
+        tool_choice: if has_tools {
+            Some("auto".to_string())
+        } else {
+            None
+        },
+        parallel_tool_calls: if has_tools { Some(true) } else { None },
+        tags: None,
+    }
+}
+
+fn is_chat_reasoning_marker_content(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '<')
+}
+
+fn log_dropped_reasoning_content(model: &str, text: &str) {
+    if !text.is_empty() {
+        tracing::debug!(
+            model,
+            bytes = text.len(),
+            "dropping chat completions reasoning_content — reasoning display is unsupported"
+        );
+    }
+}
+
+fn normalize_chat_response(
+    resp: ChatCompletionsResponse,
+    model: &str,
+) -> Result<LlmResponse, LlmError> {
+    let Some(choice) = resp.choices.into_iter().next() else {
+        return Err(LlmError::invalid_response(
+            "Chat completions returned no choices",
+        ));
+    };
+    match choice.finish_reason.as_deref() {
+        Some("length") => {
+            log_chat_completion_length(
+                model,
+                resp.usage.as_ref().and_then(ChatUsage::reasoning_tokens),
+            );
+            return Err(LlmError::invalid_response(
+                "Chat completions hit the output token limit before finishing. \
+                 Try again with a larger max_tokens value or a model with a higher output budget."
+                    .to_string(),
+            ));
+        }
+        Some("content_filter") => {
+            return Err(LlmError::new(
+                super::LlmErrorKind::ContentFilter,
+                "Chat completions response was blocked by the provider content filter",
+            ));
+        }
+        _ => {}
+    }
+    chat_message_to_response(choice.message, resp.usage, model)
+}
+
+fn log_chat_completion_length(model: &str, reasoning_tokens: Option<u32>) {
+    if let Some(tokens) = reasoning_tokens {
+        tracing::warn!(
+            model,
+            reasoning_tokens = tokens,
+            "chat completions hit output limit"
+        );
+        tracing::debug!(
+            model,
+            reasoning_tokens = tokens,
+            "chat completions usage included reasoning_tokens at length"
+        );
+    } else {
+        tracing::warn!(model, "chat completions hit output limit");
+    }
+}
+
+fn chat_message_to_response(
+    message: ChatResponseMessage,
+    usage: Option<ChatUsage>,
+    model: &str,
+) -> Result<LlmResponse, LlmError> {
+    let mut content = Vec::new();
+    if let Some(reasoning) = message.reasoning_content {
+        log_dropped_reasoning_content(model, &reasoning);
+    }
+    if let Some(text) = message.content {
+        if !text.is_empty() && !is_chat_reasoning_marker_content(&text) {
+            content.push(ContentBlock::Text { text });
+        } else if is_chat_reasoning_marker_content(&text) {
+            tracing::debug!(
+                model,
+                bytes = text.len(),
+                "dropping chat completions marker content"
+            );
+        }
+    }
+    for call in message.tool_calls.unwrap_or_default() {
+        let input = serde_json::from_str(&call.function.arguments).unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                arguments = %call.function.arguments,
+                "failed to parse chat tool call arguments"
+            );
+            serde_json::Value::Object(serde_json::Map::new())
+        });
+        content.push(ContentBlock::ToolUse {
+            id: call.id,
+            name: call.function.name,
+            input,
+        });
+    }
+    if content.is_empty() {
+        return Err(LlmError::invalid_response(
+            "Chat completions returned empty response",
+        ));
+    }
+    let has_tool_calls = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    let usage = usage.unwrap_or_default();
+    let cached = u64::from(usage.prompt_tokens_details.cached_tokens);
+    Ok(LlmResponse::non_streaming(
+        content,
+        !has_tool_calls,
+        Usage {
+            input_tokens: u64::from(usage.prompt_tokens).saturating_sub(cached),
+            output_tokens: u64::from(usage.completion_tokens),
+            cache_creation_tokens: 0,
+            cache_read_tokens: cached,
+        },
+    ))
+}
+
+struct ChatStreamAccumulator {
+    content: String,
+    tool_calls: Vec<ChatToolCallBuilder>,
+    usage: Option<ChatUsage>,
+    done: bool,
+    terminal_finish_seen: bool,
+    telemetry: StreamTelemetryRecorder,
+}
+
+fn chat_stream_error_code_as_string(code: Option<&serde_json::Value>) -> String {
+    match code {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
+}
+
+fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmError {
+    if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(body) {
+        let message = error_resp.error.message;
+        let code = error_resp.error.code.as_deref().unwrap_or("");
+        return match status_code {
+            401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
+            429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
+            400..=499 => classify_responses_error(code, &message),
+            500..=599 => LlmError::server_error(format!("Server error: {message}")),
+            _ => LlmError::server_error(format!("Unexpected HTTP {status_display}: {message}")),
+        };
+    }
+    LlmError::from_http_status(status_code, body)
+}
+
+impl ChatStreamAccumulator {
+    fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
+        Self {
+            content: String::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+            done: false,
+            terminal_finish_seen: false,
+            telemetry: StreamTelemetryRecorder::new(
+                dispatch_at,
+                request
+                    .telemetry
+                    .as_ref()
+                    .map(|telemetry| telemetry.attempt_capture.clone()),
+            ),
+        }
+    }
+
+    async fn process_event(
+        &mut self,
+        data: &str,
+        chunk_tx: &tokio::sync::mpsc::Sender<super::TokenChunk>,
+    ) -> Result<(), LlmError> {
+        if data == "[DONE]" {
+            self.done = true;
+            return Ok(());
+        }
+        let now = Instant::now();
+        self.telemetry.record_provider_event_at(now);
+        let event: ChatStreamChunk = serde_json::from_str(data).map_err(|e| {
+            LlmError::invalid_response(format!("Failed to parse chat SSE data: {e}"))
+        })?;
+        if let Some(err) = event.error {
+            let msg = err
+                .message
+                .unwrap_or_else(|| "gateway returned error chunk".to_string());
+            let code = chat_stream_error_code_as_string(err.code.as_ref());
+            return Err(classify_responses_error(&code, &msg));
+        }
+        self.usage = event.usage.or(self.usage.take());
+        let reasoning_tokens = self.usage.as_ref().and_then(ChatUsage::reasoning_tokens);
+        for choice in event.choices {
+            if let Some(reasoning) = choice.delta.reasoning_content {
+                log_dropped_reasoning_content("<streaming-chat-completions>", &reasoning);
+                if !reasoning.is_empty() {
+                    self.telemetry
+                        .record_generation_event_at(now, GenerationKind::Reasoning);
+                }
+            }
+            if let Some(reason) = choice.finish_reason.as_deref() {
+                self.terminal_finish_seen = true;
+                match reason {
+                    "length" => {
+                        log_chat_completion_length(
+                            "<streaming-chat-completions>",
+                            reasoning_tokens,
+                        );
+                        return Err(LlmError::invalid_response(
+                            "Chat completions hit the output token limit before finishing. \
+                             Try again with a larger max_tokens value or a model with a higher output budget."
+                                .to_string(),
+                        ));
+                    }
+                    "content_filter" => {
+                        return Err(LlmError::new(
+                            super::LlmErrorKind::ContentFilter,
+                            "Chat completions response was blocked by the provider content filter",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(delta) = choice.delta.content {
+                if !delta.is_empty() && !is_chat_reasoning_marker_content(&delta) {
+                    self.content.push_str(&delta);
+                    self.telemetry
+                        .record_generation_event_at(now, GenerationKind::Text);
+                    self.telemetry.record_visible_text_at(now);
+                    let _ = chunk_tx.send(super::TokenChunk::Text(delta)).await;
+                } else if is_chat_reasoning_marker_content(&delta) {
+                    tracing::debug!(
+                        bytes = delta.len(),
+                        "dropping chat completions marker content"
+                    );
+                }
+            }
+            for tool_delta in choice.delta.tool_calls.unwrap_or_default() {
+                self.telemetry
+                    .record_generation_event_at(now, GenerationKind::Tool);
+                let index = tool_delta.index.unwrap_or(self.tool_calls.len());
+                while self.tool_calls.len() <= index {
+                    self.tool_calls.push(ChatToolCallBuilder::default());
+                }
+                let builder = &mut self.tool_calls[index];
+                if let Some(id) = tool_delta.id {
+                    builder.id = id;
+                }
+                if let Some(function) = tool_delta.function {
+                    if let Some(name) = function.name {
+                        builder.name = name;
+                    }
+                    if let Some(arguments) = function.arguments {
+                        builder.arguments.push_str(&arguments);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_response(self) -> Result<LlmResponse, LlmError> {
+        if !self.done && !self.terminal_finish_seen {
+            return Err(LlmError::invalid_response(
+                "Chat completions stream ended before a terminal finish_reason or [DONE] sentinel",
+            ));
+        }
+        if self.content.is_empty() && self.tool_calls.is_empty() {
+            tracing::warn!(
+                done = self.done,
+                "chat stream produced no content and no tool_calls"
+            );
+        }
+        let telemetry = self.telemetry;
+        let message = ChatResponseMessage {
+            reasoning_content: None,
+            content: if self.content.is_empty() {
+                None
+            } else {
+                Some(self.content)
+            },
+            tool_calls: if self.tool_calls.is_empty() {
+                None
+            } else {
+                Some(
+                    self.tool_calls
+                        .into_iter()
+                        .map(ChatToolCallBuilder::build)
+                        .collect(),
+                )
+            },
+        };
+        let mut response =
+            chat_message_to_response(message, self.usage, "<streaming-chat-completions>")?;
+        telemetry.attach_success(&mut response);
+        Ok(response)
+    }
+}
+
+#[derive(Default)]
+struct ChatToolCallBuilder {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ChatToolCallBuilder {
+    fn build(self) -> ChatToolCall {
+        ChatToolCall {
+            id: self.id,
+            r#type: "function".to_string(),
+            function: ChatFunctionCall {
+                name: self.name,
+                arguments: self.arguments,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat Completions wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionsRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ChatTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<ChatContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ChatImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct ChatImageUrl {
+    url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatToolCall {
+    id: String,
+    r#type: String,
+    function: ChatFunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatTool {
+    r#type: String,
+    function: ChatFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsResponse {
+    choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: ChatResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponseMessage {
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+/// Chat Completions streaming chunk.
+///
+/// Some gateways emit inline error data events instead of failing the HTTP
+/// request — e.g. `{"error": {"message": "...", "code": 400}}`. The `error`
+/// field captures these so the caller can surface the gateway's message and
+/// code rather than reporting an empty-stream error.
+#[derive(Debug, Deserialize)]
+struct ChatStreamChunk {
+    #[serde(default)]
+    choices: Vec<ChatStreamChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+    #[serde(default)]
+    error: Option<ChatStreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatStreamError {
+    #[serde(default)]
+    message: Option<String>,
+    /// Code may be an integer or a string depending on the gateway.
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatStreamChoice {
+    delta: ChatDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatDelta {
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ChatFunctionCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// `usage.prompt_tokens_details` on the Chat Completions wire. Baseten and
+/// OpenAI-compatible gateways may report prompt cache hits here; omitted details
+/// mean no cache-read accounting is available for this response.
+#[derive(Debug, Default, Deserialize)]
+struct ChatPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    /// Chat Completions `prompt_tokens` includes `cached_tokens`, so normalization
+    /// splits cached reads out before storing Phoenix's uncached input bucket.
+    #[serde(default)]
+    prompt_tokens_details: ChatPromptTokensDetails,
+    #[serde(default)]
+    completion_tokens_details: ChatCompletionTokensDetails,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+impl ChatUsage {
+    fn reasoning_tokens(&self) -> Option<u32> {
+        self.completion_tokens_details.reasoning_tokens
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2412,8 +3262,10 @@ mod tests {
             id: "gpt-5.6".into(),
             api_name: "gpt-5.6".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
             description: String::new(),
             context_window: 100_000,
+            max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -3959,6 +4811,107 @@ mod tests {
             1,
             "fallback must not duplicate items already captured via item.done"
         );
+    }
+
+    #[test]
+    fn chat_streaming_request_requests_usage_chunk() {
+        let request = empty_request();
+        let mut wire = translate_to_chat_request("compatible-chat-model", &request);
+        wire.stream = Some(true);
+        wire.stream_options = Some(ChatStreamOptions {
+            include_usage: true,
+        });
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn chat_normalization_preserves_tool_id_and_cached_usage() {
+        let response = ChatCompletionsResponse {
+            choices: vec![ChatChoice {
+                message: ChatResponseMessage {
+                    reasoning_content: Some("private reasoning".to_string()),
+                    content: None,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: "call-7".to_string(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: r#"{"path":"README.md"}"#.to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: Some(ChatUsage {
+                prompt_tokens: 1_000,
+                completion_tokens: 50,
+                prompt_tokens_details: ChatPromptTokensDetails { cached_tokens: 800 },
+                completion_tokens_details: ChatCompletionTokensDetails::default(),
+            }),
+        };
+        let normalized = normalize_chat_response(response, "compatible-chat-model").unwrap();
+        assert!(!normalized.end_turn);
+        assert_eq!(normalized.usage.input_tokens, 200);
+        assert_eq!(normalized.usage.cache_read_tokens, 800);
+        assert!(matches!(
+            &normalized.content[0],
+            ContentBlock::ToolUse { id, name, input }
+                if id == "call-7" && name == "read_file" && input["path"] == "README.md"
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_surfaces_inline_errors_and_requires_terminal_event() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut error_acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        let error = error_acc
+            .process_event(
+                r#"{"error":{"message":"context length exceeded","code":"context_length_exceeded"}}"#,
+                &tx,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::ContextWindowExceeded);
+
+        let mut incomplete = ChatStreamAccumulator::new(Instant::now(), &request);
+        incomplete
+            .process_event(r#"{"choices":[{"delta":{"content":"partial"}}]}"#, &tx)
+            .await
+            .unwrap();
+        let error = incomplete.into_response().unwrap_err();
+        assert_eq!(error.kind, crate::LlmErrorKind::InvalidResponse);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_accumulates_tool_fragments_usage_and_telemetry() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-9","function":{"name":"bash","arguments":""}}]}}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.input_tokens, 10);
+        assert_eq!(response.usage.output_tokens, 2);
+        assert_eq!(response.stream_telemetry.generation_event_count, 2);
+        assert!(response.stream_telemetry.completed);
+        assert!(matches!(
+            &response.content[0],
+            ContentBlock::ToolUse { id, name, input }
+                if id == "call-9" && name == "bash" && input["cmd"] == "pwd"
+        ));
     }
 }
 

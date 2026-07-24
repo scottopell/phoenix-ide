@@ -1,0 +1,340 @@
+-- allium: 3
+-- chat-completions.allium
+--
+-- OpenAI-compatible Chat Completions wire contract.
+--
+-- Scope: Translation of llm/LlmRequest into Chat Completions messages,
+--        normalization of non-streaming and streaming responses into
+--        llm/LlmResponse, and classification of Chat stream failures.
+--
+-- Includes: Exact endpoint selection; message/tool/image translation;
+--           tool-call ID preservation; capability-gap logging; cached-token
+--           accounting; private-reasoning omission; finish-reason handling;
+--           streaming usage requests, tool-fragment assembly, and terminality.
+--
+-- Excludes: Shared request/response vocabulary and error taxonomy (llm.allium);
+--           Anthropic Messages (anthropic.allium); OpenAI Responses
+--           (responses.allium); model discovery and picker presentation.
+--
+-- Normative companions: requirements.md REQ-LLM-001, 002, 004, 005, 006, 007, 008, 009.
+
+use "./llm.allium" as llm
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ChatStreamStatus { accumulating | done | failed }
+enum ChatFinishReason { stop | tool_calls | length | content_filter | other }
+enum ChatMessageRole { system | user | assistant | tool }
+enum ChatContentKind { text | image_url }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value ChatUsage {
+    prompt_tokens: Integer
+    completion_tokens: Integer
+    cached_prompt_tokens: Integer
+}
+
+value ChatToolCall {
+    id: String
+    name: String
+    arguments: String
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity ChatEndpoint {
+    exact_url: String
+}
+
+entity ChatWireMessage {
+    role: ChatMessageRole
+    content_kinds: List<ChatContentKind>
+    tool_call_id: String?
+    tool_calls: List<ChatToolCall>
+}
+
+entity ChatRequest {
+    model: String
+    messages: List<ChatWireMessage>
+    stream: Boolean
+    include_usage: Boolean
+    tool_count: Integer
+}
+
+entity ChatResponse {
+    finish_reason: ChatFinishReason
+    final_text: String?
+    private_reasoning: String?
+    tool_calls: List<ChatToolCall>
+    usage: ChatUsage?
+}
+
+entity ChatStream {
+    status: ChatStreamStatus
+    terminal_observed: Boolean
+    text: String
+    tool_calls: List<ChatToolCall>
+    usage: ChatUsage?
+    provider_event_count: Integer
+    generation_event_count: Integer
+
+    transitions status {
+        accumulating -> done
+        accumulating -> failed
+        terminal: done, failed
+    }
+}
+
+entity ChatDroppedProviderBlock {
+    block_kind: llm/ContentKind
+    logged: Boolean
+}
+
+------------------------------------------------------------
+-- Rules — endpoint and request translation
+------------------------------------------------------------
+
+rule ChatEndpointResolved {
+    when: ResolveChatEndpoint(configured_url?)
+
+    ensures:
+        if configured_url != null:
+            ChatEndpoint.created(exact_url: configured_url)
+        else:
+            ChatEndpoint.created(exact_url: "https://api.openai.com/v1/chat/completions")
+}
+
+rule ChatRequestTranslated {
+    when: TranslateChatRequest(request)
+
+    ensures: ChatRequest.created(
+        model: wire_model_name(request),
+        messages: translate_chat_messages(request),
+        stream: false,
+        include_usage: false,
+        tool_count: request.tool_count
+    )
+
+    @guidance
+        -- System content becomes one system message. User/assistant text and
+        -- images preserve source order. ToolUse becomes assistant tool_calls;
+        -- ToolResult becomes a tool-role message carrying the exact model-issued
+        -- tool_call_id. Tool definitions use function-tool wire shape.
+}
+
+rule ChatStreamingRequested {
+    when: TranslateStreamingChatRequest(request)
+
+    ensures: ChatRequest.created(
+        model: wire_model_name(request),
+        messages: translate_chat_messages(request),
+        stream: true,
+        include_usage: true,
+        tool_count: request.tool_count
+    )
+}
+
+rule UnsupportedProviderBlockLoggedAndDropped {
+    when: TranslateChatContent(block)
+
+    requires: block.kind not in { text, image, tool_use, tool_result }
+
+    ensures: ChatDroppedProviderBlock.created(
+        block_kind: block.kind,
+        logged: true
+    )
+}
+
+rule ToolResultImagesLoggedAndDropped {
+    when: TranslateChatContent(block)
+
+    requires: block.kind = tool_result
+    requires: block.tool_result_images.count > 0
+
+    ensures: ChatDroppedProviderBlock.created(
+        block_kind: tool_result,
+        logged: true
+    )
+}
+
+------------------------------------------------------------
+-- Rules — response normalization
+------------------------------------------------------------
+
+rule ChatTextNormalized {
+    when: NormalizeChatResponse(response)
+
+    requires: response.finish_reason in { stop, other }
+    requires: response.final_text != null
+
+    ensures: llm/LlmResponse.created(
+        end_turn: true,
+        usage: normalize_chat_usage(response.usage)
+    )
+}
+
+rule ChatToolCallsNormalized {
+    when: NormalizeChatResponse(response)
+
+    requires: response.finish_reason = tool_calls
+    requires: response.tool_calls.count > 0
+
+    ensures: llm/LlmResponse.created(
+        end_turn: false,
+        usage: normalize_chat_usage(response.usage)
+    )
+    ensures: normalized_tool_ids(response) = wire_tool_ids(response)
+}
+
+rule PrivateReasoningOmitted {
+    when: NormalizeChatResponse(response)
+
+    requires: response.private_reasoning != null
+
+    ensures: PrivateReasoningDropped(bytes: length(response.private_reasoning))
+    ensures: normalized_visible_text(response) = response.final_text
+}
+
+rule ChatLengthFinishRejected {
+    when: NormalizeChatResponse(response)
+
+    requires: response.finish_reason = length
+
+    ensures: llm/LlmError.created(
+        kind: invalid_response,
+        message: "Chat completion ended at its output token limit",
+        recovery_in_progress: false,
+        has_quota: false
+    )
+}
+
+rule ChatContentFilterRejected {
+    when: NormalizeChatResponse(response)
+
+    requires: response.finish_reason = content_filter
+
+    ensures: llm/LlmError.created(
+        kind: content_filter,
+        message: "Chat completion was blocked by the provider content filter",
+        recovery_in_progress: false,
+        has_quota: false
+    )
+}
+
+------------------------------------------------------------
+-- Rules — streaming accumulation
+------------------------------------------------------------
+
+rule ChatStreamEventObserved {
+    when: ChatStreamEventReceived(stream, generation_kind?)
+
+    requires: stream.status = accumulating
+
+    ensures: stream.provider_event_count = stream.provider_event_count + 1
+    ensures:
+        if generation_kind != null:
+            stream.generation_event_count = stream.generation_event_count + 1
+}
+
+rule ChatStreamCompleted {
+    when: ChatTerminalEventReceived(stream, finish_reason, usage?)
+
+    requires: stream.status = accumulating
+    requires: finish_reason in { stop, tool_calls, other }
+
+    ensures: stream.status = done
+    ensures: stream.terminal_observed = true
+    ensures: stream.usage = usage
+    ensures: llm/LlmResponse.created(
+        end_turn: stream.tool_calls.count = 0,
+        usage: normalize_chat_usage(stream.usage)
+    )
+}
+
+rule ChatInlineErrorRejected {
+    when: ChatInlineErrorReceived(stream, code, message)
+
+    requires: stream.status = accumulating
+
+    ensures: stream.status = failed
+    ensures: classify_chat_error(code, message)
+}
+
+rule ChatStreamWithoutTerminalRejected {
+    when: ChatTransportEnded(stream)
+
+    requires: stream.status = accumulating
+    requires: stream.terminal_observed = false
+
+    ensures: stream.status = failed
+    ensures: llm/LlmError.created(
+        kind: invalid_response,
+        message: "Chat completion stream ended without a terminal event",
+        recovery_in_progress: false,
+        has_quota: false
+    )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ChatCachedTokensAreSubsetOfPromptTokens {
+    for response in ChatResponses where response.usage != null:
+        response.usage.cached_prompt_tokens <= response.usage.prompt_tokens
+}
+
+invariant ChatToolResultReferencesModelIssuedCall {
+    for message in ChatWireMessages where message.role = tool:
+        message.tool_call_id != null
+}
+
+invariant ChatCompletedStreamsObservedTerminal {
+    for stream in ChatStreams where stream.status = done:
+        stream.terminal_observed = true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ChatCompletionsBoundary {
+    facing: PhoenixRuntime
+
+    context request: llm/LlmRequest
+    context endpoint: ChatEndpoint
+    context chat_request: ChatRequest
+    context message: ChatWireMessage
+    context response: ChatResponse
+    context stream: ChatStream
+    context dropped: ChatDroppedProviderBlock
+
+    exposes:
+        endpoint.exact_url
+        chat_request.model
+        chat_request.messages
+        chat_request.stream
+        chat_request.include_usage
+        message.content_kinds
+        stream.text
+        dropped.block_kind
+        dropped.logged
+
+    provides:
+        ResolveChatEndpoint(configured_url?)
+        TranslateChatRequest(request)
+        TranslateStreamingChatRequest(request)
+        TranslateChatContent(block)
+        NormalizeChatResponse(response)
+        ChatStreamEventReceived(stream, generation_kind?)
+        ChatTerminalEventReceived(stream, finish_reason, usage?)
+        ChatInlineErrorReceived(stream, code, message)
+        ChatTransportEnded(stream)
+}

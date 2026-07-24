@@ -17,7 +17,7 @@
 --
 -- Excludes: Provider wire formats — request translation, response
 --           normalization, the SSE streaming accumulators (see
---           anthropic.allium and responses.allium).
+--           anthropic.allium, responses.allium, and chat-completions.allium).
 --           Error *classification* — the mapping from an HTTP status or
 --           SSE payload to an LlmErrorKind. That is per-provider; this
 --           module only fixes the taxonomy the classifiers must target.
@@ -40,12 +40,13 @@
 --   specs/llm/design.md        — LlmService, LlmError, LlmErrorKind
 --   specs/llm/anthropic.allium — Anthropic Messages wire contract
 --   specs/llm/responses.allium — OpenAI Responses API wire contract
+--   specs/llm/chat-completions.allium — OpenAI-compatible Chat Completions wire contract
 --
 -- Cross-references:
---   crates/phoenix-ide/src/llm/types.rs — ContentBlock, LlmRequest,
---                                         LlmResponse, Usage, ImageSource
---   crates/phoenix-ide/src/llm/error.rs — LlmError, LlmErrorKind
---   crates/phoenix-ide/src/llm.rs       — TokenChunk, LlmService trait
+--   crates/phoenix-core/src/domain/llm_types.rs — ContentBlock, LlmRequest,
+--                                                  LlmResponse, Usage, ImageSource
+--   crates/phoenix-llm/src/error.rs             — LlmError, LlmErrorKind
+--   crates/phoenix-llm/src/lib.rs               — TokenChunk, LlmService trait
 
 ------------------------------------------------------------
 -- Enumerations
@@ -273,27 +274,4 @@ invariant UsageNonNegative {
         r.usage.cache_read_tokens >= 0
 }
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
--- Both resolved 2026-05-22. Kept as prose so the file stays parseable.
---
--- Q1. RESOLVED — accept as shipped behaviour. TokenChunk is text-only.
---     design.md describes a richer four-variant TokenChunk
---     (ToolUseStart / ToolUseInput / ToolUseDone) for streaming
---     tool-call construction to the UI, but the shipped enum in llm.rs
---     has only Text; tool arguments are accumulated provider-side and
---     never streamed. This spec models the shipped behaviour. If
---     streamed tool-call construction is built, this value type and the
---     per-provider streaming rules grow together.
---
--- Q2. RESOLVED — keep as-is. content_filter and context_window_exceeded
---     are in the taxonomy and reachable from the Responses classifier
---     (classify_responses_error) but the Anthropic provider never
---     produces them — its SSE error mapping has no branch for either, so
---     an Anthropic context-window overflow surfaces as the generic
---     invalid_request kind. Accepted: invalid_request and
---     context_window_exceeded remains non-auto-retryable and non-user-resumable.
---     behaviour is identical, and nothing currently consumes the finer
---     kinds (both are #[allow(dead_code)] in error.rs). Revisit if a
---     consumer needs the finer Anthropic classification.
+-- No open questions.

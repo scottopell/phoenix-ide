@@ -625,7 +625,9 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
 
     AnthropicRequest {
         model: spec.api_name.clone(),
-        max_tokens: request.max_tokens.unwrap_or(16_384),
+        max_tokens: request
+            .max_tokens
+            .unwrap_or(crate::DEFAULT_MAX_OUTPUT_TOKENS),
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
@@ -1149,8 +1151,10 @@ mod tests {
             id: "test-model".into(),
             api_name: "test-model-api".into(),
             backend: ModelBackend::Anthropic,
+            family: "Anthropic".into(),
             description: "test".into(),
             context_window: 200_000,
+            max_output_tokens: crate::models::DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search,
             source: crate::models::ModelSource::BuiltIn,

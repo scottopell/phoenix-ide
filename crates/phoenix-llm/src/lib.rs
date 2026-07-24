@@ -11,15 +11,16 @@
 //! Each model has a [`ModelBackend`] that couples the route/auth family with the
 //! wire protocol. `ModelBackend::Anthropic` uses Anthropic Messages-compatible
 //! requests. `ModelBackend::OpenAIResponses` uses `OpenAI` Responses-compatible
-//! requests. Externally configured models use the same backend values, so the
-//! config says what Phoenix should speak rather than who hosts the model.
+//! requests. `ModelBackend::OpenAIChatCompletions` uses OpenAI-compatible Chat
+//! Completions requests. Externally configured models use the same backend values,
+//! so config says what Phoenix should speak rather than who hosts the model.
 //!
 //! ## Authentication
 //!
 //! Direct Anthropic calls use `x-api-key`. Helper-issued credentials may choose
 //! an alternate header style for provider-compatible endpoints. `OpenAI`
-//! Responses calls use bearer auth. The ChatGPT/Codex bridge only applies to
-//! built-in `OpenAI` Responses models.
+//! Responses and Chat Completions calls use bearer auth. The ChatGPT/Codex bridge
+//! only applies to built-in `OpenAI` Responses models.
 //!
 //! ## Discovery
 //!
@@ -65,7 +66,7 @@ pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // accessed via the `rate_limit` submodule.
 pub use models::{
     all_models, merge_model_specs, parse_external_models, ModelBackend, ModelInfo, ModelSource,
-    ModelSpec,
+    ModelSpec, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
@@ -179,6 +180,11 @@ pub trait LlmService: Send + Sync {
 
     /// Get the model ID
     fn model_id(&self) -> &str;
+
+    /// Maximum output tokens requested for a normal conversation turn.
+    fn max_output_tokens(&self) -> u32 {
+        DEFAULT_MAX_OUTPUT_TOKENS
+    }
 
     /// True if this service routes through the ChatGPT-backend codex bridge.
     /// Consumed by [`crate::ModelSpec::context_window_for`] to apply the
@@ -494,6 +500,10 @@ impl LlmService for LoggingService {
 
     fn uses_codex_bridge(&self) -> bool {
         self.inner.uses_codex_bridge()
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        self.inner.max_output_tokens()
     }
 
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {

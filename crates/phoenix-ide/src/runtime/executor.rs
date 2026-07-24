@@ -4438,6 +4438,7 @@ where
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
         let llm_client = self.llm_client.clone();
+        let max_output_tokens = llm_client.max_output_tokens();
         let tool_executor = self.tool_executor.clone();
         let clearable_names = self.clearable_names.clone();
         let clear_watermark_cache = self.clear_watermark_cache.clone();
@@ -4620,7 +4621,7 @@ where
                 system,
                 messages,
                 tools,
-                max_tokens: Some(16_384),
+                max_tokens: Some(max_output_tokens),
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id.clone(),
