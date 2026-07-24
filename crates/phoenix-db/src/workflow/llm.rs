@@ -292,6 +292,7 @@ pub enum AcceptedTopLevelLlmProduct {
     PersistedCheckpoint {
         assistant: Box<phoenix_core::domain::db_schema::Message>,
         tool_results: Vec<phoenix_core::domain::db_schema::Message>,
+        fork_proposal: Option<Box<phoenix_core::domain::db_schema::ForkProposal>>,
     },
     StateCheckpoint {
         conversation_id: String,
@@ -304,6 +305,7 @@ pub struct AcceptTopLevelLlmProductInput {
     pub delivery_id: DeliveryId,
     pub receipt_id: ReceiptId,
     pub product: AcceptedTopLevelLlmProduct,
+    pub interrupted_tool_use_ids: Vec<String>,
     pub next_state: phoenix_core::domain::sm_state::ConvState,
     pub state_updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1146,6 +1148,12 @@ impl WorkflowRepository {
              WHERE a.status IN ('Begun', 'ObservationRecorded')
                AND a.process_incarnation <> ?1
                AND w.stopped_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM workflow_attempts newer
+                   WHERE newer.workflow_id = a.workflow_id
+                     AND newer.effect_id = a.effect_id
+                     AND newer.ordinal > a.ordinal
+               )
              ORDER BY w.workflow_id, a.attempt_id"
         )
         .bind(to_i64(
@@ -3082,6 +3090,13 @@ mod tests {
         assert_eq!(retry.prepared_request.call_ordinal, 0);
         assert_eq!(retry.authority.effect_id, EffectId(1));
         assert_eq!(retry.authority.attempt_id, AttemptId(2));
+        let recoverable = repo
+            .recover_top_level_llm_attempts(ProcessIncarnation(10))
+            .await
+            .unwrap();
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].attempt.authority.attempt_id, AttemptId(2));
+        assert!(recoverable[0].recorded_outcome_payload.is_none());
         assert!(repo
             .recover_top_level_llm_attempts(ProcessIncarnation(9))
             .await

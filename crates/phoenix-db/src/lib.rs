@@ -4711,10 +4711,14 @@ impl Database {
             AcceptedTopLevelLlmProduct::PersistedCheckpoint {
                 assistant,
                 tool_results,
+                fork_proposal,
             } => {
                 insert_message_tx(&mut tx, assistant).await?;
                 for message in tool_results {
                     insert_message_tx(&mut tx, message).await?;
+                }
+                if let Some(proposal) = fork_proposal {
+                    insert_fork_proposal_tx(&mut tx, proposal).await?;
                 }
                 sqlx::query(
                     "UPDATE top_level_llm_workflows
@@ -4756,6 +4760,17 @@ impl Database {
             )
             .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
             .bind(i64::try_from(input.receipt_id.0).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await?;
+        }
+        for tool_use_id in &input.interrupted_tool_use_ids {
+            sqlx::query(
+                "UPDATE top_level_llm_tool_intents SET status = 'Interrupted'
+                 WHERE workflow_id = ?1 AND receipt_id = ?2 AND tool_use_id = ?3",
+            )
+            .bind(i64::try_from(input.workflow_id.0).unwrap_or(i64::MAX))
+            .bind(i64::try_from(input.receipt_id.0).unwrap_or(i64::MAX))
+            .bind(tool_use_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -12436,6 +12451,7 @@ mod tests {
                 usage_data: None,
                 created_at: Utc::now(),
             })),
+            interrupted_tool_use_ids: vec!["tool-1".to_string()],
             next_state: next_state.clone(),
             state_updated_at: Utc::now(),
         };
@@ -12457,15 +12473,14 @@ mod tests {
             db.get_conversation("conv-direct").await.unwrap().state,
             next_state
         );
-        assert_eq!(
-            repo.load_owed_top_level_llm_tool_intent("conv-direct", "tool-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .2
-                .status,
-            ToolIntentStatus::Owed
-        );
+        let interrupted_status: String = sqlx::query_scalar(
+            "SELECT status FROM top_level_llm_tool_intents
+             WHERE workflow_id = 1 AND tool_use_id = 'tool-1'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(interrupted_status, "Interrupted");
         assert_eq!(
             db.accept_top_level_llm_product(&input).await.unwrap(),
             AcceptTopLevelLlmProductOutcome::ExactReplay
@@ -12544,7 +12559,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(status, "Owed");
+        assert_eq!(status, "Interrupted");
         let begun_status = sqlx::query_scalar::<_, String>(
             "SELECT status FROM top_level_llm_tool_intents
              WHERE workflow_id = ?1 AND receipt_id = ?2 AND intent_ordinal = 1",
@@ -12560,12 +12575,11 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        assert_eq!(
-            repo.load_conversations_with_owed_top_level_llm_tools()
-                .await
-                .unwrap(),
-            vec!["conv-direct".to_string()]
-        );
+        assert!(repo
+            .load_conversations_with_owed_top_level_llm_tools()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -12624,6 +12638,7 @@ mod tests {
             product: AcceptedTopLevelLlmProduct::StateCheckpoint {
                 conversation_id: "conv-direct".to_string(),
             },
+            interrupted_tool_use_ids: Vec::new(),
             next_state: ConvState::Error {
                 message: "terminal".to_string(),
                 error_kind: ErrorKind::InvalidResponse,
@@ -12715,6 +12730,7 @@ mod tests {
             product: AcceptedTopLevelLlmProduct::StateCheckpoint {
                 conversation_id: "conv-direct".to_string(),
             },
+            interrupted_tool_use_ids: Vec::new(),
             next_state: ConvState::ToolExecuting {
                 current_tool: tool,
                 remaining_tools: Vec::new(),

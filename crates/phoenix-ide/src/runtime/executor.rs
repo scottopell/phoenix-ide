@@ -3091,6 +3091,94 @@ where
                     phoenix_db::AcceptedTopLevelLlmProduct::PersistedCheckpoint {
                         assistant: Box::new(assistant),
                         tool_results: tool_messages,
+                        fork_proposal: None,
+                    },
+                    persisted,
+                    Some(reserved_broadcast_range),
+                )
+            }
+            Some(Effect::PersistForkProposal {
+                proposal_id,
+                task_file,
+                title,
+                priority,
+                body,
+                checkpoint:
+                    CheckpointData::ToolRound {
+                        assistant_message,
+                        tool_results,
+                    },
+            }) => {
+                if !matches!(effects.next(), Some(Effect::PersistState)) {
+                    return Err(
+                        "durable fork proposal did not pair product and state persistence"
+                            .to_string(),
+                    );
+                }
+                let (reserved_broadcast_range, reserved_seqs) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1 + tool_results.len());
+                let agent_content = MessageContent::agent(assistant_message.content);
+                let assistant = crate::db::Message {
+                    message_id: assistant_message.message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: reserved_seqs[0],
+                    message_type: agent_content.message_type(),
+                    content: agent_content,
+                    display_data: assistant_message.display_data,
+                    usage_data: assistant_message.usage,
+                    created_at: assistant_message.created_at,
+                };
+                let tool_messages = tool_results
+                    .iter()
+                    .zip(reserved_seqs.iter().skip(1))
+                    .map(|(result, sequence_id)| {
+                        let content = MessageContent::tool_with_images(
+                            &result.tool_use_id,
+                            result.output(),
+                            result.is_error(),
+                            result.images().to_vec(),
+                        );
+                        crate::db::Message {
+                            message_id: tool_result_message_id(&result.tool_use_id),
+                            conversation_id: self.context.conversation_id.clone(),
+                            sequence_id: *sequence_id,
+                            message_type: content.message_type(),
+                            content,
+                            display_data: merge_duration_into_display_data(
+                                result.display_data(),
+                                result.duration_ms,
+                            ),
+                            usage_data: None,
+                            created_at: Utc::now(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let normalized_task_file = normalize_task_file_repo_relative(
+                    &self.context.working_dir,
+                    &task_file,
+                    &proposal_id,
+                );
+                let proposal = crate::db::ForkProposal {
+                    id: proposal_id,
+                    origin_conversation_id: self.context.conversation_id.clone(),
+                    task_file: normalized_task_file,
+                    title,
+                    priority: priority.to_string(),
+                    body,
+                    status: crate::db::ForkProposalStatus::Pending,
+                    created_at: Utc::now(),
+                    resolved_at: None,
+                    fork_conversation_id: None,
+                    refinement_conversation_id: None,
+                };
+                let mut persisted = vec![assistant.clone()];
+                persisted.extend(tool_messages.iter().cloned());
+                (
+                    phoenix_db::AcceptedTopLevelLlmProduct::PersistedCheckpoint {
+                        assistant: Box::new(assistant),
+                        tool_results: tool_messages,
+                        fork_proposal: Some(Box::new(proposal)),
                     },
                     persisted,
                     Some(reserved_broadcast_range),
@@ -3123,6 +3211,12 @@ where
                 delivery_id: owed.delivery.delivery_id,
                 receipt_id: owed.receipt.receipt_id,
                 product,
+                interrupted_tool_use_ids: owed
+                    .tool_intents
+                    .iter()
+                    .filter(|intent| intent.status == phoenix_db::ToolIntentStatus::Interrupted)
+                    .map(|intent| intent.tool_use_id.clone())
+                    .collect(),
                 next_state: next_state.clone(),
                 state_updated_at,
             })
