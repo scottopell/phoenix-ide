@@ -1,4 +1,4 @@
-# ADR-022: The Coordinator surface is chat-only
+# ADR-021: The Coordinator surface is chat-only
 
 - **Status:** Accepted
 - **Date:** 2026-07-20

@@ -1,4 +1,4 @@
-# ADR-021: Projects accept taskmd files by default and plain markdown briefs through one task-source seam
+# ADR-023: Projects accept taskmd files by default and plain markdown briefs through one task-source seam
 
 - **Status:** Accepted
 - **Date:** 2025-08-08
