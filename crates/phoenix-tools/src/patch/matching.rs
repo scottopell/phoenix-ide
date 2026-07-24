@@ -104,7 +104,7 @@ fn anchor_not_found_diagnostics(content: &str, old_text: &str) -> AnchorNotFound
         };
     }
 
-    let content_lines: Vec<&str> = content.lines().collect();
+    let content_lines: Vec<&str> = content.split_inclusive('\n').collect();
     let anchor_lines: Vec<&str> = old_text
         .lines()
         .map(str::trim)
@@ -155,7 +155,11 @@ fn anchor_not_found_diagnostics(content: &str, old_text: &str) -> AnchorNotFound
         .filter_map(|window_start| {
             let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
             let score = ordered_anchor_coverage(&hit_by_content_line[window_start..window_end]);
-            (score >= 2 || (score == 1 && unique_hit_count == 1)).then_some((score, window_start))
+            let exact_output_is_bounded = content_lines[window_start..window_end]
+                .iter()
+                .all(|line| line.chars().count() <= MAX_SNIPPET_CHARS);
+            (exact_output_is_bounded && (score >= 2 || (score == 1 && unique_hit_count == 1)))
+                .then_some((score, window_start))
         })
         .collect();
     ranked.sort_by_key(|(score, window_start)| (std::cmp::Reverse(*score), *window_start));
@@ -182,7 +186,7 @@ fn anchor_not_found_diagnostics(content: &str, old_text: &str) -> AnchorNotFound
                 let window_end = (window_start + MAX_SNIPPET_LINES).min(content_lines.len());
                 AnchorCandidateLocation {
                     start_line: window_start + 1,
-                    snippet: bounded_candidate_snippet(&content_lines[window_start..window_end]),
+                    snippet: content_lines[window_start..window_end].concat(),
                 }
             })
             .collect(),
@@ -199,21 +203,6 @@ fn ordered_anchor_coverage(hits: &[Option<usize>]) -> usize {
         }
     }
     coverage
-}
-
-fn bounded_candidate_snippet(lines: &[&str]) -> String {
-    let mut output = String::new();
-    for (index, line) in lines.iter().take(MAX_SNIPPET_LINES).enumerate() {
-        if index > 0 {
-            output.push('\n');
-        }
-        let mut chars = line.chars();
-        output.extend(chars.by_ref().take(MAX_SNIPPET_CHARS));
-        if chars.next().is_some() {
-            output.push_str("...[line shortened]");
-        }
-    }
-    output
 }
 
 fn find_exact_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
@@ -620,7 +609,7 @@ mod tests {
         assert_eq!(diagnostics.candidates[0].start_line, 1);
         assert_eq!(
             diagnostics.candidates[0].snippet,
-            "before\nfn target() {\n    let current = 2;\n    finish();\n}"
+            "before\nfn target() {\n    let current = 2;\n    finish();\n}\n"
         );
     }
 
@@ -705,10 +694,22 @@ mod tests {
             panic!("expected not found");
         };
 
-        let candidate = &diagnostics.candidates[0];
-        assert!(candidate.snippet.contains("...[line shortened]"));
-        assert!(candidate.snippet.lines().count() <= MAX_SNIPPET_LINES);
-        assert!(candidate.snippet.is_char_boundary(candidate.snippet.len()));
+        assert!(diagnostics.candidates.is_empty());
+    }
+
+    #[test]
+    fn candidate_diagnostics_preserve_crlf_bytes() {
+        let content = "before\r\nunique_current_site();\r\nafter\r\n";
+        let old_text = "unique_current_site();\r\nstale_second_line();\r\n";
+
+        let MatchError::NotFound(diagnostics) = find_unique_match(content, old_text).unwrap_err()
+        else {
+            panic!("expected not found");
+        };
+
+        assert_eq!(diagnostics.candidates.len(), 1);
+        assert_eq!(diagnostics.candidates[0].snippet, content);
+        assert!(diagnostics.candidates[0].snippet.contains("\r\n"));
     }
 
     #[test]

@@ -7,7 +7,10 @@
 use super::matching::{find_all_exact, find_unique_match, MatchError};
 #[cfg(test)]
 use super::types::AnchorNotFoundDiagnostics;
-use super::types::{Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest, Reindent};
+use super::types::{
+    AnchorRetryRequirement, Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest,
+    Reindent,
+};
 use similar::TextDiff;
 use std::collections::HashMap;
 use std::path::Path;
@@ -149,6 +152,7 @@ impl PatchPlanner {
                 patch_number,
                 operation,
                 diagnostics,
+                retry_requirement: AnchorRetryRequirement::Unique,
             },
             MatchError::NotUnique(diagnostics) => PatchError::AnchorNotUnique {
                 patch_number,
@@ -164,6 +168,7 @@ impl PatchPlanner {
                 patch_number,
                 operation: Operation::Replace,
                 diagnostics,
+                retry_requirement: AnchorRetryRequirement::ReplaceAll,
             },
             _ => PatchError::ReplaceAllInexact,
         }
@@ -907,8 +912,34 @@ mod tests {
                 diagnostics: AnchorNotFoundDiagnostics {
                     candidates: Vec::new(),
                 },
+                retry_requirement: AnchorRetryRequirement::ReplaceAll,
             }
         );
+    }
+
+    #[test]
+    fn replace_all_not_found_guidance_does_not_require_uniqueness() {
+        let mut planner = PatchPlanner::new();
+        let error = planner
+            .plan(
+                &path("test.txt"),
+                Some("before\nunique_current_site();\nafter\n"),
+                &[PatchRequest {
+                    operation: Operation::Replace,
+                    old_text: Some("unique_current_site();\nstale_line();".to_string()),
+                    new_text: Some("new".to_string()),
+                    replace_all: true,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("keep replaceAll enabled"), "{error}");
+        assert!(error.contains("uniqueness is not required"), "{error}");
+        assert!(!error.contains("requires one unique match"), "{error}");
     }
 
     #[test]
@@ -949,11 +980,12 @@ mod tests {
                 diagnostics: AnchorNotFoundDiagnostics {
                     candidates: Vec::new(),
                 },
+                retry_requirement: AnchorRetryRequirement::Unique,
             }
         );
         assert_eq!(
             err.to_string(),
-            "Patch 2 (insert_after) failed: oldText not found in file. No reliable nearby current text was found. Re-read the file and retry this patch with current text."
+            "Patch 2 (insert_after) failed: oldText not found in file. No reliable nearby current text was found. Retry with exact current text as oldText. The replacement still requires one unique match."
         );
     }
 

@@ -117,10 +117,7 @@ pub struct AnchorNotFoundDiagnostics {
 impl std::fmt::Display for AnchorNotFoundDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.candidates.is_empty() {
-            return write!(
-                f,
-                "No reliable nearby current text was found. Re-read the file and retry this patch with current text."
-            );
+            return write!(f, "No reliable nearby current text was found.");
         }
 
         writeln!(
@@ -128,15 +125,38 @@ impl std::fmt::Display for AnchorNotFoundDiagnostics {
             "The anchor is stale, but these bounded current-file regions may contain the intended site:"
         )?;
         for candidate in &self.candidates {
-            writeln!(f, "- around line {}:", candidate.start_line)?;
-            for line in candidate.snippet.lines() {
-                writeln!(f, "  {line}")?;
+            writeln!(
+                f,
+                "- exact current text around line {}:",
+                candidate.start_line
+            )?;
+            f.write_str(&candidate.snippet)?;
+            if !candidate.snippet.ends_with(['\n', '\r']) {
+                writeln!(f)?;
             }
         }
-        write!(
-            f,
-            "Copy exact current text from a candidate into oldText and retry. Candidates are advisory; the replacement still requires one unique match."
-        )
+        write!(f, "Candidates are advisory and do not authorize an edit.")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorRetryRequirement {
+    Unique,
+    ReplaceAll,
+}
+
+impl std::fmt::Display for AnchorRetryRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unique => write!(
+                f,
+                "Retry with exact current text as oldText. The replacement still requires one unique match."
+            ),
+            Self::ReplaceAll => write!(
+                f,
+                "Retry with exact current text as oldText and keep replaceAll enabled. Every exact occurrence will be replaced; uniqueness is not required."
+            ),
+        }
     }
 }
 
@@ -196,11 +216,14 @@ pub enum PatchError {
     #[error("Clipboard '{0}' not found")]
     ClipboardNotFound(String),
 
-    #[error("Patch {patch_number} ({operation}) failed: oldText not found in file. {diagnostics}")]
+    #[error(
+        "Patch {patch_number} ({operation}) failed: oldText not found in file. {diagnostics} {retry_requirement}"
+    )]
     AnchorNotFound {
         patch_number: usize,
         operation: Operation,
         diagnostics: AnchorNotFoundDiagnostics,
+        retry_requirement: AnchorRetryRequirement,
     },
 
     #[error("Patch {patch_number} ({operation}) failed: {diagnostics}")]

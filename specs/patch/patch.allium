@@ -178,9 +178,12 @@ rule MatchNotFound {
         -- A candidate requires multiple globally unique surviving anchor lines in
         -- anchor order within the emitted five-line window, or one globally unique
         -- surviving line across the diagnostic search. Up to three deterministic,
-        -- non-overlapping line-numbered snippets are returned. Repeated lines do not
-        -- contribute confidence. If confidence or work bounds fail, candidates is
-        -- empty and the caller requests a read.
+        -- non-overlapping line-numbered snippets preserve exact current-file bytes,
+        -- including line endings; a line that exceeds the output bound causes that
+        -- candidate to be omitted rather than truncated. Repeated lines do not
+        -- contribute confidence. Retry guidance preserves the original request's
+        -- unique-match or replace-all semantics. If confidence or work bounds fail,
+        -- candidates is empty and the caller requests a read.
 }
 
 rule MatchNotUnique {
