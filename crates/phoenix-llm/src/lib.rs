@@ -517,6 +517,7 @@ mod logging_tests {
                 }],
                 end_turn: true,
                 usage: Usage::default(),
+                stream_telemetry: ProviderStreamTelemetry::non_streaming(),
             })
         }
 
@@ -572,10 +573,10 @@ mod logging_tests {
             cache_key: PromptCacheKey::ephemeral(),
         };
         for (provider, streaming_transport) in [
-            ("anthropic", "http_sse"),
-            ("openai", "websocket_or_http_sse"),
-            ("configured_endpoint", "http_sse"),
-            ("mock", "in_process"),
+            ("anthropic", LlmTransport::HttpSse),
+            ("openai", LlmTransport::Websocket),
+            ("configured_endpoint", LlmTransport::HttpSse),
+            ("mock", LlmTransport::InProcess),
         ] {
             let service =
                 LoggingService::new(Arc::new(ImmediateProbe), provider, streaming_transport);

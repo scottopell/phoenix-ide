@@ -82,8 +82,8 @@ CREATE TABLE IF NOT EXISTS message_images (
 -- grandchild collections (never an earned blob). skill_* is an all-or-nothing
 -- trio enforced by CHECK. `ordinal` is the FIFO position within a conversation.
 CREATE TABLE IF NOT EXISTS steering_messages (
+    message_id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    message_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
     text TEXT NOT NULL,
     llm_text TEXT,
@@ -91,7 +91,6 @@ CREATE TABLE IF NOT EXISTS steering_messages (
     skill_name TEXT,
     skill_body TEXT,
     skill_dir TEXT,
-    PRIMARY KEY (conversation_id, message_id),
     UNIQUE (conversation_id, ordinal),
     CHECK ((skill_name IS NULL) = (skill_body IS NULL)
        AND (skill_name IS NULL) = (skill_dir IS NULL))
@@ -101,27 +100,23 @@ CREATE INDEX IF NOT EXISTS idx_steering_messages_conversation
     ON steering_messages(conversation_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS steering_message_files (
-    conversation_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     file_ordinal INTEGER NOT NULL,
     original_name TEXT NOT NULL,
     media_type TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     stored_path TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, message_id, file_ordinal),
-    FOREIGN KEY (conversation_id, message_id)
-        REFERENCES steering_messages(conversation_id, message_id) ON DELETE CASCADE
+    PRIMARY KEY (message_id, file_ordinal),
+    FOREIGN KEY (message_id) REFERENCES steering_messages(message_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS steering_message_images (
-    conversation_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     image_ordinal INTEGER NOT NULL,
     media_type TEXT NOT NULL,
     data TEXT NOT NULL,
-    PRIMARY KEY (conversation_id, message_id, image_ordinal),
-    FOREIGN KEY (conversation_id, message_id)
-        REFERENCES steering_messages(conversation_id, message_id) ON DELETE CASCADE
+    PRIMARY KEY (message_id, image_ordinal),
+    FOREIGN KEY (message_id) REFERENCES steering_messages(message_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS conversation_creation_jobs (

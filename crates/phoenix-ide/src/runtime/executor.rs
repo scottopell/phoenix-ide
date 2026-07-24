@@ -5355,6 +5355,7 @@ where
                                         },
                                         provider_request_id: Some(request_id.clone()),
                                         tool_intents: tool_intents.clone(),
+                                        local_delivery_claim: Some(super::process_incarnation()),
                                     },
                                 )
                                 .await

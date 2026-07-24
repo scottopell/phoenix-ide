@@ -567,6 +567,7 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                     },
                     provider_request_id: Some(request_id),
                     tool_intents,
+                    local_delivery_claim: None,
                 };
                 let persistence_outcome = loop {
                     let outcome = repo

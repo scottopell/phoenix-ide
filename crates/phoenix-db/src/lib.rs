@@ -6054,6 +6054,29 @@ impl Database {
             insert_message_tx(&mut tx, msg).await?;
         }
 
+        for msg in tool_results {
+            let MessageContent::Tool(tool) = &msg.content else {
+                return Err(DbError::Serialization(
+                    "tool-round result row did not contain tool content".to_string(),
+                ));
+            };
+            sqlx::query(
+                "UPDATE top_level_llm_tool_intents
+                 SET status = 'Completed'
+                 WHERE tool_use_id = ?1 AND status = 'ExecutionMayHaveBegun'
+                   AND workflow_id IN (
+                       SELECT dta.workflow_id
+                       FROM direct_turn_acceptances dta
+                       JOIN top_level_llm_workflows w ON w.workflow_id = dta.workflow_id
+                       WHERE dta.conversation_id = ?2 AND w.stopped_at IS NULL
+                   )",
+            )
+            .bind(&tool.tool_use_id)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
         // `updated_at` so list-ordering stays current.
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
@@ -12337,6 +12360,7 @@ mod tests {
                         arguments_json: "{}".to_string(),
                     },
                 ],
+                local_delivery_claim: None,
             })
             .await
             .unwrap();
@@ -12521,6 +12545,7 @@ mod tests {
                 },
                 provider_request_id: None,
                 tool_intents: Vec::new(),
+                local_delivery_claim: None,
             })
             .await
             .unwrap();
@@ -12604,6 +12629,7 @@ mod tests {
                 },
                 provider_request_id: None,
                 tool_intents: Vec::new(),
+                local_delivery_claim: None,
             })
             .await
             .unwrap();

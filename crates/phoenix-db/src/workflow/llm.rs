@@ -10,6 +10,7 @@ use super::{
     SuppressionReason, Timestamp, TransitionId, Version, WorkflowId, WorkflowRepository,
     WorkflowSequenceName, WorkflowStatus, WorkflowTx,
 };
+use chrono::Utc;
 use phoenix_workflow::llm_profile;
 use phoenix_workflow::llm_profile::{
     CompleteLlmResponse, LlmEffectKey, PreparedLlmRequest, TopLevelLlmSnapshot, TopLevelTurnRef,
@@ -184,6 +185,7 @@ pub struct AcceptCompleteLlmResponseInput {
     pub response: CompleteLlmResponse,
     pub provider_request_id: Option<String>,
     pub tool_intents: Vec<ToolIntentRecord>,
+    pub local_delivery_claim: Option<ProcessIncarnation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1337,6 +1339,19 @@ impl WorkflowRepository {
                 .bind(&intent.arguments_json)
                 .execute(&mut *tx.tx)
                 .await?;
+        }
+        if let Some(process_incarnation) = input.local_delivery_claim {
+            sqlx::query(
+                "INSERT INTO workflow_delivery_claims (
+                     workflow_id, delivery_id, process_incarnation, claimed_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(delivery_id.0, "delivery_id")?)
+            .bind(to_i64(process_incarnation.0, "process_incarnation")?)
+            .bind(Utc::now().timestamp_millis())
+            .execute(&mut *tx.tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(AcceptCompleteLlmResponseResult {
@@ -3205,6 +3220,7 @@ mod tests {
             },
             provider_request_id: Some("provider-1".to_string()),
             tool_intents: vec![],
+            local_delivery_claim: None,
         };
 
         let mut writer = lock_pool.acquire().await.unwrap();
@@ -3241,6 +3257,80 @@ mod tests {
             CompleteLlmResponsePersistenceOutcome::ExactReplay
         );
         assert_eq!(repo.list_receipts(WorkflowId(1)).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_response_acceptance_claims_delivery_in_the_same_commit() {
+        let repo = open_repo().await;
+        repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::RuntimeAccepted,
+            conversation_id: "conv-1".to_string(),
+            client_message_id: "msg-1".to_string(),
+            prepared_fingerprint: "fp-1".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: snapshot(),
+        })
+        .await
+        .unwrap();
+        let prepared = repo
+            .prepare_and_begin_top_level_llm_attempt(&PrepareAndBeginTopLevelLlmInput {
+                workflow_id: WorkflowId(1),
+                committed_at: Timestamp(2),
+                process_incarnation: ProcessIncarnation(7),
+                prepared_request: PreparedLlmRequest {
+                    codec_version: 1,
+                    request_fingerprint: "request".to_string(),
+                    provider: "test".to_string(),
+                    model: "test".to_string(),
+                    backend: "test".to_string(),
+                    request_aggregate: "{}".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        let accepted = repo
+            .accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
+                authority: prepared.authority,
+                delivery_id: None,
+                receipt_id: None,
+                response: CompleteLlmResponse {
+                    codec_version: 1,
+                    response_fingerprint: "response".to_string(),
+                    response_aggregate: "{}".to_string(),
+                },
+                provider_request_id: Some("request-1".to_string()),
+                tool_intents: vec![],
+                local_delivery_claim: Some(ProcessIncarnation(7)),
+            })
+            .await
+            .unwrap();
+        let delivery = accepted.delivery.unwrap();
+        assert!(!repo
+            .claim_workflow_delivery(
+                WorkflowId(1),
+                delivery.delivery_id,
+                ProcessIncarnation(8),
+                Timestamp(3),
+            )
+            .await
+            .unwrap());
+        repo.release_workflow_delivery_claim(
+            WorkflowId(1),
+            delivery.delivery_id,
+            ProcessIncarnation(7),
+        )
+        .await
+        .unwrap();
+        assert!(repo
+            .claim_workflow_delivery(
+                WorkflowId(1),
+                delivery.delivery_id,
+                ProcessIncarnation(8),
+                Timestamp(4),
+            )
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -3491,6 +3581,7 @@ mod tests {
                     tool_use_id: "tool-1".to_string(),
                     arguments_json: "{\"result\":\"ok\"}".to_string(),
                 }],
+                local_delivery_claim: None,
             })
             .await
             .unwrap();
@@ -3581,6 +3672,7 @@ mod tests {
                 },
                 provider_request_id: Some("provider-1".to_string()),
                 tool_intents: vec![],
+                local_delivery_claim: None,
             })
             .await
             .unwrap()
@@ -3634,6 +3726,7 @@ mod tests {
                 },
                 provider_request_id: Some("provider-late".to_string()),
                 tool_intents: vec![],
+                local_delivery_claim: None,
             })
             .await
             .unwrap()

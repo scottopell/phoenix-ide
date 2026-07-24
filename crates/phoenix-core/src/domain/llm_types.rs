@@ -797,6 +797,7 @@ mod durable_codec_tests {
                 root_conversation_id: "root".to_string(),
                 request_id: "attempt-1".to_string(),
                 retry_attempt: 1,
+                attempt_capture: LlmAttemptCapture::default(),
             }),
             cache_key: PromptCacheKey::stable("conv"),
         };
@@ -809,6 +810,7 @@ mod durable_codec_tests {
             root_conversation_id: "root".to_string(),
             request_id: "attempt-2".to_string(),
             retry_attempt: 2,
+            attempt_capture: LlmAttemptCapture::default(),
         });
         assert_eq!(DurableLlmRequest::from_attempt(&replay), durable);
         assert_eq!(replay.telemetry.unwrap().request_id, "attempt-2");
@@ -830,6 +832,7 @@ mod durable_codec_tests {
                     cache_creation_tokens: 2,
                     cache_read_tokens: 3,
                 },
+                stream_telemetry: ProviderStreamTelemetry::non_streaming(),
             },
         };
         let encoded = serde_json::to_vec(&durable).unwrap();
