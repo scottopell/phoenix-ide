@@ -3276,6 +3276,7 @@ where
         Ok(generated)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn apply_direct_turn_transition(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
@@ -3339,8 +3340,13 @@ where
             phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Committed(message) => {
                 (Some(*message), false)
             }
-            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay => (None, true),
-            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::RetryablePersistence => {
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay => {
+                self.broadcast_tx.rewind_unused_reserved_range(sequence_id, 1);
+                (None, true)
+            }
+            outcome @ (phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::RetryablePersistence
+            | phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict) => {
+                self.broadcast_tx.rewind_unused_reserved_range(sequence_id, 1);
                 self.storage
                     .release_direct_turn_runtime_delivery(
                         &pending_conversation_id,
@@ -3348,12 +3354,19 @@ where
                         super::process_incarnation(),
                     )
                     .await?;
-                return Err(
-                    "direct-turn runtime acceptance persistence is temporarily busy".to_string(),
-                );
-            }
-            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict => {
-                return Err("durable direct turn admission conflicted".to_string());
+                let message = match outcome {
+                    phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::RetryablePersistence => {
+                        "direct-turn runtime acceptance persistence is temporarily busy"
+                    }
+                    phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict => {
+                        "durable direct turn admission conflicted"
+                    }
+                    phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Committed(_)
+                    | phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay => {
+                        unreachable!("committed outcomes are handled above")
+                    }
+                };
+                return Err(message.to_string());
             }
         };
         self.state = next_state;
@@ -9159,20 +9172,19 @@ mod steering_replay_sequence_tests {
     use crate::state_machine::ConvContext;
     use crate::tools::BrowserSessionManager;
     use phoenix_llm::ModelRegistry;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    #[tokio::test]
-    async fn exact_steering_replay_rewinds_unused_sse_sequence() {
-        let storage = Arc::new(InMemoryStorage::new());
-        storage.set_queued_steering_outcome(
-            phoenix_db::PersistQueuedSteeringMessageOutcome::ExactReplay,
-        );
-        let broadcaster = SseBroadcaster::new(16, 7);
+    fn test_runtime(
+        storage: Arc<InMemoryStorage>,
+        broadcaster: SseBroadcaster,
+        cwd: PathBuf,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
         let (_event_tx, event_rx) = mpsc::channel(1);
         let event_tx_dup = mpsc::channel(1).0;
-        let runtime = ConversationRuntime::new(
-            ConvContext::new("conv", std::env::temp_dir(), "test-model", 200_000),
+        ConversationRuntime::new(
+            ConvContext::new("conv", cwd, "test-model", 200_000),
             ConvState::Idle,
             storage,
             Arc::new(MockLlmClient::new("test-model")),
@@ -9185,6 +9197,20 @@ mod steering_replay_sequence_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+        )
+    }
+
+    #[tokio::test]
+    async fn exact_steering_replay_rewinds_unused_sse_sequence() {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_queued_steering_outcome(
+            phoenix_db::PersistQueuedSteeringMessageOutcome::ExactReplay,
+        );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(
+            storage,
+            SseBroadcaster::new(16, 7),
+            temp_dir.path().to_path_buf(),
         );
 
         let persisted = runtime
@@ -9201,10 +9227,53 @@ mod steering_replay_sequence_tests {
         assert!(persisted.is_none());
         assert_eq!(runtime.broadcast_tx.current_seq(), 7);
     }
+
+    #[tokio::test]
+    async fn direct_turn_conflict_rewinds_sequence_and_releases_delivery_claim() {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_direct_turn_acceptance_outcome(
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict,
+        );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut runtime = test_runtime(
+            Arc::clone(&storage),
+            SseBroadcaster::new(16, 11),
+            temp_dir.path().to_path_buf(),
+        );
+        let transition = crate::state_machine::transition::TransitionResult {
+            new_state: ConvState::LlmRequesting { attempt: 0 },
+            effects: vec![
+                Effect::PersistMessage {
+                    content: MessageContent::user("accepted"),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: "turn-id".to_string(),
+                    idempotent: false,
+                },
+                Effect::PersistState,
+            ],
+        };
+        let pending = phoenix_db::PendingDirectTurnRuntimeAdmission {
+            workflow_id: phoenix_workflow::WorkflowId(1),
+            conversation_id: "conv".to_string(),
+            client_message_id: "turn-id".to_string(),
+            generation: phoenix_workflow::Generation(1),
+        };
+
+        assert!(runtime
+            .apply_direct_turn_transition(transition, pending)
+            .await
+            .is_err());
+        assert_eq!(runtime.broadcast_tx.current_seq(), 11);
+        assert_eq!(
+            storage.released_direct_turn_deliveries(),
+            vec![("conv".to_string(), "turn-id".to_string())]
+        );
+    }
 }
 
-/// Task 24696 Phase 3: verify the `Effect::NotifyContextExhausted` handler
-/// preserves the worktree and does NOT demote `conv_mode`. The old
+/// Verify the `Effect::NotifyContextExhausted` handler preserves the worktree
+/// and does NOT demote `conv_mode`. The old
 /// `cleanup_context_exhausted_worktree` path is gone — worktree handoff to a
 /// continuation (REQ-BED-030) or a user-initiated abandon / mark-as-merged
 /// are now the only ways a context-exhausted worktree is removed.

@@ -4423,19 +4423,28 @@ impl Database {
         }
 
         let mut tx = self.pool.begin().await?;
-        let acceptance = sqlx::query_as::<_, (i64, String, Option<String>)>(
-            "SELECT workflow_id, committed_outcome, materialized_message_id
-             FROM direct_turn_acceptances
-             WHERE conversation_id = ?1 AND client_message_id = ?2",
+        let acceptance = sqlx::query_as::<_, (i64, String, Option<String>, i64)>(
+            "SELECT a.workflow_id, a.committed_outcome, a.materialized_message_id,
+                    EXISTS (
+                        SELECT 1 FROM direct_turn_steering_cancellations c
+                        WHERE c.workflow_id = a.workflow_id
+                    ) AS cancelled
+             FROM direct_turn_acceptances a
+             WHERE a.conversation_id = ?1 AND a.client_message_id = ?2",
         )
         .bind(conversation_id)
         .bind(client_message_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((workflow_id, committed_outcome, materialized_message_id)) = acceptance else {
+        let Some((workflow_id, committed_outcome, materialized_message_id, cancelled)) = acceptance
+        else {
             tx.rollback().await?;
             return Ok(PersistQueuedSteeringMessageOutcome::LegacyQueueEntry);
         };
+        if cancelled != 0 {
+            tx.rollback().await?;
+            return Ok(PersistQueuedSteeringMessageOutcome::Conflict);
+        }
 
         if let Some(materialized_message_id) = materialized_message_id {
             let replay = sqlx::query_scalar::<_, i64>(
@@ -12302,6 +12311,66 @@ mod tests {
                 .unwrap(),
             PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_steering_cannot_materialize() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-cancel", "cancel", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let repo = WorkflowRepository::new(db.pool().clone());
+        repo.accept_direct_turn(&DirectTurnAcceptanceInput {
+            initial_outcome: DirectTurnInitialOutcome::QueuedSteering {
+                entry: Box::new(phoenix_core::domain::sm_event::SteerEntry {
+                    message_id: "msg-cancel".to_string(),
+                    text: "cancel me".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }),
+            },
+            conversation_id: "conv-cancel".to_string(),
+            client_message_id: "msg-cancel".to_string(),
+            prepared_fingerprint: "cancel-fingerprint".to_string(),
+            prepared_payload: "{}".to_string(),
+            accepted_at: Timestamp(1),
+            snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                    conversation_id: "conv-cancel".to_string(),
+                    accepted_turn_id: "msg-cancel".to_string(),
+                    generation: 1,
+                },
+                accepted_assistant_message_id: None,
+                stopped_at: None,
+            },
+        })
+        .await
+        .unwrap();
+        assert!(repo
+            .cancel_queued_steering("conv-cancel", "msg-cancel")
+            .await
+            .unwrap());
+        let proposed = Message {
+            message_id: "msg-cancel".to_string(),
+            conversation_id: "conv-cancel".to_string(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::user("cancel me"),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        assert!(matches!(
+            db.persist_queued_steering_message("conv-cancel", "msg-cancel", &proposed)
+                .await
+                .unwrap(),
+            PersistQueuedSteeringMessageOutcome::Conflict
+        ));
+        assert!(!db.message_exists("msg-cancel").await.unwrap());
     }
 
     #[allow(clippy::too_many_lines)]

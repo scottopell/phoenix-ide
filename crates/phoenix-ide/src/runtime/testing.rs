@@ -495,6 +495,9 @@ pub struct InMemoryStorage {
     fail_watermark_write: Mutex<bool>,
     stopped_top_level_llm: Mutex<Vec<String>>,
     queued_steering_outcome: Mutex<Option<phoenix_db::PersistQueuedSteeringMessageOutcome>>,
+    direct_turn_acceptance_outcome:
+        Mutex<Option<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome>>,
+    released_direct_turn_deliveries: Mutex<Vec<(String, String)>>,
 }
 
 #[allow(dead_code)]
@@ -513,6 +516,8 @@ impl InMemoryStorage {
             fail_watermark_write: Mutex::new(false),
             stopped_top_level_llm: Mutex::new(Vec::new()),
             queued_steering_outcome: Mutex::new(None),
+            direct_turn_acceptance_outcome: Mutex::new(None),
+            released_direct_turn_deliveries: Mutex::new(Vec::new()),
         }
     }
 
@@ -543,6 +548,17 @@ impl InMemoryStorage {
         outcome: phoenix_db::PersistQueuedSteeringMessageOutcome,
     ) {
         *self.queued_steering_outcome.lock().unwrap() = Some(outcome);
+    }
+
+    pub fn set_direct_turn_acceptance_outcome(
+        &self,
+        outcome: phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome,
+    ) {
+        *self.direct_turn_acceptance_outcome.lock().unwrap() = Some(outcome);
+    }
+
+    pub fn released_direct_turn_deliveries(&self) -> Vec<(String, String)> {
+        self.released_direct_turn_deliveries.lock().unwrap().clone()
     }
 
     /// Read back the persisted fork proposals (test-only).
@@ -619,6 +635,31 @@ impl MessageStore for InMemoryStorage {
             .unwrap()
             .push(conversation_id.to_string());
         Ok(Some(phoenix_workflow::CommitOutcome::Committed))
+    }
+
+    async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        _input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
+        Ok(self
+            .direct_turn_acceptance_outcome
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict))
+    }
+
+    async fn release_direct_turn_runtime_delivery(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        _process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        self.released_direct_turn_deliveries
+            .lock()
+            .unwrap()
+            .push((conversation_id.to_string(), client_message_id.to_string()));
+        Ok(())
     }
 
     async fn persist_queued_steering_message(

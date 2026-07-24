@@ -446,6 +446,28 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
             .await
     }
 
+    async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
+        (**self).persist_direct_turn_runtime_acceptance(input).await
+    }
+
+    async fn release_direct_turn_runtime_delivery(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        (**self)
+            .release_direct_turn_runtime_delivery(
+                conversation_id,
+                client_message_id,
+                process_incarnation,
+            )
+            .await
+    }
+
     async fn persist_queued_steering_message(
         &self,
         conversation_id: &str,
