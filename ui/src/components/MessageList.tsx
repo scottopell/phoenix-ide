@@ -128,6 +128,7 @@ interface MessageListProps {
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   enableMessageSidepanel?: boolean | undefined;
+  enableMessageFullscreen?: boolean | undefined;
   /** Scroll-spy: the inclusive range of `historicalUnits`/virtual transcript item
    *  indices currently rendered. Fired as the user scrolls. The conversation nav
    *  uses it to highlight the active chapter. */
@@ -439,6 +440,7 @@ function MessageListImpl({
   filePathRootDir,
   workScopeKey,
   enableMessageSidepanel = true,
+  enableMessageFullscreen = false,
   onVisibleRangeChange,
   onChaptersChange,
   hasOlderMessages = false,
@@ -1437,7 +1439,11 @@ function MessageListImpl({
         </button>
       )}
       <FilePathContextMenu />
-      <MessageContextMenu messages={messages} enableMessageSidepanel={enableMessageSidepanel} />
+      <MessageContextMenu
+        messages={messages}
+        enableMessageSidepanel={enableMessageSidepanel}
+        enableMessageFullscreen={enableMessageFullscreen}
+      />
     </main>
   );
 }

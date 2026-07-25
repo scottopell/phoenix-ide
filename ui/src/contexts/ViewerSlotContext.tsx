@@ -59,7 +59,7 @@ export interface ViewerSlotCommands {
    *  `(scope_key, handle_id)` pair (REQ-PINSP-007). */
   openInspect: (scopeKey: string, handleId: string) => void;
   /** Open a finalized chat message in the annotatable markdown viewer. */
-  openMessage: (sequenceId: number) => void;
+  openMessage: (sequenceId: number, presentation: ViewerPresentation) => void;
   /** Open a commission review request/result pair by request agent message sequence id. */
   openCommissionReview: (requestSequenceId: number) => void;
   /** Change only the active prose/message/review presentation, preserving identity. */
@@ -308,14 +308,14 @@ export function ViewerSlotProvider({
     });
   }, [setPatchContext, writeUrl]);
 
-  const openMessage = useCallback((sequenceId: number) => {
+  const openMessage = useCallback((sequenceId: number, presentation: ViewerPresentation) => {
     const validSequenceId = Number.isSafeInteger(sequenceId) && sequenceId > 0 ? sequenceId : undefined;
     if (validSequenceId === undefined) return;
     setPatchContext(null);
     writeUrl((next) => {
       clearSlotParams(next);
       next.set(VIEWER_PARAM, 'message');
-      next.set(DIFF_PRESENTATION_PARAM, 'pane');
+      next.set(DIFF_PRESENTATION_PARAM, presentation);
       next.set(MESSAGE_PARAM, String(validSequenceId));
     });
   }, [setPatchContext, writeUrl]);

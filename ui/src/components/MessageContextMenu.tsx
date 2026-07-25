@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { Message } from '../api';
+import type { ViewerPresentation } from '../contexts/ViewerSlotContext';
 import { copyToClipboard } from '../utils/clipboard';
 import { getMessageMarkdown } from '../utils/messageCopy';
 import {
@@ -24,6 +25,7 @@ interface MenuState {
 interface MessageContextMenuProps {
   messages: Message[];
   enableMessageSidepanel?: boolean | undefined;
+  enableMessageFullscreen?: boolean | undefined;
 }
 
 /** Extract plain text (strip markdown) by reading innerText from the DOM */
@@ -34,7 +36,16 @@ function getPlainText(element: HTMLElement): string {
 
 export const OPEN_MESSAGE_VIEWER_EVENT = 'phoenix:open-message-viewer';
 
-export function MessageContextMenu({ messages, enableMessageSidepanel = true }: MessageContextMenuProps) {
+export interface OpenMessageViewerEventDetail {
+  sequenceId: number;
+  presentation: ViewerPresentation;
+}
+
+export function MessageContextMenu({
+  messages,
+  enableMessageSidepanel = true,
+  enableMessageFullscreen = false,
+}: MessageContextMenuProps) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -167,9 +178,9 @@ export function MessageContextMenu({ messages, enableMessageSidepanel = true }: 
     setMenu(null);
   };
 
-  const openInSidepanel = () => {
-    window.dispatchEvent(new CustomEvent<{ sequenceId: number }>(OPEN_MESSAGE_VIEWER_EVENT, {
-      detail: { sequenceId: menu.message.sequence_id },
+  const openMessage = (presentation: ViewerPresentation) => {
+    window.dispatchEvent(new CustomEvent<OpenMessageViewerEventDetail>(OPEN_MESSAGE_VIEWER_EVENT, {
+      detail: { sequenceId: menu.message.sequence_id, presentation },
     }));
     setMenu(null);
   };
@@ -235,9 +246,16 @@ export function MessageContextMenu({ messages, enableMessageSidepanel = true }: 
         </button>
       )}
       {enableMessageSidepanel && getMessageMarkdown(menu.message).trim() && (
-        <button className="msg-context-item" onClick={openInSidepanel}>
-          Open in sidepanel
-        </button>
+        <>
+          <button className="msg-context-item" onClick={() => openMessage('pane')}>
+            Open in sidepanel
+          </button>
+          {enableMessageFullscreen && (
+            <button className="msg-context-item" onClick={() => openMessage('fullscreen')}>
+              Open in fullscreen
+            </button>
+          )}
+        </>
       )}
       {menu.toolContext && <div className="msg-context-divider" />}
       <button className="msg-context-item" onClick={copyMarkdown}>

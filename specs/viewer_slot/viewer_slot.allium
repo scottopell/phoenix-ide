@@ -277,7 +277,7 @@ entity ViewerSlot {
 --   UserOpensDiff(slot, presentation)
 --   UserOpensBrowser(slot)
 --   UserOpensInspect(slot, handle)
---   UserOpensMessage(slot, message)
+--   UserOpensMessage(slot, message, presentation)
 --   UserOpensCommissionReview(slot, review)
 --   UserClosesViewer(slot)
 --
@@ -366,11 +366,11 @@ rule UserOpensInspectViewer {
 }
 
 rule UserOpensMessageViewer {
-    when: UserOpensMessage(slot, message)
+    when: UserOpensMessage(slot, message, presentation)
     requires: not slot.conversation.is_terminal
     ensures: slot.kind = message
     ensures: slot.message_ref = message
-    ensures: slot.message_presentation = pane
+    ensures: slot.message_presentation = presentation
 }
 
 rule UserOpensCommissionReviewViewer {
@@ -565,8 +565,8 @@ rule ConversationChangeResetsSlot {
 -- @guidance
 --   REQ-VS-010 still holds: navigating from /c/A to /c/B never
 --   carries A's viewer state INTO B. This section is the symmetric
---   case: when the user navigates back TO a conversation they
---   previously had a viewer open in, restore that viewer.
+--   case: when the user navigates back TO a conversation whose
+--   durable snapshot names a viewer, restore that viewer.
 --
 --   Two storage boundaries apply:
 --
@@ -625,7 +625,7 @@ rule UserOpensInspectWritesStorage {
 }
 
 rule UserOpensMessageWritesStorage {
-    when: UserOpensMessage(slot, message)
+    when: UserOpensMessage(slot, message, presentation)
     ensures: ViewerSnapshotPersisted(slot)
 }
 
@@ -783,7 +783,7 @@ surface ConversationViewer {
             when slot.conversation.browser_session_active
         UserOpensInspect(slot, handle)
             when not slot.conversation.is_terminal
-        UserOpensMessage(slot, message)
+        UserOpensMessage(slot, message, presentation)
             when not slot.conversation.is_terminal
         UserOpensCommissionReview(slot, review)
             when not slot.conversation.is_terminal

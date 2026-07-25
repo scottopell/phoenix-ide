@@ -77,6 +77,24 @@ describe('ViewerSlot — open/close transitions', () => {
   });
 });
 
+describe('ViewerSlot — message kind', () => {
+  it.each(['pane', 'fullscreen'] as const)(
+    'opens a message directly in %s with canonical URL identity',
+    (presentation) => {
+      const h = renderSlot('/c/conv-A?viewer=inspect&scope=scope-1&handle=b-7');
+
+      act(() => { h.get().openMessage(42, presentation); });
+
+      expect(h.get().slot).toEqual({ kind: 'message', presentation, sequenceId: 42 });
+      expect(h.search()).toContain('viewer=message');
+      expect(h.search()).toContain(`presentation=${presentation}`);
+      expect(h.search()).toContain('message=42');
+      expect(h.search()).not.toContain('scope=');
+      expect(h.search()).not.toContain('handle=');
+    },
+  );
+});
+
 describe('ViewerSlot — commission-review kind', () => {
   it('opens a commission review, encoding request sequence id in the URL', () => {
     const h = renderSlot();

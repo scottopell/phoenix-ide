@@ -1328,9 +1328,9 @@ describe('message copy affordances', () => {
     const message = agentMessage('agent-open-sidepanel', [
       { type: 'text', text: 'Long **proposal**.' },
     ], 15);
-    const opened: number[] = [];
+    const opened: Array<{ sequenceId: number; presentation: string }> = [];
     const handler = (event: Event) => {
-      opened.push((event as CustomEvent<{ sequenceId: number }>).detail.sequenceId);
+      opened.push((event as CustomEvent<{ sequenceId: number; presentation: string }>).detail);
     };
     window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
     try {
@@ -1348,15 +1348,51 @@ describe('message copy affordances', () => {
       );
 
       fireEvent.contextMenu(screen.getByText(/Long/), { clientX: 20, clientY: 30 });
+      expect(screen.queryByRole('button', { name: 'Open in fullscreen' })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Open in sidepanel' }));
 
-      expect(opened).toEqual([15]);
+      expect(opened).toEqual([{ sequenceId: 15, presentation: 'pane' }]);
+      expect(screen.queryByRole('button', { name: 'Open in sidepanel' })).not.toBeInTheDocument();
     } finally {
       window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
     }
   });
 
-  it('does not offer sidepanel open when the message has no markdown text', () => {
+  it('opens message markdown directly in fullscreen when the layout supports it', () => {
+    const message = agentMessage('agent-open-fullscreen', [
+      { type: 'text', text: 'Focused **proposal**.' },
+    ], 18);
+    const opened: Array<{ sequenceId: number; presentation: string }> = [];
+    const handler = (event: Event) => {
+      opened.push((event as CustomEvent<{ sequenceId: number; presentation: string }>).detail);
+    };
+    window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+    try {
+      render(
+        <MemoryRouter>
+          <div id="messages">
+            <AgentMessage
+              message={message}
+              toolResults={new Map()}
+              onOpenFile={vi.fn()}
+            />
+          </div>
+          <MessageContextMenu messages={[message]} enableMessageFullscreen />
+        </MemoryRouter>,
+      );
+
+      fireEvent.contextMenu(screen.getByText(/Focused/), { clientX: 20, clientY: 30 });
+      expect(screen.getByRole('button', { name: 'Open in sidepanel' })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Open in fullscreen' }));
+
+      expect(opened).toEqual([{ sequenceId: 18, presentation: 'fullscreen' }]);
+      expect(screen.queryByRole('button', { name: 'Open in fullscreen' })).not.toBeInTheDocument();
+    } finally {
+      window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+    }
+  });
+
+  it('does not offer sidepanel or fullscreen open when the message has no markdown text', () => {
     const message = agentMessage('agent-tool-only-menu', [
       { type: 'tool_use', id: 'tool-1', name: 'bash', input: { cmd: 'pwd' } },
     ], 16);
@@ -1370,13 +1406,14 @@ describe('message copy affordances', () => {
             onOpenFile={vi.fn()}
           />
         </div>
-        <MessageContextMenu messages={[message]} />
+        <MessageContextMenu messages={[message]} enableMessageFullscreen />
       </MemoryRouter>,
     );
 
     fireEvent.contextMenu(screen.getByText('$ pwd'), { clientX: 20, clientY: 30 });
 
     expect(screen.queryByRole('button', { name: 'Open in sidepanel' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Open in fullscreen' })).not.toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: 'Copy command' }).length).toBeGreaterThan(0);
   });
 
@@ -1401,6 +1438,7 @@ describe('message copy affordances', () => {
     fireEvent.contextMenu(screen.getByText(/Read-only/), { clientX: 20, clientY: 30 });
 
     expect(screen.queryByRole('button', { name: 'Open in sidepanel' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Open in fullscreen' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Copy as Markdown' })).toBeInTheDocument();
   });
 });
