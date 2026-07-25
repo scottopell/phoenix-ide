@@ -1702,7 +1702,29 @@ fn creation_provisioned_transition(
             | Effect::PersistAuthoritativeUserMessage { idempotent, .. } => {
                 *idempotent = true;
             }
-            _ => {}
+            Effect::PersistState
+            | Effect::RequestLlm
+            | Effect::CompleteCreation { .. }
+            | Effect::ExecuteTool { .. }
+            | Effect::BroadcastAssistantMessage { .. }
+            | Effect::AbortTool { .. }
+            | Effect::AbortLlm
+            | Effect::CancelSubAgents { .. }
+            | Effect::NotifyParent { .. }
+            | Effect::NotifyStateChange
+            | Effect::NotifyAgentDone
+            | Effect::ScheduleRetry { .. }
+            | Effect::PersistCheckpoint { .. }
+            | Effect::PersistToolResults { .. }
+            | Effect::PersistHiddenSystemMarker { .. }
+            | Effect::PersistSubAgentResults { .. }
+            | Effect::RequestContinuation { .. }
+            | Effect::NotifyContextExhausted { .. }
+            | Effect::ApproveTask { .. }
+            | Effect::ApproveTaskFreshHandoff { .. }
+            | Effect::PersistForkProposal { .. }
+            | Effect::ResolveTask { .. }
+            | Effect::ClearSteeringQueueEntries { .. } => {}
         }
     }
     let request_index = result
@@ -4253,12 +4275,8 @@ mod tests {
             user_agent: Some("test-agent".to_string()),
             skill_invocation: None,
         };
-        let authority = phoenix_core::domain::sm_event::DirectTurnAttemptAuthority {
-            attempt_id: phoenix_core::domain::sm_event::DirectTurnAttemptId(
-                "attempt-1".to_string(),
-            ),
-            token: phoenix_core::domain::sm_event::DirectTurnAuthorityToken("token-1".to_string()),
-        };
+        let authority =
+            phoenix_core::domain::sm_event::DirectTurnAttemptAuthority::new(41, 7, 1, 9, 2, 3, 4);
 
         let result = transition(
             &ConvState::Idle,

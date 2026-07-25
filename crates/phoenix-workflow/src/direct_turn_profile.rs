@@ -1,7 +1,6 @@
 use crate::{
-    AcceptanceProfile, AcceptedDisposition, CanonicalMessageId, CodecRef, DeliveryItem,
-    DeliveryPayload, ExternalAcceptanceDisabled, ProfileRef, RuntimeAcceptanceEnabled,
-    SupportedCodecRegistry, WorkflowProfile,
+    AcceptanceProfile, CodecRef, DeliveryItem, ExternalAcceptanceDisabled, ProfileRef,
+    RuntimeAcceptanceEnabled, SupportedCodecRegistry, WorkflowProfile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +9,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const SNAPSHOT_CODEC_FAMILY: &str = "direct_turn.snapshot";
 pub const EVENT_CODEC_FAMILY: &str = "direct_turn.event";
 pub const INTENT_CODEC_FAMILY: &str = "direct_turn.intent";
+pub const PREPARED_PAYLOAD_CODEC_FAMILY: &str = "direct_turn.prepared_payload";
 pub const RECEIPT_CODEC_FAMILY: &str = "direct_turn.receipt";
 pub const RECEIPT_EVENT_CODEC_FAMILY: &str = "direct_turn.receipt_event";
 
@@ -24,7 +24,6 @@ pub struct DirectTurnSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectTurnEvent {
     Accepted,
-    Delivered(DirectTurnReceiptEvent),
     Terminal(DirectTurnTerminalEvent),
 }
 
@@ -48,23 +47,6 @@ pub struct RuntimeTurnIntent {
     pub prepared_fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectTurnReceipt {
-    pub turn_id: u64,
-    pub disposition: AcceptedDisposition,
-    pub canonical_message_id: CanonicalMessageId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DirectTurnReceiptEvent {
-    RuntimeDelivered {
-        canonical_message_id: CanonicalMessageId,
-    },
-    SteeringQueued {
-        canonical_message_id: CanonicalMessageId,
-    },
-}
-
 impl WorkflowProfile for DirectTurnProfile {
     type Snapshot = DirectTurnSnapshot;
     type RuntimeAcceptance = RuntimeAcceptanceEnabled;
@@ -72,8 +54,8 @@ impl WorkflowProfile for DirectTurnProfile {
     type Event = DirectTurnEvent;
     type Intent = RuntimeTurnIntent;
     type Observation = ();
-    type Receipt = DirectTurnReceipt;
-    type ReceiptReducerEvent = DirectTurnReceiptEvent;
+    type Receipt = ();
+    type ReceiptReducerEvent = ();
     type BarrierEvent = ();
     type ManualPayload = ();
 
@@ -81,8 +63,8 @@ impl WorkflowProfile for DirectTurnProfile {
         true
     }
 
-    fn receipt_requires_runtime_acceptance(_: &Self::ReceiptReducerEvent) -> bool {
-        true
+    fn receipt_requires_runtime_acceptance((): &Self::ReceiptReducerEvent) -> bool {
+        false
     }
 
     fn decision_handles_delivery(_: &DeliveryItem<Self>, _: &Self::Event) -> bool {
@@ -115,6 +97,7 @@ fn supported_codecs() -> SupportedCodecRegistry {
         snapshot_codec(),
         event_codec(),
         intent_codec(),
+        prepared_payload_codec(),
         receipt_codec(),
         receipt_event_codec(),
     ])
@@ -147,6 +130,14 @@ pub fn event_codec() -> CodecRef {
 pub fn intent_codec() -> CodecRef {
     CodecRef {
         family: INTENT_CODEC_FAMILY,
+        version: PROTOCOL_VERSION,
+    }
+}
+
+#[must_use]
+pub fn prepared_payload_codec() -> CodecRef {
+    CodecRef {
+        family: PREPARED_PAYLOAD_CODEC_FAMILY,
         version: PROTOCOL_VERSION,
     }
 }

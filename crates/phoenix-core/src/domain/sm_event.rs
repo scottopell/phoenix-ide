@@ -3,21 +3,140 @@
 use crate::domain::db_schema::{ErrorKind, FileAttachment, ImageData, ToolResult};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectTurnAttemptId(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnWorkflowId(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectTurnAuthorityToken(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnTurnId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnEffectId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnAttemptId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnWorkflowVersion(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnGeneration(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnProcessIncarnation(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectTurnAttemptAuthority {
+    pub workflow_id: DirectTurnWorkflowId,
+    pub turn_id: DirectTurnTurnId,
+    pub effect_id: DirectTurnEffectId,
     pub attempt_id: DirectTurnAttemptId,
-    pub token: DirectTurnAuthorityToken,
+    pub declared_workflow_version: DirectTurnWorkflowVersion,
+    pub generation: DirectTurnGeneration,
+    pub process_incarnation: DirectTurnProcessIncarnation,
 }
+
+impl DirectTurnAttemptAuthority {
+    #[must_use]
+    pub const fn new(
+        workflow_id: u64,
+        turn_id: u64,
+        effect_id: u64,
+        attempt_id: u64,
+        declared_workflow_version: u64,
+        generation: u64,
+        process_incarnation: u64,
+    ) -> Self {
+        Self {
+            workflow_id: DirectTurnWorkflowId(workflow_id),
+            turn_id: DirectTurnTurnId(turn_id),
+            effect_id: DirectTurnEffectId(effect_id),
+            attempt_id: DirectTurnAttemptId(attempt_id),
+            declared_workflow_version: DirectTurnWorkflowVersion(declared_workflow_version),
+            generation: DirectTurnGeneration(generation),
+            process_incarnation: DirectTurnProcessIncarnation(process_incarnation),
+        }
+    }
+}
+
+impl PreparedDirectTurnPayload {
+    #[must_use]
+    pub fn message_content_and_display_data(
+        &self,
+    ) -> (
+        crate::domain::db_schema::MessageContent,
+        Option<serde_json::Value>,
+    ) {
+        let content = if let Some(invocation) = &self.skill_invocation {
+            crate::domain::db_schema::MessageContent::Skill(
+                crate::domain::db_schema::SkillContent {
+                    name: invocation.name.clone(),
+                    body: invocation.body.clone(),
+                    trigger: self.text.clone(),
+                    files: self.files.clone(),
+                },
+            )
+        } else {
+            match &self.llm_text {
+                Some(expanded) => crate::domain::db_schema::MessageContent::User(
+                    crate::domain::db_schema::UserContent::with_expansion(
+                        self.text.clone(),
+                        expanded.clone(),
+                        self.images.clone(),
+                        self.files.clone(),
+                    ),
+                ),
+                None => {
+                    if self.images.is_empty() && self.files.is_empty() {
+                        crate::domain::db_schema::MessageContent::user(self.text.clone())
+                    } else {
+                        crate::domain::db_schema::MessageContent::user_with_attachments(
+                            self.text.clone(),
+                            self.images.clone(),
+                            self.files.clone(),
+                        )
+                    }
+                }
+            }
+        };
+        let display_data = self
+            .user_agent
+            .as_ref()
+            .map(|ua| serde_json::json!({ "user_agent": ua }));
+        (content, display_data)
+    }
+}
+
+impl std::fmt::Debug for PreparedDirectTurnPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedDirectTurnPayload")
+            .field("text", &self.text)
+            .field("llm_text", &self.llm_text)
+            .field("images", &self.images)
+            .field("files", &self.files)
+            .field("message_id", &self.message_id)
+            .field("user_agent", &self.user_agent)
+            .field("skill_invocation", &self.skill_invocation)
+            .finish()
+    }
+}
+
+impl PartialEq for PreparedDirectTurnPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.llm_text == other.llm_text
+            && self.images == other.images
+            && self.files == other.files
+            && self.message_id == other.message_id
+            && self.user_agent == other.user_agent
+            && self.skill_invocation == other.skill_invocation
+    }
+}
+
+impl Eq for PreparedDirectTurnPayload {}
 
 /// Serializable, lossless direct-turn payload prepared by the authoritative
 /// transport before it is delivered to the reducer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PreparedDirectTurnPayload {
     pub text: String,
     pub llm_text: Option<String>,
@@ -467,6 +586,7 @@ pub enum ParentEvent {
 /// Combined event type for sub-agent conversations.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
+#[allow(clippy::large_enum_variant)]
 pub enum SubAgentEvent {
     Core(CoreEvent),
     SubAgent(SubAgentOnlyEvent),

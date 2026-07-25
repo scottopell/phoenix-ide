@@ -6,8 +6,7 @@ use crate::state::{
 use chrono::{DateTime, Utc};
 use phoenix_bash_display::display_command;
 use phoenix_core::domain::db_schema::{
-    FileAttachment, ImageData, MessageContent, SkillContent, ToolContent, ToolContentImage,
-    ToolResult, UsageData, UserContent,
+    FileAttachment, ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData,
 };
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::llm_types::ContentBlock;
@@ -262,39 +261,7 @@ pub enum Effect {
 pub fn prepared_direct_turn_content(
     payload: &PreparedDirectTurnPayload,
 ) -> (MessageContent, Option<Value>) {
-    let content = if let Some(invocation) = &payload.skill_invocation {
-        MessageContent::Skill(SkillContent {
-            name: invocation.name.clone(),
-            body: invocation.body.clone(),
-            trigger: payload.text.clone(),
-            files: payload.files.clone(),
-        })
-    } else {
-        match &payload.llm_text {
-            Some(expanded) => MessageContent::User(UserContent::with_expansion(
-                payload.text.clone(),
-                expanded.clone(),
-                payload.images.clone(),
-                payload.files.clone(),
-            )),
-            None => {
-                if payload.images.is_empty() && payload.files.is_empty() {
-                    MessageContent::user(payload.text.clone())
-                } else {
-                    MessageContent::user_with_attachments(
-                        payload.text.clone(),
-                        payload.images.clone(),
-                        payload.files.clone(),
-                    )
-                }
-            }
-        }
-    };
-    let display_data = payload
-        .user_agent
-        .as_ref()
-        .map(|ua| serde_json::json!({ "user_agent": ua }));
-    (content, display_data)
+    payload.message_content_and_display_data()
 }
 
 impl Effect {

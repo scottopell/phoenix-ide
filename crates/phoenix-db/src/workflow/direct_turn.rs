@@ -1,5 +1,8 @@
 use super::WorkflowRepository;
 use crate::{DbError, DbResult};
+use chrono::{DateTime, Utc};
+use phoenix_core::domain::db_schema::{Message, MessageContent};
+use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
 use phoenix_workflow::{
     direct_turn_profile, AcceptedDisposition, AttemptId, AttemptStatus, AuthorityOutcome,
     CanonicalMessageId, ClaimOutcome, ClientTurnKey, ConversationAuthority, DeliveryId,
@@ -60,9 +63,11 @@ pub struct ReleaseAuthoritativeTurnInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializeAuthoritativeTurnInput {
     pub authority: super::LocalAttemptAuthority,
+    pub prepared: PreparedDirectTurnPayload,
     pub receipt_id: ReceiptId,
     pub delivery_id: DeliveryId,
-    pub message_id: CanonicalMessageId,
+    pub sequence_id: i64,
+    pub created_at: Timestamp,
     pub now: Timestamp,
 }
 
@@ -73,6 +78,33 @@ pub struct MaterializeAuthoritativeTurnResult {
     pub receipt: Option<super::LocalReceiptRecord>,
     pub delivery: Option<super::LocalDeliveryRecord>,
     pub canonical_turn: DurableTurn,
+}
+
+fn authority_event(
+    authority: &super::LocalAttemptAuthority,
+    turn_id: TurnAuthorityId,
+) -> DirectTurnAttemptAuthority {
+    DirectTurnAttemptAuthority::new(
+        authority.workflow_id.0,
+        turn_id.0,
+        authority.effect_id.0,
+        authority.attempt_id.0,
+        authority.declared_workflow_version.0,
+        authority.generation.0,
+        authority.process_incarnation.0,
+    )
+}
+
+async fn turn_id_for_workflow_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workflow_id: WorkflowId,
+) -> DbResult<TurnAuthorityId> {
+    let turn_id =
+        sqlx::query_scalar::<_, i64>("SELECT turn_id FROM durable_turns WHERE workflow_id = ?1")
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(TurnAuthorityId(to_u64(turn_id, "turn_id")?))
 }
 
 impl WorkflowRepository {
@@ -304,11 +336,31 @@ impl WorkflowRepository {
         let mut tx = self.begin_tx().await?;
         let updated = sqlx::query(
             "DELETE FROM workflow_reclaimable_leases
-             WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until > ?3",
+             WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until > ?3
+               AND EXISTS (
+                   SELECT 1 FROM workflow_attempts a
+                   WHERE a.workflow_id = workflow_reclaimable_leases.workflow_id
+                     AND a.attempt_id = workflow_reclaimable_leases.attempt_id
+                     AND a.effect_id = ?4
+                     AND a.declared_workflow_version = ?5
+                     AND a.generation = ?6
+                     AND a.process_incarnation = ?7
+                     AND a.status IN ('Begun', 'ObservationRecorded')
+               )",
         )
         .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
         .bind(to_i64(input.now.0, "now")?)
+        .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+        .bind(to_i64(
+            input.authority.declared_workflow_version.0,
+            "declared_workflow_version",
+        )?)
+        .bind(to_i64(input.authority.generation.0, "generation")?)
+        .bind(to_i64(
+            input.authority.process_incarnation.0,
+            "process_incarnation",
+        )?)
         .execute(&mut *tx.tx)
         .await?
         .rows_affected();
@@ -316,24 +368,49 @@ impl WorkflowRepository {
             tx.rollback().await?;
             return Ok(AuthorityOutcome::StaleAuthority);
         }
-        sqlx::query(
+        let attempts_updated = sqlx::query(
             "UPDATE workflow_attempts
              SET status = 'AuthorityLost'
-             WHERE workflow_id = ?1 AND attempt_id = ?2 AND status IN ('Begun', 'ObservationRecorded')",
+             WHERE workflow_id = ?1 AND attempt_id = ?2 AND effect_id = ?3
+               AND declared_workflow_version = ?4 AND generation = ?5
+               AND process_incarnation = ?6 AND status IN ('Begun', 'ObservationRecorded')",
         )
         .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+        .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+        .bind(to_i64(
+            input.authority.declared_workflow_version.0,
+            "declared_workflow_version",
+        )?)
+        .bind(to_i64(input.authority.generation.0, "generation")?)
+        .bind(to_i64(
+            input.authority.process_incarnation.0,
+            "process_incarnation",
+        )?)
         .execute(&mut *tx.tx)
-        .await?;
-        sqlx::query(
+        .await?
+        .rows_affected();
+        let effects_updated = sqlx::query(
             "UPDATE workflow_effects
              SET status = 'Eligible'
-             WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'",
+             WHERE workflow_id = ?1 AND effect_id = ?2
+               AND declared_workflow_version = ?3 AND generation = ?4
+               AND status = 'Executing'",
         )
         .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+        .bind(to_i64(
+            input.authority.declared_workflow_version.0,
+            "declared_workflow_version",
+        )?)
+        .bind(to_i64(input.authority.generation.0, "generation")?)
         .execute(&mut *tx.tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if attempts_updated != 1 || effects_updated != 1 {
+            tx.rollback().await?;
+            return Ok(AuthorityOutcome::StaleAuthority);
+        }
         tx.commit().await?;
         Ok(AuthorityOutcome::Authorized)
     }
@@ -374,24 +451,19 @@ impl WorkflowRepository {
         cut: TransactionCut,
     ) -> DbResult<MaterializeAuthoritativeTurnResult> {
         let mut tx = self.begin_tx().await?;
-        let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .fetch_optional(&mut *tx.tx)
-            .await?;
-        let turn_id = decode_turn_id_from_authority(&input.authority)?;
-        let turn = match row {
-            Some(_) => load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
-                .await?
-                .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?,
-            None => return Err(conflict(TurnConflict::UnknownTurn)),
-        };
+        let turn_id = turn_id_for_workflow_tx(&mut tx.tx, input.authority.workflow_id).await?;
+        let turn = load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
+            .await?
+            .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
+        verify_prepared_payload(&turn, &input.prepared)?;
+        let canonical_message_id = CanonicalMessageId(input.prepared.message_id.clone());
         let mut model =
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model
             .apply(TurnCommand::Materialize {
                 turn_id,
                 expected_generation: input.authority.generation.0,
-                message_id: input.message_id.clone(),
+                message_id: canonical_message_id.clone(),
             })
             .map_err(conflict)?;
         let acceptance = tx
@@ -401,12 +473,17 @@ impl WorkflowRepository {
                 delivery_id: input.delivery_id,
                 attempt_id: Some(input.authority.attempt_id),
                 origin: phoenix_workflow::ReceiptOrigin::Execution,
-                receipt_codec: local_codec_owned(&direct_turn_profile::event_codec()),
-                receipt_payload: serde_json::to_vec(&()).map_err(|e| {
-                    DbError::Serialization(format!("encode direct-turn receipt: {e}"))
-                })?,
-                receipt_event_codec: local_codec_owned(&direct_turn_profile::event_codec()),
-                receipt_event_payload: serde_json::to_vec(&()).map_err(|e| {
+                receipt_codec: local_codec_owned(&direct_turn_profile::receipt_codec()),
+                receipt_payload: serde_json::to_vec(&authority_event(&input.authority, turn_id))
+                    .map_err(|e| {
+                        DbError::Serialization(format!("encode direct-turn receipt: {e}"))
+                    })?,
+                receipt_event_codec: local_codec_owned(&direct_turn_profile::receipt_event_codec()),
+                receipt_event_payload: serde_json::to_vec(&authority_event(
+                    &input.authority,
+                    turn_id,
+                ))
+                .map_err(|e| {
                     DbError::Serialization(format!("encode direct-turn receipt event: {e}"))
                 })?,
                 receipt_event_requires_runtime_acceptance: false,
@@ -424,13 +501,22 @@ impl WorkflowRepository {
             });
         }
         if matches!(step.outcome, TurnOutcome::Materialized { .. }) {
+            let message = insert_canonical_message_tx(
+                &mut tx,
+                &turn,
+                &canonical_message_id,
+                input.sequence_id,
+                input.created_at,
+                &input.prepared,
+            )
+            .await?;
             let updated = sqlx::query(
                 "UPDATE durable_turns SET canonical_message_id = ?2
                  WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NULL
                    AND canonical_message_id IS NULL AND workflow_id = ?4",
             )
             .bind(to_i64(turn_id.0, "turn_id")?)
-            .bind(&input.message_id.0)
+            .bind(&message.message_id)
             .bind(to_i64(input.authority.generation.0, "generation")?)
             .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
             .execute(&mut *tx.tx)
@@ -443,6 +529,15 @@ impl WorkflowRepository {
                     actual: turn.generation,
                 }));
             }
+        } else {
+            let existing = load_message_by_id_tx(&mut tx.tx, &canonical_message_id.0).await?;
+            verify_existing_materialized_message(
+                &existing,
+                &turn,
+                &input.prepared,
+                input.sequence_id,
+                input.created_at,
+            )?;
         }
         let canonical_turn =
             load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
@@ -625,8 +720,23 @@ async fn insert_direct_turn_workflow_tx(
         snapshot_codec: direct_turn_profile::snapshot_codec(),
         snapshot_payload: serde_json::to_vec(&snapshot)
             .map_err(|e| DbError::Serialization(format!("encode direct-turn snapshot: {e}")))?,
-        receipt_handle: turn_id.0.to_string().into_bytes(),
-        disposition_handle: workflow_id.0.to_string().into_bytes(),
+        receipt_handle: serde_json::to_vec(&turn_id.0).map_err(|e| {
+            DbError::Serialization(format!("encode direct-turn receipt handle: {e}"))
+        })?,
+        disposition_handle: serde_json::to_vec(&authority_event(
+            &super::LocalAttemptAuthority {
+                workflow_id,
+                declared_workflow_version: Version(1),
+                generation: Generation(0),
+                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                attempt_id: AttemptId(0),
+                process_incarnation: ProcessIncarnation(0),
+            },
+            turn_id,
+        ))
+        .map_err(|e| {
+            DbError::Serialization(format!("encode direct-turn disposition handle: {e}"))
+        })?,
         now: input.accepted_at,
     };
     tx.insert_workflow(&create).await?;
@@ -678,24 +788,6 @@ async fn insert_direct_turn_workflow_tx(
     }
 }
 
-fn local_codec_owned(codec: &phoenix_workflow::CodecRef) -> LocalCodec {
-    LocalCodec {
-        family: codec.family.to_string(),
-        version: codec.version,
-    }
-}
-
-fn decode_turn_id_from_authority(
-    authority: &super::LocalAttemptAuthority,
-) -> DbResult<TurnAuthorityId> {
-    if authority.effect_id != EffectId(DIRECT_TURN_EFFECT_ID) {
-        return Err(DbError::Serialization(
-            "direct-turn authority referenced unexpected effect".to_string(),
-        ));
-    }
-    Ok(TurnAuthorityId(authority.workflow_id.0))
-}
-
 async fn load_turn_for_workflow_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     turn_id: TurnAuthorityId,
@@ -708,6 +800,226 @@ async fn load_turn_for_workflow_tx(
         .await?
         .map(row_to_turn)
         .transpose()
+}
+
+fn local_codec_owned(codec: &phoenix_workflow::CodecRef) -> LocalCodec {
+    LocalCodec {
+        family: codec.family.to_string(),
+        version: codec.version,
+    }
+}
+
+fn timestamp_to_datetime(timestamp: Timestamp) -> DateTime<Utc> {
+    DateTime::from_timestamp(i64::try_from(timestamp.0).unwrap_or(0), 0)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
+fn verify_prepared_payload(
+    turn: &DurableTurn,
+    prepared: &PreparedDirectTurnPayload,
+) -> DbResult<()> {
+    let stored: PreparedDirectTurnPayload = serde_json::from_slice(&turn.prepared.payload)
+        .map_err(|e| DbError::Serialization(format!("decode direct-turn prepared payload: {e}")))?;
+    if prepared.message_id != stored.message_id {
+        return Err(conflict(TurnConflict::MaterializationIdentityChanged {
+            canonical: CanonicalMessageId(stored.message_id),
+        }));
+    }
+    if prepared != &stored {
+        return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+    }
+    Ok(())
+}
+
+async fn insert_canonical_message_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    turn: &DurableTurn,
+    canonical_message_id: &CanonicalMessageId,
+    sequence_id: i64,
+    created_at: Timestamp,
+    prepared: &PreparedDirectTurnPayload,
+) -> DbResult<Message> {
+    if prepared.message_id != canonical_message_id.0 {
+        return Err(conflict(TurnConflict::MaterializationIdentityChanged {
+            canonical: CanonicalMessageId(prepared.message_id.clone()),
+        }));
+    }
+    let (content, display_data) = prepared.message_content_and_display_data();
+    let created_at_dt = timestamp_to_datetime(created_at);
+    let content_str = serde_json::to_string(&content.to_stored_json())
+        .map_err(|e| DbError::Serialization(e.to_string()))?;
+    let display_str = display_data
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| DbError::Serialization(e.to_string()))?;
+    sqlx::query(
+        "INSERT INTO messages (
+            message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+    )
+    .bind(&canonical_message_id.0)
+    .bind(&turn.conversation.0)
+    .bind(sequence_id)
+    .bind(content.message_type().to_string())
+    .bind(&content_str)
+    .bind(&display_str)
+    .bind(created_at_dt.to_rfc3339())
+    .execute(&mut *tx.tx)
+    .await
+    .map_err(map_constraint)?;
+    insert_message_attachments(&mut tx.tx, &canonical_message_id.0, &content).await?;
+    sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+        .bind(created_at_dt.to_rfc3339())
+        .bind(&turn.conversation.0)
+        .execute(&mut *tx.tx)
+        .await?;
+    if has_message_fts_tx(tx).await? {
+        let message = Message {
+            message_id: canonical_message_id.0.clone(),
+            conversation_id: turn.conversation.0.clone(),
+            sequence_id,
+            message_type: content.message_type(),
+            content: content.clone(),
+            display_data: display_data.clone(),
+            usage_data: None,
+            created_at: created_at_dt,
+        };
+        crate::retrieval::fts_upsert_conn(&mut tx.tx, &message).await?;
+        Ok(message)
+    } else {
+        Ok(Message {
+            message_id: canonical_message_id.0.clone(),
+            conversation_id: turn.conversation.0.clone(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data,
+            usage_data: None,
+            created_at: created_at_dt,
+        })
+    }
+}
+
+async fn load_message_by_id_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: &str,
+) -> DbResult<Message> {
+    let row = sqlx::query(
+        "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+         FROM messages WHERE message_id = ?1",
+    )
+    .bind(message_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| {
+        if matches!(e, sqlx::Error::RowNotFound) {
+            DbError::MessageNotFound(message_id.to_string())
+        } else {
+            DbError::Sqlx(e)
+        }
+    })?;
+    let mut message = crate::parse_message_row(row).map_err(DbError::Sqlx)?;
+    let files = sqlx::query(
+        "SELECT original_name, media_type, size_bytes, stored_path
+         FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
+    )
+    .bind(message_id)
+    .map(
+        |row: sqlx::sqlite::SqliteRow| phoenix_core::domain::db_schema::FileAttachment {
+            original_name: row.get("original_name"),
+            media_type: row.get("media_type"),
+            size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
+            stored_path: row.get("stored_path"),
+        },
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let images =
+        if matches!(
+            message.message_type,
+            phoenix_core::domain::db_schema::MessageType::User
+        ) {
+            sqlx::query(
+            "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
+        )
+        .bind(message_id)
+        .map(|row: sqlx::sqlite::SqliteRow| phoenix_core::domain::db_schema::ImageData {
+            data: row.get("data"),
+            media_type: row.get("media_type"),
+        })
+        .fetch_all(&mut **tx)
+        .await?
+        } else {
+            Vec::new()
+        };
+    message.content.set_attachments(images, files);
+    Ok(message)
+}
+
+fn verify_existing_materialized_message(
+    message: &Message,
+    turn: &DurableTurn,
+    prepared: &PreparedDirectTurnPayload,
+    sequence_id: i64,
+    created_at: Timestamp,
+) -> DbResult<()> {
+    if message.conversation_id != turn.conversation.0
+        || message.sequence_id != sequence_id
+        || message.created_at != timestamp_to_datetime(created_at)
+    {
+        return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+    }
+    let (expected_content, expected_display) = prepared.message_content_and_display_data();
+    if message.content != expected_content || message.display_data != expected_display {
+        return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+    }
+    Ok(())
+}
+
+async fn has_message_fts_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<bool> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'message_fts'",
+    )
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    Ok(exists > 0)
+}
+
+async fn insert_message_attachments(
+    conn: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: &str,
+    content: &MessageContent,
+) -> DbResult<()> {
+    let (images, files) = content.attachments();
+    for (ordinal, file) in files.iter().enumerate() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO message_files
+             (message_id, ordinal, original_name, media_type, size_bytes, stored_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(message_id)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(&file.original_name)
+        .bind(&file.media_type)
+        .bind(i64::try_from(file.size_bytes).unwrap_or(i64::MAX))
+        .bind(&file.stored_path)
+        .execute(&mut **conn)
+        .await?;
+    }
+    for (ordinal, image) in images.iter().enumerate() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO message_images (message_id, ordinal, media_type, data)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(message_id)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(&image.media_type)
+        .bind(&image.data)
+        .execute(&mut **conn)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn load_live_attempt_tx(
@@ -1013,21 +1325,6 @@ fn to_u64(value: i64, field: &str) -> DbResult<u64> {
     u64::try_from(value).map_err(|_| DbError::Serialization(format!("negative {field}")))
 }
 
-async fn finish_raw_transaction_at_cut(
-    tx: sqlx::Transaction<'_, sqlx::Sqlite>,
-    cut: TransactionCut,
-) -> DbResult<()> {
-    if cut == TransactionCut::BeforeCommit {
-        tx.rollback().await?;
-        return Err(injected_cut(cut));
-    }
-    tx.commit().await?;
-    if cut == TransactionCut::AfterCommit {
-        return Err(injected_cut(cut));
-    }
-    Ok(())
-}
-
 async fn finish_workflow_transaction_at_cut(
     tx: super::WorkflowTx<'_>,
     cut: TransactionCut,
@@ -1079,19 +1376,6 @@ mod tests {
         WorkflowRepository::new(db.pool().clone())
     }
 
-    async fn insert_message(repo: &WorkflowRepository, conversation: &str, message_id: &str) {
-        sqlx::query(
-            "INSERT INTO messages (
-                message_id, conversation_id, sequence_id, message_type, content, created_at
-             ) VALUES (?1, ?2, 1, 'user', '{}', '2026-01-01T00:00:00Z')",
-        )
-        .bind(message_id)
-        .bind(conversation)
-        .execute(&repo.pool)
-        .await
-        .unwrap();
-    }
-
     fn input(conversation: &str, key: &str, seed: u8) -> AcceptAuthoritativeTurn {
         input_with_disposition(conversation, key, seed, AcceptedDisposition::Runtime)
     }
@@ -1105,7 +1389,7 @@ mod tests {
         AcceptAuthoritativeTurn {
             conversation: ConversationAuthority(conversation.to_string()),
             client_key: ClientTurnKey::new(key).unwrap(),
-            prepared: PreparedTurn::from_exact_payload(vec![seed]),
+            prepared: prepared_turn(&format!("message-{conversation}-{key}")),
             disposition,
             accepted_at: phoenix_workflow::Timestamp(u64::from(seed)),
         }
@@ -1158,6 +1442,24 @@ mod tests {
         }
     }
 
+    fn prepared_payload(message_id: &str) -> PreparedDirectTurnPayload {
+        PreparedDirectTurnPayload {
+            text: format!("text-{message_id}"),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: message_id.to_string(),
+            user_agent: Some("agent/test".to_string()),
+            skill_invocation: None,
+        }
+    }
+
+    fn prepared_turn(message_id: &str) -> PreparedTurn {
+        PreparedTurn::from_exact_payload(
+            serde_json::to_vec(&prepared_payload(message_id)).unwrap(),
+        )
+    }
+
     fn materialize_input(
         authority: LocalAttemptAuthority,
         receipt_id: u64,
@@ -1167,9 +1469,11 @@ mod tests {
     ) -> MaterializeAuthoritativeTurnInput {
         MaterializeAuthoritativeTurnInput {
             authority,
+            prepared: prepared_payload(message_id),
             receipt_id: ReceiptId(receipt_id),
             delivery_id: DeliveryId(delivery_id),
-            message_id: CanonicalMessageId(message_id.to_string()),
+            sequence_id: i64::try_from(now).unwrap(),
+            created_at: Timestamp(now),
             now: Timestamp(now),
         }
     }
@@ -1227,8 +1531,7 @@ mod tests {
             .await
             .unwrap();
         let authority = claim.authority.unwrap();
-        let message = CanonicalMessageId("message-before".to_string());
-        insert_message(&before_repo, "conv-a", &message.0).await;
+        let message = CanonicalMessageId("message-conv-a-materialize-before".to_string());
         assert!(before_repo
             .materialize_authoritative_turn_at_cut(
                 &materialize_input(authority.clone(), 1, 1, &message.0, 10),
@@ -1263,8 +1566,7 @@ mod tests {
             .await
             .unwrap();
         let authority = claim.authority.unwrap();
-        let message = CanonicalMessageId("message-after".to_string());
-        insert_message(&after_repo, "conv-a", &message.0).await;
+        let message = CanonicalMessageId("message-conv-a-materialize-after".to_string());
         assert!(after_repo
             .materialize_authoritative_turn_at_cut(
                 &materialize_input(authority.clone(), 1, 1, &message.0, 11),
@@ -1847,13 +2149,12 @@ mod tests {
             .await
             .unwrap();
         let authority = claim.authority.unwrap();
-        insert_message(&repo, "conv-a", "message-phase3").await;
         let first = repo
             .materialize_authoritative_turn(&materialize_input(
                 authority.clone(),
                 10,
                 10,
-                "message-phase3",
+                "message-conv-a-materialize-phase3",
                 50,
             ))
             .await
@@ -1865,7 +2166,7 @@ mod tests {
                 authority.clone(),
                 11,
                 11,
-                "message-phase3",
+                "message-conv-a-materialize-phase3",
                 50,
             ))
             .await
