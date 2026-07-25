@@ -1,11 +1,16 @@
 use super::WorkflowRepository;
 use crate::{DbError, DbResult};
 use phoenix_workflow::{
-    AcceptedDisposition, CanonicalMessageId, ClientTurnKey, ConversationAuthority, DurableTurn,
+    direct_turn_profile, AcceptedDisposition, CanonicalMessageId, ClientTurnKey,
+    ConversationAuthority, DurableTurn, EffectRole, EffectStatus, ExecutionCapability, Generation,
     Materialization, PreparedTurn, TurnAuthorityId, TurnCommand, TurnConflict, TurnLifecycle,
-    TurnOutcome, TurnStep, TurnTerminal,
+    TurnOutcome, TurnStep, TurnTerminal, Version, WorkflowId, WorkflowStatus,
 };
 use sqlx::Row;
+
+use super::{
+    CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, LocalCodec, LocalEffectDecl,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransactionCut {
@@ -14,12 +19,16 @@ enum TransactionCut {
     AfterCommit,
 }
 
+const DIRECT_TURN_TRANSITION_ID: u64 = 1;
+const DIRECT_TURN_EFFECT_ID: u64 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptAuthoritativeTurn {
     pub conversation: ConversationAuthority,
     pub client_key: ClientTurnKey,
     pub prepared: PreparedTurn,
     pub disposition: AcceptedDisposition,
+    pub accepted_at: phoenix_workflow::Timestamp,
 }
 
 impl WorkflowRepository {
@@ -36,9 +45,9 @@ impl WorkflowRepository {
         input: &AcceptAuthoritativeTurn,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_tx().await?;
         if let Some(existing) =
-            load_by_scoped_key(&mut tx, &input.conversation, &input.client_key).await?
+            load_by_scoped_key(&mut tx.tx, &input.conversation, &input.client_key).await?
         {
             tx.rollback().await?;
             if existing.prepared != input.prepared
@@ -61,7 +70,7 @@ impl WorkflowRepository {
                 "SELECT turn_id FROM durable_turns WHERE conversation_id = ?1 AND owns_conversation = 1",
             )
             .bind(&input.conversation.0)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *tx.tx)
             .await?
             {
                 tx.rollback().await?;
@@ -72,16 +81,18 @@ impl WorkflowRepository {
         }
         let next_id =
             sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns")
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut *tx.tx)
                 .await?;
         let turn_id = TurnAuthorityId(to_u64(next_id, "turn_id")?);
+        let workflow_id = next_global_workflow_id_tx(&mut tx).await?;
+        insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
         sqlx::query(
             "INSERT INTO durable_turns (
                 turn_id, conversation_id, client_turn_key, prepared_fingerprint,
                 prepared_payload, disposition, generation, terminal_kind,
-                terminal_reason, owns_conversation, canonical_message_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL)",
+                terminal_reason, owns_conversation, canonical_message_id, workflow_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL, ?8)",
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(&input.conversation.0)
@@ -90,7 +101,8 @@ impl WorkflowRepository {
         .bind(&input.prepared.payload)
         .bind(disposition)
         .bind(i64::from(input.disposition == AcceptedDisposition::Runtime))
-        .execute(&mut *tx)
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .execute(&mut *tx.tx)
         .await
         .map_err(map_constraint)?;
         if cut == TransactionCut::BeforeCommit {
@@ -122,6 +134,44 @@ impl WorkflowRepository {
             .fetch_optional(&self.pool)
             .await?;
         row.map(row_to_turn).transpose()
+    }
+
+    pub async fn workflow_id_for_turn(
+        &self,
+        turn_id: TurnAuthorityId,
+    ) -> DbResult<Option<WorkflowId>> {
+        let workflow_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT workflow_id FROM durable_turns WHERE turn_id = ?1",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        workflow_id
+            .map(|value| to_u64(value, "workflow_id").map(WorkflowId))
+            .transpose()
+    }
+
+    pub async fn list_discoverable_accepted_turns(
+        &self,
+        conversation: &ConversationAuthority,
+    ) -> DbResult<Vec<(TurnAuthorityId, WorkflowId)>> {
+        let rows = sqlx::query(
+            "SELECT turn_id, workflow_id FROM durable_turns
+             WHERE conversation_id = ?1 AND terminal_kind IS NULL AND workflow_id IS NOT NULL
+             ORDER BY turn_id",
+        )
+        .bind(&conversation.0)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
+                    WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
+                ))
+            })
+            .collect()
     }
 
     pub async fn materialize_authoritative_turn(
@@ -221,6 +271,102 @@ impl WorkflowRepository {
         }
         tx.commit().await?;
         Ok(step)
+    }
+}
+
+async fn next_global_workflow_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<WorkflowId> {
+    let next =
+        sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(workflow_id), 0) + 1 FROM workflows")
+            .fetch_one(&mut *tx.tx)
+            .await?;
+    Ok(WorkflowId(to_u64(next, "workflow_id")?))
+}
+
+async fn insert_direct_turn_workflow_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    turn_id: TurnAuthorityId,
+    input: &AcceptAuthoritativeTurn,
+) -> DbResult<()> {
+    let snapshot = direct_turn_profile::DirectTurnSnapshot { turn_id: turn_id.0 };
+    let intent = direct_turn_profile::RuntimeTurnIntent {
+        turn_id: turn_id.0,
+        conversation_id: input.conversation.0.clone(),
+        client_turn_key: input.client_key.0.clone(),
+        prepared_fingerprint: input.prepared.fingerprint.clone(),
+    };
+    let create = CreateWorkflowWithExternalAcceptance {
+        workflow_id,
+        profile: direct_turn_profile::profile(),
+        acceptance: direct_turn_profile::acceptance_profile().erase(),
+        target_scope: phoenix_workflow::ScopeId::new(format!("direct-turn:{}", turn_id.0))
+            .ok_or_else(|| DbError::Serialization("empty direct-turn scope".to_string()))?,
+        idempotency_key: phoenix_workflow::NonEmptyExternalKey::new(format!(
+            "turn:{}:{}",
+            input.conversation.0, input.client_key.0
+        ))
+        .ok_or_else(|| DbError::Serialization("empty direct-turn key".to_string()))?,
+        intent_fingerprint: input.prepared.fingerprint.clone(),
+        snapshot_codec: direct_turn_profile::snapshot_codec(),
+        snapshot_payload: serde_json::to_vec(&snapshot)
+            .map_err(|e| DbError::Serialization(format!("encode direct-turn snapshot: {e}")))?,
+        receipt_handle: turn_id.0.to_string().into_bytes(),
+        disposition_handle: workflow_id.0.to_string().into_bytes(),
+        now: input.accepted_at,
+    };
+    tx.insert_workflow(&create).await?;
+    let plan = CommitTransitionPlanCas {
+        workflow_id,
+        expected_version: Version(0),
+        transition_id: phoenix_workflow::TransitionId(DIRECT_TURN_TRANSITION_ID),
+        generation: Generation(0),
+        next_status: WorkflowStatus::Active,
+        event_codec: local_codec(&direct_turn_profile::event_codec()),
+        event_payload: serde_json::to_vec(&direct_turn_profile::DirectTurnEvent::Accepted)
+            .map_err(|e| DbError::Serialization(format!("encode direct-turn event: {e}")))?,
+        next_snapshot_codec: local_codec(&direct_turn_profile::snapshot_codec()),
+        next_snapshot_payload: serde_json::to_vec(&snapshot)
+            .map_err(|e| DbError::Serialization(format!("encode direct-turn snapshot: {e}")))?,
+        committed_at: input.accepted_at,
+        effects: vec![LocalEffectDecl {
+            effect_id: phoenix_workflow::EffectId(DIRECT_TURN_EFFECT_ID),
+            declared_workflow_version: Version(1),
+            family: "direct_turn.delivery".to_string(),
+            kind: match input.disposition {
+                AcceptedDisposition::Runtime => "deliver_runtime_turn",
+                AcceptedDisposition::Steering => "enqueue_steering_turn",
+            }
+            .to_string(),
+            intent_codec: local_codec(&direct_turn_profile::intent_codec()),
+            intent_payload: serde_json::to_vec(&intent)
+                .map_err(|e| DbError::Serialization(format!("encode direct-turn intent: {e}")))?,
+            generation: Generation(0),
+            role: EffectRole::Required,
+            capability: ExecutionCapability::ReclaimableObservation,
+            next_eligible_at: None,
+            destructive_resource: None,
+            status: EffectStatus::Eligible,
+        }],
+        dependencies: vec![],
+        barriers: vec![],
+        barrier_members: vec![],
+        deliveries: vec![],
+        schedules: vec![],
+    };
+    match tx.commit_transition_plan(&plan).await? {
+        phoenix_workflow::CommitOutcome::Committed => Ok(()),
+        other @ (phoenix_workflow::CommitOutcome::VersionConflict
+        | phoenix_workflow::CommitOutcome::InvalidPlan
+        | phoenix_workflow::CommitOutcome::UnsupportedCodec) => Err(DbError::Serialization(
+            format!("direct-turn transition was rejected: {other:?}"),
+        )),
+    }
+}
+
+fn local_codec(codec: &phoenix_workflow::CodecRef) -> LocalCodec {
+    LocalCodec {
+        family: codec.family.to_string(),
+        version: codec.version,
     }
 }
 
@@ -351,6 +497,7 @@ mod tests {
                 payload: vec![seed],
             },
             disposition: AcceptedDisposition::Runtime,
+            accepted_at: phoenix_workflow::Timestamp(u64::from(seed)),
         }
     }
 
@@ -397,6 +544,13 @@ mod tests {
         let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        assert_eq!(
+            repo.list_discoverable_accepted_turns(&ConversationAuthority("conv-a".to_string()))
+                .await
+                .unwrap(),
+            vec![(turn_id, workflow_id)]
+        );
         assert!(matches!(
             repo.accept_authoritative_turn(&input("conv-a", "same", 1))
                 .await
@@ -422,5 +576,33 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "other", 2))
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn accept_creates_atomic_workflow_child_effect_and_relation() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "runtime", 9))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+
+        let effect_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = 1 AND status = 'Eligible'",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(effect_count, 1);
+
+        let discoverable = repo
+            .list_discoverable_accepted_turns(&ConversationAuthority("conv-a".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(discoverable, vec![(turn_id, workflow_id)]);
     }
 }
