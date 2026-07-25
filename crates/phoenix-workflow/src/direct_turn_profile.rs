@@ -21,6 +21,19 @@ pub struct DirectTurnSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectTurnEvent {
     Accepted,
+    Terminal(DirectTurnTerminalEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnTerminalEvent {
+    pub terminal: DirectTurnTerminalKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectTurnTerminalKind {
+    Completed,
+    Cancelled,
+    Failed { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

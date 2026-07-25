@@ -62,6 +62,11 @@ impl PreparedTurn {
         }
     }
 
+    /// Rehydrates persisted prepared semantics after validating their checksum.
+    ///
+    /// # Errors
+    /// Returns [`TurnConflict::CorruptAggregate`] when the persisted fingerprint
+    /// does not match the exact payload bytes.
     pub fn rehydrate(fingerprint: String, payload: Vec<u8>) -> Result<Self, TurnConflict> {
         if fingerprint != sha256_hex(&payload) {
             return Err(TurnConflict::CorruptAggregate(
@@ -475,22 +480,22 @@ impl DurableTurnModel {
             disposition,
         } = &turn.lifecycle
         {
-            if turn.generation == expected_generation.saturating_add(1) && stored == &terminal {
-                return Ok(TurnStep {
-                    outcome: TurnOutcome::TerminalReplay {
-                        generation: turn.generation,
-                        terminal,
-                        disposition: *disposition,
-                    },
-                    owed_effects: Vec::new(),
-                });
+            if turn.generation == expected_generation.saturating_add(1) {
+                if stored == &terminal {
+                    return Ok(TurnStep {
+                        outcome: TurnOutcome::TerminalReplay {
+                            generation: turn.generation,
+                            terminal,
+                            disposition: *disposition,
+                        },
+                        owed_effects: Vec::new(),
+                    });
+                }
+                return Err(TurnConflict::AlreadyTerminal);
             }
-            if turn.generation != expected_generation {
-                return Err(TurnConflict::StaleGeneration {
-                    actual: turn.generation,
-                });
-            }
-            return Err(TurnConflict::AlreadyTerminal);
+            return Err(TurnConflict::StaleGeneration {
+                actual: turn.generation,
+            });
         }
         if turn.generation != expected_generation {
             return Err(TurnConflict::StaleGeneration {

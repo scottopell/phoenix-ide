@@ -19,7 +19,8 @@ enum TransactionCut {
     AfterCommit,
 }
 
-const DIRECT_TURN_TRANSITION_ID: u64 = 1;
+const DIRECT_TURN_ACCEPTED_TRANSITION_ID: u64 = 1;
+const DIRECT_TURN_TERMINAL_TRANSITION_ID: u64 = 2;
 const DIRECT_TURN_EFFECT_ID: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +274,11 @@ impl WorkflowRepository {
             .await?
             .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
         let turn = row_to_turn(row)?;
+        let workflow_id = workflow_id_for_turn_tx(&mut tx.tx, turn_id).await?;
+        let head = tx
+            .fetch_workflow_head(workflow_id)
+            .await?
+            .ok_or_else(|| DbError::Serialization("direct-turn workflow missing".to_string()))?;
         let mut model =
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model.apply(command).map_err(conflict)?;
@@ -281,6 +287,40 @@ impl WorkflowRepository {
             return Ok(step);
         }
         let (terminal_kind, reason) = terminal_sql(&terminal);
+        let next_generation = expected_generation.saturating_add(1);
+        let snapshot = direct_turn_profile::DirectTurnSnapshot { turn_id: turn_id.0 };
+        let terminal_event = direct_turn_profile::DirectTurnEvent::Terminal(
+            direct_turn_profile::DirectTurnTerminalEvent {
+                terminal: terminal_event_kind(&terminal),
+            },
+        );
+        let event_codec = local_codec(&direct_turn_profile::event_codec());
+        let snapshot_codec = local_codec(&direct_turn_profile::snapshot_codec());
+        let event_payload = serde_json::to_vec(&terminal_event).map_err(|e| {
+            DbError::Serialization(format!("encode direct-turn terminal event: {e}"))
+        })?;
+        let snapshot_payload = serde_json::to_vec(&snapshot)
+            .map_err(|e| DbError::Serialization(format!("encode direct-turn snapshot: {e}")))?;
+        let committed = tx
+            .commit_transition_head_cas(
+                workflow_id,
+                head.version,
+                Generation(next_generation),
+                workflow_status_for_terminal(&terminal),
+                &event_codec,
+                &event_payload,
+                &snapshot_codec,
+                &snapshot_payload,
+                phoenix_workflow::TransitionId(DIRECT_TURN_TERMINAL_TRANSITION_ID),
+                phoenix_workflow::Timestamp(next_generation),
+            )
+            .await?;
+        if !committed {
+            tx.rollback().await?;
+            return Err(conflict(TurnConflict::StaleGeneration {
+                actual: turn.generation,
+            }));
+        }
         let updated = sqlx::query(
             "UPDATE durable_turns
              SET generation = generation + 1, terminal_kind = ?3,
@@ -299,17 +339,9 @@ impl WorkflowRepository {
                 actual: turn.generation,
             }));
         }
-        let workflow_id = workflow_id_for_turn_tx(&mut tx.tx, turn_id).await?;
+        mark_active_attempts_authority_lost_tx(&mut tx, workflow_id).await?;
+        delete_reclaimable_leases_tx(&mut tx, workflow_id).await?;
         tx.invalidate_nonterminal_effects(workflow_id).await?;
-        sqlx::query("UPDATE workflows SET generation = ?2, status = ?3 WHERE workflow_id = ?1")
-            .bind(to_i64(workflow_id.0, "workflow_id")?)
-            .bind(to_i64(expected_generation.saturating_add(1), "generation")?)
-            .bind(match terminal {
-                TurnTerminal::Completed => "Completed",
-                TurnTerminal::Cancelled | TurnTerminal::Failed { .. } => "Cancelled",
-            })
-            .execute(&mut *tx.tx)
-            .await?;
         finish_workflow_transaction_at_cut(tx, cut).await?;
         Ok(step)
     }
@@ -372,7 +404,7 @@ async fn insert_direct_turn_workflow_tx(
     let plan = CommitTransitionPlanCas {
         workflow_id,
         expected_version: Version(0),
-        transition_id: phoenix_workflow::TransitionId(DIRECT_TURN_TRANSITION_ID),
+        transition_id: phoenix_workflow::TransitionId(DIRECT_TURN_ACCEPTED_TRANSITION_ID),
         generation: Generation(0),
         next_status: WorkflowStatus::Active,
         event_codec: local_codec(&direct_turn_profile::event_codec()),
@@ -450,23 +482,44 @@ fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
         }
     };
     let terminal_kind = row.get::<Option<String>, _>("terminal_kind");
+    let terminal_reason = row.get::<Option<String>, _>("terminal_reason");
+    let owns_conversation = row.get::<bool, _>("owns_conversation");
     let lifecycle = match terminal_kind.as_deref() {
-        None => TurnLifecycle::Accepted { disposition },
-        Some("Completed") => TurnLifecycle::Terminal {
-            terminal: TurnTerminal::Completed,
-            disposition,
-        },
-        Some("Cancelled") => TurnLifecycle::Terminal {
-            terminal: TurnTerminal::Cancelled,
-            disposition,
-        },
+        None => {
+            if terminal_reason.is_some() {
+                return Err(DbError::Serialization(
+                    "non-terminal turn has terminal reason".to_string(),
+                ));
+            }
+            TurnLifecycle::Accepted { disposition }
+        }
+        Some("Completed") => {
+            if terminal_reason.is_some() {
+                return Err(DbError::Serialization(
+                    "completed turn must not have terminal reason".to_string(),
+                ));
+            }
+            TurnLifecycle::Terminal {
+                terminal: TurnTerminal::Completed,
+                disposition,
+            }
+        }
+        Some("Cancelled") => {
+            if terminal_reason.is_some() {
+                return Err(DbError::Serialization(
+                    "cancelled turn must not have terminal reason".to_string(),
+                ));
+            }
+            TurnLifecycle::Terminal {
+                terminal: TurnTerminal::Cancelled,
+                disposition,
+            }
+        }
         Some("Failed") => TurnLifecycle::Terminal {
             terminal: TurnTerminal::Failed {
-                reason: row
-                    .get::<Option<String>, _>("terminal_reason")
-                    .ok_or_else(|| {
-                        DbError::Serialization("failed turn missing reason".to_string())
-                    })?,
+                reason: terminal_reason.ok_or_else(|| {
+                    DbError::Serialization("failed turn missing reason".to_string())
+                })?,
             },
             disposition,
         },
@@ -476,6 +529,17 @@ fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
             )))
         }
     };
+    let expected_owns_conversation = matches!(
+        lifecycle,
+        TurnLifecycle::Accepted {
+            disposition: AcceptedDisposition::Runtime
+        }
+    );
+    if owns_conversation != expected_owns_conversation {
+        return Err(DbError::Serialization(
+            "owns_conversation disagrees with turn lifecycle".to_string(),
+        ));
+    }
     Ok(DurableTurn {
         id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
         conversation: ConversationAuthority(row.get("conversation_id")),
@@ -510,6 +574,50 @@ fn terminal_sql(terminal: &TurnTerminal) -> (&'static str, Option<&str>) {
         TurnTerminal::Cancelled => ("Cancelled", None),
         TurnTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
     }
+}
+
+fn workflow_status_for_terminal(terminal: &TurnTerminal) -> WorkflowStatus {
+    match terminal {
+        TurnTerminal::Completed => WorkflowStatus::Completed,
+        TurnTerminal::Cancelled => WorkflowStatus::Cancelled,
+        TurnTerminal::Failed { .. } => WorkflowStatus::Failed,
+    }
+}
+
+fn terminal_event_kind(terminal: &TurnTerminal) -> direct_turn_profile::DirectTurnTerminalKind {
+    match terminal {
+        TurnTerminal::Completed => direct_turn_profile::DirectTurnTerminalKind::Completed,
+        TurnTerminal::Cancelled => direct_turn_profile::DirectTurnTerminalKind::Cancelled,
+        TurnTerminal::Failed { reason } => direct_turn_profile::DirectTurnTerminalKind::Failed {
+            reason: reason.clone(),
+        },
+    }
+}
+
+async fn mark_active_attempts_authority_lost_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE workflow_attempts
+         SET status = 'AuthorityLost'
+         WHERE workflow_id = ?1 AND status IN ('Begun', 'ObservationRecorded')",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .execute(&mut *tx.tx)
+    .await?;
+    Ok(())
+}
+
+async fn delete_reclaimable_leases_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<()> {
+    sqlx::query("DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1")
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+    Ok(())
 }
 
 fn to_i64(value: u64, field: &str) -> DbResult<i64> {
@@ -606,6 +714,39 @@ mod tests {
             disposition: AcceptedDisposition::Runtime,
             accepted_at: phoenix_workflow::Timestamp(u64::from(seed)),
         }
+    }
+
+    async fn created_turn(
+        repo: &WorkflowRepository,
+        key: &str,
+        seed: u8,
+    ) -> (TurnAuthorityId, WorkflowId) {
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", key, seed))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        (turn_id, workflow_id)
+    }
+
+    async fn workflow_status_version_generation_transition_count(
+        repo: &WorkflowRepository,
+        workflow_id: WorkflowId,
+    ) -> (String, i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT w.status, w.version, w.generation, COUNT(t.transition_id)
+             FROM workflows w
+             LEFT JOIN workflow_transitions t ON t.workflow_id = w.workflow_id
+             WHERE w.workflow_id = ?1
+             GROUP BY w.workflow_id",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -757,6 +898,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_cas_advances_status_version_generation_and_transition_rows() {
+        for (key, command, expected_status, expected_terminal) in [
+            (
+                "complete-status",
+                TurnCommand::Complete {
+                    turn_id: TurnAuthorityId(0),
+                    expected_generation: 0,
+                },
+                "Completed",
+                TurnTerminal::Completed,
+            ),
+            (
+                "cancel-status",
+                TurnCommand::Cancel {
+                    turn_id: TurnAuthorityId(0),
+                    expected_generation: 0,
+                },
+                "Cancelled",
+                TurnTerminal::Cancelled,
+            ),
+            (
+                "fail-status",
+                TurnCommand::Fail {
+                    turn_id: TurnAuthorityId(0),
+                    expected_generation: 0,
+                    reason: "boom".to_string(),
+                },
+                "Failed",
+                TurnTerminal::Failed {
+                    reason: "boom".to_string(),
+                },
+            ),
+        ] {
+            let repo = repo().await;
+            let (turn_id, workflow_id) = created_turn(&repo, key, 12).await;
+            let command = match command {
+                TurnCommand::Complete { .. } => TurnCommand::Complete {
+                    turn_id,
+                    expected_generation: 0,
+                },
+                TurnCommand::Cancel { .. } => TurnCommand::Cancel {
+                    turn_id,
+                    expected_generation: 0,
+                },
+                TurnCommand::Fail { reason, .. } => TurnCommand::Fail {
+                    turn_id,
+                    expected_generation: 0,
+                    reason,
+                },
+                TurnCommand::Accept { .. } | TurnCommand::Materialize { .. } => unreachable!(),
+            };
+            let step = repo.terminate_authoritative_turn(command).await.unwrap();
+            assert_eq!(
+                step.outcome,
+                TurnOutcome::Terminal {
+                    generation: 1,
+                    terminal: expected_terminal,
+                    disposition: AcceptedDisposition::Runtime,
+                }
+            );
+            assert_eq!(
+                workflow_status_version_generation_transition_count(&repo, workflow_id).await,
+                (expected_status.to_string(), 2, 1, 2)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn repository_refines_scoped_accept_replay_and_owner_release() {
         let repo = repo().await;
         let created = repo
@@ -854,6 +1063,173 @@ mod tests {
             })
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_exact_reason_replays_and_different_reason_conflicts() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "failed-replay", 13).await;
+        repo.terminate_authoritative_turn(TurnCommand::Fail {
+            turn_id,
+            expected_generation: 0,
+            reason: "exact".to_string(),
+        })
+        .await
+        .unwrap();
+        let replay = repo
+            .terminate_authoritative_turn(TurnCommand::Fail {
+                turn_id,
+                expected_generation: 0,
+                reason: "exact".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.outcome,
+            TurnOutcome::TerminalReplay {
+                generation: 1,
+                terminal: TurnTerminal::Failed {
+                    reason: "exact".to_string(),
+                },
+                disposition: AcceptedDisposition::Runtime,
+            }
+        );
+        assert!(repo
+            .terminate_authoritative_turn(TurnCommand::Fail {
+                turn_id,
+                expected_generation: 0,
+                reason: "different".to_string(),
+            })
+            .await
+            .is_err());
+        assert_eq!(
+            workflow_status_version_generation_transition_count(&repo, workflow_id).await,
+            ("Failed".to_string(), 2, 1, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn after_commit_terminal_retry_replays_without_second_write() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "terminal-after-replay", 14).await;
+        assert!(repo
+            .terminate_authoritative_turn_at_cut(
+                TurnCommand::Complete {
+                    turn_id,
+                    expected_generation: 0,
+                },
+                TransactionCut::AfterCommit,
+            )
+            .await
+            .is_err());
+        let retry = repo
+            .terminate_authoritative_turn(TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(retry.outcome, TurnOutcome::TerminalReplay { .. }));
+        assert_eq!(
+            workflow_status_version_generation_transition_count(&repo, workflow_id).await,
+            ("Completed".to_string(), 2, 1, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cas_marks_active_attempts_authority_lost_removes_lease_and_invalidates_effect(
+    ) {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "authority-lost", 15).await;
+        let attempt = repo
+            .begin_attempt(&crate::workflow::BeginAttemptInput {
+                workflow_id,
+                effect_id: phoenix_workflow::EffectId(DIRECT_TURN_EFFECT_ID),
+                attempt_id: phoenix_workflow::AttemptId(77),
+                process_incarnation: phoenix_workflow::ProcessIncarnation(1),
+                now: phoenix_workflow::Timestamp(1),
+                lease_until: Some(phoenix_workflow::LeaseExpiry(99)),
+            })
+            .await
+            .unwrap();
+        let authority = attempt.authority.unwrap();
+        repo.record_observation(&crate::workflow::RecordObservationInput {
+            authority,
+            observation_id: 1,
+            now: phoenix_workflow::Timestamp(2),
+            observed_at: phoenix_workflow::Timestamp(2),
+            observation_codec: local_codec(&direct_turn_profile::intent_codec()),
+            observation_payload: b"{}".to_vec(),
+        })
+        .await
+        .unwrap();
+        repo.terminate_authoritative_turn(TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+        let (attempt_status, lease_count, effect_status): (String, i64, String) = sqlx::query_as(
+            "SELECT a.status,
+                    (SELECT COUNT(*) FROM workflow_reclaimable_leases l WHERE l.workflow_id = a.workflow_id),
+                    e.status
+             FROM workflow_attempts a
+             JOIN workflow_effects e ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id
+             WHERE a.workflow_id = ?1 AND a.attempt_id = ?2",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .bind(77_i64)
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(attempt_status, "AuthorityLost");
+        assert_eq!(lease_count, 0);
+        assert_eq!(effect_status, "Invalidated");
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_allows_single_winner_and_loser_replays() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "concurrent-terminal", 16).await;
+        let left_repo = repo.clone();
+        let right_repo = repo.clone();
+        let left = tokio::spawn(async move {
+            left_repo
+                .terminate_authoritative_turn(TurnCommand::Cancel {
+                    turn_id,
+                    expected_generation: 0,
+                })
+                .await
+                .unwrap()
+        });
+        let right = tokio::spawn(async move {
+            right_repo
+                .terminate_authoritative_turn(TurnCommand::Cancel {
+                    turn_id,
+                    expected_generation: 0,
+                })
+                .await
+                .unwrap()
+        });
+        let outcomes = [left.await.unwrap().outcome, right.await.unwrap().outcome];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, TurnOutcome::Terminal { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, TurnOutcome::TerminalReplay { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            workflow_status_version_generation_transition_count(&repo, workflow_id).await,
+            ("Cancelled".to_string(), 2, 1, 2)
+        );
     }
 
     #[tokio::test]
