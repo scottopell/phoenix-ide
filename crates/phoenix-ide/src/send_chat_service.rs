@@ -73,6 +73,8 @@ pub(crate) struct SendChatApplicationService {
     runtime: Arc<RuntimeManager>,
 }
 
+const MAX_STEER_QUEUE_DEPTH: usize = 5;
+
 impl SendChatApplicationService {
     pub(crate) fn new(db: crate::db::Database, runtime: Arc<RuntimeManager>) -> Self {
         Self { db, runtime }
@@ -126,13 +128,6 @@ impl SendChatApplicationService {
                 code: "target_unavailable",
             });
         }
-        let steering_queue = self
-            .runtime
-            .db()
-            .get_steering_queue(&req.conversation_id)
-            .await
-            .map_err(map_conversation_load_error)?;
-
         {
             let mut receipts = self.runtime.lock_steering_acceptance().await;
             if let Some(receipt) = receipts.get(&req.message_id) {
@@ -159,15 +154,6 @@ impl SendChatApplicationService {
                 err,
                 TransitionError::AgentBusy | TransitionError::CancellationInProgress
             ) {
-                const MAX_STEER_QUEUE_DEPTH: usize = 5;
-                if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
-                    return Ok(SendChatOutcome::Rejected {
-                        message:
-                            "Steering queue is full; try again once a queued message has been delivered."
-                                .to_string(),
-                        code: "steering_queue_full",
-                    });
-                }
                 let validated_files = validate_files(&req).await?;
                 let expanded = expand_request(&self.db, &conversation, &req).await?;
                 let event = Event::SteerMessage {
@@ -194,6 +180,19 @@ impl SendChatApplicationService {
                         }
                         receipts.remove(&req.message_id);
                         return Ok(SendChatOutcome::QueuedAsSteering);
+                    }
+                    let steering_queue = self
+                        .runtime
+                        .db()
+                        .get_steering_queue(&req.conversation_id)
+                        .await
+                        .map_err(map_conversation_load_error)?;
+                    if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
+                        return Ok(SendChatOutcome::Rejected {
+                            message: "Steering queue is full; try again once a queued message has been delivered."
+                                .to_string(),
+                            code: "steering_queue_full",
+                        });
                     }
                     self.runtime
                         .enqueue_steer_message(&conversation.id, event)
