@@ -139,8 +139,6 @@ pub enum DbError {
     /// from the idempotent no-op case (same child id), which returns `Ok`.
     #[error("Fork proposal conflict: {0}")]
     ForkProposalConflict(String),
-    #[error("Direct turn conflict: {0:?}")]
-    DirectTurnConflict(phoenix_workflow::TurnConflict),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
