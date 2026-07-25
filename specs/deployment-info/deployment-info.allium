@@ -102,6 +102,14 @@ entity ThermalGovernor {
 --   sample.pressure = elevated and sample.unavailable_reason = null.
 -- sample_is_unavailable(sample) -> Boolean
 --   sample.pressure = unavailable and sample.unavailable_reason != null.
+-- last_good_sample_exists(governor) -> Boolean
+--   The governor has retained a prior supported thermal sample.
+-- last_good_sample_is_stale(governor, sample) -> Boolean
+--   The retained supported sample is marked stale with the latest provider failure.
+-- policy_state_is_retained(governor) -> Boolean
+--   Provider unavailability does not discard the last actionable policy state.
+-- proposed_action_is_retained(governor) -> Boolean
+--   Provider unavailability does not discard the policy action associated with the retained state.
 -- raw_temperature_unavailable(sample) -> Boolean
 --   sample.raw_temperature_available = false.
 -- restoration_is_sustained_safe(governor, sample) -> Boolean
@@ -126,12 +134,22 @@ rule RawTemperatureUnavailableWithoutFabrication {
     ensures: ThermalGovernor{governor}.last_sample = sample
 }
 
-rule UnsupportedOrFailedProviderStaysUnavailable {
+rule UnavailableProviderWithoutLastGoodSampleStaysUnavailable {
     when: ThermalSampleObserved(governor, sample)
     requires: sample_is_unavailable(sample)
+    requires: not last_good_sample_exists(governor)
     ensures: ThermalGovernor{governor}.state = unavailable
     ensures: ThermalGovernor{governor}.last_sample = sample
     ensures: ThermalGovernor{governor}.proposed_action = no_proposed_action()
+}
+
+rule ProviderFailureRetainsLastGoodSampleAndPolicyObligation {
+    when: ThermalSampleObserved(governor, sample)
+    requires: sample_is_unavailable(sample)
+    requires: last_good_sample_exists(governor)
+    ensures: last_good_sample_is_stale(governor, sample)
+    ensures: policy_state_is_retained(governor)
+    ensures: proposed_action_is_retained(governor)
 }
 
 rule ObserveOnlyElevatedPressureProposesAction {

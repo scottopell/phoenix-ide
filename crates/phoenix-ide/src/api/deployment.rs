@@ -10,8 +10,8 @@
 //! yields current values.
 
 use super::resource_monitor::{
-    ResourceObservationGeneration, ThermalGovernorActionSample, ThermalGovernorStateSample,
-    ThermalObservationSample, ThermalPressureSample, ThermalProviderUnavailableReason,
+    ReportedThermalSample, ResourceObservationGeneration, ThermalGovernorActionSample,
+    ThermalGovernorStateSample, ThermalPressureSample, ThermalProviderUnavailableReason,
 };
 use super::AppState;
 use crate::api::installation_ownership::{self, InstallationOwnership};
@@ -158,7 +158,6 @@ pub struct AboutResourcesSnapshot {
 pub enum ThermalPressure {
     Nominal,
     Elevated,
-    Unavailable,
 }
 
 #[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,12 +202,26 @@ pub enum ThermalRawTemperature {
 }
 
 #[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "freshness", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ThermalSampleSnapshot {
-    pub pressure: ThermalPressure,
-    pub sampled_at: DateTime<Utc>,
-    pub unavailable_reason: Option<ThermalUnavailableReason>,
-    pub raw_temperature: ThermalRawTemperature,
+pub enum ThermalSampleSnapshot {
+    Fresh {
+        pressure: ThermalPressure,
+        sampled_at: DateTime<Utc>,
+        raw_temperature: ThermalRawTemperature,
+    },
+    Stale {
+        pressure: ThermalPressure,
+        sampled_at: DateTime<Utc>,
+        latest_attempted_at: DateTime<Utc>,
+        unavailable_reason: ThermalUnavailableReason,
+        raw_temperature: ThermalRawTemperature,
+    },
+    Unavailable {
+        attempted_at: DateTime<Utc>,
+        unavailable_reason: ThermalUnavailableReason,
+        raw_temperature: ThermalRawTemperature,
+    },
 }
 
 #[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
@@ -910,7 +923,7 @@ pub fn absolutize(path: &Path) -> PathBuf {
 fn thermal_snapshot_from_generation(
     generation: &ResourceObservationGeneration,
 ) -> ThermalGovernorSnapshot {
-    let last_sample = thermal_sample_snapshot(&generation.thermal);
+    let last_sample = thermal_sample_snapshot(generation.thermal_decision.reported_sample);
     let coverage = thermal_coverage_snapshot(generation);
     let state = match generation.thermal_decision.state {
         ThermalGovernorStateSample::Nominal => ThermalGovernorState::Nominal,
@@ -936,35 +949,53 @@ fn thermal_snapshot_from_generation(
     }
 }
 
-fn thermal_sample_snapshot(sample: &ThermalObservationSample) -> ThermalSampleSnapshot {
-    let (pressure, unavailable_reason) = match sample {
-        ThermalObservationSample::Available { pressure, .. } => (
-            match pressure {
-                ThermalPressureSample::Nominal => ThermalPressure::Nominal,
-                ThermalPressureSample::Elevated => ThermalPressure::Elevated,
-            },
-            None,
-        ),
-        ThermalObservationSample::Unavailable { reason, .. } => (
-            ThermalPressure::Unavailable,
-            Some(match reason {
-                ThermalProviderUnavailableReason::UnsupportedPlatform => {
-                    ThermalUnavailableReason::UnsupportedPlatform
-                }
-                ThermalProviderUnavailableReason::ProviderFailure => {
-                    ThermalUnavailableReason::ProviderFailure
-                }
-                ThermalProviderUnavailableReason::Unreadable => {
-                    ThermalUnavailableReason::Unreadable
-                }
-            }),
-        ),
-    };
-    ThermalSampleSnapshot {
-        pressure,
-        sampled_at: sample.sampled_at(),
-        unavailable_reason,
-        raw_temperature: ThermalRawTemperature::Unavailable,
+fn thermal_sample_snapshot(sample: ReportedThermalSample) -> ThermalSampleSnapshot {
+    fn pressure(value: ThermalPressureSample) -> ThermalPressure {
+        match value {
+            ThermalPressureSample::Nominal => ThermalPressure::Nominal,
+            ThermalPressureSample::Elevated => ThermalPressure::Elevated,
+        }
+    }
+    fn unavailable_reason(value: ThermalProviderUnavailableReason) -> ThermalUnavailableReason {
+        match value {
+            ThermalProviderUnavailableReason::UnsupportedPlatform => {
+                ThermalUnavailableReason::UnsupportedPlatform
+            }
+            ThermalProviderUnavailableReason::ProviderFailure => {
+                ThermalUnavailableReason::ProviderFailure
+            }
+            ThermalProviderUnavailableReason::Unreadable => ThermalUnavailableReason::Unreadable,
+        }
+    }
+    match sample {
+        ReportedThermalSample::Fresh {
+            pressure: value,
+            sampled_at,
+        } => ThermalSampleSnapshot::Fresh {
+            pressure: pressure(value),
+            sampled_at,
+            raw_temperature: ThermalRawTemperature::Unavailable,
+        },
+        ReportedThermalSample::Stale {
+            pressure: value,
+            sampled_at,
+            latest_attempted_at,
+            reason,
+        } => ThermalSampleSnapshot::Stale {
+            pressure: pressure(value),
+            sampled_at,
+            latest_attempted_at,
+            unavailable_reason: unavailable_reason(reason),
+            raw_temperature: ThermalRawTemperature::Unavailable,
+        },
+        ReportedThermalSample::Unavailable {
+            attempted_at,
+            reason,
+        } => ThermalSampleSnapshot::Unavailable {
+            attempted_at,
+            unavailable_reason: unavailable_reason(reason),
+            raw_temperature: ThermalRawTemperature::Unavailable,
+        },
     }
 }
 
@@ -1305,6 +1336,7 @@ impl DeploymentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::resource_monitor::ThermalObservationSample;
     use phoenix_core::domain::db_schema::ConvMode;
     use phoenix_core::domain::db_schema::NonEmptyString;
     use std::fs;
@@ -1383,6 +1415,21 @@ mod tests {
         handles: Vec<crate::api::resource_monitor::HandleObservationTarget>,
         observations: BTreeMap<u32, ProcessObservation>,
     ) -> ResourceObservationGeneration {
+        let reported_sample = match thermal {
+            ThermalObservationSample::Available {
+                pressure,
+                sampled_at,
+            } => ReportedThermalSample::Fresh {
+                pressure,
+                sampled_at,
+            },
+            ThermalObservationSample::Unavailable { reason, sampled_at } => {
+                ReportedThermalSample::Unavailable {
+                    attempted_at: sampled_at,
+                    reason,
+                }
+            }
+        };
         ResourceObservationGeneration {
             sampled_at: Utc::now(),
             host: HostResources {
@@ -1401,6 +1448,7 @@ mod tests {
             thermal_decision: crate::api::resource_monitor::ThermalGovernorDecisionSample {
                 state: ThermalGovernorStateSample::Elevated,
                 proposed_action: ThermalGovernorActionSample::Deprioritize,
+                reported_sample,
             },
             observations,
             api_pids,
@@ -1485,17 +1533,19 @@ mod tests {
 
     #[test]
     fn unavailable_provider_preserves_typed_unavailable_sample() {
-        let snapshot = thermal_sample_snapshot(&thermal_sample(
-            None,
-            Some(ThermalProviderUnavailableReason::UnsupportedPlatform),
-        ));
+        let snapshot = thermal_sample_snapshot(ReportedThermalSample::Unavailable {
+            attempted_at: Utc::now(),
+            reason: ThermalProviderUnavailableReason::UnsupportedPlatform,
+        });
 
-        assert_eq!(snapshot.pressure, ThermalPressure::Unavailable);
-        assert_eq!(
-            snapshot.unavailable_reason,
-            Some(ThermalUnavailableReason::UnsupportedPlatform)
-        );
-        assert_eq!(snapshot.raw_temperature, ThermalRawTemperature::Unavailable);
+        assert!(matches!(
+            snapshot,
+            ThermalSampleSnapshot::Unavailable {
+                unavailable_reason: ThermalUnavailableReason::UnsupportedPlatform,
+                raw_temperature: ThermalRawTemperature::Unavailable,
+                ..
+            }
+        ));
     }
 
     #[test]

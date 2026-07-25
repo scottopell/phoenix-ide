@@ -385,16 +385,28 @@ function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: ()
   const hostMemoryTotal: number | null = sample?.host.total_memory_bytes ?? null;
   const hostMemoryAvailable: number | null = sample?.host.available_memory_bytes ?? null;
 
-  const thermalPressure = sample?.thermal.last_sample.pressure;
+  const thermalSample = sample?.thermal.last_sample;
+  const thermalPressure = thermalSample?.freshness === 'unavailable' ? null : thermalSample?.pressure;
   const thermalStatus = thermalPressure === 'nominal'
     ? 'Nominal'
     : thermalPressure === 'elevated'
       ? 'Elevated pressure'
       : 'Unavailable';
-  const proposedThermalAction = sample?.thermal.proposed_action.kind === 'deprioritize'
-    ? 'Would lower scheduling priority'
-    : sample?.thermal.proposed_action.kind === 'restore'
-      ? 'Would restore scheduling priority'
+  const governorStatus = sample?.thermal.state === 'elevated'
+    ? 'Elevated policy'
+    : sample?.thermal.state === 'nominal'
+      ? 'Nominal policy'
+      : 'Unavailable';
+  const actionKind = sample?.thermal.proposed_action.kind;
+  const affectsTargets = sample?.thermal.proposed_action.affects_targets ?? false;
+  const proposedThermalAction = actionKind === 'deprioritize'
+    ? affectsTargets
+      ? 'Would lower scheduling priority'
+      : 'Deprioritization indicated, but no authoritative targets are covered'
+    : actionKind === 'restore'
+      ? affectsTargets
+        ? 'Would restore scheduling priority'
+        : 'Restoration indicated, but no authoritative targets are covered'
       : 'No policy change proposed';
 
   return (
@@ -468,20 +480,33 @@ function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: ()
                   <strong>{thermalStatus}</strong>
                 </div>
                 <div>
-                  <span>Governor</span>
+                  <span>Governor state</span>
+                  <strong>{governorStatus}</strong>
+                </div>
+                <div>
+                  <span>Mode</span>
                   <strong>{sample.thermal.mode === 'observe_only' ? 'Observe only' : sample.thermal.mode}</strong>
                 </div>
                 <div>
-                  <span>Covered WorkScopes</span>
+                  <span>Eligible WorkScopes</span>
                   <strong>{formatNumber(sample.thermal.coverage.eligible_work_scope_count)}</strong>
+                </div>
+                <div>
+                  <span>Process coverage</span>
+                  <strong>{formatNumber(sample.thermal.coverage.covered_process_count)} / {formatNumber(sample.thermal.coverage.eligible_process_count)}</strong>
                 </div>
               </div>
               <div className="settings-section__hint">
                 {proposedThermalAction}. No scheduler policy is applied in observe-only mode. Raw temperature unavailable.
               </div>
-              {sample.thermal.last_sample.unavailable_reason !== null && (
+              {thermalSample?.freshness === 'stale' && (
                 <div className="settings-section__hint">
-                  Thermal provider unavailable: {sample.thermal.last_sample.unavailable_reason.replaceAll('_', ' ')}.
+                  Thermal pressure is stale since {formatDateTime(thermalSample.sampled_at)}; latest provider attempt failed: {thermalSample.unavailable_reason.replaceAll('_', ' ')}.
+                </div>
+              )}
+              {thermalSample?.freshness === 'unavailable' && (
+                <div className="settings-section__hint">
+                  Thermal provider unavailable: {thermalSample.unavailable_reason.replaceAll('_', ' ')}.
                 </div>
               )}
               {sample.thermal.coverage.uncovered_reasons.length > 0 && (

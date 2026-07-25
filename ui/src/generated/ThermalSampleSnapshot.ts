@@ -3,4 +3,4 @@ import type { ThermalPressure } from "./ThermalPressure";
 import type { ThermalRawTemperature } from "./ThermalRawTemperature";
 import type { ThermalUnavailableReason } from "./ThermalUnavailableReason";
 
-export type ThermalSampleSnapshot = { pressure: ThermalPressure, sampled_at: string, unavailable_reason: ThermalUnavailableReason | null, raw_temperature: ThermalRawTemperature, };
+export type ThermalSampleSnapshot = { "freshness": "fresh", pressure: ThermalPressure, sampled_at: string, raw_temperature: ThermalRawTemperature, } | { "freshness": "stale", pressure: ThermalPressure, sampled_at: string, latest_attempted_at: string, unavailable_reason: ThermalUnavailableReason, raw_temperature: ThermalRawTemperature, } | { "freshness": "unavailable", attempted_at: string, unavailable_reason: ThermalUnavailableReason, raw_temperature: ThermalRawTemperature, };
