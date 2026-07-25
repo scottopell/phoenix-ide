@@ -684,6 +684,34 @@ mod tests {
         (db, scope)
     }
 
+    fn coordinator_context() -> ToolContext {
+        ToolContext::new_without_filesystem(
+            tokio_util::sync::CancellationToken::new(),
+            "coordinator".to_string(),
+            std::sync::Arc::new(phoenix_tools::browser::BrowserSessionManager::default()),
+            std::sync::Arc::new(phoenix_tools::BashHandleRegistry::new()),
+            std::sync::Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_terminal::ActiveTerminals::new(),
+            std::sync::Arc::new(phoenix_tools::TmuxRegistry::new()),
+        )
+    }
+
+    fn restricted_context(scope: WorkScopeId) -> ToolContext {
+        ToolContext::new_with_resource_access(
+            tokio_util::sync::CancellationToken::new(),
+            "restricted".to_string(),
+            PathBuf::from("/not-authoritative"),
+            std::sync::Arc::new(phoenix_tools::browser::BrowserSessionManager::default()),
+            std::sync::Arc::new(phoenix_tools::BashHandleRegistry::new()),
+            std::sync::Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_terminal::ActiveTerminals::new(),
+            std::sync::Arc::new(phoenix_tools::TmuxRegistry::new()),
+            None,
+            scope,
+            ResourceAuthority::Restricted,
+        )
+    }
+
     #[test]
     fn rejects_adversarial_refs_and_paths() {
         for reference in [
@@ -745,6 +773,55 @@ mod tests {
             &foreign
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_json_boundary_completes_coordinator_two_ref_journey() {
+        let (_temp, target, base) = repository();
+        let (db, persisted_scope) = database_with_scope(Some(&target.root), "active").await;
+        let tool = RepositoryInspectionTool::new(db);
+        let result = tool
+            .run(
+                json!({
+                    "work_scope_id": persisted_scope.as_str(),
+                    "operation": "diff",
+                    "base": base,
+                    "head": "HEAD",
+                    "name_only": true
+                }),
+                coordinator_context(),
+            )
+            .await;
+        assert!(result.is_success(), "{}", result.output());
+        let payload: Value = serde_json::from_str(result.output()).unwrap();
+        assert_eq!(payload["work_scope_id"], persisted_scope.as_str());
+        assert_eq!(payload["operation"], "diff");
+        assert_eq!(payload["resolved_commits"].as_array().unwrap().len(), 2);
+        assert!(payload["output"].as_str().unwrap().contains("src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn restricted_tool_journey_allows_own_scope_and_rejects_foreign_scope() {
+        let (_temp, target, _base) = repository();
+        let (db, own_scope) = database_with_scope(Some(&target.root), "active").await;
+        let foreign_scope = WorkScopeId::new();
+        let tool = RepositoryInspectionTool::new(db);
+        let own = tool
+            .run(
+                json!({"work_scope_id": own_scope.as_str(), "operation": "resolve_target"}),
+                restricted_context(own_scope.clone()),
+            )
+            .await;
+        assert!(own.is_success(), "{}", own.output());
+
+        let foreign = tool
+            .run(
+                json!({"work_scope_id": foreign_scope.as_str(), "operation": "resolve_target"}),
+                restricted_context(own_scope),
+            )
+            .await;
+        assert!(!foreign.is_success());
+        assert!(foreign.output().contains("not authorized"));
     }
 
     #[tokio::test]

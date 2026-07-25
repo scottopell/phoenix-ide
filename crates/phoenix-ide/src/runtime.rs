@@ -2741,6 +2741,11 @@ impl RuntimeManager {
                             agent_catalog.to_vec(),
                             available_model_ids.clone(),
                         );
+                        let registry = registry.with_additional_tools(vec![Arc::new(
+                            crate::repository_inspection::RepositoryInspectionTool::new(
+                                self.db.clone(),
+                            ),
+                        )]);
                         if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
                             .is_some()
                         {
