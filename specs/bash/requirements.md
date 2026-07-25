@@ -735,6 +735,11 @@ ring buffer output as the command saw it
 AND the tool description SHALL include a clear explanation of sandbox
 constraints
 
+WHEN the Coordinator exposes `bash`
+THE SYSTEM SHALL reuse the same Explore read-only sandbox execution path
+AND SHALL require each `op="run"` call to provide a cwd that Phoenix canonicalizes and validates against an active persisted WorkScope environment
+AND SHALL NOT assign the Coordinator a default cwd
+
 WHEN conversation is in Direct, Work, or Branch mode
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
 AND bash commands SHALL retain the existing writable behavior for that mode
@@ -759,8 +764,8 @@ reports support at startup.
 WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
 with network-block support is available
 THE SYSTEM SHALL detect this at startup
-AND SHALL NOT expose `bash` in top-level Explore mode
-AND SHALL continue to expose the read-only/planning Explore tool set
+AND SHALL NOT expose `bash` in top-level Explore mode or the Coordinator
+AND SHALL continue to expose the remaining read-only/planning tools for those modes
 
 WHEN degraded mode is active
 THE SYSTEM SHALL still apply command safety checks (REQ-BASH-011) to modes that

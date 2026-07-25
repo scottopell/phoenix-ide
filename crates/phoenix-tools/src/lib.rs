@@ -518,6 +518,11 @@ impl ToolContext {
         }
     }
 
+    fn with_working_dir(mut self, working_dir: PathBuf) -> Self {
+        self.execution_environment = ToolExecutionEnvironment::Filesystem(working_dir);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_resource_scope(
         cancel: CancellationToken,
@@ -935,9 +940,9 @@ impl ToolRegistry {
     }
 
     /// Bounded registry for the global Coordinator. The host supplies global
-    /// read tools and the singular cross-conversation text-message action.
-    /// Filesystem, browser, shell, MCP, repository, task, project, creation,
-    /// approval, workspace, and other lifecycle tools are structurally absent.
+    /// read tools, optional cwd-resolved sandboxed bash, and the singular
+    /// cross-conversation text-message action. Browser, MCP, task, project,
+    /// creation, approval, workspace, and other lifecycle tools are absent.
     #[must_use]
     pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];

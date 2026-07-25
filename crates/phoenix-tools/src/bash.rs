@@ -48,6 +48,17 @@ pub struct BashTool;
 
 pub struct SandboxedBashTool;
 
+impl SandboxedBashTool {
+    pub async fn run_with_context_cwd(
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        working_dir: std::path::PathBuf,
+    ) -> ToolOutput {
+        operations::dispatch_sandboxed(input, ctx.with_working_dir(working_dir)).await
+    }
+}
+
 #[async_trait]
 impl Tool for BashTool {
     // clearable: re-queryable read (side effects aside) — see specs/stale-tool-results (REQ-STR-002).

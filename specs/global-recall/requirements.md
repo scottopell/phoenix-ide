@@ -25,6 +25,7 @@ The user must be able to answer:
 5. Which durable conversation received each attempted message?
 6. Was each attempted message delivered, queued as steering, or rejected, and why?
 7. Which current relational facts and timestamps support each status interpretation, and was the raw result truncated?
+8. Which active WorkScope path authorized a Coordinator filesystem inspection?
 
 ## Requirements
 
@@ -36,7 +37,7 @@ THE SYSTEM SHALL provide bounded relational facts rather than application-inferr
 WHEN a user opens the Coordinator surface
 THE surface SHALL present only the normal Coordinator conversation
 
-THE facts SHALL distinguish continuation-root identity from current-conversation identity and SHALL include current state, state-update time, conversation-update time, and available task metadata without suppressing runtime state when task metadata disagrees
+THE facts SHALL distinguish continuation-root identity from current-conversation identity and SHALL include current state, state-update time, conversation-update time, available task metadata, WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
 
 ---
 
@@ -109,13 +110,19 @@ WHILE a normal coding conversation is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 WHILE the Coordinator is answering a user request
-THE SYSTEM MAY provide host-bound tools for global message search, bounded conversation reads, bounded read-only database queries, and reference resolution
+THE SYSTEM MAY provide host-bound tools for global message search, bounded conversation reads, bounded read-only database queries, reference resolution, and OS-sandboxed filesystem inspection
+
+WHEN the Coordinator invokes sandboxed filesystem inspection
+THE SYSTEM SHALL require an explicit cwd for every new command
+AND SHALL canonicalize that cwd and verify the canonical path matches the persisted cwd or worktree path of an active WorkScope before launching the existing Explore-mode `nono` sandbox
+AND SHALL NOT infer a default repository or cwd
+AND SHALL withhold the tool when the Explore sandbox is unavailable
 
 THE SYSTEM MAY provide exactly one cross-conversation mutation capability to the Coordinator: sending non-empty text to one existing non-Coordinator conversation through the authoritative user-message acceptance path
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
-THE SYSTEM SHALL NOT provide filesystem, repository, browser, MCP, task drafting, task approval, project, workspace, conversation creation, or other lifecycle mutation tools to the Coordinator
+THE SYSTEM SHALL NOT provide writable filesystem, browser, MCP, task drafting, task approval, project, workspace, conversation creation, or other lifecycle mutation tools to the Coordinator
 
 ---
 
@@ -161,7 +168,7 @@ THE briefing action SHALL preserve the user's draft and SHALL NOT create a separ
 WHEN the Coordinator dispatches an LLM turn
 THE SYSTEM SHALL attach a bounded current-activity snapshot after the stable cached Coordinator prompt
 
-THE snapshot SHALL expose raw current continuation leaves with root and current identifiers, state, state-update time, conversation-update time, and available task metadata
+THE snapshot SHALL expose raw current continuation leaves with root and current identifiers, state, state-update time, conversation-update time, available task metadata, WorkScope identity, and authoritative active WorkScope cwd and worktree paths
 
 THE snapshot SHALL order active runtime states first and then by conversation update time, SHALL state its row limit and selection rule, and SHALL explicitly report result truncation
 
