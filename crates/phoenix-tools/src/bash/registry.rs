@@ -535,49 +535,7 @@ pub async fn cascade_bash_on_delete(
             .remove_restricted_created_by(actor.conversation_id());
         return kill_selected_handles(registry, work_scope, handles).await;
     }
-    if actor.authority() == phoenix_core::work_scope::ResourceAuthority::Restricted {
-        let mut report = CascadeBashReport::default();
-        let Some(entry) = registry.get_existing(work_scope).await else {
-            return report;
-        };
-        let handles = entry.write().await.remove_for_actor(actor);
-        let inventory_changed = !handles.is_empty();
-        for handle in handles {
-            if let Some(group_id) = handle.live_pgid().await {
-                record_handle_in_report(
-                    &mut report,
-                    group_id,
-                    handle.live_pid().await,
-                    handle.is_kill_pending_kernel().await,
-                );
-                #[cfg(unix)]
-                {
-                    let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
-                    if rc != 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.raw_os_error() != Some(libc::ESRCH) {
-                            report.kill_failures.push((group_id, err.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-        if inventory_changed {
-            registry.emit_lifecycle(work_scope, BashLifecyclePhase::Terminal);
-        }
-        return report;
-    }
     let mut report = CascadeBashReport::default();
-
-    // A continuation inheriting the same scope keeps the live processes and
-    // tombstones — they belong to the ResourceScopeKey, not the deleted conversation.
-    if inheritor_scope == Some(work_scope) {
-        tracing::debug!(
-            work_scope = %work_scope,
-            "bash: skipping handle teardown — scope inherited by continuation"
-        );
-        return report;
-    }
 
     let Some(entry) = registry.remove(work_scope).await else {
         return report;

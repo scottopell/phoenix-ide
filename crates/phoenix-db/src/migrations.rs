@@ -490,9 +490,16 @@ UPDATE conversations
 SET runtime_role = 'sub_agent'
 WHERE parent_conversation_id IS NOT NULL;
 
+WITH RECURSIVE coordinator_chain(id) AS (
+    SELECT conversation_id FROM coordinator WHERE singleton = 1
+    UNION
+    SELECT predecessor.id
+    FROM coordinator_chain chain
+    JOIN conversations predecessor ON predecessor.continued_in_conv_id = chain.id
+)
 UPDATE conversations
 SET runtime_role = 'coordinator'
-WHERE id = (SELECT conversation_id FROM coordinator WHERE singleton = 1);
+WHERE id IN (SELECT id FROM coordinator_chain);
 
 -- Resolve ownership from true user roots before creating any missing scopes. A
 -- continuation successor is not a root, even though it has no parent.
@@ -621,6 +628,32 @@ SELECT lineage.conversation_id,
                 FROM migration_052_generated_direct_scope_map generated
                 WHERE generated.conversation_id = c.id)
            )
+           WHEN c.runtime_role <> 'user' THEN COALESCE(
+               (WITH RECURSIVE ancestors(id, parent_conversation_id, depth) AS (
+                    SELECT parent.id, parent.parent_conversation_id, 1
+                    FROM conversations parent
+                    WHERE parent.id = c.parent_conversation_id
+                    UNION ALL
+                    SELECT parent.id, parent.parent_conversation_id, ancestors.depth + 1
+                    FROM ancestors
+                    JOIN conversations parent ON parent.id = ancestors.parent_conversation_id
+                )
+                SELECT COALESCE(
+                    (SELECT m.new_id
+                     FROM work_scopes_old old
+                     JOIN migration_052_scope_map m ON m.old_id = old.id
+                     WHERE old.scope_type = 'Conversation' AND old.scope_value = ancestor.id),
+                    (SELECT generated.new_id
+                     FROM migration_052_generated_direct_scope_map generated
+                     WHERE generated.conversation_id = ancestor.id)
+                )
+                FROM ancestors ancestor
+                JOIN conversations parent ON parent.id = ancestor.id
+                WHERE parent.runtime_role = 'user' AND parent.cm_kind = 'direct'
+                ORDER BY ancestor.depth
+                LIMIT 1),
+               root_scope.work_scope_id
+           )
            ELSE root_scope.work_scope_id
        END
 FROM migration_052_lineage lineage
@@ -717,7 +750,7 @@ SELECT ABS(
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_work_scope ON conversations(work_scope_id);
-CREATE UNIQUE INDEX one_coordinator_conversation ON conversations(runtime_role) WHERE runtime_role = 'coordinator';
+CREATE INDEX one_coordinator_conversation ON conversations(runtime_role) WHERE runtime_role = 'coordinator';
 CREATE TRIGGER conversations_role_scope_insert
 BEFORE INSERT ON conversations
 WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
@@ -4412,7 +4445,19 @@ mod tests {
               ('inherit-child', 'inherit-child', '/wrong-child', 'inherit-root', 0, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-03', 'work', '/wrong-child', 'wrong', 'wrong-base', NULL),
               ('inherit-grandchild', 'inherit-grandchild', '/wrong-grandchild', 'inherit-child', 0, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-04', 'explore', '/wrong-grandchild', NULL, NULL, NULL),
               ('inherit-successor', 'inherit-successor', '/wrong-successor', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-05', 'branch', '/wrong-successor', 'wrong', NULL, NULL),
-              ('successor-child', 'successor-child', '/wrong-successor-child', 'inherit-successor', 0, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-06', 'work', '/wrong-successor-child', 'wrong', NULL, NULL)",
+              ('successor-child', 'successor-child', '/wrong-successor-child', 'inherit-successor', 0, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-06', 'work', '/wrong-successor-child', 'wrong', NULL, NULL),
+              ('direct-chain-root', 'direct-chain-root', '/direct/root', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-02', 'direct', NULL, NULL, NULL, 'direct-chain-successor'),
+              ('direct-chain-successor', 'direct-chain-successor', '/direct/successor', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-03', 'direct', NULL, NULL, NULL, NULL),
+              ('direct-successor-child', 'direct-successor-child', '/direct/successor/subdir', 'direct-chain-successor', 0, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-04', 'direct', NULL, NULL, NULL, NULL),
+              ('coordinator-root', 'coordinator-root', '', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-02', 'direct', NULL, NULL, NULL, 'coordinator-leaf'),
+              ('coordinator-leaf', 'coordinator-leaf', '', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-03', 'direct', NULL, NULL, NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO coordinator (singleton, conversation_id)
+             VALUES (1, 'coordinator-leaf')",
         )
         .execute(&pool)
         .await
@@ -4510,6 +4555,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(direct_scope_count, 3);
+
+        let direct_continuation_scopes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, work_scope_id FROM conversations
+             WHERE id IN ('direct-chain-root', 'direct-chain-successor', 'direct-successor-child')
+             ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let direct_root_scope = &direct_continuation_scopes[0].1;
+        let direct_successor_scope = &direct_continuation_scopes[1].1;
+        let direct_child_scope = &direct_continuation_scopes[2].1;
+        assert_ne!(direct_root_scope, direct_successor_scope);
+        assert_eq!(direct_child_scope, direct_successor_scope);
+
+        let coordinator_chain: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT runtime_role, work_scope_id FROM conversations
+             WHERE id IN ('coordinator-root', 'coordinator-leaf') ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            coordinator_chain,
+            vec![
+                ("coordinator".to_string(), None),
+                ("coordinator".to_string(), None)
+            ]
+        );
 
         let invalid_lifecycle: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM work_scopes

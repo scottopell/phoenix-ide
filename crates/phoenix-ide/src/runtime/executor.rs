@@ -3714,13 +3714,13 @@ where
         for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
             let cwd_override = nonblank(task.cwd.as_deref());
             let cwd_path = cwd_override.map_or_else(
-                || self.context.working_dir.clone(),
+                || self.context.filesystem_root().to_path_buf(),
                 |cwd| {
                     let path = std::path::Path::new(cwd);
                     if path.is_absolute() {
                         path.to_path_buf()
                     } else {
-                        self.context.working_dir.join(path)
+                        self.context.filesystem_root().join(path)
                     }
                 },
             );
