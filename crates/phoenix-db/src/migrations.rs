@@ -335,8 +335,8 @@ SET environment_kind = (SELECT environment_kind FROM work_scope_environments WHE
     base_branch = (SELECT base_branch FROM work_scope_environments WHERE work_scope_id = work_scopes.id),
     updated_at = MAX(updated_at, COALESCE((SELECT updated_at FROM work_scope_environments WHERE work_scope_id = work_scopes.id), updated_at));
 
-CREATE TEMP TABLE migration_053_guard (invalid_count INTEGER NOT NULL CHECK (invalid_count = 0));
-INSERT INTO migration_053_guard
+CREATE TEMP TABLE migration_054_guard (invalid_count INTEGER NOT NULL CHECK (invalid_count = 0));
+INSERT INTO migration_054_guard
 SELECT COUNT(*) FROM work_scopes
 WHERE NOT (
     (environment_kind = 'allocated_worktree' AND cwd IS NOT NULL AND cwd <> '' AND worktree_path IS NOT NULL AND worktree_path <> '' AND (branch_name IS NULL OR branch_name <> '') AND (base_branch IS NULL OR base_branch <> ''))
@@ -348,34 +348,6 @@ DROP TABLE work_scope_environments;
 CREATE VIEW work_scope_environments AS
 SELECT id AS work_scope_id, environment_kind, cwd, worktree_path, branch_name, base_branch, updated_at
 FROM work_scopes;
-CREATE TRIGGER work_scope_environments_insert
-INSTEAD OF INSERT ON work_scope_environments
-BEGIN
-    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_scopes WHERE id = NEW.work_scope_id)
-        THEN RAISE(ABORT, 'work scope not found') END;
-    UPDATE work_scopes
-    SET environment_kind = NEW.environment_kind,
-        cwd = NEW.cwd,
-        worktree_path = NEW.worktree_path,
-        branch_name = NEW.branch_name,
-        base_branch = NEW.base_branch,
-        updated_at = NEW.updated_at
-    WHERE id = NEW.work_scope_id;
-END;
-CREATE TRIGGER work_scope_environments_update
-INSTEAD OF UPDATE ON work_scope_environments
-BEGIN
-    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM work_scopes WHERE id = OLD.work_scope_id)
-        THEN RAISE(ABORT, 'work scope not found') END;
-    UPDATE work_scopes
-    SET environment_kind = NEW.environment_kind,
-        cwd = NEW.cwd,
-        worktree_path = NEW.worktree_path,
-        branch_name = NEW.branch_name,
-        base_branch = NEW.base_branch,
-        updated_at = NEW.updated_at
-    WHERE id = OLD.work_scope_id;
-END;
 CREATE TRIGGER work_scope_environment_shape_insert
 BEFORE INSERT ON work_scopes
 WHEN NOT (
@@ -437,7 +409,7 @@ WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
 BEGIN
     SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
 END;
-DROP TABLE migration_053_guard;
+DROP TABLE migration_054_guard;
 ";
 
 const MIGRATION_053: &str = r"

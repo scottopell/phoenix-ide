@@ -956,61 +956,24 @@ impl Database {
         context: EnvironmentContext,
         now: &str,
     ) -> DbResult<()> {
+        let (kind, cwd, worktree_path, branch_name, base_branch) =
+            Self::environment_columns(context);
         sqlx::query(
-            "INSERT INTO work_scopes (id, authority_kind, lifecycle, created_at, updated_at)
-                 VALUES (?1, ?2, 'active', ?3, ?3)",
+            "INSERT INTO work_scopes (
+                 id, authority_kind, lifecycle, environment_kind, cwd,
+                 worktree_path, branch_name, base_branch, created_at, updated_at
+             ) VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         )
         .bind(scope_id.as_str())
         .bind(authority_kind.as_str())
+        .bind(kind)
+        .bind(cwd)
+        .bind(worktree_path)
+        .bind(branch_name)
+        .bind(base_branch)
         .bind(now)
         .execute(&mut **tx)
         .await?;
-
-        match context {
-            EnvironmentContext::AllocatedWorktree {
-                cwd,
-                worktree_path,
-                branch_name,
-                base_branch,
-            } => {
-                sqlx::query(
-                        "INSERT INTO work_scope_environments (
-                            work_scope_id, environment_kind, cwd, worktree_path, branch_name, base_branch, updated_at
-                         ) VALUES (?1, 'allocated_worktree', ?2, ?3, ?4, ?5, ?6)",
-                    )
-                    .bind(scope_id.as_str())
-                    .bind(cwd)
-                    .bind(worktree_path)
-                    .bind(branch_name)
-                    .bind(base_branch)
-                    .bind(now)
-                    .execute(&mut **tx)
-                    .await?;
-            }
-            EnvironmentContext::UnownedCwd { cwd } => {
-                sqlx::query(
-                    "INSERT INTO work_scope_environments (
-                            work_scope_id, environment_kind, cwd, updated_at
-                         ) VALUES (?1, 'unowned_cwd', ?2, ?3)",
-                )
-                .bind(scope_id.as_str())
-                .bind(cwd)
-                .bind(now)
-                .execute(&mut **tx)
-                .await?;
-            }
-            EnvironmentContext::None => {
-                sqlx::query(
-                    "INSERT INTO work_scope_environments (
-                            work_scope_id, environment_kind, updated_at
-                         ) VALUES (?1, 'none', ?2)",
-                )
-                .bind(scope_id.as_str())
-                .bind(now)
-                .execute(&mut **tx)
-                .await?;
-            }
-        }
         Ok(())
     }
 
@@ -1020,22 +983,8 @@ impl Database {
         context: EnvironmentContext,
         now: &str,
     ) -> DbResult<()> {
-        let (kind, cwd, worktree_path, branch_name, base_branch) = match context {
-            EnvironmentContext::AllocatedWorktree {
-                cwd,
-                worktree_path,
-                branch_name,
-                base_branch,
-            } => (
-                "allocated_worktree",
-                Some(cwd),
-                Some(worktree_path),
-                branch_name,
-                base_branch,
-            ),
-            EnvironmentContext::UnownedCwd { cwd } => ("unowned_cwd", Some(cwd), None, None, None),
-            EnvironmentContext::None => ("none", None, None, None, None),
-        };
+        let (kind, cwd, worktree_path, branch_name, base_branch) =
+            Self::environment_columns(context);
         let result = sqlx::query(
             "UPDATE work_scopes
              SET environment_kind = ?1, cwd = ?2, worktree_path = ?3,
@@ -1057,6 +1006,33 @@ impl Database {
             )));
         }
         Ok(())
+    }
+
+    fn environment_columns(
+        context: EnvironmentContext,
+    ) -> (
+        &'static str,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        match context {
+            EnvironmentContext::AllocatedWorktree {
+                cwd,
+                worktree_path,
+                branch_name,
+                base_branch,
+            } => (
+                "allocated_worktree",
+                Some(cwd),
+                Some(worktree_path),
+                branch_name,
+                base_branch,
+            ),
+            EnvironmentContext::UnownedCwd { cwd } => ("unowned_cwd", Some(cwd), None, None, None),
+            EnvironmentContext::None => ("none", None, None, None, None),
+        }
     }
 
     fn environment_for_mode(cwd: &str, cm: &ConvModeCols<'_>) -> EnvironmentContext {
@@ -12624,9 +12600,24 @@ mod tests {
         for removed in ["cm_branch_name", "cm_worktree_path", "cm_base_branch"] {
             assert!(
                 !cols.iter().any(|column| column == removed),
-                "{removed} must be owned only by work_scope_environments: {cols:?}"
+                "{removed} must be owned only by work_scopes: {cols:?}"
             );
         }
+        let environment_projection_kind: String = sqlx::query_scalar(
+            "SELECT type FROM sqlite_master WHERE name = 'work_scope_environments'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(environment_projection_kind, "view");
+        let writable_projection_triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger' AND name LIKE 'work_scope_environments_%'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(writable_projection_triggers, 0);
         assert!(
             !cols.iter().any(|c| c == "conv_mode"),
             "conv_mode blob must be dropped after migration 029: {cols:?}"
@@ -16591,7 +16582,7 @@ mod tests {
         assert_eq!(conv.work_scope_id.as_ref(), Some(&scope));
         let environment: (String, Option<String>, Option<String>) = sqlx::query_as(
             "SELECT environment_kind, cwd, worktree_path
-             FROM work_scope_environments WHERE work_scope_id = ?1",
+             FROM work_scopes WHERE id = ?1",
         )
         .bind(scope.as_str())
         .fetch_one(db.pool())

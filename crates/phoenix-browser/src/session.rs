@@ -913,7 +913,6 @@ pub struct BrowserSessionManager {
     /// the session lets idle cleanup emit lifecycle events with the original
     /// scope rather than parsing the string key back into a `ResourceScopeKey`.
     sessions: RwLock<HashMap<String, ScopedSession>>,
-    cleanup_task: Option<JoinHandle<()>>,
     /// Optional lifecycle event sink. Populated by [`RuntimeManager::new`]
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
@@ -940,7 +939,6 @@ impl BrowserSessionManager {
     pub fn with_lifecycle_sink(sink: Option<BrowserSessionLifecycleSink>) -> Arc<Self> {
         let manager = Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
-            cleanup_task: None,
             lifecycle_sink: sink,
             scope_liveness_hook: std::sync::OnceLock::new(),
         });
@@ -1527,21 +1525,9 @@ impl Default for BrowserSessionManager {
     fn default() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            cleanup_task: None,
             lifecycle_sink: None,
             scope_liveness_hook: std::sync::OnceLock::new(),
         }
-    }
-}
-
-impl Drop for BrowserSessionManager {
-    fn drop(&mut self) {
-        // Cancel cleanup task if running
-        if let Some(task) = self.cleanup_task.take() {
-            task.abort();
-        }
-        // Note: sessions will be dropped automatically
-        tracing::info!("BrowserSessionManager dropped - all sessions will be closed");
     }
 }
 
