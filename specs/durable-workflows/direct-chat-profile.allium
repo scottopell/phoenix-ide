@@ -370,6 +370,53 @@ rule CoordinatorMultiTargetFanOutCreatesIndependentOrdinaryAcceptances {
 }
 
 ------------------------------------------------------------
+-- Authority and refinement
+------------------------------------------------------------
+
+rule ExactReplayCannotChangePreparedSemantics {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+
+    ensures: replay_preserves_prepared_payload(same_key_existing_acceptance(turn_key), prepared_payload)
+    ensures: acceptance_created_once(turn_key)
+}
+
+surface DirectTurnRefinementVerification {
+    facing turn_key: TargetBoundTurnKey
+    facing resolved_target: ResolvedTarget
+
+    demonstrates:
+        crash_cut_preserves_acceptance(turn_key)
+        same_key_race_converges_or_conflicts(turn_key)
+        different_key_race_is_target_local(resolved_target)
+        restart_preserves_committed_outcome(turn_key)
+
+    @guarantee PureModelRefinement
+        -- Every repository command normalizes to the same aggregate and owed child
+        -- effects as the pure transition model before and after each deterministic
+        -- transaction failpoint.
+
+    @guarantee OneWritableAuthorityPerSemanticFact
+        -- Conversation reducer state, direct-turn acceptance and ownership, canonical
+        -- materialization, and child effect lifecycle each have one writable authority.
+
+    @guarantee AcceptedNonterminalTurnsRemainDiscoverable
+        -- Every accepted nonterminal turn is reachable by its target-bound identity.
+
+    @guarantee TerminalTransitionsFenceChildEffects
+        -- Terminal transitions release ownership and suppress nonterminal child effects.
+
+    @guarantee ChildEffectMultiplicityIsPreserved
+        -- Independently claimable effects remain typed child records, not one phase.
+
+    @guarantee TemporaryShadowRemoval
+        -- Migration comparison is read-only and non-authoritative. A slice removes
+        -- its old writer and representation once all production readers use the new
+        -- repository and deterministic normalization agrees for the retained corpus.
+}
+
+------------------------------------------------------------
 -- Verification surfaces
 ------------------------------------------------------------
 

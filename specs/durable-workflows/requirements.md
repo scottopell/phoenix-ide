@@ -436,6 +436,47 @@ conversation permissions. A notification, indexing, or audit consumer SHALL NOT
 gain authority to redefine direct acceptance, and transcript presentation state
 SHALL NOT gain authority to start or reject runtime work.
 
+### REQ-DWF-CHAT-012: One Authority Per Direct-Turn Fact
+
+WHEN a direct turn is durably accepted
+THE SYSTEM SHALL assign exactly one writable authority for each semantic fact:
+the conversation reducer for semantic conversation state, the direct-turn
+aggregate for scoped acceptance, prepared semantics, live ownership, generation,
+terminal outcome, and canonical materialization identity, and typed child effects
+and attempts for independently claimable execution lifecycle.
+
+Runtime state, workflow snapshots, dispositions, transcript views, steering views,
+metrics, SSE state, and UI reconciliation SHALL be mechanically one-way projections
+and SHALL NOT independently redefine those facts. A projection MAY be persisted for
+read performance only when its writer is the same transaction that changes its
+authority and a refinement test proves equality.
+
+### REQ-DWF-CHAT-013: Direct-Turn Aggregate and Child-Effect Refinement
+
+WHEN a direct-turn command changes accepted ownership, materialization, execution,
+or terminal state
+THE SYSTEM SHALL first admit the command through a pure typed transition model and
+SHALL commit the corresponding aggregate and child-effect changes in one SQLite
+transaction whose normalized result equals the pure transition result.
+
+The aggregate SHALL support multiplicity through typed child effects rather than
+collapsing independently claimable LLM or tool effects into one scalar turn phase.
+A terminal command SHALL atomically advance generation, release live conversation
+ownership, and interrupt or suppress every nonterminal child effect.
+
+### REQ-DWF-CHAT-014: Deterministic Crash and Interleaving Verification
+
+WHEN direct-turn behavior is verified
+THE SYSTEM SHALL preserve focused regressions and SHALL additionally execute
+property-generated command histories plus deterministic transaction failpoints
+before and after each durable boundary for acceptance, steering, runtime delivery,
+materialization, LLM effects, tool effects, cancellation, recovery, and sequence
+publication.
+
+Correctness SHALL NOT depend on sleeps, polling cadence, timestamps that infer
+semantic ownership, manual sequence rewind discipline, provider-response-derived
+tool authority, or mutable runtime steering truth.
+
 ### REQ-DWF-CHAT-011: Crash, Race, and Mutable-Input Verification
 
 WHEN the direct-chat profile is verified
@@ -662,4 +703,6 @@ authority:
 
 Current normative authority is REQ-DWF-017, REQ-DWF-029 through REQ-DWF-042,
 REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005, and REQ-DWF-CREATE-001 through
-REQ-DWF-CREATE-005 as defined in this document.
+REQ-DWF-CREATE-005 as defined in this document. Direct-chat authority and
+refinement are additionally governed by REQ-DWF-CHAT-012 through
+REQ-DWF-CHAT-014.

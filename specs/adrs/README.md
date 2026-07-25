@@ -35,6 +35,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [021](021_coordinator-surface-is-chat-only.md) | The Coordinator surface is chat-only | Accepted | REQ-GR-001, REQ-GR-004, REQ-GR-005, REQ-GR-010, REQ-GR-011 |
 | [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Accepted | REQ-GR-001–005, REQ-GR-007–011A |
 | [023](023_projects-accept-taskmd-and-plain-markdown-briefs.md) | Projects accept taskmd files by default and plain markdown briefs through one task-source seam | Accepted | REQ-PROJ-003, REQ-PROJ-004, REQ-PROJ-006, REQ-PROJ-012, REQ-PROJ-033, REQ-PROJ-034, REQ-PROJ-037 |
+| [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 
 ## For agents: which decisions bind your task
 
@@ -56,7 +57,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, or rollback | 010 |
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
-| Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019 |
+| Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
@@ -88,6 +89,7 @@ ADR-000 (adopt spEARS v2 for new work)
           ├── ADR-015 (Observation, receipt, and runtime acceptance are distinct)
           ├── ADR-016 (Durable-workflow boundaries include client acceptance and adoption)
           └── ADR-019 (Durable-workflow core matches one scheduler authority and durable acknowledgement)
+              └── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       └── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
