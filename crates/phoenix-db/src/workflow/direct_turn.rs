@@ -61,6 +61,7 @@ impl WorkflowRepository {
             return Ok(TurnStep {
                 outcome: TurnOutcome::ExactReplay {
                     turn_id: existing.id,
+                    disposition: input.disposition,
                 },
                 owed_effects: Vec::new(),
             });
@@ -96,9 +97,9 @@ impl WorkflowRepository {
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(&input.conversation.0)
-        .bind(&input.client_key.0)
-        .bind(&input.prepared.fingerprint)
-        .bind(&input.prepared.payload)
+        .bind(input.client_key.as_str())
+        .bind(input.prepared.fingerprint())
+        .bind(input.prepared.payload())
         .bind(disposition)
         .bind(i64::from(input.disposition == AcceptedDisposition::Runtime))
         .bind(to_i64(workflow_id.0, "workflow_id")?)
@@ -275,6 +276,10 @@ impl WorkflowRepository {
         let mut model =
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model.apply(command).map_err(conflict)?;
+        if matches!(step.outcome, TurnOutcome::TerminalReplay { .. }) {
+            tx.rollback().await?;
+            return Ok(step);
+        }
         let (terminal_kind, reason) = terminal_sql(&terminal);
         let updated = sqlx::query(
             "UPDATE durable_turns
@@ -340,8 +345,8 @@ async fn insert_direct_turn_workflow_tx(
     let intent = direct_turn_profile::RuntimeTurnIntent {
         turn_id: turn_id.0,
         conversation_id: input.conversation.0.clone(),
-        client_turn_key: input.client_key.0.clone(),
-        prepared_fingerprint: input.prepared.fingerprint.clone(),
+        client_turn_key: input.client_key.as_str().to_string(),
+        prepared_fingerprint: input.prepared.fingerprint().to_string(),
     };
     let create = CreateWorkflowWithExternalAcceptance {
         workflow_id,
@@ -351,10 +356,11 @@ async fn insert_direct_turn_workflow_tx(
             .ok_or_else(|| DbError::Serialization("empty direct-turn scope".to_string()))?,
         idempotency_key: phoenix_workflow::NonEmptyExternalKey::new(format!(
             "turn:{}:{}",
-            input.conversation.0, input.client_key.0
+            input.conversation.0,
+            input.client_key.as_str()
         ))
         .ok_or_else(|| DbError::Serialization("empty direct-turn key".to_string()))?,
-        intent_fingerprint: input.prepared.fingerprint.clone(),
+        intent_fingerprint: input.prepared.fingerprint().to_string(),
         snapshot_codec: direct_turn_profile::snapshot_codec(),
         snapshot_payload: serde_json::to_vec(&snapshot)
             .map_err(|e| DbError::Serialization(format!("encode direct-turn snapshot: {e}")))?,
@@ -425,7 +431,7 @@ async fn load_by_scoped_key(
 ) -> DbResult<Option<DurableTurn>> {
     sqlx::query("SELECT * FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2")
         .bind(&conversation.0)
-        .bind(&client_key.0)
+        .bind(client_key.as_str())
         .fetch_optional(&mut **tx)
         .await?
         .map(row_to_turn)
@@ -446,13 +452,24 @@ fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
     let terminal_kind = row.get::<Option<String>, _>("terminal_kind");
     let lifecycle = match terminal_kind.as_deref() {
         None => TurnLifecycle::Accepted { disposition },
-        Some("Completed") => TurnLifecycle::Terminal(TurnTerminal::Completed),
-        Some("Cancelled") => TurnLifecycle::Terminal(TurnTerminal::Cancelled),
-        Some("Failed") => TurnLifecycle::Terminal(TurnTerminal::Failed {
-            reason: row
-                .get::<Option<String>, _>("terminal_reason")
-                .ok_or_else(|| DbError::Serialization("failed turn missing reason".to_string()))?,
-        }),
+        Some("Completed") => TurnLifecycle::Terminal {
+            terminal: TurnTerminal::Completed,
+            disposition,
+        },
+        Some("Cancelled") => TurnLifecycle::Terminal {
+            terminal: TurnTerminal::Cancelled,
+            disposition,
+        },
+        Some("Failed") => TurnLifecycle::Terminal {
+            terminal: TurnTerminal::Failed {
+                reason: row
+                    .get::<Option<String>, _>("terminal_reason")
+                    .ok_or_else(|| {
+                        DbError::Serialization("failed turn missing reason".to_string())
+                    })?,
+            },
+            disposition,
+        },
         Some(other) => {
             return Err(DbError::Serialization(format!(
                 "unknown terminal kind {other}"
@@ -462,11 +479,13 @@ fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
     Ok(DurableTurn {
         id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
         conversation: ConversationAuthority(row.get("conversation_id")),
-        client_key: ClientTurnKey(row.get("client_turn_key")),
-        prepared: PreparedTurn {
-            fingerprint: row.get("prepared_fingerprint"),
-            payload: row.get("prepared_payload"),
-        },
+        client_key: ClientTurnKey::try_from(row.get::<String, _>("client_turn_key"))
+            .map_err(|e| DbError::Serialization(e.to_string()))?,
+        prepared: PreparedTurn::rehydrate(
+            row.get("prepared_fingerprint"),
+            row.get("prepared_payload"),
+        )
+        .map_err(conflict)?,
         generation: to_u64(row.get("generation"), "generation")?,
         lifecycle,
         materialization: row.get::<Option<String>, _>("canonical_message_id").map_or(
@@ -582,11 +601,8 @@ mod tests {
     fn input(conversation: &str, key: &str, seed: u8) -> AcceptAuthoritativeTurn {
         AcceptAuthoritativeTurn {
             conversation: ConversationAuthority(conversation.to_string()),
-            client_key: ClientTurnKey(key.to_string()),
-            prepared: PreparedTurn {
-                fingerprint: format!("fp-{seed}"),
-                payload: vec![seed],
-            },
+            client_key: ClientTurnKey::new(key).unwrap(),
+            prepared: PreparedTurn::from_exact_payload(vec![seed]),
             disposition: AcceptedDisposition::Runtime,
             accepted_at: phoenix_workflow::Timestamp(u64::from(seed)),
         }
@@ -732,7 +748,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             persisted.lifecycle,
-            TurnLifecycle::Terminal(TurnTerminal::Cancelled)
+            TurnLifecycle::Terminal {
+                terminal: TurnTerminal::Cancelled,
+                ..
+            }
         ));
         assert_eq!(persisted.generation, 1);
     }
@@ -792,6 +811,70 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "other", 2))
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_replay_is_idempotent_and_different_terminal_conflicts() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "terminal-replay", 10))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        repo.terminate_authoritative_turn(TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+        let replay = repo
+            .terminate_authoritative_turn(TurnCommand::Cancel {
+                turn_id,
+                expected_generation: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replay,
+            TurnStep {
+                outcome: TurnOutcome::TerminalReplay {
+                    generation: 1,
+                    terminal: TurnTerminal::Cancelled,
+                    disposition: AcceptedDisposition::Runtime,
+                },
+                owed_effects: Vec::new(),
+            }
+        );
+        assert!(repo
+            .terminate_authoritative_turn(TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn schema_rejects_cross_conversation_canonical_message() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "schema", 11))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        insert_message(&repo, "conv-b", "foreign-message").await;
+        assert!(repo
+            .materialize_authoritative_turn(
+                turn_id,
+                0,
+                CanonicalMessageId("foreign-message".into())
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

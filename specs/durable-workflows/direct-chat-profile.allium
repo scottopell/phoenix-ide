@@ -8,7 +8,7 @@
 -- arbitration, steering, and exact-ID reconciliation.
 --
 -- Requirement traceability: REQ-DWF-038, REQ-DWF-CHAT-001 through
--- REQ-DWF-CHAT-011.
+-- REQ-DWF-CHAT-014.
 
 use "./durable-workflows.allium" as dwf
 
@@ -165,6 +165,7 @@ entity DirectChatConsumerCursor {
 -- runtime_accepted_outcome(accepted_turn), queued_steering_outcome(accepted_turn)
 -- replay_runtime_accepted_outcome(accepted_turn), replay_queued_steering_outcome(accepted_turn)
 -- independent_prepared_events_emitted(request, targets)
+-- replay_preserves_prepared_payload(acceptance, prepared_payload), acceptance_created_once(turn_key)
 
 ------------------------------------------------------------
 -- Invariants

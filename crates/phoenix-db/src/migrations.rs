@@ -298,7 +298,7 @@ CREATE TABLE durable_turns (
     turn_id INTEGER PRIMARY KEY,
     workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE CASCADE,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    client_turn_key TEXT NOT NULL,
+    client_turn_key TEXT NOT NULL CHECK (client_turn_key <> ''),
     prepared_fingerprint TEXT NOT NULL,
     prepared_payload BLOB NOT NULL,
     disposition TEXT NOT NULL CHECK (disposition IN ('Runtime', 'Steering')),
@@ -306,12 +306,20 @@ CREATE TABLE durable_turns (
     terminal_kind TEXT CHECK (terminal_kind IN ('Completed', 'Cancelled', 'Failed')),
     terminal_reason TEXT,
     owns_conversation INTEGER NOT NULL CHECK (owns_conversation IN (0, 1)),
-    canonical_message_id TEXT REFERENCES messages(message_id) ON DELETE RESTRICT,
+    canonical_message_id TEXT,
     UNIQUE (conversation_id, client_turn_key),
-    CHECK (owns_conversation = 0 OR (disposition = 'Runtime' AND terminal_kind IS NULL)),
-    CHECK ((terminal_kind = 'Failed') = (terminal_reason IS NOT NULL)),
-    CHECK (terminal_kind IS NULL OR owns_conversation = 0)
+    CHECK (owns_conversation = (disposition = 'Runtime' AND terminal_kind IS NULL)),
+    CHECK (
+        (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
+        OR (terminal_kind IS NULL AND terminal_reason IS NULL)
+        OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
+    ),
+    FOREIGN KEY (conversation_id, canonical_message_id)
+        REFERENCES messages(conversation_id, message_id) ON DELETE RESTRICT
 );
+
+CREATE UNIQUE INDEX messages_conversation_message_id_unique
+    ON messages(conversation_id, message_id);
 
 CREATE TRIGGER durable_turns_delete_owned_workflow
 AFTER DELETE ON durable_turns

@@ -83,7 +83,7 @@ or polling cadence.
 
 ## References
 
-- Extends ADR-013 and ADR-019.
+- Extends ADR-013 and ADR-020.
 - Feature spec: `specs/durable-workflows/requirements.md`
 - Behavioral specs: `specs/durable-workflows/direct-chat-profile.allium`,
   `specs/durable-workflows/llm-profile.allium`

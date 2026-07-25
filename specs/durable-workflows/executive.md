@@ -46,7 +46,7 @@ The current normative package comprises:
 - `direct-chat-profile.allium`
 - `wake-profile.allium`
 - `creation-profile.allium`
-- ADR-013 through ADR-016 and ADR-019 in `specs/adrs/`
+- ADR-013 through ADR-016, ADR-019, and ADR-024 in `specs/adrs/`
 
 These artifacts now state:
 
@@ -76,6 +76,7 @@ These artifacts now state:
 | REQ-DWF-013–018 capabilities, typed migration contract, deterministic verification | Implemented | Capability classes, supported codecs, profile/version compatibility, incompatible status, transactional failpoints, concurrency tests, and restart tests cover the implemented foundation. |
 | REQ-DWF-029–042 acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Foundation implemented; profile coverage varies | The shared one-scheduler repository, durable acknowledgement, canonical delivery, submit-observe, capability, scheduling, and migration-safety mechanisms are implemented. Direct-turn profile behavior remains specified only. |
 | REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | Target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out have no matching vertical-slice implementation. |
+| REQ-DWF-CHAT-012–014 direct-turn authority, refinement, and verification | Partially implemented | The pure aggregate and authoritative repository implement scoped replay, immutable prepared semantics, runtime ownership, canonical materialization identity, terminal generation, and deterministic transaction-cut tests. Production consumer cutover and the complete interleaving matrix are tracked separately. |
 | REQ-DWF-WAKE-001–005 wake profile | Implemented | Durable Bash/tmux registration, observation, expiry and cancellation arbitration, continuation transfer, canonical terminal delivery, exact-set adoption, restart recovery, and coalesced auto-resume use the normalized foundation. |
 | REQ-DWF-CREATE-001–005 creation profile | Specified only | Conversation creation has no matching vertical-slice implementation against the normalized foundation. |
 
@@ -109,5 +110,7 @@ Remaining profile work is:
 - ADR-016 recorded the earlier client-acceptance and adoption-perimeter decision.
 - ADR-019 supersedes ADR-013 through ADR-016 where they require permanent
   selector/shadow/drain machinery or universal leased authority.
+- ADR-024 partitions direct-turn semantic authority across the reducer, aggregate,
+  and normalized child effects with one writable authority per fact.
 - ADR-007, ADR-011, and ADR-012 remain historical profile-specific context for
   creation and wake.
