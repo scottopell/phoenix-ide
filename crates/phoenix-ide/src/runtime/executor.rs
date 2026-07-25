@@ -3891,6 +3891,16 @@ where
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
+            Effect::PersistAuthoritativeUserMessage { authority, .. } => {
+                tracing::error!(
+                    workflow_id = authority.workflow_id.0,
+                    turn_id = authority.turn_id.0,
+                    attempt_id = authority.attempt_id.0,
+                    "rejecting authoritative direct-turn persistence before runtime consumer cutover"
+                );
+                Err("authoritative direct-turn runtime consumer is not installed".to_string())
+            }
+
             Effect::PersistMessage {
                 content,
                 display_data,
