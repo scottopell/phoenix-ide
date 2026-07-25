@@ -132,6 +132,8 @@ pub enum DbError {
     SlugExists(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("Direct-turn conflict: {0:?}")]
+    DirectTurnConflict(phoenix_workflow::TurnConflict),
     /// A fork-proposal resolution was attempted but the proposal is already
     /// resolved to a different state or child id (REQ-PROJ-034/037). Distinct
     /// from the idempotent no-op case (same child id), which returns `Ok`.

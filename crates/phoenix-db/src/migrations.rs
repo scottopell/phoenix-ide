@@ -294,6 +294,10 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 const MIGRATION_055: &str = r"
+INSERT INTO workflow_global_sequences (sequence_name, next_value)
+VALUES ('direct_turn', 1)
+ON CONFLICT(sequence_name) DO NOTHING;
+
 CREATE TABLE durable_turns (
     turn_id INTEGER PRIMARY KEY,
     workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE CASCADE,
@@ -334,6 +338,10 @@ CREATE UNIQUE INDEX durable_turns_one_live_owner
 CREATE INDEX durable_turns_discoverable_nonterminal
     ON durable_turns(conversation_id, disposition, turn_id)
     WHERE terminal_kind IS NULL;
+
+CREATE UNIQUE INDEX durable_turns_canonical_message_unique
+    ON durable_turns(canonical_message_id)
+    WHERE canonical_message_id IS NOT NULL;
 ";
 
 const MIGRATION_052: &str = r"

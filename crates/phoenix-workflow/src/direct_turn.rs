@@ -43,7 +43,9 @@ impl TryFrom<&str> for ClientTurnKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TurnAuthorityId(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct CanonicalMessageId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +101,7 @@ fn sha256_hex(payload: &[u8]) -> String {
         })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AcceptedDisposition {
     Runtime,
     Steering,

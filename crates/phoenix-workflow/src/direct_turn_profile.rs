@@ -1,6 +1,7 @@
 use crate::{
-    AcceptanceProfile, CodecRef, DeliveryItem, ExternalAcceptanceDisabled, ProfileRef,
-    RuntimeAcceptanceEnabled, SupportedCodecRegistry, WorkflowProfile,
+    AcceptanceProfile, AcceptedDisposition, CanonicalMessageId, CodecRef, DeliveryItem,
+    DeliveryPayload, ExternalAcceptanceDisabled, ProfileRef, RuntimeAcceptanceEnabled,
+    SupportedCodecRegistry, WorkflowProfile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +10,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const SNAPSHOT_CODEC_FAMILY: &str = "direct_turn.snapshot";
 pub const EVENT_CODEC_FAMILY: &str = "direct_turn.event";
 pub const INTENT_CODEC_FAMILY: &str = "direct_turn.intent";
+pub const RECEIPT_CODEC_FAMILY: &str = "direct_turn.receipt";
+pub const RECEIPT_EVENT_CODEC_FAMILY: &str = "direct_turn.receipt_event";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectTurnProfile;
@@ -21,6 +24,7 @@ pub struct DirectTurnSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectTurnEvent {
     Accepted,
+    Delivered(DirectTurnReceiptEvent),
     Terminal(DirectTurnTerminalEvent),
 }
 
@@ -44,6 +48,23 @@ pub struct RuntimeTurnIntent {
     pub prepared_fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnReceipt {
+    pub turn_id: u64,
+    pub disposition: AcceptedDisposition,
+    pub canonical_message_id: CanonicalMessageId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectTurnReceiptEvent {
+    RuntimeDelivered {
+        canonical_message_id: CanonicalMessageId,
+    },
+    SteeringQueued {
+        canonical_message_id: CanonicalMessageId,
+    },
+}
+
 impl WorkflowProfile for DirectTurnProfile {
     type Snapshot = DirectTurnSnapshot;
     type RuntimeAcceptance = RuntimeAcceptanceEnabled;
@@ -51,8 +72,8 @@ impl WorkflowProfile for DirectTurnProfile {
     type Event = DirectTurnEvent;
     type Intent = RuntimeTurnIntent;
     type Observation = ();
-    type Receipt = ();
-    type ReceiptReducerEvent = ();
+    type Receipt = DirectTurnReceipt;
+    type ReceiptReducerEvent = DirectTurnReceiptEvent;
     type BarrierEvent = ();
     type ManualPayload = ();
 
@@ -60,12 +81,16 @@ impl WorkflowProfile for DirectTurnProfile {
         true
     }
 
-    fn receipt_requires_runtime_acceptance((): &Self::ReceiptReducerEvent) -> bool {
-        false
+    fn receipt_requires_runtime_acceptance(_: &Self::ReceiptReducerEvent) -> bool {
+        true
     }
 
-    fn decision_handles_delivery(_: &DeliveryItem<Self>, _: &Self::Event) -> bool {
-        false
+    fn decision_handles_delivery(item: &DeliveryItem<Self>, event: &Self::Event) -> bool {
+        matches!(
+            (&item.payload, event),
+            (DeliveryPayload::Receipt(delivery), DirectTurnEvent::Delivered(accepted))
+                if delivery == accepted
+        )
     }
 
     fn decision_handles_runtime_acceptance(_: &DeliveryItem<Self>, _: &Self::Event) -> bool {
@@ -86,8 +111,14 @@ pub fn profile() -> ProfileRef {
 }
 
 fn supported_codecs() -> SupportedCodecRegistry {
-    SupportedCodecRegistry::new([snapshot_codec(), event_codec(), intent_codec()])
-        .unwrap_or_else(|| unreachable!("static direct-turn codec registry is non-empty and valid"))
+    SupportedCodecRegistry::new([
+        snapshot_codec(),
+        event_codec(),
+        intent_codec(),
+        receipt_codec(),
+        receipt_event_codec(),
+    ])
+    .unwrap_or_else(|| unreachable!("static direct-turn codec registry is non-empty and valid"))
 }
 
 #[must_use]
@@ -116,6 +147,22 @@ pub fn event_codec() -> CodecRef {
 pub fn intent_codec() -> CodecRef {
     CodecRef {
         family: INTENT_CODEC_FAMILY,
+        version: PROTOCOL_VERSION,
+    }
+}
+
+#[must_use]
+pub fn receipt_codec() -> CodecRef {
+    CodecRef {
+        family: RECEIPT_CODEC_FAMILY,
+        version: PROTOCOL_VERSION,
+    }
+}
+
+#[must_use]
+pub fn receipt_event_codec() -> CodecRef {
+    CodecRef {
+        family: RECEIPT_EVENT_CODEC_FAMILY,
         version: PROTOCOL_VERSION,
     }
 }

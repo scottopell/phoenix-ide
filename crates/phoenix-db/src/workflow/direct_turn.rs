@@ -20,8 +20,8 @@ enum TransactionCut {
 }
 
 const DIRECT_TURN_ACCEPTED_TRANSITION_ID: u64 = 1;
-const DIRECT_TURN_TERMINAL_TRANSITION_ID: u64 = 2;
 const DIRECT_TURN_EFFECT_ID: u64 = 1;
+const DIRECT_TURN_SEQUENCE_NAME: &str = "direct_turn";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptAuthoritativeTurn {
@@ -37,6 +37,19 @@ impl WorkflowRepository {
         &self,
         input: &AcceptAuthoritativeTurn,
     ) -> DbResult<TurnStep> {
+        for _ in 0..20 {
+            match self
+                .accept_authoritative_turn_at_cut(input, TransactionCut::None)
+                .await
+            {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
         self.accept_authoritative_turn_at_cut(input, TransactionCut::None)
             .await
     }
@@ -81,11 +94,9 @@ impl WorkflowRepository {
                 }));
             }
         }
-        let next_id =
-            sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns")
-                .fetch_one(&mut *tx.tx)
-                .await?;
-        let turn_id = TurnAuthorityId(to_u64(next_id, "turn_id")?);
+        let turn_id = TurnAuthorityId(
+            next_global_id_tx(&mut tx, DIRECT_TURN_SEQUENCE_NAME, "turn_id").await?,
+        );
         let workflow_id = next_global_workflow_id_tx(&mut tx).await?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
@@ -232,6 +243,19 @@ impl WorkflowRepository {
     }
 
     pub async fn terminate_authoritative_turn(&self, command: TurnCommand) -> DbResult<TurnStep> {
+        for _ in 0..20 {
+            match self
+                .terminate_authoritative_turn_at_cut(command.clone(), TransactionCut::None)
+                .await
+            {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
         self.terminate_authoritative_turn_at_cut(command, TransactionCut::None)
             .await
     }
@@ -288,6 +312,11 @@ impl WorkflowRepository {
         }
         let (terminal_kind, reason) = terminal_sql(&terminal);
         let next_generation = expected_generation.saturating_add(1);
+        let terminal_at = phoenix_workflow::Timestamp(
+            u64::try_from(chrono::Utc::now().timestamp_millis()).map_err(|_| {
+                DbError::Serialization("terminal timestamp before epoch".to_string())
+            })?,
+        );
         let snapshot = direct_turn_profile::DirectTurnSnapshot { turn_id: turn_id.0 };
         let terminal_event = direct_turn_profile::DirectTurnEvent::Terminal(
             direct_turn_profile::DirectTurnTerminalEvent {
@@ -311,8 +340,8 @@ impl WorkflowRepository {
                 &event_payload,
                 &snapshot_codec,
                 &snapshot_payload,
-                phoenix_workflow::TransitionId(DIRECT_TURN_TERMINAL_TRANSITION_ID),
-                phoenix_workflow::Timestamp(next_generation),
+                phoenix_workflow::TransitionId(head.version.0.saturating_add(1)),
+                terminal_at,
             )
             .await?;
         if !committed {
@@ -342,6 +371,7 @@ impl WorkflowRepository {
         mark_active_attempts_authority_lost_tx(&mut tx, workflow_id).await?;
         delete_reclaimable_leases_tx(&mut tx, workflow_id).await?;
         tx.invalidate_nonterminal_effects(workflow_id).await?;
+        suppress_pending_deliveries_tx(&mut tx, workflow_id).await?;
         finish_workflow_transaction_at_cut(tx, cut).await?;
         Ok(step)
     }
@@ -359,12 +389,33 @@ async fn workflow_id_for_turn_tx(
     Ok(WorkflowId(to_u64(workflow_id, "workflow_id")?))
 }
 
+async fn next_global_id_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    sequence_name: &str,
+    field: &'static str,
+) -> DbResult<u64> {
+    sqlx::query(
+        "INSERT INTO workflow_global_sequences (sequence_name, next_value)
+         VALUES (?1, 2)
+         ON CONFLICT(sequence_name)
+         DO UPDATE SET next_value = workflow_global_sequences.next_value + 1",
+    )
+    .bind(sequence_name)
+    .execute(&mut *tx.tx)
+    .await?;
+    let allocated = sqlx::query_scalar::<_, i64>(
+        "SELECT next_value - 1 FROM workflow_global_sequences WHERE sequence_name = ?1",
+    )
+    .bind(sequence_name)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    to_u64(allocated, field)
+}
+
 async fn next_global_workflow_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<WorkflowId> {
-    let next =
-        sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(workflow_id), 0) + 1 FROM workflows")
-            .fetch_one(&mut *tx.tx)
-            .await?;
-    Ok(WorkflowId(to_u64(next, "workflow_id")?))
+    Ok(WorkflowId(
+        next_global_id_tx(tx, "workflow", "workflow_id").await?,
+    ))
 }
 
 async fn insert_direct_turn_workflow_tx(
@@ -428,7 +479,9 @@ async fn insert_direct_turn_workflow_tx(
                 .map_err(|e| DbError::Serialization(format!("encode direct-turn intent: {e}")))?,
             generation: Generation(0),
             role: EffectRole::Required,
-            capability: ExecutionCapability::ReclaimableObservation,
+            capability: ExecutionCapability::IdempotentSubmission {
+                stable_command_id: phoenix_workflow::StableCommandId(turn_id.0),
+            },
             next_eligible_at: None,
             destructive_resource: None,
             status: EffectStatus::Eligible,
@@ -594,6 +647,25 @@ fn terminal_event_kind(terminal: &TurnTerminal) -> direct_turn_profile::DirectTu
     }
 }
 
+async fn suppress_pending_deliveries_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE workflow_deliveries
+         SET status = 'Suppressed', suppression_reason = 'LifecycleTerminal',
+             runtime_acceptance_status = CASE
+                 WHEN requires_runtime_acceptance = 1 THEN 'Suppressed'
+                 ELSE runtime_acceptance_status
+             END
+         WHERE workflow_id = ?1 AND status IN ('Pending', 'Deferred')",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .execute(&mut *tx.tx)
+    .await?;
+    Ok(())
+}
+
 async fn mark_active_attempts_authority_lost_tx(
     tx: &mut super::WorkflowTx<'_>,
     workflow_id: WorkflowId,
@@ -664,7 +736,7 @@ fn injected_cut(cut: TransactionCut) -> DbError {
 
 #[allow(clippy::needless_pass_by_value)]
 fn conflict(conflict: TurnConflict) -> DbError {
-    DbError::Serialization(format!("direct-turn conflict: {conflict:?}"))
+    DbError::DirectTurnConflict(conflict)
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -691,6 +763,30 @@ mod tests {
             .await
             .unwrap();
         WorkflowRepository::new(db.pool().clone())
+    }
+
+    async fn file_repos() -> (WorkflowRepository, WorkflowRepository, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("direct-turn.db");
+        let path = path.to_str().unwrap();
+        let first = Database::open(path).await.unwrap();
+        crate::migrations::run_pending_migrations(first.pool())
+            .await
+            .unwrap();
+        first
+            .create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        first
+            .create_conversation("conv-b", "B", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let second = Database::open(path).await.unwrap();
+        (
+            WorkflowRepository::new(first.pool().clone()),
+            WorkflowRepository::new(second.pool().clone()),
+            temp,
+        )
     }
 
     async fn insert_message(repo: &WorkflowRepository, conversation: &str, message_id: &str) {
@@ -780,6 +876,44 @@ mod tests {
                 .outcome,
             TurnOutcome::ExactReplay { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn file_backed_same_key_acceptance_converges() {
+        let (first, second, _temp) = file_repos().await;
+        let accepted = input("conv-a", "same-key", 31);
+        let (left, right) = tokio::join!(
+            first.accept_authoritative_turn(&accepted),
+            second.accept_authoritative_turn(&accepted),
+        );
+        let outcomes = [left.unwrap().outcome, right.unwrap().outcome];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, TurnOutcome::Created { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, TurnOutcome::ExactReplay { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_turn_ids_are_not_reused_after_deletion() {
+        let repo = repo().await;
+        let (first, _) = created_turn(&repo, "first-id", 32).await;
+        sqlx::query("DELETE FROM durable_turns WHERE turn_id = ?1")
+            .bind(i64::try_from(first.0).unwrap())
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let (second, _) = created_turn(&repo, "second-id", 33).await;
+        assert!(second.0 > first.0);
     }
 
     #[tokio::test]
@@ -1148,21 +1282,11 @@ mod tests {
                 attempt_id: phoenix_workflow::AttemptId(77),
                 process_incarnation: phoenix_workflow::ProcessIncarnation(1),
                 now: phoenix_workflow::Timestamp(1),
-                lease_until: Some(phoenix_workflow::LeaseExpiry(99)),
+                lease_until: None,
             })
             .await
             .unwrap();
-        let authority = attempt.authority.unwrap();
-        repo.record_observation(&crate::workflow::RecordObservationInput {
-            authority,
-            observation_id: 1,
-            now: phoenix_workflow::Timestamp(2),
-            observed_at: phoenix_workflow::Timestamp(2),
-            observation_codec: local_codec(&direct_turn_profile::intent_codec()),
-            observation_payload: b"{}".to_vec(),
-        })
-        .await
-        .unwrap();
+        assert!(attempt.authority.is_some());
         repo.terminate_authoritative_turn(TurnCommand::Cancel {
             turn_id,
             expected_generation: 0,
@@ -1185,6 +1309,43 @@ mod tests {
         assert_eq!(attempt_status, "AuthorityLost");
         assert_eq!(lease_count, 0);
         assert_eq!(effect_status, "Invalidated");
+    }
+
+    #[tokio::test]
+    async fn terminal_suppresses_pending_delivery() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "pending-delivery", 34).await;
+        sqlx::query(
+            "INSERT INTO workflow_deliveries (
+                workflow_id, delivery_id, effect_id, barrier_id, consumer_kind,
+                event_codec_family, event_codec_version, payload_kind, payload_blob,
+                requires_runtime_acceptance, status, runtime_acceptance_status,
+                suppression_reason, accepted_by_transition_id
+             ) VALUES (?1, 1, 1, NULL, 'reducer', 'direct_turn.event', 1,
+                       'Receipt', X'00', 1, 'Pending', 'Owed', NULL, NULL)",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+        repo.terminate_authoritative_turn(TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+        let (status, runtime_status, reason): (String, String, String) = sqlx::query_as(
+            "SELECT status, runtime_acceptance_status, suppression_reason
+             FROM workflow_deliveries WHERE workflow_id = ?1 AND delivery_id = 1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "Suppressed");
+        assert_eq!(runtime_status, "Suppressed");
+        assert_eq!(reason, "LifecycleTerminal");
     }
 
     #[tokio::test]
