@@ -423,6 +423,12 @@ impl WorkflowRepository {
     pub(crate) async fn begin_tx(&self) -> DbResult<WorkflowTx<'_>> {
         Ok(WorkflowTx::new(self.pool.begin().await?))
     }
+
+    pub(crate) async fn begin_immediate_tx(&self) -> DbResult<WorkflowTx<'_>> {
+        Ok(WorkflowTx::new(
+            self.pool.begin_with("BEGIN IMMEDIATE").await?,
+        ))
+    }
 }
 
 fn external_binding_from_input(
@@ -2321,6 +2327,35 @@ impl WorkflowRepository {
         tx.commit().await?;
         Ok(head)
     }
+}
+
+pub(super) async fn next_global_sequence_value_tx(
+    tx: &mut WorkflowTx<'_>,
+    sequence_name: &str,
+    field: &str,
+) -> DbResult<u64> {
+    sqlx::query(
+        "INSERT INTO workflow_global_sequences (sequence_name, next_value)
+         VALUES (?1, 2)
+         ON CONFLICT(sequence_name)
+         DO UPDATE SET next_value = workflow_global_sequences.next_value + 1",
+    )
+    .bind(sequence_name)
+    .execute(&mut *tx.tx)
+    .await?;
+    let allocated = sqlx::query_scalar::<_, i64>(
+        "SELECT next_value - 1 FROM workflow_global_sequences WHERE sequence_name = ?1",
+    )
+    .bind(sequence_name)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    to_u64(allocated, field)
+}
+
+pub(super) async fn next_global_workflow_id_tx(tx: &mut WorkflowTx<'_>) -> DbResult<WorkflowId> {
+    Ok(WorkflowId(
+        next_global_sequence_value_tx(tx, "workflow", "workflow_id").await?,
+    ))
 }
 
 fn to_i64(value: u64, field: &str) -> DbResult<i64> {

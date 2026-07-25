@@ -138,7 +138,7 @@ impl WorkflowRepository {
         input: &AcceptAuthoritativeTurn,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
-        let mut tx = self.begin_tx().await?;
+        let mut tx = self.begin_immediate_tx().await?;
         if let Some(existing) =
             load_by_scoped_key(&mut tx.tx, &input.conversation, &input.client_key).await?
         {
@@ -173,12 +173,8 @@ impl WorkflowRepository {
                 }));
             }
         }
-        let next_id =
-            sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns")
-                .fetch_one(&mut *tx.tx)
-                .await?;
-        let turn_id = TurnAuthorityId(to_u64(next_id, "turn_id")?);
-        let workflow_id = next_global_workflow_id_tx(&mut tx).await?;
+        let turn_id = next_direct_turn_id_tx(&mut tx).await?;
+        let workflow_id = super::next_global_workflow_id_tx(&mut tx).await?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
         sqlx::query(
@@ -844,12 +840,10 @@ async fn workflow_id_for_turn_tx(
     Ok(WorkflowId(to_u64(workflow_id, "workflow_id")?))
 }
 
-async fn next_global_workflow_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<WorkflowId> {
-    let next =
-        sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(workflow_id), 0) + 1 FROM workflows")
-            .fetch_one(&mut *tx.tx)
-            .await?;
-    Ok(WorkflowId(to_u64(next, "workflow_id")?))
+async fn next_direct_turn_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<TurnAuthorityId> {
+    Ok(TurnAuthorityId(
+        super::next_global_sequence_value_tx(tx, "direct_turn", "turn_id").await?,
+    ))
 }
 
 async fn insert_direct_turn_workflow_tx(
@@ -1544,8 +1538,12 @@ fn map_constraint(error: sqlx::Error) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::run_pending_migrations;
+    use crate::workflow::wake::{WakeRegistrationOutcome, WakeRepository};
     use crate::Database;
     use crate::LocalAttemptAuthority;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::str::FromStr;
 
     async fn repo() -> WorkflowRepository {
         let db = Database::open_in_memory().await.unwrap();
@@ -1562,6 +1560,54 @@ mod tests {
             .await
             .unwrap();
         WorkflowRepository::new(db.pool().clone())
+    }
+
+    async fn setup_repo_schema(pool: &sqlx::SqlitePool) {
+        sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, slug TEXT, title TEXT NOT NULL DEFAULT '', conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', cwd TEXT NOT NULL DEFAULT '/tmp', parent_conversation_id TEXT, user_initiated BOOLEAN NOT NULL DEFAULT 1, archived BOOLEAN NOT NULL DEFAULT 0, model TEXT, steering_queue TEXT NOT NULL DEFAULT '[]', state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', created_at TEXT NOT NULL DEFAULT '2025-01-01', updated_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
+        sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT, created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
+        run_pending_migrations(pool).await.unwrap();
+        for conversation_id in ["conv-a", "conv-b", "conv-c", "conv-d"] {
+            sqlx::query("INSERT OR IGNORE INTO conversations (id) VALUES (?1)")
+                .bind(conversation_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn open_workflow_repo_pair() -> (tempfile::TempDir, WorkflowRepository, WorkflowRepository)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("direct-turn.db");
+        let url = format!("sqlite://{}", path.display());
+        let open = || async {
+            let opts = SqliteConnectOptions::from_str(&url)
+                .unwrap()
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(5));
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&pool)
+                .await
+                .unwrap();
+            if sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='conversations'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+                == 0
+            {
+                setup_repo_schema(&pool).await;
+            }
+            WorkflowRepository::new(pool)
+        };
+        (dir, open().await, open().await)
     }
 
     fn input(conversation: &str, key: &str, seed: u8) -> AcceptAuthoritativeTurn {
@@ -2359,6 +2405,116 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_turn_and_wake_allocate_distinct_global_workflow_ids() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let workflow_repo = WorkflowRepository::new(db.pool().clone());
+        let wake_repo = WakeRepository::new(db.pool().clone());
+
+        let created = workflow_repo
+            .accept_authoritative_turn(&input("conv-a", "direct-first", 41))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected direct turn creation")
+        };
+        let direct_workflow_id = workflow_repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let wake_intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
+            contract_id: "contract-direct-cross-profile".to_string(),
+            conversation_id: "conv-a".to_string(),
+            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                stable_key: "conv-a".to_string(),
+            },
+            resource: phoenix_workflow::wake_profile::WakeResourceIdentity::TmuxWindow(
+                phoenix_workflow::wake_profile::TmuxResourceIdentity {
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
+                        kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
+                        stable_key: "conv-a".to_string(),
+                    },
+                    server_token: "server-direct-cross-profile".to_string(),
+                    window_id: "@direct-cross-profile".to_string(),
+                    completion_policy:
+                        phoenix_workflow::wake_profile::TmuxCompletionPolicy::KeepOpen,
+                },
+            ),
+            registering_tool_use_id: "tool-direct-cross-profile".to_string(),
+            registered_at: Timestamp(42),
+            expires_at: Timestamp(100),
+        };
+        let wake_workflow_id = match wake_repo
+            .register(&wake_intent, "wake-after-direct", Timestamp(42))
+            .await
+            .unwrap()
+        {
+            WakeRegistrationOutcome::Registered { workflow_id, .. } => workflow_id,
+            other @ (WakeRegistrationOutcome::Replayed { .. }
+            | WakeRegistrationOutcome::Conflict) => {
+                panic!("expected wake registration, got {other:?}")
+            }
+        };
+
+        assert_ne!(direct_workflow_id, wake_workflow_id);
+        let workflow_ids =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(DISTINCT workflow_id) FROM workflows")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(workflow_ids, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_direct_turns_on_different_scoped_keys_allocate_distinct_ids() {
+        let (_dir, first, second) = open_workflow_repo_pair().await;
+        let left_input = input("conv-a", "left", 51);
+        let right_input = input("conv-b", "right", 52);
+        let (left, right) = tokio::join!(
+            first.accept_authoritative_turn(&left_input),
+            second.accept_authoritative_turn(&right_input)
+        );
+        let TurnOutcome::Created { turn_id: left_id } = left.unwrap().outcome else {
+            panic!("expected left creation")
+        };
+        let TurnOutcome::Created { turn_id: right_id } = right.unwrap().outcome else {
+            panic!("expected right creation")
+        };
+        let left_workflow = first.workflow_id_for_turn(left_id).await.unwrap().unwrap();
+        let right_workflow = first.workflow_id_for_turn(right_id).await.unwrap().unwrap();
+
+        assert_ne!(left_id, right_id);
+        assert_ne!(left_workflow, right_workflow);
+    }
+
+    #[tokio::test]
+    async fn concurrent_direct_turns_on_same_scoped_key_converge_to_created_and_exact_replay() {
+        let (_dir, first, second) = open_workflow_repo_pair().await;
+        let direct_input = input("conv-a", "same-concurrent", 61);
+        let (left, right) = tokio::join!(
+            first.accept_authoritative_turn(&direct_input),
+            second.accept_authoritative_turn(&direct_input)
+        );
+        let left = left.unwrap().outcome;
+        let right = right.unwrap().outcome;
+        let created = [left.clone(), right.clone()]
+            .into_iter()
+            .filter(|outcome| matches!(outcome, TurnOutcome::Created { .. }))
+            .count();
+        let replay = [left, right]
+            .into_iter()
+            .filter(|outcome| matches!(outcome, TurnOutcome::ExactReplay { .. }))
+            .count();
+
+        assert_eq!(created, 1);
+        assert_eq!(replay, 1);
     }
 
     #[tokio::test]

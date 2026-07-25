@@ -579,7 +579,7 @@ impl WakeRepository {
 
         let workflow_id = match allocated_workflow_id {
             Some(workflow_id) => workflow_id,
-            None => next_global_workflow_id_tx(&mut tx).await?,
+            None => super::next_global_workflow_id_tx(&mut tx).await?,
         };
         let snapshot = WakeRegistrationSnapshot {
             contract_id: input.contract_id.clone(),
@@ -3355,27 +3355,10 @@ async fn expire_observation_lease_in_tx(
     Ok(AuthorityOutcome::Authorized)
 }
 
-async fn next_global_workflow_id_tx(tx: &mut WorkflowTx<'_>) -> DbResult<WorkflowId> {
-    sqlx::query(
-        "INSERT INTO workflow_global_sequences (sequence_name, next_value)
-         VALUES ('workflow', 2)
-         ON CONFLICT(sequence_name)
-         DO UPDATE SET next_value = workflow_global_sequences.next_value + 1",
-    )
-    .execute(&mut *tx.tx)
-    .await?;
-    let allocated = sqlx::query_scalar::<_, i64>(
-        "SELECT next_value - 1 FROM workflow_global_sequences WHERE sequence_name = 'workflow'",
-    )
-    .fetch_one(&mut *tx.tx)
-    .await?;
-    Ok(WorkflowId(to_u64(allocated, "workflow_id")?))
-}
-
 #[cfg(test)]
 async fn next_test_workflow_id(repo: &WakeRepository) -> DbResult<WorkflowId> {
     let mut tx = repo.workflow_repo.begin_tx().await?;
-    let workflow_id = next_global_workflow_id_tx(&mut tx).await?;
+    let workflow_id = super::next_global_workflow_id_tx(&mut tx).await?;
     tx.commit().await?;
     Ok(workflow_id)
 }

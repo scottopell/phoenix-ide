@@ -291,7 +291,34 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_authoritative_direct_turns",
         sql: MIGRATION_055,
     },
+    Migration {
+        version: 56,
+        name: "seed_workflow_global_sequences",
+        sql: MIGRATION_056,
+    },
 ];
+
+const MIGRATION_056: &str = r"
+INSERT OR IGNORE INTO workflow_global_sequences (sequence_name, next_value)
+SELECT 'workflow', COALESCE(MAX(workflow_id), 0) + 1 FROM workflows;
+
+UPDATE workflow_global_sequences
+SET next_value = MAX(
+    next_value,
+    (SELECT COALESCE(MAX(workflow_id), 0) + 1 FROM workflows)
+)
+WHERE sequence_name = 'workflow';
+
+INSERT OR IGNORE INTO workflow_global_sequences (sequence_name, next_value)
+SELECT 'direct_turn', COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns;
+
+UPDATE workflow_global_sequences
+SET next_value = MAX(
+    next_value,
+    (SELECT COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns)
+)
+WHERE sequence_name = 'direct_turn';
+";
 
 const MIGRATION_055: &str = r"
 INSERT INTO workflow_global_sequences (sequence_name, next_value)
@@ -2929,6 +2956,43 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    #[tokio::test]
+    async fn migration_056_advances_global_sequences_without_regression() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE workflows (workflow_id INTEGER PRIMARY KEY);
+             CREATE TABLE durable_turns (turn_id INTEGER PRIMARY KEY);
+             CREATE TABLE workflow_global_sequences (
+                 sequence_name TEXT PRIMARY KEY,
+                 next_value INTEGER NOT NULL
+             );
+             INSERT INTO workflows (workflow_id) VALUES (7);
+             INSERT INTO durable_turns (turn_id) VALUES (11);
+             INSERT INTO workflow_global_sequences (sequence_name, next_value)
+             VALUES ('workflow', 3), ('direct_turn', 20);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_056).execute(&pool).await.unwrap();
+
+        let workflow: i64 = sqlx::query_scalar(
+            "SELECT next_value FROM workflow_global_sequences WHERE sequence_name = 'workflow'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let direct_turn: i64 = sqlx::query_scalar(
+            "SELECT next_value FROM workflow_global_sequences WHERE sequence_name = 'direct_turn'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workflow, 8);
+        assert_eq!(direct_turn, 20);
     }
 
     #[tokio::test]
