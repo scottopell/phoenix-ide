@@ -75,23 +75,38 @@ pub struct DiscoverableAcceptedTurn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaterializeAuthoritativeTurnInput {
+pub struct PreflightDirectTurnMaterializationInput {
+    pub turn_id: TurnAuthorityId,
     pub authority: super::LocalAttemptAuthority,
     pub prepared: PreparedDirectTurnPayload,
-    pub receipt_id: ReceiptId,
-    pub delivery_id: DeliveryId,
+    pub now: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectTurnMaterializationEligibility {
+    Fresh,
+    ExactReplay,
+    StaleAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializeAuthoritativeTurnInput {
+    pub turn_id: TurnAuthorityId,
+    pub authority: super::LocalAttemptAuthority,
+    pub prepared: PreparedDirectTurnPayload,
     pub sequence_id: i64,
     pub created_at: Timestamp,
     pub now: Timestamp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MaterializeAuthoritativeTurnResult {
     pub outcome: TurnOutcome,
     pub authority_outcome: AuthorityOutcome,
     pub receipt: Option<super::LocalReceiptRecord>,
     pub delivery: Option<super::LocalDeliveryRecord>,
     pub canonical_turn: DurableTurn,
+    pub message: Option<Message>,
 }
 
 fn authority_event(
@@ -107,18 +122,6 @@ fn authority_event(
         authority.generation.0,
         authority.process_incarnation.0,
     )
-}
-
-async fn turn_id_for_workflow_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    workflow_id: WorkflowId,
-) -> DbResult<TurnAuthorityId> {
-    let turn_id =
-        sqlx::query_scalar::<_, i64>("SELECT turn_id FROM durable_turns WHERE workflow_id = ?1")
-            .bind(to_i64(workflow_id.0, "workflow_id")?)
-            .fetch_one(&mut **tx)
-            .await?;
-    Ok(TurnAuthorityId(to_u64(turn_id, "turn_id")?))
 }
 
 impl WorkflowRepository {
@@ -497,6 +500,95 @@ impl WorkflowRepository {
             .collect()
     }
 
+    pub async fn preflight_direct_turn_materialization(
+        &self,
+        input: &PreflightDirectTurnMaterializationInput,
+    ) -> DbResult<DirectTurnMaterializationEligibility> {
+        let mut tx = self.begin_tx().await?;
+        let eligibility = self
+            .preflight_direct_turn_materialization_tx(&mut tx, input)
+            .await?;
+        tx.rollback().await?;
+        Ok(eligibility)
+    }
+
+    async fn preflight_direct_turn_materialization_tx(
+        &self,
+        tx: &mut super::WorkflowTx<'_>,
+        input: &PreflightDirectTurnMaterializationInput,
+    ) -> DbResult<DirectTurnMaterializationEligibility> {
+        let Some(row) = sqlx::query(
+            "SELECT * FROM durable_turns
+             WHERE turn_id = ?1 AND workflow_id = ?2 AND workflow_id IS NOT NULL",
+        )
+        .bind(to_i64(input.turn_id.0, "turn_id")?)
+        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        else {
+            return Ok(DirectTurnMaterializationEligibility::StaleAuthority);
+        };
+        let turn = row_to_turn(row)?;
+        verify_prepared_payload(&turn, &input.prepared)?;
+        if !matches!(turn.lifecycle, TurnLifecycle::Accepted { .. })
+            || turn.generation != input.authority.generation.0
+        {
+            return Ok(DirectTurnMaterializationEligibility::StaleAuthority);
+        }
+        if let Materialization::Materialized { message_id } = &turn.materialization {
+            let message = load_message_by_id_tx(&mut tx.tx, &message_id.0).await?;
+            verify_existing_materialized_message_without_sequence(
+                &message,
+                &turn,
+                &input.prepared,
+            )?;
+            return Ok(DirectTurnMaterializationEligibility::ExactReplay);
+        }
+
+        let Some(authority_row) = sqlx::query(
+            "SELECT e.status AS effect_status, a.status AS attempt_status, l.lease_until
+             FROM workflow_effects e
+             JOIN workflow_attempts a
+               ON a.workflow_id = e.workflow_id AND a.attempt_id = ?3
+             LEFT JOIN workflow_reclaimable_leases l
+               ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
+             WHERE e.workflow_id = ?1 AND e.effect_id = ?2
+               AND e.declared_workflow_version = ?4 AND e.generation = ?5
+               AND a.effect_id = ?2 AND a.declared_workflow_version = ?4
+               AND a.generation = ?5 AND a.process_incarnation = ?6",
+        )
+        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+        .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+        .bind(to_i64(
+            input.authority.declared_workflow_version.0,
+            "declared_workflow_version",
+        )?)
+        .bind(to_i64(input.authority.generation.0, "generation")?)
+        .bind(to_i64(
+            input.authority.process_incarnation.0,
+            "process_incarnation",
+        )?)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        else {
+            return Ok(DirectTurnMaterializationEligibility::StaleAuthority);
+        };
+        if authority_row.get::<String, _>("effect_status") != "Executing"
+            || !matches!(
+                authority_row.get::<String, _>("attempt_status").as_str(),
+                "Begun" | "ObservationRecorded"
+            )
+            || authority_row
+                .get::<Option<i64>, _>("lease_until")
+                .and_then(|value| to_u64(value, "lease_until").ok())
+                .is_none_or(|lease_until| !LeaseExpiry(lease_until).is_live_at(input.now))
+        {
+            return Ok(DirectTurnMaterializationEligibility::StaleAuthority);
+        }
+        Ok(DirectTurnMaterializationEligibility::Fresh)
+    }
+
     pub async fn materialize_authoritative_turn(
         &self,
         input: &MaterializeAuthoritativeTurnInput,
@@ -511,7 +603,7 @@ impl WorkflowRepository {
         cut: TransactionCut,
     ) -> DbResult<MaterializeAuthoritativeTurnResult> {
         let mut tx = self.begin_tx().await?;
-        let turn_id = turn_id_for_workflow_tx(&mut tx.tx, input.authority.workflow_id).await?;
+        let turn_id = input.turn_id;
         let turn = load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
             .await?
             .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
@@ -526,11 +618,18 @@ impl WorkflowRepository {
                 message_id: canonical_message_id.clone(),
             })
             .map_err(conflict)?;
+        let receipt_id = next_workflow_sequence_tx(&mut tx, input.authority.workflow_id, "receipt")
+            .await
+            .map(ReceiptId)?;
+        let delivery_id =
+            next_workflow_sequence_tx(&mut tx, input.authority.workflow_id, "delivery")
+                .await
+                .map(DeliveryId)?;
         let acceptance = tx
             .accept_receipt_and_delivery(&super::AcceptReceiptInput {
                 authority: input.authority.clone(),
-                receipt_id: input.receipt_id,
-                delivery_id: input.delivery_id,
+                receipt_id,
+                delivery_id,
                 attempt_id: Some(input.authority.attempt_id),
                 origin: phoenix_workflow::ReceiptOrigin::Execution,
                 receipt_codec: local_codec_owned(&direct_turn_profile::receipt_codec()),
@@ -558,9 +657,10 @@ impl WorkflowRepository {
                 receipt: None,
                 delivery: None,
                 canonical_turn: turn,
+                message: None,
             });
         }
-        if matches!(step.outcome, TurnOutcome::Materialized { .. }) {
+        let message = if matches!(step.outcome, TurnOutcome::Materialized { .. }) {
             let message = insert_canonical_message_tx(
                 &mut tx,
                 &turn,
@@ -589,16 +689,16 @@ impl WorkflowRepository {
                     actual: turn.generation,
                 }));
             }
+            Some(message)
         } else {
             let existing = load_message_by_id_tx(&mut tx.tx, &canonical_message_id.0).await?;
-            verify_existing_materialized_message(
+            verify_existing_materialized_message_without_sequence(
                 &existing,
                 &turn,
                 &input.prepared,
-                input.sequence_id,
-                input.created_at,
             )?;
-        }
+            Some(existing)
+        };
         let canonical_turn =
             load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
                 .await?
@@ -612,6 +712,7 @@ impl WorkflowRepository {
             receipt: acceptance.receipt,
             delivery: acceptance.delivery,
             canonical_turn,
+            message,
         })
     }
 
@@ -1017,17 +1118,12 @@ async fn load_message_by_id_tx(
     Ok(message)
 }
 
-fn verify_existing_materialized_message(
+fn verify_existing_materialized_message_without_sequence(
     message: &Message,
     turn: &DurableTurn,
     prepared: &PreparedDirectTurnPayload,
-    sequence_id: i64,
-    created_at: Timestamp,
 ) -> DbResult<()> {
-    if message.conversation_id != turn.conversation.0
-        || message.sequence_id != sequence_id
-        || message.created_at != timestamp_to_datetime(created_at)
-    {
+    if message.conversation_id != turn.conversation.0 {
         return Err(conflict(TurnConflict::PreparedSemanticsChanged));
     }
     let (expected_content, expected_display) = prepared.message_content_and_display_data();
@@ -1152,6 +1248,32 @@ async fn next_attempt_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<AttemptI
     .fetch_one(&mut *tx.tx)
     .await?;
     Ok(AttemptId(to_u64(next, "attempt_id")?))
+}
+
+async fn next_workflow_sequence_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    sequence_name: &str,
+) -> DbResult<u64> {
+    sqlx::query(
+        "INSERT INTO workflow_sequences (workflow_id, sequence_name, next_value)
+         VALUES (?1, ?2, 2)
+         ON CONFLICT(workflow_id, sequence_name)
+         DO UPDATE SET next_value = workflow_sequences.next_value + 1",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(sequence_name)
+    .execute(&mut *tx.tx)
+    .await?;
+    let next = sqlx::query_scalar::<_, i64>(
+        "SELECT next_value - 1 FROM workflow_sequences
+         WHERE workflow_id = ?1 AND sequence_name = ?2",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(sequence_name)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    to_u64(next, sequence_name)
 }
 
 async fn expire_direct_turn_lease_in_tx(
@@ -1527,19 +1649,33 @@ mod tests {
     }
 
     fn materialize_input(
+        turn_id: TurnAuthorityId,
         authority: LocalAttemptAuthority,
-        receipt_id: u64,
-        delivery_id: u64,
+        _receipt_id: u64,
+        _delivery_id: u64,
         message_id: &str,
         now: u64,
     ) -> MaterializeAuthoritativeTurnInput {
         MaterializeAuthoritativeTurnInput {
+            turn_id,
             authority,
             prepared: prepared_payload(message_id),
-            receipt_id: ReceiptId(receipt_id),
-            delivery_id: DeliveryId(delivery_id),
             sequence_id: i64::try_from(now).unwrap(),
             created_at: Timestamp(now),
+            now: Timestamp(now),
+        }
+    }
+
+    fn preflight_input(
+        turn_id: TurnAuthorityId,
+        authority: LocalAttemptAuthority,
+        message_id: &str,
+        now: u64,
+    ) -> PreflightDirectTurnMaterializationInput {
+        PreflightDirectTurnMaterializationInput {
+            turn_id,
+            authority,
+            prepared: prepared_payload(message_id),
             now: Timestamp(now),
         }
     }
@@ -1600,14 +1736,16 @@ mod tests {
         let message = CanonicalMessageId("message-conv-a-materialize-before".to_string());
         assert!(before_repo
             .materialize_authoritative_turn_at_cut(
-                &materialize_input(authority.clone(), 1, 1, &message.0, 10),
+                &materialize_input(turn_id, authority.clone(), 1, 1, &message.0, 10),
                 TransactionCut::BeforeCommit,
             )
             .await
             .is_err());
         assert!(matches!(
             before_repo
-                .materialize_authoritative_turn(&materialize_input(authority, 1, 1, &message.0, 10))
+                .materialize_authoritative_turn(&materialize_input(
+                    turn_id, authority, 1, 1, &message.0, 10
+                ))
                 .await
                 .unwrap()
                 .outcome,
@@ -1635,14 +1773,16 @@ mod tests {
         let message = CanonicalMessageId("message-conv-a-materialize-after".to_string());
         assert!(after_repo
             .materialize_authoritative_turn_at_cut(
-                &materialize_input(authority.clone(), 1, 1, &message.0, 11),
+                &materialize_input(turn_id, authority.clone(), 1, 1, &message.0, 11),
                 TransactionCut::AfterCommit,
             )
             .await
             .is_err());
         assert!(matches!(
             after_repo
-                .materialize_authoritative_turn(&materialize_input(authority, 2, 2, &message.0, 11))
+                .materialize_authoritative_turn(&materialize_input(
+                    turn_id, authority, 2, 2, &message.0, 11
+                ))
                 .await
                 .unwrap()
                 .outcome,
@@ -2155,6 +2295,7 @@ mod tests {
             .await
             .unwrap();
         repo.materialize_authoritative_turn(&materialize_input(
+            materialized_id,
             materialized_claim.authority.unwrap(),
             100,
             100,
@@ -2305,6 +2446,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialization_preflight_fresh_replay_stale_and_wrong_payload() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "preflight", 31))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 70))
+            .await
+            .unwrap();
+        let authority = claim.authority.unwrap();
+
+        assert!(matches!(
+            repo.preflight_direct_turn_materialization(&preflight_input(
+                turn_id,
+                authority.clone(),
+                "message-conv-a-preflight",
+                70,
+            ))
+            .await
+            .unwrap(),
+            DirectTurnMaterializationEligibility::Fresh
+        ));
+        assert!(repo
+            .preflight_direct_turn_materialization(&preflight_input(
+                turn_id,
+                authority.clone(),
+                "message-other",
+                70,
+            ))
+            .await
+            .is_err());
+
+        let stale_authority = LocalAttemptAuthority {
+            attempt_id: AttemptId(authority.attempt_id.0 + 100),
+            ..authority.clone()
+        };
+        assert!(matches!(
+            repo.preflight_direct_turn_materialization(&preflight_input(
+                turn_id,
+                stale_authority.clone(),
+                "message-conv-a-preflight",
+                70,
+            ))
+            .await
+            .unwrap(),
+            DirectTurnMaterializationEligibility::StaleAuthority
+        ));
+        assert!(matches!(
+            repo.preflight_direct_turn_materialization(&preflight_input(
+                TurnAuthorityId(turn_id.0 + 100),
+                authority.clone(),
+                "message-conv-a-preflight",
+                70,
+            ))
+            .await
+            .unwrap(),
+            DirectTurnMaterializationEligibility::StaleAuthority
+        ));
+        assert!(matches!(
+            repo.preflight_direct_turn_materialization(&preflight_input(
+                turn_id,
+                authority.clone(),
+                "message-conv-a-preflight",
+                80,
+            ))
+            .await
+            .unwrap(),
+            DirectTurnMaterializationEligibility::StaleAuthority
+        ));
+
+        let materialized = repo
+            .materialize_authoritative_turn(&materialize_input(
+                turn_id,
+                authority.clone(),
+                1,
+                1,
+                "message-conv-a-preflight",
+                70,
+            ))
+            .await
+            .unwrap();
+        assert!(materialized.message.is_some());
+        let replay = repo
+            .preflight_direct_turn_materialization(&preflight_input(
+                turn_id,
+                authority.clone(),
+                "message-conv-a-preflight",
+                70,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay, DirectTurnMaterializationEligibility::ExactReplay);
+
+        let replay_with_stale_attempt = repo
+            .preflight_direct_turn_materialization(&preflight_input(
+                turn_id,
+                stale_authority,
+                "message-conv-a-preflight",
+                70,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay_with_stale_attempt,
+            DirectTurnMaterializationEligibility::ExactReplay
+        ));
+    }
+
+    #[tokio::test]
     async fn materialization_exact_replay_conflict_and_terminal_fencing() {
         let repo = repo().await;
         let created = repo
@@ -2322,6 +2577,7 @@ mod tests {
         let authority = claim.authority.unwrap();
         let first = repo
             .materialize_authoritative_turn(&materialize_input(
+                turn_id,
                 authority.clone(),
                 10,
                 10,
@@ -2334,6 +2590,7 @@ mod tests {
         assert!(matches!(first.outcome, TurnOutcome::Materialized { .. }));
         let replay = repo
             .materialize_authoritative_turn(&materialize_input(
+                turn_id,
                 authority.clone(),
                 11,
                 11,
@@ -2348,6 +2605,7 @@ mod tests {
         ));
         let conflict = repo
             .materialize_authoritative_turn(&materialize_input(
+                turn_id,
                 authority.clone(),
                 12,
                 12,
@@ -2382,7 +2640,9 @@ mod tests {
         .await
         .unwrap();
         let terminal = repo
-            .materialize_authoritative_turn(&materialize_input(authority, 20, 20, "late", 60))
+            .materialize_authoritative_turn(&materialize_input(
+                turn_id, authority, 20, 20, "late", 60,
+            ))
             .await;
         assert!(terminal.is_err());
     }

@@ -3891,14 +3891,54 @@ where
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
-            Effect::PersistAuthoritativeUserMessage { authority, .. } => {
-                tracing::error!(
-                    workflow_id = authority.workflow_id.0,
-                    turn_id = authority.turn_id.0,
-                    attempt_id = authority.attempt_id.0,
-                    "rejecting authoritative direct-turn persistence before runtime consumer cutover"
-                );
-                Err("authoritative direct-turn runtime consumer is not installed".to_string())
+            Effect::PersistAuthoritativeUserMessage {
+                payload, authority, ..
+            } => {
+                let now = chrono::Utc::now()
+                    .timestamp()
+                    .try_into()
+                    .unwrap_or_default();
+                match self
+                    .storage
+                    .preflight_authoritative_user_message(
+                        &authority,
+                        &payload,
+                        phoenix_workflow::Timestamp(now),
+                    )
+                    .await?
+                {
+                    phoenix_db::workflow::DirectTurnMaterializationEligibility::Fresh => {}
+                    phoenix_db::workflow::DirectTurnMaterializationEligibility::ExactReplay
+                    | phoenix_db::workflow::DirectTurnMaterializationEligibility::StaleAuthority => {
+                        return Ok(None);
+                    }
+                }
+                let (reserved_broadcast_range, reserved_seqs) =
+                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let _reserved_broadcast_range = reserved_broadcast_range;
+                match self
+                    .storage
+                    .materialize_authoritative_user_message(
+                        &authority,
+                        &payload,
+                        reserved_seqs[0],
+                        phoenix_workflow::Timestamp(now),
+                        phoenix_workflow::Timestamp(now),
+                    )
+                    .await?
+                {
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized(
+                        message,
+                    ) => {
+                        let _ = self.broadcast_tx.send_message(*message);
+                        Ok(None)
+                    }
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority => Err(
+                        "direct-turn materialization became replay/stale after broadcast sequence reservation"
+                            .to_string(),
+                    ),
+                }
             }
 
             Effect::PersistMessage {
@@ -8314,6 +8354,210 @@ mod test_git_helpers {
 /// The effect is dispatched through the real `execute_effect` match arm
 /// (not a private helper) so the handler's full transition-time behaviour
 /// is exercised end-to-end.
+#[cfg(test)]
+mod authoritative_user_message_effect_tests {
+    use super::*;
+    use crate::db::{Message, MessageContent, MessageType};
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::traits::AuthoritativeUserMessageMaterialization;
+    use crate::tools::BrowserSessionManager;
+    use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
+    use phoenix_db::workflow::DirectTurnMaterializationEligibility;
+    use phoenix_llm::ModelRegistry;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::{broadcast, mpsc};
+
+    fn assert_no_broadcast(rx: &mut broadcast::Receiver<SseEvent>) {
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    fn payload(message_id: &str) -> PreparedDirectTurnPayload {
+        PreparedDirectTurnPayload {
+            text: "hello".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: message_id.to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        }
+    }
+
+    fn authority() -> DirectTurnAttemptAuthority {
+        DirectTurnAttemptAuthority::new(1, 1, 1, 1, 1, 0, 1)
+    }
+
+    fn message(message_id: &str, sequence_id: i64) -> Message {
+        Message {
+            message_id: message_id.to_string(),
+            conversation_id: "conv-direct".to_string(),
+            sequence_id,
+            message_type: MessageType::User,
+            content: MessageContent::user("hello"),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn runtime(
+        preflight: DirectTurnMaterializationEligibility,
+        materialize: AuthoritativeUserMessageMaterialization,
+    ) -> (
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
+        Arc<InMemoryStorage>,
+        broadcast::Receiver<SseEvent>,
+    ) {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.queue_preflight_authoritative_user_message(preflight);
+        storage.queue_materialize_authoritative_user_message(materialize);
+        let context = ConvContext::new("conv-direct", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let broadcaster = SseBroadcaster::new(128, 0);
+        let broadcast_rx = broadcaster.subscribe();
+        (
+            ConversationRuntime::new(
+                context,
+                ConvState::Idle,
+                storage.clone(),
+                Arc::new(MockLlmClient::new("test-model")),
+                Arc::new(MockToolExecutor::new()),
+                Arc::new(BrowserSessionManager::default()),
+                Arc::new(crate::tools::BashHandleRegistry::new()),
+                Arc::new(crate::tools::TmuxRegistry::new()),
+                Arc::new(ModelRegistry::new_empty()),
+                crate::terminal::ActiveTerminals::new(),
+                event_rx,
+                event_tx_dup,
+                broadcaster,
+            ),
+            storage,
+            broadcast_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn replay_preflight_does_not_reserve_sequence_or_emit() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::ExactReplay,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+
+        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload("msg-direct"),
+            authority: authority(),
+            idempotent: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(rt.broadcast_tx.current_seq(), 0);
+        assert_no_broadcast(&mut rx);
+        assert_eq!(
+            storage
+                .recorded_materialize_authoritative_user_message_calls()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_preflight_does_not_reserve_sequence_or_emit() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+
+        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload("msg-direct"),
+            authority: authority(),
+            idempotent: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(rt.broadcast_tx.current_seq(), 0);
+        assert_no_broadcast(&mut rx);
+        assert_eq!(
+            storage
+                .recorded_materialize_authoritative_user_message_calls()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_materialized_emits_one_persisted_reserved_message() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized(Box::new(message(
+                "msg-direct",
+                1,
+            ))),
+        );
+
+        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload("msg-direct"),
+            authority: authority(),
+            idempotent: true,
+        })
+        .await
+        .unwrap();
+
+        let event = rx.try_recv().expect("persisted message broadcast");
+        let SseEvent::Message { message } = event else {
+            panic!("expected message event")
+        };
+        assert_eq!(message.message_id, "msg-direct");
+        assert_eq!(message.sequence_id, 1);
+        assert_eq!(rt.broadcast_tx.current_seq(), 1);
+        let materialize_calls = storage.recorded_materialize_authoritative_user_message_calls();
+        assert_eq!(materialize_calls.len(), 1);
+        assert_eq!(materialize_calls[0].sequence_id, 1);
+        assert_no_broadcast(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn fresh_then_replay_or_stale_materialization_is_hard_error_without_broadcast() {
+        for materialize in [
+            AuthoritativeUserMessageMaterialization::ExactReplay,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        ] {
+            let (mut rt, storage, mut rx) =
+                runtime(DirectTurnMaterializationEligibility::Fresh, materialize);
+
+            let err = rt
+                .execute_effect(Effect::PersistAuthoritativeUserMessage {
+                    payload: payload("msg-direct"),
+                    authority: authority(),
+                    idempotent: true,
+                })
+                .await
+                .expect_err(
+                    "fresh preflight followed by replay/stale materialization is impossible",
+                );
+
+            assert!(
+                err.contains("direct-turn materialization became replay/stale"),
+                "unexpected error: {err}"
+            );
+            assert_no_broadcast(&mut rx);
+            assert_eq!(
+                storage
+                    .recorded_materialize_authoritative_user_message_calls()
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod context_exhausted_preserves_worktree_tests {
     use super::test_git_helpers::{add_worktree, branch_exists, init_repo};

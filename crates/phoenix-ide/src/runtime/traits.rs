@@ -9,6 +9,13 @@ use async_trait::async_trait;
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
 
+#[derive(Debug, Clone)]
+pub enum AuthoritativeUserMessageMaterialization {
+    Materialized(Box<Message>),
+    ExactReplay,
+    StaleAuthority,
+}
+
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
@@ -89,6 +96,26 @@ pub trait MessageStore: Send + Sync {
         _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
     ) -> Result<crate::db::CreationCasOutcome, String> {
         Ok(crate::db::CreationCasOutcome::ClaimLost)
+    }
+
+    async fn preflight_authoritative_user_message(
+        &self,
+        _authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        _payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        _now: phoenix_workflow::Timestamp,
+    ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
+        Ok(phoenix_db::workflow::DirectTurnMaterializationEligibility::StaleAuthority)
+    }
+
+    async fn materialize_authoritative_user_message(
+        &self,
+        _authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        _payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        _sequence_id: i64,
+        _created_at: phoenix_workflow::Timestamp,
+        _now: phoenix_workflow::Timestamp,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        Ok(AuthoritativeUserMessageMaterialization::StaleAuthority)
     }
 
     /// Update `display_data` for an existing message
@@ -387,6 +414,36 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         claim: &phoenix_core::domain::creation_protocol::CreationClaim,
     ) -> Result<crate::db::CreationCasOutcome, String> {
         (**self).complete_creation_job(job_id, claim).await
+    }
+
+    async fn preflight_authoritative_user_message(
+        &self,
+        authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        now: phoenix_workflow::Timestamp,
+    ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
+        (**self)
+            .preflight_authoritative_user_message(authority, payload, now)
+            .await
+    }
+
+    async fn materialize_authoritative_user_message(
+        &self,
+        authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        sequence_id: i64,
+        created_at: phoenix_workflow::Timestamp,
+        now: phoenix_workflow::Timestamp,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        (**self)
+            .materialize_authoritative_user_message(
+                authority,
+                payload,
+                sequence_id,
+                created_at,
+                now,
+            )
+            .await
     }
 
     async fn update_message_display_data(
@@ -709,6 +766,67 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn preflight_authoritative_user_message(
+        &self,
+        authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        now: phoenix_workflow::Timestamp,
+    ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
+        use phoenix_db::workflow::{PreflightDirectTurnMaterializationInput, WorkflowRepository};
+        use phoenix_workflow::TurnAuthorityId;
+        let repo = WorkflowRepository::new(self.db.pool().clone());
+        let local_authority = direct_turn_local_authority(authority);
+        repo.preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
+            turn_id: TurnAuthorityId(authority.turn_id.0),
+            authority: local_authority,
+            prepared: payload.clone(),
+            now,
+        })
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn materialize_authoritative_user_message(
+        &self,
+        authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        sequence_id: i64,
+        created_at: phoenix_workflow::Timestamp,
+        now: phoenix_workflow::Timestamp,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        use phoenix_db::workflow::{MaterializeAuthoritativeTurnInput, WorkflowRepository};
+        use phoenix_workflow::{AuthorityOutcome, TurnAuthorityId, TurnOutcome};
+        let repo = WorkflowRepository::new(self.db.pool().clone());
+        let local_authority = direct_turn_local_authority(authority);
+        let materialized = repo
+            .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+                turn_id: TurnAuthorityId(authority.turn_id.0),
+                authority: local_authority,
+                prepared: payload.clone(),
+                sequence_id,
+                created_at,
+                now,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        match (
+            materialized.authority_outcome,
+            materialized.outcome,
+            materialized.message,
+        ) {
+            (AuthorityOutcome::Authorized, TurnOutcome::Materialized { .. }, Some(message)) => Ok(
+                AuthoritativeUserMessageMaterialization::Materialized(Box::new(message)),
+            ),
+            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, Some(_)) => {
+                Ok(AuthoritativeUserMessageMaterialization::ExactReplay)
+            }
+            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, None) => {
+                Err("direct-turn replay did not return canonical message".to_string())
+            }
+            _ => Ok(AuthoritativeUserMessageMaterialization::StaleAuthority),
+        }
+    }
+
     async fn update_message_display_data(
         &self,
         message_id: &str,
@@ -759,6 +877,23 @@ impl MessageStore for DatabaseStorage {
             .persist_tool_round(conv_id, assistant, tool_results)
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+fn direct_turn_local_authority(
+    authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+) -> phoenix_db::LocalAttemptAuthority {
+    use phoenix_workflow::{
+        AttemptId, EffectId, Generation, ProcessIncarnation, Version, WorkflowId,
+    };
+
+    phoenix_db::LocalAttemptAuthority {
+        workflow_id: WorkflowId(authority.workflow_id.0),
+        declared_workflow_version: Version(authority.declared_workflow_version.0),
+        generation: Generation(authority.generation.0),
+        effect_id: EffectId(authority.effect_id.0),
+        attempt_id: AttemptId(authority.attempt_id.0),
+        process_incarnation: ProcessIncarnation(authority.process_incarnation.0),
     }
 }
 

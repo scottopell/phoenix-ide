@@ -8,8 +8,11 @@ use crate::state_machine::ConvState;
 use crate::tools::browser::BrowserSessionManager;
 use crate::tools::{ToolContext, ToolOutput};
 use async_trait::async_trait;
+use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
+use phoenix_db::workflow::DirectTurnMaterializationEligibility;
 use phoenix_llm::ModelRegistry;
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse, PromptCacheKey, ToolDefinition};
+use phoenix_workflow::Timestamp;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -490,6 +493,24 @@ impl ToolExecutor for FirstCallUncooperativeToolExecutor {
 // In-Memory Storage
 // ============================================================================
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct PreflightAuthoritativeUserMessageCall {
+    pub authority: DirectTurnAttemptAuthority,
+    pub payload: PreparedDirectTurnPayload,
+    pub now: Timestamp,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct MaterializeAuthoritativeUserMessageCall {
+    pub authority: DirectTurnAttemptAuthority,
+    pub payload: PreparedDirectTurnPayload,
+    pub sequence_id: i64,
+    pub created_at: Timestamp,
+    pub now: Timestamp,
+}
+
 /// In-memory storage for testing
 #[allow(dead_code)]
 pub struct InMemoryStorage {
@@ -502,6 +523,13 @@ pub struct InMemoryStorage {
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
+    preflight_authoritative_user_message_results:
+        Mutex<VecDeque<DirectTurnMaterializationEligibility>>,
+    materialize_authoritative_user_message_results:
+        Mutex<VecDeque<AuthoritativeUserMessageMaterialization>>,
+    preflight_authoritative_user_message_calls: Mutex<Vec<PreflightAuthoritativeUserMessageCall>>,
+    materialize_authoritative_user_message_calls:
+        Mutex<Vec<MaterializeAuthoritativeUserMessageCall>>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -520,6 +548,10 @@ impl InMemoryStorage {
             fork_proposals: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
             last_prompt_tokens: Mutex::new(HashMap::new()),
+            preflight_authoritative_user_message_results: Mutex::new(VecDeque::new()),
+            materialize_authoritative_user_message_results: Mutex::new(VecDeque::new()),
+            preflight_authoritative_user_message_calls: Mutex::new(Vec::new()),
+            materialize_authoritative_user_message_calls: Mutex::new(Vec::new()),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -590,6 +622,44 @@ impl InMemoryStorage {
     /// Get current state for a conversation
     pub fn get_current_state(&self, conv_id: &str) -> Option<ConvState> {
         self.states.lock().unwrap().get(conv_id).cloned()
+    }
+
+    pub fn queue_preflight_authoritative_user_message(
+        &self,
+        result: DirectTurnMaterializationEligibility,
+    ) {
+        self.preflight_authoritative_user_message_results
+            .lock()
+            .unwrap()
+            .push_back(result);
+    }
+
+    pub fn queue_materialize_authoritative_user_message(
+        &self,
+        result: AuthoritativeUserMessageMaterialization,
+    ) {
+        self.materialize_authoritative_user_message_results
+            .lock()
+            .unwrap()
+            .push_back(result);
+    }
+
+    pub fn recorded_preflight_authoritative_user_message_calls(
+        &self,
+    ) -> Vec<PreflightAuthoritativeUserMessageCall> {
+        self.preflight_authoritative_user_message_calls
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    pub fn recorded_materialize_authoritative_user_message_calls(
+        &self,
+    ) -> Vec<MaterializeAuthoritativeUserMessageCall> {
+        self.materialize_authoritative_user_message_calls
+            .lock()
+            .unwrap()
+            .clone()
     }
 }
 
@@ -741,6 +811,54 @@ impl MessageStore for InMemoryStorage {
             }
         }
         Err(format!("Message not found: {message_id}"))
+    }
+
+    async fn preflight_authoritative_user_message(
+        &self,
+        authority: &DirectTurnAttemptAuthority,
+        payload: &PreparedDirectTurnPayload,
+        now: Timestamp,
+    ) -> Result<DirectTurnMaterializationEligibility, String> {
+        self.preflight_authoritative_user_message_calls
+            .lock()
+            .unwrap()
+            .push(PreflightAuthoritativeUserMessageCall {
+                authority: authority.clone(),
+                payload: payload.clone(),
+                now,
+            });
+        Ok(self
+            .preflight_authoritative_user_message_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(DirectTurnMaterializationEligibility::StaleAuthority))
+    }
+
+    async fn materialize_authoritative_user_message(
+        &self,
+        authority: &DirectTurnAttemptAuthority,
+        payload: &PreparedDirectTurnPayload,
+        sequence_id: i64,
+        created_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        self.materialize_authoritative_user_message_calls
+            .lock()
+            .unwrap()
+            .push(MaterializeAuthoritativeUserMessageCall {
+                authority: authority.clone(),
+                payload: payload.clone(),
+                sequence_id,
+                created_at,
+                now,
+            });
+        Ok(self
+            .materialize_authoritative_user_message_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(AuthoritativeUserMessageMaterialization::StaleAuthority))
     }
 
     async fn update_message_display_data(
