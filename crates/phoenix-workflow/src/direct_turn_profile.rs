@@ -1,6 +1,6 @@
 use crate::{
-    AcceptanceProfile, CodecRef, DeliveryItem, ExternalAcceptanceDisabled, ProfileRef,
-    RuntimeAcceptanceEnabled, SupportedCodecRegistry, WorkflowProfile,
+    AcceptanceProfile, CodecRef, DeliveryItem, DeliveryPayload, ExternalAcceptanceDisabled,
+    ProfileRef, RuntimeAcceptanceEnabled, SupportedCodecRegistry, WorkflowProfile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,7 @@ pub struct DirectTurnSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectTurnEvent {
     Accepted,
+    Delivered(DirectTurnReceiptEvent),
     Terminal(DirectTurnTerminalEvent),
 }
 
@@ -75,11 +76,11 @@ impl WorkflowProfile for DirectTurnProfile {
     }
 
     fn receipt_requires_runtime_acceptance(_: &Self::ReceiptReducerEvent) -> bool {
-        false
+        true
     }
 
-    fn decision_handles_delivery(_: &DeliveryItem<Self>, _: &Self::Event) -> bool {
-        false
+    fn decision_handles_delivery(item: &DeliveryItem<Self>, event: &Self::Event) -> bool {
+        Self::decision_handles_runtime_acceptance(item, event)
     }
 
     fn decision_handles_runtime_acceptance(item: &DeliveryItem<Self>, event: &Self::Event) -> bool {

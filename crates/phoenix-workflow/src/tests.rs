@@ -1900,8 +1900,8 @@ fn direct_turn_profile_accepts_matching_delivered_runtime_acceptance() {
         crate::direct_turn_profile::DirectTurnSnapshot { turn_id: 7 },
     )
     .expect("workflow");
-    let receipt = DirectTurnReceiptEvent::RuntimeDelivered {
-        canonical_message_id: CanonicalMessageId("m-1".to_string()),
+    let receipt = DirectTurnReceiptEvent::Materialized {
+        canonical_message_id: "m-1".to_string(),
     };
     workflow.deliveries.insert(
         DeliveryId(1),
