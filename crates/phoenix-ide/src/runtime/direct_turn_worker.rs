@@ -162,8 +162,15 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.release(authority, now).await?;
-                tracing::warn!(turn_id = candidate.turn_id.0, error = %error, "direct-turn payload decode failed; released claim");
+                self.repo
+                    .terminate_authoritative_turn(phoenix_workflow::TurnCommand::Fail {
+                        turn_id: candidate.turn_id,
+                        expected_generation: authority.generation.0,
+                        reason: format!("prepared payload decode failed: {error}"),
+                    })
+                    .await
+                    .map_err(|terminal_error| terminal_error.to_string())?;
+                tracing::warn!(turn_id = candidate.turn_id.0, error = %error, "direct-turn payload decode failed; terminally quarantined turn");
                 return Ok(());
             }
         };
@@ -644,13 +651,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_payload_releases_claim() {
+    async fn malformed_payload_is_terminally_quarantined() {
         let (repo, dispatcher) = fixture().await;
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority("conv-a".to_string()),
                 client_key: ClientTurnKey::new("bad").unwrap(),
-                prepared: PreparedTurn::from_exact_payload(b"not-json".to_vec()),
+                prepared: prepared_turn("bad"),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
@@ -659,11 +666,24 @@ mod tests {
         let TurnOutcome::Created { turn_id } = step.outcome else {
             panic!("expected created turn")
         };
+        let malformed = b"not-json";
+        sqlx::query(
+            "UPDATE durable_turns
+             SET prepared_payload = ?1, prepared_fingerprint = ?2
+             WHERE turn_id = ?3",
+        )
+        .bind(malformed.as_slice())
+        .bind(phoenix_core::domain::sm_event::exact_payload_fingerprint(
+            malformed,
+        ))
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .execute(repo.pool())
+        .await
+        .unwrap();
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
-        worker(repo.clone(), dispatcher.clone(), 10, 1)
-            .run_once()
-            .await
-            .unwrap();
+        let worker = worker(repo.clone(), dispatcher.clone(), 10, 1);
+        worker.run_once().await.unwrap();
+        worker.run_once().await.unwrap();
         assert!(dispatcher.events.lock().unwrap().is_empty());
         let attempts = repo
             .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
@@ -673,6 +693,18 @@ mod tests {
             attempts[0].status,
             phoenix_workflow::AttemptStatus::AuthorityLost
         );
+        let turn = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            turn.lifecycle,
+            phoenix_workflow::TurnLifecycle::Terminal {
+                terminal: phoenix_workflow::TurnTerminal::Failed { .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

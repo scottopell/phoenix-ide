@@ -1273,6 +1273,11 @@ impl WorkflowRepository {
         Self { pool }
     }
 
+    #[must_use]
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// # Errors
     ///
     /// Returns an error when the transaction cannot read or persist the workflow foundation rows.

@@ -321,10 +321,6 @@ WHERE sequence_name = 'direct_turn';
 ";
 
 const MIGRATION_055: &str = r"
-INSERT INTO workflow_global_sequences (sequence_name, next_value)
-VALUES ('direct_turn', 1)
-ON CONFLICT(sequence_name) DO NOTHING;
-
 CREATE TABLE durable_turns (
     turn_id INTEGER PRIMARY KEY,
     workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE CASCADE,
@@ -344,7 +340,9 @@ CREATE TABLE durable_turns (
         (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
         OR (terminal_kind IS NULL AND terminal_reason IS NULL)
         OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
-    )
+    ),
+    FOREIGN KEY (conversation_id, canonical_message_id)
+        REFERENCES messages(conversation_id, message_id) ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX messages_conversation_message_id_unique
@@ -361,24 +359,10 @@ CREATE UNIQUE INDEX durable_turns_one_live_owner
     WHERE owns_conversation = 1;
 
 CREATE INDEX durable_turns_discoverable_nonterminal
-    ON durable_turns(conversation_id, disposition, turn_id)
-    WHERE terminal_kind IS NULL;
-
-CREATE TRIGGER durable_turns_canonical_message_guard
-BEFORE UPDATE OF canonical_message_id ON durable_turns
-WHEN NEW.canonical_message_id IS NOT NULL
- AND NOT EXISTS (
-    SELECT 1 FROM messages
-    WHERE messages.conversation_id = NEW.conversation_id
-      AND messages.message_id = NEW.canonical_message_id
- )
-BEGIN
-    SELECT RAISE(ABORT, 'direct-turn canonical message missing from conversation');
-END;
-
-CREATE UNIQUE INDEX durable_turns_canonical_message_unique
-    ON durable_turns(canonical_message_id)
-    WHERE canonical_message_id IS NOT NULL;
+    ON durable_turns(turn_id, workflow_id)
+    WHERE disposition = 'Runtime'
+      AND terminal_kind IS NULL
+      AND canonical_message_id IS NULL;
 ";
 
 const MIGRATION_052: &str = r"
