@@ -286,7 +286,40 @@ const MIGRATIONS: &[Migration] = &[
         name: "work_scope_owns_environment",
         sql: MIGRATION_054,
     },
+    Migration {
+        version: 55,
+        name: "create_authoritative_direct_turns",
+        sql: MIGRATION_055,
+    },
 ];
+
+const MIGRATION_055: &str = r"
+CREATE TABLE durable_turns (
+    turn_id INTEGER PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    client_turn_key TEXT NOT NULL,
+    prepared_fingerprint TEXT NOT NULL,
+    prepared_payload BLOB NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN ('Runtime', 'Steering')),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    terminal_kind TEXT CHECK (terminal_kind IN ('Completed', 'Cancelled', 'Failed')),
+    terminal_reason TEXT,
+    owns_conversation INTEGER NOT NULL CHECK (owns_conversation IN (0, 1)),
+    canonical_message_id TEXT REFERENCES messages(message_id) ON DELETE RESTRICT,
+    UNIQUE (conversation_id, client_turn_key),
+    CHECK (owns_conversation = 0 OR (disposition = 'Runtime' AND terminal_kind IS NULL)),
+    CHECK ((terminal_kind = 'Failed') = (terminal_reason IS NOT NULL)),
+    CHECK (terminal_kind IS NULL OR owns_conversation = 0)
+);
+
+CREATE UNIQUE INDEX durable_turns_one_live_owner
+    ON durable_turns(conversation_id)
+    WHERE owns_conversation = 1;
+
+CREATE INDEX durable_turns_discoverable_nonterminal
+    ON durable_turns(conversation_id, disposition, turn_id)
+    WHERE terminal_kind IS NULL;
+";
 
 const MIGRATION_052: &str = r"
 CREATE TABLE IF NOT EXISTS llm_request_metrics (

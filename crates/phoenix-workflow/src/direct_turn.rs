@@ -71,29 +71,18 @@ impl DurableTurn {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DurableTurnModel {
     turns: BTreeMap<TurnAuthorityId, DurableTurn>,
     by_scoped_key: BTreeMap<(ConversationAuthority, ClientTurnKey), TurnAuthorityId>,
     live_owner: BTreeMap<ConversationAuthority, TurnAuthorityId>,
-    next_id: u64,
-}
-
-impl Default for DurableTurnModel {
-    fn default() -> Self {
-        Self {
-            turns: BTreeMap::new(),
-            by_scoped_key: BTreeMap::new(),
-            live_owner: BTreeMap::new(),
-            next_id: 1,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnCommand {
     Accept {
         conversation: ConversationAuthority,
+        turn_id: TurnAuthorityId,
         client_key: ClientTurnKey,
         prepared: PreparedTurn,
         disposition: AcceptedDisposition,
@@ -135,6 +124,7 @@ pub enum TurnConflict {
     StaleGeneration { actual: u64 },
     AlreadyTerminal,
     MaterializationIdentityChanged { canonical: CanonicalMessageId },
+    CorruptAggregate(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +154,44 @@ pub struct TurnStep {
 }
 
 impl DurableTurnModel {
+    /// Rehydrates a persisted conversation aggregate into the pure model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant conflict when scoped identities collide, more than one
+    /// runtime turn owns a conversation, or a terminal/non-runtime turn claims
+    /// ownership.
+    pub fn from_turns(turns: impl IntoIterator<Item = DurableTurn>) -> Result<Self, TurnConflict> {
+        let mut model = Self::default();
+        for turn in turns {
+            let scoped_key = (turn.conversation.clone(), turn.client_key.clone());
+            if model.by_scoped_key.insert(scoped_key, turn.id).is_some() {
+                return Err(TurnConflict::CorruptAggregate(
+                    "duplicate scoped client turn identity",
+                ));
+            }
+            if turn.owns_conversation()
+                && model
+                    .live_owner
+                    .insert(turn.conversation.clone(), turn.id)
+                    .is_some()
+            {
+                return Err(TurnConflict::CorruptAggregate(
+                    "multiple live owners for one conversation",
+                ));
+            }
+            if model.turns.insert(turn.id, turn).is_some() {
+                return Err(TurnConflict::CorruptAggregate(
+                    "duplicate turn authority id",
+                ));
+            }
+        }
+        if let Some(violation) = model.invariant_violations().into_iter().next() {
+            return Err(TurnConflict::CorruptAggregate(violation));
+        }
+        Ok(model)
+    }
+
     #[must_use]
     pub fn turn(&self, id: &TurnAuthorityId) -> Option<&DurableTurn> {
         self.turns.get(id)
@@ -183,11 +211,12 @@ impl DurableTurnModel {
     pub fn apply(&mut self, command: TurnCommand) -> Result<TurnStep, TurnConflict> {
         match command {
             TurnCommand::Accept {
+                turn_id,
                 conversation,
                 client_key,
                 prepared,
                 disposition,
-            } => self.accept(conversation, client_key, prepared, disposition),
+            } => self.accept(turn_id, conversation, client_key, prepared, disposition),
             TurnCommand::Materialize {
                 turn_id,
                 expected_generation,
@@ -215,6 +244,7 @@ impl DurableTurnModel {
 
     fn accept(
         &mut self,
+        turn_id: TurnAuthorityId,
         conversation: ConversationAuthority,
         client_key: ClientTurnKey,
         prepared: PreparedTurn,
@@ -240,8 +270,11 @@ impl DurableTurnModel {
                 return Err(TurnConflict::ConversationAlreadyOwned { owner: *owner });
             }
         }
-        let turn_id = TurnAuthorityId(self.next_id);
-        self.next_id = self.next_id.saturating_add(1);
+        if self.turns.contains_key(&turn_id) {
+            return Err(TurnConflict::CorruptAggregate(
+                "duplicate turn authority id",
+            ));
+        }
         let turn = DurableTurn {
             id: turn_id,
             conversation: conversation.clone(),
@@ -395,9 +428,29 @@ mod tests {
     }
 
     #[test]
+    fn rehydration_rejects_multiple_live_owners() {
+        let make_turn = |id| DurableTurn {
+            id: TurnAuthorityId(id),
+            conversation: ConversationAuthority("same".into()),
+            client_key: ClientTurnKey(format!("key-{id}")),
+            prepared: prepared(u8::try_from(id).unwrap()),
+            generation: 0,
+            lifecycle: TurnLifecycle::Accepted {
+                disposition: AcceptedDisposition::Runtime,
+            },
+            materialization: Materialization::Unmaterialized,
+        };
+        assert!(matches!(
+            DurableTurnModel::from_turns([make_turn(4), make_turn(9)]),
+            Err(TurnConflict::CorruptAggregate(_))
+        ));
+    }
+
+    #[test]
     fn exact_replay_is_scoped_and_semantically_immutable() {
         let mut model = DurableTurnModel::default();
         let command = TurnCommand::Accept {
+            turn_id: TurnAuthorityId(1),
             conversation: ConversationAuthority("a".into()),
             client_key: ClientTurnKey("same".into()),
             prepared: prepared(1),
@@ -412,6 +465,7 @@ mod tests {
                 conversation: ConversationAuthority("a".into()),
                 client_key: ClientTurnKey("same".into()),
                 prepared: prepared(2),
+                turn_id: TurnAuthorityId(2),
                 disposition: AcceptedDisposition::Runtime,
             })
             .is_err());
@@ -420,6 +474,7 @@ mod tests {
                 conversation: ConversationAuthority("b".into()),
                 client_key: ClientTurnKey("same".into()),
                 prepared: prepared(1),
+                turn_id: TurnAuthorityId(3),
                 disposition: AcceptedDisposition::Runtime,
             })
             .is_ok());
@@ -433,6 +488,7 @@ mod tests {
                 conversation: ConversationAuthority("a".into()),
                 client_key: ClientTurnKey("turn".into()),
                 prepared: prepared(1),
+                turn_id: TurnAuthorityId(1),
                 disposition: AcceptedDisposition::Runtime,
             })
             .unwrap();
@@ -462,8 +518,10 @@ mod tests {
             let mut model = DurableTurnModel::default();
             let mut known = Vec::new();
             for (conversation, key, cancel) in commands {
+                let turn_id = TurnAuthorityId(u64::from(conversation) * 16 + u64::from(key) + 1);
                 let conversation = ConversationAuthority(format!("c-{conversation}"));
                 let outcome = model.apply(TurnCommand::Accept {
+                    turn_id,
                     conversation,
                     client_key: ClientTurnKey(format!("k-{key}")),
                     prepared: prepared(key),

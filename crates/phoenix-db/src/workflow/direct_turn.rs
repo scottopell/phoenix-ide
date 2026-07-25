@@ -1,0 +1,426 @@
+use super::WorkflowRepository;
+use crate::{DbError, DbResult};
+use phoenix_workflow::{
+    AcceptedDisposition, CanonicalMessageId, ClientTurnKey, ConversationAuthority, DurableTurn,
+    Materialization, PreparedTurn, TurnAuthorityId, TurnCommand, TurnConflict, TurnLifecycle,
+    TurnOutcome, TurnStep, TurnTerminal,
+};
+use sqlx::Row;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionCut {
+    None,
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptAuthoritativeTurn {
+    pub conversation: ConversationAuthority,
+    pub client_key: ClientTurnKey,
+    pub prepared: PreparedTurn,
+    pub disposition: AcceptedDisposition,
+}
+
+impl WorkflowRepository {
+    pub async fn accept_authoritative_turn(
+        &self,
+        input: &AcceptAuthoritativeTurn,
+    ) -> DbResult<TurnStep> {
+        self.accept_authoritative_turn_at_cut(input, TransactionCut::None)
+            .await
+    }
+
+    async fn accept_authoritative_turn_at_cut(
+        &self,
+        input: &AcceptAuthoritativeTurn,
+        cut: TransactionCut,
+    ) -> DbResult<TurnStep> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(existing) =
+            load_by_scoped_key(&mut tx, &input.conversation, &input.client_key).await?
+        {
+            tx.rollback().await?;
+            if existing.prepared != input.prepared
+                || existing.lifecycle
+                    != (TurnLifecycle::Accepted {
+                        disposition: input.disposition,
+                    })
+            {
+                return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+            }
+            return Ok(TurnStep {
+                outcome: TurnOutcome::ExactReplay {
+                    turn_id: existing.id,
+                },
+                owed_effects: Vec::new(),
+            });
+        }
+        if input.disposition == AcceptedDisposition::Runtime {
+            if let Some(owner) = sqlx::query_scalar::<_, i64>(
+                "SELECT turn_id FROM durable_turns WHERE conversation_id = ?1 AND owns_conversation = 1",
+            )
+            .bind(&input.conversation.0)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                tx.rollback().await?;
+                return Err(conflict(TurnConflict::ConversationAlreadyOwned {
+                    owner: TurnAuthorityId(to_u64(owner, "turn_id")?),
+                }));
+            }
+        }
+        let next_id =
+            sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns")
+                .fetch_one(&mut *tx)
+                .await?;
+        let turn_id = TurnAuthorityId(to_u64(next_id, "turn_id")?);
+        let disposition = disposition_sql(input.disposition);
+        sqlx::query(
+            "INSERT INTO durable_turns (
+                turn_id, conversation_id, client_turn_key, prepared_fingerprint,
+                prepared_payload, disposition, generation, terminal_kind,
+                terminal_reason, owns_conversation, canonical_message_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL)",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(&input.conversation.0)
+        .bind(&input.client_key.0)
+        .bind(&input.prepared.fingerprint)
+        .bind(&input.prepared.payload)
+        .bind(disposition)
+        .bind(i64::from(input.disposition == AcceptedDisposition::Runtime))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_constraint)?;
+        if cut == TransactionCut::BeforeCommit {
+            tx.rollback().await?;
+            return Err(injected_cut(cut));
+        }
+        tx.commit().await?;
+        if cut == TransactionCut::AfterCommit {
+            return Err(injected_cut(cut));
+        }
+        let mut model = phoenix_workflow::DurableTurnModel::default();
+        model
+            .apply(TurnCommand::Accept {
+                turn_id,
+                conversation: input.conversation.clone(),
+                client_key: input.client_key.clone(),
+                prepared: input.prepared.clone(),
+                disposition: input.disposition,
+            })
+            .map_err(conflict)
+    }
+
+    pub async fn load_authoritative_turn(
+        &self,
+        turn_id: TurnAuthorityId,
+    ) -> DbResult<Option<DurableTurn>> {
+        let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_turn).transpose()
+    }
+
+    pub async fn materialize_authoritative_turn(
+        &self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+        message_id: CanonicalMessageId,
+    ) -> DbResult<TurnStep> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
+        let turn = row_to_turn(row)?;
+        let mut model =
+            phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
+        let step = model
+            .apply(TurnCommand::Materialize {
+                turn_id,
+                expected_generation,
+                message_id: message_id.clone(),
+            })
+            .map_err(conflict)?;
+        if matches!(step.outcome, TurnOutcome::Materialized { .. }) {
+            sqlx::query(
+                "UPDATE durable_turns SET canonical_message_id = ?2
+                 WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NULL
+                   AND canonical_message_id IS NULL",
+            )
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .bind(&message_id.0)
+            .bind(to_i64(expected_generation, "generation")?)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_constraint)?;
+        }
+        tx.commit().await?;
+        Ok(step)
+    }
+
+    pub async fn terminate_authoritative_turn(&self, command: TurnCommand) -> DbResult<TurnStep> {
+        let (turn_id, expected_generation, terminal) = match &command {
+            TurnCommand::Complete {
+                turn_id,
+                expected_generation,
+            } => (*turn_id, *expected_generation, TurnTerminal::Completed),
+            TurnCommand::Cancel {
+                turn_id,
+                expected_generation,
+            } => (*turn_id, *expected_generation, TurnTerminal::Cancelled),
+            TurnCommand::Fail {
+                turn_id,
+                expected_generation,
+                reason,
+            } => (
+                *turn_id,
+                *expected_generation,
+                TurnTerminal::Failed {
+                    reason: reason.clone(),
+                },
+            ),
+            TurnCommand::Accept { .. } | TurnCommand::Materialize { .. } => {
+                return Err(DbError::Serialization(
+                    "terminal repository command required".to_string(),
+                ));
+            }
+        };
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
+        let turn = row_to_turn(row)?;
+        let mut model =
+            phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
+        let step = model.apply(command).map_err(conflict)?;
+        let (terminal_kind, reason) = terminal_sql(&terminal);
+        let updated = sqlx::query(
+            "UPDATE durable_turns
+             SET generation = generation + 1, terminal_kind = ?3,
+                 terminal_reason = ?4, owns_conversation = 0
+             WHERE turn_id = ?1 AND generation = ?2 AND terminal_kind IS NULL",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(to_i64(expected_generation, "generation")?)
+        .bind(terminal_kind)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(conflict(TurnConflict::StaleGeneration {
+                actual: turn.generation,
+            }));
+        }
+        tx.commit().await?;
+        Ok(step)
+    }
+}
+
+async fn load_by_scoped_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation: &ConversationAuthority,
+    client_key: &ClientTurnKey,
+) -> DbResult<Option<DurableTurn>> {
+    sqlx::query("SELECT * FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2")
+        .bind(&conversation.0)
+        .bind(&client_key.0)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(row_to_turn)
+        .transpose()
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
+    let disposition = match row.get::<String, _>("disposition").as_str() {
+        "Runtime" => AcceptedDisposition::Runtime,
+        "Steering" => AcceptedDisposition::Steering,
+        other => {
+            return Err(DbError::Serialization(format!(
+                "unknown disposition {other}"
+            )))
+        }
+    };
+    let terminal_kind = row.get::<Option<String>, _>("terminal_kind");
+    let lifecycle = match terminal_kind.as_deref() {
+        None => TurnLifecycle::Accepted { disposition },
+        Some("Completed") => TurnLifecycle::Terminal(TurnTerminal::Completed),
+        Some("Cancelled") => TurnLifecycle::Terminal(TurnTerminal::Cancelled),
+        Some("Failed") => TurnLifecycle::Terminal(TurnTerminal::Failed {
+            reason: row
+                .get::<Option<String>, _>("terminal_reason")
+                .ok_or_else(|| DbError::Serialization("failed turn missing reason".to_string()))?,
+        }),
+        Some(other) => {
+            return Err(DbError::Serialization(format!(
+                "unknown terminal kind {other}"
+            )))
+        }
+    };
+    Ok(DurableTurn {
+        id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
+        conversation: ConversationAuthority(row.get("conversation_id")),
+        client_key: ClientTurnKey(row.get("client_turn_key")),
+        prepared: PreparedTurn {
+            fingerprint: row.get("prepared_fingerprint"),
+            payload: row.get("prepared_payload"),
+        },
+        generation: to_u64(row.get("generation"), "generation")?,
+        lifecycle,
+        materialization: row.get::<Option<String>, _>("canonical_message_id").map_or(
+            Materialization::Unmaterialized,
+            |message_id| Materialization::Materialized {
+                message_id: CanonicalMessageId(message_id),
+            },
+        ),
+    })
+}
+
+fn disposition_sql(disposition: AcceptedDisposition) -> &'static str {
+    match disposition {
+        AcceptedDisposition::Runtime => "Runtime",
+        AcceptedDisposition::Steering => "Steering",
+    }
+}
+
+fn terminal_sql(terminal: &TurnTerminal) -> (&'static str, Option<&str>) {
+    match terminal {
+        TurnTerminal::Completed => ("Completed", None),
+        TurnTerminal::Cancelled => ("Cancelled", None),
+        TurnTerminal::Failed { reason } => ("Failed", Some(reason.as_str())),
+    }
+}
+
+fn to_i64(value: u64, field: &str) -> DbResult<i64> {
+    i64::try_from(value).map_err(|_| DbError::Serialization(format!("{field} exceeds i64")))
+}
+
+fn to_u64(value: i64, field: &str) -> DbResult<u64> {
+    u64::try_from(value).map_err(|_| DbError::Serialization(format!("negative {field}")))
+}
+
+fn injected_cut(cut: TransactionCut) -> DbError {
+    DbError::Serialization(format!("injected transaction cut: {cut:?}"))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn conflict(conflict: TurnConflict) -> DbError {
+    DbError::Serialization(format!("direct-turn conflict: {conflict:?}"))
+}
+
+#[allow(clippy::wildcard_enum_match_arm)]
+fn map_constraint(error: sqlx::Error) -> DbError {
+    match error {
+        sqlx::Error::Database(database) if database.is_unique_violation() => {
+            DbError::Serialization("direct-turn uniqueness conflict".to_string())
+        }
+        other => DbError::Sqlx(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+
+    async fn repo() -> WorkflowRepository {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("conv-b", "B", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        WorkflowRepository::new(db.pool().clone())
+    }
+
+    fn input(conversation: &str, key: &str, seed: u8) -> AcceptAuthoritativeTurn {
+        AcceptAuthoritativeTurn {
+            conversation: ConversationAuthority(conversation.to_string()),
+            client_key: ClientTurnKey(key.to_string()),
+            prepared: PreparedTurn {
+                fingerprint: format!("fp-{seed}"),
+                payload: vec![seed],
+            },
+            disposition: AcceptedDisposition::Runtime,
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_refines_before_and_after_commit_crash_cuts() {
+        let before_repo = repo().await;
+        let before_input = input("conv-a", "before", 1);
+        assert!(before_repo
+            .accept_authoritative_turn_at_cut(&before_input, TransactionCut::BeforeCommit)
+            .await
+            .is_err());
+        assert!(matches!(
+            before_repo
+                .accept_authoritative_turn(&before_input)
+                .await
+                .unwrap()
+                .outcome,
+            TurnOutcome::Created { .. }
+        ));
+
+        let after_repo = repo().await;
+        let after_input = input("conv-a", "after", 2);
+        assert!(after_repo
+            .accept_authoritative_turn_at_cut(&after_input, TransactionCut::AfterCommit)
+            .await
+            .is_err());
+        assert!(matches!(
+            after_repo
+                .accept_authoritative_turn(&after_input)
+                .await
+                .unwrap()
+                .outcome,
+            TurnOutcome::ExactReplay { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn repository_refines_scoped_accept_replay_and_owner_release() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "same", 1))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        assert!(matches!(
+            repo.accept_authoritative_turn(&input("conv-a", "same", 1))
+                .await
+                .unwrap()
+                .outcome,
+            TurnOutcome::ExactReplay { .. }
+        ));
+        assert!(repo
+            .accept_authoritative_turn(&input("conv-a", "other", 2))
+            .await
+            .is_err());
+        assert!(repo
+            .accept_authoritative_turn(&input("conv-b", "same", 1))
+            .await
+            .is_ok());
+        repo.terminate_authoritative_turn(TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+        assert!(repo
+            .accept_authoritative_turn(&input("conv-a", "other", 2))
+            .await
+            .is_ok());
+    }
+}
