@@ -1669,11 +1669,25 @@ mod tests {
             "conv-a-scope",
             "conv-b-scope",
         ] {
-            sqlx::query("INSERT OR IGNORE INTO conversations (id) VALUES (?1)")
-                .bind(conversation_id)
-                .execute(pool)
-                .await
-                .unwrap();
+            let work_scope_id = format!("scope-{conversation_id}");
+            sqlx::query(
+                "INSERT OR IGNORE INTO work_scopes
+                 (id, authority_kind, lifecycle, created_at, updated_at, environment_kind, cwd)
+                 VALUES (?1, 'restricted_explore', 'active', '2025-01-01', '2025-01-01', 'unowned_cwd', '/tmp')",
+            )
+            .bind(&work_scope_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT OR IGNORE INTO conversations
+                 (id, runtime_role, work_scope_id) VALUES (?1, 'user', ?2)",
+            )
+            .bind(conversation_id)
+            .bind(work_scope_id)
+            .execute(pool)
+            .await
+            .unwrap();
         }
     }
 
@@ -2538,19 +2552,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let work_scope_id: String =
+            sqlx::query_scalar("SELECT work_scope_id FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         let wake_intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
             contract_id: "contract-direct-cross-profile".to_string(),
             conversation_id: "conv-a".to_string(),
-            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
-                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
-                stable_key: "conv-a".to_string(),
-            },
+            root_conversation_id: "conv-a".to_string(),
+            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
+                work_scope_id.clone(),
+            ),
             resource: phoenix_workflow::wake_profile::WakeResourceIdentity::TmuxWindow(
                 phoenix_workflow::wake_profile::TmuxResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
-                        kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
-                        stable_key: "conv-a".to_string(),
-                    },
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(work_scope_id),
                     server_token: "server-direct-cross-profile".to_string(),
                     window_id: "@direct-cross-profile".to_string(),
                     completion_policy:
