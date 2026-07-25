@@ -283,7 +283,7 @@ impl Effect {
         let submitted = SubmittedDirectTurnIdentity {
             text: text.clone(),
             images: images.clone(),
-            files: files.clone(),
+            files: files.clone().into_iter().map(Into::into).collect(),
             message_id,
             user_agent: user_agent.clone(),
             skill_invocation: skill_invocation.clone(),

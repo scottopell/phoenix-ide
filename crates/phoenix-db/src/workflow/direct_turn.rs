@@ -1607,14 +1607,14 @@ fn injected_cut(cut: TransactionCut) -> DbError {
 
 #[allow(clippy::needless_pass_by_value)]
 fn conflict(conflict: TurnConflict) -> DbError {
-    DbError::Serialization(format!("direct-turn conflict: {conflict:?}"))
+    DbError::DirectTurnConflict(conflict)
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
 fn map_constraint(error: sqlx::Error) -> DbError {
     match error {
         sqlx::Error::Database(database) if database.is_unique_violation() => {
-            DbError::Serialization("direct-turn uniqueness conflict".to_string())
+            DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged)
         }
         other => DbError::Sqlx(other),
     }

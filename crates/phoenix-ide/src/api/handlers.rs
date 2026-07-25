@@ -3563,6 +3563,12 @@ async fn send_chat(
             | crate::send_chat_service::SendChatServiceError::Dispatch(message) => {
                 AppError::BadRequest(message)
             }
+            crate::send_chat_service::SendChatServiceError::Busy => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Conversation is already accepting another message; retry shortly.".to_string(),
+                    "conversation_busy",
+                )))
+            }
             crate::send_chat_service::SendChatServiceError::Expansion {
                 message,
                 error_type,

@@ -1,6 +1,7 @@
 //! Events that can occur in a conversation
 
 use crate::domain::db_schema::{ErrorKind, FileAttachment, ImageData, ToolResult};
+use crate::domain::skill_invocation::SkillInvocation;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,13 +67,43 @@ pub enum SubmittedDirectTurnExpansionPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedDirectTurnFileAttachment {
+    pub original_name: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub stored_path: String,
+}
+
+impl From<FileAttachment> for SubmittedDirectTurnFileAttachment {
+    fn from(value: FileAttachment) -> Self {
+        Self {
+            original_name: value.original_name,
+            media_type: value.media_type,
+            size_bytes: value.size_bytes,
+            stored_path: value.stored_path,
+        }
+    }
+}
+
+impl From<SubmittedDirectTurnFileAttachment> for FileAttachment {
+    fn from(value: SubmittedDirectTurnFileAttachment) -> Self {
+        Self {
+            original_name: value.original_name,
+            media_type: value.media_type,
+            size_bytes: value.size_bytes,
+            stored_path: value.stored_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmittedDirectTurnIdentity {
     pub text: String,
     pub images: Vec<ImageData>,
-    pub files: Vec<FileAttachment>,
+    pub files: Vec<SubmittedDirectTurnFileAttachment>,
     pub message_id: String,
     pub user_agent: Option<String>,
-    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+    pub skill_invocation: Option<SkillInvocation>,
     pub expansion_policy: SubmittedDirectTurnExpansionPolicy,
 }
 

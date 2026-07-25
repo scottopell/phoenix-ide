@@ -1030,8 +1030,8 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::Serialization(_)
-        | DbError::DirectTurnConflict(_)
-        | DbError::ForkProposalConflict(_)) => AppError::Internal(other.to_string()),
+        | DbError::ForkProposalConflict(_)
+        | DbError::DirectTurnConflict(_)) => AppError::Internal(other.to_string()),
     }
 }
 
