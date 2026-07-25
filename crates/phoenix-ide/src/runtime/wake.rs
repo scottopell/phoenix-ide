@@ -165,12 +165,17 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .interrupt_begun_top_level_llm_tools(super::process_incarnation())
             .await
             .map_err(|error| error.to_string())?;
-        recover_top_level_llm_attempts(&manager).await?;
+        let _ = ready_tx.send(());
+        let recovery_manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            if let Err(error) = recover_top_level_llm_attempts(&recovery_manager).await {
+                tracing::error!(%error, "top-level LLM startup recovery failed");
+            }
+        });
         deliver_owed_top_level_llm_receipts(&manager).await?;
         deliver_owed_top_level_llm_tools(&manager).await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
         deliver_pending_direct_turns(&manager).await?;
-        let _ = ready_tx.send(());
         self.run_loop_inner(&mut kick_rx, Some(manager)).await
     }
 
@@ -636,14 +641,26 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
             continue;
         };
         let request_id = uuid::Uuid::new_v4().to_string();
+        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let request = durable_request.into_attempt(phoenix_llm::LlmRequestTelemetry {
             conversation_id: recovery.workflow.conversation_id.clone(),
             root_conversation_id: recovery.workflow.conversation_id.clone(),
             request_id: request_id.clone(),
             retry_attempt: u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX),
-            attempt_capture: phoenix_llm::LlmAttemptCapture::default(),
+            attempt_capture: attempt_capture.clone(),
         });
-        match llm.complete(&request).await {
+        let completion = llm.complete(&request).await;
+        if let Some(metrics) = attempt_capture.finalized() {
+            if let Err(error) = manager.db().upsert_llm_request_metrics(&metrics).await {
+                tracing::warn!(%error, "failed to write recovered llm_request_metrics row");
+            }
+        } else {
+            tracing::warn!(
+                request_id,
+                "recovered LLM attempt completed without finalized metrics"
+            );
+        }
+        match completion {
             Ok(response) => {
                 let response_usage = response.usage.clone();
                 let aggregate = serde_json::to_string(&phoenix_llm::DurableLlmResponse {

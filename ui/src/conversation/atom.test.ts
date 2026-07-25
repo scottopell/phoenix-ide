@@ -770,6 +770,29 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(9);
     });
 
+    it('reconnect preserves active stream request before the first token', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 7,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        streamingBuffer: null,
+        activeLlmStreamRequestId: 'request-before-token',
+        conversationId: 'conv-1',
+      };
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastAppliedEventSeq: 7,
+        pendingAnchorSequenceId: 7,
+        pendingEvents: [],
+        pendingTruncated: false,
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.activeLlmStreamRequestId).toBe('request-before-token');
+    });
+
     // Codex P2 from PR #79: when pendingTruncated=true the ring
     // overflowed, so the server is intentionally NOT sending the tokens
     // between anchor and tip. The safety belt advances lastAppliedEventSeq

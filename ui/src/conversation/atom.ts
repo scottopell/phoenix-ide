@@ -1273,7 +1273,9 @@ export function conversationReducer(
         messages: mergedMessages,
         streamingBuffer: phase1StreamingBuffer,
         activeLlmStreamRequestId:
-          phase1StreamingBuffer === null ? null : atom.activeLlmStreamRequestId,
+          !isFreshConnect && p.phase.type === 'llm_requesting' && !p.pendingTruncated
+            ? atom.activeLlmStreamRequestId
+            : null,
         uiError: null,
         toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
         // REQ-WPV-001: seed the server-authoritative phase-entry timestamp
