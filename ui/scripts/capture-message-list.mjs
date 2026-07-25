@@ -60,8 +60,13 @@ async function verifyWideTable({ page, id, viewport }) {
   const mobile = await page.evaluate(() => {
     const message = document.querySelector('.message.agent');
     const wrapper = document.querySelector('.markdown-table-scroll');
-    if (!(message instanceof HTMLElement) || !(wrapper instanceof HTMLElement)) {
-      throw new Error('wide table fixture is missing mobile layout elements');
+    const cell = wrapper?.querySelector('td:has(code)');
+    const inlineCode = cell?.querySelector('code');
+    if (!(message instanceof HTMLElement)
+      || !(wrapper instanceof HTMLElement)
+      || !(cell instanceof HTMLTableCellElement)
+      || !(inlineCode instanceof HTMLElement)) {
+      throw new Error('wide table fixture is missing mobile layout or typography elements');
     }
     const messageRect = message.getBoundingClientRect();
     const wrapperRect = wrapper.getBoundingClientRect();
@@ -71,6 +76,8 @@ async function verifyWideTable({ page, id, viewport }) {
       wrapperLeft: wrapperRect.left,
       wrapperRight: wrapperRect.right,
       wrapperOverflowX: getComputedStyle(wrapper).overflowX,
+      cellFontSize: getComputedStyle(cell).fontSize,
+      inlineCodeFontSize: getComputedStyle(inlineCode).fontSize,
       documentClientWidth: document.documentElement.clientWidth,
       documentScrollWidth: document.documentElement.scrollWidth,
     };
@@ -78,12 +85,13 @@ async function verifyWideTable({ page, id, viewport }) {
   if (mobile.wrapperLeft < mobile.messageLeft
     || mobile.wrapperRight > mobile.messageRight
     || mobile.wrapperOverflowX !== 'auto'
+    || mobile.cellFontSize !== mobile.inlineCodeFontSize
     || mobile.documentScrollWidth !== mobile.documentClientWidth) {
     throw new Error(`Wide table mobile fallback regressed: ${JSON.stringify(mobile)}`);
   }
 
   await page.setViewportSize({ width: viewport.width, height: viewport.height });
-  console.log(`  verified wide table surface and overflow geometry (${id})`);
+  console.log(`  verified wide table surface, typography, and overflow geometry (${id})`);
   return false;
 }
 

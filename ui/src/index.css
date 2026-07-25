@@ -1047,6 +1047,13 @@ body.app-viewport-active #root {
   text-align: left;
 }
 
+/* stylelint-disable no-descending-specificity --
+   Table-cell code is disjoint from the other code-rendering scopes. */
+.agent-text-block :where(th, td) code {
+  font-size: inherit;
+}
+/* stylelint-enable no-descending-specificity */
+
 .agent-text-block th {
   background: var(--bg-tertiary);
   font-weight: 600;

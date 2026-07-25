@@ -2180,7 +2180,7 @@ describe('markdown table rendering', () => {
   const wideTableMarkdown = [
     '| Alpha | Beta | Gamma | Delta | Epsilon | Zeta |',
     '| --- | --- | --- | --- | --- | --- |',
-    '| one | two | three | four | five | six |',
+    '| one | `direct_turn_id` | three | four | five | six |',
   ].join('\n');
 
   it('wraps finalized agent message tables in a local horizontal scroll container', () => {
@@ -2197,6 +2197,10 @@ describe('markdown table rendering', () => {
     const wrapper = table.parentElement;
     expect(wrapper).toHaveClass('markdown-table-scroll');
     expect(wrapper?.parentElement).toHaveClass('agent-text-block');
+
+    const inlineCode = screen.getByText('direct_turn_id');
+    expect(inlineCode.tagName).toBe('CODE');
+    expect(inlineCode.closest('td')).not.toBeNull();
   });
 
   it('keeps finalized agent message task lists enabled for plus and ordered markers', () => {
@@ -2265,6 +2269,10 @@ describe('markdown table rendering', () => {
       expect(wrapper).toHaveClass('markdown-table-scroll');
       expect(wrapper?.parentElement).toHaveClass('agent-text-block');
     });
+
+    const inlineCode = screen.getByText('direct_turn_id');
+    expect(inlineCode.tagName).toBe('CODE');
+    expect(inlineCode.closest('td')).not.toBeNull();
   });
 });
 
