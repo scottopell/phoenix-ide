@@ -2,7 +2,9 @@ use super::WorkflowRepository;
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{Message, MessageContent};
-use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
+use phoenix_core::domain::sm_event::{
+    DirectTurnAttemptAuthority, PreparedDirectTurnPayload, SubmittedDirectTurnIdentity,
+};
 use phoenix_workflow::{
     direct_turn_profile, AcceptedDisposition, AttemptId, AttemptStatus, AuthorityOutcome,
     CanonicalMessageId, ClaimOutcome, ClientTurnKey, ConversationAuthority, DeliveryId,
@@ -72,6 +74,41 @@ pub struct DiscoverableAcceptedTurn {
     pub workflow_id: WorkflowId,
     pub conversation: ConversationAuthority,
     pub prepared: PreparedTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmittedIdentityChanged {
+    pub turn: DurableTurn,
+    pub stored: SubmittedDirectTurnIdentity,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScopedDirectTurnReplayError {
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error("submitted direct-turn identity changed for turn {turn_id:?}")]
+    SubmittedIdentityChanged {
+        turn_id: TurnAuthorityId,
+        changed: Box<SubmittedIdentityChanged>,
+    },
+}
+
+impl From<SubmittedIdentityChanged> for ScopedDirectTurnReplayError {
+    fn from(changed: SubmittedIdentityChanged) -> Self {
+        Self::SubmittedIdentityChanged {
+            turn_id: changed.turn.id,
+            changed: Box::new(changed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedDirectTurnReplayLookup {
+    Missing,
+    Exact {
+        turn: DurableTurn,
+        prepared: Box<PreparedDirectTurnPayload>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +261,40 @@ impl WorkflowRepository {
             .fetch_optional(&self.pool)
             .await?;
         row.map(row_to_turn).transpose()
+    }
+
+    pub async fn lookup_scoped_direct_turn_replay(
+        &self,
+        conversation: &ConversationAuthority,
+        client_key: &ClientTurnKey,
+        submitted: &SubmittedDirectTurnIdentity,
+    ) -> Result<ScopedDirectTurnReplayLookup, ScopedDirectTurnReplayError> {
+        let Some(turn) = load_by_scoped_key_pool(&self.pool, conversation, client_key).await?
+        else {
+            return Ok(ScopedDirectTurnReplayLookup::Missing);
+        };
+        let stored = PreparedDirectTurnPayload::from_exact_bytes(&turn.prepared.payload)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let stored_fingerprint =
+            phoenix_core::domain::sm_event::exact_payload_fingerprint(&turn.prepared.payload);
+        if turn.prepared.fingerprint != stored_fingerprint {
+            return Err(DbError::Serialization(format!(
+                "direct-turn prepared payload fingerprint mismatch for turn {}: stored {}, computed {}",
+                turn.id.0, turn.prepared.fingerprint, stored_fingerprint
+            ))
+            .into());
+        }
+        if !stored.submitted_identity_matches(submitted) {
+            return Err(SubmittedIdentityChanged {
+                turn,
+                stored: stored.submitted,
+            }
+            .into());
+        }
+        Ok(ScopedDirectTurnReplayLookup::Exact {
+            turn,
+            prepared: Box::new(stored),
+        })
     }
 
     pub async fn workflow_id_for_turn(
@@ -604,7 +675,7 @@ impl WorkflowRepository {
             .await?
             .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
         verify_prepared_payload(&turn, &input.prepared)?;
-        let canonical_message_id = CanonicalMessageId(input.prepared.message_id.clone());
+        let canonical_message_id = CanonicalMessageId(input.prepared.message_id().to_string());
         let mut model =
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model
@@ -973,11 +1044,11 @@ fn verify_prepared_payload(
     turn: &DurableTurn,
     prepared: &PreparedDirectTurnPayload,
 ) -> DbResult<()> {
-    let stored: PreparedDirectTurnPayload = serde_json::from_slice(&turn.prepared.payload)
-        .map_err(|e| DbError::Serialization(format!("decode direct-turn prepared payload: {e}")))?;
-    if prepared.message_id != stored.message_id {
+    let stored = PreparedDirectTurnPayload::from_exact_bytes(&turn.prepared.payload)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    if prepared.message_id() != stored.message_id() {
         return Err(conflict(TurnConflict::MaterializationIdentityChanged {
-            canonical: CanonicalMessageId(stored.message_id),
+            canonical: CanonicalMessageId(stored.message_id().to_string()),
         }));
     }
     if prepared != &stored {
@@ -994,9 +1065,9 @@ async fn insert_canonical_message_tx(
     created_at: Timestamp,
     prepared: &PreparedDirectTurnPayload,
 ) -> DbResult<Message> {
-    if prepared.message_id != canonical_message_id.0 {
+    if prepared.message_id() != canonical_message_id.0 {
         return Err(conflict(TurnConflict::MaterializationIdentityChanged {
-            canonical: CanonicalMessageId(prepared.message_id.clone()),
+            canonical: CanonicalMessageId(prepared.message_id().to_string()),
         }));
     }
     let (content, display_data) = prepared.message_content_and_display_data();
@@ -1343,6 +1414,20 @@ async fn load_by_scoped_key(
         .transpose()
 }
 
+async fn load_by_scoped_key_pool(
+    pool: &sqlx::SqlitePool,
+    conversation: &ConversationAuthority,
+    client_key: &ClientTurnKey,
+) -> DbResult<Option<DurableTurn>> {
+    sqlx::query("SELECT * FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2")
+        .bind(&conversation.0)
+        .bind(&client_key.0)
+        .fetch_optional(pool)
+        .await?
+        .map(row_to_turn)
+        .transpose()
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
     let disposition = match row.get::<String, _>("disposition").as_str() {
@@ -1559,6 +1644,15 @@ mod tests {
         db.create_conversation("conv-d", "D", "/tmp", true, None, None)
             .await
             .unwrap();
+        db.create_conversation("conv-replay", "Replay", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("conv-a-scope", "A scope", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("conv-b-scope", "B scope", "/tmp", true, None, None)
+            .await
+            .unwrap();
         WorkflowRepository::new(db.pool().clone())
     }
 
@@ -1566,7 +1660,15 @@ mod tests {
         sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, slug TEXT, title TEXT NOT NULL DEFAULT '', conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}', state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', cwd TEXT NOT NULL DEFAULT '/tmp', parent_conversation_id TEXT, user_initiated BOOLEAN NOT NULL DEFAULT 1, archived BOOLEAN NOT NULL DEFAULT 0, model TEXT, steering_queue TEXT NOT NULL DEFAULT '[]', state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', created_at TEXT NOT NULL DEFAULT '2025-01-01', updated_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         sqlx::query("CREATE TABLE messages (message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sequence_id INTEGER NOT NULL DEFAULT 1, message_type TEXT NOT NULL, content TEXT NOT NULL, display_data TEXT, usage_data TEXT, created_at TEXT NOT NULL DEFAULT '2025-01-01')").execute(pool).await.unwrap();
         run_pending_migrations(pool).await.unwrap();
-        for conversation_id in ["conv-a", "conv-b", "conv-c", "conv-d"] {
+        for conversation_id in [
+            "conv-a",
+            "conv-b",
+            "conv-c",
+            "conv-d",
+            "conv-replay",
+            "conv-a-scope",
+            "conv-b-scope",
+        ] {
             sqlx::query("INSERT OR IGNORE INTO conversations (id) VALUES (?1)")
                 .bind(conversation_id)
                 .execute(pool)
@@ -1677,21 +1779,29 @@ mod tests {
     }
 
     fn prepared_payload(message_id: &str) -> PreparedDirectTurnPayload {
-        PreparedDirectTurnPayload {
-            text: format!("text-{message_id}"),
-            llm_text: None,
-            images: Vec::new(),
-            files: Vec::new(),
-            message_id: message_id.to_string(),
-            user_agent: Some("agent/test".to_string()),
-            skill_invocation: None,
-        }
+        PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: format!("text-{message_id}"),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: message_id.to_string(),
+                user_agent: Some("agent/test".to_string()),
+                skill_invocation: None,
+                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: format!("text-{message_id}"),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: Some("agent/test".to_string()),
+                skill_invocation: None,
+            },
+        )
     }
 
     fn prepared_turn(message_id: &str) -> PreparedTurn {
-        PreparedTurn::from_exact_payload(
-            serde_json::to_vec(&prepared_payload(message_id)).unwrap(),
-        )
+        PreparedTurn::from_exact_payload(prepared_payload(message_id).to_exact_bytes().unwrap())
     }
 
     fn materialize_input(
@@ -2801,5 +2911,115 @@ mod tests {
             ))
             .await;
         assert!(terminal.is_err());
+    }
+    #[tokio::test]
+    async fn scoped_replay_returns_exact_before_expansion_changes() {
+        let repo = repo().await;
+        let input = input("conv-replay", "client", 31);
+        repo.accept_authoritative_turn(&input).await.unwrap();
+        let mut changed_delivery =
+            PreparedDirectTurnPayload::from_exact_bytes(&input.prepared.payload).unwrap();
+        changed_delivery.delivery.llm_text = Some("changed expansion".to_string());
+        let lookup = repo
+            .lookup_scoped_direct_turn_replay(
+                &input.conversation,
+                &input.client_key,
+                &changed_delivery.submitted,
+            )
+            .await
+            .unwrap();
+        let ScopedDirectTurnReplayLookup::Exact { prepared, .. } = lookup else {
+            panic!("expected exact replay by submitted identity");
+        };
+        assert_ne!(prepared.delivery, changed_delivery.delivery);
+        assert_eq!(prepared.submitted, changed_delivery.submitted);
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_reports_submitted_identity_changed() {
+        let repo = repo().await;
+        let input = input("conv-replay", "conflict", 32);
+        repo.accept_authoritative_turn(&input).await.unwrap();
+        let mut submitted = PreparedDirectTurnPayload::from_exact_bytes(&input.prepared.payload)
+            .unwrap()
+            .submitted;
+        submitted.text.push_str(" changed");
+        let err = repo
+            .lookup_scoped_direct_turn_replay(&input.conversation, &input.client_key, &submitted)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ScopedDirectTurnReplayError::SubmittedIdentityChanged { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_client_key_is_conversation_scoped() {
+        let repo = repo().await;
+        let input_a = input("conv-a-scope", "same-key", 33);
+        let input_b = input("conv-b-scope", "same-key", 34);
+        repo.accept_authoritative_turn(&input_a).await.unwrap();
+        repo.accept_authoritative_turn(&input_b).await.unwrap();
+        let submitted_a = PreparedDirectTurnPayload::from_exact_bytes(&input_a.prepared.payload)
+            .unwrap()
+            .submitted;
+        let submitted_b = PreparedDirectTurnPayload::from_exact_bytes(&input_b.prepared.payload)
+            .unwrap()
+            .submitted;
+        assert!(matches!(
+            repo.lookup_scoped_direct_turn_replay(
+                &input_a.conversation,
+                &input_a.client_key,
+                &submitted_a
+            )
+            .await
+            .unwrap(),
+            ScopedDirectTurnReplayLookup::Exact { .. }
+        ));
+        assert!(matches!(
+            repo.lookup_scoped_direct_turn_replay(
+                &input_b.conversation,
+                &input_b.client_key,
+                &submitted_b
+            )
+            .await
+            .unwrap(),
+            ScopedDirectTurnReplayLookup::Exact { .. }
+        ));
+        assert!(matches!(
+            repo.lookup_scoped_direct_turn_replay(
+                &input_a.conversation,
+                &input_a.client_key,
+                &submitted_b
+            )
+            .await
+            .unwrap_err(),
+            ScopedDirectTurnReplayError::SubmittedIdentityChanged { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_rejects_corrupt_persisted_fingerprint() {
+        let repo = repo().await;
+        let input = input("conv-replay", "corrupt", 35);
+        repo.accept_authoritative_turn(&input).await.unwrap();
+        sqlx::query("UPDATE durable_turns SET prepared_fingerprint = 'not-the-exact-fingerprint' WHERE conversation_id = ?1 AND client_turn_key = ?2")
+            .bind(&input.conversation.0)
+            .bind(&input.client_key.0)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let submitted = PreparedDirectTurnPayload::from_exact_bytes(&input.prepared.payload)
+            .unwrap()
+            .submitted;
+        let err = repo
+            .lookup_scoped_direct_turn_replay(&input.conversation, &input.client_key, &submitted)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ScopedDirectTurnReplayError::Db(DbError::Serialization(_))
+        ));
     }
 }

@@ -10,7 +10,10 @@ use phoenix_core::domain::db_schema::{
 };
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::llm_types::ContentBlock;
-use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
+use phoenix_core::domain::sm_event::{
+    DirectTurnAttemptAuthority, PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+    SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+};
 use serde_json::Value;
 use std::fmt;
 use std::path::Path;
@@ -276,21 +279,31 @@ impl Effect {
         skill_invocation: Option<phoenix_core::domain::skill_invocation::SkillInvocation>,
         idempotent: bool,
     ) -> Self {
-        let payload = PreparedDirectTurnPayload {
-            text: text.into(),
+        let text = text.into();
+        let submitted = SubmittedDirectTurnIdentity {
+            text: text.clone(),
+            images: images.clone(),
+            files: files.clone(),
+            message_id,
+            user_agent: user_agent.clone(),
+            skill_invocation: skill_invocation.clone(),
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+        };
+        let delivery = PreparedDirectTurnDelivery {
+            text,
             llm_text,
             images,
             files,
-            message_id,
             user_agent,
             skill_invocation,
         };
+        let payload = PreparedDirectTurnPayload::from_parts(submitted, delivery);
         let (content, display_data) = prepared_direct_turn_content(&payload);
         Effect::PersistMessage {
             content,
             display_data,
             usage_data: None,
-            message_id: payload.message_id,
+            message_id: payload.message_id().to_string(),
             idempotent,
         }
     }

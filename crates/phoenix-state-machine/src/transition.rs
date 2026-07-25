@@ -710,7 +710,7 @@ pub fn transition_core(
         ) => Ok(
             CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
                 .with_effect(Effect::PersistAuthoritativeUserMessage {
-                    payload: payload.clone(),
+                    payload: payload.as_ref().clone(),
                     authority: authority.clone(),
                     idempotent: false,
                 })
@@ -4266,15 +4266,25 @@ mod tests {
 
     #[test]
     fn authoritative_user_message_persists_distinct_effect_with_authority() {
-        let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload {
-            text: "Hello".to_string(),
-            llm_text: Some("Expanded hello".to_string()),
-            images: vec![],
-            files: vec![],
-            message_id: "authoritative-message-id".to_string(),
-            user_agent: Some("test-agent".to_string()),
-            skill_invocation: None,
-        };
+        let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: "Hello".to_string(),
+                images: vec![],
+                files: vec![],
+                message_id: "authoritative-message-id".to_string(),
+                user_agent: Some("test-agent".to_string()),
+                skill_invocation: None,
+                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: "Hello".to_string(),
+                llm_text: Some("Expanded hello".to_string()),
+                images: vec![],
+                files: vec![],
+                user_agent: Some("test-agent".to_string()),
+                skill_invocation: None,
+            },
+        );
         let authority =
             phoenix_core::domain::sm_event::DirectTurnAttemptAuthority::new(41, 7, 1, 9, 2, 3, 4);
 
@@ -4298,8 +4308,8 @@ mod tests {
                 payload: effect_payload,
                 authority: effect_authority,
                 idempotent: false,
-            } if effect_payload.message_id == payload.message_id
-                && effect_payload.llm_text == payload.llm_text
+            } if effect_payload.message_id() == payload.message_id()
+                && effect_payload.delivery.llm_text == payload.delivery.llm_text
                 && effect_authority == &authority
         )));
         assert!(!result

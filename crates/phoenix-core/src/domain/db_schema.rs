@@ -987,7 +987,7 @@ impl UserContent {
 /// Non-image file attachment in a user message. The bytes live on disk and the
 /// LLM sees the path as text context; provider-native image payloads remain in
 /// [`ImageData`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileAttachment {
     pub original_name: String,
     pub media_type: String,
@@ -1017,7 +1017,7 @@ fn xml_attr_escape(value: &str) -> String {
 }
 
 /// Image attachment in a message
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageData {
     pub data: String,
     pub media_type: String,

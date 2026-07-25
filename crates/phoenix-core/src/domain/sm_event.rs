@@ -58,7 +58,111 @@ impl DirectTurnAttemptAuthority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmittedDirectTurnExpansionPolicy {
+    ExpandReferences,
+    LiteralText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedDirectTurnIdentity {
+    pub text: String,
+    pub images: Vec<ImageData>,
+    pub files: Vec<FileAttachment>,
+    pub message_id: String,
+    pub user_agent: Option<String>,
+    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+    pub expansion_policy: SubmittedDirectTurnExpansionPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedDirectTurnDelivery {
+    pub text: String,
+    pub llm_text: Option<String>,
+    pub images: Vec<ImageData>,
+    pub files: Vec<FileAttachment>,
+    pub user_agent: Option<String>,
+    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+}
+
+/// Serializable, lossless direct-turn payload prepared by the authoritative
+/// transport before it is delivered to the reducer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedDirectTurnPayload {
+    pub v: u32,
+    pub submitted: SubmittedDirectTurnIdentity,
+    pub delivery: PreparedDirectTurnDelivery,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PreparedDirectTurnPayloadCodecError {
+    #[error("encode direct-turn prepared payload: {0}")]
+    Encode(serde_json::Error),
+    #[error("decode direct-turn prepared payload: {0}")]
+    Decode(serde_json::Error),
+    #[error("unsupported direct-turn prepared payload version {actual}; expected {expected}")]
+    UnsupportedVersion { actual: u32, expected: u32 },
+}
+
 impl PreparedDirectTurnPayload {
+    pub const VERSION: u32 = 1;
+
+    #[must_use]
+    pub const fn from_parts(
+        submitted: SubmittedDirectTurnIdentity,
+        delivery: PreparedDirectTurnDelivery,
+    ) -> Self {
+        Self {
+            v: Self::VERSION,
+            submitted,
+            delivery,
+        }
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> &str {
+        &self.submitted.message_id
+    }
+
+    #[must_use]
+    pub fn submitted_identity_matches(&self, other: &SubmittedDirectTurnIdentity) -> bool {
+        &self.submitted == other
+    }
+
+    /// Encodes the complete versioned envelope.
+    ///
+    /// # Errors
+    /// Returns [`PreparedDirectTurnPayloadCodecError::Encode`] if JSON encoding fails.
+    pub fn to_exact_bytes(&self) -> Result<Vec<u8>, PreparedDirectTurnPayloadCodecError> {
+        serde_json::to_vec(self).map_err(PreparedDirectTurnPayloadCodecError::Encode)
+    }
+
+    /// Decodes and version-checks a complete envelope.
+    ///
+    /// # Errors
+    /// Returns a decode error for invalid JSON or `UnsupportedVersion` for an
+    /// envelope whose codec version is not supported.
+    pub fn from_exact_bytes(bytes: &[u8]) -> Result<Self, PreparedDirectTurnPayloadCodecError> {
+        let payload: Self =
+            serde_json::from_slice(bytes).map_err(PreparedDirectTurnPayloadCodecError::Decode)?;
+        if payload.v != Self::VERSION {
+            return Err(PreparedDirectTurnPayloadCodecError::UnsupportedVersion {
+                actual: payload.v,
+                expected: Self::VERSION,
+            });
+        }
+        Ok(payload)
+    }
+
+    /// Hashes the exact encoded envelope bytes.
+    ///
+    /// # Errors
+    /// Returns [`PreparedDirectTurnPayloadCodecError::Encode`] if encoding fails.
+    pub fn exact_fingerprint(&self) -> Result<String, PreparedDirectTurnPayloadCodecError> {
+        Ok(exact_payload_fingerprint(&self.to_exact_bytes()?))
+    }
+
     #[must_use]
     pub fn message_content_and_display_data(
         &self,
@@ -66,39 +170,40 @@ impl PreparedDirectTurnPayload {
         crate::domain::db_schema::MessageContent,
         Option<serde_json::Value>,
     ) {
-        let content = if let Some(invocation) = &self.skill_invocation {
+        let content = if let Some(invocation) = &self.delivery.skill_invocation {
             crate::domain::db_schema::MessageContent::Skill(
                 crate::domain::db_schema::SkillContent {
                     name: invocation.name.clone(),
                     body: invocation.body.clone(),
-                    trigger: self.text.clone(),
-                    files: self.files.clone(),
+                    trigger: self.delivery.text.clone(),
+                    files: self.delivery.files.clone(),
                 },
             )
         } else {
-            match &self.llm_text {
+            match &self.delivery.llm_text {
                 Some(expanded) => crate::domain::db_schema::MessageContent::User(
                     crate::domain::db_schema::UserContent::with_expansion(
-                        self.text.clone(),
+                        self.delivery.text.clone(),
                         expanded.clone(),
-                        self.images.clone(),
-                        self.files.clone(),
+                        self.delivery.images.clone(),
+                        self.delivery.files.clone(),
                     ),
                 ),
                 None => {
-                    if self.images.is_empty() && self.files.is_empty() {
-                        crate::domain::db_schema::MessageContent::user(self.text.clone())
+                    if self.delivery.images.is_empty() && self.delivery.files.is_empty() {
+                        crate::domain::db_schema::MessageContent::user(self.delivery.text.clone())
                     } else {
                         crate::domain::db_schema::MessageContent::user_with_attachments(
-                            self.text.clone(),
-                            self.images.clone(),
-                            self.files.clone(),
+                            self.delivery.text.clone(),
+                            self.delivery.images.clone(),
+                            self.delivery.files.clone(),
                         )
                     }
                 }
             }
         };
         let display_data = self
+            .delivery
             .user_agent
             .as_ref()
             .map(|ua| serde_json::json!({ "user_agent": ua }));
@@ -106,46 +211,16 @@ impl PreparedDirectTurnPayload {
     }
 }
 
-impl std::fmt::Debug for PreparedDirectTurnPayload {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedDirectTurnPayload")
-            .field("text", &self.text)
-            .field("llm_text", &self.llm_text)
-            .field("images", &self.images)
-            .field("files", &self.files)
-            .field("message_id", &self.message_id)
-            .field("user_agent", &self.user_agent)
-            .field("skill_invocation", &self.skill_invocation)
-            .finish()
+#[must_use]
+pub fn exact_payload_fingerprint(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
     }
-}
-
-impl PartialEq for PreparedDirectTurnPayload {
-    fn eq(&self, other: &Self) -> bool {
-        self.text == other.text
-            && self.llm_text == other.llm_text
-            && self.images == other.images
-            && self.files == other.files
-            && self.message_id == other.message_id
-            && self.user_agent == other.user_agent
-            && self.skill_invocation == other.skill_invocation
-    }
-}
-
-impl Eq for PreparedDirectTurnPayload {}
-
-/// Serializable, lossless direct-turn payload prepared by the authoritative
-/// transport before it is delivered to the reducer.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct PreparedDirectTurnPayload {
-    pub text: String,
-    pub llm_text: Option<String>,
-    pub images: Vec<ImageData>,
-    #[serde(default)]
-    pub files: Vec<FileAttachment>,
-    pub message_id: String,
-    pub user_agent: Option<String>,
-    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+    out
 }
 
 /// A steering message queued for delivery when the conversation next reaches
@@ -166,13 +241,13 @@ pub struct SteerEntry {
 impl From<PreparedDirectTurnPayload> for SteerEntry {
     fn from(value: PreparedDirectTurnPayload) -> Self {
         Self {
-            text: value.text,
-            llm_text: value.llm_text,
-            images: value.images,
-            files: value.files,
-            message_id: value.message_id,
-            user_agent: value.user_agent,
-            skill_invocation: value.skill_invocation,
+            text: value.delivery.text,
+            llm_text: value.delivery.llm_text,
+            images: value.delivery.images,
+            files: value.delivery.files,
+            message_id: value.submitted.message_id,
+            user_agent: value.delivery.user_agent,
+            skill_invocation: value.delivery.skill_invocation,
         }
     }
 }
@@ -481,7 +556,7 @@ pub enum CoreEvent {
         skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
     },
     AuthoritativeUserMessage {
-        payload: PreparedDirectTurnPayload,
+        payload: Box<PreparedDirectTurnPayload>,
         authority: DirectTurnAttemptAuthority,
     },
     UserCancel {
@@ -642,7 +717,7 @@ impl TryFrom<Event> for ParentEvent {
             })),
             Event::AuthoritativeUserMessage { payload, authority } => {
                 Ok(ParentEvent::Core(CoreEvent::AuthoritativeUserMessage {
-                    payload,
+                    payload: Box::new(payload),
                     authority,
                 }))
             }
@@ -806,7 +881,7 @@ impl TryFrom<Event> for SubAgentEvent {
             })),
             Event::AuthoritativeUserMessage { payload, authority } => {
                 Ok(SubAgentEvent::Core(CoreEvent::AuthoritativeUserMessage {
-                    payload,
+                    payload: Box::new(payload),
                     authority,
                 }))
             }
@@ -1003,5 +1078,118 @@ mod spec_runtime_name_alignment_tests {
         };
         let parent_event = ParentEvent::Parent(parent_only);
         assert_eq!(parent_event.variant_name(), "TaskApprovalDecided");
+    }
+}
+
+#[cfg(test)]
+mod direct_turn_payload_tests {
+    use super::{
+        PreparedDirectTurnDelivery, PreparedDirectTurnPayload, PreparedDirectTurnPayloadCodecError,
+        SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+    };
+
+    fn submitted(
+        message_id: &str,
+        policy: SubmittedDirectTurnExpansionPolicy,
+    ) -> SubmittedDirectTurnIdentity {
+        SubmittedDirectTurnIdentity {
+            text: "display @file".to_string(),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: message_id.to_string(),
+            user_agent: Some("agent/test".to_string()),
+            skill_invocation: None,
+            expansion_policy: policy,
+        }
+    }
+
+    fn delivery(text: &str, llm_text: Option<&str>) -> PreparedDirectTurnDelivery {
+        PreparedDirectTurnDelivery {
+            text: text.to_string(),
+            llm_text: llm_text.map(str::to_string),
+            images: Vec::new(),
+            files: Vec::new(),
+            user_agent: Some("agent/test".to_string()),
+            skill_invocation: None,
+        }
+    }
+
+    #[test]
+    fn prepared_payload_exact_bytes_roundtrip_preserves_submitted_and_delivery() {
+        let payload = PreparedDirectTurnPayload::from_parts(
+            submitted(
+                "msg-1",
+                SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            ),
+            delivery("display @file", Some("display <file>expanded</file>")),
+        );
+        let bytes = payload.to_exact_bytes().unwrap();
+        assert_eq!(
+            PreparedDirectTurnPayload::from_exact_bytes(&bytes).unwrap(),
+            payload
+        );
+        assert_eq!(
+            payload.exact_fingerprint().unwrap(),
+            super::exact_payload_fingerprint(&bytes)
+        );
+    }
+
+    #[test]
+    fn prepared_payload_rejects_unsupported_version() {
+        let payload = PreparedDirectTurnPayload::from_parts(
+            submitted(
+                "msg-1",
+                SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            ),
+            delivery("display @file", Some("display <file>expanded</file>")),
+        );
+        let mut value = serde_json::to_value(payload).unwrap();
+        value["v"] = serde_json::json!(PreparedDirectTurnPayload::VERSION + 1);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(
+            PreparedDirectTurnPayload::from_exact_bytes(&bytes),
+            Err(PreparedDirectTurnPayloadCodecError::UnsupportedVersion { actual, expected })
+                if actual == PreparedDirectTurnPayload::VERSION + 1
+                    && expected == PreparedDirectTurnPayload::VERSION
+        ));
+    }
+
+    #[test]
+    fn delivery_conversion_uses_resolved_delivery_not_submitted_identity() {
+        let payload = PreparedDirectTurnPayload::from_parts(
+            submitted(
+                "msg-1",
+                SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            ),
+            delivery("display @file", Some("display <file>expanded</file>")),
+        );
+        let (content, _) = payload.message_content_and_display_data();
+        let crate::domain::db_schema::MessageContent::User(user) = content else {
+            panic!("expected user content");
+        };
+        assert_eq!(user.text, "display @file");
+        assert_eq!(
+            user.llm_text.as_deref(),
+            Some("display <file>expanded</file>")
+        );
+    }
+
+    #[test]
+    fn same_submitted_identity_can_have_changed_delivery() {
+        let submitted = submitted(
+            "msg-1",
+            SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+        );
+        let original = PreparedDirectTurnPayload::from_parts(
+            submitted.clone(),
+            delivery("display @file", Some("first expansion")),
+        );
+        let changed = PreparedDirectTurnPayload::from_parts(
+            submitted.clone(),
+            delivery("display @file", Some("second expansion")),
+        );
+        assert!(original.submitted_identity_matches(&submitted));
+        assert!(changed.submitted_identity_matches(&submitted));
+        assert_ne!(original, changed);
     }
 }

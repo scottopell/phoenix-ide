@@ -8376,15 +8376,25 @@ mod authoritative_user_message_effect_tests {
     }
 
     fn payload(message_id: &str) -> PreparedDirectTurnPayload {
-        PreparedDirectTurnPayload {
-            text: "hello".to_string(),
-            llm_text: None,
-            images: Vec::new(),
-            files: Vec::new(),
-            message_id: message_id.to_string(),
-            user_agent: None,
-            skill_invocation: None,
-        }
+        PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: "hello".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: message_id.to_owned(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: "hello".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        )
     }
 
     fn authority() -> DirectTurnAttemptAuthority {

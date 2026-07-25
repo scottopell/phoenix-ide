@@ -142,7 +142,7 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
         let Some(authority) = claim.authority else {
             return Ok(());
         };
-        let prepared = match serde_json::from_slice::<PreparedDirectTurnPayload>(
+        let prepared = match PreparedDirectTurnPayload::from_exact_bytes(
             &candidate.prepared.payload,
         ) {
             Ok(prepared) => prepared,
@@ -308,15 +308,25 @@ mod tests {
     }
 
     fn prepared_payload(message_id: &str) -> PreparedDirectTurnPayload {
-        PreparedDirectTurnPayload {
-            text: format!("text-{message_id}"),
-            llm_text: Some(format!("expanded-{message_id}")),
-            images: Vec::new(),
-            files: Vec::new(),
-            message_id: message_id.to_string(),
-            user_agent: Some("agent/test".to_string()),
-            skill_invocation: None,
-        }
+        PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: format!("text-{message_id}"),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: message_id.to_string(),
+                user_agent: Some("agent/test".to_string()),
+                skill_invocation: None,
+                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: format!("text-{message_id}"),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: Some("agent/test".to_string()),
+                skill_invocation: None,
+            },
+        )
     }
 
     fn prepared_turn(message_id: &str) -> PreparedTurn {
