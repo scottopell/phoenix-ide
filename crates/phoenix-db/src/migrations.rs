@@ -296,7 +296,7 @@ const MIGRATIONS: &[Migration] = &[
 const MIGRATION_055: &str = r"
 CREATE TABLE durable_turns (
     turn_id INTEGER PRIMARY KEY,
-    workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE RESTRICT,
+    workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE CASCADE,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     client_turn_key TEXT NOT NULL,
     prepared_fingerprint TEXT NOT NULL,
@@ -312,6 +312,12 @@ CREATE TABLE durable_turns (
     CHECK ((terminal_kind = 'Failed') = (terminal_reason IS NOT NULL)),
     CHECK (terminal_kind IS NULL OR owns_conversation = 0)
 );
+
+CREATE TRIGGER durable_turns_delete_owned_workflow
+AFTER DELETE ON durable_turns
+BEGIN
+    DELETE FROM workflows WHERE workflow_id = OLD.workflow_id;
+END;
 
 CREATE UNIQUE INDEX durable_turns_one_live_owner
     ON durable_turns(conversation_id)

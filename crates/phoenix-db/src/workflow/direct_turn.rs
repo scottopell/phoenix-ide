@@ -240,10 +240,10 @@ impl WorkflowRepository {
                 ));
             }
         };
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_tx().await?;
         let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
             .bind(to_i64(turn_id.0, "turn_id")?)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *tx.tx)
             .await?
             .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
         let turn = row_to_turn(row)?;
@@ -261,7 +261,7 @@ impl WorkflowRepository {
         .bind(to_i64(expected_generation, "generation")?)
         .bind(terminal_kind)
         .bind(reason)
-        .execute(&mut *tx)
+        .execute(&mut *tx.tx)
         .await?;
         if updated.rows_affected() != 1 {
             tx.rollback().await?;
@@ -269,9 +269,32 @@ impl WorkflowRepository {
                 actual: turn.generation,
             }));
         }
+        let workflow_id = workflow_id_for_turn_tx(&mut tx.tx, turn_id).await?;
+        tx.invalidate_nonterminal_effects(workflow_id).await?;
+        sqlx::query("UPDATE workflows SET generation = ?2, status = ?3 WHERE workflow_id = ?1")
+            .bind(to_i64(workflow_id.0, "workflow_id")?)
+            .bind(to_i64(expected_generation.saturating_add(1), "generation")?)
+            .bind(match terminal {
+                TurnTerminal::Completed => "Completed",
+                TurnTerminal::Cancelled | TurnTerminal::Failed { .. } => "Cancelled",
+            })
+            .execute(&mut *tx.tx)
+            .await?;
         tx.commit().await?;
         Ok(step)
     }
+}
+
+async fn workflow_id_for_turn_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    turn_id: TurnAuthorityId,
+) -> DbResult<WorkflowId> {
+    let workflow_id =
+        sqlx::query_scalar::<_, i64>("SELECT workflow_id FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(WorkflowId(to_u64(workflow_id, "workflow_id")?))
 }
 
 async fn next_global_workflow_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<WorkflowId> {
@@ -572,10 +595,48 @@ mod tests {
         })
         .await
         .unwrap();
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let (workflow_status, effect_status): (String, String) = sqlx::query_as(
+            "SELECT wf.status, e.status
+             FROM workflows wf
+             JOIN workflow_effects e ON e.workflow_id = wf.workflow_id
+             WHERE wf.workflow_id = ?1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(workflow_status, "Cancelled");
+        assert_eq!(effect_status, "Invalidated");
         assert!(repo
             .accept_authoritative_turn(&input("conv-a", "other", 2))
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn deleting_authoritative_turn_deletes_owned_workflow_and_effects() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "delete", 4))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        sqlx::query("DELETE FROM durable_turns WHERE turn_id = ?1")
+            .bind(i64::try_from(turn_id.0).unwrap())
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let workflow_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE workflow_id = ?1")
+                .bind(i64::try_from(workflow_id.0).unwrap())
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(workflow_count, 0);
     }
 
     #[tokio::test]

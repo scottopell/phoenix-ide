@@ -1118,6 +1118,23 @@ impl<'a> WorkflowTx<'a> {
         insert_external_acceptance_binding_tx(&mut self.tx, input).await
     }
 
+    pub(crate) async fn invalidate_nonterminal_effects(
+        &mut self,
+        workflow_id: WorkflowId,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE workflow_effects
+             SET status = 'Invalidated', next_eligible_at = NULL,
+                 pending_reconciliation = 0
+             WHERE workflow_id = ?1
+               AND status IN ('Blocked', 'Eligible', 'Executing', 'RetryWait', 'AmbiguityWait')",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn commit_transition_plan(
         &mut self,
         input: &CommitTransitionPlanCas,
