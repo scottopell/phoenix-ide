@@ -1889,6 +1889,67 @@ fn external_acceptance_registry_created_replayed_conflict_and_target_independenc
 }
 
 #[test]
+fn direct_turn_profile_accepts_matching_delivered_runtime_acceptance() {
+    use crate::direct_turn_profile::{DirectTurnEvent, DirectTurnProfile, DirectTurnReceiptEvent};
+
+    let mut workflow = WorkflowState::<DirectTurnProfile>::new(
+        WorkflowId(1),
+        &crate::direct_turn_profile::profile(),
+        crate::direct_turn_profile::acceptance_profile(),
+        crate::direct_turn_profile::snapshot_codec(),
+        crate::direct_turn_profile::DirectTurnSnapshot { turn_id: 7 },
+    )
+    .expect("workflow");
+    let receipt = DirectTurnReceiptEvent::RuntimeDelivered {
+        canonical_message_id: CanonicalMessageId("m-1".to_string()),
+    };
+    workflow.deliveries.insert(
+        DeliveryId(1),
+        DeliveryItem {
+            id: DeliveryId(1),
+            effect_id: Some(EffectId(1)),
+            barrier_id: None,
+            consumer_kind: "reducer",
+            event_codec: crate::direct_turn_profile::receipt_event_codec(),
+            requires_runtime_acceptance: true,
+            payload: DeliveryPayload::Receipt(receipt.clone()),
+            status: DeliveryStatus::Pending,
+            runtime_acceptance_status: Some(RuntimeAcceptanceStatus::Owed),
+            suppression_reason: None,
+            accepted_by: None,
+        },
+    );
+    let accepted = workflow
+        .accept_runtime_delivery(
+            DeliveryId(1),
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: TransitionPlan {
+                    event: DirectTurnEvent::Delivered(receipt),
+                    event_codec: crate::direct_turn_profile::event_codec(),
+                    next_status: WorkflowStatus::Active,
+                    snapshot: crate::direct_turn_profile::DirectTurnSnapshot { turn_id: 7 },
+                    snapshot_codec: crate::direct_turn_profile::snapshot_codec(),
+                    invalidations: vec![],
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    deliveries: vec![],
+                    schedules: vec![],
+                },
+            },
+            false,
+        )
+        .expect("accept runtime");
+    assert_eq!(accepted.outcome, CommitOutcome::Committed);
+    assert_eq!(
+        workflow.deliveries[&DeliveryId(1)].runtime_acceptance_status,
+        Some(RuntimeAcceptanceStatus::Accepted)
+    );
+}
+
+#[test]
 fn runtime_acceptance_can_be_suppressed_and_exactly_targets_single_item() {
     let mut first_workflow = workflow();
     let mut first_plan = base_plan();

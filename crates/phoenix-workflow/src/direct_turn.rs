@@ -199,6 +199,7 @@ pub enum TurnCommand {
 pub enum TurnOutcome {
     Created {
         turn_id: TurnAuthorityId,
+        disposition: AcceptedDisposition,
     },
     ExactReplay {
         turn_id: TurnAuthorityId,
@@ -224,7 +225,7 @@ pub enum TurnOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnConflict {
-    PreparedSemanticsChanged,
+    PreparedSemanticsChanged { authoritative_fingerprint: String },
     ConversationAlreadyOwned { owner: TurnAuthorityId },
     UnknownTurn,
     StaleGeneration { actual: u64 },
@@ -360,26 +361,25 @@ impl DurableTurnModel {
         if let Some(existing_id) = self.by_scoped_key.get(&scoped_key) {
             let existing = &self.turns[existing_id];
             if existing.prepared != prepared {
-                return Err(TurnConflict::PreparedSemanticsChanged);
+                return Err(TurnConflict::PreparedSemanticsChanged {
+                    authoritative_fingerprint: existing.prepared.fingerprint().to_string(),
+                });
             }
             let outcome = match &existing.lifecycle {
                 TurnLifecycle::Accepted {
                     disposition: stored,
-                } if *stored == disposition => TurnOutcome::ExactReplay {
+                } => TurnOutcome::ExactReplay {
                     turn_id: *existing_id,
-                    disposition,
+                    disposition: *stored,
                 },
                 TurnLifecycle::Terminal {
                     terminal,
                     disposition: stored,
-                } if *stored == disposition => TurnOutcome::TerminalReplay {
+                } => TurnOutcome::TerminalReplay {
                     generation: existing.generation,
                     terminal: terminal.clone(),
-                    disposition,
+                    disposition: *stored,
                 },
-                TurnLifecycle::Accepted { .. } | TurnLifecycle::Terminal { .. } => {
-                    return Err(TurnConflict::PreparedSemanticsChanged);
-                }
             };
             return Ok(TurnStep {
                 outcome,
@@ -415,7 +415,10 @@ impl DurableTurnModel {
             AcceptedDisposition::Steering => OwedTurnEffect::SteeringQueue { turn_id },
         };
         Ok(TurnStep {
-            outcome: TurnOutcome::Created { turn_id },
+            outcome: TurnOutcome::Created {
+                turn_id,
+                disposition,
+            },
             owed_effects: vec![owed_effect],
         })
     }
@@ -645,8 +648,20 @@ mod tests {
         };
         let created = model.apply(command.clone()).unwrap();
         let replayed = model.apply(command).unwrap();
-        assert!(matches!(created.outcome, TurnOutcome::Created { .. }));
-        assert!(matches!(replayed.outcome, TurnOutcome::ExactReplay { .. }));
+        assert!(matches!(
+            created.outcome,
+            TurnOutcome::Created {
+                disposition: AcceptedDisposition::Runtime,
+                ..
+            }
+        ));
+        assert!(matches!(
+            replayed.outcome,
+            TurnOutcome::ExactReplay {
+                disposition: AcceptedDisposition::Runtime,
+                ..
+            }
+        ));
         assert!(model
             .apply(TurnCommand::Accept {
                 conversation: ConversationAuthority("a".into()),
@@ -668,6 +683,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_replay_returns_authoritative_terminal_and_disposition() {
+        let mut model = DurableTurnModel::default();
+        let created = model
+            .apply(TurnCommand::Accept {
+                conversation: ConversationAuthority("a".into()),
+                client_key: ClientTurnKey::new("turn").unwrap(),
+                prepared: prepared(1),
+                turn_id: TurnAuthorityId(1),
+                disposition: AcceptedDisposition::Runtime,
+            })
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected creation")
+        };
+        model
+            .apply(TurnCommand::Cancel {
+                turn_id,
+                expected_generation: 0,
+            })
+            .unwrap();
+        let replay = model
+            .apply(TurnCommand::Accept {
+                conversation: ConversationAuthority("a".into()),
+                client_key: ClientTurnKey::new("turn").unwrap(),
+                prepared: prepared(1),
+                turn_id: TurnAuthorityId(99),
+                disposition: AcceptedDisposition::Steering,
+            })
+            .unwrap();
+        assert_eq!(
+            replay.outcome,
+            TurnOutcome::TerminalReplay {
+                generation: 1,
+                terminal: TurnTerminal::Cancelled,
+                disposition: AcceptedDisposition::Runtime,
+            }
+        );
+    }
+
+    #[test]
     fn terminal_transition_advances_generation_and_releases_owner() {
         let mut model = DurableTurnModel::default();
         let created = model
@@ -679,7 +734,7 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
             })
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected creation")
         };
         let terminal = model
@@ -757,7 +812,7 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
             })
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected creation")
         };
         model
@@ -804,7 +859,7 @@ mod tests {
                 disposition: AcceptedDisposition::Steering,
             })
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected creation")
         };
         let step = model
@@ -837,7 +892,7 @@ mod tests {
                     prepared: prepared(key),
                     disposition: if key % 2 == 0 { AcceptedDisposition::Runtime } else { AcceptedDisposition::Steering },
                 });
-                if let Ok(TurnStep { outcome: TurnOutcome::Created { turn_id }, .. }) = outcome {
+                if let Ok(TurnStep { outcome: TurnOutcome::Created { turn_id, .. }, .. }) = outcome {
                     known.push(turn_id);
                     if cancel {
                         let _ = model.apply(TurnCommand::Cancel { turn_id, expected_generation: 0 });

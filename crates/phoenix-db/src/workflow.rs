@@ -1232,6 +1232,7 @@ async fn insert_external_acceptance_binding_tx(
 const SQLITE_CONSTRAINT_UNIQUE: &str = "2067";
 const SQLITE_CONSTRAINT_PRIMARYKEY: &str = "1555";
 const SQLITE_BUSY: &str = "5";
+const DIRECT_TURN_PROFILE_KIND: &str = "direct_turn";
 
 fn sqlite_error_code_is(error: &dyn DatabaseError, expected: &str) -> bool {
     error.code().as_deref() == Some(expected)
@@ -1247,6 +1248,17 @@ fn is_sqlite_primary_key_constraint(error: &dyn DatabaseError) -> bool {
 
 fn is_sqlite_busy_retryable(error: &dyn DatabaseError) -> bool {
     sqlite_error_code_is(error, SQLITE_BUSY) || error.code().as_deref() == Some("517")
+}
+
+async fn workflow_profile_kind(
+    pool: &SqlitePool,
+    workflow_id: WorkflowId,
+) -> DbResult<Option<String>> {
+    sqlx::query_scalar::<_, String>("SELECT profile_kind FROM workflows WHERE workflow_id = ?1")
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .fetch_optional(pool)
+        .await
+        .map_err(Into::into)
 }
 
 impl WorkflowRepository {
@@ -1293,6 +1305,13 @@ impl WorkflowRepository {
         &self,
         input: &CommitTransitionHeadCas,
     ) -> DbResult<CommitOutcome> {
+        if workflow_profile_kind(&self.pool, input.workflow_id)
+            .await?
+            .as_deref()
+            == Some(DIRECT_TURN_PROFILE_KIND)
+        {
+            return Ok(CommitOutcome::InvalidPlan);
+        }
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE workflows
@@ -1708,6 +1727,13 @@ impl WorkflowRepository {
         &self,
         input: &AcceptOrSuppressDeliveryInput,
     ) -> DbResult<CommitOutcome> {
+        if workflow_profile_kind(&self.pool, input.workflow_id)
+            .await?
+            .as_deref()
+            == Some(DIRECT_TURN_PROFILE_KIND)
+        {
+            return Ok(CommitOutcome::InvalidPlan);
+        }
         let mut tx = self.begin_tx().await?;
         let mut exact_delivery_ids = input.accept_delivery_ids.clone();
         exact_delivery_ids.extend(input.suppress_delivery_ids.iter().copied());
@@ -2612,7 +2638,8 @@ mod tests {
     use super::*;
     use crate::migrations::run_pending_migrations;
     use phoenix_workflow::{
-        Generation, NonEmptyExternalKey, ScopeId, SupportedCodecRegistry, Timestamp, TransitionId,
+        AcceptedDisposition, ClientTurnKey, ConversationAuthority, Generation, NonEmptyExternalKey,
+        PreparedTurn, ScopeId, SupportedCodecRegistry, Timestamp, TransitionId, TurnOutcome,
     };
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
@@ -3219,6 +3246,97 @@ mod tests {
                 .await
                 .unwrap(),
             CommitOutcome::VersionConflict
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_delivery_resolution_rejects_direct_turn_workflow() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        crate::Database {
+            pool: repo.pool.clone(),
+            path: String::new(),
+        }
+        .create_conversation("conv-a", "A", "/tmp", true, None, None)
+        .await
+        .unwrap();
+        let accepted_at = Timestamp(7);
+        let created = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                conversation: ConversationAuthority("conv-a".to_string()),
+                client_key: ClientTurnKey::new("gate-delivery").unwrap(),
+                prepared: PreparedTurn::from_exact_payload(vec![1]),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at,
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        assert_eq!(
+            repo.accept_or_suppress_deliveries_exact(&AcceptOrSuppressDeliveryInput {
+                workflow_id,
+                expected_version: Version(1),
+                transition_id: TransitionId(2),
+                generation: Generation(0),
+                next_status: WorkflowStatus::Active,
+                event_codec: local_codec_owned("event"),
+                event_payload: vec![1],
+                next_snapshot_codec: local_codec_owned("snapshot"),
+                next_snapshot_payload: vec![2],
+                committed_at: Timestamp(8),
+                accept_delivery_ids: vec![],
+                suppress_delivery_ids: vec![DeliveryId(1)],
+                suppression_reason: SuppressionReason::ReducerTerminal,
+            })
+            .await
+            .unwrap(),
+            CommitOutcome::InvalidPlan
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_head_cas_rejects_direct_turn_workflow() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        crate::Database {
+            pool: repo.pool.clone(),
+            path: String::new(),
+        }
+        .create_conversation("conv-a", "A", "/tmp", true, None, None)
+        .await
+        .unwrap();
+        let accepted_at = Timestamp(7);
+        let created = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                conversation: ConversationAuthority("conv-a".to_string()),
+                client_key: ClientTurnKey::new("gate-head").unwrap(),
+                prepared: PreparedTurn::from_exact_payload(vec![2]),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at,
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        assert_eq!(
+            repo.commit_transition_head_cas(&CommitTransitionHeadCas {
+                workflow_id,
+                expected_version: Version(1),
+                transition_id: TransitionId(99),
+                generation: Generation(0),
+                next_status: WorkflowStatus::Active,
+                event_codec: codec("event"),
+                event_payload: vec![1],
+                next_snapshot_codec: codec("snapshot"),
+                next_snapshot_payload: vec![2],
+                committed_at: Timestamp(9),
+            })
+            .await
+            .unwrap(),
+            CommitOutcome::InvalidPlan
         );
     }
 

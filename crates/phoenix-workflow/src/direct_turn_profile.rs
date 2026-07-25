@@ -93,8 +93,12 @@ impl WorkflowProfile for DirectTurnProfile {
         )
     }
 
-    fn decision_handles_runtime_acceptance(_: &DeliveryItem<Self>, _: &Self::Event) -> bool {
-        false
+    fn decision_handles_runtime_acceptance(item: &DeliveryItem<Self>, event: &Self::Event) -> bool {
+        matches!(
+            (&item.payload, event),
+            (DeliveryPayload::Receipt(delivery), DirectTurnEvent::Delivered(accepted))
+                if delivery == accepted
+        )
     }
 
     fn decision_handles_runtime_suppression(_: &DeliveryItem<Self>, _: &Self::Event) -> bool {

@@ -64,19 +64,27 @@ impl WorkflowRepository {
             load_by_scoped_key(&mut tx.tx, &input.conversation, &input.client_key).await?
         {
             tx.rollback().await?;
-            if existing.prepared != input.prepared
-                || existing.lifecycle
-                    != (TurnLifecycle::Accepted {
-                        disposition: input.disposition,
-                    })
-            {
-                return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+            if existing.prepared != input.prepared {
+                return Err(conflict(TurnConflict::PreparedSemanticsChanged {
+                    authoritative_fingerprint: existing.prepared.fingerprint().to_string(),
+                }));
             }
-            return Ok(TurnStep {
-                outcome: TurnOutcome::ExactReplay {
+            let outcome = match &existing.lifecycle {
+                TurnLifecycle::Accepted { disposition } => TurnOutcome::ExactReplay {
                     turn_id: existing.id,
-                    disposition: input.disposition,
+                    disposition: *disposition,
                 },
+                TurnLifecycle::Terminal {
+                    terminal,
+                    disposition,
+                } => TurnOutcome::TerminalReplay {
+                    generation: existing.generation,
+                    terminal: terminal.clone(),
+                    disposition: *disposition,
+                },
+            };
+            return Ok(TurnStep {
+                outcome,
                 owed_effects: Vec::new(),
             });
         }
@@ -193,6 +201,24 @@ impl WorkflowRepository {
         expected_generation: u64,
         message_id: CanonicalMessageId,
     ) -> DbResult<TurnStep> {
+        for _ in 0..20 {
+            match self
+                .materialize_authoritative_turn_at_cut(
+                    turn_id,
+                    expected_generation,
+                    message_id.clone(),
+                    TransactionCut::None,
+                )
+                .await
+            {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
         self.materialize_authoritative_turn_at_cut(
             turn_id,
             expected_generation,
@@ -827,7 +853,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", key, seed))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
@@ -896,7 +922,7 @@ mod tests {
         assert_eq!(
             outcomes
                 .iter()
-                .filter(|outcome| matches!(outcome, TurnOutcome::Created { .. }))
+                .filter(|outcome| matches!(outcome, TurnOutcome::Created { disposition: _, .. }))
                 .count(),
             1
         );
@@ -929,7 +955,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "materialize-before", 3))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         let message = CanonicalMessageId("materialize-before".to_string());
@@ -957,7 +983,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "materialize-after", 4))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         let message = CanonicalMessageId("materialize-after".to_string());
@@ -988,7 +1014,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "terminal-before", 5))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         let command = TurnCommand::Cancel {
@@ -1009,7 +1035,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "terminal-after", 6))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         assert!(after_repo
@@ -1112,7 +1138,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "same", 1))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
@@ -1163,13 +1189,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acceptance_replay_returns_stored_terminal_and_disposition() {
+        let repo = repo().await;
+        let mut accepted = input("conv-a", "replay-terminal", 21);
+        accepted.disposition = AcceptedDisposition::Runtime;
+        let created = repo.accept_authoritative_turn(&accepted).await.unwrap();
+        let TurnOutcome::Created {
+            turn_id,
+            disposition,
+        } = created.outcome
+        else {
+            panic!("expected created turn")
+        };
+        assert_eq!(disposition, AcceptedDisposition::Runtime);
+        repo.terminate_authoritative_turn(TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+
+        accepted.disposition = AcceptedDisposition::Steering;
+        let replay = repo.accept_authoritative_turn(&accepted).await.unwrap();
+        assert_eq!(
+            replay.outcome,
+            TurnOutcome::TerminalReplay {
+                generation: 1,
+                terminal: TurnTerminal::Cancelled,
+                disposition: AcceptedDisposition::Runtime,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_replay_is_idempotent_and_different_terminal_conflicts() {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "terminal-replay", 10))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         repo.terminate_authoritative_turn(TurnCommand::Cancel {
@@ -1406,7 +1465,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "schema", 11))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         insert_message(&repo, "conv-b", "foreign-message").await;
@@ -1427,7 +1486,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "delete", 4))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
@@ -1452,7 +1511,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "runtime", 9))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = created.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
