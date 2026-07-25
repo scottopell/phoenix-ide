@@ -11,6 +11,7 @@
 
 pub(crate) mod creation_worker;
 pub mod deny_gate;
+pub(crate) mod direct_turn_worker;
 pub(crate) mod executor;
 pub(crate) mod fork_resolve;
 pub mod pr_status_poll;
@@ -244,6 +245,8 @@ pub struct RuntimeManager {
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     wake_kick_tx: tokio::sync::watch::Sender<u64>,
     wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
+    direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
@@ -1315,6 +1318,7 @@ impl RuntimeManager {
         let (work_scope_browser_tx, work_scope_browser_rx) = mpsc::unbounded_channel();
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
+        let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
@@ -1357,6 +1361,8 @@ impl RuntimeManager {
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
             wake_kick_tx,
             wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
+            direct_turn_kick_tx,
+            direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
             wake_registrar: Some(wake_registrar),
         }
     }
@@ -2057,6 +2063,29 @@ impl RuntimeManager {
     pub fn kick_wake_worker(&self) {
         let next = self.wake_kick_tx.borrow().wrapping_add(1);
         let _ = self.wake_kick_tx.send(next);
+    }
+
+    pub fn kick_direct_turn_worker(&self) {
+        let next = self.direct_turn_kick_tx.borrow().wrapping_add(1);
+        let _ = self.direct_turn_kick_tx.send(next);
+    }
+
+    pub async fn start_direct_turn_worker(self: &Arc<Self>) -> Result<(), String> {
+        let rx = self.direct_turn_kick_rx.write().await.take();
+        let Some(rx) = rx else {
+            tracing::debug!("direct-turn worker already started; skipping");
+            return Ok(());
+        };
+        let manager = Arc::clone(self);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            crate::runtime::direct_turn_worker::run(manager, rx, ready_tx).await;
+        });
+        ready_rx
+            .await
+            .map_err(|_| "direct-turn worker stopped before startup pass completed".to_string())?;
+        self.kick_direct_turn_worker();
+        Ok(())
     }
 
     pub async fn start_wake_worker(self: &Arc<Self>) -> Result<(), String> {

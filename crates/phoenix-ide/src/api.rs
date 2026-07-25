@@ -149,6 +149,10 @@ impl AppState {
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
+        runtime
+            .start_direct_turn_worker()
+            .await
+            .map_err(std::io::Error::other)?;
         if AGENT_FACING_WAKE_REGISTRATION.0 {
             runtime
                 .start_wake_worker()

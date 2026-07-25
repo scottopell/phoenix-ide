@@ -60,6 +60,20 @@ pub struct ReleaseAuthoritativeTurnInput {
     pub now: Timestamp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectTurnDiscoveryCursor {
+    pub turn_id: TurnAuthorityId,
+    pub workflow_id: WorkflowId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverableAcceptedTurn {
+    pub turn_id: TurnAuthorityId,
+    pub workflow_id: WorkflowId,
+    pub conversation: ConversationAuthority,
+    pub prepared: PreparedTurn,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializeAuthoritativeTurnInput {
     pub authority: super::LocalAttemptAuthority,
@@ -433,6 +447,52 @@ impl WorkflowRepository {
                     TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
                     WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
                 ))
+            })
+            .collect()
+    }
+
+    pub async fn list_discoverable_accepted_runtime_direct_turns(
+        &self,
+        cursor: Option<DirectTurnDiscoveryCursor>,
+        limit: usize,
+    ) -> DbResult<Vec<DiscoverableAcceptedTurn>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let capped_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let (cursor_turn_id, cursor_workflow_id) = cursor.map_or((0_i64, 0_i64), |cursor| {
+            (
+                i64::try_from(cursor.turn_id.0).unwrap_or(i64::MAX),
+                i64::try_from(cursor.workflow_id.0).unwrap_or(i64::MAX),
+            )
+        });
+        let rows = sqlx::query(
+            "SELECT turn_id, workflow_id, conversation_id, prepared_fingerprint, prepared_payload
+             FROM durable_turns
+             WHERE disposition = 'Runtime'
+               AND terminal_kind IS NULL
+               AND canonical_message_id IS NULL
+               AND workflow_id IS NOT NULL
+               AND (turn_id > ?1 OR (turn_id = ?1 AND workflow_id > ?2))
+             ORDER BY turn_id, workflow_id
+             LIMIT ?3",
+        )
+        .bind(cursor_turn_id)
+        .bind(cursor_workflow_id)
+        .bind(capped_limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(DiscoverableAcceptedTurn {
+                    turn_id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
+                    workflow_id: WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
+                    conversation: ConversationAuthority(row.get("conversation_id")),
+                    prepared: PreparedTurn {
+                        fingerprint: row.get("prepared_fingerprint"),
+                        payload: row.get("prepared_payload"),
+                    },
+                })
             })
             .collect()
     }
@@ -1373,6 +1433,12 @@ mod tests {
         db.create_conversation("conv-b", "B", "/tmp", true, None, None)
             .await
             .unwrap();
+        db.create_conversation("conv-c", "C", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("conv-d", "D", "/tmp", true, None, None)
+            .await
+            .unwrap();
         WorkflowRepository::new(db.pool().clone())
     }
 
@@ -2047,6 +2113,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(discoverable, vec![(turn_id, workflow_id)]);
+    }
+
+    #[tokio::test]
+    async fn global_discovery_is_bounded_cursor_ordered_and_filters_materialized_terminal_steering()
+    {
+        let repo = repo().await;
+        let first = repo
+            .accept_authoritative_turn(&input("conv-a", "first", 21))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id: first_id } = first.outcome else {
+            panic!("expected first runtime turn")
+        };
+        let first_workflow = repo.workflow_id_for_turn(first_id).await.unwrap().unwrap();
+        let second = repo
+            .accept_authoritative_turn(&input("conv-b", "second", 22))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id: second_id } = second.outcome else {
+            panic!("expected second runtime turn")
+        };
+        let second_workflow = repo.workflow_id_for_turn(second_id).await.unwrap().unwrap();
+        let materialized = repo
+            .accept_authoritative_turn(&input("conv-c", "materialized", 23))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: materialized_id,
+        } = materialized.outcome
+        else {
+            panic!("expected materialized runtime turn")
+        };
+        let materialized_workflow = repo
+            .workflow_id_for_turn(materialized_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let materialized_claim = repo
+            .claim_authoritative_turn(&claim_input(materialized_workflow, materialized_id, 100))
+            .await
+            .unwrap();
+        repo.materialize_authoritative_turn(&materialize_input(
+            materialized_claim.authority.unwrap(),
+            100,
+            100,
+            "message-conv-c-materialized",
+            100,
+        ))
+        .await
+        .unwrap();
+        let terminal = repo
+            .accept_authoritative_turn(&input_with_disposition(
+                "conv-a",
+                "terminal",
+                24,
+                AcceptedDisposition::Steering,
+            ))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: terminal_id,
+        } = terminal.outcome
+        else {
+            panic!("expected steering turn")
+        };
+        repo.terminate_authoritative_turn(TurnCommand::Cancel {
+            turn_id: terminal_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+
+        let first_page = repo
+            .list_discoverable_accepted_runtime_direct_turns(None, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|row| (row.turn_id, row.workflow_id, row.conversation.0.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(first_id, first_workflow, "conv-a")]
+        );
+        let second_page = repo
+            .list_discoverable_accepted_runtime_direct_turns(
+                Some(DirectTurnDiscoveryCursor {
+                    turn_id: first_id,
+                    workflow_id: first_workflow,
+                }),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|row| (row.turn_id, row.workflow_id, row.conversation.0.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(second_id, second_workflow, "conv-b")]
+        );
+        assert!(repo
+            .list_discoverable_accepted_runtime_direct_turns(None, 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
