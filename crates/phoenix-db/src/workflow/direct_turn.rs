@@ -1,10 +1,12 @@
 use super::WorkflowRepository;
 use crate::{DbError, DbResult};
 use phoenix_workflow::{
-    direct_turn_profile, AcceptedDisposition, CanonicalMessageId, ClientTurnKey,
-    ConversationAuthority, DurableTurn, EffectRole, EffectStatus, ExecutionCapability, Generation,
-    Materialization, PreparedTurn, TurnAuthorityId, TurnCommand, TurnConflict, TurnLifecycle,
-    TurnOutcome, TurnStep, TurnTerminal, Version, WorkflowId, WorkflowStatus,
+    direct_turn_profile, AcceptedDisposition, AttemptId, AttemptStatus, AuthorityOutcome,
+    CanonicalMessageId, ClaimOutcome, ClientTurnKey, ConversationAuthority, DeliveryId,
+    DurableTurn, EffectId, EffectRole, EffectStatus, ExecutionCapability, Generation, LeaseExpiry,
+    Materialization, PreparedTurn, ProcessIncarnation, ReceiptId, Timestamp, TurnAuthorityId,
+    TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep, TurnTerminal, Version,
+    WorkflowId, WorkflowStatus,
 };
 use sqlx::Row;
 
@@ -20,8 +22,8 @@ enum TransactionCut {
 }
 
 const DIRECT_TURN_ACCEPTED_TRANSITION_ID: u64 = 1;
+const DIRECT_TURN_TERMINAL_TRANSITION_ID: u64 = 2;
 const DIRECT_TURN_EFFECT_ID: u64 = 1;
-const DIRECT_TURN_SEQUENCE_NAME: &str = "direct_turn";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptAuthoritativeTurn {
@@ -32,24 +34,52 @@ pub struct AcceptAuthoritativeTurn {
     pub accepted_at: phoenix_workflow::Timestamp,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimAuthoritativeTurnInput {
+    pub turn_id: TurnAuthorityId,
+    pub workflow_id: WorkflowId,
+    pub process_incarnation: ProcessIncarnation,
+    pub now: Timestamp,
+    pub lease_until: LeaseExpiry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimAuthoritativeTurnResult {
+    pub outcome: ClaimOutcome,
+    pub authority: Option<super::LocalAttemptAuthority>,
+    pub attempt: Option<super::LocalAttemptRecord>,
+    pub canonical_turn: Option<DurableTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseAuthoritativeTurnInput {
+    pub authority: super::LocalAttemptAuthority,
+    pub now: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializeAuthoritativeTurnInput {
+    pub authority: super::LocalAttemptAuthority,
+    pub receipt_id: ReceiptId,
+    pub delivery_id: DeliveryId,
+    pub message_id: CanonicalMessageId,
+    pub now: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializeAuthoritativeTurnResult {
+    pub outcome: TurnOutcome,
+    pub authority_outcome: AuthorityOutcome,
+    pub receipt: Option<super::LocalReceiptRecord>,
+    pub delivery: Option<super::LocalDeliveryRecord>,
+    pub canonical_turn: DurableTurn,
+}
+
 impl WorkflowRepository {
     pub async fn accept_authoritative_turn(
         &self,
         input: &AcceptAuthoritativeTurn,
     ) -> DbResult<TurnStep> {
-        for _ in 0..20 {
-            match self
-                .accept_authoritative_turn_at_cut(input, TransactionCut::None)
-                .await
-            {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                result => return result,
-            }
-        }
         self.accept_authoritative_turn_at_cut(input, TransactionCut::None)
             .await
     }
@@ -60,38 +90,23 @@ impl WorkflowRepository {
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
         let mut tx = self.begin_tx().await?;
-        if input.prepared.target() != &input.conversation {
-            tx.rollback().await?;
-            return Err(conflict(TurnConflict::CorruptAggregate(
-                "prepared turn target disagrees with accepted conversation",
-            )));
-        }
         if let Some(existing) =
             load_by_scoped_key(&mut tx.tx, &input.conversation, &input.client_key).await?
         {
             tx.rollback().await?;
-            if existing.prepared != input.prepared {
-                return Err(conflict(TurnConflict::PreparedSemanticsChanged {
-                    authoritative_fingerprint: existing.prepared.fingerprint().to_string(),
-                }));
+            if existing.prepared != input.prepared
+                || existing.lifecycle
+                    != (TurnLifecycle::Accepted {
+                        disposition: input.disposition,
+                    })
+            {
+                return Err(conflict(TurnConflict::PreparedSemanticsChanged));
             }
-            let outcome = match &existing.lifecycle {
-                TurnLifecycle::Accepted { disposition } => TurnOutcome::ExactReplay {
-                    turn_id: existing.id,
-                    disposition: *disposition,
-                },
-                TurnLifecycle::Terminal {
-                    terminal,
-                    disposition,
-                } => TurnOutcome::TerminalReplay {
-                    turn_id: existing.id,
-                    generation: existing.generation,
-                    terminal: terminal.clone(),
-                    disposition: *disposition,
-                },
-            };
             return Ok(TurnStep {
-                outcome,
+                outcome: TurnOutcome::ExactReplay {
+                    turn_id: existing.id,
+                    disposition: input.disposition,
+                },
                 owed_effects: Vec::new(),
             });
         }
@@ -109,30 +124,12 @@ impl WorkflowRepository {
                 }));
             }
         }
-        let existing_turns = sqlx::query(
-            "SELECT * FROM durable_turns WHERE conversation_id = ?1 AND terminal_kind IS NULL",
-        )
-        .bind(&input.conversation.0)
-        .fetch_all(&mut *tx.tx)
-        .await?
-        .into_iter()
-        .map(row_to_turn)
-        .collect::<DbResult<Vec<_>>>()?;
-        let mut model =
-            phoenix_workflow::DurableTurnModel::from_turns(existing_turns).map_err(conflict)?;
-        let turn_id = TurnAuthorityId(
-            next_global_id_tx(&mut tx, DIRECT_TURN_SEQUENCE_NAME, "turn_id").await?,
-        );
+        let next_id =
+            sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(turn_id), 0) + 1 FROM durable_turns")
+                .fetch_one(&mut *tx.tx)
+                .await?;
+        let turn_id = TurnAuthorityId(to_u64(next_id, "turn_id")?);
         let workflow_id = next_global_workflow_id_tx(&mut tx).await?;
-        let step = model
-            .apply(TurnCommand::Accept {
-                turn_id,
-                conversation: input.conversation.clone(),
-                client_key: input.client_key.clone(),
-                prepared: input.prepared.clone(),
-                disposition: input.disposition,
-            })
-            .map_err(conflict)?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
         sqlx::query(
@@ -161,7 +158,16 @@ impl WorkflowRepository {
         if cut == TransactionCut::AfterCommit {
             return Err(injected_cut(cut));
         }
-        Ok(step)
+        let mut model = phoenix_workflow::DurableTurnModel::default();
+        model
+            .apply(TurnCommand::Accept {
+                turn_id,
+                conversation: input.conversation.clone(),
+                client_key: input.client_key.clone(),
+                prepared: input.prepared.clone(),
+                disposition: input.disposition,
+            })
+            .map_err(conflict)
     }
 
     pub async fn load_authoritative_turn(
@@ -191,6 +197,147 @@ impl WorkflowRepository {
             .transpose()
     }
 
+    pub async fn claim_authoritative_turn(
+        &self,
+        input: &ClaimAuthoritativeTurnInput,
+    ) -> DbResult<ClaimAuthoritativeTurnResult> {
+        let mut tx = self.begin_tx().await?;
+        let Some(canonical_turn) =
+            load_turn_for_workflow_tx(&mut tx.tx, input.turn_id, input.workflow_id).await?
+        else {
+            tx.rollback().await?;
+            return Ok(ClaimAuthoritativeTurnResult {
+                outcome: ClaimOutcome::Ineligible,
+                authority: None,
+                attempt: None,
+                canonical_turn: None,
+            });
+        };
+        let Some(existing_live_attempt) =
+            load_live_attempt_tx(&mut tx.tx, input.workflow_id, DIRECT_TURN_EFFECT_ID).await?
+        else {
+            let attempt_id = next_attempt_id_tx(&mut tx).await?;
+            let result = tx
+                .begin_attempt(&super::BeginAttemptInput {
+                    workflow_id: input.workflow_id,
+                    effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                    attempt_id,
+                    process_incarnation: input.process_incarnation,
+                    now: input.now,
+                    lease_until: Some(input.lease_until),
+                })
+                .await?;
+            if result.outcome == ClaimOutcome::Started {
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            return Ok(ClaimAuthoritativeTurnResult {
+                outcome: result.outcome,
+                authority: result.authority,
+                attempt: result.attempt,
+                canonical_turn: Some(canonical_turn),
+            });
+        };
+        if let Some(lease_until) = existing_live_attempt
+            .lease
+            .as_ref()
+            .map(|lease| lease.lease_until)
+        {
+            if lease_until.is_live_at(input.now) {
+                tx.rollback().await?;
+                return Ok(ClaimAuthoritativeTurnResult {
+                    outcome: ClaimOutcome::AuthorityConflict,
+                    authority: None,
+                    attempt: None,
+                    canonical_turn: Some(canonical_turn),
+                });
+            }
+        }
+        let expired = expire_direct_turn_lease_in_tx(
+            &mut tx,
+            &super::ExpireLeaseInput {
+                workflow_id: input.workflow_id,
+                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                attempt_id: existing_live_attempt.id,
+                now: input.now,
+            },
+        )
+        .await?;
+        if expired != AuthorityOutcome::Authorized {
+            tx.rollback().await?;
+            return Ok(ClaimAuthoritativeTurnResult {
+                outcome: ClaimOutcome::Ineligible,
+                authority: None,
+                attempt: None,
+                canonical_turn: Some(canonical_turn),
+            });
+        }
+        let attempt_id = next_attempt_id_tx(&mut tx).await?;
+        let result = tx
+            .begin_attempt(&super::BeginAttemptInput {
+                workflow_id: input.workflow_id,
+                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                attempt_id,
+                process_incarnation: input.process_incarnation,
+                now: input.now,
+                lease_until: Some(input.lease_until),
+            })
+            .await?;
+        if result.outcome == ClaimOutcome::Started {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(ClaimAuthoritativeTurnResult {
+            outcome: result.outcome,
+            authority: result.authority,
+            attempt: result.attempt,
+            canonical_turn: Some(canonical_turn),
+        })
+    }
+
+    pub async fn release_authoritative_turn_dispatch_failure(
+        &self,
+        input: &ReleaseAuthoritativeTurnInput,
+    ) -> DbResult<AuthorityOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let updated = sqlx::query(
+            "DELETE FROM workflow_reclaimable_leases
+             WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until > ?3",
+        )
+        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+        .bind(to_i64(input.now.0, "now")?)
+        .execute(&mut *tx.tx)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(AuthorityOutcome::StaleAuthority);
+        }
+        sqlx::query(
+            "UPDATE workflow_attempts
+             SET status = 'AuthorityLost'
+             WHERE workflow_id = ?1 AND attempt_id = ?2 AND status IN ('Begun', 'ObservationRecorded')",
+        )
+        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_effects
+             SET status = 'Eligible'
+             WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'",
+        )
+        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+        tx.commit().await?;
+        Ok(AuthorityOutcome::Authorized)
+    }
+
     pub async fn list_discoverable_accepted_turns(
         &self,
         conversation: &ConversationAuthority,
@@ -215,91 +362,105 @@ impl WorkflowRepository {
 
     pub async fn materialize_authoritative_turn(
         &self,
-        turn_id: TurnAuthorityId,
-        expected_generation: u64,
-        message_id: CanonicalMessageId,
-    ) -> DbResult<TurnStep> {
-        for _ in 0..20 {
-            match self
-                .materialize_authoritative_turn_at_cut(
-                    turn_id,
-                    expected_generation,
-                    message_id.clone(),
-                    TransactionCut::None,
-                )
-                .await
-            {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                result => return result,
-            }
-        }
-        self.materialize_authoritative_turn_at_cut(
-            turn_id,
-            expected_generation,
-            message_id,
-            TransactionCut::None,
-        )
-        .await
+        input: &MaterializeAuthoritativeTurnInput,
+    ) -> DbResult<MaterializeAuthoritativeTurnResult> {
+        self.materialize_authoritative_turn_at_cut(input, TransactionCut::None)
+            .await
     }
 
     async fn materialize_authoritative_turn_at_cut(
         &self,
-        turn_id: TurnAuthorityId,
-        expected_generation: u64,
-        message_id: CanonicalMessageId,
+        input: &MaterializeAuthoritativeTurnInput,
         cut: TransactionCut,
-    ) -> DbResult<TurnStep> {
-        let mut tx = self.pool.begin().await?;
+    ) -> DbResult<MaterializeAuthoritativeTurnResult> {
+        let mut tx = self.begin_tx().await?;
         let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
-            .bind(to_i64(turn_id.0, "turn_id")?)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
-        let turn = row_to_turn(row)?;
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .fetch_optional(&mut *tx.tx)
+            .await?;
+        let turn_id = decode_turn_id_from_authority(&input.authority)?;
+        let turn = match row {
+            Some(_) => load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
+                .await?
+                .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?,
+            None => return Err(conflict(TurnConflict::UnknownTurn)),
+        };
         let mut model =
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model
             .apply(TurnCommand::Materialize {
                 turn_id,
-                expected_generation,
-                message_id: message_id.clone(),
+                expected_generation: input.authority.generation.0,
+                message_id: input.message_id.clone(),
             })
             .map_err(conflict)?;
+        let acceptance = tx
+            .accept_receipt_and_delivery(&super::AcceptReceiptInput {
+                authority: input.authority.clone(),
+                receipt_id: input.receipt_id,
+                delivery_id: input.delivery_id,
+                attempt_id: Some(input.authority.attempt_id),
+                origin: phoenix_workflow::ReceiptOrigin::Execution,
+                receipt_codec: local_codec_owned(&direct_turn_profile::event_codec()),
+                receipt_payload: serde_json::to_vec(&()).map_err(|e| {
+                    DbError::Serialization(format!("encode direct-turn receipt: {e}"))
+                })?,
+                receipt_event_codec: local_codec_owned(&direct_turn_profile::event_codec()),
+                receipt_event_payload: serde_json::to_vec(&()).map_err(|e| {
+                    DbError::Serialization(format!("encode direct-turn receipt event: {e}"))
+                })?,
+                receipt_event_requires_runtime_acceptance: false,
+                request_runtime_acceptance_for_cancellation: false,
+            })
+            .await?;
+        if acceptance.outcome != AuthorityOutcome::Authorized {
+            tx.rollback().await?;
+            return Ok(MaterializeAuthoritativeTurnResult {
+                outcome: step.outcome,
+                authority_outcome: acceptance.outcome,
+                receipt: None,
+                delivery: None,
+                canonical_turn: turn,
+            });
+        }
         if matches!(step.outcome, TurnOutcome::Materialized { .. }) {
-            sqlx::query(
+            let updated = sqlx::query(
                 "UPDATE durable_turns SET canonical_message_id = ?2
                  WHERE turn_id = ?1 AND generation = ?3 AND terminal_kind IS NULL
-                   AND canonical_message_id IS NULL",
+                   AND canonical_message_id IS NULL AND workflow_id = ?4",
             )
             .bind(to_i64(turn_id.0, "turn_id")?)
-            .bind(&message_id.0)
-            .bind(to_i64(expected_generation, "generation")?)
-            .execute(&mut *tx)
+            .bind(&input.message_id.0)
+            .bind(to_i64(input.authority.generation.0, "generation")?)
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .execute(&mut *tx.tx)
             .await
-            .map_err(map_constraint)?;
+            .map_err(map_constraint)?
+            .rows_affected();
+            if updated != 1 {
+                tx.rollback().await?;
+                return Err(conflict(TurnConflict::StaleGeneration {
+                    actual: turn.generation,
+                }));
+            }
         }
-        finish_raw_transaction_at_cut(tx, cut).await?;
-        Ok(step)
+        let canonical_turn =
+            load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
+                .await?
+                .ok_or_else(|| {
+                    DbError::Serialization("direct-turn missing after materialization".to_string())
+                })?;
+        finish_workflow_transaction_at_cut(tx, cut).await?;
+        Ok(MaterializeAuthoritativeTurnResult {
+            outcome: step.outcome,
+            authority_outcome: acceptance.outcome,
+            receipt: acceptance.receipt,
+            delivery: acceptance.delivery,
+            canonical_turn,
+        })
     }
 
     pub async fn terminate_authoritative_turn(&self, command: TurnCommand) -> DbResult<TurnStep> {
-        for _ in 0..20 {
-            match self
-                .terminate_authoritative_turn_at_cut(command.clone(), TransactionCut::None)
-                .await
-            {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                result => return result,
-            }
-        }
         self.terminate_authoritative_turn_at_cut(command, TransactionCut::None)
             .await
     }
@@ -356,11 +517,6 @@ impl WorkflowRepository {
         }
         let (terminal_kind, reason) = terminal_sql(&terminal);
         let next_generation = expected_generation.saturating_add(1);
-        let terminal_at = phoenix_workflow::Timestamp(
-            u64::try_from(chrono::Utc::now().timestamp_millis()).map_err(|_| {
-                DbError::Serialization("terminal timestamp before epoch".to_string())
-            })?,
-        );
         let snapshot = direct_turn_profile::DirectTurnSnapshot { turn_id: turn_id.0 };
         let terminal_event = direct_turn_profile::DirectTurnEvent::Terminal(
             direct_turn_profile::DirectTurnTerminalEvent {
@@ -384,8 +540,8 @@ impl WorkflowRepository {
                 &event_payload,
                 &snapshot_codec,
                 &snapshot_payload,
-                phoenix_workflow::TransitionId(head.version.0.saturating_add(1)),
-                terminal_at,
+                phoenix_workflow::TransitionId(DIRECT_TURN_TERMINAL_TRANSITION_ID),
+                phoenix_workflow::Timestamp(next_generation),
             )
             .await?;
         if !committed {
@@ -415,7 +571,6 @@ impl WorkflowRepository {
         mark_active_attempts_authority_lost_tx(&mut tx, workflow_id).await?;
         delete_reclaimable_leases_tx(&mut tx, workflow_id).await?;
         tx.invalidate_nonterminal_effects(workflow_id).await?;
-        suppress_pending_deliveries_tx(&mut tx, workflow_id).await?;
         finish_workflow_transaction_at_cut(tx, cut).await?;
         Ok(step)
     }
@@ -433,45 +588,12 @@ async fn workflow_id_for_turn_tx(
     Ok(WorkflowId(to_u64(workflow_id, "workflow_id")?))
 }
 
-async fn next_global_id_tx(
-    tx: &mut super::WorkflowTx<'_>,
-    sequence_name: &str,
-    field: &'static str,
-) -> DbResult<u64> {
-    sqlx::query(
-        "INSERT INTO workflow_global_sequences (sequence_name, next_value)
-         VALUES (?1, 2)
-         ON CONFLICT(sequence_name)
-         DO UPDATE SET next_value = workflow_global_sequences.next_value + 1",
-    )
-    .bind(sequence_name)
-    .execute(&mut *tx.tx)
-    .await?;
-    let allocated = sqlx::query_scalar::<_, i64>(
-        "SELECT next_value - 1 FROM workflow_global_sequences WHERE sequence_name = ?1",
-    )
-    .bind(sequence_name)
-    .fetch_one(&mut *tx.tx)
-    .await?;
-    to_u64(allocated, field)
-}
-
 async fn next_global_workflow_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<WorkflowId> {
-    let floor =
+    let next =
         sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(workflow_id), 0) + 1 FROM workflows")
             .fetch_one(&mut *tx.tx)
             .await?;
-    sqlx::query(
-        "INSERT INTO workflow_global_sequences (sequence_name, next_value)
-         VALUES ('workflow', ?1)
-         ON CONFLICT(sequence_name) DO UPDATE SET next_value = MAX(next_value, excluded.next_value)",
-    )
-    .bind(floor)
-    .execute(&mut *tx.tx)
-    .await?;
-    Ok(WorkflowId(
-        next_global_id_tx(tx, "workflow", "workflow_id").await?,
-    ))
+    Ok(WorkflowId(to_u64(next, "workflow_id")?))
 }
 
 async fn insert_direct_turn_workflow_tx(
@@ -535,9 +657,7 @@ async fn insert_direct_turn_workflow_tx(
                 .map_err(|e| DbError::Serialization(format!("encode direct-turn intent: {e}")))?,
             generation: Generation(0),
             role: EffectRole::Required,
-            capability: ExecutionCapability::IdempotentSubmission {
-                stable_command_id: phoenix_workflow::StableCommandId(turn_id.0),
-            },
+            capability: ExecutionCapability::ReclaimableObservation,
             next_eligible_at: None,
             destructive_resource: None,
             status: EffectStatus::Eligible,
@@ -555,6 +675,162 @@ async fn insert_direct_turn_workflow_tx(
         | phoenix_workflow::CommitOutcome::UnsupportedCodec) => Err(DbError::Serialization(
             format!("direct-turn transition was rejected: {other:?}"),
         )),
+    }
+}
+
+fn local_codec_owned(codec: &phoenix_workflow::CodecRef) -> LocalCodec {
+    LocalCodec {
+        family: codec.family.to_string(),
+        version: codec.version,
+    }
+}
+
+fn decode_turn_id_from_authority(
+    authority: &super::LocalAttemptAuthority,
+) -> DbResult<TurnAuthorityId> {
+    if authority.effect_id != EffectId(DIRECT_TURN_EFFECT_ID) {
+        return Err(DbError::Serialization(
+            "direct-turn authority referenced unexpected effect".to_string(),
+        ));
+    }
+    Ok(TurnAuthorityId(authority.workflow_id.0))
+}
+
+async fn load_turn_for_workflow_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    turn_id: TurnAuthorityId,
+    workflow_id: WorkflowId,
+) -> DbResult<Option<DurableTurn>> {
+    sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1 AND workflow_id = ?2")
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(row_to_turn)
+        .transpose()
+}
+
+async fn load_live_attempt_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workflow_id: WorkflowId,
+    effect_id: u64,
+) -> DbResult<Option<super::LocalAttemptRecord>> {
+    let rows = sqlx::query(
+        "SELECT a.attempt_id, a.ordinal, a.declared_workflow_version, a.generation,
+                a.effect_id, a.process_incarnation, a.status, l.lease_until
+         FROM workflow_attempts a
+         LEFT JOIN workflow_reclaimable_leases l
+           ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
+         WHERE a.workflow_id = ?1 AND a.effect_id = ?2
+           AND a.status IN ('Begun', 'ObservationRecorded')
+         ORDER BY a.ordinal
+         LIMIT 1",
+    )
+    .bind(to_i64(workflow_id.0, "workflow_id")?)
+    .bind(to_i64(effect_id, "effect_id")?)
+    .fetch_optional(&mut **tx)
+    .await?;
+    rows.map(|row| {
+        let authority = super::LocalAttemptAuthority {
+            workflow_id,
+            declared_workflow_version: Version(to_u64(
+                row.get::<i64, _>("declared_workflow_version"),
+                "declared_workflow_version",
+            )?),
+            generation: Generation(to_u64(row.get::<i64, _>("generation"), "generation")?),
+            effect_id: EffectId(to_u64(row.get::<i64, _>("effect_id"), "effect_id")?),
+            attempt_id: AttemptId(to_u64(row.get::<i64, _>("attempt_id"), "attempt_id")?),
+            process_incarnation: ProcessIncarnation(to_u64(
+                row.get::<i64, _>("process_incarnation"),
+                "process_incarnation",
+            )?),
+        };
+        Ok(super::LocalAttemptRecord {
+            id: authority.attempt_id,
+            ordinal: u32::try_from(row.get::<i64, _>("ordinal"))
+                .map_err(|_| DbError::Serialization("ordinal exceeds u32".to_string()))?,
+            authority: authority.clone(),
+            status: parse_attempt_status_local(&row.get::<String, _>("status"))?,
+            lease: row
+                .get::<Option<i64>, _>("lease_until")
+                .map(|value| {
+                    to_u64(value, "lease_until").map(|lease_until| super::LocalReclaimableLease {
+                        attempt_id: authority.attempt_id,
+                        lease_until: LeaseExpiry(lease_until),
+                    })
+                })
+                .transpose()?,
+        })
+    })
+    .transpose()
+}
+
+async fn next_attempt_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<AttemptId> {
+    sqlx::query(
+        "INSERT INTO workflow_global_sequences (sequence_name, next_value)
+         VALUES ('attempt', 2)
+         ON CONFLICT(sequence_name)
+         DO UPDATE SET next_value = workflow_global_sequences.next_value + 1",
+    )
+    .execute(&mut *tx.tx)
+    .await?;
+    let next = sqlx::query_scalar::<_, i64>(
+        "SELECT next_value - 1 FROM workflow_global_sequences WHERE sequence_name = 'attempt'",
+    )
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    Ok(AttemptId(to_u64(next, "attempt_id")?))
+}
+
+async fn expire_direct_turn_lease_in_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    input: &super::ExpireLeaseInput,
+) -> DbResult<AuthorityOutcome> {
+    let lease = sqlx::query("SELECT a.status as attempt_status, e.capability_kind FROM workflow_reclaimable_leases l JOIN workflow_attempts a ON a.workflow_id = l.workflow_id AND a.attempt_id = l.attempt_id JOIN workflow_effects e ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id WHERE l.workflow_id = ?1 AND l.attempt_id = ?2 AND a.effect_id = ?3 AND l.lease_until <= ?4")
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.attempt_id.0, "attempt_id")?)
+        .bind(to_i64(input.effect_id.0, "effect_id")?)
+        .bind(to_i64(input.now.0, "now")?)
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+    let Some(lease) = lease else {
+        return Ok(AuthorityOutcome::StaleAuthority);
+    };
+    if !matches!(
+        lease.get::<String, _>("attempt_status").as_str(),
+        "Begun" | "ObservationRecorded"
+    ) {
+        return Ok(AuthorityOutcome::StaleAuthority);
+    }
+    sqlx::query(
+        "DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1 AND attempt_id = ?2",
+    )
+    .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+    .bind(to_i64(input.attempt_id.0, "attempt_id")?)
+    .execute(&mut *tx.tx)
+    .await?;
+    sqlx::query("UPDATE workflow_attempts SET status = 'AuthorityLost' WHERE workflow_id = ?1 AND attempt_id = ?2")
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.attempt_id.0, "attempt_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+    sqlx::query("UPDATE workflow_effects SET status = 'Eligible' WHERE workflow_id = ?1 AND effect_id = ?2 AND status = 'Executing'")
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.effect_id.0, "effect_id")?)
+        .execute(&mut *tx.tx)
+        .await?;
+    Ok(AuthorityOutcome::Authorized)
+}
+
+fn parse_attempt_status_local(raw: &str) -> DbResult<AttemptStatus> {
+    match raw {
+        "Begun" => Ok(AttemptStatus::Begun),
+        "ObservationRecorded" => Ok(AttemptStatus::ObservationRecorded),
+        "ReceiptAccepted" => Ok(AttemptStatus::ReceiptAccepted),
+        "AuthorityLost" => Ok(AttemptStatus::AuthorityLost),
+        other => Err(DbError::Serialization(format!(
+            "unknown attempt status {other}"
+        ))),
     }
 }
 
@@ -649,14 +925,12 @@ fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
             "owns_conversation disagrees with turn lifecycle".to_string(),
         ));
     }
-    let conversation = ConversationAuthority(row.get("conversation_id"));
     Ok(DurableTurn {
         id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
-        conversation: conversation.clone(),
+        conversation: ConversationAuthority(row.get("conversation_id")),
         client_key: ClientTurnKey::try_from(row.get::<String, _>("client_turn_key"))
             .map_err(|e| DbError::Serialization(e.to_string()))?,
         prepared: PreparedTurn::rehydrate(
-            &conversation,
             row.get("prepared_fingerprint"),
             row.get("prepared_payload"),
         )
@@ -703,25 +977,6 @@ fn terminal_event_kind(terminal: &TurnTerminal) -> direct_turn_profile::DirectTu
             reason: reason.clone(),
         },
     }
-}
-
-async fn suppress_pending_deliveries_tx(
-    tx: &mut super::WorkflowTx<'_>,
-    workflow_id: WorkflowId,
-) -> DbResult<()> {
-    sqlx::query(
-        "UPDATE workflow_deliveries
-         SET status = 'Suppressed', suppression_reason = 'LifecycleTerminal',
-             runtime_acceptance_status = CASE
-                 WHEN requires_runtime_acceptance = 1 THEN 'Suppressed'
-                 ELSE runtime_acceptance_status
-             END
-         WHERE workflow_id = ?1 AND status IN ('Pending', 'Deferred')",
-    )
-    .bind(to_i64(workflow_id.0, "workflow_id")?)
-    .execute(&mut *tx.tx)
-    .await?;
-    Ok(())
 }
 
 async fn mark_active_attempts_authority_lost_tx(
@@ -794,7 +1049,7 @@ fn injected_cut(cut: TransactionCut) -> DbError {
 
 #[allow(clippy::needless_pass_by_value)]
 fn conflict(conflict: TurnConflict) -> DbError {
-    DbError::DirectTurnConflict(conflict)
+    DbError::Serialization(format!("direct-turn conflict: {conflict:?}"))
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -811,6 +1066,7 @@ fn map_constraint(error: sqlx::Error) -> DbError {
 mod tests {
     use super::*;
     use crate::Database;
+    use crate::LocalAttemptAuthority;
 
     async fn repo() -> WorkflowRepository {
         let db = Database::open_in_memory().await.unwrap();
@@ -821,30 +1077,6 @@ mod tests {
             .await
             .unwrap();
         WorkflowRepository::new(db.pool().clone())
-    }
-
-    async fn file_repos() -> (WorkflowRepository, WorkflowRepository, tempfile::TempDir) {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("direct-turn.db");
-        let path = path.to_str().unwrap();
-        let first = Database::open(path).await.unwrap();
-        crate::migrations::run_pending_migrations(first.pool())
-            .await
-            .unwrap();
-        first
-            .create_conversation("conv-a", "A", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        first
-            .create_conversation("conv-b", "B", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        let second = Database::open(path).await.unwrap();
-        (
-            WorkflowRepository::new(first.pool().clone()),
-            WorkflowRepository::new(second.pool().clone()),
-            temp,
-        )
     }
 
     async fn insert_message(repo: &WorkflowRepository, conversation: &str, message_id: &str) {
@@ -861,14 +1093,20 @@ mod tests {
     }
 
     fn input(conversation: &str, key: &str, seed: u8) -> AcceptAuthoritativeTurn {
+        input_with_disposition(conversation, key, seed, AcceptedDisposition::Runtime)
+    }
+
+    fn input_with_disposition(
+        conversation: &str,
+        key: &str,
+        seed: u8,
+        disposition: AcceptedDisposition,
+    ) -> AcceptAuthoritativeTurn {
         AcceptAuthoritativeTurn {
             conversation: ConversationAuthority(conversation.to_string()),
             client_key: ClientTurnKey::new(key).unwrap(),
-            prepared: PreparedTurn::from_exact_payload(
-                &ConversationAuthority(conversation.to_string()),
-                vec![seed],
-            ),
-            disposition: AcceptedDisposition::Runtime,
+            prepared: PreparedTurn::from_exact_payload(vec![seed]),
+            disposition,
             accepted_at: phoenix_workflow::Timestamp(u64::from(seed)),
         }
     }
@@ -882,7 +1120,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", key, seed))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
@@ -904,6 +1142,36 @@ mod tests {
         .fetch_one(&repo.pool)
         .await
         .unwrap()
+    }
+
+    fn claim_input(
+        workflow_id: WorkflowId,
+        turn_id: TurnAuthorityId,
+        now: u64,
+    ) -> ClaimAuthoritativeTurnInput {
+        ClaimAuthoritativeTurnInput {
+            turn_id,
+            workflow_id,
+            process_incarnation: ProcessIncarnation(now),
+            now: Timestamp(now),
+            lease_until: LeaseExpiry(now + 10),
+        }
+    }
+
+    fn materialize_input(
+        authority: LocalAttemptAuthority,
+        receipt_id: u64,
+        delivery_id: u64,
+        message_id: &str,
+        now: u64,
+    ) -> MaterializeAuthoritativeTurnInput {
+        MaterializeAuthoritativeTurnInput {
+            authority,
+            receipt_id: ReceiptId(receipt_id),
+            delivery_id: DeliveryId(delivery_id),
+            message_id: CanonicalMessageId(message_id.to_string()),
+            now: Timestamp(now),
+        }
     }
 
     #[tokio::test]
@@ -940,67 +1208,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_backed_same_key_acceptance_converges() {
-        let (first, second, _temp) = file_repos().await;
-        let accepted = input("conv-a", "same-key", 31);
-        let (left, right) = tokio::join!(
-            first.accept_authoritative_turn(&accepted),
-            second.accept_authoritative_turn(&accepted),
-        );
-        let outcomes = [left.unwrap().outcome, right.unwrap().outcome];
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, TurnOutcome::Created { disposition: _, .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, TurnOutcome::ExactReplay { .. }))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_turn_ids_are_not_reused_after_deletion() {
-        let repo = repo().await;
-        let (first, _) = created_turn(&repo, "first-id", 32).await;
-        sqlx::query("DELETE FROM durable_turns WHERE turn_id = ?1")
-            .bind(i64::try_from(first.0).unwrap())
-            .execute(&repo.pool)
-            .await
-            .unwrap();
-        let (second, _) = created_turn(&repo, "second-id", 33).await;
-        assert!(second.0 > first.0);
-    }
-
-    #[tokio::test]
     async fn materialization_refines_before_and_after_commit_crash_cuts() {
         let before_repo = repo().await;
         let created = before_repo
             .accept_authoritative_turn(&input("conv-a", "materialize-before", 3))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
-        let message = CanonicalMessageId("conv-a:materialize-before".to_string());
+        let workflow_id = before_repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = before_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 10))
+            .await
+            .unwrap();
+        let authority = claim.authority.unwrap();
+        let message = CanonicalMessageId("message-before".to_string());
         insert_message(&before_repo, "conv-a", &message.0).await;
         assert!(before_repo
             .materialize_authoritative_turn_at_cut(
-                turn_id,
-                0,
-                message.clone(),
+                &materialize_input(authority.clone(), 1, 1, &message.0, 10),
                 TransactionCut::BeforeCommit,
             )
             .await
             .is_err());
         assert!(matches!(
             before_repo
-                .materialize_authoritative_turn(turn_id, 0, message)
+                .materialize_authoritative_turn(&materialize_input(authority, 1, 1, &message.0, 10))
                 .await
                 .unwrap()
                 .outcome,
@@ -1012,23 +1250,31 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "materialize-after", 4))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
-        let message = CanonicalMessageId("conv-a:materialize-after".to_string());
+        let workflow_id = after_repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = after_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 11))
+            .await
+            .unwrap();
+        let authority = claim.authority.unwrap();
+        let message = CanonicalMessageId("message-after".to_string());
         insert_message(&after_repo, "conv-a", &message.0).await;
         assert!(after_repo
             .materialize_authoritative_turn_at_cut(
-                turn_id,
-                0,
-                message.clone(),
+                &materialize_input(authority.clone(), 1, 1, &message.0, 11),
                 TransactionCut::AfterCommit,
             )
             .await
             .is_err());
         assert!(matches!(
             after_repo
-                .materialize_authoritative_turn(turn_id, 0, message)
+                .materialize_authoritative_turn(&materialize_input(authority, 2, 2, &message.0, 11))
                 .await
                 .unwrap()
                 .outcome,
@@ -1043,7 +1289,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "terminal-before", 5))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
         let command = TurnCommand::Cancel {
@@ -1064,7 +1310,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "terminal-after", 6))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
         assert!(after_repo
@@ -1167,7 +1413,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "same", 1))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
@@ -1218,47 +1464,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acceptance_replay_returns_stored_terminal_and_disposition() {
-        let repo = repo().await;
-        let mut accepted = input("conv-a", "replay-terminal", 21);
-        accepted.disposition = AcceptedDisposition::Runtime;
-        let created = repo.accept_authoritative_turn(&accepted).await.unwrap();
-        let TurnOutcome::Created {
-            turn_id,
-            disposition,
-        } = created.outcome
-        else {
-            panic!("expected created turn")
-        };
-        assert_eq!(disposition, AcceptedDisposition::Runtime);
-        repo.terminate_authoritative_turn(TurnCommand::Cancel {
-            turn_id,
-            expected_generation: 0,
-        })
-        .await
-        .unwrap();
-
-        accepted.disposition = AcceptedDisposition::Steering;
-        let replay = repo.accept_authoritative_turn(&accepted).await.unwrap();
-        assert_eq!(
-            replay.outcome,
-            TurnOutcome::TerminalReplay {
-                turn_id,
-                generation: 1,
-                terminal: TurnTerminal::Cancelled,
-                disposition: AcceptedDisposition::Runtime,
-            }
-        );
-    }
-
-    #[tokio::test]
     async fn terminal_replay_is_idempotent_and_different_terminal_conflicts() {
         let repo = repo().await;
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "terminal-replay", 10))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
         repo.terminate_authoritative_turn(TurnCommand::Cancel {
@@ -1278,7 +1490,6 @@ mod tests {
             replay,
             TurnStep {
                 outcome: TurnOutcome::TerminalReplay {
-                    turn_id,
                     generation: 1,
                     terminal: TurnTerminal::Cancelled,
                     disposition: AcceptedDisposition::Runtime,
@@ -1317,7 +1528,6 @@ mod tests {
         assert_eq!(
             replay.outcome,
             TurnOutcome::TerminalReplay {
-                turn_id,
                 generation: 1,
                 terminal: TurnTerminal::Failed {
                     reason: "exact".to_string(),
@@ -1379,11 +1589,21 @@ mod tests {
                 attempt_id: phoenix_workflow::AttemptId(77),
                 process_incarnation: phoenix_workflow::ProcessIncarnation(1),
                 now: phoenix_workflow::Timestamp(1),
-                lease_until: None,
+                lease_until: Some(phoenix_workflow::LeaseExpiry(99)),
             })
             .await
             .unwrap();
-        assert!(attempt.authority.is_some());
+        let authority = attempt.authority.unwrap();
+        repo.record_observation(&crate::workflow::RecordObservationInput {
+            authority,
+            observation_id: 1,
+            now: phoenix_workflow::Timestamp(2),
+            observed_at: phoenix_workflow::Timestamp(2),
+            observation_codec: local_codec(&direct_turn_profile::intent_codec()),
+            observation_payload: b"{}".to_vec(),
+        })
+        .await
+        .unwrap();
         repo.terminate_authoritative_turn(TurnCommand::Cancel {
             turn_id,
             expected_generation: 0,
@@ -1406,43 +1626,6 @@ mod tests {
         assert_eq!(attempt_status, "AuthorityLost");
         assert_eq!(lease_count, 0);
         assert_eq!(effect_status, "Invalidated");
-    }
-
-    #[tokio::test]
-    async fn terminal_suppresses_pending_delivery() {
-        let repo = repo().await;
-        let (turn_id, workflow_id) = created_turn(&repo, "pending-delivery", 34).await;
-        sqlx::query(
-            "INSERT INTO workflow_deliveries (
-                workflow_id, delivery_id, effect_id, barrier_id, consumer_kind,
-                event_codec_family, event_codec_version, payload_kind, payload_blob,
-                requires_runtime_acceptance, status, runtime_acceptance_status,
-                suppression_reason, accepted_by_transition_id
-             ) VALUES (?1, 1, 1, NULL, 'reducer', 'direct_turn.event', 1,
-                       'Receipt', X'00', 1, 'Pending', 'Owed', NULL, NULL)",
-        )
-        .bind(i64::try_from(workflow_id.0).unwrap())
-        .execute(&repo.pool)
-        .await
-        .unwrap();
-
-        repo.terminate_authoritative_turn(TurnCommand::Cancel {
-            turn_id,
-            expected_generation: 0,
-        })
-        .await
-        .unwrap();
-        let (status, runtime_status, reason): (String, String, String) = sqlx::query_as(
-            "SELECT status, runtime_acceptance_status, suppression_reason
-             FROM workflow_deliveries WHERE workflow_id = ?1 AND delivery_id = 1",
-        )
-        .bind(i64::try_from(workflow_id.0).unwrap())
-        .fetch_one(&repo.pool)
-        .await
-        .unwrap();
-        assert_eq!(status, "Suppressed");
-        assert_eq!(runtime_status, "Suppressed");
-        assert_eq!(reason, "LifecycleTerminal");
     }
 
     #[tokio::test]
@@ -1497,7 +1680,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "schema", 11))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
         insert_message(&repo, "conv-b", "foreign-message").await;
@@ -1518,7 +1701,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "delete", 4))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
@@ -1543,7 +1726,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-a", "runtime", 9))
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
@@ -1562,5 +1745,173 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(discoverable, vec![(turn_id, workflow_id)]);
+    }
+
+    #[tokio::test]
+    async fn claim_contention_and_expired_reclaim_are_deterministic() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "claim", 7))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+
+        let first = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 20))
+            .await
+            .unwrap();
+        assert_eq!(first.outcome, ClaimOutcome::Started);
+        let second = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 21))
+            .await
+            .unwrap();
+        assert_eq!(second.outcome, ClaimOutcome::AuthorityConflict);
+
+        let reclaimed = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(40),
+                now: Timestamp(40),
+                lease_until: LeaseExpiry(50),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.outcome, ClaimOutcome::Started);
+        let attempts = repo
+            .list_attempts(workflow_id, EffectId(DIRECT_TURN_EFFECT_ID))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, AttemptStatus::AuthorityLost);
+        assert_eq!(attempts[1].status, AttemptStatus::Begun);
+    }
+
+    #[tokio::test]
+    async fn release_dispatch_failure_exactly_releases_and_reclaims() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "release", 8))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 30))
+            .await
+            .unwrap();
+        let authority = claim.authority.unwrap();
+        assert_eq!(
+            repo.release_authoritative_turn_dispatch_failure(&ReleaseAuthoritativeTurnInput {
+                authority: authority.clone(),
+                now: Timestamp(31),
+            })
+            .await
+            .unwrap(),
+            AuthorityOutcome::Authorized
+        );
+        assert_eq!(
+            repo.release_authoritative_turn_dispatch_failure(&ReleaseAuthoritativeTurnInput {
+                authority,
+                now: Timestamp(31),
+            })
+            .await
+            .unwrap(),
+            AuthorityOutcome::StaleAuthority
+        );
+        let reclaimed = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 32))
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.outcome, ClaimOutcome::Started);
+    }
+
+    #[tokio::test]
+    async fn materialization_exact_replay_conflict_and_terminal_fencing() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "materialize-phase3", 9))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 50))
+            .await
+            .unwrap();
+        let authority = claim.authority.unwrap();
+        insert_message(&repo, "conv-a", "message-phase3").await;
+        let first = repo
+            .materialize_authoritative_turn(&materialize_input(
+                authority.clone(),
+                10,
+                10,
+                "message-phase3",
+                50,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.authority_outcome, AuthorityOutcome::Authorized);
+        assert!(matches!(first.outcome, TurnOutcome::Materialized { .. }));
+        let replay = repo
+            .materialize_authoritative_turn(&materialize_input(
+                authority.clone(),
+                11,
+                11,
+                "message-phase3",
+                50,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay.outcome,
+            TurnOutcome::MaterializationReplay { .. }
+        ));
+        let conflict = repo
+            .materialize_authoritative_turn(&materialize_input(
+                authority.clone(),
+                12,
+                12,
+                "message-other",
+                50,
+            ))
+            .await;
+        assert!(conflict.is_err());
+
+        let terminal_created = repo
+            .accept_authoritative_turn(&input_with_disposition(
+                "conv-a",
+                "steering-terminal",
+                12,
+                AcceptedDisposition::Steering,
+            ))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = terminal_created.outcome else {
+            panic!("expected created turn")
+        };
+        let terminal_workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(terminal_workflow_id, turn_id, 60))
+            .await
+            .unwrap();
+        let authority = claim.authority.unwrap();
+        repo.terminate_authoritative_turn(TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+        let terminal = repo
+            .materialize_authoritative_turn(&materialize_input(authority, 20, 20, "late", 60))
+            .await;
+        assert!(terminal.is_err());
     }
 }
