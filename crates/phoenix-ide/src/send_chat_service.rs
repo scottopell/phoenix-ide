@@ -238,22 +238,50 @@ impl SendChatApplicationService {
             user_agent: req.user_agent,
             skill_invocation: expanded.skill_invocation,
         };
-        let prepared_payload = PreparedDirectTurnPayload::from_parts(submitted, delivery);
+        let prepared_payload = PreparedDirectTurnPayload::from_parts(submitted.clone(), delivery);
         let prepared_bytes = prepared_payload
             .to_exact_bytes()
             .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
         let repo = WorkflowRepository::new(self.db.pool().clone());
-        let step = repo
+        let client_key = ClientTurnKey::new(req.message_id.clone())
+            .ok_or(SendChatServiceError::IdempotencyConflict)?;
+        let step = match repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority(conversation.id.clone()),
-                client_key: ClientTurnKey::new(req.message_id.clone())
-                    .ok_or(SendChatServiceError::IdempotencyConflict)?,
+                client_key: client_key.clone(),
                 prepared: PreparedTurn::from_exact_payload(prepared_bytes),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: now_timestamp(),
             })
             .await
-            .map_err(map_direct_turn_accept_error)?;
+        {
+            Ok(step) => step,
+            Err(crate::db::DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged)) => {
+                match repo
+                    .lookup_scoped_direct_turn_replay(
+                        &ConversationAuthority(conversation.id.clone()),
+                        &client_key,
+                        &submitted,
+                    )
+                    .await
+                {
+                    Ok(ScopedDirectTurnReplayLookup::Exact { turn, .. }) => {
+                        if matches!(turn.materialization, Materialization::Unmaterialized) {
+                            self.runtime.kick_direct_turn_worker();
+                        }
+                        return Ok(SendChatOutcome::Delivered);
+                    }
+                    Ok(ScopedDirectTurnReplayLookup::Missing)
+                    | Err(ScopedDirectTurnReplayError::SubmittedIdentityChanged { .. }) => {
+                        return Err(SendChatServiceError::IdempotencyConflict);
+                    }
+                    Err(ScopedDirectTurnReplayError::Db(error)) => {
+                        return Err(map_db_internal_error(&error));
+                    }
+                }
+            }
+            Err(error) => return Err(map_direct_turn_accept_error(error)),
+        };
         match step.outcome {
             TurnOutcome::Created { .. } | TurnOutcome::ExactReplay { .. } => {
                 self.runtime.kick_direct_turn_worker();
@@ -471,9 +499,10 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
 
 fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
-        crate::db::DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged) => {
-            SendChatServiceError::IdempotencyConflict
-        }
+        crate::db::DbError::DirectTurnConflict(
+            TurnConflict::PreparedSemanticsChanged
+            | TurnConflict::CanonicalMessageAlreadyBound { .. },
+        ) => SendChatServiceError::IdempotencyConflict,
         crate::db::DbError::DirectTurnConflict(TurnConflict::ConversationAlreadyOwned {
             ..
         }) => SendChatServiceError::Busy,

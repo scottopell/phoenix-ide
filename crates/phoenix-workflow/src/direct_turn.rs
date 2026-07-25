@@ -50,17 +50,15 @@ pub struct CanonicalMessageId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedTurn {
-    target: ConversationAuthority,
     fingerprint: String,
     payload: Vec<u8>,
 }
 
 impl PreparedTurn {
     #[must_use]
-    pub fn from_exact_payload(target: &ConversationAuthority, payload: Vec<u8>) -> Self {
-        let fingerprint = prepared_fingerprint(target, &payload);
+    pub fn from_exact_payload(payload: Vec<u8>) -> Self {
+        let fingerprint = sha256_hex(&payload);
         Self {
-            target: target.clone(),
             fingerprint,
             payload,
         }
@@ -71,26 +69,16 @@ impl PreparedTurn {
     /// # Errors
     /// Returns [`TurnConflict::CorruptAggregate`] when the persisted fingerprint
     /// does not match the exact payload bytes.
-    pub fn rehydrate(
-        target: &ConversationAuthority,
-        fingerprint: String,
-        payload: Vec<u8>,
-    ) -> Result<Self, TurnConflict> {
-        if fingerprint != prepared_fingerprint(target, &payload) {
+    pub fn rehydrate(fingerprint: String, payload: Vec<u8>) -> Result<Self, TurnConflict> {
+        if fingerprint != sha256_hex(&payload) {
             return Err(TurnConflict::CorruptAggregate(
                 "prepared turn fingerprint does not match payload",
             ));
         }
         Ok(Self {
-            target: target.clone(),
             fingerprint,
             payload,
         })
-    }
-
-    #[must_use]
-    pub fn target(&self) -> &ConversationAuthority {
-        &self.target
     }
 
     #[must_use]
@@ -102,14 +90,6 @@ impl PreparedTurn {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
-}
-
-fn prepared_fingerprint(target: &ConversationAuthority, payload: &[u8]) -> String {
-    let mut exact = Vec::with_capacity(target.0.len() + 1 + payload.len());
-    exact.extend_from_slice(target.0.as_bytes());
-    exact.push(0);
-    exact.extend_from_slice(payload);
-    sha256_hex(&exact)
 }
 
 fn sha256_hex(payload: &[u8]) -> String {
@@ -219,7 +199,6 @@ pub enum TurnCommand {
 pub enum TurnOutcome {
     Created {
         turn_id: TurnAuthorityId,
-        disposition: AcceptedDisposition,
     },
     ExactReplay {
         turn_id: TurnAuthorityId,
@@ -237,7 +216,6 @@ pub enum TurnOutcome {
         disposition: AcceptedDisposition,
     },
     TerminalReplay {
-        turn_id: TurnAuthorityId,
         generation: u64,
         terminal: TurnTerminal,
         disposition: AcceptedDisposition,
@@ -246,7 +224,8 @@ pub enum TurnOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnConflict {
-    PreparedSemanticsChanged { authoritative_fingerprint: String },
+    PreparedSemanticsChanged,
+    CanonicalMessageAlreadyBound { canonical: CanonicalMessageId },
     ConversationAlreadyOwned { owner: TurnAuthorityId },
     UnknownTurn,
     StaleGeneration { actual: u64 },
@@ -382,42 +361,36 @@ impl DurableTurnModel {
         if let Some(existing_id) = self.by_scoped_key.get(&scoped_key) {
             let existing = &self.turns[existing_id];
             if existing.prepared != prepared {
-                return Err(TurnConflict::PreparedSemanticsChanged {
-                    authoritative_fingerprint: existing.prepared.fingerprint().to_string(),
-                });
+                return Err(TurnConflict::PreparedSemanticsChanged);
             }
             let outcome = match &existing.lifecycle {
                 TurnLifecycle::Accepted {
                     disposition: stored,
-                } => TurnOutcome::ExactReplay {
+                } if *stored == disposition => TurnOutcome::ExactReplay {
                     turn_id: *existing_id,
-                    disposition: *stored,
+                    disposition,
                 },
                 TurnLifecycle::Terminal {
                     terminal,
                     disposition: stored,
-                } => TurnOutcome::TerminalReplay {
-                    turn_id: *existing_id,
+                } if *stored == disposition => TurnOutcome::TerminalReplay {
                     generation: existing.generation,
                     terminal: terminal.clone(),
-                    disposition: *stored,
+                    disposition,
                 },
+                TurnLifecycle::Accepted { .. } | TurnLifecycle::Terminal { .. } => {
+                    return Err(TurnConflict::PreparedSemanticsChanged);
+                }
             };
             return Ok(TurnStep {
                 outcome,
                 owed_effects: Vec::new(),
             });
         }
-        match (disposition, self.live_owner.get(&conversation).copied()) {
-            (AcceptedDisposition::Runtime, Some(owner)) => {
-                return Err(TurnConflict::ConversationAlreadyOwned { owner });
+        if disposition == AcceptedDisposition::Runtime {
+            if let Some(owner) = self.live_owner.get(&conversation) {
+                return Err(TurnConflict::ConversationAlreadyOwned { owner: *owner });
             }
-            (AcceptedDisposition::Steering, None) => {
-                return Err(TurnConflict::CorruptAggregate(
-                    "steering requires an active runtime owner",
-                ));
-            }
-            _ => {}
         }
         if self.turns.contains_key(&turn_id) {
             return Err(TurnConflict::CorruptAggregate(
@@ -443,10 +416,7 @@ impl DurableTurnModel {
             AcceptedDisposition::Steering => OwedTurnEffect::SteeringQueue { turn_id },
         };
         Ok(TurnStep {
-            outcome: TurnOutcome::Created {
-                turn_id,
-                disposition,
-            },
+            outcome: TurnOutcome::Created { turn_id },
             owed_effects: vec![owed_effect],
         })
     }
@@ -534,7 +504,6 @@ impl DurableTurnModel {
                 if stored == &terminal {
                     return Ok(TurnStep {
                         outcome: TurnOutcome::TerminalReplay {
-                            turn_id,
                             generation: turn.generation,
                             terminal,
                             disposition: *disposition,
@@ -619,7 +588,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn prepared(seed: u8) -> PreparedTurn {
-        PreparedTurn::from_exact_payload(&ConversationAuthority("conv-a".to_string()), vec![seed])
+        PreparedTurn::from_exact_payload(vec![seed])
     }
 
     #[test]
@@ -630,33 +599,18 @@ mod tests {
     }
 
     #[test]
-    fn prepared_turn_fingerprint_binds_target_and_exact_payload() {
-        let prepared = PreparedTurn::from_exact_payload(
-            &ConversationAuthority("conv-a".to_string()),
-            b"abc".to_vec(),
-        );
-        assert_ne!(
+    fn prepared_turn_fingerprint_is_exact_payload_sha256() {
+        let prepared = PreparedTurn::from_exact_payload(b"abc".to_vec());
+        assert_eq!(
             prepared.fingerprint(),
-            PreparedTurn::from_exact_payload(
-                &ConversationAuthority("conv-b".to_string()),
-                b"abc".to_vec(),
-            )
-            .fingerprint()
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(prepared.payload(), b"abc");
-        assert!(PreparedTurn::rehydrate(
-            &ConversationAuthority("conv-a".into()),
-            prepared.fingerprint().to_string(),
-            b"abd".to_vec()
-        )
-        .is_err());
+        assert!(
+            PreparedTurn::rehydrate(prepared.fingerprint().to_string(), b"abd".to_vec()).is_err()
+        );
         assert_eq!(
-            PreparedTurn::rehydrate(
-                &ConversationAuthority("conv-a".into()),
-                prepared.fingerprint().to_string(),
-                b"abc".to_vec()
-            )
-            .unwrap(),
+            PreparedTurn::rehydrate(prepared.fingerprint().to_string(), b"abc".to_vec()).unwrap(),
             prepared
         );
     }
@@ -692,20 +646,8 @@ mod tests {
         };
         let created = model.apply(command.clone()).unwrap();
         let replayed = model.apply(command).unwrap();
-        assert!(matches!(
-            created.outcome,
-            TurnOutcome::Created {
-                disposition: AcceptedDisposition::Runtime,
-                ..
-            }
-        ));
-        assert!(matches!(
-            replayed.outcome,
-            TurnOutcome::ExactReplay {
-                disposition: AcceptedDisposition::Runtime,
-                ..
-            }
-        ));
+        assert!(matches!(created.outcome, TurnOutcome::Created { .. }));
+        assert!(matches!(replayed.outcome, TurnOutcome::ExactReplay { .. }));
         assert!(model
             .apply(TurnCommand::Accept {
                 conversation: ConversationAuthority("a".into()),
@@ -727,47 +669,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_replay_returns_authoritative_terminal_and_disposition() {
-        let mut model = DurableTurnModel::default();
-        let created = model
-            .apply(TurnCommand::Accept {
-                conversation: ConversationAuthority("a".into()),
-                client_key: ClientTurnKey::new("turn").unwrap(),
-                prepared: prepared(1),
-                turn_id: TurnAuthorityId(1),
-                disposition: AcceptedDisposition::Runtime,
-            })
-            .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
-            panic!("expected creation")
-        };
-        model
-            .apply(TurnCommand::Cancel {
-                turn_id,
-                expected_generation: 0,
-            })
-            .unwrap();
-        let replay = model
-            .apply(TurnCommand::Accept {
-                conversation: ConversationAuthority("a".into()),
-                client_key: ClientTurnKey::new("turn").unwrap(),
-                prepared: prepared(1),
-                turn_id: TurnAuthorityId(99),
-                disposition: AcceptedDisposition::Steering,
-            })
-            .unwrap();
-        assert_eq!(
-            replay.outcome,
-            TurnOutcome::TerminalReplay {
-                turn_id,
-                generation: 1,
-                terminal: TurnTerminal::Cancelled,
-                disposition: AcceptedDisposition::Runtime,
-            }
-        );
-    }
-
-    #[test]
     fn terminal_transition_advances_generation_and_releases_owner() {
         let mut model = DurableTurnModel::default();
         let created = model
@@ -779,7 +680,7 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
             })
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected creation")
         };
         let terminal = model
@@ -857,7 +758,7 @@ mod tests {
                 disposition: AcceptedDisposition::Runtime,
             })
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected creation")
         };
         model
@@ -876,7 +777,6 @@ mod tests {
             replay,
             TurnStep {
                 outcome: TurnOutcome::TerminalReplay {
-                    turn_id,
                     generation: 1,
                     terminal: TurnTerminal::Cancelled,
                     disposition: AcceptedDisposition::Runtime,
@@ -896,15 +796,6 @@ mod tests {
     #[test]
     fn steering_terminal_does_not_release_conversation_owner() {
         let mut model = DurableTurnModel::default();
-        model
-            .apply(TurnCommand::Accept {
-                conversation: ConversationAuthority("a".into()),
-                client_key: ClientTurnKey::new("runtime").unwrap(),
-                prepared: prepared(0),
-                turn_id: TurnAuthorityId(9),
-                disposition: AcceptedDisposition::Runtime,
-            })
-            .unwrap();
         let created = model
             .apply(TurnCommand::Accept {
                 conversation: ConversationAuthority("a".into()),
@@ -914,7 +805,7 @@ mod tests {
                 disposition: AcceptedDisposition::Steering,
             })
             .unwrap();
-        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+        let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected creation")
         };
         let step = model
@@ -947,7 +838,7 @@ mod tests {
                     prepared: prepared(key),
                     disposition: if key % 2 == 0 { AcceptedDisposition::Runtime } else { AcceptedDisposition::Steering },
                 });
-                if let Ok(TurnStep { outcome: TurnOutcome::Created { turn_id, .. }, .. }) = outcome {
+                if let Ok(TurnStep { outcome: TurnOutcome::Created { turn_id }, .. }) = outcome {
                     known.push(turn_id);
                     if cancel {
                         let _ = model.apply(TurnCommand::Cancel { turn_id, expected_generation: 0 });

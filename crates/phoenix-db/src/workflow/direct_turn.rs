@@ -198,6 +198,29 @@ impl WorkflowRepository {
                 owed_effects: Vec::new(),
             });
         }
+        let submitted_message_id =
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
+                .map_err(|_| {
+                    conflict(TurnConflict::CorruptAggregate(
+                        "prepared payload decode failed",
+                    ))
+                })?
+                .message_id()
+                .to_string();
+        if let Some(existing_conversation) = sqlx::query_scalar::<_, String>(
+            "SELECT conversation_id FROM messages WHERE message_id = ?1",
+        )
+        .bind(&submitted_message_id)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        {
+            if existing_conversation != input.conversation.0 {
+                tx.rollback().await?;
+                return Err(conflict(TurnConflict::CanonicalMessageAlreadyBound {
+                    canonical: CanonicalMessageId(submitted_message_id),
+                }));
+            }
+        }
         if input.disposition == AcceptedDisposition::Runtime {
             if let Some(owner) = sqlx::query_scalar::<_, i64>(
                 "SELECT turn_id FROM durable_turns WHERE conversation_id = ?1 AND owns_conversation = 1",
@@ -2394,6 +2417,34 @@ mod tests {
         assert_eq!(
             workflow_status_version_generation_transition_count(&repo, workflow_id).await,
             ("Cancelled".to_string(), 2, 1, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_rejects_message_identity_bound_to_another_conversation() {
+        let repo = repo().await;
+        sqlx::query(
+            "INSERT INTO messages
+             (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES ('message-conv-a-cross-conversation', 'conv-b', 1, 'user', '[]', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.accept_authoritative_turn(&input("conv-a", "cross-conversation", 11))
+                .await,
+            Err(DbError::DirectTurnConflict(
+                TurnConflict::CanonicalMessageAlreadyBound { .. }
+            ))
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM durable_turns")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap(),
+            0
         );
     }
 
