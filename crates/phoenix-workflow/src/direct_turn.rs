@@ -431,6 +431,23 @@ impl DurableTurnModel {
             .turns
             .get_mut(&turn_id)
             .ok_or(TurnConflict::UnknownTurn)?;
+        if let Materialization::Materialized {
+            message_id: canonical,
+        } = &turn.materialization
+        {
+            return if canonical == &message_id {
+                Ok(TurnStep {
+                    outcome: TurnOutcome::MaterializationReplay {
+                        message_id: canonical.clone(),
+                    },
+                    owed_effects: Vec::new(),
+                })
+            } else {
+                Err(TurnConflict::MaterializationIdentityChanged {
+                    canonical: canonical.clone(),
+                })
+            };
+        }
         if turn.generation != expected_generation {
             return Err(TurnConflict::StaleGeneration {
                 actual: turn.generation,
@@ -687,6 +704,45 @@ mod tests {
                 message_id: CanonicalMessageId("late".into()),
             })
             .is_err());
+    }
+
+    #[test]
+    fn exact_materialization_replays_after_terminal() {
+        let mut model = DurableTurnModel::default();
+        model
+            .apply(TurnCommand::Accept {
+                conversation: ConversationAuthority("a".into()),
+                client_key: ClientTurnKey::new("turn").unwrap(),
+                prepared: prepared(1),
+                turn_id: TurnAuthorityId(1),
+                disposition: AcceptedDisposition::Runtime,
+            })
+            .unwrap();
+        model
+            .apply(TurnCommand::Materialize {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+                message_id: CanonicalMessageId("message".into()),
+            })
+            .unwrap();
+        model
+            .apply(TurnCommand::Complete {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+            })
+            .unwrap();
+
+        let replay = model
+            .apply(TurnCommand::Materialize {
+                turn_id: TurnAuthorityId(1),
+                expected_generation: 0,
+                message_id: CanonicalMessageId("message".into()),
+            })
+            .unwrap();
+        assert!(matches!(
+            replay.outcome,
+            TurnOutcome::MaterializationReplay { .. }
+        ));
     }
 
     #[test]
