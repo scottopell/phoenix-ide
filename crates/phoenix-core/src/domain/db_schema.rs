@@ -1595,8 +1595,8 @@ pub struct UsageConversationModelRow {
     pub slug: Option<String>,
     pub title: Option<String>,
     pub project_id: Option<String>,
-    /// The conversation's worktree path (from the normalized `cm_worktree_path`
-    /// column). `None` for modes without a worktree (Direct, sub-agent Explore).
+    /// The conversation's worktree path from its normalized `WorkScope` environment.
+    /// `None` for environments without a worktree.
     pub worktree_path: Option<String>,
     pub started_at: String,
     pub input_tokens: i64,

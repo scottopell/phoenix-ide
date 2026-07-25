@@ -273,17 +273,9 @@ result alone is insufficient. Cap of 5 matches the ring buffer capacity.
 
 ### REQ-TERM-012: Terminal Torn Down with WorkScope
 
-WHEN a conversation reaches a terminal state (completed, failed, context_exhausted)
-AND a terminal session is active for the `WorkScope::Conversation(id)` of that
-conversation (i.e. a Direct-mode conversation with no worktree)
-THE SYSTEM SHALL close the master fd
-AND the kernel SHALL deliver SIGHUP to the shell
-AND the terminal session SHALL be torn down
-
-WHEN a worktree is cleaned up via the resource-cleanup cascade
-(archive / abandon / mark-merged / hard-delete; see REQ-TMUX-WS-002)
-AND a terminal session is active for `WorkScope::Worktree(path)` of that worktree
-AND no continuation conversation resolves to the same `WorkScope`
+WHEN a conversation or workspace is cleaned up by the resource-cleanup cascade
+AND a terminal session is active for its opaque persisted WorkScope identity
+AND no other live conversation owns that same `work_scope_id`
 THE SYSTEM SHALL close the master fd
 AND the terminal session SHALL be torn down
 
@@ -534,9 +526,9 @@ it doesn't understand.
 
 ### REQ-TERM-WS-001: Terminal Sessions Keyed by WorkScope
 
-Phoenix MUST key terminal session ownership by `WorkScope`:
-`WorkScope::Worktree(path)` for managed/branch worktrees,
-`WorkScope::Conversation(conversation_id)` for Direct conversations, and
+Phoenix MUST key conversation-bound terminal session ownership by the opaque
+persisted `work_scope_id`, and MUST NOT derive terminal identity from a
+conversation id, working directory, or worktree path. Phoenix MUST use
 `WorkScope::Global` for the singleton scope surfaced by every UI surface
 that wants a terminal not bound to a single conversation. Two such
 surfaces exist: the collapsible pane on the `/new` page and the dedicated
@@ -545,10 +537,11 @@ both resolve to `WorkScope::Global`, they attach to one PTY and one tmux
 session — opening one while the other is attached reclaims the shared
 session rather than spawning a competing shell.
 
-The `ActiveTerminals` registry MUST be a `HashMap<WorkScope, …>` rather
-than a `HashMap<String, …>` keyed by conversation id. Continuation
-conversations that resolve to the same `WorkScope` MUST share the
-existing terminal rather than spawn a new one.
+The `ActiveTerminals` registry MUST be keyed by the persisted WorkScope
+identity rather than conversation id or filesystem path. Continuation
+conversations that retain the same `work_scope_id` MUST share the existing
+terminal rather than spawn a new one; a fresh identity MUST remain isolated
+even when its environment uses the same path.
 
 The cleanup cascade MUST decide preservation by whether the scope is
 still owned by a live conversation other than the one being torn down:
@@ -571,12 +564,10 @@ REQ-TMUX-WS-002 and REQ-BROWSER-WS-001 / REQ-BROWSER-WS-003 — the three
 work-affine resources (tmux server, Chrome session, terminal PTY) share
 a single ownership pattern.
 
-**Rationale:** Pre-existing keying by `conversation_id` created two
-parallel representations of "who owns this resource" — `ActiveTerminals`
-keyed by conv id, `TmuxRegistry` keyed by `WorkScope`. The two
-representations diverged on continuation: tmux state survived
-context-exhaustion continuations within the same worktree, but the
-terminal PTY did not, even though the user's mental model is "the
+**Rationale:** Resource registries need one shared authority for ownership.
+Using the persisted WorkScope identity keeps terminal and tmux state aligned
+across continuations without making path equality imply shared ownership. The
+user's mental model is "the
 shell I was just typing into." Aligning the terminal registry on
 `WorkScope` makes continuation persistence consistent across all
 work-affine resources and makes `WorkScope::Global` representable

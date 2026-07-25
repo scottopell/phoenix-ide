@@ -413,6 +413,9 @@ DROP INDEX one_coordinator_conversation;
 CREATE UNIQUE INDEX one_live_coordinator_conversation
 ON conversations(coordinator_head)
 WHERE coordinator_head = 1;
+ALTER TABLE conversations DROP COLUMN cm_branch_name;
+ALTER TABLE conversations DROP COLUMN cm_worktree_path;
+ALTER TABLE conversations DROP COLUMN cm_base_branch;
 ALTER TABLE conversations DROP COLUMN cwd;
 DROP TRIGGER conversations_role_scope_insert;
 DROP TRIGGER conversations_role_scope_update;
@@ -3157,9 +3160,12 @@ mod tests {
             let pool = pool.clone();
             async move {
                 sqlx::query(
-                    "SELECT cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, \
-                            cm_task_id, cm_task_title, cm_next_taskmd_id_hint \
-                     FROM conversations WHERE id = ?1",
+                    "SELECT c.cm_kind, e.branch_name AS cm_branch_name,
+                            e.worktree_path AS cm_worktree_path, e.base_branch AS cm_base_branch,
+                            c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint
+                     FROM conversations c
+                     LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
+                     WHERE c.id = ?1",
                 )
                 .bind(id)
                 .fetch_one(&pool)
@@ -3602,7 +3608,10 @@ mod tests {
         run_pending_migrations(&pool).await.unwrap();
 
         let row = sqlx::query(
-            "SELECT cm_kind, cm_worktree_path, state FROM conversations WHERE id = 'c2'",
+            "SELECT c.cm_kind, e.worktree_path AS cm_worktree_path, c.state
+             FROM conversations c
+             LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
+             WHERE c.id = 'c2'",
         )
         .fetch_one(&pool)
         .await

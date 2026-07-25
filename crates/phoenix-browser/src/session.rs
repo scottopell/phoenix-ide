@@ -833,10 +833,6 @@ pub async fn cascade_browser_on_delete(
         }
         return;
     }
-    if actor.authority() == ResourceAuthority::Restricted {
-        manager.kill_session_for_actor(work_scope, actor).await;
-        return;
-    }
     manager.kill_session(work_scope).await;
 }
 

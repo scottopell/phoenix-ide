@@ -10219,17 +10219,8 @@ pub(crate) mod hard_delete_cascade_tests {
         use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
 
         let state = make_test_state().await;
-        state
-            .db
-            .create_conversation("conv-live", "live", "/tmp", true, None, None)
-            .await
-            .expect("conversation");
-        let conv = state
-            .db
-            .get_conversation("conv-live")
-            .await
-            .expect("conversation");
-        let scope = crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id.expect("scope"));
+        let actor_id = "conv-live";
+        let scope = create_inspector_actor(&state, actor_id, "Inventory live").await;
 
         // Insert a live handle directly into the ResourceScopeKey-keyed registry.
         let table = state.runtime.bash_handles().get_or_create(&scope).await;
@@ -10248,7 +10239,7 @@ pub(crate) mod hard_delete_cascade_tests {
             State(state),
             Path(scope.stable_key()),
             Query(super::WorkScopeActorQuery {
-                conversation_id: "conv-live".into(),
+                conversation_id: actor_id.into(),
             }),
         )
         .await
@@ -10596,13 +10587,8 @@ pub(crate) mod hard_delete_cascade_tests {
         use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
 
         let state = make_test_state().await;
-        state
-            .db
-            .create_conversation("c-ws", "test", "/tmp", true, None, None)
-            .await
-            .expect("create");
-
-        let scope = conversation_scope(&state, "c-ws").await;
+        let actor_id = "c-ws";
+        let scope = create_inspector_actor(&state, actor_id, "Inventory SSE live").await;
 
         // Insert a live bash handle into the scope's registry table so the
         // assembled inventory has something to report.
@@ -10619,7 +10605,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         // Force a runtime handle (so a broadcaster exists) and subscribe
         // before the bridge fires.
-        let mut rx = state.runtime.subscribe("c-ws").await.expect("subscribe");
+        let mut rx = state.runtime.subscribe(actor_id).await.expect("subscribe");
 
         state.runtime.broadcast_work_scope_update(&scope).await;
 

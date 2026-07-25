@@ -340,7 +340,7 @@ THE `ToolContext.browser()` method SHALL:
 - Return a guard that updates activity timestamp on drop
 - Lazily initialize Chrome on first call
 
-**Rationale:** Stateless tools with context injection make invalid states unrepresentable. Tools cannot use the wrong scope's browser because `browser()` derives identity from the context's `WorkScope`. Direct-mode conversations resolve to `WorkScope::Conversation(<id>)` (per-conversation scoping fallback); worktree-backed conversations resolve to `WorkScope::Worktree(<path>)` (shared across continuations).
+**Rationale:** Stateless tools with context injection make invalid states unrepresentable. Tools cannot use the wrong scope's browser because `browser()` consumes the opaque persisted identity from the context's `WorkScope`; it does not derive ownership from mode, conversation id, or filesystem path.
 
 **User Stories:** US-1, US-2, US-3
 
@@ -348,24 +348,22 @@ THE `ToolContext.browser()` method SHALL:
 
 ## WorkScope Ownership
 
-These requirements migrate browser sessions from per-conversation ownership to `WorkScope` ownership, the same primitive tmux integration adopted in REQ-TMUX-WS-001. Worktree-backed conversations share a single Chrome window across continuation members; Direct conversations fall back to per-conversation scoping because no durable owner exists for them to inherit.
+Browser sessions use the same opaque persisted WorkScope identity as the other work-affine resources. Conversations share one Chrome window only when they retain the same `work_scope_id`; filesystem paths and conversation ids do not define browser ownership.
 
 ### REQ-BROWSER-WS-001: Sessions Keyed by WorkScope
 
 WHEN `BrowserSessionManager::get_session` resolves a session
 THE SYSTEM SHALL key the lookup by `WorkScope::stable_key()`
 
-WHEN a conversation is worktree-backed (Work, Branch, top-level managed Explore)
-THE SYSTEM SHALL resolve `WorkScope::Worktree(<path>)` for the lookup
-
-WHEN a conversation is Direct (no durable owner)
-THE SYSTEM SHALL resolve `WorkScope::Conversation(<id>)` for the lookup
+WHEN a conversation accesses browser state
+THE SYSTEM SHALL resolve the lookup from its opaque persisted `work_scope_id`
+AND SHALL NOT derive browser identity from its conversation id, working directory, or worktree path
 
 WHEN `BrowserSession::new` constructs a Chrome instance
 THE SYSTEM SHALL derive the user data directory from the same scope key
 AND two sessions resolving to the same scope SHALL share the same on-disk profile
 
-**Rationale:** A Work/Branch conversation and any context-exhaustion continuation that inherits its worktree are the same unit of work. Their tools should drive the same Chrome window — including open tabs, cookies, and dev-tools state — without the continuation observing a silent re-login.
+**Rationale:** Conversations retaining one persisted scope are the same unit of work. Their tools should drive the same Chrome window — including open tabs, cookies, and dev-tools state — without a continuation observing a silent re-login. Distinct persisted scopes remain isolated even when their environments point at the same path.
 
 **User Stories:** US-1, US-2, US-3
 
@@ -412,7 +410,7 @@ THE SYSTEM SHALL skip the session kill
 
 WHEN `inheritor_scope` is `None`
 THE SYSTEM SHALL tear the session down
-    (the deleted conversation was the last live owner — excluding it from the enumeration is what makes this reachable; Direct conversations also fall here, having no shared worktree scope)
+    (the deleted conversation was the last live owner — excluding it from the enumeration is what makes this reachable)
 
 **Rationale:** Before this requirement, archive/abandon killed bash + tmux but leaked Chrome until Phoenix restart. The preservation signal is correct by construction — it asks "are my resources still owned by someone live other than me?" rather than relying on the implicit invariant "Worktree continuations always inherit the same worktree." Continuation is one way a scope outlives a conversation; a live sibling such as a Work-mode sub-agent sharing its parent's scope is another. The same shape applies to tmux (REQ-TMUX-WS-002) and the terminal (REQ-TERM-WS-001).
 

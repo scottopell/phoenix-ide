@@ -26,6 +26,13 @@ fn work_actor(id: &str) -> phoenix_core::work_scope::EffectiveResourceAccess {
     )
 }
 
+fn restricted_actor(id: &str) -> phoenix_core::work_scope::EffectiveResourceAccess {
+    phoenix_core::work_scope::EffectiveResourceAccess::new(
+        id,
+        phoenix_core::work_scope::ResourceAuthority::Restricted,
+    )
+}
+
 /// Check if Chrome is available or obtainable.
 ///
 /// `dev.py check` classifies the environment up front and sets internal
@@ -3229,6 +3236,29 @@ async fn cascade_tears_down_when_no_inheritor() {
         !manager.is_active(&scope).await,
         "no-inheritor cascade must tear the session down"
     );
+}
+
+#[tokio::test]
+async fn cascade_last_restricted_owner_tears_down_every_scope_session() {
+    require_chrome!();
+
+    let manager = Arc::new(BrowserSessionManager::default());
+    let scope = scope("cascade-restricted-last-owner");
+    let owner = restricted_actor("owner");
+    let sibling = restricted_actor("finished-sub-agent");
+
+    let _ = manager
+        .get_session_for_actor(&scope, &owner)
+        .await
+        .expect("owner session");
+    let _ = manager
+        .get_session_for_actor(&scope, &sibling)
+        .await
+        .expect("sibling session");
+
+    crate::browser::session::cascade_browser_on_delete(&manager, &scope, &owner, None).await;
+
+    assert!(!manager.is_active(&scope).await);
 }
 
 /// Direct continuations resolve to a *different* `Conversation` scope

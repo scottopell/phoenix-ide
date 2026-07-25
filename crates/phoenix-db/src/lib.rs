@@ -2849,8 +2849,8 @@ impl Database {
                 .await?;
             }
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -2866,9 +2866,6 @@ impl Database {
             .bind(seed_label)
             .bind(llm_language.as_str())
             .bind(cm.kind)
-            .bind(cm.branch_name)
-            .bind(cm.worktree_path)
-            .bind(cm.base_branch)
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
@@ -3067,7 +3064,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.id = ?1",
@@ -3096,7 +3093,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id WHERE c.slug = ?1",
@@ -3125,7 +3122,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -3255,7 +3252,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -3282,7 +3279,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -3306,7 +3303,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -3412,8 +3409,8 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?6, ?6, 0, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'user', ?19)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?6, ?6, 0, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'user', ?16)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -3427,9 +3424,6 @@ impl Database {
             .bind(seed_label)
             .bind(llm_language.as_str())
             .bind(cm.kind)
-            .bind(cm.branch_name)
-            .bind(cm.worktree_path)
-            .bind(cm.base_branch)
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
@@ -4877,15 +4871,11 @@ impl Database {
 
         let result = sqlx::query(
             "UPDATE conversations
-             SET cm_kind = ?1, cm_branch_name = ?2, cm_worktree_path = ?3, cm_base_branch = ?4,
-                 cm_task_id = ?5, cm_task_title = ?6, cm_next_taskmd_id_hint = ?7,
-                 updated_at = ?8
-             WHERE id = ?9 AND work_scope_id = ?10",
+             SET cm_kind = ?1, cm_task_id = ?2, cm_task_title = ?3,
+                 cm_next_taskmd_id_hint = ?4, updated_at = ?5
+             WHERE id = ?6 AND work_scope_id = ?7",
         )
         .bind(cm.kind)
-        .bind(cm.branch_name)
-        .bind(cm.worktree_path)
-        .bind(cm.base_branch)
         .bind(cm.task_id)
         .bind(cm.task_title)
         .bind(cm.next_taskmd_id_hint)
@@ -4966,7 +4956,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -4996,7 +4986,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -5181,8 +5171,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'user', ?17)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11, ?12, ?13, 'user', ?14)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5194,9 +5184,6 @@ impl Database {
             .bind(parent.desired_base_branch.as_deref())
             .bind(parent.llm_language.as_str())
             .bind(cm.kind)
-            .bind(cm.branch_name)
-            .bind(cm.worktree_path)
-            .bind(cm.base_branch)
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
@@ -5491,8 +5478,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
-                 VALUES (?1, ?2, ?3, CASE WHEN ?21 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?20, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22, ?23)",
+                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
+                 VALUES (?1, ?2, ?3, CASE WHEN ?18 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?17, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?18, ?19, ?20)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5509,9 +5496,6 @@ impl Database {
             .bind::<Option<&str>>(None)
             .bind(parent.llm_language.as_str())
             .bind(cm.kind)
-            .bind(cm.branch_name)
-            .bind(cm.worktree_path)
-            .bind(cm.base_branch)
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
@@ -5704,7 +5688,7 @@ impl Database {
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
             FROM conversations c
@@ -6495,35 +6479,31 @@ impl Database {
                          ELSE title
                      END,
                      project_id = CASE
-                         WHEN ?5 = 1 THEN ?6
+                         WHEN ?4 = 1 THEN ?5
                          ELSE project_id
                      END,
                      desired_base_branch = CASE
-                         WHEN ?7 = 1 THEN ?8
+                         WHEN ?6 = 1 THEN ?7
                          ELSE desired_base_branch
                      END,
-                     cm_kind = ?9,
-                     cm_branch_name = ?10,
-                     cm_worktree_path = ?11,
-                     cm_base_branch = ?12,
-                     cm_task_id = ?13,
-                     cm_task_title = ?14,
-                     cm_next_taskmd_id_hint = ?15,
-                     model = ?16,
-                     updated_at = ?17
-                 WHERE id = ?18
+                     cm_kind = ?8,
+                     cm_task_id = ?9,
+                     cm_task_title = ?10,
+                     cm_next_taskmd_id_hint = ?11,
+                     model = ?12,
+                     updated_at = ?13
+                 WHERE id = ?14
                    AND EXISTS (
                        SELECT 1 FROM conversation_creation_jobs j
-                       WHERE j.id = ?19 AND j.conversation_id = conversations.id
-                         AND j.status = 'claimed' AND j.generation = ?20
-                         AND j.claim_worker_id = ?21 AND j.claim_token = ?22
-                         AND j.lease_until > ?17 AND j.stage = ?23
+                       WHERE j.id = ?15 AND j.conversation_id = conversations.id
+                         AND j.status = 'claimed' AND j.generation = ?16
+                         AND j.claim_worker_id = ?17 AND j.claim_token = ?18
+                         AND j.lease_until > ?13 AND j.stage = ?19
                    )",
             )
             .bind(candidate_slug.as_deref())
             .bind(update.title.is_some())
             .bind(update.title.as_ref().and_then(|v| v.as_deref()))
-            .bind(update.cwd.as_deref())
             .bind(update.project_id.is_some())
             .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
             .bind(update.desired_base_branch.is_some())
@@ -6534,9 +6514,6 @@ impl Database {
                     .and_then(|v| v.as_deref()),
             )
             .bind(cm.kind)
-            .bind(cm.branch_name)
-            .bind(cm.worktree_path)
-            .bind(cm.base_branch)
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
@@ -6630,7 +6607,7 @@ impl Database {
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
-                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -8269,7 +8246,7 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
             }
         }
         Some("explore") => ConvMode::Explore {
-            worktree_path: ne("cm_worktree_path"),
+            worktree_path: ne_env("env_worktree_path"),
             next_taskmd_id_hint: ne("cm_next_taskmd_id_hint"),
         },
         // An unknown kind or NULL (legacy/malformed) → bare default Explore,
@@ -8690,10 +8667,9 @@ async fn insert_conversation_tx(
             desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, llm_language,
             spawned_from_conversation_id,
-            cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch,
-            cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
+            cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
             runtime_role, work_scope_id
-        ) VALUES (?1, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+        ) VALUES (?1, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -8718,9 +8694,6 @@ async fn insert_conversation_tx(
     .bind(conv.llm_language.as_str())
     .bind(&conv.spawned_from_conversation_id)
     .bind(cm.kind)
-    .bind(cm.branch_name)
-    .bind(cm.worktree_path)
-    .bind(cm.base_branch)
     .bind(cm.task_id)
     .bind(cm.task_title)
     .bind(cm.next_taskmd_id_hint)
@@ -12648,10 +12621,12 @@ mod tests {
             cols.iter().any(|c| c == "cm_kind"),
             "cm_kind present: {cols:?}"
         );
-        assert!(
-            cols.iter().any(|c| c == "cm_worktree_path"),
-            "cm_worktree_path present: {cols:?}"
-        );
+        for removed in ["cm_branch_name", "cm_worktree_path", "cm_base_branch"] {
+            assert!(
+                !cols.iter().any(|column| column == removed),
+                "{removed} must be owned only by work_scope_environments: {cols:?}"
+            );
+        }
         assert!(
             !cols.iter().any(|c| c == "conv_mode"),
             "conv_mode blob must be dropped after migration 029: {cols:?}"
@@ -16583,8 +16558,6 @@ mod tests {
         db.update_conversation_mode("normalized", &mode)
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET cm_worktree_path = '/tmp/stale-shadow', cm_branch_name = 'stale'")
-            .execute(db.pool()).await.unwrap();
         let conv = db.get_conversation("normalized").await.unwrap();
         assert_eq!(
             conv.conv_mode.worktree_path(),

@@ -1216,5 +1216,5 @@ AND SHALL keep the worktree checkout's remote relationship distinct from the bas
 
 ### REQ-PROJ-WS-001: WorkScope as Resource Owner
 
-Work-affine resources SHOULD be owned by `WorkScope`. Managed/Branch work uses the managed worktree path; Direct conversations use their conversation id as the fallback scope.
+Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from conversation ids, working directories, or worktree paths. Conversations retaining one identity share its resources; conversations with distinct identities remain isolated even when their environments use the same path.
 
