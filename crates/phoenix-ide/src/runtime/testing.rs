@@ -493,6 +493,12 @@ pub struct InMemoryStorage {
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
+    stopped_top_level_llm: Mutex<Vec<String>>,
+    queued_steering_outcome: Mutex<Option<phoenix_db::PersistQueuedSteeringMessageOutcome>>,
+    direct_turn_acceptance_outcome:
+        Mutex<Option<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome>>,
+    released_direct_turn_deliveries: Mutex<Vec<(String, String)>>,
+    failure_record_outcomes: Mutex<VecDeque<Result<phoenix_workflow::AuthorityOutcome, String>>>,
 }
 
 #[allow(dead_code)]
@@ -509,6 +515,11 @@ impl InMemoryStorage {
             last_prompt_tokens: Mutex::new(HashMap::new()),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
+            stopped_top_level_llm: Mutex::new(Vec::new()),
+            queued_steering_outcome: Mutex::new(None),
+            direct_turn_acceptance_outcome: Mutex::new(None),
+            released_direct_turn_deliveries: Mutex::new(Vec::new()),
+            failure_record_outcomes: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -530,6 +541,35 @@ impl InMemoryStorage {
         *self.fail_watermark_write.lock().unwrap() = fail;
     }
 
+    pub fn stopped_top_level_llm(&self) -> Vec<String> {
+        self.stopped_top_level_llm.lock().unwrap().clone()
+    }
+
+    pub fn set_queued_steering_outcome(
+        &self,
+        outcome: phoenix_db::PersistQueuedSteeringMessageOutcome,
+    ) {
+        *self.queued_steering_outcome.lock().unwrap() = Some(outcome);
+    }
+
+    pub fn set_direct_turn_acceptance_outcome(
+        &self,
+        outcome: phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome,
+    ) {
+        *self.direct_turn_acceptance_outcome.lock().unwrap() = Some(outcome);
+    }
+
+    pub fn released_direct_turn_deliveries(&self) -> Vec<(String, String)> {
+        self.released_direct_turn_deliveries.lock().unwrap().clone()
+    }
+
+    pub fn set_failure_record_outcomes(
+        &self,
+        outcomes: impl IntoIterator<Item = Result<phoenix_workflow::AuthorityOutcome, String>>,
+    ) {
+        *self.failure_record_outcomes.lock().unwrap() = outcomes.into_iter().collect();
+    }
+
     /// Read back the persisted fork proposals (test-only).
     pub fn get_fork_proposals(&self) -> Vec<crate::db::ForkProposal> {
         self.fork_proposals.lock().unwrap().clone()
@@ -546,6 +586,17 @@ impl InMemoryStorage {
             .get(conv_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub fn set_steering_queue(
+        &self,
+        conv_id: &str,
+        queue: Vec<crate::state_machine::event::SteerEntry>,
+    ) {
+        self.steering_queues
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), queue);
     }
 
     /// Seed the `conv_mode` for a conversation (used by tests that need to
@@ -583,6 +634,68 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn record_top_level_llm_failure(
+        &self,
+        _input: &phoenix_db::RecordTopLevelLlmFailureInput,
+    ) -> Result<phoenix_workflow::AuthorityOutcome, String> {
+        self.failure_record_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(phoenix_workflow::AuthorityOutcome::Authorized))
+    }
+
+    async fn stop_active_top_level_llm_for_conversation(
+        &self,
+        conversation_id: &str,
+        _stopped_at: phoenix_workflow::Timestamp,
+    ) -> Result<Option<phoenix_workflow::CommitOutcome>, String> {
+        self.stopped_top_level_llm
+            .lock()
+            .unwrap()
+            .push(conversation_id.to_string());
+        Ok(Some(phoenix_workflow::CommitOutcome::Committed))
+    }
+
+    async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        _input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
+        Ok(self
+            .direct_turn_acceptance_outcome
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict))
+    }
+
+    async fn release_direct_turn_runtime_delivery(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        _process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        self.released_direct_turn_deliveries
+            .lock()
+            .unwrap()
+            .push((conversation_id.to_string(), client_message_id.to_string()));
+        Ok(())
+    }
+
+    async fn persist_queued_steering_message(
+        &self,
+        _conversation_id: &str,
+        _client_message_id: &str,
+        _message: &Message,
+    ) -> Result<phoenix_db::PersistQueuedSteeringMessageOutcome, String> {
+        Ok(self
+            .queued_steering_outcome
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(phoenix_db::PersistQueuedSteeringMessageOutcome::LegacyQueueEntry))
+    }
+
     async fn add_message(
         &self,
         message_id: &str,
@@ -706,11 +819,21 @@ impl MessageStore for InMemoryStorage {
         Ok(self.get_all_messages(conv_id))
     }
 
-    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
-        let messages = self.messages.lock().unwrap();
-        Ok(messages
-            .values()
-            .any(|msgs| msgs.iter().any(|m| m.message_id == message_id)))
+    async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message.message_id == message_id)
+            }))
     }
 
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
@@ -904,18 +1027,6 @@ impl StateStore for InMemoryStorage {
         &self,
         _metrics: &phoenix_llm::LlmAttemptMetrics,
     ) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn update_steering_queue(
-        &self,
-        conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String> {
-        self.steering_queues
-            .lock()
-            .unwrap()
-            .insert(conv_id.to_string(), queue.to_vec());
         Ok(())
     }
 

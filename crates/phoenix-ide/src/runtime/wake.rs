@@ -32,10 +32,7 @@ const ERROR_RETRY_BASE_INTERVAL: Duration = Duration::from_millis(250);
 const ERROR_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
 
 fn fresh_process_incarnation() -> ProcessIncarnation {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..8]);
-    bytes[7] &= 0x7f;
-    ProcessIncarnation(u64::from_le_bytes(bytes))
+    super::process_incarnation()
 }
 
 #[derive(Clone)]
@@ -160,8 +157,25 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .await
             .map_err(|error| error.to_string())?;
         self.run_once().await?;
-        deliver_pending(&manager, &self.repo, self.clock.now()).await?;
+        phoenix_db::WorkflowRepository::new(manager.db().pool().clone())
+            .reclaim_workflow_delivery_claims(super::process_incarnation())
+            .await
+            .map_err(|error| error.to_string())?;
+        phoenix_db::WorkflowRepository::new(manager.db().pool().clone())
+            .interrupt_begun_top_level_llm_tools(super::process_incarnation())
+            .await
+            .map_err(|error| error.to_string())?;
         let _ = ready_tx.send(());
+        let recovery_manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            if let Err(error) = recover_top_level_llm_attempts(&recovery_manager).await {
+                tracing::error!(%error, "top-level LLM startup recovery failed");
+            }
+        });
+        deliver_owed_top_level_llm_receipts(&manager).await?;
+        deliver_owed_top_level_llm_tools(&manager).await?;
+        deliver_pending(&manager, &self.repo, self.clock.now()).await?;
+        deliver_pending_direct_turns(&manager).await?;
         self.run_loop_inner(&mut kick_rx, Some(manager)).await
     }
 
@@ -175,6 +189,18 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             let wait = match self.run_once().await {
                 Ok(wait) => {
                     if let Some(manager) = manager.as_ref() {
+                        if let Err(error) = recover_top_level_llm_attempts(manager).await {
+                            tracing::warn!(error = %error, "top-level LLM recovery failed; retrying");
+                        }
+                        if let Err(error) = deliver_owed_top_level_llm_receipts(manager).await {
+                            tracing::warn!(error = %error, "owed LLM receipt delivery failed; retrying");
+                        }
+                        if let Err(error) = deliver_owed_top_level_llm_tools(manager).await {
+                            tracing::warn!(error = %error, "owed LLM tool delivery failed; retrying");
+                        }
+                        if let Err(error) = deliver_pending_direct_turns(manager).await {
+                            tracing::warn!(error = %error, retry_in = ?error_backoff, "direct-turn recovery failed; retrying");
+                        }
                         if let Err(error) =
                             deliver_pending(manager, &self.repo, self.clock.now()).await
                         {
@@ -364,6 +390,496 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             }
         }
     }
+}
+
+async fn deliver_owed_top_level_llm_tools(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    for conversation_id in repo
+        .load_conversations_with_owed_top_level_llm_tools()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let handle = match manager.get_or_create(&conversation_id).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(conversation_id, error = %error, "owed LLM tool runtime unavailable");
+                continue;
+            }
+        };
+        if !matches!(
+            *handle.state_rx.borrow(),
+            crate::state_machine::ConvState::ToolExecuting { .. }
+        ) {
+            continue;
+        }
+        if let Err(error) = handle
+            .event_tx
+            .send(phoenix_core::domain::sm_event::Event::ResumeDurableToolExecution)
+            .await
+        {
+            tracing::warn!(conversation_id, error = %error, "owed LLM tool runtime channel closed");
+        }
+    }
+    Ok(())
+}
+
+async fn deliver_owed_top_level_llm_receipts(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    for owed in repo
+        .load_owed_top_level_llm_receipts()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let incarnation = super::process_incarnation();
+        if !repo
+            .claim_workflow_delivery(
+                owed.workflow.workflow_id,
+                owed.delivery.delivery_id,
+                incarnation,
+                Timestamp(u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            continue;
+        }
+        let durable: phoenix_llm::DurableLlmResponse =
+            serde_json::from_str(&owed.llm_receipt.response_aggregate)
+                .map_err(|error| error.to_string())?;
+        let handle = match manager.get_or_create(&owed.workflow.conversation_id).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                repo.release_workflow_delivery_claim(
+                    owed.workflow.workflow_id,
+                    owed.delivery.delivery_id,
+                    incarnation,
+                )
+                .await
+                .map_err(|release_error| release_error.to_string())?;
+                tracing::warn!(%error, "owed LLM receipt runtime unavailable");
+                continue;
+            }
+        };
+        let event = phoenix_core::domain::sm_event::Event::LlmResponse {
+            tool_calls: durable
+                .response
+                .tool_uses()
+                .into_iter()
+                .map(
+                    |(id, name, input)| phoenix_core::domain::sm_state::ToolCall {
+                        id: id.to_string(),
+                        input: phoenix_core::domain::sm_state::ToolInput::from_model_name_and_value(
+                            name,
+                            input.clone(),
+                        ),
+                    },
+                )
+                .collect(),
+            content: durable.response.content,
+            end_turn: durable.response.end_turn,
+            usage: durable.response.usage,
+            request_id: owed
+                .llm_receipt
+                .provider_request_id
+                .unwrap_or_else(|| format!("llm-receipt-{}", owed.receipt.receipt_id.0)),
+        };
+        if let Err(error) = handle.event_tx.send(event).await {
+            repo.release_workflow_delivery_claim(
+                owed.workflow.workflow_id,
+                owed.delivery.delivery_id,
+                incarnation,
+            )
+            .await
+            .map_err(|release_error| release_error.to_string())?;
+            tracing::warn!(error = %error, "owed LLM receipt runtime channel closed");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+    use sha2::Digest as _;
+
+    fn durable_failure(
+        message: String,
+        error_kind: phoenix_core::domain::db_schema::ErrorKind,
+        attempt: u32,
+        recovery_in_progress: bool,
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> phoenix_core::domain::llm_types::DurableLlmFailureEvent {
+        phoenix_core::domain::llm_types::DurableLlmFailureEvent {
+            codec_version: 1,
+            message,
+            error_kind,
+            attempt,
+            recovery_in_progress,
+            resets_at,
+        }
+    }
+
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    for recovery in repo
+        .recover_top_level_llm_attempts(super::process_incarnation())
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if let Some(payload) = recovery.recorded_outcome_payload.as_deref() {
+            let failure: phoenix_core::domain::llm_types::DurableLlmFailureEvent =
+                serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+            if failure.codec_version != 1 {
+                return Err(format!(
+                    "unsupported durable LLM failure codec {}",
+                    failure.codec_version
+                ));
+            }
+            let handle = manager
+                .get_or_create(&recovery.workflow.conversation_id)
+                .await?;
+            let authority = &recovery.attempt.authority;
+            if let Err(error) = handle
+                .event_tx
+                .send(
+                    phoenix_core::domain::sm_event::Event::ResumeDurableLlmFailure {
+                        failure,
+                        authority: phoenix_core::domain::llm_types::DurableLlmFailureAuthority {
+                            workflow_id: authority.workflow_id.0,
+                            effect_id: authority.effect_id.0,
+                            attempt_id: authority.attempt_id.0,
+                            declared_workflow_version: authority.declared_workflow_version.0,
+                            generation: authority.generation.0,
+                            process_incarnation: authority.process_incarnation.0,
+                        },
+                    },
+                )
+                .await
+            {
+                tracing::warn!(%error, "recorded LLM failure runtime channel closed");
+            }
+            continue;
+        }
+        let durable_request: phoenix_llm::DurableLlmRequest =
+            serde_json::from_str(&recovery.prepared_request.request_aggregate)
+                .map_err(|error| error.to_string())?;
+        let routing_identity = manager
+            .model_registry()
+            .model_routing_identity(&recovery.prepared_request.model);
+        let expected_identity = (
+            recovery.prepared_request.provider.as_str(),
+            recovery.prepared_request.backend.as_str(),
+        );
+        let routing_matches = routing_identity
+            .as_ref()
+            .map(|(provider, backend)| (provider.as_str(), backend.as_str()))
+            == Some(expected_identity);
+        let llm = routing_matches
+            .then(|| {
+                manager
+                    .model_registry()
+                    .get(&recovery.prepared_request.model)
+            })
+            .flatten();
+        let begun = repo
+            .begin_recovered_top_level_llm_attempt(
+                recovery.workflow.workflow_id,
+                recovery.prepared_request.effect_id,
+                super::process_incarnation(),
+                Timestamp(u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(authority) = begun.authority else {
+            continue;
+        };
+        let Some(llm) = llm else {
+            let attempt = u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX);
+            let message = if routing_matches {
+                format!(
+                    "Recovered LLM model '{}' is unavailable",
+                    recovery.prepared_request.model
+                )
+            } else {
+                format!(
+                    "Recovered LLM routing changed for model '{}': stored {}/{}",
+                    recovery.prepared_request.model,
+                    recovery.prepared_request.provider,
+                    recovery.prepared_request.backend
+                )
+            };
+            let failure = durable_failure(
+                message.clone(),
+                phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                attempt,
+                false,
+                None,
+            );
+            repo.record_top_level_llm_failure(&phoenix_db::RecordTopLevelLlmFailureInput {
+                authority,
+                observed_at: Timestamp(
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                ),
+                outcome_payload: serde_json::to_vec(&failure).map_err(|error| error.to_string())?,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            let handle = manager
+                .get_or_create(&recovery.workflow.conversation_id)
+                .await?;
+            if let Err(error) = handle
+                .event_tx
+                .send(phoenix_core::domain::sm_event::Event::LlmError {
+                    message,
+                    error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+                    attempt,
+                    recovery_in_progress: false,
+                    resets_at: None,
+                })
+                .await
+            {
+                tracing::warn!(%error, "unavailable recovered model runtime channel closed");
+            }
+            continue;
+        };
+        let root_conversation_id =
+            super::find_root_conversation_id(manager.db(), &recovery.workflow.conversation_id)
+                .await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
+        let request = durable_request.into_attempt(phoenix_llm::LlmRequestTelemetry {
+            conversation_id: recovery.workflow.conversation_id.clone(),
+            root_conversation_id: root_conversation_id.clone(),
+            request_id: request_id.clone(),
+            retry_attempt: recovery.attempt.ordinal.saturating_add(2),
+            attempt_capture: attempt_capture.clone(),
+        });
+        let completion = llm.complete(&request).await;
+        if let Some(metrics) = attempt_capture.finalized() {
+            if let Err(error) = manager.db().upsert_llm_request_metrics(&metrics).await {
+                tracing::warn!(%error, "failed to write recovered llm_request_metrics row");
+            }
+        } else {
+            tracing::warn!(
+                request_id,
+                "recovered LLM attempt completed without finalized metrics"
+            );
+        }
+        match completion {
+            Ok(response) => {
+                let response_usage = response.usage.clone();
+                let aggregate = serde_json::to_string(&phoenix_llm::DurableLlmResponse {
+                    response: response.clone(),
+                })
+                .map_err(|error| error.to_string())?;
+                let fingerprint = sha2::Sha256::digest(aggregate.as_bytes()).iter().fold(
+                    String::with_capacity(64),
+                    |mut output, byte| {
+                        use std::fmt::Write as _;
+                        write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                        output
+                    },
+                );
+                let tool_intents = response
+                    .tool_uses()
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(ordinal, (id, name, arguments))| phoenix_db::ToolIntentRecord {
+                            intent_ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                            status: phoenix_db::ToolIntentStatus::PendingAcceptance,
+                            tool_name: name.to_string(),
+                            tool_kind: phoenix_db::ToolKindRecord::Function,
+                            tool_use_id: id.to_string(),
+                            arguments_json: arguments.to_string(),
+                        },
+                    )
+                    .collect();
+                let acceptance = phoenix_db::AcceptCompleteLlmResponseInput {
+                    authority,
+                    delivery_id: None,
+                    receipt_id: None,
+                    response: phoenix_workflow::llm_profile::CompleteLlmResponse {
+                        codec_version: phoenix_llm::DURABLE_LLM_RESPONSE_CODEC_VERSION,
+                        response_fingerprint: fingerprint,
+                        response_aggregate: aggregate,
+                    },
+                    provider_request_id: Some(request_id),
+                    tool_intents,
+                    local_delivery_claim: None,
+                };
+                let persistence_outcome = loop {
+                    let outcome = repo
+                        .accept_complete_top_level_llm_response(&acceptance)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if outcome.outcome
+                        != phoenix_db::CompleteLlmResponsePersistenceOutcome::RetryablePersistence
+                    {
+                        break outcome.outcome;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                };
+                if persistence_outcome
+                    == phoenix_db::CompleteLlmResponsePersistenceOutcome::Accepted
+                {
+                    if let Err(error) = manager
+                        .db()
+                        .insert_turn_usage(
+                            &recovery.workflow.conversation_id,
+                            &root_conversation_id,
+                            &recovery.prepared_request.model,
+                            &response_usage,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to record recovered LLM usage");
+                    }
+                }
+            }
+            Err(error) => {
+                let error_kind = super::executor::llm_error_to_db_error(error.kind);
+                let recovery_in_progress = error.recovery_in_progress;
+                let resets_at = error.quota.as_ref().and_then(|quota| quota.resets_at);
+                let message = error.message;
+                let attempt = u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX);
+                let failure = durable_failure(
+                    message.clone(),
+                    error_kind.clone(),
+                    attempt,
+                    recovery_in_progress,
+                    resets_at,
+                );
+                repo.record_top_level_llm_failure(&phoenix_db::RecordTopLevelLlmFailureInput {
+                    authority,
+                    observed_at: Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                    ),
+                    outcome_payload: serde_json::to_vec(&failure)
+                        .map_err(|error| error.to_string())?,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+                let handle = manager
+                    .get_or_create(&recovery.workflow.conversation_id)
+                    .await?;
+                if let Err(send_error) = handle
+                    .event_tx
+                    .send(phoenix_core::domain::sm_event::Event::LlmError {
+                        message,
+                        error_kind,
+                        attempt,
+                        recovery_in_progress,
+                        resets_at,
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %send_error, "recovered LLM error runtime channel closed");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn deliver_pending_direct_turns(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    for pending in repo
+        .claim_recoverable_direct_turns(super::process_incarnation())
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let event = match pending.committed_outcome {
+            phoenix_db::DirectTurnCommittedOutcome::PendingRuntime => {
+                let prepared: phoenix_core::domain::sm_event::PreparedDirectTurn =
+                    match serde_json::from_str(&pending.prepared_payload) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            tracing::error!(
+                                workflow_id = pending.workflow_id.0,
+                                conversation_id = %pending.conversation_id,
+                                error = %error,
+                                "pending direct turn has an unreadable prepared payload"
+                            );
+                            continue;
+                        }
+                    };
+                if prepared.codec_version
+                    != phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION
+                {
+                    tracing::error!(
+                        workflow_id = pending.workflow_id.0,
+                        codec_version = prepared.codec_version,
+                        "pending direct turn uses an unsupported codec version"
+                    );
+                    continue;
+                }
+                prepared.into_event()
+            }
+            phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
+                phoenix_core::domain::sm_event::Event::ResumeDurableLlmRequest
+            }
+            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering
+            | phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => continue,
+        };
+        let handle = match manager.get_or_create(&pending.conversation_id).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::error!(
+                    workflow_id = pending.workflow_id.0,
+                    conversation_id = %pending.conversation_id,
+                    error = %error,
+                    "pending direct turn runtime could not be constructed"
+                );
+                repo.release_direct_turn_runtime_delivery(
+                    &pending.conversation_id,
+                    &pending.client_message_id,
+                    super::process_incarnation(),
+                )
+                .await
+                .map_err(|release_error| release_error.to_string())?;
+                continue;
+            }
+        };
+        let state_accepts_delivery = match pending.committed_outcome {
+            phoenix_db::DirectTurnCommittedOutcome::PendingRuntime => matches!(
+                *handle.state_rx.borrow(),
+                crate::state_machine::ConvState::Idle
+                    | crate::state_machine::ConvState::Error { .. }
+            ),
+            phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => matches!(
+                *handle.state_rx.borrow(),
+                crate::state_machine::ConvState::LlmRequesting { .. }
+            ),
+            phoenix_db::DirectTurnCommittedOutcome::QueuedSteering
+            | phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => false,
+        };
+        if !state_accepts_delivery {
+            repo.release_direct_turn_runtime_delivery(
+                &pending.conversation_id,
+                &pending.client_message_id,
+                super::process_incarnation(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            continue;
+        }
+        if let Err(error) = handle.event_tx.send(event).await {
+            repo.release_direct_turn_runtime_delivery(
+                &pending.conversation_id,
+                &pending.client_message_id,
+                super::process_incarnation(),
+            )
+            .await
+            .map_err(|release_error| release_error.to_string())?;
+            tracing::warn!(
+                workflow_id = pending.workflow_id.0,
+                conversation_id = %pending.conversation_id,
+                error = %error,
+                "recoverable direct turn runtime channel closed"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1319,6 +1835,71 @@ mod tests {
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, ERROR_RETRY_MAX_INTERVAL);
         join.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_redelivers_pending_direct_turn_from_prepared_payload() {
+        let (db, _repo) = open_repo().await;
+        let prepared = phoenix_core::domain::sm_event::PreparedDirectTurn {
+            codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            expand_references: false,
+            text: "recovered".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "message-recovered".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let prepared_payload = serde_json::to_string(&prepared).unwrap();
+        phoenix_db::WorkflowRepository::new(db.pool().clone())
+            .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+                initial_outcome: phoenix_db::DirectTurnInitialOutcome::PendingRuntime,
+                conversation_id: "conv".to_string(),
+                client_message_id: "message-recovered".to_string(),
+                prepared_fingerprint: "fingerprint".to_string(),
+                prepared_payload,
+                accepted_at: Timestamp(1),
+                snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                    turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                        conversation_id: "conv".to_string(),
+                        accepted_turn_id: "message-recovered".to_string(),
+                        generation: 0,
+                    },
+                    accepted_assistant_message_id: None,
+                    stopped_at: None,
+                },
+            })
+            .await
+            .unwrap();
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+
+        deliver_pending_direct_turns(&manager).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !db.message_exists("message-recovered").await.unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let pending_dispatch = phoenix_db::WorkflowRepository::new(db.pool().clone())
+            .load_pending_direct_turns()
+            .await
+            .unwrap();
+        assert!(pending_dispatch.is_empty());
+        assert!(matches!(
+            db.get_conversation("conv").await.unwrap().state,
+            phoenix_core::domain::sm_state::ConvState::LlmRequesting { .. }
+        ));
     }
 
     #[tokio::test]

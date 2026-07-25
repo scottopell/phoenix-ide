@@ -70,6 +70,137 @@ pub trait MessageStore: Send + Sync {
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Message, String>;
 
+    async fn pending_direct_turn(
+        &self,
+        _conversation_id: &str,
+        _message_id: &str,
+    ) -> Result<Option<phoenix_db::PendingDirectTurnRuntimeAdmission>, String> {
+        Ok(None)
+    }
+
+    async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        _input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
+        Ok(phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict)
+    }
+
+    async fn release_direct_turn_runtime_delivery(
+        &self,
+        _conversation_id: &str,
+        _client_message_id: &str,
+        _process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn persist_queued_steering_message(
+        &self,
+        _conversation_id: &str,
+        _client_message_id: &str,
+        _message: &Message,
+    ) -> Result<phoenix_db::PersistQueuedSteeringMessageOutcome, String> {
+        Ok(phoenix_db::PersistQueuedSteeringMessageOutcome::LegacyQueueEntry)
+    }
+
+    async fn consume_queued_steering_batch(
+        &self,
+        _conversation_id: &str,
+        _owner_message_id: &str,
+        _drained_message_ids: &[String],
+    ) -> Result<phoenix_db::QueuedSteeringBatchOwnership, String> {
+        Ok(phoenix_db::QueuedSteeringBatchOwnership::LegacyUnowned)
+    }
+
+    fn requires_durable_top_level_llm(&self) -> bool {
+        false
+    }
+
+    async fn active_top_level_llm_workflow(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_db::TopLevelLlmWorkflowRecord>, String> {
+        Ok(None)
+    }
+
+    async fn prepare_and_begin_top_level_llm_attempt(
+        &self,
+        _input: &phoenix_db::PrepareAndBeginTopLevelLlmInput,
+    ) -> Result<phoenix_db::PreparedTopLevelLlmAttempt, String> {
+        Err("durable top-level LLM attempts are unsupported by this storage".to_string())
+    }
+
+    async fn mark_top_level_llm_tool_execution_may_have_begun(
+        &self,
+        _conversation_id: &str,
+        _tool_use_id: &str,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn mark_top_level_llm_tool_completed(
+        &self,
+        _conversation_id: &str,
+        _tool_use_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn owed_top_level_llm_receipt(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<phoenix_db::OwedTopLevelLlmReceipt>, String> {
+        Ok(None)
+    }
+
+    async fn accept_top_level_llm_product(
+        &self,
+        _input: &phoenix_db::AcceptTopLevelLlmProductInput,
+    ) -> Result<phoenix_db::AcceptTopLevelLlmProductOutcome, String> {
+        Ok(phoenix_db::AcceptTopLevelLlmProductOutcome::StaleAuthority)
+    }
+
+    async fn release_workflow_delivery_claim(
+        &self,
+        _workflow_id: phoenix_workflow::WorkflowId,
+        _delivery_id: phoenix_workflow::DeliveryId,
+        _process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn persist_recovered_failure_state(
+        &self,
+        _conversation_id: &str,
+        _state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+        _authority: &phoenix_core::domain::llm_types::DurableLlmFailureAuthority,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn stop_active_top_level_llm_for_conversation(
+        &self,
+        _conversation_id: &str,
+        _stopped_at: phoenix_workflow::Timestamp,
+    ) -> Result<Option<phoenix_workflow::CommitOutcome>, String> {
+        Ok(None)
+    }
+
+    async fn record_top_level_llm_failure(
+        &self,
+        _input: &phoenix_db::RecordTopLevelLlmFailureInput,
+    ) -> Result<phoenix_workflow::AuthorityOutcome, String> {
+        Err("durable top-level LLM failures are unsupported by this storage".to_string())
+    }
+
+    async fn accept_complete_top_level_llm_response(
+        &self,
+        _input: &phoenix_db::AcceptCompleteLlmResponseInput,
+    ) -> Result<phoenix_db::AcceptCompleteLlmResponseResult, String> {
+        Err("durable top-level LLM receipts are unsupported by this storage".to_string())
+    }
+
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
@@ -77,10 +208,12 @@ pub trait MessageStore: Send + Sync {
     #[allow(dead_code)]
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String>;
 
-    /// Returns true if a message with the given `message_id` already exists.
-    /// Used by `PersistMessage` to make persistence idempotent across crash
-    /// recovery (re-drain after partial steering-queue drain).
-    async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
+    /// Returns true if the message identity exists in the target conversation.
+    async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String>;
 
     /// Complete an async creation job using the authority that enqueued the initial turn.
     async fn complete_creation_job(
@@ -205,12 +338,6 @@ pub trait StateStore: Send + Sync {
 
     /// Update the steering queue for a conversation. Persists the FIFO queue
     /// of pending steering messages to the DB.
-    async fn update_steering_queue(
-        &self,
-        conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String>;
-
     /// Remove specific drained entries from the persisted steering queue,
     /// preserving any concurrently-enqueued entries. Implementations must be
     /// atomic re: `enqueue_steer_message`'s read-modify-write to avoid losing
@@ -243,6 +370,14 @@ pub trait LlmClient: Send + Sync {
     /// Get the model ID
     #[allow(dead_code)] // API completeness
     fn model_id(&self) -> &str;
+
+    fn durable_provider(&self) -> String {
+        "custom".to_string()
+    }
+
+    fn durable_backend(&self) -> String {
+        "direct".to_string()
+    }
 
     /// Typed provider/route limits for continuation-summary requests.
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
@@ -299,6 +434,62 @@ impl<T: MessageStore + StateStore> Storage for T {}
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn persist_recovered_failure_state(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        authority: &phoenix_core::domain::llm_types::DurableLlmFailureAuthority,
+    ) -> Result<(), String> {
+        (**self)
+            .persist_recovered_failure_state(conversation_id, state, state_updated_at, authority)
+            .await
+    }
+
+    async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
+        (**self).persist_direct_turn_runtime_acceptance(input).await
+    }
+
+    async fn release_direct_turn_runtime_delivery(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        (**self)
+            .release_direct_turn_runtime_delivery(
+                conversation_id,
+                client_message_id,
+                process_incarnation,
+            )
+            .await
+    }
+
+    async fn consume_queued_steering_batch(
+        &self,
+        conversation_id: &str,
+        owner_message_id: &str,
+        drained_message_ids: &[String],
+    ) -> Result<phoenix_db::QueuedSteeringBatchOwnership, String> {
+        (**self)
+            .consume_queued_steering_batch(conversation_id, owner_message_id, drained_message_ids)
+            .await
+    }
+
+    async fn persist_queued_steering_message(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        message: &Message,
+    ) -> Result<phoenix_db::PersistQueuedSteeringMessageOutcome, String> {
+        (**self)
+            .persist_queued_steering_message(conversation_id, client_message_id, message)
+            .await
+    }
+
     async fn add_message(
         &self,
         message_id: &str,
@@ -365,8 +556,24 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).get_message_by_id(message_id).await
     }
 
-    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
-        (**self).message_exists(message_id).await
+    async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String> {
+        (**self)
+            .message_exists_in_conversation(conversation_id, message_id)
+            .await
+    }
+
+    async fn stop_active_top_level_llm_for_conversation(
+        &self,
+        conversation_id: &str,
+        stopped_at: phoenix_workflow::Timestamp,
+    ) -> Result<Option<phoenix_workflow::CommitOutcome>, String> {
+        (**self)
+            .stop_active_top_level_llm_for_conversation(conversation_id, stopped_at)
+            .await
     }
 
     async fn complete_creation_job(
@@ -499,14 +706,6 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).upsert_llm_request_metrics(metrics).await
     }
 
-    async fn update_steering_queue(
-        &self,
-        conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String> {
-        (**self).update_steering_queue(conv_id, queue).await
-    }
-
     async fn remove_steering_entries(
         &self,
         conv_id: &str,
@@ -532,6 +731,14 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
     fn model_id(&self) -> &str {
         (**self).model_id()
+    }
+
+    fn durable_provider(&self) -> String {
+        (**self).durable_provider()
+    }
+
+    fn durable_backend(&self) -> String {
+        (**self).durable_backend()
     }
 
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
@@ -629,6 +836,263 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn consume_queued_steering_batch(
+        &self,
+        conversation_id: &str,
+        owner_message_id: &str,
+        drained_message_ids: &[String],
+    ) -> Result<phoenix_db::QueuedSteeringBatchOwnership, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .consume_queued_steering_batch(conversation_id, owner_message_id, drained_message_ids)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn requires_durable_top_level_llm(&self) -> bool {
+        true
+    }
+
+    async fn active_top_level_llm_workflow(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_db::TopLevelLlmWorkflowRecord>, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .load_active_top_level_llm_workflow(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn prepare_and_begin_top_level_llm_attempt(
+        &self,
+        input: &phoenix_db::PrepareAndBeginTopLevelLlmInput,
+    ) -> Result<phoenix_db::PreparedTopLevelLlmAttempt, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .prepare_and_begin_top_level_llm_attempt(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn mark_top_level_llm_tool_execution_may_have_begun(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> Result<bool, String> {
+        let repo = phoenix_db::WorkflowRepository::new(self.db.pool().clone());
+        let Some((workflow_id, receipt_id, intent, generation)) = repo
+            .load_owed_top_level_llm_tool_intent(conversation_id, tool_use_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(repo
+                .load_active_top_level_llm_workflow(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none());
+        };
+        match repo
+            .transition_top_level_llm_tool_intent(&phoenix_db::ToolIntentTransitionInput {
+                workflow_id,
+                receipt_id,
+                intent_ordinal: intent.intent_ordinal,
+                generation,
+                from: phoenix_db::ToolIntentStatus::Owed,
+                to: phoenix_db::ToolIntentStatus::ExecutionMayHaveBegun,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            phoenix_db::ToolIntentTransitionOutcome::Committed
+            | phoenix_db::ToolIntentTransitionOutcome::ExactReplay => Ok(true),
+            phoenix_db::ToolIntentTransitionOutcome::Conflict => Ok(false),
+            phoenix_db::ToolIntentTransitionOutcome::RetryablePersistence => {
+                Err("tool execution authority persistence is temporarily busy".to_string())
+            }
+        }
+    }
+
+    async fn mark_top_level_llm_tool_completed(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+    ) -> Result<(), String> {
+        let repo = phoenix_db::WorkflowRepository::new(self.db.pool().clone());
+        let Some((workflow_id, receipt_id, intent, generation)) = repo
+            .load_top_level_llm_tool_intent(
+                conversation_id,
+                tool_use_id,
+                phoenix_db::ToolIntentStatus::ExecutionMayHaveBegun,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        match repo
+            .transition_top_level_llm_tool_intent(&phoenix_db::ToolIntentTransitionInput {
+                workflow_id,
+                receipt_id,
+                intent_ordinal: intent.intent_ordinal,
+                generation,
+                from: phoenix_db::ToolIntentStatus::ExecutionMayHaveBegun,
+                to: phoenix_db::ToolIntentStatus::Completed,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            phoenix_db::ToolIntentTransitionOutcome::Committed
+            | phoenix_db::ToolIntentTransitionOutcome::ExactReplay => Ok(()),
+            phoenix_db::ToolIntentTransitionOutcome::Conflict => {
+                Err("durable tool completion lost authority".to_string())
+            }
+            phoenix_db::ToolIntentTransitionOutcome::RetryablePersistence => {
+                Err("durable tool completion persistence is temporarily busy".to_string())
+            }
+        }
+    }
+
+    async fn owed_top_level_llm_receipt(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_db::OwedTopLevelLlmReceipt>, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .load_owed_top_level_llm_receipt_for_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn accept_top_level_llm_product(
+        &self,
+        input: &phoenix_db::AcceptTopLevelLlmProductInput,
+    ) -> Result<phoenix_db::AcceptTopLevelLlmProductOutcome, String> {
+        self.db
+            .accept_top_level_llm_product(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn release_workflow_delivery_claim(
+        &self,
+        workflow_id: phoenix_workflow::WorkflowId,
+        delivery_id: phoenix_workflow::DeliveryId,
+        process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .release_workflow_delivery_claim(workflow_id, delivery_id, process_incarnation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_recovered_failure_state(
+        &self,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+        authority: &phoenix_core::domain::llm_types::DurableLlmFailureAuthority,
+    ) -> Result<(), String> {
+        self.db
+            .persist_recovered_failure_state(
+                conversation_id,
+                state,
+                state_updated_at,
+                &phoenix_db::LocalAttemptAuthority {
+                    workflow_id: phoenix_workflow::WorkflowId(authority.workflow_id),
+                    effect_id: phoenix_workflow::EffectId(authority.effect_id),
+                    attempt_id: phoenix_workflow::AttemptId(authority.attempt_id),
+                    declared_workflow_version: phoenix_workflow::Version(
+                        authority.declared_workflow_version,
+                    ),
+                    generation: phoenix_workflow::Generation(authority.generation),
+                    process_incarnation: phoenix_workflow::ProcessIncarnation(
+                        authority.process_incarnation,
+                    ),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .then_some(())
+            .ok_or_else(|| "recorded LLM failure persistence lost authority".to_string())
+    }
+
+    async fn stop_active_top_level_llm_for_conversation(
+        &self,
+        conversation_id: &str,
+        stopped_at: phoenix_workflow::Timestamp,
+    ) -> Result<Option<phoenix_workflow::CommitOutcome>, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .stop_active_top_level_llm_for_conversation(conversation_id, stopped_at)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn record_top_level_llm_failure(
+        &self,
+        input: &phoenix_db::RecordTopLevelLlmFailureInput,
+    ) -> Result<phoenix_workflow::AuthorityOutcome, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .record_top_level_llm_failure(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn accept_complete_top_level_llm_response(
+        &self,
+        input: &phoenix_db::AcceptCompleteLlmResponseInput,
+    ) -> Result<phoenix_db::AcceptCompleteLlmResponseResult, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .accept_complete_top_level_llm_response(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn pending_direct_turn(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<phoenix_db::PendingDirectTurnRuntimeAdmission>, String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .load_pending_direct_turn_runtime_admission(conversation_id, message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_direct_turn_runtime_acceptance(
+        &self,
+        input: &phoenix_db::PersistDirectTurnRuntimeAcceptanceInput,
+    ) -> Result<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome, String> {
+        self.db
+            .persist_direct_turn_runtime_acceptance(input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn release_direct_turn_runtime_delivery(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        process_incarnation: phoenix_workflow::ProcessIncarnation,
+    ) -> Result<(), String> {
+        phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+            .release_direct_turn_runtime_delivery(
+                conversation_id,
+                client_message_id,
+                process_incarnation,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn persist_queued_steering_message(
+        &self,
+        conversation_id: &str,
+        client_message_id: &str,
+        message: &Message,
+    ) -> Result<phoenix_db::PersistQueuedSteeringMessageOutcome, String> {
+        self.db
+            .persist_queued_steering_message(conversation_id, client_message_id, message)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn add_message_with_seq_at(
         &self,
@@ -668,9 +1132,13 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
+    async fn message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool, String> {
         self.db
-            .message_exists(message_id)
+            .message_exists_in_conversation(conversation_id, message_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -840,17 +1308,6 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn update_steering_queue(
-        &self,
-        conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String> {
-        self.db
-            .update_steering_queue(conv_id, queue)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
     async fn remove_steering_entries(
         &self,
         conv_id: &str,
@@ -903,6 +1360,18 @@ impl LlmClient for RegistryLlmClient {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn durable_provider(&self) -> String {
+        self.registry
+            .model_routing_identity(&self.model_id)
+            .map_or_else(|| "Unknown".to_string(), |(provider, _)| provider)
+    }
+
+    fn durable_backend(&self) -> String {
+        self.registry
+            .model_routing_identity(&self.model_id)
+            .map_or_else(|| "unavailable".to_string(), |(_, backend)| backend)
     }
 
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {

@@ -968,6 +968,9 @@ fn handle_core_tool_complete(
                 assistant_message: assistant_message.clone(),
             })
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::CompleteDurableToolIntent {
+                tool_use_id: tool_use_id.clone(),
+            })
             .with_effect(Effect::notify_state_change())
             .with_effect(Effect::execute_tool(next_tool)))
         }
@@ -990,6 +993,9 @@ fn handle_core_tool_complete(
                 CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
+                    .with_effect(Effect::CompleteDurableToolIntent {
+                        tool_use_id: tool_use_id.clone(),
+                    })
                     .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm),
             )
@@ -1018,6 +1024,9 @@ fn handle_core_tool_complete(
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::CompleteDurableToolIntent {
+                tool_use_id: tool_use_id.clone(),
+            })
             .with_effect(Effect::notify_state_change()))
         }
 
@@ -1044,6 +1053,9 @@ fn handle_core_tool_complete(
                 assistant_message: assistant_message.clone(),
             })
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::CompleteDurableToolIntent {
+                tool_use_id: tool_use_id.clone(),
+            })
             .with_effect(Effect::notify_state_change())
             .with_effect(Effect::execute_tool(next_tool)))
         }
@@ -1071,6 +1083,9 @@ fn handle_core_tool_complete(
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::CompleteDurableToolIntent {
+                tool_use_id: tool_use_id.clone(),
+            })
             .with_effect(Effect::notify_state_change()))
         }
 
@@ -1548,6 +1563,7 @@ fn handle_core_error_retry(
                 resets_at,
             })
             .with_effect(Effect::PersistState)
+            .with_effect(Effect::AbortLlm)
             .with_effect(Effect::notify_state_change()))
         }
 
@@ -3328,7 +3344,8 @@ pub fn handle_outcome(
 
 /// Convert `LlmOutcome` to the equivalent `Event` for delegation to `transition()`.
 #[allow(clippy::too_many_lines)] // Pure-data dispatch over a wide LlmOutcome enum
-fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
+#[must_use]
+pub fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
     match outcome {
         LlmOutcome::Response {
             content,
@@ -6662,6 +6679,7 @@ mod tests {
                 Effect::ExecuteTool { tool } => Some(tool),
                 Effect::PersistMessage { .. }
                 | Effect::PersistState
+                | Effect::CompleteDurableToolIntent { .. }
                 | Effect::RequestLlm
                 | Effect::CompleteCreation { .. }
                 | Effect::BroadcastAssistantMessage { .. }

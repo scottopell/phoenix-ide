@@ -1,0 +1,426 @@
+-- allium: 3
+-- Durable top-level conversation LLM effects.
+--
+-- Scope: every provider call in a non-sub-agent conversation turn, including
+-- initial response, tool-result continuation, restart continuation, planning,
+-- and final response. Internal/helper LLM consumers require other profiles.
+--
+-- Requirement traceability: REQ-DWF-LLM-001 through REQ-DWF-LLM-010.
+
+use "./durable-workflows.allium" as dwf
+
+------------------------------------------------------------
+-- Types
+------------------------------------------------------------
+
+enum LlmEffectStatus { prepared | attempting | receipted | accepted | cancelled }
+enum LlmAttemptStatus { begun | response_ready | receipt_committed | outcome_unknown | fenced }
+enum ToolIntentStatus { pending_acceptance | owed | execution_may_have_begun | completed | interrupted | suppressed }
+enum StreamStatus { active | superseded | completed | fenced }
+enum LlmConsumerKind { top_level_conversation }
+
+value TopLevelTurnRef {
+    conversation_id: String
+    accepted_turn_id: String
+    generation: Integer
+}
+
+value LlmEffectKey {
+    accepted_turn_id: String
+    generation: Integer
+    call_ordinal: Integer
+}
+
+value PreparedLlmRequest {
+    codec_version: Integer
+    request_fingerprint: String
+    provider: String
+    model: String
+    backend: String
+    request_aggregate: String
+}
+
+value CompleteLlmResponse {
+    codec_version: Integer
+    response_fingerprint: String
+    response_aggregate: String
+}
+
+------------------------------------------------------------
+-- Actors and profile-owned entities
+------------------------------------------------------------
+
+actor TopLevelConversationRuntime {}
+actor LlmEffectScheduler {}
+actor ProviderAdapter {}
+actor ToolDispatcher {}
+
+entity TopLevelLlmTurn {
+    turn_ref: TopLevelTurnRef
+    next_call_ordinal: Integer
+    stopped_at: Timestamp?
+}
+
+entity TopLevelLlmEffect {
+    key: LlmEffectKey
+    turn: TopLevelLlmTurn
+    workflow: dwf/Workflow
+    engine_effect: dwf/Effect
+    prepared_request: PreparedLlmRequest
+    status: LlmEffectStatus
+    accepted_assistant_message_id: String?
+
+    transitions status {
+        prepared -> attempting
+        prepared -> cancelled
+        attempting -> receipted
+        attempting -> cancelled
+        receipted -> accepted
+        receipted -> cancelled
+        terminal: accepted, cancelled
+    }
+}
+
+entity LlmProviderAttempt {
+    effect: TopLevelLlmEffect
+    engine_attempt: dwf/Attempt
+    attempt_ordinal: Integer
+    process_incarnation: String
+    status: LlmAttemptStatus
+
+    transitions status {
+        begun -> response_ready
+        begun -> outcome_unknown
+        begun -> fenced
+        response_ready -> receipt_committed
+        response_ready -> fenced
+        outcome_unknown -> fenced
+        terminal: receipt_committed, fenced
+    }
+}
+
+entity LlmResponseReceipt {
+    effect: TopLevelLlmEffect
+    engine_receipt: dwf/Receipt
+    canonical_delivery: dwf/DeliveryItem
+    response: CompleteLlmResponse
+    generation: Integer
+}
+
+entity LlmToolIntent {
+    effect: TopLevelLlmEffect
+    ordinal: Integer
+    tool_call_id: String
+    tool_name: String
+    immutable_input: String
+    status: ToolIntentStatus
+
+    transitions status {
+        pending_acceptance -> owed
+        pending_acceptance -> suppressed
+        owed -> execution_may_have_begun
+        owed -> suppressed
+        execution_may_have_begun -> completed
+        execution_may_have_begun -> interrupted
+        terminal: completed, interrupted, suppressed
+    }
+}
+
+entity LlmPartialStream {
+    effect: TopLevelLlmEffect
+    attempt: LlmProviderAttempt
+    status: StreamStatus
+
+    transitions status {
+        active -> superseded
+        active -> completed
+        active -> fenced
+        terminal: superseded, completed, fenced
+    }
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- top_level_llm_profile_ref(), supported_provider(provider), covered_top_level_call(request)
+-- internal_or_subagent_call(request), turn_ref_for(request), effect_key_for(turn, call_ordinal)
+-- next_call_ordinal(turn), prepared_request_for(request), immutable_after_prepare(prepared_request)
+-- safely_repeatable_effect_for(key, prepared_request), engine_attempt_for(effect)
+-- attempt_ordinal_for(effect), provider_dispatch_uses_exact_request(attempt, prepared_request)
+-- authoritative_attempt(attempt), complete_response_for(provider_result), same_complete_response(left, right)
+-- receipt_for(effect), canonical_delivery_for(receipt), receipt_and_delivery_committed_atomically(receipt)
+-- retry_same_response_persistence(attempt, response), no_additional_provider_dispatch(effect)
+-- process_loss_without_receipt(effect), replacement_attempt_for(effect), known_provider_error(result)
+-- existing_provider_retry_policy_applies(result), product_acceptance_for(receipt)
+-- reducer_accepts_response(receipt), assistant_message_for(receipt), next_conversation_state_for(receipt)
+-- normalized_tool_intents_for(receipt), tool_intents_are_addressable(intents)
+-- acceptance_transaction_commits_atomically(receipt, intents), broadcast_after_commit(receipt)
+-- dispatch_after_commit(intent), execution_may_have_begun(intent), interrupted_tool_materialized(intent)
+-- restart_continuation_inspects_interrupted_tool(intent), partial_stream_for(attempt)
+-- stream_is_ephemeral(stream), supersede_abandoned_stream(stream), no_cross_attempt_fragment_join(effect)
+-- accepted_transcript_excludes_partial_streams(effect), stop_generation_for(turn)
+-- stop_commits_before_response_acceptance(turn, receipt), response_acceptance_commits_before_stop(turn, receipt)
+-- late_response_evidence_only(receipt), no_tool_authority(receipt), restart_does_not_resurrect(turn)
+-- legacy_in_flight_llm(request), restart_continuation_for(request), no_inferred_legacy_history(request)
+-- all_new_covered_calls_use_profile(), common_provider_contract_suite()
+-- sqlite_contention_case(), crash_before_receipt_case(), crash_after_receipt_case()
+-- crash_before_tool_dispatch_case(), interrupted_tool_case(), stop_race_cases(), stream_replacement_case()
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant EffectIdentityIsStableWithinTurn {
+    -- One accepted turn generation and call ordinal identify at most one LLM
+    -- effect and one immutable prepared request across attempts and restart.
+    true
+}
+
+invariant TerminalReceiptPreventsProviderReplay {
+    -- A terminal response receipt is unique for its effect, is reused for every
+    -- later product-acceptance attempt, and prohibits another provider dispatch.
+    true
+}
+
+invariant ProductAcceptanceIsAtomicAndSingle {
+    -- At most one response becomes product-authoritative for an effect, and its
+    -- assistant message, next state, delivery disposition, and normalized tool
+    -- intents share one transaction boundary.
+    true
+}
+
+invariant PartialStreamsAreNotTranscriptAuthority {
+    -- Attempt-correlated partial output is ephemeral and cannot become accepted
+    -- transcript content or be joined to output from a replacement attempt.
+    true
+}
+
+invariant StopWinsAfterItsDurableCommit {
+    -- A response from an older generation cannot regain transcript or tool
+    -- authority after Stop durably advances the turn generation.
+    true
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule PrepareCoveredCallBeforeProviderDispatch {
+    when: TopLevelLlmCallRequested(runtime, request)
+    requires: covered_top_level_call(request)
+    requires: not internal_or_subagent_call(request)
+    requires: supported_provider(request.provider)
+
+    let turn_ref = turn_ref_for(request)
+    let turn = TopLevelLlmTurn(turn_ref)
+    let call_ordinal = next_call_ordinal(turn)
+    let key = effect_key_for(turn, call_ordinal)
+    let prepared_request = prepared_request_for(request)
+    let engine_effect = safely_repeatable_effect_for(key, prepared_request)
+
+    ensures: immutable_after_prepare(prepared_request)
+    ensures: TopLevelLlmEffect.created(
+        key: key,
+        turn: turn,
+        workflow: engine_effect.workflow,
+        engine_effect: engine_effect,
+        prepared_request: prepared_request,
+        status: prepared,
+        accepted_assistant_message_id: null
+    )
+}
+
+rule AttemptExistsBeforeExactRequestDispatch {
+    when: LlmEffectScheduled(scheduler, effect)
+    requires: effect.status = prepared
+    requires: receipt_for(effect) = null
+
+    let engine_attempt = engine_attempt_for(effect)
+    let attempt = LlmProviderAttempt.created(
+        effect: effect,
+        engine_attempt: engine_attempt,
+        attempt_ordinal: attempt_ordinal_for(effect),
+        process_incarnation: engine_attempt.authority.process_incarnation,
+        status: begun
+    )
+
+    ensures: effect.status = attempting
+    ensures: provider_dispatch_uses_exact_request(attempt, effect.prepared_request)
+}
+
+rule UnknownAttemptOutcomeIsAutomaticallyResubmitted {
+    when: LlmSchedulerRecovered(scheduler, effect)
+    requires: process_loss_without_receipt(effect)
+    requires: receipt_for(effect) = null
+
+    ensures: replacement_attempt_for(effect)
+}
+
+rule KnownProviderErrorsKeepDeclaredRetryPolicy {
+    when: ProviderResultArrived(attempt, result)
+    requires: known_provider_error(result)
+
+    ensures: existing_provider_retry_policy_applies(result)
+}
+
+rule CompleteResponseBecomesReceiptBeforeDelivery {
+    when: ProviderResultArrived(attempt, result)
+    requires: authoritative_attempt(attempt)
+    requires: not known_provider_error(result)
+    requires: receipt_for(attempt.effect) = null
+
+    let response = complete_response_for(result)
+    let receipt = receipt_for(attempt.effect)
+
+    ensures: attempt.status = response_ready
+    ensures: receipt.response = response
+    ensures: receipt.generation = attempt.effect.key.generation
+    ensures: receipt_and_delivery_committed_atomically(receipt)
+    ensures: attempt.status = receipt_committed
+    ensures: attempt.effect.status = receipted
+}
+
+rule TemporaryReceiptPersistenceFailureRetriesSameResponse {
+    when: ResponseReceiptPersistenceFailed(attempt, response)
+    requires: authoritative_attempt(attempt)
+    requires: attempt.status = response_ready
+    requires: receipt_for(attempt.effect) = null
+
+    ensures: retry_same_response_persistence(attempt, response)
+    ensures: no_additional_provider_dispatch(attempt.effect)
+}
+
+rule ExistingReceiptIsReusedWithoutProviderDispatch {
+    when: LlmSchedulerRecovered(scheduler, effect)
+    requires: receipt_for(effect) != null
+    requires: effect.status = receipted
+
+    ensures: product_acceptance_for(receipt_for(effect))
+    ensures: no_additional_provider_dispatch(effect)
+}
+
+rule ProductAcceptanceCommitsResponseStateAndToolIntentsAtomically {
+    when: LlmResponseDeliveryOffered(runtime, receipt)
+    requires: receipt.effect.status = receipted
+    requires: receipt.generation = receipt.effect.turn.turn_ref.generation
+    requires: receipt.effect.turn.stopped_at = null
+    requires: reducer_accepts_response(receipt)
+
+    let intents = normalized_tool_intents_for(receipt)
+
+    ensures: assistant_message_for(receipt)
+    ensures: next_conversation_state_for(receipt)
+    ensures: tool_intents_are_addressable(intents)
+    ensures: acceptance_transaction_commits_atomically(receipt, intents)
+    ensures: receipt.effect.status = accepted
+    ensures: broadcast_after_commit(receipt)
+}
+
+rule ToolDispatchRequiresCommittedIntent {
+    when: DurableToolIntentOffered(dispatcher, intent)
+    requires: intent.status = owed
+    requires: intent.effect.status = accepted
+
+    ensures: intent.status = execution_may_have_begun
+    ensures: dispatch_after_commit(intent)
+}
+
+rule PossiblyStartedToolUsesInterruptedRecovery {
+    when: RuntimeRecoveredAfterToolInterruption(runtime, intent)
+    requires: intent.status = execution_may_have_begun
+
+    ensures: intent.status = interrupted
+    ensures: interrupted_tool_materialized(intent)
+    ensures: restart_continuation_inspects_interrupted_tool(intent)
+}
+
+rule PartialStreamingIsAttemptCorrelatedAndEphemeral {
+    when: ProviderPartialArrived(attempt, partial)
+    requires: authoritative_attempt(attempt)
+    requires: attempt.status = begun
+
+    let stream = partial_stream_for(attempt)
+
+    ensures: stream.attempt = attempt
+    ensures: stream_is_ephemeral(stream)
+    ensures: accepted_transcript_excludes_partial_streams(attempt.effect)
+}
+
+rule ReplacementAttemptSupersedesAbandonedStream {
+    when: ReplacementAttemptStarted(replacement_attempt, abandoned_attempt)
+    requires: replacement_attempt.effect = abandoned_attempt.effect
+    requires: partial_stream_for(abandoned_attempt).status = active
+
+    ensures: supersede_abandoned_stream(partial_stream_for(abandoned_attempt))
+    ensures: no_cross_attempt_fragment_join(replacement_attempt.effect)
+}
+
+rule StopDurablyFencesTheTurnGeneration {
+    when: StopAccepted(runtime, turn)
+    requires: turn.stopped_at = null
+
+    ensures: turn.turn_ref.generation = stop_generation_for(turn)
+    ensures: turn.stopped_at = now()
+}
+
+rule LateResponseAfterStopIsEvidenceOnly {
+    when: LlmResponseDeliveryOffered(runtime, receipt)
+    requires: stop_commits_before_response_acceptance(receipt.effect.turn, receipt)
+
+    ensures: late_response_evidence_only(receipt)
+    ensures: receipt.effect.status = cancelled
+    ensures: no_tool_authority(receipt)
+    ensures: restart_does_not_resurrect(receipt.effect.turn)
+}
+
+rule ResponseAcceptedBeforeStopRemainsAuthoritative {
+    when: StopAccepted(runtime, turn)
+    requires: response_acceptance_commits_before_stop(turn, receipt_for(turn))
+
+    ensures: receipt_for(turn).effect.status = accepted
+}
+
+rule LegacyWorkUsesRestartContinuationWithoutInferredHistory {
+    when: RuntimeStartedAfterProfileCutover(runtime, request)
+    requires: legacy_in_flight_llm(request)
+
+    ensures: no_inferred_legacy_history(request)
+    ensures: restart_continuation_for(request)
+    ensures: all_new_covered_calls_use_profile()
+}
+
+------------------------------------------------------------
+-- Verification surfaces
+------------------------------------------------------------
+
+surface TopLevelLlmRecoveryVerification {
+    facing effect: TopLevelLlmEffect
+    facing receipt: LlmResponseReceipt
+    facing tool_intent: LlmToolIntent
+    facing partial_stream: LlmPartialStream
+
+    demonstrates:
+        sqlite_contention_case()
+        crash_before_receipt_case()
+        crash_after_receipt_case()
+        crash_before_tool_dispatch_case()
+        interrupted_tool_case()
+        stop_race_cases()
+        stream_replacement_case()
+
+    @guarantee DurableCompletionBoundary
+        -- Verification proves that receipt persistence precedes product meaning,
+        -- receipt reuse prevents provider replay, and unknown attempts may retry.
+}
+
+surface TopLevelLlmProviderParity {
+    facing consumer: LlmConsumerKind
+
+    demonstrates:
+        common_provider_contract_suite()
+
+    @guarantee UniformCoveredPath
+        -- Every configured provider uses the same effect, attempt, receipt,
+        -- acceptance, cancellation, and recovery contract for covered calls.
+}

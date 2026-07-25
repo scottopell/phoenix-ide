@@ -21,8 +21,9 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
-    CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
+    AcceptedMessageAcceptanceDisposition, AcceptedMessageMaterialization,
+    AcceptedMessageReconciliation, AttachmentUploadResponse, CancelResponse, ChatDisposition,
+    ChatRequest, ChatRequestResult, ChatResponse, CodeSearchEntry, CodeSearchQuery,
     CodeSearchResponse, ConflictErrorResponse, ContinueConversationRequest,
     ContinueConversationResponse, ContinueConversationStatus, ConversationListResponse,
     ConversationMessageRangeResponse, ConversationMessageSliceResponse,
@@ -2756,35 +2757,73 @@ async fn reconcile_accepted_messages(
         .get_conversation(&id)
         .await
         .map_err(|_| AppError::NotFound("Conversation not found".into()))?;
-    let steering_queue = state
-        .db
-        .get_steering_queue(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let queued_ids: std::collections::HashSet<&str> = steering_queue
-        .iter()
-        .map(|entry| entry.message_id.as_str())
-        .collect();
+    let workflow_repo = phoenix_db::WorkflowRepository::new(state.db.pool().clone());
 
     let mut entries = Vec::with_capacity(req.message_ids.len());
     for message_id in req.message_ids {
-        let disposition = match state.db.get_message_by_id(&message_id).await {
-            Ok(message) if message.conversation_id == id => AcceptedMessageDisposition::Persisted {
-                message: Box::new(super::wire::EnrichedMessage::from(&message)),
+        let acceptance = workflow_repo
+            .load_direct_turn_acceptance(&id, &message_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .map(|record| match record.committed_outcome {
+                phoenix_db::DirectTurnCommittedOutcome::PendingRuntime => {
+                    AcceptedMessageAcceptanceDisposition::PendingRuntime
+                }
+                phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
+                    AcceptedMessageAcceptanceDisposition::RuntimeAccepted
+                }
+                phoenix_db::DirectTurnCommittedOutcome::QueuedSteering => {
+                    AcceptedMessageAcceptanceDisposition::QueuedSteering
+                }
+                phoenix_db::DirectTurnCommittedOutcome::CancelledSteering => {
+                    AcceptedMessageAcceptanceDisposition::CancelledSteering
+                }
+            });
+        let acceptance = if acceptance.is_none()
+            && state
+                .db
+                .get_steering_queue(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .iter()
+                .any(|entry| entry.message_id == message_id)
+        {
+            Some(AcceptedMessageAcceptanceDisposition::QueuedSteering)
+        } else {
+            acceptance
+        };
+        let persisted_id = workflow_repo
+            .load_direct_turn_materialized_message_id(&id, &message_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        let materialization = match persisted_id {
+            Some(persisted_id) => match state.db.get_message_by_id(&persisted_id).await {
+                Ok(message) if message.conversation_id == id => {
+                    AcceptedMessageMaterialization::Persisted {
+                        message: Box::new(super::wire::EnrichedMessage::from(&message)),
+                    }
+                }
+                Ok(_) | Err(crate::db::DbError::MessageNotFound(_)) => {
+                    AcceptedMessageMaterialization::NotPersisted
+                }
+                Err(error) => return Err(AppError::Internal(error.to_string())),
             },
-            Err(crate::db::DbError::MessageNotFound(_))
-                if queued_ids.contains(message_id.as_str()) =>
-            {
-                AcceptedMessageDisposition::SteeringQueued
-            }
-            Ok(_) | Err(crate::db::DbError::MessageNotFound(_)) => {
-                AcceptedMessageDisposition::Absent
-            }
-            Err(error) => return Err(AppError::Internal(error.to_string())),
+            None => match state.db.get_message_by_id(&message_id).await {
+                Ok(message) if message.conversation_id == id => {
+                    AcceptedMessageMaterialization::Persisted {
+                        message: Box::new(super::wire::EnrichedMessage::from(&message)),
+                    }
+                }
+                Ok(_) | Err(crate::db::DbError::MessageNotFound(_)) => {
+                    AcceptedMessageMaterialization::NotPersisted
+                }
+                Err(error) => return Err(AppError::Internal(error.to_string())),
+            },
         };
         entries.push(AcceptedMessageReconciliation {
             message_id,
-            disposition,
+            acceptance,
+            materialization,
         });
     }
 
@@ -3483,7 +3522,7 @@ async fn send_chat(
         .send(crate::send_chat_service::SendChatRequest {
             conversation_id: id,
             text: req.text,
-            message_id: req.message_id,
+            message_id: req.message_id.clone(),
             images: req.images,
             files: req.files,
             user_agent: req.user_agent,
@@ -3519,20 +3558,34 @@ async fn send_chat(
         })?;
 
     Ok(Json(match outcome {
-        crate::send_chat_service::SendChatOutcome::Delivered => ChatResponse {
-            queued: true,
-            steering: false,
-            already_persisted: false,
-        },
-        crate::send_chat_service::SendChatOutcome::AlreadyPersisted => ChatResponse {
-            queued: true,
-            steering: false,
-            already_persisted: true,
-        },
-        crate::send_chat_service::SendChatOutcome::QueuedAsSteering => ChatResponse {
-            queued: true,
-            steering: true,
-            already_persisted: false,
+        crate::send_chat_service::SendChatOutcome::Accepted {
+            message_id,
+            request_result,
+            disposition,
+        } => ChatResponse {
+            message_id,
+            request_result: match request_result {
+                crate::send_chat_service::SendChatRequestResult::Created => {
+                    ChatRequestResult::Created
+                }
+                crate::send_chat_service::SendChatRequestResult::Replayed => {
+                    ChatRequestResult::Replayed
+                }
+            },
+            disposition: match disposition {
+                crate::send_chat_service::SendChatDisposition::PendingRuntime => {
+                    ChatDisposition::PendingRuntime
+                }
+                crate::send_chat_service::SendChatDisposition::RuntimeAccepted => {
+                    ChatDisposition::RuntimeAccepted
+                }
+                crate::send_chat_service::SendChatDisposition::QueuedSteering => {
+                    ChatDisposition::QueuedSteering
+                }
+                crate::send_chat_service::SendChatDisposition::CancelledSteering => {
+                    ChatDisposition::CancelledSteering
+                }
+            },
         },
         crate::send_chat_service::SendChatOutcome::Rejected { message, code } => {
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -3636,6 +3689,41 @@ async fn cancel_wake(
     Ok(axum::Json(SuccessResponse { success: true }))
 }
 
+async fn stop_idle_durable_turn(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<Option<Json<CancelResponse>>, AppError> {
+    let repo = phoenix_db::WorkflowRepository::new(state.runtime.db().pool().clone());
+    match repo
+        .stop_active_top_level_llm_for_conversation(
+            conversation_id,
+            phoenix_workflow::Timestamp(
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+            ),
+        )
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        Some(phoenix_workflow::CommitOutcome::Committed) => Ok(Some(Json(CancelResponse {
+            ok: true,
+            no_op: false,
+        }))),
+        Some(phoenix_workflow::CommitOutcome::VersionConflict) => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation changed while cancellation was committing".to_string(),
+                "cancel_conflict",
+            ))))
+        }
+        Some(
+            phoenix_workflow::CommitOutcome::InvalidPlan
+            | phoenix_workflow::CommitOutcome::UnsupportedCodec,
+        ) => Err(AppError::Internal(
+            "Durable cancellation transition was rejected".to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3685,6 +3773,12 @@ async fn cancel_conversation(
             ok: true,
             no_op: false,
         }));
+    }
+
+    if matches!(conversation.state, ConvState::Idle) {
+        if let Some(response) = stop_idle_durable_turn(&state, &id).await? {
+            return Ok(response);
+        }
     }
 
     if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
@@ -3818,10 +3912,8 @@ async fn cancel_steering_message(
 
     // Delete the entry directly (cascading its attachments); a missing entry is
     // a no-op, matching the idempotent contract.
-    state
-        .runtime
-        .db()
-        .remove_steering_entries(&id, std::slice::from_ref(&message_id))
+    phoenix_db::WorkflowRepository::new(state.runtime.db().pool().clone())
+        .cancel_queued_steering(&id, &message_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -3879,31 +3971,26 @@ async fn dispatch_continuation_handoff(
     })
     .await;
     match dispatch {
-        Ok(crate::send_chat_service::SendChatOutcome::Delivered) => {
-            // Channel delivery is not durable acceptance. The outbox intent stays
-            // pending until the message INSERT trigger consumes it, so a crash
-            // before executor persistence remains replayable.
-            (ContinueConversationStatus::Accepted, None)
-        }
-        Ok(
-            crate::send_chat_service::SendChatOutcome::AlreadyPersisted
-            | crate::send_chat_service::SendChatOutcome::QueuedAsSteering,
-        ) => {
-            // Both outcomes have another durable representation. Normally the
-            // message trigger has already consumed the intent for AlreadyPersisted;
-            // this delete also handles durable steering and reconciliation.
+        Ok(crate::send_chat_service::SendChatOutcome::Accepted {
+            disposition: crate::send_chat_service::SendChatDisposition::CancelledSteering,
+            ..
+        }) => {
             if let Err(error) = state
                 .db
                 .delete_continuation_dispatch_intent(&parent_id)
                 .await
             {
-                tracing::warn!(
-                    parent_id,
-                    continuation_id = conversation_id,
-                    error = %error,
-                    "handoff is durable but continuation intent cleanup failed",
+                return (
+                    ContinueConversationStatus::DispatchFailed,
+                    Some(error.to_string()),
                 );
             }
+            (
+                ContinueConversationStatus::DispatchFailed,
+                Some("continuation handoff was cancelled before materialization".to_string()),
+            )
+        }
+        Ok(crate::send_chat_service::SendChatOutcome::Accepted { .. }) => {
             (ContinueConversationStatus::Accepted, None)
         }
         Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {
@@ -7564,6 +7651,128 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn accepted_message_reconciliation_surfaces_acceptance_separately_from_materialization() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-reconcile-acceptance",
+                "reconcile",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create conversation");
+
+        let repo = phoenix_db::WorkflowRepository::new(state.db.pool().clone());
+        let snapshot = phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+            turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                conversation_id: "conv-reconcile-acceptance".to_string(),
+                accepted_turn_id: "pending-runtime".to_string(),
+                generation: 0,
+            },
+            accepted_assistant_message_id: None,
+            stopped_at: None,
+        };
+        repo.accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+            initial_outcome: phoenix_db::DirectTurnInitialOutcome::RuntimeAccepted,
+            conversation_id: "conv-reconcile-acceptance".to_string(),
+            client_message_id: "pending-runtime".to_string(),
+            prepared_fingerprint: "fp-pending".to_string(),
+            prepared_payload: "{\"text\":\"pending\"}".to_string(),
+            accepted_at: phoenix_workflow::Timestamp(1),
+            snapshot: snapshot.clone(),
+        })
+        .await
+        .expect("persist pending acceptance");
+        state
+            .db
+            .add_message(
+                "pending-runtime",
+                "conv-reconcile-acceptance",
+                &crate::db::MessageContent::user("runtime".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("persist message");
+        assert_eq!(
+            repo.stop_active_top_level_llm_for_conversation(
+                "conv-reconcile-acceptance",
+                phoenix_workflow::Timestamp(2),
+            )
+            .await
+            .expect("stop runtime-accepted direct turn"),
+            Some(phoenix_workflow::CommitOutcome::Committed)
+        );
+        repo.accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+            initial_outcome: phoenix_db::DirectTurnInitialOutcome::QueuedSteering {
+                entry: Box::new(crate::state_machine::event::SteerEntry {
+                    text: "queued".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "queued-steering".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }),
+            },
+            conversation_id: "conv-reconcile-acceptance".to_string(),
+            client_message_id: "queued-steering".to_string(),
+            prepared_fingerprint: "fp-queued".to_string(),
+            prepared_payload: "{\"text\":\"queued\"}".to_string(),
+            accepted_at: phoenix_workflow::Timestamp(3),
+            snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                    accepted_turn_id: "queued-steering".to_string(),
+                    ..snapshot.turn_ref.clone()
+                },
+                ..snapshot.clone()
+            },
+        })
+        .await
+        .expect("persist queued acceptance");
+        let Json(response) = reconcile_accepted_messages(
+            State(state),
+            Path("conv-reconcile-acceptance".to_string()),
+            Json(ReconcileAcceptedMessagesRequest {
+                message_ids: vec![
+                    "pending-runtime".to_string(),
+                    "queued-steering".to_string(),
+                    "missing".to_string(),
+                ],
+            }),
+        )
+        .await
+        .expect("reconcile messages");
+
+        assert!(matches!(
+            response.entries[0].acceptance,
+            Some(AcceptedMessageAcceptanceDisposition::RuntimeAccepted)
+        ));
+        assert!(matches!(
+            response.entries[0].materialization,
+            AcceptedMessageMaterialization::Persisted { .. }
+        ));
+        assert!(matches!(
+            response.entries[1].acceptance,
+            Some(AcceptedMessageAcceptanceDisposition::QueuedSteering)
+        ));
+        assert!(matches!(
+            response.entries[1].materialization,
+            AcceptedMessageMaterialization::NotPersisted
+        ));
+        assert!(response.entries[2].acceptance.is_none());
+        assert!(matches!(
+            response.entries[2].materialization,
+            AcceptedMessageMaterialization::NotPersisted
+        ));
+    }
+
+    #[tokio::test]
     async fn accepted_message_reconciliation_finds_messages_outside_latest_history_window() {
         let state = make_test_state().await;
         state
@@ -7617,17 +7826,23 @@ pub(crate) mod hard_delete_cascade_tests {
         .await
         .expect("reconcile messages");
 
+        assert!(response.entries[0].acceptance.is_none());
         assert!(matches!(
-            response.entries[0].disposition,
-            AcceptedMessageDisposition::Persisted { .. }
+            response.entries[0].materialization,
+            AcceptedMessageMaterialization::Persisted { .. }
         ));
         assert!(matches!(
-            response.entries[1].disposition,
-            AcceptedMessageDisposition::SteeringQueued
+            response.entries[1].acceptance,
+            Some(AcceptedMessageAcceptanceDisposition::QueuedSteering)
         ));
         assert!(matches!(
-            response.entries[2].disposition,
-            AcceptedMessageDisposition::Absent
+            response.entries[1].materialization,
+            AcceptedMessageMaterialization::NotPersisted
+        ));
+        assert!(response.entries[2].acceptance.is_none());
+        assert!(matches!(
+            response.entries[2].materialization,
+            AcceptedMessageMaterialization::NotPersisted
         ));
     }
 
@@ -13382,15 +13597,14 @@ mod chat_authority_tests {
             files: vec![],
             user_agent: None,
         };
+        let message_id = req.message_id.clone();
         let result = send_chat(State(state.clone()), Path("c-fm7".to_string()), Json(req))
             .await
             .expect("must not return Err — steering should succeed");
 
-        assert!(result.0.queued, "message must be queued");
-        assert!(
-            result.0.steering,
-            "must be routed as steering, not UserMessage"
-        );
+        assert_eq!(result.0.request_result, ChatRequestResult::Created);
+        assert_eq!(result.0.disposition, ChatDisposition::QueuedSteering);
+        assert_eq!(result.0.message_id, message_id);
     }
 }
 

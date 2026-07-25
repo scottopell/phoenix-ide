@@ -770,6 +770,29 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(9);
     });
 
+    it('reconnect preserves active stream request before the first token', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 7,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        streamingBuffer: null,
+        activeLlmStreamRequestId: 'request-before-token',
+        conversationId: 'conv-1',
+      };
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastAppliedEventSeq: 7,
+        pendingAnchorSequenceId: 7,
+        pendingEvents: [],
+        pendingTruncated: false,
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.activeLlmStreamRequestId).toBe('request-before-token');
+    });
+
     // Codex P2 from PR #79: when pendingTruncated=true the ring
     // overflowed, so the server is intentionally NOT sending the tokens
     // between anchor and tip. The safety belt advances lastAppliedEventSeq
@@ -782,6 +805,7 @@ describe('conversationReducer', () => {
         lastAppliedEventSeq: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
         streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
+        activeLlmStreamRequestId: 'test-req-id',
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
@@ -795,6 +819,7 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.streamingBuffer).toBeNull();
+      expect(next.activeLlmStreamRequestId).toBeNull();
       expect(next.lastAppliedEventSeq).toBe(50);
       expect(next.eventGap).toBeNull();
     });
@@ -1637,6 +1662,114 @@ describe('conversationReducer', () => {
       expect(next.streamingBuffer?.text).toBe('fresh');
       expect(next.streamingBuffer?.requestId).toBe('attempt-2');
       expect(next.streamingBuffer?.startedAt).not.toBe(startedAt);
+    });
+
+    it('rejects tokens for an unannounced replacement stream', () => {
+      let atom = llmRequestingAtom();
+      atom = dispatch(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: 1,
+        requestId: 'attempt-1',
+        workflowId: 7,
+        effectId: 2,
+        attemptId: 1,
+        generation: 0,
+      });
+      atom = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 2,
+        delta: 'attempt one',
+        requestId: 'attempt-1',
+      });
+      const withoutMarker = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 3,
+        delta: 'attempt two',
+        requestId: 'attempt-2',
+      });
+      expect(withoutMarker.streamingBuffer?.text).toBe('attempt one');
+      expect(withoutMarker.activeLlmStreamRequestId).toBe('attempt-1');
+    });
+
+    it('ignores stale first-byte markers after stream supersession', () => {
+      let atom = llmRequestingAtom();
+      atom = dispatch(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: 1,
+        requestId: 'attempt-2',
+        workflowId: 7,
+        effectId: 2,
+        attemptId: 2,
+        generation: 0,
+      });
+      const stale = dispatch(atom, {
+        type: 'sse_llm_first_byte',
+        sequenceId: 2,
+        requestId: 'attempt-1',
+      });
+      expect(stale.firstByteRequestId).toBeNull();
+
+      const current = dispatch(stale, {
+        type: 'sse_llm_first_byte',
+        sequenceId: 3,
+        requestId: 'attempt-2',
+      });
+      expect(current.firstByteRequestId).toBe('attempt-2');
+      const outsideRequest = dispatch(
+        { ...current, phase: { type: 'idle' } },
+        {
+          type: 'sse_llm_first_byte',
+          sequenceId: 4,
+          requestId: 'attempt-2',
+        },
+      );
+      expect(outsideRequest.firstByteRequestId).toBe('attempt-2');
+    });
+
+    it('supersedes partial output and drops late tokens from the abandoned attempt', () => {
+      let atom = llmRequestingAtom();
+      atom = dispatch(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: 1,
+        requestId: 'attempt-1',
+        workflowId: 7,
+        effectId: 2,
+        attemptId: 1,
+        generation: 0,
+      });
+      atom = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 2,
+        delta: 'abandoned partial',
+        requestId: 'attempt-1',
+      });
+      atom = dispatch(atom, {
+        type: 'sse_llm_stream_started',
+        sequenceId: 3,
+        requestId: 'attempt-2',
+        workflowId: 7,
+        effectId: 2,
+        attemptId: 2,
+        generation: 0,
+      });
+      expect(atom.streamingBuffer).toBeNull();
+
+      atom = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 4,
+        delta: 'late old token',
+        requestId: 'attempt-1',
+      });
+      expect(atom.streamingBuffer).toBeNull();
+
+      atom = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 5,
+        delta: 'replacement',
+        requestId: 'attempt-2',
+      });
+      expect(atom.streamingBuffer?.text).toBe('replacement');
+      expect(atom.streamingBuffer?.requestId).toBe('attempt-2');
     });
 
     // Task 24683 regression: tokens arriving after the phase has left

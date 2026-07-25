@@ -26,6 +26,17 @@ pub mod testing;
 pub use executor::ConversationRuntime;
 pub use traits::*;
 
+pub(crate) fn process_incarnation() -> phoenix_workflow::ProcessIncarnation {
+    static PROCESS_INCARNATION: std::sync::OnceLock<phoenix_workflow::ProcessIncarnation> =
+        std::sync::OnceLock::new();
+    *PROCESS_INCARNATION.get_or_init(|| {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..8]);
+        bytes[7] &= 0x7f;
+        phoenix_workflow::ProcessIncarnation(u64::from_le_bytes(bytes))
+    })
+}
+
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::browser::session::BrowserSessionLifecycleEvent;
@@ -173,7 +184,7 @@ pub struct RuntimeManager {
     runtime_creation_lock: AsyncMutex<()>,
     /// Serializes message-id acceptance and bridges the gap between event
     /// dispatch and durable message persistence for in-process retries.
-    chat_acceptance_receipts: AsyncMutex<HashMap<String, ChatAcceptanceReceipt>>,
+    chat_acceptance_receipts: AsyncMutex<HashMap<(String, String), ChatAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -651,6 +662,14 @@ impl SseBroadcaster {
         self.last_seq.fetch_max(seq, Ordering::AcqRel);
     }
 
+    pub fn rewind_unused_reserved_range(&self, start: i64, count: usize) {
+        let count = i64::try_from(count).expect("reserved range count fits i64");
+        let end = start + count - 1;
+        let _ = self
+            .last_seq
+            .compare_exchange(end, start - 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+
     /// Highest `sequence_id` emitted so far. Used to seed `SseEvent::Init`'s
     /// `last_sequence_id` so the client's `applyIfNewer` guard starts at the
     /// correct floor.
@@ -1065,6 +1084,16 @@ pub enum SseEvent {
         sequence_id: i64,
         text: String,
         request_id: String,
+    },
+    /// Opens an ephemeral stream for one exact durable provider attempt.
+    /// A later marker supersedes any partial output from the prior attempt.
+    LlmStreamStarted {
+        sequence_id: i64,
+        request_id: String,
+        workflow_id: u64,
+        effect_id: u64,
+        attempt_id: u64,
+        generation: u64,
     },
     /// Emitted exactly once per LLM request immediately before the first
     /// `Token` event for that request, so the client can transition the
@@ -2963,7 +2992,7 @@ impl RuntimeManager {
 
     pub(crate) async fn lock_chat_acceptance(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<String, ChatAcceptanceReceipt>> {
+    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), ChatAcceptanceReceipt>> {
         self.chat_acceptance_receipts.lock().await
     }
 
@@ -2979,64 +3008,6 @@ impl RuntimeManager {
             .send(event)
             .await
             .map_err(|e| format!("Failed to send event: {e}"))
-    }
-
-    /// Queue a steering message to be delivered when the conversation next
-    /// reaches `Idle`. Persists the entry to DB **before** sending to the
-    /// executor channel, so the entry survives a crash between acceptance
-    /// and executor processing.
-    pub async fn enqueue_steer_message(
-        self: &Arc<Self>,
-        conversation_id: &str,
-        event: Event,
-    ) -> Result<(), String> {
-        let Event::SteerMessage {
-            ref text,
-            ref llm_text,
-            ref images,
-            ref files,
-            ref message_id,
-            ref user_agent,
-            ref skill_invocation,
-        } = event
-        else {
-            return Err("enqueue_steer_message expects Event::SteerMessage".into());
-        };
-
-        // Build SteerEntry and persist before touching the executor channel (P1).
-        let new_entry = crate::state_machine::event::SteerEntry {
-            text: text.clone(),
-            llm_text: llm_text.clone(),
-            images: images.clone(),
-            files: files.clone(),
-            message_id: message_id.clone(),
-            user_agent: user_agent.clone(),
-            skill_invocation: skill_invocation.clone(),
-        };
-        let db = self.db();
-        let mut queue = db
-            .get_steering_queue(conversation_id)
-            .await
-            .map_err(|e| format!("Failed to load steering queue for enqueue: {e}"))?;
-        queue.push(new_entry);
-        db.update_steering_queue(conversation_id, &queue)
-            .await
-            .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
-        tracing::info!(
-            conversation_id,
-            message_id,
-            queue_depth = queue.len(),
-            "Persisted steering message before executor delivery"
-        );
-
-        // DB is durable; now update the executor's in-memory queue via channel.
-        let handle = self.get_or_create(conversation_id).await?;
-        deposit_turn_trigger(&handle);
-        handle
-            .event_tx
-            .send(event)
-            .await
-            .map_err(|e| format!("Failed to send steer message: {e}"))
     }
 
     /// Subscribe to conversation updates
@@ -3307,7 +3278,7 @@ impl RuntimeManager {
 /// sub-agents it follows `parent_conversation_id` links until it reaches a
 /// conversation with no parent, or until the 10-iteration guard fires on
 /// corrupt data.
-async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> String {
+pub(crate) async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> String {
     let mut current_id = conversation_id.to_string();
     for _ in 0..10 {
         match db.get_conversation(&current_id).await {
@@ -3915,6 +3886,27 @@ mod broadcaster_tests {
             }
             other => panic!("expected Token, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_after_accepts_anchor_and_tip_boundaries() {
+        let b = SseBroadcaster::new(16, 0);
+        let _rx = b.subscribe();
+        let _ = b.send_persisted_message(test_message(5, "anchor"));
+        let _ = b.send_seq(|seq| token_event(seq, "a"));
+        let _ = b.send_seq(|seq| token_event(seq, "b"));
+
+        let (anchor, truncated, highest, after_anchor) = b
+            .snapshot_pending_after(5)
+            .expect("cursor at anchor should be replayable");
+        assert_eq!((anchor, truncated, highest), (5, false, 7));
+        assert_eq!(after_anchor.len(), 2);
+
+        let (_, _, highest, after_tip) = b
+            .snapshot_pending_after(7)
+            .expect("cursor at tip should produce an empty replay");
+        assert_eq!(highest, 7);
+        assert!(after_tip.is_empty());
     }
 
     #[test]

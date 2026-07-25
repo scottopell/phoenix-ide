@@ -185,20 +185,29 @@ pub struct ReconcileAcceptedMessagesRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptedMessageAcceptanceDisposition {
+    PendingRuntime,
+    RuntimeAccepted,
+    QueuedSteering,
+    CancelledSteering,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum AcceptedMessageDisposition {
+pub enum AcceptedMessageMaterialization {
     Persisted {
         message: Box<crate::api::wire::EnrichedMessage>,
     },
-    SteeringQueued,
-    Absent,
+    NotPersisted,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AcceptedMessageReconciliation {
     pub message_id: String,
-    #[serde(flatten)]
-    pub disposition: AcceptedMessageDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<AcceptedMessageAcceptanceDisposition>,
+    pub materialization: AcceptedMessageMaterialization,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,18 +245,28 @@ pub struct ConversationMessagesAroundResponse {
     pub server_message_tail: Option<i64>,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRequestResult {
+    Created,
+    Replayed,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatDisposition {
+    PendingRuntime,
+    RuntimeAccepted,
+    QueuedSteering,
+    CancelledSteering,
+}
+
 /// Response for chat action
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
-    pub queued: bool,
-    /// Present and `true` when the message was accepted as a steering message
-    /// (the conversation was busy and the message was queued for later delivery).
-    /// Absent (`null`/`undefined` on the client) for normal immediate processing.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub steering: bool,
-    /// The supplied message ID was already persisted before this request.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub already_persisted: bool,
+    pub message_id: String,
+    pub request_result: ChatRequestResult,
+    pub disposition: ChatDisposition,
 }
 
 /// Response for cancel action.

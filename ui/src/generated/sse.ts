@@ -77,6 +77,10 @@ export type SseStateChangeData = Omit<
   'type'
 >;
 export type SseTokenData = Omit<Extract<SseWireEvent, { type: 'token' }>, 'type'>;
+export type SseLlmStreamStartedData = Omit<
+  Extract<SseWireEvent, { type: 'llm_stream_started' }>,
+  'type'
+>;
 export type SseLlmFirstByteData = Omit<
   Extract<SseWireEvent, { type: 'llm_first_byte' }>,
   'type'

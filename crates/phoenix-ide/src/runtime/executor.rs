@@ -46,6 +46,27 @@ const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty 
 const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
 const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
 
+#[derive(Clone, Copy)]
+enum LlmDispatchOwnership {
+    DurableDirectTurn,
+    AdoptedWakeBatch,
+}
+
+async fn record_durable_llm_failure<S: super::traits::MessageStore + ?Sized>(
+    storage: &S,
+    failure: &phoenix_db::RecordTopLevelLlmFailureInput,
+) -> phoenix_workflow::AuthorityOutcome {
+    loop {
+        match storage.record_top_level_llm_failure(failure).await {
+            Ok(outcome) => return outcome,
+            Err(error) => {
+                tracing::warn!(%error, "failed to persist durable LLM failure; retrying");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortTaskOnDrop {
@@ -648,6 +669,27 @@ const CLEAR_AT_LEAST_TOKENS: usize = 8192;
 /// the reported prompt size that acts as the planner's pressure signal.
 const CLEAR_GAIN_FRACTION_NUM: usize = 1;
 const CLEAR_GAIN_FRACTION_DEN: usize = 20;
+
+fn owed_tool_to_dispatch(
+    state: &ConvState,
+    event: &Event,
+    owed: Option<&phoenix_db::OwedTopLevelLlmReceipt>,
+) -> Option<ToolCall> {
+    let ConvState::ToolExecuting { current_tool, .. } = state else {
+        return None;
+    };
+    if !matches!(event, Event::LlmResponse { .. }) {
+        return None;
+    }
+    owed?
+        .tool_intents
+        .iter()
+        .any(|intent| {
+            intent.tool_use_id == current_tool.id
+                && intent.status == phoenix_db::ToolIntentStatus::Owed
+        })
+        .then(|| current_tool.clone())
+}
 
 fn proportional_gain_tokens(reported_prompt_tokens: i64) -> usize {
     let prompt = usize::try_from(reported_prompt_tokens).unwrap_or(usize::MAX);
@@ -1644,6 +1686,9 @@ where
         String,
         phoenix_core::domain::creation_protocol::CreationClaim,
     )>,
+    recovered_failure_authority:
+        Option<phoenix_core::domain::llm_types::DurableLlmFailureAuthority>,
+    active_llm_dispatch_ownership: LlmDispatchOwnership,
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
@@ -1914,6 +1959,8 @@ where
             state,
             state_updated_at: Utc::now(),
             startup_creation_completion: None,
+            recovered_failure_authority: None,
+            active_llm_dispatch_ownership: LlmDispatchOwnership::DurableDirectTurn,
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
@@ -2091,7 +2138,27 @@ where
         if let ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. } = &self.state
         {
             tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
-            if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
+            let resume_result = if self.context.is_sub_agent {
+                self.dispatch_llm_request(LlmDispatchOwnership::DurableDirectTurn)
+                    .await
+            } else {
+                match self
+                    .storage
+                    .active_top_level_llm_workflow(&self.context.conversation_id)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        self.dispatch_llm_request(LlmDispatchOwnership::DurableDirectTurn)
+                            .await
+                    }
+                    Ok(None) => {
+                        self.dispatch_llm_request(LlmDispatchOwnership::AdoptedWakeBatch)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            if let Err(e) = resume_result {
                 tracing::error!(error = %e, "Failed to resume LLM request");
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
@@ -2518,6 +2585,35 @@ where
             }
         }
 
+        if !self.context.is_sub_agent
+            && matches!(outcome, EffectOutcome::Llm(LlmOutcome::Response { .. }))
+            && self
+                .storage
+                .owed_top_level_llm_receipt(&self.context.conversation_id)
+                .await?
+                .is_some()
+        {
+            let EffectOutcome::Llm(LlmOutcome::Response {
+                content,
+                tool_calls,
+                end_turn,
+                usage,
+                request_id,
+            }) = outcome
+            else {
+                unreachable!("guard requires an LLM response");
+            };
+            return self
+                .process_event(Event::LlmResponse {
+                    content,
+                    tool_calls,
+                    end_turn,
+                    usage,
+                    request_id,
+                })
+                .await;
+        }
+
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => r,
             Err(invalid) => {
@@ -2550,6 +2646,7 @@ where
     }
 
     async fn process_adopted_wake_batch(&mut self) -> Result<(), String> {
+        self.active_llm_dispatch_ownership = LlmDispatchOwnership::AdoptedWakeBatch;
         self.parent_tool_cycle_count = 0;
         if !matches!(self.state, ConvState::Idle) {
             tracing::debug!(
@@ -2570,16 +2667,88 @@ where
             state_updated_at: self.state_updated_at,
             presentation_mode: self.state.presentation_mode().to_string(),
         });
-        self.execute_effect(Effect::RequestLlm).await.map(|_| ())
+        self.dispatch_llm_request(LlmDispatchOwnership::AdoptedWakeBatch)
+            .await
+            .map(|_| ())
     }
 
+    async fn canonicalize_llm_response_event(&self, event: Event) -> Result<Event, String> {
+        if !matches!(event, Event::LlmResponse { .. }) {
+            return Ok(event);
+        }
+        let Some(owed) = self
+            .storage
+            .owed_top_level_llm_receipt(&self.context.conversation_id)
+            .await?
+        else {
+            return Ok(event);
+        };
+        let durable: phoenix_llm::DurableLlmResponse =
+            serde_json::from_str(&owed.llm_receipt.response_aggregate)
+                .map_err(|error| error.to_string())?;
+        let request_id = owed.llm_receipt.provider_request_id.unwrap_or_else(|| {
+            format!(
+                "llm-receipt-{}-{}",
+                owed.workflow.workflow_id.0, owed.receipt.receipt_id.0
+            )
+        });
+        let tool_calls = owed
+            .tool_intents
+            .iter()
+            .filter(|intent| {
+                matches!(
+                    intent.status,
+                    phoenix_db::ToolIntentStatus::PendingAcceptance
+                        | phoenix_db::ToolIntentStatus::Owed
+                )
+            })
+            .map(|intent| {
+                let arguments: serde_json::Value = serde_json::from_str(&intent.arguments_json)
+                    .map_err(|error| {
+                        format!(
+                            "invalid durable tool intent {} arguments: {error}",
+                            intent.tool_use_id
+                        )
+                    })?;
+                Ok(crate::state_machine::state::ToolCall {
+                    id: intent.tool_use_id.clone(),
+                    input: crate::state_machine::state::ToolInput::from_model_name_and_value(
+                        &intent.tool_name,
+                        arguments,
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Event::LlmResponse {
+            tool_calls,
+            content: durable.response.content,
+            end_turn: durable.response.end_turn,
+            usage: durable.response.usage,
+            request_id,
+        })
+    }
+
+    async fn pending_direct_turn_for_event(
+        &self,
+        event: &Event,
+    ) -> Result<Option<phoenix_db::PendingDirectTurnRuntimeAdmission>, String> {
+        let message_id = match event {
+            Event::UserMessage { message_id, .. } => message_id,
+            Event::CreationProvisioned {
+                initial_message, ..
+            } => &initial_message.message_id,
+            _ => return Ok(None),
+        };
+        self.storage
+            .pending_direct_turn(&self.context.conversation_id, message_id)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        // A fresh user turn always resets the parent tool-cycle counter
-        // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
         if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;
         }
-
         // Steering messages are buffered rather than fed to the state machine.
         // They are delivered as `UserMessage` when the conversation next enters `Idle`.
         if let Event::SteerMessage {
@@ -2601,16 +2770,22 @@ where
                 user_agent,
                 skill_invocation,
             };
+            if let Some(queue_position) = self
+                .steering_queue
+                .iter()
+                .position(|queued| queued.message_id == message_id)
+            {
+                let _ = self
+                    .broadcast_tx
+                    .send_seq(|seq| SseEvent::SteerMessageQueued {
+                        sequence_id: seq,
+                        message_id,
+                        queue_position,
+                    });
+                return Ok(());
+            }
             self.steering_queue.push(entry);
             let queue_position = self.steering_queue.len() - 1;
-            // Persist updated queue
-            if let Err(e) = self
-                .storage
-                .update_steering_queue(&self.context.conversation_id, &self.steering_queue)
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to persist steering queue");
-            }
             // Notify the UI so it can show the queued indicator
             let _ = self
                 .broadcast_tx
@@ -2640,6 +2815,48 @@ where
             return self.process_adopted_wake_batch().await;
         }
 
+        if matches!(event, Event::ResumeDurableLlmRequest) {
+            if !matches!(self.state, ConvState::LlmRequesting { .. }) {
+                return Err(format!(
+                    "cannot resume durable LLM request from {}",
+                    self.state.variant_name()
+                ));
+            }
+            self.dispatch_llm_request(LlmDispatchOwnership::DurableDirectTurn)
+                .await?;
+            return Ok(());
+        }
+
+        if matches!(event, Event::ResumeDurableToolExecution) {
+            let ConvState::ToolExecuting { current_tool, .. } = &self.state else {
+                return Err(format!(
+                    "cannot resume durable tool execution from {}",
+                    self.state.variant_name()
+                ));
+            };
+            self.execute_effect(Effect::ExecuteTool {
+                tool: current_tool.clone(),
+            })
+            .await?;
+            return Ok(());
+        }
+
+        if let Event::ResumeDurableLlmFailure { failure, authority } = event {
+            self.recovered_failure_authority = Some(authority);
+            let error_event = Event::LlmError {
+                message: failure.message,
+                error_kind: failure.error_kind,
+                attempt: failure.attempt,
+                recovery_in_progress: failure.recovery_in_progress,
+                resets_at: failure.resets_at,
+            };
+            let result = Box::pin(self.process_event(error_event)).await;
+            if result.is_err() {
+                self.recovered_failure_authority = None;
+            }
+            return result;
+        }
+
         // Check if this is a SubAgentResult that needs buffering
         if let Event::SubAgentResult { .. } = &event {
             if !self.can_handle_sub_agent_result() {
@@ -2653,6 +2870,35 @@ where
         let mut events_to_process = vec![event];
 
         while let Some(current_event) = events_to_process.pop() {
+            let owed_llm_receipt = if matches!(current_event, Event::LlmResponse { .. }) {
+                self.storage
+                    .owed_top_level_llm_receipt(&self.context.conversation_id)
+                    .await?
+            } else {
+                None
+            };
+            let current_event = self.canonicalize_llm_response_event(current_event).await?;
+            if let Some(tool) =
+                owed_tool_to_dispatch(&self.state, &current_event, owed_llm_receipt.as_ref())
+            {
+                self.execute_effect(Effect::ExecuteTool { tool }).await?;
+                return Ok(());
+            }
+            if owed_llm_receipt.is_some()
+                && matches!(current_event, Event::LlmResponse { .. })
+                && matches!(self.state, ConvState::Idle)
+            {
+                let attempt = owed_llm_receipt
+                    .as_ref()
+                    .and_then(|owed| owed.receipt.attempt_id)
+                    .and_then(|attempt_id| u32::try_from(attempt_id.0).ok())
+                    .unwrap_or(1);
+                self.state = ConvState::LlmRequesting { attempt };
+                self.state_updated_at = Utc::now();
+                if let Some(state_watcher) = &self.state_watcher {
+                    let _ = state_watcher.send(self.state.clone());
+                }
+            }
             // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
                 if let ConvState::AwaitingSubAgents { ref pending, .. }
@@ -2666,6 +2912,8 @@ where
                     }
                 }
             }
+
+            let pending_direct_turn = self.pending_direct_turn_for_event(&current_event).await?;
 
             // Pure state transition
             let result = match transition(&self.state, &self.context, current_event) {
@@ -2688,7 +2936,14 @@ where
                 }
             };
 
-            let generated_events = self.apply_transition_result(result).await?;
+            let generated_events = if let Some(pending) = pending_direct_turn {
+                self.apply_direct_turn_transition(result, pending).await?
+            } else if let Some(owed) = owed_llm_receipt {
+                self.apply_durable_llm_receipt_transition(result, owed)
+                    .await?
+            } else {
+                self.apply_transition_result(result).await?
+            };
             events_to_process.extend(generated_events);
         }
 
@@ -2763,6 +3018,398 @@ where
         to_drain
     }
 
+    #[allow(clippy::too_many_lines)]
+    async fn apply_durable_llm_receipt_transition(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+        owed: phoenix_db::OwedTopLevelLlmReceipt,
+    ) -> Result<Vec<Event>, String> {
+        let mut effects = result.effects.into_iter();
+        let (product, persisted_messages, reserved_broadcast_range) = match effects.next() {
+            Some(Effect::PersistMessage {
+                content,
+                display_data,
+                usage_data,
+                message_id,
+                idempotent: false,
+            }) => {
+                if !matches!(effects.next(), Some(Effect::PersistState)) {
+                    return Err(
+                        "durable LLM response did not pair message and state persistence"
+                            .to_string(),
+                    );
+                }
+                let message = crate::db::Message {
+                    message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: self.broadcast_tx.next_seq(),
+                    message_type: content.message_type(),
+                    content,
+                    display_data,
+                    usage_data,
+                    created_at: Utc::now(),
+                };
+                (
+                    phoenix_db::AcceptedTopLevelLlmProduct::PersistedAssistant(Box::new(
+                        message.clone(),
+                    )),
+                    vec![message],
+                    None,
+                )
+            }
+            Some(Effect::PersistCheckpoint {
+                data:
+                    CheckpointData::ToolRound {
+                        assistant_message,
+                        tool_results,
+                    },
+            }) => {
+                if !matches!(effects.next(), Some(Effect::PersistState)) {
+                    return Err(
+                        "durable LLM checkpoint did not pair product and state persistence"
+                            .to_string(),
+                    );
+                }
+                let (reserved_broadcast_range, reserved_seqs) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1 + tool_results.len());
+                let agent_content = MessageContent::agent(assistant_message.content);
+                let assistant = crate::db::Message {
+                    message_id: assistant_message.message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: reserved_seqs[0],
+                    message_type: agent_content.message_type(),
+                    content: agent_content,
+                    display_data: assistant_message.display_data,
+                    usage_data: assistant_message.usage,
+                    created_at: assistant_message.created_at,
+                };
+                let tool_messages = tool_results
+                    .iter()
+                    .zip(reserved_seqs.iter().skip(1))
+                    .map(|(result, sequence_id)| {
+                        let content = MessageContent::tool_with_images(
+                            &result.tool_use_id,
+                            result.output(),
+                            result.is_error(),
+                            result.images().to_vec(),
+                        );
+                        crate::db::Message {
+                            message_id: tool_result_message_id(&result.tool_use_id),
+                            conversation_id: self.context.conversation_id.clone(),
+                            sequence_id: *sequence_id,
+                            message_type: content.message_type(),
+                            content,
+                            display_data: merge_duration_into_display_data(
+                                result.display_data(),
+                                result.duration_ms,
+                            ),
+                            usage_data: None,
+                            created_at: Utc::now(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut persisted = Vec::with_capacity(1 + tool_messages.len());
+                persisted.push(assistant.clone());
+                persisted.extend(tool_messages.iter().cloned());
+                (
+                    phoenix_db::AcceptedTopLevelLlmProduct::PersistedCheckpoint {
+                        assistant: Box::new(assistant),
+                        tool_results: tool_messages,
+                        fork_proposal: None,
+                    },
+                    persisted,
+                    Some(reserved_broadcast_range),
+                )
+            }
+            Some(Effect::PersistForkProposal {
+                proposal_id,
+                task_file,
+                title,
+                priority,
+                body,
+                checkpoint:
+                    CheckpointData::ToolRound {
+                        assistant_message,
+                        tool_results,
+                    },
+            }) => {
+                if !matches!(effects.next(), Some(Effect::PersistState)) {
+                    return Err(
+                        "durable fork proposal did not pair product and state persistence"
+                            .to_string(),
+                    );
+                }
+                let (reserved_broadcast_range, reserved_seqs) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1 + tool_results.len());
+                let agent_content = MessageContent::agent(assistant_message.content);
+                let assistant = crate::db::Message {
+                    message_id: assistant_message.message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: reserved_seqs[0],
+                    message_type: agent_content.message_type(),
+                    content: agent_content,
+                    display_data: assistant_message.display_data,
+                    usage_data: assistant_message.usage,
+                    created_at: assistant_message.created_at,
+                };
+                let tool_messages = tool_results
+                    .iter()
+                    .zip(reserved_seqs.iter().skip(1))
+                    .map(|(result, sequence_id)| {
+                        let content = MessageContent::tool_with_images(
+                            &result.tool_use_id,
+                            result.output(),
+                            result.is_error(),
+                            result.images().to_vec(),
+                        );
+                        crate::db::Message {
+                            message_id: tool_result_message_id(&result.tool_use_id),
+                            conversation_id: self.context.conversation_id.clone(),
+                            sequence_id: *sequence_id,
+                            message_type: content.message_type(),
+                            content,
+                            display_data: merge_duration_into_display_data(
+                                result.display_data(),
+                                result.duration_ms,
+                            ),
+                            usage_data: None,
+                            created_at: Utc::now(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let normalized_task_file = normalize_task_file_repo_relative(
+                    &self.context.working_dir,
+                    &task_file,
+                    &proposal_id,
+                );
+                let proposal = crate::db::ForkProposal {
+                    id: proposal_id,
+                    origin_conversation_id: self.context.conversation_id.clone(),
+                    task_file: normalized_task_file,
+                    title,
+                    priority: priority.to_string(),
+                    body,
+                    status: crate::db::ForkProposalStatus::Pending,
+                    created_at: Utc::now(),
+                    resolved_at: None,
+                    fork_conversation_id: None,
+                    refinement_conversation_id: None,
+                };
+                let mut persisted = vec![assistant.clone()];
+                persisted.extend(tool_messages.iter().cloned());
+                (
+                    phoenix_db::AcceptedTopLevelLlmProduct::PersistedCheckpoint {
+                        assistant: Box::new(assistant),
+                        tool_results: tool_messages,
+                        fork_proposal: Some(Box::new(proposal)),
+                    },
+                    persisted,
+                    Some(reserved_broadcast_range),
+                )
+            }
+            Some(Effect::PersistState) => (
+                phoenix_db::AcceptedTopLevelLlmProduct::StateCheckpoint {
+                    conversation_id: self.context.conversation_id.clone(),
+                },
+                Vec::new(),
+                None,
+            ),
+            _ => {
+                return Err(
+                    "durable LLM response did not begin with product persistence".to_string(),
+                );
+            }
+        };
+        let old_state = self.state.clone();
+        let next_state = result.new_state;
+        let state_updated_at = if next_state == old_state {
+            self.state_updated_at
+        } else {
+            Utc::now()
+        };
+        let outcome = self
+            .storage
+            .accept_top_level_llm_product(&phoenix_db::AcceptTopLevelLlmProductInput {
+                workflow_id: owed.workflow.workflow_id,
+                delivery_id: owed.delivery.delivery_id,
+                receipt_id: owed.receipt.receipt_id,
+                product,
+                interrupted_tool_use_ids: owed
+                    .tool_intents
+                    .iter()
+                    .filter(|intent| intent.status == phoenix_db::ToolIntentStatus::Interrupted)
+                    .map(|intent| intent.tool_use_id.clone())
+                    .collect(),
+                next_state: next_state.clone(),
+                state_updated_at,
+            })
+            .await?;
+        let product_replay = outcome == phoenix_db::AcceptTopLevelLlmProductOutcome::ExactReplay;
+        if outcome != phoenix_db::AcceptTopLevelLlmProductOutcome::Committed
+            && !persisted_messages.is_empty()
+        {
+            self.broadcast_tx.rewind_unused_reserved_range(
+                persisted_messages[0].sequence_id,
+                persisted_messages.len(),
+            );
+        }
+        drop(reserved_broadcast_range);
+        if outcome != phoenix_db::AcceptTopLevelLlmProductOutcome::Committed && !product_replay {
+            self.storage
+                .release_workflow_delivery_claim(
+                    owed.workflow.workflow_id,
+                    owed.delivery.delivery_id,
+                    super::process_incarnation(),
+                )
+                .await?;
+            return Err(format!(
+                "durable LLM product acceptance failed: {outcome:?}"
+            ));
+        }
+        self.state = next_state;
+        self.state_updated_at = state_updated_at;
+        self.manage_deadline(&old_state);
+        let drain_event = self.maybe_drain_steering_queue(&old_state, false);
+        if drain_event.is_none() {
+            if let Some(tx) = &self.state_watcher {
+                let _ = tx.send(self.state.clone());
+            }
+        }
+        if !product_replay {
+            for message in persisted_messages {
+                let _ = self.broadcast_tx.send_message(message);
+            }
+        }
+        let mut generated = Vec::new();
+        let remaining_effects: Vec<_> = effects.collect();
+        if let Some(drain_event) = drain_event {
+            self.run_effects_with_inline_drain(remaining_effects, drain_event, &mut generated)
+                .await?;
+        } else {
+            for effect in remaining_effects {
+                if let Some(event) = self.execute_effect(effect).await? {
+                    generated.push(event);
+                }
+            }
+        }
+        Ok(generated)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn apply_direct_turn_transition(
+        &mut self,
+        result: crate::state_machine::transition::TransitionResult,
+        pending: phoenix_db::PendingDirectTurnRuntimeAdmission,
+    ) -> Result<Vec<Event>, String> {
+        let mut effects = result.effects.into_iter();
+        let Some(Effect::PersistMessage {
+            content,
+            display_data,
+            usage_data,
+            message_id,
+            idempotent: _,
+        }) = effects.next()
+        else {
+            return Err(
+                "direct turn transition did not begin with user-message persistence".to_string(),
+            );
+        };
+        if !matches!(effects.next(), Some(Effect::PersistState)) {
+            return Err(
+                "direct turn transition did not pair message and state persistence".to_string(),
+            );
+        }
+        let old_state = self.state.clone();
+        let next_state = result.new_state;
+        let next_state_updated_at = if next_state == old_state {
+            self.state_updated_at
+        } else {
+            Utc::now()
+        };
+        let sequence_id = self.broadcast_tx.next_seq();
+        let message = crate::db::Message {
+            message_id: message_id.clone(),
+            conversation_id: self.context.conversation_id.clone(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data,
+            usage_data,
+            created_at: Utc::now(),
+        };
+        let pending_conversation_id = pending.conversation_id.clone();
+        let pending_client_message_id = pending.client_message_id.clone();
+        let acceptance = phoenix_db::PersistDirectTurnRuntimeAcceptanceInput {
+            admission: phoenix_db::DirectTurnRuntimeAdmissionInput {
+                workflow_id: pending.workflow_id,
+                conversation_id: pending.conversation_id,
+                client_message_id: pending.client_message_id,
+                generation: pending.generation,
+                disposition: phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted,
+            },
+            message: message.clone(),
+            next_state: next_state.clone(),
+            state_updated_at: next_state_updated_at,
+        };
+        let outcome = self
+            .storage
+            .persist_direct_turn_runtime_acceptance(&acceptance)
+            .await?;
+        let (persisted_message, product_replay) = match outcome {
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Committed(message) => {
+                (Some(*message), false)
+            }
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay => {
+                self.broadcast_tx.rewind_unused_reserved_range(sequence_id, 1);
+                (None, true)
+            }
+            outcome @ (phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::RetryablePersistence
+            | phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict) => {
+                self.broadcast_tx.rewind_unused_reserved_range(sequence_id, 1);
+                self.storage
+                    .release_direct_turn_runtime_delivery(
+                        &pending_conversation_id,
+                        &pending_client_message_id,
+                        super::process_incarnation(),
+                    )
+                    .await?;
+                let message = match outcome {
+                    phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::RetryablePersistence => {
+                        "direct-turn runtime acceptance persistence is temporarily busy"
+                    }
+                    phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict => {
+                        "durable direct turn admission conflicted"
+                    }
+                    phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Committed(_)
+                    | phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::ExactReplay => {
+                        unreachable!("committed outcomes are handled above")
+                    }
+                };
+                return Err(message.to_string());
+            }
+        };
+        self.state = next_state;
+        self.state_updated_at = next_state_updated_at;
+        self.manage_deadline(&old_state);
+        if let Some(tx) = &self.state_watcher {
+            let _ = tx.send(self.state.clone());
+        }
+        if !product_replay {
+            let _ = self
+                .broadcast_tx
+                .send_message(persisted_message.expect("committed admission returns message"));
+        }
+        let mut generated = Vec::new();
+        for effect in effects {
+            if let Some(event) = self.execute_effect(effect).await? {
+                generated.push(event);
+            }
+        }
+        Ok(generated)
+    }
+
     /// Apply a `TransitionResult` from either `transition()` or `handle_outcome()`.
     ///
     /// Updates state, drains sub-agent buffer if entering `AwaitingSubAgents`,
@@ -2781,6 +3428,9 @@ where
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        if matches!(self.state, ConvState::Idle) {
+            self.active_llm_dispatch_ownership = LlmDispatchOwnership::DurableDirectTurn;
+        }
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
         // an empty steering drain re-enters the same state) and reach here
@@ -2985,6 +3635,14 @@ where
         let Event::SteerDrainedUserMessages { entries } = drain_event else {
             unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
         };
+        let drained_message_ids: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.message_id.clone())
+            .collect();
+        let owner_message_id = drained_message_ids
+            .last()
+            .ok_or_else(|| "steering drain batch was empty".to_string())?
+            .clone();
         let drain_result = transition(
             &self.state,
             &self.context,
@@ -3009,6 +3667,25 @@ where
             }
         }
         for effect in drain_result.effects {
+            if matches!(effect, Effect::ClearSteeringQueueEntries { .. }) {
+                self.active_llm_dispatch_ownership = match self
+                    .storage
+                    .consume_queued_steering_batch(
+                        &self.context.conversation_id,
+                        &owner_message_id,
+                        &drained_message_ids,
+                    )
+                    .await?
+                {
+                    phoenix_db::QueuedSteeringBatchOwnership::DurableDirectTurn => {
+                        LlmDispatchOwnership::DurableDirectTurn
+                    }
+                    phoenix_db::QueuedSteeringBatchOwnership::LegacyUnowned => {
+                        LlmDispatchOwnership::AdoptedWakeBatch
+                    }
+                };
+                continue;
+            }
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);
             }
@@ -3850,6 +4527,86 @@ where
         }))
     }
 
+    async fn persist_message_effect(
+        &self,
+        content: MessageContent,
+        display_data: Option<serde_json::Value>,
+        usage_data: Option<crate::db::UsageData>,
+        message_id: String,
+        idempotent: bool,
+    ) -> Result<Option<crate::db::Message>, String> {
+        let sequence_id = self.broadcast_tx.next_seq();
+        let proposed = crate::db::Message {
+            message_id: message_id.clone(),
+            conversation_id: self.context.conversation_id.clone(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data,
+            usage_data,
+            created_at: Utc::now(),
+        };
+        if !idempotent {
+            return self
+                .storage
+                .add_message_with_seq(
+                    &message_id,
+                    &self.context.conversation_id,
+                    sequence_id,
+                    &proposed.content,
+                    proposed.display_data.as_ref(),
+                    proposed.usage_data.as_ref(),
+                )
+                .await
+                .map(Some);
+        }
+
+        match self
+            .storage
+            .persist_queued_steering_message(&self.context.conversation_id, &message_id, &proposed)
+            .await?
+        {
+            phoenix_db::PersistQueuedSteeringMessageOutcome::Committed(message) => {
+                Ok(Some(*message))
+            }
+            phoenix_db::PersistQueuedSteeringMessageOutcome::ExactReplay => {
+                self.broadcast_tx
+                    .rewind_unused_reserved_range(sequence_id, 1);
+                Ok(None)
+            }
+            phoenix_db::PersistQueuedSteeringMessageOutcome::LegacyQueueEntry => {
+                if self
+                    .storage
+                    .message_exists_in_conversation(&self.context.conversation_id, &message_id)
+                    .await?
+                {
+                    self.broadcast_tx
+                        .rewind_unused_reserved_range(sequence_id, 1);
+                    Ok(None)
+                } else {
+                    self.storage
+                        .add_message_with_seq(
+                            &message_id,
+                            &self.context.conversation_id,
+                            sequence_id,
+                            &proposed.content,
+                            proposed.display_data.as_ref(),
+                            proposed.usage_data.as_ref(),
+                        )
+                        .await
+                        .map(Some)
+                }
+            }
+            phoenix_db::PersistQueuedSteeringMessageOutcome::Conflict => {
+                self.broadcast_tx
+                    .rewind_unused_reserved_range(sequence_id, 1);
+                Err(format!(
+                    "queued steering materialization lost authority for {message_id}"
+                ))
+            }
+        }
+    }
+
     /// Execute an effect and optionally return a generated event
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
@@ -3861,48 +4618,66 @@ where
                 message_id,
                 idempotent,
             } => {
-                // Idempotent path: skip if already persisted. Prevents double-
-                // insert (and seq gap) when a SteerDrainedUserMessages re-fires
-                // after crash recovery before ClearSteeringQueueEntries ran.
-                // Gated to idempotent=true so non-replayable persists pay no
-                // extra query.
-                if idempotent && self.storage.message_exists(&message_id).await? {
-                    tracing::debug!(
-                        message_id = %message_id,
-                        "Skipping PersistMessage; message already exists"
-                    );
-                    return Ok(None);
+                let msg = Box::pin(self.persist_message_effect(
+                    content,
+                    display_data,
+                    usage_data,
+                    message_id.clone(),
+                    idempotent,
+                ))
+                .await?;
+                if let Some(msg) = msg {
+                    if idempotent {
+                        tracing::info!(
+                            conversation_id = %self.context.conversation_id,
+                            client_message_id = %message_id,
+                            materialized_message_id = %msg.message_id,
+                            sequence_id = msg.sequence_id,
+                            "Persisted drained steering message"
+                        );
+                    }
+                    let _ = self.broadcast_tx.send_message(msg);
                 }
-
-                let seq = self.broadcast_tx.next_seq();
-                let msg = self
-                    .storage
-                    .add_message_with_seq(
-                        &message_id,
-                        &self.context.conversation_id,
-                        seq,
-                        &content,
-                        display_data.as_ref(),
-                        usage_data.as_ref(),
-                    )
-                    .await?;
-                if idempotent {
-                    tracing::info!(
-                        conversation_id = %self.context.conversation_id,
-                        message_id = %message_id,
-                        sequence_id = seq,
-                        "Persisted drained steering message"
-                    );
-                }
-
-                // Broadcast to clients (display_data already computed at effect creation)
-                let _ = self.broadcast_tx.send_message(msg);
                 Ok(None)
             }
 
-            Effect::PersistState => self.persist_state_effect(true).await,
+            Effect::PersistState => {
+                let recovered_authority = self.recovered_failure_authority.take();
+                let is_recovered_failure = recovered_authority.is_some();
+                let result = if let Some(authority) = recovered_authority {
+                    self.storage
+                        .persist_recovered_failure_state(
+                            &self.context.conversation_id,
+                            &self.state,
+                            self.state_updated_at,
+                            &authority,
+                        )
+                        .await
+                        .map(|()| None)
+                } else {
+                    self.persist_state_effect(true).await
+                };
+                if result.is_ok() && is_recovered_failure {
+                    let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                        sequence_id: seq,
+                        state: self.state.clone(),
+                        presentation_mode: self.state.presentation_mode().to_string(),
+                        state_updated_at: self.state_updated_at,
+                    });
+                }
+                result
+            }
 
-            Effect::RequestLlm => self.dispatch_llm_request().await,
+            Effect::CompleteDurableToolIntent { tool_use_id } => {
+                self.storage
+                    .mark_top_level_llm_tool_completed(&self.context.conversation_id, &tool_use_id)
+                    .await?;
+                Ok(None)
+            }
+            Effect::RequestLlm => {
+                self.dispatch_llm_request(self.active_llm_dispatch_ownership)
+                    .await
+            }
 
             Effect::CompleteCreation { job_id, claim } => {
                 match self.storage.complete_creation_job(&job_id, &claim).await {
@@ -3917,7 +4692,24 @@ where
                 Ok(None)
             }
 
-            Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
+            Effect::ExecuteTool { tool } => {
+                if !self.context.is_sub_agent {
+                    let durable = self
+                        .storage
+                        .mark_top_level_llm_tool_execution_may_have_begun(
+                            &self.context.conversation_id,
+                            &tool.id,
+                        )
+                        .await?;
+                    if !durable {
+                        return Err(format!(
+                            "tool {} has no committed durable execution authority",
+                            tool.id
+                        ));
+                    }
+                }
+                self.dispatch_tool_execution(tool).await
+            }
 
             Effect::ScheduleRetry {
                 delay,
@@ -4096,6 +4888,22 @@ where
 
             Effect::AbortLlm => {
                 tracing::info!("Aborting LLM request");
+                let stopped_at = phoenix_workflow::Timestamp(
+                    u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                );
+                match self
+                    .storage
+                    .stop_active_top_level_llm_for_conversation(
+                        &self.context.conversation_id,
+                        stopped_at,
+                    )
+                    .await?
+                {
+                    Some(phoenix_workflow::CommitOutcome::Committed) | None => {}
+                    Some(outcome) => {
+                        return Err(format!("durable LLM stop lost authority: {outcome:?}"));
+                    }
+                }
                 // Bump the generation so the aborted task's forwarded outcome
                 // (a synthetic NetworkError from the dropped sender) is stale
                 // and gets discarded by the select loop, rather than being
@@ -4323,10 +5131,25 @@ where
         }
     }
 
+    fn sha256_hex(value: &[u8]) -> String {
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        sha2::Sha256::digest(value)
+            .iter()
+            .fold(String::with_capacity(64), |mut output, byte| {
+                write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                output
+            })
+    }
+
     /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
     /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
-    async fn dispatch_llm_request(&mut self) -> Result<Option<Event>, String> {
+    async fn dispatch_llm_request(
+        &mut self,
+        ownership: LlmDispatchOwnership,
+    ) -> Result<Option<Event>, String> {
+        self.active_llm_dispatch_ownership = ownership;
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
         // have their own lifetime cap below (REQ-PROJ-008); this branch
         // only fires for parent conversations. The counter is reset at
@@ -4449,6 +5272,21 @@ where
         let working_dir = self.context.working_dir.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
+        let durable_workflow =
+            if is_sub_agent || matches!(ownership, LlmDispatchOwnership::AdoptedWakeBatch) {
+                None
+            } else {
+                storage.active_top_level_llm_workflow(&conv_id).await?
+            };
+        if !is_sub_agent
+            && self.storage.requires_durable_top_level_llm()
+            && durable_workflow.is_none()
+            && matches!(ownership, LlmDispatchOwnership::DurableDirectTurn)
+        {
+            return Err(
+                "top-level LLM dispatch requires an accepted durable direct turn".to_string(),
+            );
+        }
         let mode_context = self.context.mode_context.clone();
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
@@ -4476,6 +5314,7 @@ where
         let request_id = uuid::Uuid::new_v4().to_string();
 
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
+        let broadcast_tx_for_stream = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
         let first_byte_at = Arc::new(tokio::sync::Mutex::new(None));
         let first_byte_at_for_fwd = first_byte_at.clone();
@@ -4522,6 +5361,7 @@ where
             }
         });
 
+        let state_for_task = self.state.clone();
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let task_attempt_capture = attempt_capture.clone();
         let forwarder_abort = forwarder_handle.abort_handle();
@@ -4616,7 +5456,7 @@ where
             }
 
             let attempt_capture = task_attempt_capture;
-            let request = LlmRequest {
+            let mut request = LlmRequest {
                 system,
                 messages,
                 tools,
@@ -4633,23 +5473,166 @@ where
                 cache_key: PromptCacheKey::stable(&conv_id),
             };
 
+            let durable_attempt = if let Some(workflow) = durable_workflow {
+                let durable_request = phoenix_llm::DurableLlmRequest::from_attempt(&request);
+                let request_aggregate = match serde_json::to_string(&durable_request) {
+                    Ok(aggregate) => aggregate,
+                    Err(error) => {
+                        let _ = llm_tx.send(LlmOutcome::NetworkError {
+                            message: format!("failed to encode durable LLM request: {error}"),
+                        });
+                        return;
+                    }
+                };
+                let request_fingerprint = Self::sha256_hex(request_aggregate.as_bytes());
+                match storage
+                    .prepare_and_begin_top_level_llm_attempt(
+                        &phoenix_db::PrepareAndBeginTopLevelLlmInput {
+                            workflow_id: workflow.workflow_id,
+                            committed_at: phoenix_workflow::Timestamp(
+                                u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                            ),
+                            process_incarnation: super::process_incarnation(),
+                            prepared_request: phoenix_workflow::llm_profile::PreparedLlmRequest {
+                                codec_version: phoenix_llm::DURABLE_LLM_REQUEST_CODEC_VERSION,
+                                request_fingerprint,
+                                provider: llm_client.durable_provider(),
+                                model: model_id.clone(),
+                                backend: llm_client.durable_backend(),
+                                request_aggregate,
+                            },
+                        },
+                    )
+                    .await
+                {
+                    Ok(attempt) => Some(attempt),
+                    Err(error) => {
+                        let _ = llm_tx.send(LlmOutcome::NetworkError {
+                            message: format!("failed to prepare durable LLM attempt: {error}"),
+                        });
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(attempt) = durable_attempt.as_ref() {
+                let durable_request: phoenix_llm::DurableLlmRequest = match serde_json::from_str(
+                    &attempt.prepared_request.request_aggregate,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = llm_tx.send(LlmOutcome::NetworkError {
+                            message: format!("failed to decode stored durable LLM request: {error}"),
+                        });
+                        return;
+                    }
+                };
+                request = durable_request.into_attempt(
+                    request
+                        .telemetry
+                        .clone()
+                        .expect("executor LLM requests always carry telemetry"),
+                );
+                let authority = &attempt.authority;
+                let stream_request_id = request_id.clone();
+                let _ = broadcast_tx_for_stream.send_seq(|sequence_id| {
+                    SseEvent::LlmStreamStarted {
+                        sequence_id,
+                        request_id: stream_request_id,
+                        workflow_id: authority.workflow_id.0,
+                        effect_id: authority.effect_id.0,
+                        attempt_id: authority.attempt_id.0,
+                        generation: authority.generation.0,
+                    }
+                });
+            }
+
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
                 Ok(response) => {
                     // Extract tool calls from content and convert to typed ToolCall
+                    if let Some(attempt) = durable_attempt.as_ref() {
+                        let durable_response = phoenix_llm::DurableLlmResponse {
+                            response: response.clone(),
+                        };
+                        let response_aggregate = match serde_json::to_string(&durable_response) {
+                            Ok(aggregate) => aggregate,
+                            Err(error) => {
+                                let _ = llm_tx.send(LlmOutcome::NetworkError {
+                                    message: format!("failed to encode durable LLM response: {error}"),
+                                });
+                                return;
+                            }
+                        };
+                        let response_fingerprint = Self::sha256_hex(response_aggregate.as_bytes());
+                        let tool_intents: Vec<phoenix_db::ToolIntentRecord> = response
+                            .tool_uses()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ordinal, (tool_use_id, tool_name, arguments))| {
+                                phoenix_db::ToolIntentRecord {
+                                    intent_ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                                    status: phoenix_db::ToolIntentStatus::PendingAcceptance,
+                                    tool_name: tool_name.to_string(),
+                                    tool_kind: phoenix_db::ToolKindRecord::Function,
+                                    tool_use_id: tool_use_id.to_string(),
+                                    arguments_json: arguments.to_string(),
+                                }
+                            })
+                            .collect();
+                        loop {
+                            match storage
+                                .accept_complete_top_level_llm_response(
+                                    &phoenix_db::AcceptCompleteLlmResponseInput {
+                                        authority: attempt.authority.clone(),
+                                        delivery_id: None,
+                                        receipt_id: None,
+                                        response: phoenix_workflow::llm_profile::CompleteLlmResponse {
+                                            codec_version: phoenix_llm::DURABLE_LLM_RESPONSE_CODEC_VERSION,
+                                            response_fingerprint: response_fingerprint.clone(),
+                                            response_aggregate: response_aggregate.clone(),
+                                        },
+                                        provider_request_id: Some(request_id.clone()),
+                                        tool_intents: tool_intents.clone(),
+                                        local_delivery_claim: Some(super::process_incarnation()),
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(result)
+                                    if result.outcome
+                                        == phoenix_db::CompleteLlmResponsePersistenceOutcome::RetryablePersistence =>
+                                {
+                                    tokio::time::sleep(Duration::from_millis(25)).await;
+                                }
+                                Ok(result)
+                                    if matches!(
+                                        result.outcome,
+                                        phoenix_db::CompleteLlmResponsePersistenceOutcome::Accepted
+                                            | phoenix_db::CompleteLlmResponsePersistenceOutcome::ExactReplay
+                                    ) => break,
+                                Ok(result) => {
+                                    let _ = llm_tx.send(LlmOutcome::Cancelled);
+                                    tracing::warn!(outcome = ?result.outcome, "durable LLM response lost authority");
+                                    return;
+                                }
+                                Err(error) => {
+                                    let _ = llm_tx.send(LlmOutcome::NetworkError {
+                                        message: format!("failed to persist durable LLM response: {error}"),
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     let tool_calls: Vec<ToolCall> = response
                         .tool_uses()
                         .into_iter()
                         .map(|(id, name, input)| {
-                            let typed_input = if name == "approved_commission_review" {
-                                ToolInput::Malformed {
-                                    name: name.to_string(),
-                                    input: input.clone(),
-                                    error: "approved_commission_review is runtime-only and cannot be emitted by the model".to_string(),
-                                }
-                            } else {
-                                ToolInput::from_name_and_value(name, input.clone())
-                            };
+                            let typed_input =
+                                ToolInput::from_model_name_and_value(name, input.clone());
                             ToolCall::new(id.to_string(), typed_input)
                         })
                         .collect();
@@ -4684,6 +5667,45 @@ where
                     retry_attempt,
                     "LLM attempt completed without finalized metrics"
                 );
+            }
+
+            if let Some(attempt) = durable_attempt.as_ref() {
+                if !matches!(llm_outcome, LlmOutcome::Response { .. }) {
+                    let failure = phoenix_db::RecordTopLevelLlmFailureInput {
+                        authority: attempt.authority.clone(),
+                        observed_at: phoenix_workflow::Timestamp(
+                            u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                        ),
+                        outcome_payload: match phoenix_state_machine::llm_outcome_to_event(
+                            llm_outcome.clone(),
+                            &state_for_task,
+                        ) {
+                            Event::LlmError {
+                                message,
+                                error_kind,
+                                attempt,
+                                recovery_in_progress,
+                                resets_at,
+                            } => serde_json::to_vec(
+                                &phoenix_core::domain::llm_types::DurableLlmFailureEvent {
+                                    codec_version: 1,
+                                    message,
+                                    error_kind,
+                                    attempt,
+                                    recovery_in_progress,
+                                    resets_at,
+                                },
+                            )
+                            .expect("durable LLM failure event has a total codec"),
+                            _ => unreachable!("non-response LLM outcome must map to LlmError"),
+                        },
+                    };
+                    let outcome = record_durable_llm_failure(&storage, &failure).await;
+                    if outcome != phoenix_workflow::AuthorityOutcome::Authorized {
+                        tracing::warn!(?outcome, "durable LLM failure lost authority");
+                        return;
+                    }
+                }
             }
 
             // Task 67004: a terminal UsageLimitReached carries the
@@ -5079,6 +6101,16 @@ where
                 self.storage
                     .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                     .await?;
+                if !self.state.is_busy() {
+                    self.storage
+                        .stop_active_top_level_llm_for_conversation(
+                            &conv_id,
+                            phoenix_workflow::Timestamp(
+                                u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                            ),
+                        )
+                        .await?;
+                }
 
                 // Broadcast the now-durable rows so connected clients render
                 // the assistant message and each tool result. Tool-result
@@ -7828,7 +8860,7 @@ fn render_rejected_tool_call(tool: &ToolCall) -> String {
     }
 }
 
-fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKind {
+pub(crate) fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKind {
     // Explicit match arms — no catch-all. The compiler enforces exhaustiveness.
     match kind {
         phoenix_llm::LlmErrorKind::Auth => crate::db::ErrorKind::Auth,
@@ -8161,8 +9193,189 @@ mod test_git_helpers {
     }
 }
 
-/// Task 24696 Phase 3: verify the `Effect::NotifyContextExhausted` handler
-/// preserves the worktree and does NOT demote `conv_mode`. The old
+#[cfg(test)]
+mod steering_replay_sequence_tests {
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::ConvContext;
+    use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn test_runtime(
+        storage: Arc<InMemoryStorage>,
+        broadcaster: SseBroadcaster,
+        cwd: PathBuf,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let event_tx_dup = mpsc::channel(1).0;
+        ConversationRuntime::new(
+            ConvContext::new("conv", cwd, "test-model", 200_000),
+            ConvState::Idle,
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcaster,
+        )
+    }
+
+    #[tokio::test]
+    async fn durable_failure_recording_retries_transient_persistence_error() {
+        let storage = InMemoryStorage::new();
+        storage.set_failure_record_outcomes([
+            Err("database busy".to_string()),
+            Ok(phoenix_workflow::AuthorityOutcome::Authorized),
+        ]);
+        let failure = phoenix_db::RecordTopLevelLlmFailureInput {
+            authority: phoenix_db::LocalAttemptAuthority {
+                workflow_id: phoenix_workflow::WorkflowId(1),
+                declared_workflow_version: phoenix_workflow::Version(1),
+                generation: phoenix_workflow::Generation(1),
+                effect_id: phoenix_workflow::EffectId(1),
+                attempt_id: phoenix_workflow::AttemptId(1),
+                process_incarnation: phoenix_workflow::ProcessIncarnation(1),
+            },
+            observed_at: phoenix_workflow::Timestamp(1),
+            outcome_payload: Vec::new(),
+        };
+
+        assert_eq!(
+            record_durable_llm_failure(&storage, &failure).await,
+            phoenix_workflow::AuthorityOutcome::Authorized
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_steering_replay_rewinds_unused_sse_sequence() {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_queued_steering_outcome(
+            phoenix_db::PersistQueuedSteeringMessageOutcome::ExactReplay,
+        );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(
+            storage,
+            SseBroadcaster::new(16, 7),
+            temp_dir.path().to_path_buf(),
+        );
+
+        let persisted = runtime
+            .persist_message_effect(
+                MessageContent::user("replayed"),
+                None,
+                None,
+                "steer-id".to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(persisted.is_none());
+        assert_eq!(runtime.broadcast_tx.current_seq(), 7);
+    }
+
+    #[tokio::test]
+    async fn adopted_wake_ownership_survives_non_idle_tool_round() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut runtime = test_runtime(
+            storage,
+            SseBroadcaster::new(16, 0),
+            temp_dir.path().to_path_buf(),
+        );
+        runtime.active_llm_dispatch_ownership = LlmDispatchOwnership::AdoptedWakeBatch;
+
+        runtime
+            .apply_transition_result(crate::state_machine::transition::TransitionResult::new(
+                ConvState::LlmRequesting { attempt: 0 },
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            runtime.active_llm_dispatch_ownership,
+            LlmDispatchOwnership::AdoptedWakeBatch
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_completion_resets_adopted_wake_ownership() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut runtime = test_runtime(
+            storage,
+            SseBroadcaster::new(16, 0),
+            temp_dir.path().to_path_buf(),
+        );
+        runtime.active_llm_dispatch_ownership = LlmDispatchOwnership::AdoptedWakeBatch;
+
+        runtime
+            .apply_transition_result(crate::state_machine::transition::TransitionResult::new(
+                ConvState::Idle,
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            runtime.active_llm_dispatch_ownership,
+            LlmDispatchOwnership::DurableDirectTurn
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_turn_conflict_rewinds_sequence_and_releases_delivery_claim() {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_direct_turn_acceptance_outcome(
+            phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome::Conflict,
+        );
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut runtime = test_runtime(
+            Arc::clone(&storage),
+            SseBroadcaster::new(16, 11),
+            temp_dir.path().to_path_buf(),
+        );
+        let transition = crate::state_machine::transition::TransitionResult {
+            new_state: ConvState::LlmRequesting { attempt: 0 },
+            effects: vec![
+                Effect::PersistMessage {
+                    content: MessageContent::user("accepted"),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: "turn-id".to_string(),
+                    idempotent: false,
+                },
+                Effect::PersistState,
+            ],
+        };
+        let pending = phoenix_db::PendingDirectTurnRuntimeAdmission {
+            workflow_id: phoenix_workflow::WorkflowId(1),
+            conversation_id: "conv".to_string(),
+            client_message_id: "turn-id".to_string(),
+            generation: phoenix_workflow::Generation(1),
+        };
+
+        assert!(runtime
+            .apply_direct_turn_transition(transition, pending)
+            .await
+            .is_err());
+        assert_eq!(runtime.broadcast_tx.current_seq(), 11);
+        assert_eq!(
+            storage.released_direct_turn_deliveries(),
+            vec![("conv".to_string(), "turn-id".to_string())]
+        );
+    }
+}
+
+/// Verify the `Effect::NotifyContextExhausted` handler preserves the worktree
+/// and does NOT demote `conv_mode`. The old
 /// `cleanup_context_exhausted_worktree` path is gone — worktree handoff to a
 /// continuation (REQ-BED-030) or a user-initiated abandon / mark-as-merged
 /// are now the only ways a context-exhausted worktree is removed.
@@ -10510,7 +11723,6 @@ mod steer_drain_detector_tests {
     /// enqueue-during-drain race.
     #[tokio::test]
     async fn clear_steering_queue_entries_preserves_concurrent_enqueue() {
-        use crate::runtime::traits::StateStore;
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-clear-effect",
             ConvState::LlmRequesting { attempt: 1 },
@@ -10518,17 +11730,14 @@ mod steer_drain_detector_tests {
         );
         // Pre-seed storage as if drain took [p1, p2] from in-memory, then a
         // concurrent enqueue persisted [p1, p2, c1] (c1 added by enqueue).
-        storage
-            .update_steering_queue(
-                "conv-clear-effect",
-                &[
-                    mk_entry("p1", "pending-1"),
-                    mk_entry("p2", "pending-2"),
-                    mk_entry("c1", "concurrent"),
-                ],
-            )
-            .await
-            .expect("seed steering queue");
+        storage.set_steering_queue(
+            "conv-clear-effect",
+            vec![
+                mk_entry("p1", "pending-1"),
+                mk_entry("p2", "pending-2"),
+                mk_entry("c1", "concurrent"),
+            ],
+        );
 
         // Drain only removes p1 and p2.
         rt.execute_effect(Effect::ClearSteeringQueueEntries {
@@ -11630,6 +12839,37 @@ mod retry_timer_epoch_tests {
             .await
             .expect("current-generation retry timeout must apply cleanly");
         true
+    }
+
+    #[tokio::test]
+    async fn terminal_llm_error_releases_durable_live_slot() {
+        let mut rt = runtime_requesting();
+        rt.process_event(Event::LlmError {
+            message: "bad credentials".to_string(),
+            error_kind: crate::db::ErrorKind::Auth,
+            attempt: 0,
+            recovery_in_progress: false,
+            resets_at: None,
+        })
+        .await
+        .expect("terminal error transition and durable cleanup");
+
+        assert!(matches!(rt.state, ConvState::Error { .. }));
+        assert_eq!(
+            rt.storage.stopped_top_level_llm(),
+            vec!["conv-retry".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_llm_error_keeps_durable_live_slot() {
+        let mut rt = runtime_requesting();
+        rt.process_event(retryable_llm_error())
+            .await
+            .expect("retryable error transition");
+
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.storage.stopped_top_level_llm().is_empty());
     }
 
     /// A retryable `LlmError` schedules a backoff timer (bumping

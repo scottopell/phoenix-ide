@@ -11,10 +11,10 @@ for user-visible meaning.
 ## Scope
 
 This specification defines the shared durable-workflow engine plus the normative
-wake and conversation-creation profiles. The engine owns crash-spanning execution
-truth for one Phoenix API-server process with one bundled SQLite database and one
-scheduler authority. Profiles own typed domain meaning, external adapters,
-reducer-event mapping, and user projections.
+direct-chat, top-level LLM, wake, and conversation-creation profiles. The engine
+owns crash-spanning execution truth for one Phoenix API-server process with one
+bundled SQLite database and one scheduler authority. Profiles own typed domain
+meaning, external adapters, reducer-event mapping, and user projections.
 
 ## Requirements
 
@@ -349,12 +349,14 @@ conflict decision for that accepted turn.
 EVERY durable direct-chat acceptance lookup, replay, reconciliation, or conflict
 resolution SHALL produce one typed disposition.
 
-The disposition family SHALL distinguish at least RetryableUnaccepted,
-QueuedSteering, RuntimeAccepted, ReplayQueuedSteering,
-ReplayRuntimeAccepted, ConflictingKeyReuse, and TerminalRejected. The profile
-SHALL NOT encode these cases as ambiguous booleans or by omitting fields whose
-absence could mean either replay, steering, conflict, runtime acceptance,
-conflict, or rejection.
+The accepted-turn disposition family SHALL distinguish PendingRuntime,
+QueuedSteering, CancelledSteering, and RuntimeAccepted. A successful submission response SHALL
+separately identify whether that request created the acceptance or replayed an
+existing matching acceptance. Conflicting key reuse and terminal rejection SHALL
+remain typed unaccepted request outcomes rather than accepted-turn lifecycle
+states. The profile SHALL NOT encode these cases as ambiguous booleans or by
+omitting fields whose absence could mean replay, steering, conflict, runtime
+acceptance, or rejection.
 
 ### REQ-DWF-CHAT-004: Same-Key Convergence and Conflict
 
@@ -400,6 +402,15 @@ Secondary effects MAY add typed owed work, typed failure, or typed suppression,
 but they SHALL NOT retroactively revoke, remap, or replace the already accepted
 turn identity or transform accepted into never-accepted.
 
+A successful submission SHALL return after durable acceptance without waiting
+for runtime delivery or recipient LLM completion. Runtime delivery SHALL remain
+recoverable owed work, and failure of an immediate delivery notification SHALL
+NOT reverse or delay the accepted response.
+
+WHEN a terminal provider failure settles the conversation, THE SYSTEM SHALL
+persist the terminal state before stopping the durable turn, suppressing owed
+work, and releasing its live slot.
+
 ### REQ-DWF-CHAT-008: Exact-ID Reconciliation Independent of Transcript Window
 
 WHEN Phoenix reconciles a durable direct-chat turn with runtime or transcript
@@ -410,6 +421,15 @@ message still appearing inside an arbitrary transcript window.
 A missing message in the currently loaded transcript slice SHALL trigger lookup,
 replay, steering, or typed reconciliation by exact identifier rather than a new
 acceptance or a window-relative guess.
+
+Exact-ID reconciliation SHALL report durable acceptance independently from
+transcript materialization. A durably accepted turn that is not yet visible in
+the transcript SHALL NOT be reported as unaccepted or absent.
+
+WHEN an accepted queued-steering turn is cancelled, THE SYSTEM SHALL durably
+tombstone its steering lifecycle while atomically removing its queue row. A
+matching replay SHALL report CancelledSteering and SHALL NOT recreate runtime or
+queue delivery.
 
 ### REQ-DWF-CHAT-009: Independent Non-Atomic Fan-Out
 
@@ -451,6 +471,139 @@ transcript window.
 The verification SHALL prove that acceptance identity, typed disposition,
 fingerprint comparison, runtime reconciliation, target-local runtime arbitration,
 and independent multi-target fan-out remain stable under those schedules.
+
+## Top-Level LLM Profile
+
+### REQ-DWF-LLM-001: Complete Top-Level Turn Coverage
+
+WHEN a non-sub-agent conversation runtime requires an LLM call for an accepted
+user turn, tool-result continuation, restart continuation, subsequent planning
+step, or final response
+THE SYSTEM SHALL execute that call as a durable top-level LLM effect under one
+uniform workflow contract for every configured provider and compatible endpoint.
+
+Sub-agent conversations, commissioned reviews, naming, summarization, and other
+internal or helper LLM consumers SHALL remain outside this profile unless they
+adopt a separately specified durable profile. Provider-specific transports MAY
+differ, but none SHALL silently route a covered call through legacy direct
+execution.
+
+### REQ-DWF-LLM-002: Stable Effect Identity and Immutable Prepared Request
+
+BEFORE dispatching a covered provider request
+THE top-level LLM profile SHALL durably bind a stable effect identity to the exact
+accepted turn identity, turn generation, and monotonically assigned LLM-call
+ordinal within that turn.
+
+The profile SHALL persist an immutable versioned prepared-request aggregate and
+its fingerprint, including the selected provider, model, backend, messages,
+tools, and request options that determine provider behavior. An attempt SHALL
+reference that exact effect and prepared request and SHALL be durably created
+before provider dispatch.
+
+### REQ-DWF-LLM-003: Safe Repeat After Unknown Attempt Outcome
+
+WHEN process loss leaves a provider attempt without a durably accepted terminal
+receipt
+THE scheduler SHALL automatically create another attempt for the same effect and
+immutable prepared request without asking the user to retry.
+
+The profile SHALL classify this execution capability as safely repeatable at the
+product boundary: multiple provider submissions and charges MAY occur after an
+ambiguous process failure, but at most one complete response SHALL become the
+durably accepted terminal receipt for the effect. A known provider error SHALL
+continue through the provider's declared error classification and retry policy.
+
+### REQ-DWF-LLM-004: Complete Response Receipt Precedes Product Meaning
+
+WHEN a provider returns a complete response for an authoritative attempt
+THE SYSTEM SHALL persist that complete response as the effect's terminal typed
+receipt before the response may change conversation state, become accepted
+transcript content, authorize tool intent, or dispatch a tool.
+
+IF receipt persistence is temporarily unavailable while the process still holds
+the complete response
+THE SYSTEM SHALL retry persistence of that same response without submitting
+another provider attempt.
+
+IF a terminal response receipt already exists
+THE SYSTEM SHALL reuse that receipt for recovery and product acceptance and SHALL
+NOT submit another provider request for that effect.
+
+### REQ-DWF-LLM-005: Atomic Product Acceptance and Durable Tool Intent
+
+WHEN the product reducer accepts a complete response receipt
+THE SYSTEM SHALL atomically commit the accepted assistant response or checkpoint,
+the next conversation state, the exact canonical-delivery and runtime-acceptance
+disposition, and every normalized tool intent contained in the response.
+
+Each tool call SHALL be an addressable durable child intent with stable identity,
+ordinal, tool name, and immutable input. Tool intent SHALL NOT be represented only
+as an array inside a response blob. Accepted assistant content SHALL be broadcast
+and tools SHALL be dispatched only after this transaction commits.
+
+### REQ-DWF-LLM-006: Conservative Tool Dispatch Boundary
+
+WHEN a committed tool intent has no evidence that execution may have begun
+THE SYSTEM SHALL permit post-commit dispatch through the existing tool executor.
+
+WHEN process loss occurs after tool execution may have begun
+THE SYSTEM SHALL NOT blindly redispatch the tool. It SHALL use the existing
+interrupted-tool materialization and restart continuation so the next covered LLM
+call can inspect and reconcile the observable result. This profile SHALL NOT
+claim universal exactly-once tool execution.
+
+### REQ-DWF-LLM-007: Ephemeral Attempt-Correlated Streaming
+
+WHILE a provider attempt streams partial output
+THE SYSTEM MAY expose that output as temporary progress correlated to the exact
+effect and attempt, but SHALL NOT treat it as accepted transcript authority or as
+proof of provider completion.
+
+WHEN an attempt is abandoned after process loss or replacement
+THE SYSTEM SHALL remove or supersede its partial stream before exposing output
+from a later attempt. It SHALL NOT append fragments from different attempts,
+preserve abandoned partial output as a separate final assistant answer, or admit
+partial output into persisted transcript history.
+
+### REQ-DWF-LLM-008: Durable Stop Fences Late Outcomes
+
+WHEN the conversation reducer accepts Stop for a covered turn
+THE SYSTEM SHALL durably advance the turn generation and revoke all authority held
+by prior-generation attempts before cancellation is reported as accepted.
+
+A complete response may acquire product meaning only when its receipt and product
+acceptance commit before the Stop transaction. Once Stop commits, a late
+prior-generation response MAY be retained as non-authoritative diagnostic
+evidence, but SHALL NOT become transcript content, create accepted tool intents,
+dispatch tools, or resurrect the cancelled turn after restart.
+
+### REQ-DWF-LLM-009: Legacy Cutover Without Inferred History
+
+WHEN software introducing this profile starts
+THE SYSTEM SHALL route every new covered LLM call through durable effect
+acceptance immediately. A legacy LLM request that was already in flight SHALL be
+treated as interrupted or lost and MAY be replaced by the existing restart
+auto-continuation, whose LLM call becomes the first durable effect.
+
+Legacy in-flight tool rounds SHALL use existing interrupted-tool recovery. The
+SYSTEM SHALL NOT infer or synthesize durable workflow history for work that began
+under legacy execution, wait for all conversations to drain before serving, or
+retain a silent legacy fallback for new covered calls.
+
+### REQ-DWF-LLM-010: Crash, Contention, Provider, and Cancellation Verification
+
+WHEN the top-level LLM profile is verified
+THE SYSTEM SHALL use real SQLite files and independent connections where lock and
+restart behavior matters and SHALL cover receipt-persistence contention, crash
+before receipt, crash after receipt but before product acceptance, crash after
+acceptance but before tool dispatch, crash after tool execution may have begun,
+both Stop transaction orderings, and partial-stream replacement.
+
+A common contract suite SHALL cover representative Anthropic Messages, OpenAI
+Responses, Codex WebSocket bridge, configured compatible-endpoint, and
+deterministic mock adapters without requiring provider-level exactly-once
+capability.
 
 ### REQ-DWF-039: Typed Profile Migrations Prevent Silent Loss
 
@@ -661,5 +814,6 @@ authority:
 - REQ-DWF-022 Deprecated — shadow/drain client-boundary semantics superseded by REQ-DWF-029 through REQ-DWF-042
 
 Current normative authority is REQ-DWF-017, REQ-DWF-029 through REQ-DWF-042,
-REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005, and REQ-DWF-CREATE-001 through
-REQ-DWF-CREATE-005 as defined in this document.
+REQ-DWF-CHAT-001 through REQ-DWF-CHAT-011, REQ-DWF-LLM-001 through
+REQ-DWF-LLM-010, REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005, and
+REQ-DWF-CREATE-001 through REQ-DWF-CREATE-005 as defined in this document.

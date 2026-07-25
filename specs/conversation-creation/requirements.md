@@ -52,6 +52,9 @@ WHEN provisioning submits an initial message
 THE SYSTEM SHALL transition directly from provisioning into the normal conversation lifecycle through an idempotent bootstrap operation
 AND the system SHALL NOT temporarily persist an idle conversation solely to initialize a runtime
 
+WHEN runtime bootstrap remains pending after worker failure or process restart
+THE SYSTEM SHALL recover it through the current creation-job claim and SHALL NOT replay the creation-owned message as an ordinary direct-chat turn
+
 ### REQ-CCR-007: Cancellation
 
 WHEN a user cancels an accepted, claimed, or retry-scheduled creation

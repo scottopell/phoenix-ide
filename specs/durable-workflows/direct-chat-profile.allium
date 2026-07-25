@@ -11,6 +11,7 @@
 -- REQ-DWF-CHAT-011.
 
 use "./durable-workflows.allium" as dwf
+use "./llm-profile.allium" as llm
 
 ------------------------------------------------------------
 -- Types
@@ -25,13 +26,11 @@ enum DirectChatRejectReason {
 enum PayloadSourceKind { inline_text | inline_file_reference | skill_invocation }
 enum RuntimeSlotStatus { idle | accepted }
 enum ConsumerProgressStatus { owed | in_progress | delivered | failed | suppressed }
-enum CommittedOutcomeKind { RuntimeAccepted | QueuedSteering }
-enum DirectChatOutcomeKind {
-    RetryableUnaccepted
-    | RuntimeAccepted
-    | QueuedSteering
-    | ReplayRuntimeAccepted
-    | ReplayQueuedSteering
+enum CommittedOutcomeKind { PendingRuntime | RuntimeAccepted | QueuedSteering | CancelledSteering }
+enum RequestResultKind {
+    Created
+    | Replayed
+    | RetryableUnaccepted
     | ConflictingKeyReuse
     | TerminalRejected
 }
@@ -71,19 +70,18 @@ value AcceptedTurnRef {
 
 value CommittedOutcome {
     kind: CommittedOutcomeKind
+    pending_runtime: AcceptedTurnRef? when kind = PendingRuntime
     runtime_accepted: AcceptedTurnRef? when kind = RuntimeAccepted
     queued_steering: AcceptedTurnRef? when kind = QueuedSteering
+    cancelled_steering: AcceptedTurnRef? when kind = CancelledSteering
 }
 
 value DirectChatOutcome {
-    kind: DirectChatOutcomeKind
-    retryable_unaccepted: TargetBoundTurnKey? when kind = RetryableUnaccepted
-    runtime_accepted: AcceptedTurnRef? when kind = RuntimeAccepted
-    queued_steering: AcceptedTurnRef? when kind = QueuedSteering
-    replay_runtime_accepted: AcceptedTurnRef? when kind = ReplayRuntimeAccepted
-    replay_queued_steering: AcceptedTurnRef? when kind = ReplayQueuedSteering
-    conflicting_key_reuse: PreparedTurnFingerprint? when kind = ConflictingKeyReuse
-    terminal_rejected: DirectChatRejectReason? when kind = TerminalRejected
+    request_result: RequestResultKind
+    committed_outcome: CommittedOutcome? when request_result = Created or request_result = Replayed
+    retryable_unaccepted: TargetBoundTurnKey? when request_result = RetryableUnaccepted
+    conflicting_key_reuse: PreparedTurnFingerprint? when request_result = ConflictingKeyReuse
+    terminal_rejected: DirectChatRejectReason? when request_result = TerminalRejected
 }
 
 ------------------------------------------------------------
@@ -104,6 +102,7 @@ entity DirectChatAcceptance {
     committed_outcome: CommittedOutcome?
     runtime_delivery: dwf/Delivery?
     runtime_acceptance: dwf/RuntimeAcceptance?
+    llm_turn: llm/TopLevelLlmTurn?
     accepted_at: Timestamp
 }
 
@@ -150,7 +149,7 @@ entity DirectChatConsumerCursor {
 -- same_key_existing_acceptance(turn_key), fingerprints_match(left, right)
 -- conflicting_fingerprint(existing_acceptance), runtime_slot_for(resolved_target), slot_is_available(slot)
 -- canonical_delivery_for(acceptance), runtime_acceptance_for(delivery), runtime_identity_matches_acceptance(acceptance, runtime_acceptance)
--- committed_outcome_for(acceptance), replay_of(outcome), steering_target_matches_successor(acceptance)
+-- committed_outcome_for(acceptance), created_with(outcome), replayed_with(outcome), steering_target_matches_successor(acceptance)
 -- target_can_accept_runtime(resolved_target), queued_steering_ref(acceptance), runtime_accepted_ref(acceptance)
 -- consumer_cursor_for(acceptance, consumer_kind), cursor_progress_is_secondary_only(cursor)
 -- exact_acceptance_lookup(turn_key), transcript_window_lookup_is_non_authoritative(turn_key)
@@ -162,8 +161,10 @@ entity DirectChatConsumerCursor {
 -- restart_preserves_committed_outcome(turn_key), runtime_steering_is_monotonic(acceptance)
 -- terminal_rejected_outcome(request), prepared_event_emitted(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
 -- retryable_unaccepted_outcome(turn_key), conflicting_key_reuse_outcome(prepared_fingerprint)
--- runtime_accepted_outcome(accepted_turn), queued_steering_outcome(accepted_turn)
--- replay_runtime_accepted_outcome(accepted_turn), replay_queued_steering_outcome(accepted_turn)
+-- pending_runtime_outcome(accepted_turn), runtime_accepted_outcome(accepted_turn), queued_steering_outcome(accepted_turn)
+-- response_returns_after_durable_acceptance(acceptance), runtime_delivery_remains_owed(acceptance)
+-- acceptance_disposition_for(turn_key), transcript_materialization_for(turn_key), reconciliation_separates_acceptance_and_materialization(turn_key)
+-- top_level_llm_turn_for(acceptance), llm_turn_matches_exact_acceptance(acceptance)
 -- independent_prepared_events_emitted(request, targets)
 
 ------------------------------------------------------------
@@ -204,6 +205,13 @@ invariant RuntimeAcceptanceMatchesExactAcceptedTurn {
     -- Runtime acceptance, when present, always references the exact accepted turn
     -- identity rather than a transcript offset, pagination window, or latest-
     -- message guess.
+    true
+}
+
+invariant TopLevelLlmTurnMatchesDurableAcceptance {
+    -- A runtime-accepted direct-chat turn creates one top-level LLM turn bound
+    -- to the exact durable acceptance identity and generation. Subsequent LLM
+    -- calls in that turn use the LLM profile rather than legacy execution.
     true
 }
 
@@ -258,12 +266,15 @@ rule NewAcceptanceBeginsRetryableUntilCommittedOutcomeExists {
         prepared_payload: prepared_payload,
         prepared_fingerprint: prepared_fingerprint,
         accepted_turn: AcceptedTurnRef{workflow_id: next_workflow_id(), canonical_delivery_id: null},
-        committed_outcome: null,
+        committed_outcome: CommittedOutcome{kind: PendingRuntime, pending_runtime: AcceptedTurnRef{workflow_id: next_workflow_id(), canonical_delivery_id: null}},
         runtime_delivery: null,
         runtime_acceptance: null,
+        llm_turn: null,
         accepted_at: now()
     )
-    ensures: retryable_unaccepted_outcome(turn_key)
+    ensures: created_with(CommittedOutcome{kind: PendingRuntime, pending_runtime: AcceptedTurnRef{workflow_id: next_workflow_id(), canonical_delivery_id: null}})
+    ensures: response_returns_after_durable_acceptance(same_key_existing_acceptance(turn_key))
+    ensures: runtime_delivery_remains_owed(same_key_existing_acceptance(turn_key))
 }
 
 rule SameKeyReplayReturnsExistingCommittedOutcome {
@@ -275,7 +286,7 @@ rule SameKeyReplayReturnsExistingCommittedOutcome {
     let acceptance = same_key_existing_acceptance(turn_key)
     let outcome = committed_outcome_for(acceptance)
 
-    ensures: replay_of(outcome)
+    ensures: replayed_with(outcome)
 }
 
 rule SameKeyConflictRejectsDifferentPreparedFingerprint {
@@ -288,7 +299,7 @@ rule SameKeyConflictRejectsDifferentPreparedFingerprint {
 
 rule RuntimeAcceptanceWinsThePerTargetSlot {
     when: RuntimeAdmissionRequested(acceptance)
-    requires: acceptance.committed_outcome = null
+    requires: acceptance.committed_outcome.kind = PendingRuntime
     requires: runtime_admission_is_per_target(acceptance.resolved_target)
     requires: runtime_slot_for(acceptance.resolved_target) = null or slot_is_available(runtime_slot_for(acceptance.resolved_target))
 
@@ -302,19 +313,21 @@ rule RuntimeAcceptanceWinsThePerTargetSlot {
     )
     ensures: acceptance.runtime_delivery = delivery
     ensures: acceptance.runtime_acceptance = runtime_acceptance
+    ensures: acceptance.llm_turn = top_level_llm_turn_for(acceptance)
+    ensures: llm_turn_matches_exact_acceptance(acceptance)
     ensures: acceptance.committed_outcome = CommittedOutcome{kind: RuntimeAccepted, runtime_accepted: runtime_accepted_ref(acceptance)}
-    ensures: runtime_accepted_outcome(runtime_accepted_ref(acceptance))
+    ensures: created_with(acceptance.committed_outcome)
 }
 
 rule RuntimeContentionQueuesSteeringWithoutRevokingAcceptance {
     when: RuntimeAdmissionRequested(acceptance)
-    requires: acceptance.committed_outcome = null
+    requires: acceptance.committed_outcome.kind = PendingRuntime
     requires: runtime_admission_is_per_target(acceptance.resolved_target)
     requires: runtime_slot_for(acceptance.resolved_target) != null
     requires: not slot_is_available(runtime_slot_for(acceptance.resolved_target))
 
     ensures: acceptance.committed_outcome = CommittedOutcome{kind: QueuedSteering, queued_steering: queued_steering_ref(acceptance)}
-    ensures: queued_steering_outcome(queued_steering_ref(acceptance))
+    ensures: created_with(acceptance.committed_outcome)
 }
 
 rule ReplayReturnsQueuedSteeringAfterCommittedQueueOutcome {
@@ -323,7 +336,7 @@ rule ReplayReturnsQueuedSteeringAfterCommittedQueueOutcome {
     requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
     requires: committed_outcome_for(same_key_existing_acceptance(turn_key)).kind = QueuedSteering
 
-    ensures: replay_queued_steering_outcome(queued_steering_ref(same_key_existing_acceptance(turn_key)))
+    ensures: replayed_with(committed_outcome_for(same_key_existing_acceptance(turn_key)))
 }
 
 rule ReplayReturnsRuntimeAcceptedAfterCommittedRuntimeOutcome {
@@ -332,7 +345,17 @@ rule ReplayReturnsRuntimeAcceptedAfterCommittedRuntimeOutcome {
     requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
     requires: committed_outcome_for(same_key_existing_acceptance(turn_key)).kind = RuntimeAccepted
 
-    ensures: replay_runtime_accepted_outcome(runtime_accepted_ref(same_key_existing_acceptance(turn_key)))
+    ensures: replayed_with(committed_outcome_for(same_key_existing_acceptance(turn_key)))
+}
+
+rule CancelledSteeringCannotReplayAsQueued {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+    requires: committed_outcome_for(same_key_existing_acceptance(turn_key)).kind = CancelledSteering
+
+    ensures: replayed_with(committed_outcome_for(same_key_existing_acceptance(turn_key)))
+    ensures: not runtime_delivery_remains_owed(same_key_existing_acceptance(turn_key))
 }
 
 rule SteeringConversionPreservesAcceptedIdentity {
@@ -349,6 +372,9 @@ rule ExactIdLookupReconcilesOutsideTranscriptWindows {
     requires: exact_acceptance_lookup(turn_key) != null
 
     ensures: replay_finds_exact_turn(turn_key)
+    ensures: acceptance_disposition_for(turn_key)
+    ensures: transcript_materialization_for(turn_key)
+    ensures: reconciliation_separates_acceptance_and_materialization(turn_key)
 }
 
 rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
@@ -381,14 +407,19 @@ surface DirectChatDispositionSurface {
         DirectChatOutcome
 
     @guarantee TypedOutcomeFamily
-        -- A lookup or replay yields exactly one typed outcome from the closed
-        -- family RetryableUnaccepted, RuntimeAccepted, QueuedSteering,
-        -- ReplayRuntimeAccepted, ReplayQueuedSteering, ConflictingKeyReuse, or
-        -- TerminalRejected.
+        -- A successful submission reports Created or Replayed separately from
+        -- the durable PendingRuntime, RuntimeAccepted, QueuedSteering, or
+        -- CancelledSteering
+        -- disposition. Conflict and terminal rejection remain unaccepted request
+        -- outcomes rather than accepted-turn lifecycle states.
 
     @guarantee ExactIdAuthority
         -- Lookup is keyed by the target-bound message identity. Transcript window
         -- position is never authoritative for replay or conflict decisions.
+
+    @guarantee AcceptanceAndMaterializationAreIndependent
+        -- Exact-ID reconciliation reports durable acceptance separately from
+        -- whether the user message has materialized in the transcript.
 }
 
 surface DirectChatCrashAndRaceVerification {

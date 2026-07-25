@@ -25,6 +25,36 @@ use crate::domain::sm_state::{
 };
 use std::collections::HashMap;
 
+pub const PREPARED_DIRECT_TURN_CODEC_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreparedDirectTurn {
+    pub codec_version: u32,
+    pub expand_references: bool,
+    pub text: String,
+    pub llm_text: Option<String>,
+    pub images: Vec<ImageData>,
+    pub files: Vec<FileAttachment>,
+    pub message_id: String,
+    pub user_agent: Option<String>,
+    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+}
+
+impl PreparedDirectTurn {
+    #[must_use]
+    pub fn into_event(self) -> Event {
+        Event::UserMessage {
+            text: self.text,
+            llm_text: self.llm_text,
+            images: self.images,
+            files: self.files,
+            message_id: self.message_id,
+            user_agent: self.user_agent,
+            skill_invocation: self.skill_invocation,
+        }
+    }
+}
+
 /// Events that trigger state transitions
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -239,6 +269,19 @@ pub enum Event {
     /// already-adopted turn without persisting another message or state row.
     WakeBatchAdopted,
 
+    /// Internal recovery edge for a direct turn whose accepting message and
+    /// `LlmRequesting` state committed before its LLM effect was prepared.
+    ResumeDurableLlmRequest,
+
+    /// Internal recovery edge for an owed durable tool intent whose accepted
+    /// LLM response is already reflected in persisted `ToolExecuting` state.
+    ResumeDurableToolExecution,
+
+    ResumeDurableLlmFailure {
+        failure: crate::domain::llm_types::DurableLlmFailureEvent,
+        authority: crate::domain::llm_types::DurableLlmFailureAuthority,
+    },
+
     /// Sent by `RuntimeManager::evict_runtime` (e.g. after a model upgrade)
     /// to cleanly terminate a running runtime that is being replaced.
     /// The executor returns from `run()` immediately on receipt, which drops
@@ -283,6 +326,9 @@ impl Event {
             Event::CancelSteerMessage { .. } => "CancelSteerMessage",
             Event::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
             Event::WakeBatchAdopted => "WakeBatchAdopted",
+            Event::ResumeDurableLlmRequest => "ResumeDurableLlmRequest",
+            Event::ResumeDurableToolExecution => "ResumeDurableToolExecution",
+            Event::ResumeDurableLlmFailure { .. } => "ResumeDurableLlmFailure",
             Event::Shutdown => "Shutdown",
         }
     }
@@ -597,6 +643,9 @@ impl TryFrom<Event> for ParentEvent {
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
             | Event::WakeBatchAdopted
+            | Event::ResumeDurableLlmRequest
+            | Event::ResumeDurableToolExecution
+            | Event::ResumeDurableLlmFailure { .. }
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "ParentEvent",
@@ -728,6 +777,9 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::CancelSteerMessage { .. }
             | Event::SteerDrainedUserMessages { .. }
             | Event::WakeBatchAdopted
+            | Event::ResumeDurableLlmRequest
+            | Event::ResumeDurableToolExecution
+            | Event::ResumeDurableLlmFailure { .. }
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",
@@ -821,5 +873,32 @@ mod spec_runtime_name_alignment_tests {
         };
         let parent_event = ParentEvent::Parent(parent_only);
         assert_eq!(parent_event.variant_name(), "TaskApprovalDecided");
+    }
+}
+
+#[cfg(test)]
+mod prepared_direct_turn_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_direct_turn_round_trips_and_rebuilds_user_event() {
+        let prepared = PreparedDirectTurn {
+            codec_version: PREPARED_DIRECT_TURN_CODEC_VERSION,
+            expand_references: true,
+            text: "hello".to_string(),
+            llm_text: Some("expanded hello".to_string()),
+            images: vec![],
+            files: vec![],
+            message_id: "message-1".to_string(),
+            user_agent: Some("test".to_string()),
+            skill_invocation: None,
+        };
+        let encoded = serde_json::to_vec(&prepared).unwrap();
+        let decoded: PreparedDirectTurn = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, prepared);
+        assert!(matches!(
+            decoded.into_event(),
+            Event::UserMessage { message_id, .. } if message_id == "message-1"
+        ));
     }
 }

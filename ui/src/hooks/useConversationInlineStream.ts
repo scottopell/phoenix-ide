@@ -7,6 +7,7 @@ import {
   SseInitDataSchema,
   SseLlmAttemptDataSchema,
   SseLlmFirstByteDataSchema,
+  SseLlmStreamStartedDataSchema,
   SseConversationBecameTerminalDataSchema,
   SseConversationHardDeletedDataSchema,
   SseConversationUpdateDataSchema,
@@ -243,6 +244,25 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         if (!isAgentWorking(phase)) {
           closeSource();
         }
+      });
+
+      source.addEventListener('llm_stream_started', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseLlmStreamStartedDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_llm_stream_started',
+            sequenceId: res.output.sequence_id,
+            requestId: res.output.request_id,
+            workflowId: res.output.workflow_id,
+            effectId: res.output.effect_id,
+            attemptId: res.output.attempt_id,
+            generation: res.output.generation,
+          },
+        });
       });
 
       source.addEventListener('llm_first_byte', (event) => {

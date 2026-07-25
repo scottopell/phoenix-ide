@@ -196,6 +196,18 @@ describe('useMessageQueue', () => {
     });
   });
 
+  it('marks a steering-queued POST with its phase watermark', () => {
+    seed('conv-1', { localId: 'steering' });
+    const { result } = renderHook(() => useMessageQueue('conv-1'));
+
+    act(() => result.current.markSteeringQueued('steering', 23));
+
+    expect(result.current.queuedMessages[0]).toMatchObject({
+      status: 'steering_queued',
+      acceptedAfterEventSeq: 23,
+    });
+  });
+
   it('compacts entries observed in authoritative history from state and storage', () => {
     seed('conv-1', { localId: 'echoed' }, { localId: 'waiting' });
     const { result } = renderHook(() => useMessageQueue('conv-1'));

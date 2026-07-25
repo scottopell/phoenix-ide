@@ -2023,6 +2023,11 @@ impl WakeRepository {
                           AND (d.status = 'Pending' OR d.runtime_acceptance_status = 'Owed')
                     )
                   )
+                UNION ALL
+                SELECT 1 FROM direct_turn_acceptances a
+                WHERE a.conversation_id = ?1
+                  AND a.live_slot = 1
+                  AND a.committed_outcome IN ('PendingRuntime', 'RuntimeAccepted')
              )",
         )
         .bind(conversation_id)
@@ -2510,7 +2515,7 @@ impl WakeRepository {
     }
 
     pub async fn transfer(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
-        for _ in 0..5 {
+        for _ in 0..20 {
             match self.transfer_once(input).await {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
                     if super::is_sqlite_busy_retryable(error.as_ref()) =>
@@ -7652,6 +7657,37 @@ mod tests {
         assert!(pending_original.is_empty());
         let pending_original_restarted = restarted.list_pending("conv-1").await.unwrap();
         assert!(pending_original_restarted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_direct_turn_counts_as_owed_work() {
+        let (_dir, repo, _restarted) = open_repo_pair().await;
+        let outcome = WorkflowRepository::new(repo.workflow_repo.pool.clone())
+            .accept_direct_turn(&crate::workflow::llm::DirectTurnAcceptanceInput {
+                initial_outcome: crate::workflow::llm::DirectTurnInitialOutcome::PendingRuntime,
+                conversation_id: "conv-1".to_string(),
+                client_message_id: "pending-message".to_string(),
+                prepared_fingerprint: "pending-fingerprint".to_string(),
+                prepared_payload: "{}".to_string(),
+                accepted_at: Timestamp(1),
+                snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                    turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                        conversation_id: "conv-1".to_string(),
+                        accepted_turn_id: "pending-message".to_string(),
+                        generation: 0,
+                    },
+                    accepted_assistant_message_id: None,
+                    stopped_at: None,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::workflow::llm::DirectTurnAcceptanceOutcome::Created(_)
+        ));
+
+        assert!(repo.has_owed_work_for_conversation("conv-1").await.unwrap());
     }
 
     #[tokio::test]

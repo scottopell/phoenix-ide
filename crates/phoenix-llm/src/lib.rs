@@ -506,6 +506,38 @@ mod logging_tests {
     use super::*;
     use crate::mock::MockLlmService;
 
+    struct ImmediateProbe;
+
+    #[async_trait]
+    impl LlmService for ImmediateProbe {
+        async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: "ok".to_string(),
+                }],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+
+        async fn complete_streaming(
+            &self,
+            request: &LlmRequest,
+            chunk_tx: &mpsc::Sender<TokenChunk>,
+        ) -> Result<LlmResponse, LlmError> {
+            chunk_tx
+                .send(TokenChunk::Text("ok".to_string()))
+                .await
+                .unwrap();
+            self.complete(request).await
+        }
+
+        fn model_id(&self) -> &'static str {
+            "probe"
+        }
+    }
+
     #[test]
     fn logging_transport_matches_the_actual_call_path() {
         let http =
@@ -521,5 +553,44 @@ mod logging_tests {
         let mock = LoggingService::new(Arc::new(MockLlmService), "mock", LlmTransport::InProcess);
         assert_eq!(mock.fallback_transport_for(false), LlmTransport::InProcess);
         assert_eq!(mock.fallback_transport_for(true), LlmTransport::InProcess);
+    }
+
+    #[tokio::test]
+    async fn provider_families_share_complete_and_streaming_contracts() {
+        use crate::types::{ContentBlock, LlmMessage, MessageRole, PromptCacheKey};
+
+        let request = LlmRequest {
+            system: vec![],
+            messages: vec![LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "[[scenario:plain_text]]".to_string(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            telemetry: None,
+            cache_key: PromptCacheKey::ephemeral(),
+        };
+        for (provider, streaming_transport) in [
+            ("anthropic", LlmTransport::HttpSse),
+            ("openai", LlmTransport::Websocket),
+            ("configured_endpoint", LlmTransport::HttpSse),
+            ("mock", LlmTransport::InProcess),
+        ] {
+            let service =
+                LoggingService::new(Arc::new(ImmediateProbe), provider, streaming_transport);
+            assert!(
+                service.complete(&request).await.is_ok(),
+                "{provider} complete"
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+            assert!(
+                service.complete_streaming(&request, &tx).await.is_ok(),
+                "{provider} complete_streaming"
+            );
+            drop(tx);
+            assert!(rx.recv().await.is_some(), "{provider} emitted no stream");
+        }
     }
 }

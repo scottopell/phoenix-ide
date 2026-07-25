@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::send_chat_service::{SendChatApplicationService, SendChatRequest, SendChatServiceError};
+use crate::send_chat_service::{
+    SendChatApplicationService, SendChatDisposition, SendChatRequest, SendChatRequestResult,
+    SendChatServiceError,
+};
 use crate::tools::{Tool, ToolContext, ToolOutput};
 
 pub(crate) fn tools(
@@ -39,15 +42,12 @@ struct SendConversationMessageInput {
 #[derive(Debug, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum SendConversationMessageOutput {
-    Delivered {
+    Accepted {
         target: String,
         conversation_id: String,
         message_id: String,
-    },
-    QueuedAsSteering {
-        target: String,
-        conversation_id: String,
-        message_id: String,
+        request_result: SendChatRequestResult,
+        disposition: SendChatDisposition,
     },
     Rejected {
         target: Option<String>,
@@ -217,21 +217,17 @@ impl Tool for SendConversationMessage {
             expansion_policy: crate::send_chat_service::MessageExpansionPolicy::LiteralText,
         };
         let output = match self.send_chat.send(request).await {
-            Ok(
-                crate::send_chat_service::SendChatOutcome::Delivered
-                | crate::send_chat_service::SendChatOutcome::AlreadyPersisted,
-            ) => SendConversationMessageOutput::Delivered {
+            Ok(crate::send_chat_service::SendChatOutcome::Accepted {
+                message_id,
+                request_result,
+                disposition,
+            }) => SendConversationMessageOutput::Accepted {
                 target: parsed.target,
                 conversation_id: conversation_id.clone(),
-                message_id: parsed.message_id.clone(),
+                message_id,
+                request_result,
+                disposition,
             },
-            Ok(crate::send_chat_service::SendChatOutcome::QueuedAsSteering) => {
-                SendConversationMessageOutput::QueuedAsSteering {
-                    target: parsed.target,
-                    conversation_id: conversation_id.clone(),
-                    message_id: parsed.message_id.clone(),
-                }
-            }
             Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, code }) => {
                 SendConversationMessageOutput::Rejected {
                     target: Some(parsed.target),
@@ -263,8 +259,7 @@ impl Tool for SendConversationMessage {
 impl SendConversationMessageOutput {
     fn kind(&self) -> &'static str {
         match self {
-            Self::Delivered { .. } => "delivered",
-            Self::QueuedAsSteering { .. } => "queued_as_steering",
+            Self::Accepted { .. } => "accepted",
             Self::Rejected { .. } => "rejected",
         }
     }
@@ -307,5 +302,58 @@ fn result(value: Result<String, String>) -> ToolOutput {
     match value {
         Ok(value) => ToolOutput::success(value),
         Err(error) => ToolOutput::error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_output_serializes_with_request_result_and_disposition() {
+        let output = SendConversationMessageOutput::Accepted {
+            target: "@conv:abc".to_string(),
+            conversation_id: "conv-123".to_string(),
+            message_id: "msg-123".to_string(),
+            request_result: SendChatRequestResult::Created,
+            disposition: SendChatDisposition::QueuedSteering,
+        };
+
+        let value = serde_json::to_value(output).expect("serialize accepted output");
+        assert_eq!(
+            value,
+            json!({
+                "outcome": "accepted",
+                "target": "@conv:abc",
+                "conversation_id": "conv-123",
+                "message_id": "msg-123",
+                "request_result": "created",
+                "disposition": "queued_steering"
+            })
+        );
+    }
+
+    #[test]
+    fn rejected_output_serializes_as_rejected_metadata() {
+        let output = SendConversationMessageOutput::Rejected {
+            target: Some("@conv:abc".to_string()),
+            conversation_id: Some("conv-123".to_string()),
+            message_id: "msg-123".to_string(),
+            reason_code: "dispatch_failed",
+            message: "dispatch failed: timeout".to_string(),
+        };
+
+        let value = serde_json::to_value(output).expect("serialize rejected output");
+        assert_eq!(
+            value,
+            json!({
+                "outcome": "rejected",
+                "target": "@conv:abc",
+                "conversation_id": "conv-123",
+                "message_id": "msg-123",
+                "reason_code": "dispatch_failed",
+                "message": "dispatch failed: timeout"
+            })
+        );
     }
 }

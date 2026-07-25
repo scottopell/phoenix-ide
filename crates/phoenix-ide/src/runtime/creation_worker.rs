@@ -12,6 +12,7 @@ use fs2::FileExt;
 use phoenix_core::domain::creation_protocol::{
     CreationClaimToken, CreationStatus, CreationWorkerId,
 };
+use sha2::Digest as _;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -619,8 +620,37 @@ async fn provision_conversation(
         && intent.text.trim().is_empty()
         && images.is_empty()
         && files.is_empty();
+    let creation_message_id = job.message_id.as_deref();
+    let repo = phoenix_db::WorkflowRepository::new(manager.db().pool().clone());
+    let existing_initial_acceptance = if let Some(message_id) = creation_message_id {
+        repo.load_direct_turn_acceptance(&job.conversation_id, message_id)
+            .await
+            .map_err(|error| (error.to_string(), ErrorKind::ServerError))?
+    } else {
+        None
+    };
+    let stored_prepared_turn = existing_initial_acceptance
+        .as_ref()
+        .map(|existing| {
+            serde_json::from_str::<phoenix_core::domain::sm_event::PreparedDirectTurn>(
+                &existing.prepared_payload,
+            )
+            .map_err(|error| {
+                (
+                    format!("stored initial direct turn is unreadable: {error}"),
+                    ErrorKind::ServerError,
+                )
+            })
+        })
+        .transpose()?;
     let expanded_initial_message = if seeded_empty {
         None
+    } else if let Some(prepared) = &stored_prepared_turn {
+        Some((
+            prepared.text.clone(),
+            prepared.llm_text.clone(),
+            prepared.skill_invocation.clone(),
+        ))
     } else {
         let expanded = if intent.expansion_preflighted {
             (
@@ -775,17 +805,91 @@ async fn provision_conversation(
             ErrorKind::ServerError,
         )
     })?;
-    let event = Event::CreationProvisioned {
-        job_id: job.id.clone(),
-        claim: claim.clone(),
-        initial_message: phoenix_core::domain::sm_event::SteerEntry {
+    let prepared_turn = if let Some(prepared) = stored_prepared_turn {
+        prepared
+    } else {
+        phoenix_core::domain::sm_event::PreparedDirectTurn {
+            codec_version: phoenix_core::domain::sm_event::PREPARED_DIRECT_TURN_CODEC_VERSION,
+            expand_references: false,
             text: display_text,
             llm_text,
             images,
             files,
-            message_id,
+            message_id: message_id.clone(),
             user_agent: None,
             skill_invocation,
+        }
+    };
+    let prepared_payload = if let Some(existing) = &existing_initial_acceptance {
+        existing.prepared_payload.clone()
+    } else {
+        serde_json::to_string(&prepared_turn).map_err(|error| {
+            (
+                format!("failed to encode initial direct turn: {error}"),
+                ErrorKind::ServerError,
+            )
+        })?
+    };
+    let prepared_fingerprint = existing_initial_acceptance.as_ref().map_or_else(
+        || {
+            sha2::Sha256::digest(prepared_payload.as_bytes())
+                .iter()
+                .fold(String::with_capacity(64), |mut output, byte| {
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                })
+        },
+        |existing| existing.prepared_fingerprint.clone(),
+    );
+    match repo
+        .accept_direct_turn(&phoenix_db::DirectTurnAcceptanceInput {
+            initial_outcome: phoenix_db::DirectTurnInitialOutcome::PendingRuntime,
+            conversation_id: job.conversation_id.clone(),
+            client_message_id: message_id.clone(),
+            prepared_fingerprint,
+            prepared_payload,
+            accepted_at: phoenix_workflow::Timestamp(
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+            ),
+            snapshot: phoenix_workflow::llm_profile::TopLevelLlmSnapshot {
+                turn_ref: phoenix_workflow::llm_profile::TopLevelTurnRef {
+                    conversation_id: job.conversation_id.clone(),
+                    accepted_turn_id: message_id.clone(),
+                    generation: 0,
+                },
+                accepted_assistant_message_id: None,
+                stopped_at: None,
+            },
+        })
+        .await
+        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?
+    {
+        phoenix_db::DirectTurnAcceptanceOutcome::Created(_)
+        | phoenix_db::DirectTurnAcceptanceOutcome::Replayed(_) => {}
+        phoenix_db::DirectTurnAcceptanceOutcome::Conflict => {
+            return Err((
+                "initial direct-turn acceptance conflicted".to_string(),
+                ErrorKind::ServerError,
+            ));
+        }
+        phoenix_db::DirectTurnAcceptanceOutcome::RetryablePersistence => {
+            return Err((
+                "initial direct-turn acceptance is temporarily busy".to_string(),
+                ErrorKind::ServerError,
+            ));
+        }
+    }
+    let event = Event::CreationProvisioned {
+        job_id: job.id.clone(),
+        claim: claim.clone(),
+        initial_message: phoenix_core::domain::sm_event::SteerEntry {
+            text: prepared_turn.text,
+            llm_text: prepared_turn.llm_text,
+            images: prepared_turn.images,
+            files: prepared_turn.files,
+            message_id: prepared_turn.message_id,
+            user_agent: prepared_turn.user_agent,
+            skill_invocation: prepared_turn.skill_invocation,
         },
     };
     manager

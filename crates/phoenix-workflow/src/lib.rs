@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod llm_profile;
 pub mod simulator;
 #[cfg(test)]
 mod tests;

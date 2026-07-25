@@ -942,6 +942,25 @@ impl ModelRegistry {
             )
     }
 
+    /// Return the durable provider and backend identities for a registered model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model registry's services or specs lock is poisoned.
+    #[must_use]
+    pub fn model_routing_identity(&self, model_id: &str) -> Option<(String, String)> {
+        let services = self.services.read().expect("services lock poisoned");
+        let service = services.get(model_id)?;
+        let specs = self.specs.read().expect("specs lock poisoned");
+        let spec = specs.get(model_id)?;
+        let backend = if service.uses_codex_bridge() {
+            "codex_bridge"
+        } else {
+            "direct"
+        };
+        Some((spec.backend.display_name().to_string(), backend.to_string()))
+    }
+
     /// Check if any models are available
     pub fn has_models(&self) -> bool {
         self.services.read().is_ok_and(|map| !map.is_empty())
@@ -1345,6 +1364,10 @@ mod tests {
 
         assert!(registry.get("baseten/moonshotai/Kimi-K2.6").is_some());
         assert_eq!(registry.default_model_id(), "baseten/moonshotai/Kimi-K2.6");
+        assert_eq!(
+            registry.model_routing_identity("baseten/moonshotai/Kimi-K2.6"),
+            Some(("Anthropic".to_string(), "direct".to_string()))
+        );
         assert_eq!(
             registry.context_window("baseten/moonshotai/Kimi-K2.6"),
             262_000

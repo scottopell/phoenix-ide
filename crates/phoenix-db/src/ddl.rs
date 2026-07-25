@@ -100,21 +100,23 @@ CREATE INDEX IF NOT EXISTS idx_steering_messages_conversation
     ON steering_messages(conversation_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS steering_message_files (
-    message_id TEXT NOT NULL REFERENCES steering_messages(message_id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
     file_ordinal INTEGER NOT NULL,
     original_name TEXT NOT NULL,
     media_type TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     stored_path TEXT NOT NULL,
-    PRIMARY KEY (message_id, file_ordinal)
+    PRIMARY KEY (message_id, file_ordinal),
+    FOREIGN KEY (message_id) REFERENCES steering_messages(message_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS steering_message_images (
-    message_id TEXT NOT NULL REFERENCES steering_messages(message_id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
     image_ordinal INTEGER NOT NULL,
     media_type TEXT NOT NULL,
     data TEXT NOT NULL,
-    PRIMARY KEY (message_id, image_ordinal)
+    PRIMARY KEY (message_id, image_ordinal),
+    FOREIGN KEY (message_id) REFERENCES steering_messages(message_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS conversation_creation_jobs (
