@@ -180,6 +180,22 @@ impl WorkflowRepository {
         expected_generation: u64,
         message_id: CanonicalMessageId,
     ) -> DbResult<TurnStep> {
+        self.materialize_authoritative_turn_at_cut(
+            turn_id,
+            expected_generation,
+            message_id,
+            TransactionCut::None,
+        )
+        .await
+    }
+
+    async fn materialize_authoritative_turn_at_cut(
+        &self,
+        turn_id: TurnAuthorityId,
+        expected_generation: u64,
+        message_id: CanonicalMessageId,
+        cut: TransactionCut,
+    ) -> DbResult<TurnStep> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
             .bind(to_i64(turn_id.0, "turn_id")?)
@@ -209,11 +225,20 @@ impl WorkflowRepository {
             .await
             .map_err(map_constraint)?;
         }
-        tx.commit().await?;
+        finish_raw_transaction_at_cut(tx, cut).await?;
         Ok(step)
     }
 
     pub async fn terminate_authoritative_turn(&self, command: TurnCommand) -> DbResult<TurnStep> {
+        self.terminate_authoritative_turn_at_cut(command, TransactionCut::None)
+            .await
+    }
+
+    async fn terminate_authoritative_turn_at_cut(
+        &self,
+        command: TurnCommand,
+        cut: TransactionCut,
+    ) -> DbResult<TurnStep> {
         let (turn_id, expected_generation, terminal) = match &command {
             TurnCommand::Complete {
                 turn_id,
@@ -280,7 +305,7 @@ impl WorkflowRepository {
             })
             .execute(&mut *tx.tx)
             .await?;
-        tx.commit().await?;
+        finish_workflow_transaction_at_cut(tx, cut).await?;
         Ok(step)
     }
 }
@@ -476,6 +501,36 @@ fn to_u64(value: i64, field: &str) -> DbResult<u64> {
     u64::try_from(value).map_err(|_| DbError::Serialization(format!("negative {field}")))
 }
 
+async fn finish_raw_transaction_at_cut(
+    tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    cut: TransactionCut,
+) -> DbResult<()> {
+    if cut == TransactionCut::BeforeCommit {
+        tx.rollback().await?;
+        return Err(injected_cut(cut));
+    }
+    tx.commit().await?;
+    if cut == TransactionCut::AfterCommit {
+        return Err(injected_cut(cut));
+    }
+    Ok(())
+}
+
+async fn finish_workflow_transaction_at_cut(
+    tx: super::WorkflowTx<'_>,
+    cut: TransactionCut,
+) -> DbResult<()> {
+    if cut == TransactionCut::BeforeCommit {
+        tx.rollback().await?;
+        return Err(injected_cut(cut));
+    }
+    tx.commit().await?;
+    if cut == TransactionCut::AfterCommit {
+        return Err(injected_cut(cut));
+    }
+    Ok(())
+}
+
 fn injected_cut(cut: TransactionCut) -> DbError {
     DbError::Serialization(format!("injected transaction cut: {cut:?}"))
 }
@@ -509,6 +564,19 @@ mod tests {
             .await
             .unwrap();
         WorkflowRepository::new(db.pool().clone())
+    }
+
+    async fn insert_message(repo: &WorkflowRepository, conversation: &str, message_id: &str) {
+        sqlx::query(
+            "INSERT INTO messages (
+                message_id, conversation_id, sequence_id, message_type, content, created_at
+             ) VALUES (?1, ?2, 1, 'user', '{}', '2026-01-01T00:00:00Z')",
+        )
+        .bind(message_id)
+        .bind(conversation)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
     }
 
     fn input(conversation: &str, key: &str, seed: u8) -> AcceptAuthoritativeTurn {
@@ -555,6 +623,118 @@ mod tests {
                 .outcome,
             TurnOutcome::ExactReplay { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn materialization_refines_before_and_after_commit_crash_cuts() {
+        let before_repo = repo().await;
+        let created = before_repo
+            .accept_authoritative_turn(&input("conv-a", "materialize-before", 3))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let message = CanonicalMessageId("message-before".to_string());
+        insert_message(&before_repo, "conv-a", &message.0).await;
+        assert!(before_repo
+            .materialize_authoritative_turn_at_cut(
+                turn_id,
+                0,
+                message.clone(),
+                TransactionCut::BeforeCommit,
+            )
+            .await
+            .is_err());
+        assert!(matches!(
+            before_repo
+                .materialize_authoritative_turn(turn_id, 0, message)
+                .await
+                .unwrap()
+                .outcome,
+            TurnOutcome::Materialized { .. }
+        ));
+
+        let after_repo = repo().await;
+        let created = after_repo
+            .accept_authoritative_turn(&input("conv-a", "materialize-after", 4))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let message = CanonicalMessageId("message-after".to_string());
+        insert_message(&after_repo, "conv-a", &message.0).await;
+        assert!(after_repo
+            .materialize_authoritative_turn_at_cut(
+                turn_id,
+                0,
+                message.clone(),
+                TransactionCut::AfterCommit,
+            )
+            .await
+            .is_err());
+        assert!(matches!(
+            after_repo
+                .materialize_authoritative_turn(turn_id, 0, message)
+                .await
+                .unwrap()
+                .outcome,
+            TurnOutcome::MaterializationReplay { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_refines_before_and_after_commit_crash_cuts() {
+        let before_repo = repo().await;
+        let created = before_repo
+            .accept_authoritative_turn(&input("conv-a", "terminal-before", 5))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let command = TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        };
+        assert!(before_repo
+            .terminate_authoritative_turn_at_cut(command.clone(), TransactionCut::BeforeCommit)
+            .await
+            .is_err());
+        assert!(before_repo
+            .terminate_authoritative_turn(command)
+            .await
+            .is_ok());
+
+        let after_repo = repo().await;
+        let created = after_repo
+            .accept_authoritative_turn(&input("conv-a", "terminal-after", 6))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id } = created.outcome else {
+            panic!("expected created turn")
+        };
+        assert!(after_repo
+            .terminate_authoritative_turn_at_cut(
+                TurnCommand::Cancel {
+                    turn_id,
+                    expected_generation: 0,
+                },
+                TransactionCut::AfterCommit,
+            )
+            .await
+            .is_err());
+        let persisted = after_repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            persisted.lifecycle,
+            TurnLifecycle::Terminal(TurnTerminal::Cancelled)
+        ));
+        assert_eq!(persisted.generation, 1);
     }
 
     #[tokio::test]
