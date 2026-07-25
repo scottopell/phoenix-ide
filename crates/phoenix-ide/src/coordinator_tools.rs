@@ -5,19 +5,92 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::send_chat_service::{SendChatApplicationService, SendChatRequest, SendChatServiceError};
-use crate::tools::{Tool, ToolContext, ToolOutput};
+use crate::tools::{ExploreToolPolicy, SandboxedBashTool, Tool, ToolContext, ToolOutput};
 
 pub(crate) fn tools(
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
+    explore_policy: ExploreToolPolicy,
 ) -> Vec<Arc<dyn Tool>> {
-    vec![
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SearchConversations(service.clone())),
         Arc::new(ReadConversation(service.clone())),
         Arc::new(QueryDatabase(service.clone())),
         Arc::new(ResolveReference(service.clone())),
-        Arc::new(SendConversationMessage { service, send_chat }),
-    ]
+        Arc::new(SendConversationMessage {
+            service: service.clone(),
+            send_chat,
+        }),
+    ];
+    if explore_policy.has_sandboxed_bash() {
+        tools.push(Arc::new(CoordinatorBash(service)));
+    }
+    tools
+}
+
+struct CoordinatorBash(GlobalReadService);
+
+#[async_trait]
+impl Tool for CoordinatorBash {
+    fn name(&self) -> &'static str {
+        "bash"
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "{}\n\nCoordinator usage: every op=run call must include cwd set to an authoritative active WorkScope cwd or worktree path from Coordinator context. There is no default repository or working directory. peek, wait, and kill use the handle and do not need cwd.",
+            SandboxedBashTool.description()
+        )
+    }
+
+    fn description_for_language(
+        &self,
+        language: phoenix_core::llm_language::LlmLanguage,
+    ) -> String {
+        format!(
+            "{}\n\nCoordinator: every op=run need cwd from active WorkScope path in context. No default repo or cwd. peek, wait, kill use handle without cwd.",
+            SandboxedBashTool.description_for_language(language)
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        let mut schema = SandboxedBashTool.input_schema();
+        schema["properties"]["cwd"] = json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Server-side working directory for op=run. It must exactly identify an active persisted WorkScope cwd or worktree path. There is no default."
+        });
+        schema
+    }
+
+    fn clearable(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
+        let is_run = input.get("op").and_then(Value::as_str) == Some("run");
+        let cwd = input
+            .as_object_mut()
+            .and_then(|object| object.remove("cwd"));
+        if is_run {
+            let Some(cwd) = cwd.as_ref().and_then(Value::as_str) else {
+                return ToolOutput::error(
+                    "Coordinator bash op=run requires cwd; there is no default working directory"
+                        .to_string(),
+                );
+            };
+            let resolved = match self.0.validate_active_work_scope_cwd(cwd).await {
+                Ok(path) => path,
+                Err(error) => return ToolOutput::error(error),
+            };
+            return SandboxedBashTool
+                .run_with_context_cwd(input, ctx, resolved)
+                .await;
+        } else if cwd.is_some() {
+            return ToolOutput::error("cwd is only valid for bash op=run".to_string());
+        }
+        SandboxedBashTool.run(input, ctx).await
+    }
 }
 
 struct SearchConversations(GlobalReadService);
@@ -307,5 +380,81 @@ fn result(value: Result<String, String>) -> ToolOutput {
     match value {
         Ok(value) => ToolOutput::success(value),
         Err(error) => ToolOutput::error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phoenix_db::retrieval::Fts5Retriever;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct NoLlm;
+
+    impl phoenix_core::llm_service::LlmSelector for NoLlm {
+        fn get(
+            &self,
+            _model_id: &str,
+        ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+
+        fn default_service(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+            None
+        }
+    }
+
+    async fn tool_and_context() -> (CoordinatorBash, ToolContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("coordinator-bash.db");
+        let db = crate::db::Database::open(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let tool = CoordinatorBash(GlobalReadService::new(db, retriever));
+        let context = ToolContext::new_without_filesystem(
+            CancellationToken::new(),
+            "coordinator".to_string(),
+            Arc::new(crate::tools::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+        );
+        (tool, context)
+    }
+
+    #[tokio::test]
+    async fn coordinator_bash_schema_requires_explicit_run_cwd_by_policy() {
+        let (tool, context) = tool_and_context().await;
+        let schema = tool.input_schema();
+        assert!(schema["properties"].get("cwd").is_some());
+        assert_eq!(schema["required"], json!(["op"]));
+        let alternate =
+            tool.description_for_language(phoenix_core::llm_language::LlmLanguage::Caveman);
+        assert!(alternate.contains("every op=run need cwd"));
+        assert!(alternate.contains("No default repo or cwd"));
+
+        let output = tool.run(json!({"op": "run", "cmd": "pwd"}), context).await;
+        assert!(!output.is_success());
+        assert!(output.output().contains("requires cwd"));
+        assert!(output.output().contains("no default"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_bash_rejects_non_scope_cwd_before_sandbox_dispatch() {
+        let (tool, context) = tool_and_context().await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = tool
+            .run(
+                json!({"op": "run", "cmd": "pwd", "cwd": dir.path()}),
+                context,
+            )
+            .await;
+
+        assert!(!output.is_success());
+        assert!(output.output().contains("active persisted WorkScope"));
     }
 }

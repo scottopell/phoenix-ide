@@ -2712,7 +2712,11 @@ impl RuntimeManager {
                         self.clone(),
                     ));
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
+                    ToolRegistry::coordinator(crate::coordinator_tools::tools(
+                        service,
+                        send_chat,
+                        ExploreToolPolicy::from_platform(&self.platform),
+                    )),
                     agent_catalog.clone(),
                 )
             } else {
