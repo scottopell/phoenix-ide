@@ -52,6 +52,21 @@ enum LlmDispatchOwnership {
     AdoptedWakeBatch,
 }
 
+async fn record_durable_llm_failure<S: super::traits::MessageStore + ?Sized>(
+    storage: &S,
+    failure: &phoenix_db::RecordTopLevelLlmFailureInput,
+) -> phoenix_workflow::AuthorityOutcome {
+    loop {
+        match storage.record_top_level_llm_failure(failure).await {
+            Ok(outcome) => return outcome,
+            Err(error) => {
+                tracing::warn!(%error, "failed to persist durable LLM failure; retrying");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortTaskOnDrop {
@@ -5682,16 +5697,10 @@ where
                             _ => unreachable!("non-response LLM outcome must map to LlmError"),
                         },
                     };
-                    match storage.record_top_level_llm_failure(&failure).await {
-                        Ok(phoenix_workflow::AuthorityOutcome::Authorized) => {}
-                        Ok(outcome) => {
-                            tracing::warn!(?outcome, "durable LLM failure lost authority");
-                            return;
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to persist durable LLM failure");
-                            return;
-                        }
+                    let outcome = record_durable_llm_failure(&storage, &failure).await;
+                    if outcome != phoenix_workflow::AuthorityOutcome::Authorized {
+                        tracing::warn!(?outcome, "durable LLM failure lost authority");
+                        return;
                     }
                 }
             }
@@ -9214,6 +9223,32 @@ mod steering_replay_sequence_tests {
             event_tx_dup,
             broadcaster,
         )
+    }
+
+    #[tokio::test]
+    async fn durable_failure_recording_retries_transient_persistence_error() {
+        let storage = InMemoryStorage::new();
+        storage.set_failure_record_outcomes([
+            Err("database busy".to_string()),
+            Ok(phoenix_workflow::AuthorityOutcome::Authorized),
+        ]);
+        let failure = phoenix_db::RecordTopLevelLlmFailureInput {
+            authority: phoenix_db::LocalAttemptAuthority {
+                workflow_id: phoenix_workflow::WorkflowId(1),
+                declared_workflow_version: phoenix_workflow::Version(1),
+                generation: phoenix_workflow::Generation(1),
+                effect_id: phoenix_workflow::EffectId(1),
+                attempt_id: phoenix_workflow::AttemptId(1),
+                process_incarnation: phoenix_workflow::ProcessIncarnation(1),
+            },
+            observed_at: phoenix_workflow::Timestamp(1),
+            outcome_payload: Vec::new(),
+        };
+
+        assert_eq!(
+            record_durable_llm_failure(&storage, &failure).await,
+            phoenix_workflow::AuthorityOutcome::Authorized
+        );
     }
 
     #[tokio::test]

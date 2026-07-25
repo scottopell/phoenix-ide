@@ -498,6 +498,7 @@ pub struct InMemoryStorage {
     direct_turn_acceptance_outcome:
         Mutex<Option<phoenix_db::PersistDirectTurnRuntimeAcceptanceOutcome>>,
     released_direct_turn_deliveries: Mutex<Vec<(String, String)>>,
+    failure_record_outcomes: Mutex<VecDeque<Result<phoenix_workflow::AuthorityOutcome, String>>>,
 }
 
 #[allow(dead_code)]
@@ -518,6 +519,7 @@ impl InMemoryStorage {
             queued_steering_outcome: Mutex::new(None),
             direct_turn_acceptance_outcome: Mutex::new(None),
             released_direct_turn_deliveries: Mutex::new(Vec::new()),
+            failure_record_outcomes: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -559,6 +561,13 @@ impl InMemoryStorage {
 
     pub fn released_direct_turn_deliveries(&self) -> Vec<(String, String)> {
         self.released_direct_turn_deliveries.lock().unwrap().clone()
+    }
+
+    pub fn set_failure_record_outcomes(
+        &self,
+        outcomes: impl IntoIterator<Item = Result<phoenix_workflow::AuthorityOutcome, String>>,
+    ) {
+        *self.failure_record_outcomes.lock().unwrap() = outcomes.into_iter().collect();
     }
 
     /// Read back the persisted fork proposals (test-only).
@@ -625,6 +634,17 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn record_top_level_llm_failure(
+        &self,
+        _input: &phoenix_db::RecordTopLevelLlmFailureInput,
+    ) -> Result<phoenix_workflow::AuthorityOutcome, String> {
+        self.failure_record_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(phoenix_workflow::AuthorityOutcome::Authorized))
+    }
+
     async fn stop_active_top_level_llm_for_conversation(
         &self,
         conversation_id: &str,

@@ -528,15 +528,17 @@ impl SendChatApplicationService {
             ),
             phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
             | phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted => {
-                let should_deliver =
-                    matches!(
-                        accepted.committed_outcome,
-                        phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
-                    ) || phoenix_db::WorkflowRepository::new(self.db.pool().clone())
-                        .load_active_top_level_llm_workflow(&conversation.id)
-                        .await
-                        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-                        .is_some();
+                let active_workflow = phoenix_db::WorkflowRepository::new(self.db.pool().clone())
+                    .load_active_top_level_llm_workflow(&conversation.id)
+                    .await
+                    .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
+                let should_deliver = replayed_acceptance_owns_runtime_delivery(
+                    &accepted.committed_outcome,
+                    accepted.workflow_id,
+                    active_workflow
+                        .as_ref()
+                        .map(|workflow| workflow.workflow_id),
+                );
                 if should_deliver {
                     kick_runtime_delivery(
                         self.runtime.clone(),
@@ -933,6 +935,20 @@ fn sha256_hex(value: &[u8]) -> String {
         })
 }
 
+fn replayed_acceptance_owns_runtime_delivery(
+    outcome: &phoenix_db::DirectTurnCommittedOutcome,
+    accepted_workflow_id: phoenix_workflow::WorkflowId,
+    active_workflow_id: Option<phoenix_workflow::WorkflowId>,
+) -> bool {
+    matches!(
+        outcome,
+        phoenix_db::DirectTurnCommittedOutcome::PendingRuntime
+    ) || (matches!(
+        outcome,
+        phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted
+    ) && active_workflow_id == Some(accepted_workflow_id))
+}
+
 fn replay_receipt(
     receipt: &ChatAcceptanceReceipt,
     req: &SendChatRequest,
@@ -983,6 +999,25 @@ mod tests {
         queued_retry_matches, MessageExpansionPolicy, SendChatApplicationService, SendChatRequest,
     };
     use phoenix_core::domain::db_schema::SkillContent;
+
+    #[test]
+    fn non_owner_runtime_acceptance_does_not_rekick_active_batch_owner() {
+        assert!(!super::replayed_acceptance_owns_runtime_delivery(
+            &phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted,
+            phoenix_workflow::WorkflowId(1),
+            Some(phoenix_workflow::WorkflowId(2)),
+        ));
+        assert!(super::replayed_acceptance_owns_runtime_delivery(
+            &phoenix_db::DirectTurnCommittedOutcome::RuntimeAccepted,
+            phoenix_workflow::WorkflowId(2),
+            Some(phoenix_workflow::WorkflowId(2)),
+        ));
+        assert!(super::replayed_acceptance_owns_runtime_delivery(
+            &phoenix_db::DirectTurnCommittedOutcome::PendingRuntime,
+            phoenix_workflow::WorkflowId(1),
+            None,
+        ));
+    }
 
     #[tokio::test]
     async fn durable_replay_ignores_reference_changes_after_acceptance() {
