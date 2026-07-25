@@ -216,6 +216,12 @@ impl WorkflowRepository {
             .await?
             .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
         let turn = row_to_turn(row)?;
+        if message_id.0 != turn.client_key.as_str() {
+            tx.rollback().await?;
+            return Err(conflict(TurnConflict::MaterializationIdentityChanged {
+                canonical: CanonicalMessageId(turn.client_key.as_str().to_string()),
+            }));
+        }
         let mut model =
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model
@@ -926,7 +932,7 @@ mod tests {
         let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
-        let message = CanonicalMessageId("message-before".to_string());
+        let message = CanonicalMessageId("materialize-before".to_string());
         insert_message(&before_repo, "conv-a", &message.0).await;
         assert!(before_repo
             .materialize_authoritative_turn_at_cut(
@@ -954,7 +960,7 @@ mod tests {
         let TurnOutcome::Created { turn_id } = created.outcome else {
             panic!("expected created turn")
         };
-        let message = CanonicalMessageId("message-after".to_string());
+        let message = CanonicalMessageId("materialize-after".to_string());
         insert_message(&after_repo, "conv-a", &message.0).await;
         assert!(after_repo
             .materialize_authoritative_turn_at_cut(
