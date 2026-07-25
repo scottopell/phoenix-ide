@@ -832,16 +832,14 @@ orphans a live process at every continuation boundary: the process keeps
 running but becomes unaddressable from the continuation, so the agent sees the
 runtime silently forget half its in-flight work. Keying by `WorkScope` makes
 bash symmetric with the other three runtime resources and makes "the work scope
-owns its processes" structural rather than conventional. The scope is derived
-from the persisted `ConvMode::worktree_path()`, the single authority every
-DB-facing path (inventory, hard-delete cascade, work-scope SSE routing) also
-resolves from — so the handle-table keying and the inventory/cleanup keying
-cannot diverge. Direct-mode conversations and Explore sub-agents (which persist
-`worktree_path: None`) resolve to `WorkScope::Conversation(id)`, for which this
-is exactly one conversation's handles; worktree-backed chains and Work-mode
-sub-agents (which inherit the parent's worktree-bearing `conv_mode`) resolve to
-`WorkScope::Worktree(path)` and so share one table — the former across a
-continuation boundary, the latter with the live parent, both toward survival.
+owns its processes" structural rather than conventional. The scope is identified
+by one opaque persisted `work_scope_id`; runtime
+registries, inventory, cleanup, and SSE routing all consume that same identity
+rather than independently deriving keys from conversation ids or filesystem
+paths. Continuations and Work-authority sub-agents that retain the same
+persisted identity share one table, while a fresh identity is isolated even
+when its environment happens to use the same path. Filesystem paths remain
+scope-owned environment data, not resource identity.
 
 ---
 

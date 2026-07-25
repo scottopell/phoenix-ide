@@ -248,22 +248,11 @@ scope-equality preservation rule as hard-delete (REQ-TMUX-WS-002),
 killing the tmux server and unlinking the socket unless a continuation
 inherits the same `WorkScope`
 
-**Rationale:** "Comes back tomorrow, dev server still running" remains
-the pitch of using tmux — but only across UI noise (closing a tab,
-blurring it, restarting Phoenix). Archive is the user's signal that
-the work is over; preserving live resources after that point is a
-leak, not a feature. The earlier "archive is purely organisational"
-framing predates the unified-cleanup-cascade work in REQ-BED-032; this
-requirement is the spec catching up to that decision.
-
-History: prior text treated archive as a soft-state signal that left
-the tmux server alive indefinitely. This was identified as a leak
-during the WorkScope stack review on PR #135 — Copilot flagged that
-the orchestrator was reclaiming resources but the unarchive surface
-still implied the conversation could be resumed. The fix is to treat
-archive as terminal across the board (drop unarchive, run the cascade);
-see REQ-API-006 and REQ-BED-032 for the matching API and orchestrator
-changes.
+**Rationale:** "Comes back tomorrow, dev server still running" applies across
+UI noise such as closing a tab, blurring it, or restarting Phoenix. Archive is
+the user's signal that the work is over; preserving live resources after that
+point is a leak, not a feature. See REQ-API-006 and REQ-BED-032 for the matching
+API and orchestrator contracts.
 
 ---
 
@@ -481,13 +470,13 @@ remains available for detailed tmux operations.
 
 ### REQ-TMUX-WS-001: Tmux Server Keyed by WorkScope
 
-Phoenix MUST key tmux server ownership by `WorkScope`, derived from the persisted `ConvMode::worktree_path()`: `WorkScope::Worktree(path)` when the conversation owns a worktree (Work, Branch, and top-level Explore), and `WorkScope::Conversation(conversation_id)` when it does not (Direct conversations, and sub-agent Explore conversations — which share the parent's working directory but persist `worktree_path: None`). The scope-defining worktree path is the same authority every DB-facing path resolves from (`WorkScope::resolve(conv.id, conv.conv_mode.worktree_path())`), so the tool-side keying and the inventory / cleanup / SSE keying cannot diverge — a managed conversation without its own worktree is not silently keyed to its `working_dir`.
+Phoenix MUST key tmux server ownership by the conversation's opaque persisted `work_scope_id`. Tool execution, inventory, cleanup, and SSE routing MUST consume that same identity rather than deriving a resource key from a conversation id, working directory, or worktree path. Filesystem paths belong to the scope's environment and MUST NOT determine whether two scopes share a tmux server.
 
 ### REQ-TMUX-WS-002: Continuation Sharing Within Worktree Scope
 
-Managed/Branch continuations that share a worktree MUST share the same tmux socket/session. Direct-mode conversations continue to use the conversation fallback scope.
+Continuations that retain the same persisted `work_scope_id` MUST share the same tmux socket/session. A continuation assigned a fresh `work_scope_id` MUST use a distinct server even when its environment points at the same filesystem path.
 
-The cleanup cascade MUST decide preservation by whether the scope is still owned by a live conversation other than the one being torn down: skip the kill/unlink iff `inheritor_scope == Some(work_scope)`, where `inheritor_scope` is `Some(work_scope)` iff a live conversation other than the deleted one resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope. A live conversation here is one that is BOTH non-terminal in state AND not `archived`, determined from the persisted conversation rows in the DATABASE — NOT from the set of live runtime handles. A non-terminal conversation with no runtime handle (after a server restart or runtime eviction) is still a live owner; enumerating handles would tear down a scope whose surviving owner is handle-less. An archived conversation does not count as a live owner even while its state row still reads non-terminal, because archiving a chain archives earlier members before the leaf's cascade runs — counting one as live would preserve the scope and leak the tmux server. The deleted conversation is excluded from that enumeration: the cascade runs before its terminal-state write, so it still reads non-terminal, and excluding it is what lets the server tear down when it is the last live owner. Conversation-scope continuations always resolve to a different scope (their own conversation id), so the rule subsumes the "Direct continuations cannot inherit" case structurally without per-kind case-analysis.
+The cleanup cascade MUST decide preservation by whether the scope is still owned by a live conversation other than the one being torn down: skip the kill/unlink iff `inheritor_scope == Some(work_scope)`, where `inheritor_scope` is `Some(work_scope)` iff a live conversation other than the deleted one resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope. A live conversation here is one that is BOTH non-terminal in state AND not `archived`, determined from the persisted conversation rows in the DATABASE — NOT from the set of live runtime handles. A non-terminal conversation with no runtime handle (after a server restart or runtime eviction) is still a live owner; enumerating handles would tear down a scope whose surviving owner is handle-less. An archived conversation does not count as a live owner even while its state row still reads non-terminal, because archiving a chain archives earlier members before the leaf's cascade runs — counting one as live would preserve the scope and leak the tmux server. The deleted conversation is excluded from that enumeration: the cascade runs before its terminal-state write, so it still reads non-terminal, and excluding it is what lets the server tear down when it is the last live owner. A continuation with a fresh persisted identity is a different scope, so preservation is determined by identity equality without mode- or path-specific case analysis.
 
 ### REQ-TMUX-015: Companion Refresh on Reuse
 

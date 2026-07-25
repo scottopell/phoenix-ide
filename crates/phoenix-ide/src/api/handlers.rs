@@ -10339,6 +10339,39 @@ pub(crate) mod hard_delete_cascade_tests {
     // Process inspector endpoint (specs/process-inspector/ REQ-PINSP-*)
     // ----------------------------------------------------------------
 
+    async fn create_inspector_actor(
+        state: &AppState,
+        actor_id: &str,
+        title: &str,
+    ) -> crate::work_scope::ResourceScopeKey {
+        let mode = crate::db::ConvMode::Work {
+            branch_name: crate::db::NonEmptyString::new(actor_id.to_string()).unwrap(),
+            worktree_path: crate::db::NonEmptyString::new("/tmp".to_string()).unwrap(),
+            base_branch: crate::db::NonEmptyString::new("main".to_string()).unwrap(),
+            task_id: crate::db::NonEmptyString::new(actor_id.to_string()).unwrap(),
+            task_title: crate::db::NonEmptyString::new(title.to_string()).unwrap(),
+        };
+        let actor = state
+            .db
+            .create_conversation_with_project(
+                actor_id,
+                actor_id,
+                "/tmp",
+                true,
+                None,
+                None,
+                None,
+                &mode,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create actor conversation");
+        crate::work_scope::ResourceScopeKey::Work(actor.work_scope_id.expect("actor work scope"))
+    }
+
     /// REQ-PINSP-001/002/003/004: a live handle's inspection reports identity
     /// and state, an output window (with the appended line), and — on the host
     /// platform — a non-null resource sample. The handle wraps a REAL spawned
@@ -10356,7 +10389,8 @@ pub(crate) mod hard_delete_cascade_tests {
         use std::process::Stdio;
 
         let state = make_test_state().await;
-        let scope = crate::scope("conv-inspect-live");
+        let actor_id = "conv-inspect-live";
+        let scope = create_inspector_actor(&state, actor_id, "Inspect live").await;
 
         // Spawn a real, long-lived child as its own process-group leader so the
         // sampler has a live group to read. setpgid(0,0) makes pgid == pid.
@@ -10398,7 +10432,7 @@ pub(crate) mod hard_delete_cascade_tests {
             State(state),
             Path((scope.stable_key(), "b-1".to_string())),
             Query(super::InspectQuery {
-                conversation_id: "conv-inspect".into(),
+                conversation_id: actor_id.into(),
                 since: None,
             }),
         )
@@ -10456,7 +10490,8 @@ pub(crate) mod hard_delete_cascade_tests {
         use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
 
         let state = make_test_state().await;
-        let scope = crate::scope("conv-inspect-term");
+        let actor_id = "conv-inspect-term";
+        let scope = create_inspector_actor(&state, actor_id, "Inspect terminal").await;
 
         let table = state.runtime.bash_handles().get_or_create(&scope).await;
         let handle = Handle::new_live(
@@ -10486,7 +10521,7 @@ pub(crate) mod hard_delete_cascade_tests {
             State(state),
             Path((scope.stable_key(), "b-1".to_string())),
             Query(super::InspectQuery {
-                conversation_id: "conv-inspect".into(),
+                conversation_id: actor_id.into(),
                 since: None,
             }),
         )

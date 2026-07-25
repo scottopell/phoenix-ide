@@ -678,11 +678,16 @@ CREATE TEMP TABLE migration_052_environment_candidates (
 );
 INSERT INTO migration_052_environment_candidates
 SELECT scoped.work_scope_id, scoped.conversation_id,
-       CASE WHEN lineage.root_id = scoped.conversation_id THEN 0 ELSE 1 END
+       CASE
+           WHEN c.cm_kind IN ('work', 'branch') THEN 0
+           WHEN lineage.root_id = scoped.conversation_id THEN 1
+           ELSE 2
+       END
 FROM migration_052_conversation_scope scoped
-JOIN migration_052_lineage lineage ON lineage.conversation_id = scoped.conversation_id;
+JOIN migration_052_lineage lineage ON lineage.conversation_id = scoped.conversation_id
+JOIN conversations c ON c.id = scoped.conversation_id;
 INSERT OR IGNORE INTO migration_052_environment_candidates
-SELECT m.new_id, c.id, 2
+SELECT m.new_id, c.id, 3
 FROM work_scopes_old old
 JOIN migration_052_scope_map m ON m.old_id = old.id
 JOIN conversations c
@@ -4450,7 +4455,9 @@ mod tests {
               ('direct-chain-successor', 'direct-chain-successor', '/direct/successor', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-03', 'direct', NULL, NULL, NULL, NULL),
               ('direct-successor-child', 'direct-successor-child', '/direct/successor/subdir', 'direct-chain-successor', 0, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-04', 'direct', NULL, NULL, NULL, NULL),
               ('coordinator-root', 'coordinator-root', '', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-02', 'direct', NULL, NULL, NULL, 'coordinator-leaf'),
-              ('coordinator-leaf', 'coordinator-leaf', '', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-03', 'direct', NULL, NULL, NULL, NULL)",
+              ('coordinator-leaf', 'coordinator-leaf', '', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-03', 'direct', NULL, NULL, NULL, NULL),
+              ('handoff-explore', 'handoff-explore', '/handoff/worktree', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-07', 'explore', '/handoff/worktree', NULL, NULL, 'handoff-work'),
+              ('handoff-work', 'handoff-work', '/handoff/worktree', NULL, 1, '{\"type\":\"idle\"}', '2025-01-01', '2025-01-01', '2025-01-08', 'work', '/handoff/worktree', 'task-handoff', 'main', NULL)",
         )
         .execute(&pool)
         .await
@@ -4583,6 +4590,25 @@ mod tests {
                 ("coordinator".to_string(), None),
                 ("coordinator".to_string(), None)
             ]
+        );
+
+        let handoff_environment: (String, String, String) = sqlx::query_as(
+            "SELECT environment.branch_name, environment.base_branch, environment.worktree_path
+             FROM conversations successor
+             JOIN work_scope_environments environment
+               ON environment.work_scope_id = successor.work_scope_id
+             WHERE successor.id = 'handoff-work'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            handoff_environment,
+            (
+                "task-handoff".to_string(),
+                "main".to_string(),
+                "/handoff/worktree".to_string(),
+            )
         );
 
         let invalid_lifecycle: i64 = sqlx::query_scalar(
