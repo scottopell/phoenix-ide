@@ -704,12 +704,26 @@ pub fn transition_core(
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
+        (
+            CoreState::Idle | CoreState::Error { .. },
+            CoreEvent::AuthoritativeUserMessage { payload, authority },
+        ) => Ok(
+            CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistAuthoritativeUserMessage {
+                    payload: payload.clone(),
+                    authority: authority.clone(),
+                    idempotent: false,
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm),
+        ),
 
         (
             CoreState::LlmRequesting { .. }
             | CoreState::ToolExecuting { .. }
             | CoreState::AwaitingSubAgents { .. },
-            CoreEvent::UserMessage { .. },
+            CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
         )
         | (
             CoreState::ToolExecuting { .. } | CoreState::AwaitingSubAgents { .. },
@@ -718,7 +732,9 @@ pub fn transition_core(
 
         (
             CoreState::CancellingTool { .. } | CoreState::CancellingSubAgents { .. },
-            CoreEvent::UserMessage { .. } | CoreEvent::SteerDrainedUserMessages { .. },
+            CoreEvent::UserMessage { .. }
+            | CoreEvent::AuthoritativeUserMessage { .. }
+            | CoreEvent::SteerDrainedUserMessages { .. },
         ) => Err(TransitionError::CancellationInProgress),
 
         // LLM Response Processing (REQ-BED-003)
@@ -1081,6 +1097,7 @@ fn handle_core_tool_complete(
         CoreEvent::ToolComplete { .. }
         | CoreEvent::SpawnAgentsComplete { .. }
         | CoreEvent::UserMessage { .. }
+        | CoreEvent::AuthoritativeUserMessage { .. }
         | CoreEvent::UserCancel { .. }
         | CoreEvent::LlmResponse { .. }
         | CoreEvent::LlmError { .. }
@@ -1680,8 +1697,12 @@ fn creation_provisioned_transition(
         },
     )?;
     for effect in &mut result.effects {
-        if let Effect::PersistMessage { idempotent, .. } = effect {
-            *idempotent = true;
+        match effect {
+            Effect::PersistMessage { idempotent, .. }
+            | Effect::PersistAuthoritativeUserMessage { idempotent, .. } => {
+                *idempotent = true;
+            }
+            _ => {}
         }
     }
     let request_index = result
@@ -1725,7 +1746,11 @@ pub fn transition_parent(
         // ============================================================
         (
             ParentState::AwaitingTaskApproval { .. },
-            ParentEvent::Core(CoreEvent::UserMessage { .. } | CoreEvent::UserTriggerContinuation),
+            ParentEvent::Core(
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::UserTriggerContinuation,
+            ),
         ) => Err(TransitionError::AwaitingTaskApproval),
 
         (
@@ -1848,7 +1873,11 @@ pub fn transition_parent(
         (
             ParentState::AwaitingCommissionReviewApproval { .. }
             | ParentState::AwaitingUserResponse { .. },
-            ParentEvent::Core(CoreEvent::UserMessage { .. } | CoreEvent::UserTriggerContinuation),
+            ParentEvent::Core(
+                CoreEvent::UserMessage { .. }
+                | CoreEvent::AuthoritativeUserMessage { .. }
+                | CoreEvent::UserTriggerContinuation,
+            ),
         ) => Err(TransitionError::AwaitingUserResponse),
 
         (
@@ -2123,7 +2152,9 @@ pub fn transition_parent(
         // ============================================================
         (
             ParentState::ContextExhausted { .. },
-            ParentEvent::Core(CoreEvent::UserMessage { .. }),
+            ParentEvent::Core(
+                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+            ),
         ) => Err(TransitionError::ContextExhausted),
 
         (state @ ParentState::ContextExhausted { .. }, _event) => {
@@ -2133,10 +2164,18 @@ pub fn transition_parent(
         // ============================================================
         // Parent-only state: Terminal / handed-off
         // ============================================================
-        (ParentState::HandedOff { .. }, ParentEvent::Core(CoreEvent::UserMessage { .. }))
-        | (ParentState::Terminal, ParentEvent::Core(CoreEvent::UserMessage { .. })) => {
-            Err(TransitionError::ConversationTerminal)
-        }
+        (
+            ParentState::HandedOff { .. },
+            ParentEvent::Core(
+                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+            ),
+        )
+        | (
+            ParentState::Terminal,
+            ParentEvent::Core(
+                CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+            ),
+        ) => Err(TransitionError::ConversationTerminal),
 
         (state @ ParentState::HandedOff { .. }, _event) => {
             Ok(ParentTransitionResult::new(state.clone()))
@@ -4204,6 +4243,54 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_user_message_persists_distinct_effect_with_authority() {
+        let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload {
+            text: "Hello".to_string(),
+            llm_text: Some("Expanded hello".to_string()),
+            images: vec![],
+            files: vec![],
+            message_id: "authoritative-message-id".to_string(),
+            user_agent: Some("test-agent".to_string()),
+            skill_invocation: None,
+        };
+        let authority = phoenix_core::domain::sm_event::DirectTurnAttemptAuthority {
+            attempt_id: phoenix_core::domain::sm_event::DirectTurnAttemptId(
+                "attempt-1".to_string(),
+            ),
+            token: phoenix_core::domain::sm_event::DirectTurnAuthorityToken("token-1".to_string()),
+        };
+
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::AuthoritativeUserMessage {
+                payload: payload.clone(),
+                authority: authority.clone(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistAuthoritativeUserMessage {
+                payload: effect_payload,
+                authority: effect_authority,
+                idempotent: false,
+            } if effect_payload.message_id == payload.message_id
+                && effect_payload.llm_text == payload.llm_text
+                && effect_authority == &authority
+        )));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
+    }
+
+    #[test]
     fn creation_provisioned_reuses_normal_initial_turn_transition() {
         let claim = phoenix_core::domain::creation_protocol::CreationClaim {
             worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId("worker".into()),
@@ -4263,6 +4350,14 @@ mod tests {
                     Effect::PersistMessage {
                         idempotent: false, ..
                     },
+                )
+                | (
+                    Effect::PersistAuthoritativeUserMessage {
+                        idempotent: true, ..
+                    },
+                    Effect::PersistAuthoritativeUserMessage {
+                        idempotent: false, ..
+                    },
                 ) => {}
                 _ => assert_eq!(format!("{provisioning:?}"), format!("{idle:?}")),
             }
@@ -4270,6 +4365,9 @@ mod tests {
         assert!(from_provisioning.effects.iter().any(|effect| matches!(
             effect,
             Effect::PersistMessage {
+                idempotent: true,
+                ..
+            } | Effect::PersistAuthoritativeUserMessage {
                 idempotent: true,
                 ..
             }
@@ -6796,6 +6894,7 @@ mod tests {
             let execute_effect = result.effects.iter().find_map(|effect| match effect {
                 Effect::ExecuteTool { tool } => Some(tool),
                 Effect::PersistMessage { .. }
+                | Effect::PersistAuthoritativeUserMessage { .. }
                 | Effect::PersistState
                 | Effect::RequestLlm
                 | Effect::CompleteCreation { .. }

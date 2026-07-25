@@ -3,6 +3,32 @@
 use crate::domain::db_schema::{ErrorKind, FileAttachment, ImageData, ToolResult};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnAttemptId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnAuthorityToken(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnAttemptAuthority {
+    pub attempt_id: DirectTurnAttemptId,
+    pub token: DirectTurnAuthorityToken,
+}
+
+/// Serializable, lossless direct-turn payload prepared by the authoritative
+/// transport before it is delivered to the reducer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedDirectTurnPayload {
+    pub text: String,
+    pub llm_text: Option<String>,
+    pub images: Vec<ImageData>,
+    #[serde(default)]
+    pub files: Vec<FileAttachment>,
+    pub message_id: String,
+    pub user_agent: Option<String>,
+    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+}
+
 /// A steering message queued for delivery when the conversation next reaches
 /// `Idle`. The in-memory form of a pending steer; persisted across the
 /// normalized `steering_messages` (+ attachment) tables by the DB layer.
@@ -16,6 +42,20 @@ pub struct SteerEntry {
     pub message_id: String,
     pub user_agent: Option<String>,
     pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+}
+
+impl From<PreparedDirectTurnPayload> for SteerEntry {
+    fn from(value: PreparedDirectTurnPayload) -> Self {
+        Self {
+            text: value.text,
+            llm_text: value.llm_text,
+            images: value.images,
+            files: value.files,
+            message_id: value.message_id,
+            user_agent: value.user_agent,
+            skill_invocation: value.skill_invocation,
+        }
+    }
 }
 
 use crate::domain::llm_types::{ContentBlock, Usage};
@@ -44,6 +84,10 @@ pub enum Event {
         /// If this message triggered a skill invocation, the details are here.
         /// When present, the message is persisted as `MessageContent::Skill`.
         skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+    },
+    AuthoritativeUserMessage {
+        payload: PreparedDirectTurnPayload,
+        authority: DirectTurnAttemptAuthority,
     },
     /// Internal first-turn event accepted only while the shell is provisioning.
     CreationProvisioned {
@@ -256,6 +300,7 @@ impl Event {
     pub fn variant_name(&self) -> &'static str {
         match self {
             Event::UserMessage { .. } => "UserMessage",
+            Event::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
             Event::CreationRequestResume { .. } => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
@@ -315,6 +360,10 @@ pub enum CoreEvent {
         message_id: String,
         user_agent: Option<String>,
         skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
+    },
+    AuthoritativeUserMessage {
+        payload: PreparedDirectTurnPayload,
+        authority: DirectTurnAttemptAuthority,
     },
     UserCancel {
         reason: Option<String>,
@@ -471,6 +520,12 @@ impl TryFrom<Event> for ParentEvent {
                 user_agent,
                 skill_invocation,
             })),
+            Event::AuthoritativeUserMessage { payload, authority } => {
+                Ok(ParentEvent::Core(CoreEvent::AuthoritativeUserMessage {
+                    payload,
+                    authority,
+                }))
+            }
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "ParentEvent",
@@ -629,6 +684,12 @@ impl TryFrom<Event> for SubAgentEvent {
                 user_agent,
                 skill_invocation,
             })),
+            Event::AuthoritativeUserMessage { payload, authority } => {
+                Ok(SubAgentEvent::Core(CoreEvent::AuthoritativeUserMessage {
+                    payload,
+                    authority,
+                }))
+            }
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
                 target_type: "SubAgentEvent",
@@ -742,6 +803,7 @@ impl CoreEvent {
     pub fn variant_name(&self) -> &'static str {
         match self {
             CoreEvent::UserMessage { .. } => "UserMessage",
+            CoreEvent::AuthoritativeUserMessage { .. } => "AuthoritativeUserMessage",
             CoreEvent::UserCancel { .. } => "UserCancel",
             CoreEvent::LlmResponse { .. } => "LlmResponse",
             CoreEvent::LlmError { .. } => "LlmError",
