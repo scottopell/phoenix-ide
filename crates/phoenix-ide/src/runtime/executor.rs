@@ -2692,7 +2692,7 @@ where
                 owed.workflow.workflow_id.0, owed.receipt.receipt_id.0
             )
         });
-        let owed_tool_use_ids: std::collections::HashSet<_> = owed
+        let tool_calls = owed
             .tool_intents
             .iter()
             .filter(|intent| {
@@ -2702,22 +2702,25 @@ where
                         | phoenix_db::ToolIntentStatus::Owed
                 )
             })
-            .map(|intent| intent.tool_use_id.as_str())
-            .collect();
-        Ok(Event::LlmResponse {
-            tool_calls: durable
-                .response
-                .tool_uses()
-                .into_iter()
-                .filter(|(id, _, _)| owed_tool_use_ids.contains(*id))
-                .map(|(id, name, input)| crate::state_machine::state::ToolCall {
-                    id: id.to_string(),
+            .map(|intent| {
+                let arguments: serde_json::Value = serde_json::from_str(&intent.arguments_json)
+                    .map_err(|error| {
+                        format!(
+                            "invalid durable tool intent {} arguments: {error}",
+                            intent.tool_use_id
+                        )
+                    })?;
+                Ok(crate::state_machine::state::ToolCall {
+                    id: intent.tool_use_id.clone(),
                     input: crate::state_machine::state::ToolInput::from_model_name_and_value(
-                        name,
-                        input.clone(),
+                        &intent.tool_name,
+                        arguments,
                     ),
                 })
-                .collect(),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Event::LlmResponse {
+            tool_calls,
             content: durable.response.content,
             end_turn: durable.response.end_turn,
             usage: durable.response.usage,

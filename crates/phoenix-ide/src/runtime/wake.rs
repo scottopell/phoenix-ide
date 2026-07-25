@@ -640,13 +640,16 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
             }
             continue;
         };
+        let root_conversation_id =
+            super::find_root_conversation_id(manager.db(), &recovery.workflow.conversation_id)
+                .await;
         let request_id = uuid::Uuid::new_v4().to_string();
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let request = durable_request.into_attempt(phoenix_llm::LlmRequestTelemetry {
             conversation_id: recovery.workflow.conversation_id.clone(),
-            root_conversation_id: recovery.workflow.conversation_id.clone(),
+            root_conversation_id: root_conversation_id.clone(),
             request_id: request_id.clone(),
-            retry_attempt: u32::try_from(authority.attempt_id.0).unwrap_or(u32::MAX),
+            retry_attempt: recovery.attempt.ordinal.saturating_add(2),
             attempt_capture: attempt_capture.clone(),
         });
         let completion = llm.complete(&request).await;
@@ -718,11 +721,6 @@ async fn recover_top_level_llm_attempts(manager: &Arc<RuntimeManager>) -> Result
                 if persistence_outcome
                     == phoenix_db::CompleteLlmResponsePersistenceOutcome::Accepted
                 {
-                    let root_conversation_id = super::find_root_conversation_id(
-                        manager.db(),
-                        &recovery.workflow.conversation_id,
-                    )
-                    .await;
                     if let Err(error) = manager
                         .db()
                         .insert_turn_usage(

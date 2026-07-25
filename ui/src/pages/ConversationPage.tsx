@@ -1500,6 +1500,8 @@ function ConversationPageContent({
           if (reconciledOutcome === 'failed') {
             markFailedRef.current(localId);
             rollbackOptimisticPhase();
+          } else if (reconciledOutcome === 'cancelled') {
+            rollbackOptimisticPhase();
           } else if (reconciledOutcome === 'steering_queued') {
             rollbackOptimisticPhase();
           } else if (reconciledOutcome === 'persisted_only') {

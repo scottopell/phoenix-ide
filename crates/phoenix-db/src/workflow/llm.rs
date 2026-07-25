@@ -1786,11 +1786,12 @@ impl WorkflowRepository {
         let workflow_id = WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?);
         let accepted_turn_id: String = row.get("accepted_turn_id");
         let turn_generation = to_u64(row.get("turn_generation"), "turn_generation")?;
+        let stop_generation = turn_generation.saturating_add(1);
         let next_snapshot = TopLevelLlmSnapshot {
             turn_ref: TopLevelTurnRef {
                 conversation_id: conversation_id.to_string(),
                 accepted_turn_id: accepted_turn_id.clone(),
-                generation: turn_generation,
+                generation: stop_generation,
             },
             accepted_assistant_message_id: row.get("accepted_assistant_message_id"),
             stopped_at: Some(stopped_at.0),
@@ -1806,7 +1807,7 @@ impl WorkflowRepository {
             stopped_at,
             expected_version: Version(to_u64(row.get("version"), "version")?),
             transition_id,
-            generation: Generation(to_u64(row.get("generation"), "generation")?),
+            generation: Generation(to_u64(row.get("generation"), "generation")?.saturating_add(1)),
             next_status: WorkflowStatus::Cancelled,
             event_payload: serde_json::to_vec(&llm_profile::TopLevelLlmEvent::ResponseCancelled {
                 key: LlmEffectKey {
@@ -1829,6 +1830,21 @@ impl WorkflowRepository {
         input: &StopTopLevelLlmInput,
     ) -> DbResult<CommitOutcome> {
         let mut tx = self.begin_tx().await?;
+        let current_generations = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT wf.generation, llm.turn_generation
+             FROM workflows wf
+             JOIN top_level_llm_workflows llm ON llm.workflow_id = wf.workflow_id
+             WHERE wf.workflow_id = ?1",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        let stop_generation =
+            Generation(to_u64(current_generations.0, "generation")?.saturating_add(1));
+        let stop_turn_generation =
+            to_u64(current_generations.1, "turn_generation")?.saturating_add(1);
+        let mut next_snapshot = input.next_snapshot.clone();
+        next_snapshot.turn_ref.generation = stop_turn_generation;
         let deliveries = sqlx::query_scalar::<_, i64>(
             "SELECT delivery_id FROM workflow_deliveries WHERE workflow_id = ?1 AND status = 'Pending' ORDER BY delivery_id"
         )
@@ -1841,13 +1857,13 @@ impl WorkflowRepository {
         if deliveries.is_empty() {
             let event_codec = local_codec_ref_to_owned(&llm_profile::event_codec());
             let snapshot_codec = local_codec_ref_to_owned(&llm_profile::snapshot_codec());
-            let snapshot_payload = serde_json::to_vec(&input.next_snapshot)
+            let snapshot_payload = serde_json::to_vec(&next_snapshot)
                 .map_err(|e| DbError::Serialization(e.to_string()))?;
             let committed = tx
                 .commit_transition_head_cas(
                     input.workflow_id,
                     input.expected_version,
-                    input.generation,
+                    stop_generation,
                     input.next_status,
                     &event_codec,
                     &input.event_payload,
@@ -1867,10 +1883,11 @@ impl WorkflowRepository {
                 return Ok(outcome);
             }
             sqlx::query(
-                "UPDATE top_level_llm_workflows SET stopped_at = ?2 WHERE workflow_id = ?1",
+                "UPDATE top_level_llm_workflows SET stopped_at = ?2, turn_generation = ?3 WHERE workflow_id = ?1",
             )
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.stopped_at.0, "stopped_at")?)
+            .bind(to_i64(stop_turn_generation, "turn_generation")?)
             .execute(&mut *tx.tx)
             .await?;
             fence_tool_intents_for_stop(&mut tx, input.workflow_id).await?;
@@ -1885,14 +1902,14 @@ impl WorkflowRepository {
         }
         let event_codec = local_codec_ref_to_owned(&llm_profile::event_codec());
         let snapshot_codec = local_codec_ref_to_owned(&llm_profile::snapshot_codec());
-        let snapshot_payload = serde_json::to_vec(&input.next_snapshot)
+        let snapshot_payload = serde_json::to_vec(&next_snapshot)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let outcome = tx
             .resolve_deliveries_exact(DeliveryResolutionPlan {
                 workflow_id: input.workflow_id,
                 expected_version: input.expected_version,
                 transition_id: input.transition_id,
-                generation: input.generation,
+                generation: stop_generation,
                 next_status: input.next_status,
                 event_codec: &event_codec,
                 event_payload: &input.event_payload,
@@ -1909,9 +1926,10 @@ impl WorkflowRepository {
             tx.rollback().await?;
             return Ok(outcome);
         }
-        sqlx::query("UPDATE top_level_llm_workflows SET stopped_at = ?2 WHERE workflow_id = ?1")
+        sqlx::query("UPDATE top_level_llm_workflows SET stopped_at = ?2, turn_generation = ?3 WHERE workflow_id = ?1")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.stopped_at.0, "stopped_at")?)
+            .bind(to_i64(stop_turn_generation, "turn_generation")?)
             .execute(&mut *tx.tx)
             .await?;
         fence_tool_intents_for_stop(&mut tx, input.workflow_id).await?;
@@ -3825,6 +3843,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stopped, CommitOutcome::Committed);
+        let generations = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT wf.generation, llm.turn_generation
+             FROM workflows wf
+             JOIN top_level_llm_workflows llm ON llm.workflow_id = wf.workflow_id
+             WHERE wf.workflow_id = 1",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(generations, (1, 5));
         assert_eq!(
             repo.accept_complete_top_level_llm_response(&AcceptCompleteLlmResponseInput {
                 authority: LocalAttemptAuthority {
