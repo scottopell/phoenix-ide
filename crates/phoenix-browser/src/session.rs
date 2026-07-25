@@ -26,10 +26,10 @@ use tokio::task::JoinHandle;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
 
-/// Derive a Chrome user data dir from a `ResourceScopeKey::stable_key()`.
+/// Derive a Chrome user data dir from a browser session key.
 ///
-/// Hash the stable key to a bounded filesystem-safe component while preserving
-/// deterministic profile reuse for the same resource scope.
+/// Hash the key to a bounded filesystem-safe component while preserving
+/// deterministic profile reuse for the same browser session identity.
 ///
 /// SHA-256 is used (rather than `DefaultHasher`) so the derivation is
 /// stable across Rust/Phoenix releases — a toolchain upgrade must not
@@ -384,15 +384,12 @@ impl BrowserSession {
     }
 
     /// Build a `BrowserConfig` with optional explicit Chrome executable path.
-    /// `scope_key` is a `ResourceScopeKey::stable_key()` value — a string that
-    /// uniquely identifies the durable owner of this session. The Chrome
-    /// user data dir is derived from it so a continuation that resolves to
-    /// the same scope reuses the same on-disk profile.
+    /// The Chrome user data dir is derived from the browser session key.
     fn browser_config(
-        scope_key: &str,
+        session_key: &str,
         executable: Option<&Path>,
     ) -> Result<BrowserConfig, BrowserError> {
-        let user_data_dir = user_data_dir_for_key(scope_key);
+        let user_data_dir = user_data_dir_for_key(session_key);
 
         // Remove stale user data directory to avoid Chrome SingletonLock conflicts
         // (e.g. from a previous crash or test run that didn't clean up)
@@ -889,7 +886,6 @@ struct ScopedSession {
     creator_conversation_id: String,
     authority: ResourceAuthority,
     session: Arc<RwLock<BrowserSession>>,
-    user_data_key: String,
     kill_done: Arc<Notify>,
     kill_requested: Arc<AtomicBool>,
 }
@@ -909,7 +905,7 @@ fn session_key(work_scope: &ResourceScopeKey, actor: &EffectiveResourceAccess) -
 
 /// Global manager for all browser sessions
 pub struct BrowserSessionManager {
-    /// Keyed by `ResourceScopeKey::stable_key()`. Storing the `ResourceScopeKey` alongside
+    /// Keyed by the browser session identity. Storing the `ResourceScopeKey` alongside
     /// the session lets idle cleanup emit lifecycle events with the original
     /// scope rather than parsing the string key back into a `ResourceScopeKey`.
     sessions: RwLock<HashMap<String, ScopedSession>>,
@@ -1057,8 +1053,8 @@ impl BrowserSessionManager {
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///
-    /// Sessions are keyed by `ResourceScopeKey::stable_key()`: continuations of a
-    /// worktree-backed conversation resolve to the same scope and therefore
+    /// Session identity starts with `ResourceScopeKey::stable_key()`: continuations
+    /// of a worktree-backed conversation resolve to the same scope and therefore
     /// inherit the same Chrome window (REQ-BROWSER-WS-001), while Direct
     /// conversations fall back to per-conversation scoping (no shared owner
     /// exists for them to inherit).
@@ -1155,7 +1151,6 @@ impl BrowserSessionManager {
                 creator_conversation_id: actor.conversation_id().to_string(),
                 authority: actor.authority(),
                 session: session_arc.clone(),
-                user_data_key: key.clone(),
                 kill_done: Arc::new(Notify::new()),
                 kill_requested: Arc::new(AtomicBool::new(false)),
             },
@@ -1276,34 +1271,37 @@ impl BrowserSessionManager {
                 session_guard.terminate().await;
             }
 
-            let Some(user_data_key) = ({
+            let still_tracked = {
                 let sessions = manager.sessions.read().await;
                 sessions
-                    .iter()
-                    .find(|(_, entry)| Arc::ptr_eq(&entry.session, &session))
-                    .map(|(_, entry)| entry.user_data_key.clone())
-            }) else {
-                tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was already removed");
+                    .get(&key)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.session, &session))
+            };
+            if !still_tracked {
+                tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was removed or replaced");
                 kill_done.notify_waiters();
                 return;
-            };
+            }
 
-            let user_data_dir = user_data_dir_for_key(&user_data_key);
+            let user_data_dir = user_data_dir_for_key(&key);
             if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
                 tracing::warn!(path = %user_data_dir, error = %e, "Failed to clean up browser data dir");
             }
 
             let removed = {
                 let mut sessions = manager.sessions.write().await;
-                let removed_key = sessions
-                    .iter()
-                    .find(|(_, entry)| Arc::ptr_eq(&entry.session, &session))
-                    .map(|(key, _)| key.clone());
-                removed_key.and_then(|key| sessions.remove(&key))
+                if sessions
+                    .get(&key)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.session, &session))
+                {
+                    sessions.remove(&key)
+                } else {
+                    None
+                }
             };
 
             let Some(entry) = removed else {
-                tracing::debug!(work_scope = %requested_scope, "browser kill cleaned profile after session was already removed");
+                tracing::debug!(work_scope = %requested_scope, "browser kill cleaned profile after session was removed or replaced");
                 kill_done.notify_waiters();
                 return;
             };

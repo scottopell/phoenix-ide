@@ -951,7 +951,7 @@ impl Database {
         restrict_db_permissions(&self.path);
     }
 
-    async fn insert_work_scope_environment_tx(
+    async fn insert_work_scope_tx(
         tx: &mut Transaction<'_, Sqlite>,
         scope_id: &WorkScopeId,
         authority_kind: AuthorityKind,
@@ -2817,7 +2817,7 @@ impl Database {
                 .unwrap_or_else(|| generated_scope.as_ref().expect("generated scope").0.clone());
             let mut tx = self.pool.begin().await?;
             if let Some((scope_id, authority_kind, environment)) = generated_scope {
-                Self::insert_work_scope_environment_tx(
+                Self::insert_work_scope_tx(
                     &mut tx,
                     &scope_id,
                     authority_kind,
@@ -3373,7 +3373,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let (created_work_scope_id, authority_kind, environment) =
             Self::new_scope_for_conversation(cwd, &cm);
-        Self::insert_work_scope_environment_tx(
+        Self::insert_work_scope_tx(
             &mut tx,
             &created_work_scope_id,
             authority_kind,
@@ -5415,14 +5415,8 @@ impl Database {
         let continuation_work_scope_id = if matches!(parent.conv_mode, ConvMode::Direct) {
             let (scope_id, authority_kind, environment) =
                 Self::new_scope_for_conversation(&parent.cwd, &cm);
-            Self::insert_work_scope_environment_tx(
-                &mut tx,
-                &scope_id,
-                authority_kind,
-                environment,
-                &now_str,
-            )
-            .await?;
+            Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
+                .await?;
             Some(scope_id)
         } else {
             parent.work_scope_id.clone()
@@ -8623,7 +8617,7 @@ async fn insert_conversation_tx(
     } else {
         let (scope_id, authority_kind, environment) =
             Database::new_scope_for_conversation(&conv.cwd, &cm);
-        Database::insert_work_scope_environment_tx(
+        Database::insert_work_scope_tx(
             tx,
             &scope_id,
             authority_kind,
