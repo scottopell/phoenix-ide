@@ -1012,6 +1012,12 @@ impl ToolRegistry {
     /// proposal (REQ-PROJ-033/036). Unlike Explore, the writing modes keep
     /// their full unrestricted `patch`; `propose_task` is added on top.
     #[must_use]
+    pub fn with_additional_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools.splice(0..0, tools);
+        self
+    }
+
+    #[must_use]
     pub fn with_propose_task(mut self) -> Self {
         self.tools.push(Arc::new(ProposeTaskTool));
         self

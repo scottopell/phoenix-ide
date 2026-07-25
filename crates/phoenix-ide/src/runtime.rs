@@ -2712,7 +2712,11 @@ impl RuntimeManager {
                         self.clone(),
                     ));
                 ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
+                    ToolRegistry::coordinator(crate::coordinator_tools::tools(
+                        service,
+                        send_chat,
+                        self.db.clone(),
+                    )),
                     agent_catalog.clone(),
                 )
             } else {
@@ -2722,7 +2726,12 @@ impl RuntimeManager {
                         agent_catalog.to_vec(),
                         available_model_ids.clone(),
                         ExploreToolPolicy::from_platform(&self.platform),
-                    ),
+                    )
+                    .with_additional_tools(vec![Arc::new(
+                        crate::repository_inspection::RepositoryInspectionTool::new(
+                            self.db.clone(),
+                        ),
+                    )]),
                     ConvMode::Direct => {
                         // Full tool suite for Direct mode. `propose_task` (the
                         // fork proposal) is offered only when the working dir is

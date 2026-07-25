@@ -17,6 +17,7 @@ mod mcp_oauth_store;
 mod message_expander;
 mod phx_cli;
 mod project_opportunistic_build_warm;
+mod repository_inspection;
 mod resolution_root;
 mod runtime;
 mod send_chat_service;

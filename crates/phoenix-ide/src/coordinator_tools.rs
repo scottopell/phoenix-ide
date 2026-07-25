@@ -10,11 +10,15 @@ use crate::tools::{Tool, ToolContext, ToolOutput};
 pub(crate) fn tools(
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
+    database: crate::db::Database,
 ) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(SearchConversations(service.clone())),
         Arc::new(ReadConversation(service.clone())),
         Arc::new(QueryDatabase(service.clone())),
+        Arc::new(crate::repository_inspection::RepositoryInspectionTool::new(
+            database,
+        )),
         Arc::new(ResolveReference(service.clone())),
         Arc::new(SendConversationMessage { service, send_chat }),
     ]

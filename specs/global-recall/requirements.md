@@ -115,7 +115,9 @@ THE SYSTEM MAY provide exactly one cross-conversation mutation capability to the
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
-THE SYSTEM SHALL NOT provide filesystem, repository, browser, MCP, task drafting, task approval, project, workspace, conversation creation, or other lifecycle mutation tools to the Coordinator
+THE SYSTEM MAY provide the dedicated bounded repository-inspection capability from REQ-RI-001–008 against an explicitly selected active WorkScope
+
+THE SYSTEM SHALL NOT provide general filesystem, repository-mutation, browser, MCP, task drafting, task approval, project, workspace, conversation creation, or other lifecycle mutation tools to the Coordinator
 
 ---
 
