@@ -386,10 +386,16 @@ impl DurableTurnModel {
                 owed_effects: Vec::new(),
             });
         }
-        if disposition == AcceptedDisposition::Runtime {
-            if let Some(owner) = self.live_owner.get(&conversation) {
-                return Err(TurnConflict::ConversationAlreadyOwned { owner: *owner });
+        match (disposition, self.live_owner.get(&conversation).copied()) {
+            (AcceptedDisposition::Runtime, Some(owner)) => {
+                return Err(TurnConflict::ConversationAlreadyOwned { owner });
             }
+            (AcceptedDisposition::Steering, None) => {
+                return Err(TurnConflict::CorruptAggregate(
+                    "steering requires an active runtime owner",
+                ));
+            }
+            _ => {}
         }
         if self.turns.contains_key(&turn_id) {
             return Err(TurnConflict::CorruptAggregate(
@@ -433,7 +439,11 @@ impl DurableTurnModel {
             .turns
             .get_mut(&turn_id)
             .ok_or(TurnConflict::UnknownTurn)?;
-        let message_id = CanonicalMessageId(turn.client_key.as_str().to_string());
+        let message_id = CanonicalMessageId(format!(
+            "{}:{}",
+            turn.conversation.0,
+            turn.client_key.as_str()
+        ));
         if let Materialization::Materialized {
             message_id: canonical,
         } = &turn.materialization
@@ -850,6 +860,15 @@ mod tests {
     #[test]
     fn steering_terminal_does_not_release_conversation_owner() {
         let mut model = DurableTurnModel::default();
+        model
+            .apply(TurnCommand::Accept {
+                conversation: ConversationAuthority("a".into()),
+                client_key: ClientTurnKey::new("runtime").unwrap(),
+                prepared: prepared(0),
+                turn_id: TurnAuthorityId(9),
+                disposition: AcceptedDisposition::Runtime,
+            })
+            .unwrap();
         let created = model
             .apply(TurnCommand::Accept {
                 conversation: ConversationAuthority("a".into()),

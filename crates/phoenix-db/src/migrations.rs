@@ -337,6 +337,18 @@ CREATE INDEX durable_turns_discoverable_nonterminal
     ON durable_turns(conversation_id, disposition, turn_id)
     WHERE terminal_kind IS NULL;
 
+CREATE TRIGGER durable_turns_canonical_message_guard
+BEFORE UPDATE OF canonical_message_id ON durable_turns
+WHEN NEW.canonical_message_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM messages
+    WHERE messages.conversation_id = NEW.conversation_id
+      AND messages.message_id = NEW.canonical_message_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'direct-turn canonical message missing from conversation');
+END;
+
 CREATE UNIQUE INDEX durable_turns_canonical_message_unique
     ON durable_turns(canonical_message_id)
     WHERE canonical_message_id IS NOT NULL;
