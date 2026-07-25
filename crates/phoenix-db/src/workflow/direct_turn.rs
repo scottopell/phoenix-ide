@@ -249,6 +249,7 @@ impl WorkflowRepository {
             .apply(TurnCommand::Materialize {
                 turn_id,
                 expected_generation,
+                message_id: message_id.clone(),
             })
             .map_err(conflict)?;
         if matches!(step.outcome, TurnOutcome::Materialized { .. }) {

@@ -1274,6 +1274,11 @@ impl WorkflowRepository {
         &self,
         input: &CreateWorkflowWithExternalAcceptance,
     ) -> DbResult<ExternalAcceptanceOutcome<Vec<u8>>> {
+        if input.profile.profile_kind == DIRECT_TURN_PROFILE_KIND {
+            return Err(DbError::Serialization(
+                "direct-turn workflows require accept_authoritative_turn".to_string(),
+            ));
+        }
         let mut tx = self.begin_tx().await?;
         if let Some(replay) = tx.fetch_external_acceptance_binding(input).await? {
             tx.commit().await?;
