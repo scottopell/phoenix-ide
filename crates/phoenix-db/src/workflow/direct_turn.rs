@@ -501,6 +501,24 @@ impl WorkflowRepository {
         Ok(AuthorityOutcome::Authorized)
     }
 
+    pub async fn load_active_runtime_turn(
+        &self,
+        conversation: &ConversationAuthority,
+    ) -> DbResult<Option<DurableTurn>> {
+        sqlx::query(
+            "SELECT * FROM durable_turns
+             WHERE conversation_id = ?1
+               AND disposition = 'Runtime'
+               AND terminal_kind IS NULL
+               AND owns_conversation = 1",
+        )
+        .bind(&conversation.0)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(row_to_turn)
+        .transpose()
+    }
+
     pub async fn list_discoverable_accepted_turns(
         &self,
         conversation: &ConversationAuthority,

@@ -1861,6 +1861,9 @@ where
     /// Task 24684 was originally numbered 24679 in commit history — see
     /// the task file for the rebase-time renumbering note.
     parent_tool_cycle_count: u32,
+    active_direct_turn: Option<Box<crate::runtime::traits::ActiveDirectTurn>>,
+    pending_direct_turn_terminal: Option<Box<crate::runtime::traits::ActiveDirectTurnTerminal>>,
+    direct_turn_cancellation_initiated: bool,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
     /// a system message. `0` disables the cap. Read once at construction
     /// time from `PHOENIX_PARENT_TOOL_CYCLE_CAP`, with
@@ -1987,6 +1990,9 @@ where
             grace_turn_granted: false,
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
+            active_direct_turn: None,
+            pending_direct_turn_terminal: None,
+            direct_turn_cancellation_initiated: false,
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             credential_helper: None,
             agent_catalog: Arc::from(Vec::new()),
@@ -2068,6 +2074,14 @@ where
         self
     }
 
+    pub fn with_active_direct_turn(
+        mut self,
+        active: Option<crate::runtime::traits::ActiveDirectTurn>,
+    ) -> Self {
+        self.active_direct_turn = active.map(Box::new);
+        self
+    }
+
     /// Set the parent event channel (for sub-agents)
     pub fn with_parent(mut self, parent_tx: mpsc::Sender<Event>) -> Self {
         self.parent_event_tx = Some(parent_tx);
@@ -2111,8 +2125,12 @@ where
         self
     }
 
-    #[allow(clippy::too_many_lines)] // Sequential event loop; splitting hurts readability
-    pub async fn run(mut self) {
+    pub fn run(self) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'static>> {
+        Box::pin(self.run_inner())
+    }
+
+    #[allow(clippy::too_many_lines)] // Sequential event loop owns the runtime state.
+    async fn run_inner(mut self) {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
 
         // Check if we need to resume an interrupted operation
@@ -2692,6 +2710,7 @@ where
             }
 
             // Pure state transition
+            let terminal_event = current_event.clone();
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2712,6 +2731,7 @@ where
                 }
             };
 
+            self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             let generated_events = self.apply_transition_result(result).await?;
             events_to_process.extend(generated_events);
         }
@@ -2993,6 +3013,7 @@ where
                 match &effect {
                     Effect::PersistState => {
                         self.persist_state_effect(false).await?;
+                        Box::pin(self.terminate_pending_direct_turn()).await?;
                         continue;
                     }
                     Effect::NotifyStateChange => {
@@ -3888,6 +3909,61 @@ where
     }
 
     /// Execute an effect and optionally return a generated event
+    fn classify_active_direct_turn_terminal(&mut self, event: &Event, new_state: &ConvState) {
+        if self.active_direct_turn.is_none() {
+            return;
+        }
+        if matches!(event, Event::UserCancel { .. }) {
+            self.direct_turn_cancellation_initiated = true;
+        }
+        if matches!(new_state, ConvState::Idle) {
+            if self.direct_turn_cancellation_initiated {
+                self.pending_direct_turn_terminal = Some(Box::new(
+                    crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
+                ));
+            } else if matches!(event, Event::LlmResponse { .. }) {
+                self.pending_direct_turn_terminal = Some(Box::new(
+                    crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+                ));
+            }
+            return;
+        }
+        if matches!(
+            new_state,
+            ConvState::Error { .. } | ConvState::ContextExhausted { .. }
+        ) {
+            let reason = match event {
+                Event::LlmError { message, .. } | Event::CredentialHelperFailed { message } => {
+                    message.clone()
+                }
+                _ => format!("conversation entered terminal error state after {event:?}"),
+            };
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed { reason },
+            ));
+        }
+    }
+
+    async fn terminate_pending_direct_turn(&mut self) -> Result<(), String> {
+        let (Some(active), Some(terminal)) = (
+            self.active_direct_turn.as_deref().cloned(),
+            self.pending_direct_turn_terminal.take(),
+        ) else {
+            return Ok(());
+        };
+        if let Err(error) = self
+            .storage
+            .terminate_active_direct_turn(&active, terminal.as_ref().clone())
+            .await
+        {
+            self.pending_direct_turn_terminal = Some(terminal);
+            return Err(error);
+        }
+        self.active_direct_turn = None;
+        self.direct_turn_cancellation_initiated = false;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
         match effect {
@@ -3931,9 +4007,11 @@ where
                     )
                     .await?
                 {
-                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized(
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized {
                         message,
-                    ) => {
+                        active,
+                    } => {
+                        self.active_direct_turn = Some(Box::new(active));
                         let _ = self.broadcast_tx.send_message(*message);
                         Ok(None)
                     }
@@ -3991,7 +4069,11 @@ where
                 Ok(None)
             }
 
-            Effect::PersistState => self.persist_state_effect(true).await,
+            Effect::PersistState => {
+                let outcome = self.persist_state_effect(true).await?;
+                Box::pin(self.terminate_pending_direct_turn()).await?;
+                Ok(outcome)
+            }
 
             Effect::RequestLlm => self.dispatch_llm_request().await,
 
@@ -8510,10 +8592,13 @@ mod authoritative_user_message_effect_tests {
     async fn fresh_materialized_emits_one_persisted_reserved_message() {
         let (mut rt, storage, mut rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
-            AuthoritativeUserMessageMaterialization::Materialized(Box::new(message(
-                "msg-direct",
-                1,
-            ))),
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
         );
 
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
@@ -8535,6 +8620,138 @@ mod authoritative_user_message_effect_tests {
         assert_eq!(materialize_calls.len(), 1);
         assert_eq!(materialize_calls[0].sequence_id, 1);
         assert_no_broadcast(&mut rx);
+        assert_eq!(
+            rt.active_direct_turn,
+            Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(1),
+                generation: 0,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_active_direct_turn_completes_after_state_persistence() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let active = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(8),
+            generation: 0,
+        };
+        rt = rt.with_active_direct_turn(Some(active.clone()));
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+
+        rt.process_event(Event::LlmResponse {
+            content: Vec::new(),
+            tool_calls: Vec::new(),
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "response".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            storage.recorded_terminate_active_direct_turn_calls(),
+            vec![(
+                active,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            )]
+        );
+        assert_eq!(rt.active_direct_turn, None);
+        assert_eq!(rt.pending_direct_turn_terminal, None);
+    }
+
+    #[tokio::test]
+    async fn active_direct_turn_terminal_classification_releases_exactly_once() {
+        for (event, new_state, expected) in [
+            (
+                Event::LlmResponse {
+                    content: Vec::new(),
+                    tool_calls: Vec::new(),
+                    end_turn: true,
+                    usage: phoenix_llm::Usage::default(),
+                    request_id: "response".to_string(),
+                },
+                ConvState::Idle,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            ),
+            (
+                Event::LlmError {
+                    message: "provider failed".to_string(),
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                    attempt: 1,
+                    recovery_in_progress: false,
+                    resets_at: None,
+                },
+                ConvState::Error {
+                    message: "provider failed".to_string(),
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                    resets_at: None,
+                },
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: "provider failed".to_string(),
+                },
+            ),
+        ] {
+            let (mut rt, storage, _rx) = runtime(
+                DirectTurnMaterializationEligibility::StaleAuthority,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+            rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(9),
+                generation: 0,
+            }));
+            rt.classify_active_direct_turn_terminal(&event, &new_state);
+            rt.terminate_pending_direct_turn().await.unwrap();
+            rt.terminate_pending_direct_turn().await.unwrap();
+            assert_eq!(
+                storage.recorded_terminate_active_direct_turn_calls(),
+                vec![(
+                    crate::runtime::traits::ActiveDirectTurn {
+                        turn_id: phoenix_workflow::TurnAuthorityId(9),
+                        generation: 0,
+                    },
+                    expected,
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn active_direct_turn_cancellation_latches_until_idle() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(10),
+            generation: 0,
+        }));
+        rt.classify_active_direct_turn_terminal(
+            &Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            },
+            &ConvState::LlmRequesting { attempt: 1 },
+        );
+        rt.classify_active_direct_turn_terminal(
+            &Event::ToolAborted {
+                tool_use_id: "tool".to_string(),
+            },
+            &ConvState::Idle,
+        );
+        rt.terminate_pending_direct_turn().await.unwrap();
+        assert!(matches!(
+            storage
+                .recorded_terminate_active_direct_turn_calls()
+                .as_slice(),
+            [(
+                _,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled
+            )]
+        ));
     }
 
     #[tokio::test]

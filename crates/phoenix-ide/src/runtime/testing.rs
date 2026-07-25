@@ -532,6 +532,13 @@ pub struct InMemoryStorage {
     preflight_authoritative_user_message_calls: Mutex<Vec<PreflightAuthoritativeUserMessageCall>>,
     materialize_authoritative_user_message_calls:
         Mutex<Vec<MaterializeAuthoritativeUserMessageCall>>,
+    active_direct_turn: Mutex<Option<crate::runtime::traits::ActiveDirectTurn>>,
+    terminate_active_direct_turn_calls: Mutex<
+        Vec<(
+            crate::runtime::traits::ActiveDirectTurn,
+            crate::runtime::traits::ActiveDirectTurnTerminal,
+        )>,
+    >,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -554,6 +561,8 @@ impl InMemoryStorage {
             materialize_authoritative_user_message_results: Mutex::new(VecDeque::new()),
             preflight_authoritative_user_message_calls: Mutex::new(Vec::new()),
             materialize_authoritative_user_message_calls: Mutex::new(Vec::new()),
+            active_direct_turn: Mutex::new(None),
+            terminate_active_direct_turn_calls: Mutex::new(Vec::new()),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -650,6 +659,22 @@ impl InMemoryStorage {
         &self,
     ) -> Vec<PreflightAuthoritativeUserMessageCall> {
         self.preflight_authoritative_user_message_calls
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    pub fn set_active_direct_turn(&self, active: Option<crate::runtime::traits::ActiveDirectTurn>) {
+        *self.active_direct_turn.lock().unwrap() = active;
+    }
+
+    pub fn recorded_terminate_active_direct_turn_calls(
+        &self,
+    ) -> Vec<(
+        crate::runtime::traits::ActiveDirectTurn,
+        crate::runtime::traits::ActiveDirectTurnTerminal,
+    )> {
+        self.terminate_active_direct_turn_calls
             .lock()
             .unwrap()
             .clone()
@@ -859,6 +884,26 @@ impl MessageStore for InMemoryStorage {
             .unwrap()
             .pop_front()
             .unwrap_or(AuthoritativeUserMessageMaterialization::StaleAuthority))
+    }
+
+    async fn load_active_direct_turn(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<crate::runtime::traits::ActiveDirectTurn>, String> {
+        Ok(self.active_direct_turn.lock().unwrap().clone())
+    }
+
+    async fn terminate_active_direct_turn(
+        &self,
+        turn: &crate::runtime::traits::ActiveDirectTurn,
+        terminal: crate::runtime::traits::ActiveDirectTurnTerminal,
+    ) -> Result<(), String> {
+        self.terminate_active_direct_turn_calls
+            .lock()
+            .unwrap()
+            .push((turn.clone(), terminal));
+        *self.active_direct_turn.lock().unwrap() = None;
+        Ok(())
     }
 
     async fn update_message_display_data(

@@ -10,11 +10,27 @@ use chrono::{DateTime, Utc};
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveDirectTurn {
+    pub turn_id: phoenix_workflow::TurnAuthorityId,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum AuthoritativeUserMessageMaterialization {
-    Materialized(Box<Message>),
+    Materialized {
+        message: Box<Message>,
+        active: ActiveDirectTurn,
+    },
     ExactReplay,
     StaleAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveDirectTurnTerminal {
+    Completed,
+    Cancelled,
+    Failed { reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +141,17 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
         Ok(AuthoritativeUserMessageMaterialization::StaleAuthority)
     }
+
+    async fn load_active_direct_turn(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ActiveDirectTurn>, String>;
+
+    async fn terminate_active_direct_turn(
+        &self,
+        turn: &ActiveDirectTurn,
+        terminal: ActiveDirectTurnTerminal,
+    ) -> Result<(), String>;
 
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
@@ -440,6 +467,21 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         input: &AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
         (**self).materialize_authoritative_user_message(input).await
+    }
+
+    async fn load_active_direct_turn(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ActiveDirectTurn>, String> {
+        (**self).load_active_direct_turn(conversation_id).await
+    }
+
+    async fn terminate_active_direct_turn(
+        &self,
+        turn: &ActiveDirectTurn,
+        terminal: ActiveDirectTurnTerminal,
+    ) -> Result<(), String> {
+        (**self).terminate_active_direct_turn(turn, terminal).await
     }
 
     async fn update_message_display_data(
@@ -808,9 +850,15 @@ impl MessageStore for DatabaseStorage {
             materialized.outcome,
             materialized.message,
         ) {
-            (AuthorityOutcome::Authorized, TurnOutcome::Materialized { .. }, Some(message)) => Ok(
-                AuthoritativeUserMessageMaterialization::Materialized(Box::new(message)),
-            ),
+            (AuthorityOutcome::Authorized, TurnOutcome::Materialized { .. }, Some(message)) => {
+                Ok(AuthoritativeUserMessageMaterialization::Materialized {
+                    message: Box::new(message),
+                    active: ActiveDirectTurn {
+                        turn_id: materialized.canonical_turn.id,
+                        generation: materialized.canonical_turn.generation,
+                    },
+                })
+            }
             (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, Some(_)) => {
                 Ok(AuthoritativeUserMessageMaterialization::ExactReplay)
             }
@@ -819,6 +867,51 @@ impl MessageStore for DatabaseStorage {
             }
             _ => Ok(AuthoritativeUserMessageMaterialization::StaleAuthority),
         }
+    }
+
+    async fn load_active_direct_turn(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ActiveDirectTurn>, String> {
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        repo.load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+            conversation_id.to_string(),
+        ))
+        .await
+        .map(|turn| {
+            turn.map(|turn| ActiveDirectTurn {
+                turn_id: turn.id,
+                generation: turn.generation,
+            })
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    async fn terminate_active_direct_turn(
+        &self,
+        turn: &ActiveDirectTurn,
+        terminal: ActiveDirectTurnTerminal,
+    ) -> Result<(), String> {
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let command = match terminal {
+            ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
+                turn_id: turn.turn_id,
+                expected_generation: turn.generation,
+            },
+            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnCommand::Cancel {
+                turn_id: turn.turn_id,
+                expected_generation: turn.generation,
+            },
+            ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnCommand::Fail {
+                turn_id: turn.turn_id,
+                expected_generation: turn.generation,
+                reason,
+            },
+        };
+        repo.terminate_authoritative_turn(command)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     async fn update_message_display_data(

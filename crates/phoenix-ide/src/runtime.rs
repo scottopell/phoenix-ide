@@ -2813,6 +2813,12 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
+        let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
+            &storage,
+            conversation_id,
+        )
+        .await?;
+
         let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
             initial_state.clone(),
@@ -2839,6 +2845,7 @@ impl RuntimeManager {
         let runtime = runtime
             .with_wake_registrar(self.wake_registrar())
             .with_state_updated_at(initial_state_updated_at)
+            .with_active_direct_turn(active_direct_turn)
             .with_steering_queue(steering_queue)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
             .with_task_handoff_channel(self.handoff_tx.clone())
