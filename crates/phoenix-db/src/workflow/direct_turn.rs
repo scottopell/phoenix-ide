@@ -744,15 +744,17 @@ impl WorkflowRepository {
                 attempt_id: Some(input.authority.attempt_id),
                 origin: phoenix_workflow::ReceiptOrigin::Execution,
                 receipt_codec: local_codec_owned(&direct_turn_profile::receipt_codec()),
-                receipt_payload: serde_json::to_vec(&authority_event(&input.authority, turn_id))
-                    .map_err(|e| {
-                        DbError::Serialization(format!("encode direct-turn receipt: {e}"))
-                    })?,
+                receipt_payload: serde_json::to_vec(&direct_turn_profile::DirectTurnReceipt {
+                    turn_id: turn_id.0,
+                    canonical_message_id: canonical_message_id.0.clone(),
+                })
+                .map_err(|e| DbError::Serialization(format!("encode direct-turn receipt: {e}")))?,
                 receipt_event_codec: local_codec_owned(&direct_turn_profile::receipt_event_codec()),
-                receipt_event_payload: serde_json::to_vec(&authority_event(
-                    &input.authority,
-                    turn_id,
-                ))
+                receipt_event_payload: serde_json::to_vec(
+                    &direct_turn_profile::DirectTurnReceiptEvent::Materialized {
+                        canonical_message_id: canonical_message_id.0.clone(),
+                    },
+                )
                 .map_err(|e| {
                     DbError::Serialization(format!("encode direct-turn receipt event: {e}"))
                 })?,
@@ -1950,6 +1952,42 @@ mod tests {
                 .outcome,
             TurnOutcome::ExactReplay { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn materialization_persists_typed_receipt_payloads() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "typed-receipt", 19).await;
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 10))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        let result = repo
+            .materialize_authoritative_turn(&materialize_input(
+                turn_id,
+                claim,
+                1,
+                1,
+                "message-conv-a-typed-receipt",
+                10,
+            ))
+            .await
+            .unwrap();
+
+        let receipt: direct_turn_profile::DirectTurnReceipt =
+            serde_json::from_slice(&result.receipt.as_ref().unwrap().receipt_payload).unwrap();
+        assert_eq!(receipt.turn_id, turn_id.0);
+        assert_eq!(receipt.canonical_message_id, "message-conv-a-typed-receipt");
+        let event: direct_turn_profile::DirectTurnReceiptEvent =
+            serde_json::from_slice(&result.delivery.as_ref().unwrap().payload_blob).unwrap();
+        assert_eq!(
+            event,
+            direct_turn_profile::DirectTurnReceiptEvent::Materialized {
+                canonical_message_id: "message-conv-a-typed-receipt".to_string(),
+            }
+        );
     }
 
     #[tokio::test]

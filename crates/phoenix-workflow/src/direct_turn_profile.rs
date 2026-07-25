@@ -47,6 +47,17 @@ pub struct RuntimeTurnIntent {
     pub prepared_fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTurnReceipt {
+    pub turn_id: u64,
+    pub canonical_message_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectTurnReceiptEvent {
+    Materialized { canonical_message_id: String },
+}
+
 impl WorkflowProfile for DirectTurnProfile {
     type Snapshot = DirectTurnSnapshot;
     type RuntimeAcceptance = RuntimeAcceptanceEnabled;
@@ -54,8 +65,8 @@ impl WorkflowProfile for DirectTurnProfile {
     type Event = DirectTurnEvent;
     type Intent = RuntimeTurnIntent;
     type Observation = ();
-    type Receipt = ();
-    type ReceiptReducerEvent = ();
+    type Receipt = DirectTurnReceipt;
+    type ReceiptReducerEvent = DirectTurnReceiptEvent;
     type BarrierEvent = ();
     type ManualPayload = ();
 
@@ -63,7 +74,7 @@ impl WorkflowProfile for DirectTurnProfile {
         true
     }
 
-    fn receipt_requires_runtime_acceptance((): &Self::ReceiptReducerEvent) -> bool {
+    fn receipt_requires_runtime_acceptance(_: &Self::ReceiptReducerEvent) -> bool {
         false
     }
 
