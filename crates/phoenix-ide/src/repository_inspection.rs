@@ -254,12 +254,34 @@ async fn inspect_file(
 ) -> Result<Evidence, String> {
     let commit = resolve_commit(target, reference).await?;
     let path = validate_path(path)?;
-    let output = run_git(
+    let object = format!("{commit}:{path}");
+    let size = run_git(
         target,
-        vec!["show".into(), format!("{commit}:{path}")],
-        MAX_FILE_BYTES,
+        vec!["cat-file".into(), "-s".into(), object.clone()],
+        1024,
     )
     .await?;
+    if size.status != 0 {
+        return Ok(evidence(
+            target,
+            "read_file",
+            vec![commit],
+            size.status,
+            size.truncated,
+            size.text,
+        ));
+    }
+    let size: usize = size
+        .text
+        .trim()
+        .parse()
+        .map_err(|_| "Git returned an invalid blob size".to_string())?;
+    if size > MAX_FILE_BYTES {
+        return Err(format!(
+            "committed file exceeds {MAX_FILE_BYTES} byte inspection limit"
+        ));
+    }
+    let output = run_git(target, vec!["show".into(), object], MAX_FILE_BYTES).await?;
     if output.status != 0 {
         return Ok(evidence(
             target,
@@ -321,10 +343,18 @@ async fn inspect_search(
         args.push(validate_path(&path)?);
     }
     let mut output = run_git(target, args, MAX_OUTPUT_BYTES).await?;
-    let lines: Vec<&str> = output.text.lines().collect();
-    if lines.len() > limit {
-        output.text = lines[..limit].join("\n");
+    let prefix = format!("{commit}:");
+    let normalized = output
+        .text
+        .lines()
+        .map(|line| line.strip_prefix(&prefix).unwrap_or(line))
+        .map(|line| format!("{commit}:{line}"))
+        .collect::<Vec<_>>();
+    if normalized.len() > limit {
+        output.text = normalized[..limit].join("\n");
         output.truncated = true;
+    } else {
+        output.text = normalized.join("\n");
     }
     Ok(evidence(
         target,
@@ -506,6 +536,11 @@ async fn run_git_with_timeout(
         .args(args)
         .env_remove("GIT_EXTERNAL_DIFF")
         .env_remove("GIT_DIFF_OPTS")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("GIT_SSH")
+        .env_remove("GIT_SSH_COMMAND")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -790,7 +825,7 @@ mod tests {
                 "-F".into(),
                 "-e".into(),
                 "feature".into(),
-                head,
+                head.clone(),
                 "--".into(),
             ],
             MAX_OUTPUT_BYTES,
@@ -799,6 +834,43 @@ mod tests {
         .unwrap();
         assert_eq!(search.status, 0);
         assert!(search.text.contains("src/lib.rs:3:feature"));
+        let normalized = inspect_search(&target, "HEAD", "feature".to_string(), None, Some(10))
+            .await
+            .unwrap();
+        assert!(normalized
+            .output
+            .contains(&format!("{head}:src/lib.rs:3:feature")));
+    }
+
+    #[tokio::test]
+    async fn two_ref_triage_resolves_identity_overlap_and_source_evidence() {
+        let (_temp, target, base) = repository();
+        let head = resolve_commit(&target, "HEAD").await.unwrap();
+        let names = inspect_diff(&target, &base, &head, Vec::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(names.resolved_commits, vec![base.clone(), head.clone()]);
+        assert!(names.output.contains("src/lib.rs"));
+
+        let source = inspect_file(&target, &head, "src/lib.rs", Some(1), Some(10))
+            .await
+            .unwrap();
+        assert!(source
+            .output
+            .contains(&format!("{head}:src/lib.rs:2\tshared changed")));
+
+        let search = inspect_search(
+            &target,
+            &head,
+            "shared changed".to_string(),
+            Some("src".to_string()),
+            Some(10),
+        )
+        .await
+        .unwrap();
+        assert!(search
+            .output
+            .contains(&format!("{head}:src/lib.rs:2:shared changed")));
     }
 
     #[tokio::test]
@@ -826,6 +898,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_registry_contains_only_the_narrow_repository_capability() {
+        let database = Database::open_in_memory().await.unwrap();
+        let inspection: std::sync::Arc<dyn Tool> =
+            std::sync::Arc::new(RepositoryInspectionTool::new(database));
+        let registry = phoenix_tools::ToolRegistry::coordinator(vec![inspection]);
+        assert!(registry.find_tool("repository_inspect").is_some());
+        for forbidden in [
+            "bash",
+            "patch",
+            "tmux_run",
+            "browser_navigate",
+            "propose_task",
+        ] {
+            assert!(registry.find_tool(forbidden).is_none(), "{forbidden}");
+        }
+    }
+
+    #[tokio::test]
     async fn output_is_bounded_and_index_is_unchanged() {
         let (temp, target, _base) = repository();
         fs::write(
@@ -836,15 +926,10 @@ mod tests {
         git(temp.path(), &["add", "large.txt"]);
         git(temp.path(), &["commit", "-qm", "large"]);
         let head = resolve_commit(&target, "HEAD").await.unwrap();
-        let output = run_git(
-            &target,
-            vec!["show".into(), format!("{head}:large.txt")],
-            MAX_FILE_BYTES,
-        )
-        .await
-        .unwrap();
-        assert!(output.truncated);
-        assert!(output.text.len() <= MAX_FILE_BYTES);
+        let error = inspect_file(&target, &head, "large.txt", None, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("byte inspection limit"));
 
         let index = temp.path().join(".git/index");
         let before = fs::metadata(&index).unwrap().modified().unwrap();

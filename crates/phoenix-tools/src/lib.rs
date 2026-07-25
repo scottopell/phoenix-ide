@@ -936,8 +936,10 @@ impl ToolRegistry {
 
     /// Bounded registry for the global Coordinator. The host supplies global
     /// read tools and the singular cross-conversation text-message action.
-    /// Filesystem, browser, shell, MCP, repository, task, project, creation,
-    /// approval, workspace, and other lifecycle tools are structurally absent.
+    /// General filesystem, browser, shell, MCP, repository-mutation, task,
+    /// project, creation, approval, workspace, and lifecycle tools are structurally
+    /// absent. The supplied list may include narrowly typed read capabilities such
+    /// as bounded repository inspection.
     #[must_use]
     pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
