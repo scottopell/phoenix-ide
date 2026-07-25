@@ -578,6 +578,11 @@ mod tests {
                             prepared: prepared_payload("message-materialized"),
                             sequence_id: 99,
                             created_at: Timestamp(99),
+                            accepted_state:
+                                phoenix_core::domain::db_schema::ConvState::LlmRequesting {
+                                    attempt: 1,
+                                },
+                            state_updated_at: chrono::DateTime::from_timestamp(99, 0).unwrap(),
                             now: Timestamp(10),
                         },
                     )

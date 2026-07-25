@@ -508,6 +508,8 @@ pub struct MaterializeAuthoritativeUserMessageCall {
     pub payload: PreparedDirectTurnPayload,
     pub sequence_id: i64,
     pub created_at: Timestamp,
+    pub accepted_state: ConvState,
+    pub state_updated_at: chrono::DateTime<chrono::Utc>,
     pub now: Timestamp,
 }
 
@@ -837,21 +839,19 @@ impl MessageStore for InMemoryStorage {
 
     async fn materialize_authoritative_user_message(
         &self,
-        authority: &DirectTurnAttemptAuthority,
-        payload: &PreparedDirectTurnPayload,
-        sequence_id: i64,
-        created_at: Timestamp,
-        now: Timestamp,
+        input: &crate::runtime::traits::AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
         self.materialize_authoritative_user_message_calls
             .lock()
             .unwrap()
             .push(MaterializeAuthoritativeUserMessageCall {
-                authority: authority.clone(),
-                payload: payload.clone(),
-                sequence_id,
-                created_at,
-                now,
+                authority: input.authority.clone(),
+                payload: input.payload.clone(),
+                sequence_id: input.sequence_id,
+                created_at: input.created_at,
+                accepted_state: input.accepted_state.clone(),
+                state_updated_at: input.state_updated_at,
+                now: input.now,
             });
         Ok(self
             .materialize_authoritative_user_message_results

@@ -1,7 +1,7 @@
 use super::WorkflowRepository;
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::db_schema::{Message, MessageContent};
+use phoenix_core::domain::db_schema::{ConvState, Message, MessageContent};
 use phoenix_core::domain::sm_event::{
     DirectTurnAttemptAuthority, PreparedDirectTurnPayload, SubmittedDirectTurnIdentity,
 };
@@ -126,13 +126,15 @@ pub enum DirectTurnMaterializationEligibility {
     StaleAuthority,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MaterializeAuthoritativeTurnInput {
     pub turn_id: TurnAuthorityId,
     pub authority: super::LocalAttemptAuthority,
     pub prepared: PreparedDirectTurnPayload,
     pub sequence_id: i64,
     pub created_at: Timestamp,
+    pub accepted_state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
     pub now: Timestamp,
 }
 
@@ -757,6 +759,7 @@ impl WorkflowRepository {
                     actual: turn.generation,
                 }));
             }
+            update_conversation_state_for_adoption_tx(&mut tx, &turn.conversation, input).await?;
             Some(message)
         } else {
             let existing = load_message_by_id_tx(&mut tx.tx, &canonical_message_id.0).await?;
@@ -1054,6 +1057,28 @@ fn verify_prepared_payload(
     }
     if prepared != &stored {
         return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+    }
+    Ok(())
+}
+
+async fn update_conversation_state_for_adoption_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    conversation: &ConversationAuthority,
+    input: &MaterializeAuthoritativeTurnInput,
+) -> DbResult<()> {
+    let state_json = serde_json::to_string(&input.accepted_state)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let updated = sqlx::query(
+        "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+    )
+    .bind(state_json)
+    .bind(input.state_updated_at.to_rfc3339())
+    .bind(&conversation.0)
+    .execute(&mut *tx.tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(DbError::ConversationNotFound(conversation.0.clone()));
     }
     Ok(())
 }
@@ -1833,6 +1858,8 @@ mod tests {
             prepared: prepared_payload(message_id),
             sequence_id: i64::try_from(now).unwrap(),
             created_at: Timestamp(now),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: timestamp_to_datetime(Timestamp(now)),
             now: Timestamp(now),
         }
     }

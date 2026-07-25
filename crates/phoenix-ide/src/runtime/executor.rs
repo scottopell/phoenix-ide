@@ -3919,11 +3919,15 @@ where
                 match self
                     .storage
                     .materialize_authoritative_user_message(
-                        &authority,
-                        &payload,
-                        reserved_seqs[0],
-                        phoenix_workflow::Timestamp(now),
-                        phoenix_workflow::Timestamp(now),
+                        &crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
+                            authority,
+                            payload,
+                            sequence_id: reserved_seqs[0],
+                            created_at: phoenix_workflow::Timestamp(now),
+                            accepted_state: self.state.clone(),
+                            state_updated_at: self.state_updated_at,
+                            now: phoenix_workflow::Timestamp(now),
+                        },
                     )
                     .await?
                 {

@@ -888,6 +888,8 @@ mod tests {
             prepared: payload,
             sequence_id: 7,
             created_at: Timestamp(11),
+            accepted_state: crate::db::ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: chrono::DateTime::from_timestamp(11, 0).unwrap(),
             now: Timestamp(11),
         })
         .await

@@ -714,7 +714,6 @@ pub fn transition_core(
                     authority: authority.clone(),
                     idempotent: false,
                 })
-                .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),

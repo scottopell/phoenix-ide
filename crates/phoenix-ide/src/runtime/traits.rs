@@ -6,6 +6,7 @@ use crate::db::{ConvMode, Message, MessageContent, UsageData};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
 
@@ -14,6 +15,17 @@ pub enum AuthoritativeUserMessageMaterialization {
     Materialized(Box<Message>),
     ExactReplay,
     StaleAuthority,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthoritativeUserMessageAdoptionInput {
+    pub authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+    pub payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+    pub sequence_id: i64,
+    pub created_at: phoenix_workflow::Timestamp,
+    pub accepted_state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+    pub now: phoenix_workflow::Timestamp,
 }
 
 /// Storage for conversation messages
@@ -109,11 +121,7 @@ pub trait MessageStore: Send + Sync {
 
     async fn materialize_authoritative_user_message(
         &self,
-        _authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
-        _payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
-        _sequence_id: i64,
-        _created_at: phoenix_workflow::Timestamp,
-        _now: phoenix_workflow::Timestamp,
+        _input: &AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
         Ok(AuthoritativeUserMessageMaterialization::StaleAuthority)
     }
@@ -173,7 +181,7 @@ pub trait StateStore: Send + Sync {
         &self,
         conv_id: &str,
         state: &ConvState,
-        state_updated_at: chrono::DateTime<chrono::Utc>,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
 
     /// Get the current conversation state
@@ -429,21 +437,9 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
     async fn materialize_authoritative_user_message(
         &self,
-        authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
-        payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
-        sequence_id: i64,
-        created_at: phoenix_workflow::Timestamp,
-        now: phoenix_workflow::Timestamp,
+        input: &AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
-        (**self)
-            .materialize_authoritative_user_message(
-                authority,
-                payload,
-                sequence_id,
-                created_at,
-                now,
-            )
-            .await
+        (**self).materialize_authoritative_user_message(input).await
     }
 
     async fn update_message_display_data(
@@ -501,7 +497,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         &self,
         conv_id: &str,
         state: &ConvState,
-        state_updated_at: chrono::DateTime<chrono::Utc>,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         (**self)
             .update_state(conv_id, state, state_updated_at)
@@ -788,24 +784,22 @@ impl MessageStore for DatabaseStorage {
 
     async fn materialize_authoritative_user_message(
         &self,
-        authority: &phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
-        payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
-        sequence_id: i64,
-        created_at: phoenix_workflow::Timestamp,
-        now: phoenix_workflow::Timestamp,
+        input: &AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
         use phoenix_db::workflow::{MaterializeAuthoritativeTurnInput, WorkflowRepository};
         use phoenix_workflow::{AuthorityOutcome, TurnAuthorityId, TurnOutcome};
         let repo = WorkflowRepository::new(self.db.pool().clone());
-        let local_authority = direct_turn_local_authority(authority);
+        let local_authority = direct_turn_local_authority(&input.authority);
         let materialized = repo
             .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
-                turn_id: TurnAuthorityId(authority.turn_id.0),
+                turn_id: TurnAuthorityId(input.authority.turn_id.0),
                 authority: local_authority,
-                prepared: payload.clone(),
-                sequence_id,
-                created_at,
-                now,
+                prepared: input.payload.clone(),
+                sequence_id: input.sequence_id,
+                created_at: input.created_at,
+                accepted_state: input.accepted_state.clone(),
+                state_updated_at: input.state_updated_at,
+                now: input.now,
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -903,7 +897,7 @@ impl StateStore for DatabaseStorage {
         &self,
         conv_id: &str,
         state: &ConvState,
-        state_updated_at: chrono::DateTime<chrono::Utc>,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         self.db
             .update_conversation_state_at(conv_id, state, state_updated_at)
