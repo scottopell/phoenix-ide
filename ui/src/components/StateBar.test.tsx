@@ -87,6 +87,7 @@ function renderStateBar({
   firstByteRequestId,
   turnRetryContext,
   onOpenFiles,
+  terminalLauncher,
   availableModels,
   onUpgradeModel,
 }: {
@@ -103,6 +104,7 @@ function renderStateBar({
   firstByteRequestId?: string | null;
   turnRetryContext?: ComponentProps<typeof StateBar>['turnRetryContext'];
   onOpenFiles?: ComponentProps<typeof StateBar>['onOpenFiles'];
+  terminalLauncher?: ComponentProps<typeof StateBar>['terminalLauncher'];
   availableModels?: ComponentProps<typeof StateBar>['availableModels'];
   onUpgradeModel?: ComponentProps<typeof StateBar>['onUpgradeModel'];
 } = {}) {
@@ -117,6 +119,9 @@ function renderStateBar({
   };
   if (onOpenFiles !== undefined) {
     props.onOpenFiles = onOpenFiles;
+  }
+  if (terminalLauncher !== undefined) {
+    props.terminalLauncher = terminalLauncher;
   }
   if (availableModels !== undefined) {
     props.availableModels = availableModels;
@@ -148,6 +153,31 @@ function renderStateBar({
     </MemoryRouter>,
   );
 }
+
+describe('mobile terminal launcher', () => {
+  it('reveals terminal status only in expanded details and opens it directly', () => {
+    setMobileViewport(true);
+    const onOpen = vi.fn();
+    const buttonRef = { current: null };
+    renderStateBar({
+      terminalLauncher: {
+        status: { activity: 'running', unreadLines: 3, cwd: '/repo/worktree' },
+        onOpen,
+        buttonRef,
+      },
+    });
+
+    expect(screen.queryByRole('button', { name: 'Open terminal' })).not.toBeInTheDocument();
+    fireEvent.click(document.querySelector('.statebar-chevron')!);
+
+    const launcher = screen.getByRole('button', { name: 'Open terminal' });
+    expect(launcher).toHaveTextContent('Terminal');
+    expect(launcher).toHaveTextContent('/repo/worktree');
+    expect(launcher).toHaveTextContent('+3');
+    fireEvent.click(launcher);
+    expect(onOpen).toHaveBeenCalledOnce();
+  });
+});
 
 function setMobileViewport(matches = true) {
   const listeners = new Set<(event: MediaQueryListEvent) => void>();

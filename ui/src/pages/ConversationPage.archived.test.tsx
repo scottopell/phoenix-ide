@@ -844,7 +844,7 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.getByRole('button', { name: /Work/ })).toBeInTheDocument();
   });
 
-  it('keeps the conversation terminal inside mobile conversation chrome', async () => {
+  it('moves the mobile terminal out of persistent conversation chrome into a launcher sheet', async () => {
     viewportFlags.isDesktop = false;
     viewportFlags.isWideDesktop = false;
 
@@ -852,9 +852,12 @@ describe('ConversationPage archived read-only rendering', () => {
 
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     expect(await screen.findByRole('textbox')).toBeInTheDocument();
-    expect(await screen.findByTestId('terminal-panel')).toBeInTheDocument();
-    expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('[data-testid="terminal-panel"]'));
+    const terminal = await screen.findByTestId('terminal-panel');
+    expect(document.querySelector('.conversation-column')).not.toContainElement(terminal);
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
+    expect(document.querySelector('.mobile-terminal-sheet')).toContainElement(terminal);
+
+    expect(document.querySelector('.mobile-terminal-sheet')).not.toHaveClass('mobile-terminal-sheet--open');
   });
 
   it('cold-loads a UUID route via id metadata and id full-history paths', async () => {

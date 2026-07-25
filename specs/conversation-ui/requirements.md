@@ -120,6 +120,11 @@ AND keep cancellation independently accessible when cancellation is also availab
 WHEN composer controls are displayed at any supported responsive width
 THE SYSTEM SHALL keep every control outside the editable and selectable text region
 
+WHEN the composer is empty on a mobile-sized viewport
+THE SYSTEM SHALL begin as one compact control row
+AND SHALL expand the editable area only as its content grows up to the maximum height
+AND SHALL keep send, queue, and cancellation actions directly accessible as compact controls without reserving a second action row
+
 **Rationale:** Users expect standard text input behavior. Draft persistence prevents frustrating message loss.
 
 ---
@@ -262,6 +267,12 @@ WHEN viewport is mobile-sized (< 768px)
 THE SYSTEM SHALL use full-width single-column layout
 AND ensure touch targets are at least 44px
 AND respect safe area insets for notched devices
+
+WHEN a conversation terminal is available on a mobile-sized viewport
+THE SYSTEM SHALL omit persistent terminal chrome from the conversation column
+AND SHALL expose terminal status and a launcher in the expanded mobile state drawer
+AND SHALL open the live terminal in a dismissible large-screen surface
+AND SHALL preserve the terminal session and scrollback while that surface is closed
 
 WHEN viewport is tablet-sized (768px - 1024px)
 THE SYSTEM SHALL use mobile layout patterns

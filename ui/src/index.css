@@ -6915,6 +6915,70 @@ html * {
   overflow: hidden;
 }
 
+/* Mobile terminal stays mounted behind a takeover so its PTY/WebSocket and
+   scrollback survive closing. The expanded StateBar owns its launcher. */
+.mobile-terminal-sheet {
+  display: none;
+}
+
+@media (width <= 1024px) {
+  .mobile-terminal-sheet--open {
+    --terminal-pane-height: 100%;
+
+    position: fixed;
+    inset: 0;
+    z-index: 1200;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-primary);
+    padding-top: env(safe-area-inset-top, 0);
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+
+  .mobile-terminal-sheet-header {
+    min-height: 52px;
+    padding: 0 8px 0 16px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex: 0 0 auto;
+  }
+
+  .mobile-terminal-sheet-close {
+    width: 44px;
+    height: 44px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 28px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .mobile-terminal-sheet-close:hover {
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+  }
+
+  .mobile-terminal-sheet-close:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: -2px;
+  }
+
+  .mobile-terminal-sheet-content {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .mobile-terminal-sheet-content > .terminal-panel {
+    height: 100%;
+    border-top: 0;
+  }
+}
+
 /* ── Pane dividers ─────────────────────────────────────────────────────── */
 
 .pane-divider {

@@ -40,14 +40,14 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 |-------------|--------|-------|
 | **REQ-CONV-001:** Conversation List | ✅ Complete | List with slug, cwd, timestamps |
 | **REQ-CONV-002:** Chat View | ✅ Complete | Messages, markdown, tool grouping, invisible reader-proximity history acquisition with localized retry; raw and Markdown-encoded local file paths share one classifier and open through the conversation file viewer; browser screenshot attachment URIs render inline through a filename- and canonicalization-confined preview path (`linkifyText`, `ConversationMarkdownAnchor`, `resolveConversationMarkdownImageSrc`, `MessageComponents.test.tsx`) |
-| **REQ-CONV-003:** Message Composition | ✅ Complete | Auto-resize and draft persistence; Enter/Shift+Enter and IME-safe submission; non-overlapping responsive controls; concurrent Stop and steering Queue actions while busy |
+| **REQ-CONV-003:** Message Composition | ✅ Complete | One-line mobile composer that grows to its bounded maximum; draft persistence; Enter/Shift+Enter and IME-safe submission; compact non-overlapping icon controls; concurrent Stop and steering Queue actions while busy |
 | **REQ-CONV-004:** Message Delivery States | ✅ Complete | Sending/sent/failed with retry; accepted steering entries reconcile by authoritative message ID, compact from local storage, and surface a recoverable inconsistency if later authoritative idle evidence still lacks the message |
 | **REQ-CONV-005:** Connection Status | ✅ Complete | Reconnection with backoff |
 | **REQ-CONV-006:** Reconnection Data Integrity | ✅ Complete | Sequence-based deduplication |
 | **REQ-CONV-007:** Agent Activity Indicators | ✅ Complete | StateBar is the sole live-activity owner; discriminated union and exhaustive labels prevent ambiguous duplicate activity surfaces |
 | **REQ-CONV-008:** Cancellation | ✅ Complete | Cancel button during agent work |
 | **REQ-CONV-009:** New Conversation | ⚠️ Deprecated | Replaced by REQ-CONV-015, 017, 018 |
-| **REQ-CONV-010:** Responsive Layout | ✅ Complete | Viewport-specific layouts |
+| **REQ-CONV-010:** Responsive Layout | ✅ Complete | Viewport-specific layouts; mobile terminal status/launcher lives in the expanded state drawer and opens the session-preserving terminal takeover instead of consuming persistent transcript height |
 | **REQ-CONV-011:** Local Storage Schema | ✅ Complete | Namespaced keys |
 | **REQ-CONV-012:** Conversation State Indicators | ✅ Complete | Part of task 561 |
 | **REQ-CONV-013:** Per-Conversation Scroll Position | ⚠️ Deprecated | Removed wholesale; returning lands pinned to bottom |

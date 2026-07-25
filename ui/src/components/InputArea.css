@@ -1,13 +1,16 @@
 .input-quick-action {
   flex: 0 0 auto;
-  min-height: 34px;
-  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--composer-control-height);
+  min-width: var(--composer-control-height);
+  min-height: var(--composer-control-height);
+  padding: 0;
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-size: 12px;
-  font-weight: 600;
   cursor: pointer;
 }
 
@@ -82,6 +85,7 @@
 .input-textarea-wrap {
   --composer-control-height: 44px;
   --pulse-color: var(--accent-purple, #a371f7);
+  --composer-controls-width: calc(var(--composer-control-height) * 3 + 8px);
 
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -113,6 +117,18 @@
   line-height: 1.4;
 }
 
+.input-textarea-wrap:has(.input-inline-actions > :nth-child(3)) {
+  --composer-controls-width: calc(var(--composer-control-height) * 3 + 8px);
+}
+
+.input-textarea-wrap:has(.input-inline-actions > :only-child) {
+  --composer-controls-width: var(--composer-control-height);
+}
+
+.input-textarea-wrap:has(.input-inline-actions > :nth-child(2):last-child) {
+  --composer-controls-width: calc(var(--composer-control-height) * 2 + 4px);
+}
+
 #message-input:focus {
   outline: none;
 }
@@ -139,7 +155,8 @@
 
 .input-inline-actions {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
+  align-self: end;
   gap: 4px;
   min-height: var(--composer-control-height);
   padding: 0 5px 0 2px;
@@ -150,12 +167,11 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 34px;
-  min-width: 54px;
-  padding: 0 10px;
-  border-radius: 5px;
-  font-size: 13px;
-  font-weight: 500;
+  width: var(--composer-control-height);
+  min-width: var(--composer-control-height);
+  min-height: var(--composer-control-height);
+  padding: 0;
+  border-radius: 6px;
   line-height: 1;
   cursor: pointer;
 }
@@ -191,22 +207,29 @@
 }
 
 @media (width <= 480px) {
-  .input-quick-action {
-    min-height: 44px;
+  .input-textarea-wrap {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(var(--composer-control-height), auto);
+    position: relative;
   }
 
-  .input-textarea-wrap {
-    grid-template-columns: 1fr;
+  #message-input {
+    grid-column: 1;
+    grid-row: 1;
+    padding-right: calc(var(--composer-controls-width) + 12px);
   }
 
   .input-inline-actions {
+    grid-column: 1;
+    grid-row: 1;
     justify-content: flex-end;
-    padding: 2px 5px 5px;
+    padding: 0 5px 0 2px;
+    z-index: 1;
+    pointer-events: none;
   }
 
-  .input-send-btn,
-  .input-stop-btn {
-    min-height: 44px;
+  .input-inline-actions > * {
+    pointer-events: auto;
   }
 }
 

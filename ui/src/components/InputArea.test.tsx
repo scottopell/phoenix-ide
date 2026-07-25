@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useRef } from 'react';
 import { InputArea } from './InputArea';
 import { AgentMessage } from './MessageComponents';
@@ -195,8 +195,63 @@ describe('InputArea quick action', () => {
     expect(onSend).toHaveBeenCalledWith(prompt, [], []);
     expect(screen.getByRole('textbox')).toHaveValue('keep my draft');
     const actionGroup = document.querySelector('.input-inline-actions');
-    expect(actionGroup).toContainElement(screen.getByRole('button', { name: 'Brief me on current work' }));
-    expect(screen.getByRole('button', { name: 'Brief me on current work' })).toHaveTextContent('Brief me');
+    const button = screen.getByRole('button', { name: 'Brief me on current work' });
+    expect(actionGroup).toContainElement(button);
+    expect(button).toHaveAttribute('title', 'Brief me on current work');
+    expect(button).toContainHTML('svg');
+  });
+});
+
+describe('InputArea compact composer layout', () => {
+  it('starts at one row and keeps the 120px auto-grow cap styles', () => {
+    renderInput({ cwd: 'conv-grow', draft: '' });
+    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+
+    expect(textarea).toHaveAttribute('rows', '1');
+  });
+
+  it('uses icon-only action buttons with preserved accessible names and titles', () => {
+    renderInput({
+      cwd: 'conv-icons',
+      convState: { type: 'llm_requesting', attempt: 1 },
+      draft: 'change direction',
+      quickAction: {
+        label: 'Brief me on current work',
+        compactLabel: 'Brief me',
+        prompt: 'Summarize current work.',
+      },
+    });
+
+    const quickAction = screen.getByRole('button', { name: 'Brief me on current work' });
+    expect(quickAction).toHaveAttribute('title', 'Brief me on current work');
+    expect(quickAction).toContainHTML('svg');
+
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    expect(stop).toHaveAttribute('title', 'Stop agent (Esc)');
+    expect(stop).toContainHTML('svg');
+
+    const queue = screen.getByRole('button', { name: 'Queue follow-up' });
+    expect(queue).toHaveAttribute('title', 'Queue follow-up (Enter)');
+    expect(queue).toContainHTML('svg');
+  });
+
+  it('keeps quick action and send controls together without adding a second composer action row', async () => {
+    renderInput({
+      cwd: 'conv-mobile',
+      draft: 'hello',
+      quickAction: {
+        label: 'Brief me on current work',
+        compactLabel: 'Brief me',
+        prompt: 'Summarize current work.',
+      },
+    });
+
+    const actionGroup = document.querySelectorAll('.input-inline-actions');
+    expect(actionGroup).toHaveLength(1);
+    await waitFor(() => {
+      expect(document.querySelector('.input-inline-actions .input-quick-action')).not.toBeNull();
+      expect(document.querySelector('.input-inline-actions .input-send-btn')).not.toBeNull();
+    });
   });
 });
 

@@ -6,10 +6,12 @@ import {
   useCallback,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type RefObject,
 } from "react";
 import { Link } from "react-router-dom";
 import { useLastSseEventAtRef } from "../conversation/useConversationAtom";
-import { FolderTree } from "lucide-react";
+import { FolderTree, TerminalSquare } from "lucide-react";
+import type { TerminalPanelStatus } from "./TerminalPanel";
 import {
   canChangeModelInState,
   type Conversation,
@@ -138,6 +140,12 @@ interface StateBarProps {
    *  assigns `undefined` from a ternary, which the strict mode rejects
    *  without this annotation. */
   onOpenFiles?: (() => void) | undefined;
+  /** Mobile/tablet-only terminal launcher rendered in expanded details. */
+  terminalLauncher?: {
+    status: TerminalPanelStatus;
+    onOpen: () => void;
+    buttonRef: RefObject<HTMLButtonElement>;
+  } | undefined;
   workActionsAvailable?: boolean;
   prStatusHandle?: ConversationPrStatusHandle;
 }
@@ -491,6 +499,7 @@ export function StateBar({
   firstByteRequestId,
   turnRetryContext,
   onOpenFiles,
+  terminalLauncher,
   prStatusHandle,
   workActionsAvailable = true,
 }: StateBarProps) {
@@ -1199,6 +1208,44 @@ export function StateBar({
                     {branchName}
                   </code>
                   <span className="statebar-mobile-pr">{prStatusContent}</span>
+                </section>
+              )}
+
+              {terminalLauncher && (
+                <section
+                  className="statebar-mobile-section statebar-mobile-section--terminal"
+                  aria-label="Terminal"
+                >
+                  <button
+                    ref={terminalLauncher.buttonRef}
+                    type="button"
+                    className="statebar-terminal-launcher"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      terminalLauncher.onOpen();
+                    }}
+                    aria-label="Open terminal"
+                  >
+                    <TerminalSquare size={20} aria-hidden="true" />
+                    <span className="statebar-terminal-launcher-copy">
+                      <span className="statebar-terminal-launcher-title">
+                        Terminal
+                        <span
+                          className={`statebar-terminal-dot statebar-terminal-dot--${terminalLauncher.status.activity}`}
+                          aria-hidden="true"
+                        />
+                      </span>
+                      <code className="statebar-terminal-launcher-path" title={terminalLauncher.status.cwd}>
+                        {terminalLauncher.status.cwd || 'Shell'}
+                      </code>
+                    </span>
+                    {terminalLauncher.status.unreadLines > 0 && (
+                      <span className="statebar-terminal-unread">
+                        +{terminalLauncher.status.unreadLines}
+                      </span>
+                    )}
+                    <span className="statebar-terminal-arrow" aria-hidden="true">›</span>
+                  </button>
                 </section>
               )}
 

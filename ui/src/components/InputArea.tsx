@@ -11,7 +11,7 @@ import {
   DragEvent,
   type SetStateAction,
 } from 'react';
-// Icon buttons removed from action row -- file browse via sidebar, image attach via paste/drag
+import { Square, SendHorizontal, Zap } from 'lucide-react';
 import type { QueuedMessage } from '../hooks';
 import { useDraftActions, useDraftValue, useScopedState, useInlineReferences } from '../hooks';
 import type { ConversationState, FileAttachment, ImageData } from '../api';
@@ -716,7 +716,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             ref={textareaRef}
             id="message-input"
             placeholder={placeholder}
-            rows={2}
+            rows={1}
             enterKeyHint="send"
             value={voiceBase !== null
               ? (voiceBase.trim()
@@ -735,6 +735,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 className="input-quick-action"
                 disabled={!acceptsChatMessage || isUploadingFiles || quickActionSending}
                 aria-label={quickAction.label}
+                title={quickAction.label}
                 onClick={async () => {
                   setQuickActionSending(true);
                   try {
@@ -744,7 +745,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                   }
                 }}
               >
-                {quickAction.compactLabel}
+                <Zap size={18} aria-hidden="true" />
               </button>
             )}
             {!agentWorking && voiceSupported && (
@@ -762,9 +763,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 className="input-stop-btn"
                 onClick={onCancel}
                 disabled={isCancelling || isOffline}
-                title="Stop agent (Esc)"
+                title={isCancelling ? 'Stopping...' : 'Stop agent (Esc)'}
+                aria-label={isCancelling ? 'Stopping...' : 'Stop'}
               >
-                {isCancelling ? 'Stopping...' : 'Stop'}
+                <Square size={18} aria-hidden="true" fill="currentColor" />
               </button>
             )}
             {acceptsChatMessage && (
@@ -775,7 +777,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 title={agentWorking ? 'Queue follow-up (Enter)' : 'Send message (Enter)'}
                 aria-label={agentWorking ? 'Queue follow-up' : 'Send message'}
               >
-                {agentWorking ? 'Queue' : 'Send'}
+                <SendHorizontal size={18} aria-hidden="true" />
               </button>
             )}
           </div>
