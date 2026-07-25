@@ -242,17 +242,13 @@ impl SendChatApplicationService {
         let prepared_bytes = prepared_payload
             .to_exact_bytes()
             .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-        let prepared_fingerprint =
-            phoenix_core::domain::sm_event::exact_payload_fingerprint(&prepared_bytes);
         let repo = WorkflowRepository::new(self.db.pool().clone());
         let step = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority(conversation.id.clone()),
-                client_key: ClientTurnKey(req.message_id.clone()),
-                prepared: PreparedTurn {
-                    fingerprint: prepared_fingerprint,
-                    payload: prepared_bytes,
-                },
+                client_key: ClientTurnKey::new(req.message_id.clone())
+                    .ok_or(SendChatServiceError::IdempotencyConflict)?,
+                prepared: PreparedTurn::from_exact_payload(prepared_bytes),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: now_timestamp(),
             })
@@ -262,6 +258,7 @@ impl SendChatApplicationService {
             TurnOutcome::Created { .. } | TurnOutcome::ExactReplay { .. } => {
                 self.runtime.kick_direct_turn_worker();
             }
+            TurnOutcome::TerminalReplay { .. } => {}
             TurnOutcome::Materialized { .. }
             | TurnOutcome::MaterializationReplay { .. }
             | TurnOutcome::Terminal { .. } => {
@@ -396,7 +393,8 @@ async fn lookup_durable_replay(
     match repo
         .lookup_scoped_direct_turn_replay(
             &ConversationAuthority(req.conversation_id.clone()),
-            &ClientTurnKey(req.message_id.clone()),
+            &ClientTurnKey::new(req.message_id.clone())
+                .ok_or(SendChatServiceError::IdempotencyConflict)?,
             submitted,
         )
         .await
@@ -753,11 +751,7 @@ mod tests {
     }
 
     fn prepared_turn(payload: &PreparedDirectTurnPayload) -> PreparedTurn {
-        let exact = payload.to_exact_bytes().unwrap();
-        PreparedTurn {
-            fingerprint: phoenix_core::domain::sm_event::exact_payload_fingerprint(&exact),
-            payload: exact,
-        }
+        PreparedTurn::from_exact_payload(payload.to_exact_bytes().unwrap())
     }
 
     async fn db_with_conversation(conversation_id: &str) -> crate::db::Database {
@@ -848,7 +842,7 @@ mod tests {
         let turn = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority(req.conversation_id.clone()),
-                client_key: ClientTurnKey(req.message_id.clone()),
+                client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
                 prepared: prepared_turn(&payload),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
@@ -915,7 +909,7 @@ mod tests {
         let payload = prepared_payload(&req, "accepted before archive");
         repo.accept_authoritative_turn(&AcceptAuthoritativeTurn {
             conversation: ConversationAuthority(req.conversation_id.clone()),
-            client_key: ClientTurnKey(req.message_id.clone()),
+            client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
             prepared: prepared_turn(&payload),
             disposition: AcceptedDisposition::Runtime,
             accepted_at: Timestamp(1),

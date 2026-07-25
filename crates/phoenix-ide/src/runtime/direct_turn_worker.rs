@@ -6,7 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
 use phoenix_db::workflow::{
-    ClaimAuthoritativeTurnInput, DirectTurnDiscoveryCursor, DiscoverableAcceptedTurn,
+    ClaimAuthoritativeTurnInput, DirectTurnDiscoveryCursor, DirectTurnMaterializationEligibility,
+    DiscoverableAcceptedTurn, PreflightDirectTurnMaterializationInput,
     ReleaseAuthoritativeTurnInput, WorkflowRepository,
 };
 use phoenix_db::LocalAttemptAuthority;
@@ -50,7 +51,13 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
+    #[cfg(test)]
+    pre_dispatch_hook: Option<PreDispatchHook>,
 }
+
+#[cfg(test)]
+type PreDispatchHook =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 
 impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
     pub(crate) fn new(
@@ -64,7 +71,15 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
             dispatcher,
             clock,
             process_incarnation,
+            #[cfg(test)]
+            pre_dispatch_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_pre_dispatch_hook(mut self, hook: PreDispatchHook) -> Self {
+        self.pre_dispatch_hook = Some(hook);
+        self
     }
 
     async fn run_loop(
@@ -143,7 +158,7 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
             return Ok(());
         };
         let prepared = match PreparedDirectTurnPayload::from_exact_bytes(
-            &candidate.prepared.payload,
+            candidate.prepared.payload(),
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -152,6 +167,43 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
                 return Ok(());
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = &self.pre_dispatch_hook {
+            hook().await;
+        }
+        let eligibility = match self
+            .repo
+            .preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
+                turn_id: candidate.turn_id,
+                authority: authority.clone(),
+                prepared: prepared.clone(),
+                now,
+            })
+            .await
+        {
+            Ok(eligibility) => eligibility,
+            Err(error) => {
+                self.release(authority, now).await?;
+                return Err(error.to_string());
+            }
+        };
+        match eligibility {
+            DirectTurnMaterializationEligibility::Fresh => {}
+            DirectTurnMaterializationEligibility::ExactReplay => {
+                tracing::debug!(
+                    turn_id = candidate.turn_id.0,
+                    "direct-turn already materialized before dispatch; skipping"
+                );
+                return Ok(());
+            }
+            DirectTurnMaterializationEligibility::StaleAuthority => {
+                tracing::debug!(
+                    turn_id = candidate.turn_id.0,
+                    "direct-turn authority stale before dispatch; skipping"
+                );
+                return Ok(());
+            }
+        }
         let event = Event::AuthoritativeUserMessage {
             payload: prepared,
             authority: authority_to_event(&authority, candidate.turn_id),
@@ -254,7 +306,8 @@ mod tests {
     use crate::db::Database;
     use phoenix_core::domain::sm_event::PreparedDirectTurnPayload;
     use phoenix_workflow::{
-        AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, TurnOutcome,
+        AcceptedDisposition, CanonicalMessageId, ClientTurnKey, ConversationAuthority, EffectId,
+        PreparedTurn, TurnCommand, TurnOutcome,
     };
     use std::sync::Mutex;
 
@@ -330,17 +383,14 @@ mod tests {
     }
 
     fn prepared_turn(message_id: &str) -> PreparedTurn {
-        PreparedTurn {
-            fingerprint: format!("fp-{message_id}"),
-            payload: serde_json::to_vec(&prepared_payload(message_id)).unwrap(),
-        }
+        PreparedTurn::from_exact_payload(prepared_payload(message_id).to_exact_bytes().unwrap())
     }
 
     async fn accept(repo: &WorkflowRepository, key: &str) -> phoenix_workflow::TurnAuthorityId {
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority("conv-a".to_string()),
-                client_key: ClientTurnKey(key.to_string()),
+                client_key: ClientTurnKey::new(key).unwrap(),
                 prepared: prepared_turn(&format!("message-{key}")),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
@@ -351,6 +401,26 @@ mod tests {
             panic!("expected created turn")
         };
         turn_id
+    }
+
+    async fn latest_authority(
+        repo: &WorkflowRepository,
+        workflow_id: phoenix_workflow::WorkflowId,
+    ) -> LocalAttemptAuthority {
+        repo.list_attempts(workflow_id, EffectId(1))
+            .await
+            .unwrap()
+            .into_iter()
+            .last()
+            .unwrap()
+            .authority
+    }
+
+    async fn receipt_count(
+        repo: &WorkflowRepository,
+        workflow_id: phoenix_workflow::WorkflowId,
+    ) -> usize {
+        repo.list_receipts(workflow_id).await.unwrap().len()
     }
 
     fn worker(
@@ -456,6 +526,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_terminalized_between_claim_and_dispatch_is_not_dispatched_or_released() {
+        let (repo, dispatcher) = fixture().await;
+        let turn_id = accept(&repo, "terminalized").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let hook_repo = repo.clone();
+        let worker = worker(repo.clone(), dispatcher.clone(), 10, 1).with_pre_dispatch_hook(
+            Arc::new(move || {
+                let repo = hook_repo.clone();
+                Box::pin(async move {
+                    repo.terminate_authoritative_turn(TurnCommand::Complete {
+                        turn_id,
+                        expected_generation: 0,
+                    })
+                    .await
+                    .unwrap();
+                })
+            }),
+        );
+
+        worker.run_once().await.unwrap();
+
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        assert_eq!(receipt_count(&repo, workflow_id).await, 0);
+        let attempts = repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].status,
+            phoenix_workflow::AttemptStatus::AuthorityLost
+        );
+    }
+
+    #[tokio::test]
+    async fn already_materialized_between_claim_and_dispatch_is_not_dispatched_or_duplicated() {
+        let (repo, dispatcher) = fixture().await;
+        let turn_id = accept(&repo, "materialized").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let hook_repo = repo.clone();
+        let worker = worker(repo.clone(), dispatcher.clone(), 10, 1).with_pre_dispatch_hook(
+            Arc::new(move || {
+                let repo = hook_repo.clone();
+                Box::pin(async move {
+                    let authority = latest_authority(&repo, workflow_id).await;
+                    repo.materialize_authoritative_turn(
+                        &phoenix_db::workflow::MaterializeAuthoritativeTurnInput {
+                            turn_id,
+                            authority,
+                            prepared: prepared_payload("message-materialized"),
+                            sequence_id: 99,
+                            created_at: Timestamp(99),
+                            now: Timestamp(10),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                })
+            }),
+        );
+
+        worker.run_once().await.unwrap();
+
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        assert_eq!(receipt_count(&repo, workflow_id).await, 1);
+        let turn = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.generation, 0);
+        assert_eq!(
+            turn.materialization,
+            phoenix_workflow::Materialization::Materialized {
+                message_id: CanonicalMessageId("message-materialized".to_string())
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn unavailable_runtime_or_closed_channel_releases_claim() {
         let (repo, dispatcher) = fixture().await;
         *dispatcher.result.lock().unwrap() = Err("closed".to_string());
@@ -494,11 +644,8 @@ mod tests {
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority("conv-a".to_string()),
-                client_key: ClientTurnKey("bad".to_string()),
-                prepared: PreparedTurn {
-                    fingerprint: "bad".to_string(),
-                    payload: b"not-json".to_vec(),
-                },
+                client_key: ClientTurnKey::new("bad").unwrap(),
+                prepared: PreparedTurn::from_exact_payload(b"not-json".to_vec()),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
