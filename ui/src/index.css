@@ -1048,8 +1048,8 @@ body.app-viewport-active #root {
 }
 
 /* stylelint-disable no-descending-specificity --
-   Table-cell code is disjoint from the other code-rendering scopes. */
-.agent-text-block :where(th, td) code {
+   Table-cell code must override the general message-code size regardless of stylesheet order. */
+.message-content .agent-text-block :where(th, td) code {
   font-size: inherit;
 }
 /* stylelint-enable no-descending-specificity */
