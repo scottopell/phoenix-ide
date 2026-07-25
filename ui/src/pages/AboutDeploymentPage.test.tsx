@@ -80,6 +80,26 @@ function resourcesSnapshot(overrides: Partial<AboutResourcesSnapshot> = {}): Abo
       load_average_five: 0.9,
       load_average_fifteen: 1.2,
     },
+    thermal: {
+      mode: 'observe_only',
+      state: 'nominal',
+      last_sample: {
+        pressure: 'nominal',
+        sampled_at: '2026-06-01T00:00:03Z',
+        unavailable_reason: null,
+        raw_temperature: { kind: 'unavailable' },
+      },
+      proposed_action: { kind: 'none', affects_targets: false },
+      applied_action: 'none',
+      coverage: {
+        eligible_work_scope_count: 1,
+        eligible_process_count: 2,
+        covered_process_count: 2,
+        uncovered_reasons: [
+          'browser sessions are excluded because authoritative native process ownership is not exposed',
+        ],
+      },
+    },
     managed_total: {
       cpu_percent: 24,
       memory_bytes: 3 * 1024,
@@ -370,6 +390,10 @@ describe('AboutDeploymentPage disk usage health', () => {
 
     expect(await screen.findByText('Host mostly idle')).toBeInTheDocument();
     expect(screen.getByText('Phoenix managed')).toBeInTheDocument();
+    expect(screen.getByLabelText('macOS thermal status')).toHaveTextContent('Nominal');
+    expect(screen.getByLabelText('macOS thermal status')).toHaveTextContent('Observe only');
+    expect(screen.getByText('No policy change proposed. No scheduler policy is applied in observe-only mode. Raw temperature unavailable.')).toBeInTheDocument();
+    expect(screen.getByText('1 thermal coverage gap')).toBeInTheDocument();
     expect(screen.getByText('MCP disabled on this deployment')).toBeInTheDocument();
     expect(screen.getByText('phoenix-api')).toBeInTheDocument();
     expect(screen.getByText('chromium')).toBeInTheDocument();

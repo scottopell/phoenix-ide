@@ -11,9 +11,13 @@ use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSProcessInfo, NSProcessInfoThermalState};
 use tokio::sync::Mutex;
 
 const FRESHNESS_LEASE: Duration = Duration::from_millis(1_200);
+const SAFE_SAMPLES_TO_RESTORE: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservationKey {
@@ -55,11 +59,69 @@ pub struct HandleObservationTarget {
 pub struct ResourceObservationGeneration {
     pub sampled_at: DateTime<Utc>,
     pub host: HostResources,
+    pub thermal: ThermalObservationSample,
+    pub thermal_decision: ThermalGovernorDecisionSample,
     pub observations: BTreeMap<u32, ProcessObservation>,
     pub api_pids: BTreeSet<u32>,
     pub terminal_pids: Option<BTreeSet<u32>>,
     pub handles: Vec<HandleObservationTarget>,
     pub bash_attribution_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalPressureSample {
+    Nominal,
+    Elevated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ThermalProviderUnavailableReason {
+    UnsupportedPlatform,
+    ProviderFailure,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThermalObservationSample {
+    Available {
+        pressure: ThermalPressureSample,
+        sampled_at: DateTime<Utc>,
+    },
+    Unavailable {
+        reason: ThermalProviderUnavailableReason,
+        sampled_at: DateTime<Utc>,
+    },
+}
+
+impl ThermalObservationSample {
+    pub fn sampled_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Available { sampled_at, .. } | Self::Unavailable { sampled_at, .. } => {
+                *sampled_at
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalGovernorStateSample {
+    Nominal,
+    Elevated,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalGovernorActionSample {
+    None,
+    Deprioritize,
+    Restore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThermalGovernorDecisionSample {
+    pub state: ThermalGovernorStateSample,
+    pub proposed_action: ThermalGovernorActionSample,
 }
 
 impl ResourceObservationGeneration {
@@ -110,10 +172,88 @@ pub fn health_for_pids(
     }
 }
 
+struct ThermalDecisionState {
+    state: ThermalGovernorStateSample,
+    consecutive_nominal_samples: u8,
+}
+
+impl Default for ThermalDecisionState {
+    fn default() -> Self {
+        Self {
+            state: ThermalGovernorStateSample::Nominal,
+            consecutive_nominal_samples: 0,
+        }
+    }
+}
+
+impl ThermalDecisionState {
+    fn observe(&mut self, sample: &ThermalObservationSample) -> ThermalGovernorDecisionSample {
+        let previous_state = self.state;
+        let proposed_action = match sample {
+            ThermalObservationSample::Available {
+                pressure: ThermalPressureSample::Elevated,
+                ..
+            } if self.state != ThermalGovernorStateSample::Elevated => {
+                self.consecutive_nominal_samples = 0;
+                self.state = ThermalGovernorStateSample::Elevated;
+                ThermalGovernorActionSample::Deprioritize
+            }
+            ThermalObservationSample::Available {
+                pressure: ThermalPressureSample::Elevated,
+                ..
+            } => {
+                self.consecutive_nominal_samples = 0;
+                ThermalGovernorActionSample::None
+            }
+            ThermalObservationSample::Available {
+                pressure: ThermalPressureSample::Nominal,
+                ..
+            } if self.state == ThermalGovernorStateSample::Elevated => {
+                self.consecutive_nominal_samples =
+                    self.consecutive_nominal_samples.saturating_add(1);
+                if self.consecutive_nominal_samples >= SAFE_SAMPLES_TO_RESTORE {
+                    self.state = ThermalGovernorStateSample::Nominal;
+                    self.consecutive_nominal_samples = 0;
+                    ThermalGovernorActionSample::Restore
+                } else {
+                    ThermalGovernorActionSample::None
+                }
+            }
+            ThermalObservationSample::Available {
+                pressure: ThermalPressureSample::Nominal,
+                ..
+            } => {
+                self.consecutive_nominal_samples = 0;
+                self.state = ThermalGovernorStateSample::Nominal;
+                ThermalGovernorActionSample::None
+            }
+            ThermalObservationSample::Unavailable { .. } => {
+                self.consecutive_nominal_samples = 0;
+                self.state = ThermalGovernorStateSample::Unavailable;
+                ThermalGovernorActionSample::None
+            }
+        };
+        if self.state != previous_state {
+            tracing::debug!(
+                previous_state = ?previous_state,
+                state = ?self.state,
+                proposed_action = ?proposed_action,
+                mode = "observe_only",
+                "macOS thermal governor state changed"
+            );
+        }
+        ThermalGovernorDecisionSample {
+            state: self.state,
+            proposed_action,
+        }
+    }
+}
+
 #[derive(Default)]
 struct MonitorState {
     cached: Option<(ObservationKey, Instant, Arc<ResourceObservationGeneration>)>,
     sample_count: u64,
+    thermal_decision: ThermalDecisionState,
 }
 
 /// A short-lived observation lease. Holding the mutex across the one underlying
@@ -161,7 +301,9 @@ impl ResourceMonitor {
             }
         }
 
-        let generation = Arc::new(sample().await);
+        let mut generation = sample().await;
+        generation.thermal_decision = state.thermal_decision.observe(&generation.thermal);
+        let generation = Arc::new(generation);
         state.sample_count = state.sample_count.saturating_add(1);
         state.cached = Some((key, Instant::now(), generation.clone()));
         generation
@@ -170,6 +312,42 @@ impl ResourceMonitor {
     #[cfg(test)]
     pub async fn sample_count(&self) -> u64 {
         self.state.lock().await.sample_count
+    }
+}
+
+fn sample_thermal_observation() -> ThermalObservationSample {
+    #[cfg(target_os = "macos")]
+    {
+        let sampled_at = Utc::now();
+        let process_info = NSProcessInfo::processInfo();
+        let pressure = match process_info.thermalState() {
+            NSProcessInfoThermalState::Nominal => Some(ThermalPressureSample::Nominal),
+            NSProcessInfoThermalState::Fair
+            | NSProcessInfoThermalState::Serious
+            | NSProcessInfoThermalState::Critical => Some(ThermalPressureSample::Elevated),
+            other => {
+                tracing::debug!(state = ?other, "thermal provider returned unreadable state");
+                None
+            }
+        };
+        match pressure {
+            Some(pressure) => ThermalObservationSample::Available {
+                pressure,
+                sampled_at,
+            },
+            None => ThermalObservationSample::Unavailable {
+                reason: ThermalProviderUnavailableReason::Unreadable,
+                sampled_at,
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        ThermalObservationSample::Unavailable {
+            reason: ThermalProviderUnavailableReason::UnsupportedPlatform,
+            sampled_at: Utc::now(),
+        }
     }
 }
 
@@ -211,6 +389,7 @@ async fn sample_generation(
         all_identities.extend(identities.clone());
     }
 
+    let thermal = sample_thermal_observation();
     let (host, rows) = tokio::join!(
         super::deployment::sample_host_resources(),
         sample_process_observations(&all_identities)
@@ -219,6 +398,11 @@ async fn sample_generation(
     ResourceObservationGeneration {
         sampled_at: Utc::now(),
         host,
+        thermal,
+        thermal_decision: ThermalGovernorDecisionSample {
+            state: ThermalGovernorStateSample::Unavailable,
+            proposed_action: ThermalGovernorActionSample::None,
+        },
         observations: rows.into_iter().map(|row| (row.pid, row)).collect(),
         api_pids: api_identities.keys().copied().collect(),
         terminal_pids: terminal_identities.map(|ids| ids.keys().copied().collect()),
@@ -247,12 +431,88 @@ mod tests {
                 load_average_five: None,
                 load_average_fifteen: None,
             },
+            thermal: ThermalObservationSample::Unavailable {
+                reason: ThermalProviderUnavailableReason::UnsupportedPlatform,
+                sampled_at: Utc::now(),
+            },
+            thermal_decision: ThermalGovernorDecisionSample {
+                state: ThermalGovernorStateSample::Unavailable,
+                proposed_action: ThermalGovernorActionSample::None,
+            },
             observations: BTreeMap::new(),
             api_pids: BTreeSet::new(),
             terminal_pids: Some(BTreeSet::new()),
             handles: Vec::new(),
             bash_attribution_available: true,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_thermal_provider_returns_public_pressure_state() {
+        assert!(matches!(
+            sample_thermal_observation(),
+            ThermalObservationSample::Available { .. }
+        ));
+    }
+
+    #[test]
+    fn thermal_decision_requires_two_nominal_samples_before_restore() {
+        let elevated = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Elevated,
+            sampled_at: Utc::now(),
+        };
+        let nominal = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Nominal,
+            sampled_at: Utc::now(),
+        };
+        let mut state = ThermalDecisionState::default();
+
+        assert_eq!(
+            state.observe(&elevated),
+            ThermalGovernorDecisionSample {
+                state: ThermalGovernorStateSample::Elevated,
+                proposed_action: ThermalGovernorActionSample::Deprioritize,
+            }
+        );
+        assert_eq!(
+            state.observe(&elevated),
+            ThermalGovernorDecisionSample {
+                state: ThermalGovernorStateSample::Elevated,
+                proposed_action: ThermalGovernorActionSample::None,
+            }
+        );
+        assert_eq!(
+            state.observe(&nominal),
+            ThermalGovernorDecisionSample {
+                state: ThermalGovernorStateSample::Elevated,
+                proposed_action: ThermalGovernorActionSample::None,
+            }
+        );
+        assert_eq!(
+            state.observe(&nominal),
+            ThermalGovernorDecisionSample {
+                state: ThermalGovernorStateSample::Nominal,
+                proposed_action: ThermalGovernorActionSample::Restore,
+            }
+        );
+    }
+
+    #[test]
+    fn unavailable_thermal_sample_never_proposes_native_policy() {
+        let mut state = ThermalDecisionState::default();
+        let unavailable = ThermalObservationSample::Unavailable {
+            reason: ThermalProviderUnavailableReason::ProviderFailure,
+            sampled_at: Utc::now(),
+        };
+
+        assert_eq!(
+            state.observe(&unavailable),
+            ThermalGovernorDecisionSample {
+                state: ThermalGovernorStateSample::Unavailable,
+                proposed_action: ThermalGovernorActionSample::None,
+            }
+        );
     }
 
     #[tokio::test]

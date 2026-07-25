@@ -385,6 +385,18 @@ function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: ()
   const hostMemoryTotal: number | null = sample?.host.total_memory_bytes ?? null;
   const hostMemoryAvailable: number | null = sample?.host.available_memory_bytes ?? null;
 
+  const thermalPressure = sample?.thermal.last_sample.pressure;
+  const thermalStatus = thermalPressure === 'nominal'
+    ? 'Nominal'
+    : thermalPressure === 'elevated'
+      ? 'Elevated pressure'
+      : 'Unavailable';
+  const proposedThermalAction = sample?.thermal.proposed_action.kind === 'deprioritize'
+    ? 'Would lower scheduling priority'
+    : sample?.thermal.proposed_action.kind === 'restore'
+      ? 'Would restore scheduling priority'
+      : 'No policy change proposed';
+
   return (
     <section className="settings-section about-resources-section">
       <div className="settings-section__title-row">
@@ -450,6 +462,36 @@ function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: ()
                   ? 'Logical CPU count unavailable.'
                   : `${sample.host.logical_cpu_count} logical CPUs`} · load avg {resourceText(sample.host.load_average_one, (value) => value.toFixed(2))} / {resourceText(sample.host.load_average_five, (value) => value.toFixed(2))} / {resourceText(sample.host.load_average_fifteen, (value) => value.toFixed(2))}
               </div>
+              <div className="about-resources-card__stat-row" aria-label="macOS thermal status">
+                <div>
+                  <span>Thermal pressure</span>
+                  <strong>{thermalStatus}</strong>
+                </div>
+                <div>
+                  <span>Governor</span>
+                  <strong>{sample.thermal.mode === 'observe_only' ? 'Observe only' : sample.thermal.mode}</strong>
+                </div>
+                <div>
+                  <span>Covered WorkScopes</span>
+                  <strong>{formatNumber(sample.thermal.coverage.eligible_work_scope_count)}</strong>
+                </div>
+              </div>
+              <div className="settings-section__hint">
+                {proposedThermalAction}. No scheduler policy is applied in observe-only mode. Raw temperature unavailable.
+              </div>
+              {sample.thermal.last_sample.unavailable_reason !== null && (
+                <div className="settings-section__hint">
+                  Thermal provider unavailable: {sample.thermal.last_sample.unavailable_reason.replaceAll('_', ' ')}.
+                </div>
+              )}
+              {sample.thermal.coverage.uncovered_reasons.length > 0 && (
+                <details className="about-resource-reasons">
+                  <summary>{sample.thermal.coverage.uncovered_reasons.length} thermal coverage gap{sample.thermal.coverage.uncovered_reasons.length === 1 ? '' : 's'}</summary>
+                  <ul>
+                    {sample.thermal.coverage.uncovered_reasons.map((reason) => <li key={reason}>{reason}</li>)}
+                  </ul>
+                </details>
+              )}
             </section>
 
             <section className="about-resources-card">
