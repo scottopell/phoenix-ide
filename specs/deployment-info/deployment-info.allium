@@ -1,0 +1,195 @@
+-- allium: 3
+-- deployment-info.allium
+--
+-- Focused behavioural specification for the observe-only macOS thermal
+-- provider/governor diagnostics surfaced by Deployment Info.
+--
+-- Scope:
+--   - Typed macOS thermal-provider samples, including unavailable outcomes.
+--   - Governor mode and decision-state transitions for observe-only operation.
+--   - Non-mutating proposed-action semantics and sustained-safe restoration.
+--
+-- Excludes:
+--   - The rest of the Deployment Info page fetch/render flow.
+--   - Native scheduler-policy application details for enforcing mode.
+--   - Process-inventory discovery and WorkScope UI presentation details.
+--
+-- Requirement traceability:
+--   - REQ-DEPLOY-004E is modelled by ThermalSampleRecordsCapability,
+--     RawTemperatureUnavailableWithoutFabrication, and
+--     UnsupportedOrFailedProviderStaysUnavailable.
+--   - REQ-DEPLOY-004F is modelled by ObserveOnlyElevatedPressureProposesAction,
+--     ObserveOnlyRecoveryProposesRestoration, ObserveOnlyNeverAppliesPolicy,
+--     and ThermalResponseNeverUsesLifecycleControl.
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ThermalPressure {
+    nominal
+    | elevated
+    | unavailable
+}
+
+enum GovernorMode {
+    observe_only
+    | enforcing
+}
+
+enum GovernorState {
+    nominal
+    | elevated
+    | unavailable
+}
+
+enum ThermalActionKind {
+    none
+    | deprioritize
+    | restore
+}
+
+enum UnavailableReason {
+    unsupported_platform
+    | provider_failure
+    | unreadable
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value ThermalSample {
+    pressure: ThermalPressure
+    sampled_at: Timestamp
+    unavailable_reason: UnavailableReason?
+    raw_temperature_available: Boolean
+}
+
+value ProposedAction {
+    kind: ThermalActionKind
+    affects_targets: Boolean
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity ThermalGovernor {
+    mode: GovernorMode
+    state: GovernorState
+    last_sample: ThermalSample?
+    proposed_action: ProposedAction
+    applied_action: ThermalActionKind
+
+    transitions state {
+        nominal -> elevated
+        elevated -> nominal
+        nominal -> unavailable
+        elevated -> unavailable
+        unavailable -> nominal
+        unavailable -> elevated
+    }
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- sample_is_supported_nominal(sample) -> Boolean
+--   sample.pressure = nominal and sample.unavailable_reason = null.
+-- sample_is_supported_elevated(sample) -> Boolean
+--   sample.pressure = elevated and sample.unavailable_reason = null.
+-- sample_is_unavailable(sample) -> Boolean
+--   sample.pressure = unavailable and sample.unavailable_reason != null.
+-- raw_temperature_unavailable(sample) -> Boolean
+--   sample.raw_temperature_available = false.
+-- restoration_is_sustained_safe(governor, sample) -> Boolean
+--   The governor's hysteresis condition for leaving elevated state is satisfied
+--   by the observed safer pressure sample.
+-- proposed_deprioritization() -> ProposedAction
+--   Returns ProposedAction{ kind: deprioritize, affects_targets: true }.
+-- proposed_restoration() -> ProposedAction
+--   Returns ProposedAction{ kind: restore, affects_targets: true }.
+-- no_proposed_action() -> ProposedAction
+--   Returns ProposedAction{ kind: none, affects_targets: false }.
+
+rule ThermalSampleRecordsCapability {
+    when: ThermalSampleObserved(governor, sample)
+    requires: sample.pressure in { nominal, elevated }
+    ensures: ThermalGovernor{governor}.last_sample = sample
+}
+
+rule RawTemperatureUnavailableWithoutFabrication {
+    when: ThermalSampleObserved(governor, sample)
+    requires: raw_temperature_unavailable(sample)
+    ensures: ThermalGovernor{governor}.last_sample = sample
+}
+
+rule UnsupportedOrFailedProviderStaysUnavailable {
+    when: ThermalSampleObserved(governor, sample)
+    requires: sample_is_unavailable(sample)
+    ensures: ThermalGovernor{governor}.state = unavailable
+    ensures: ThermalGovernor{governor}.last_sample = sample
+    ensures: ThermalGovernor{governor}.proposed_action = no_proposed_action()
+}
+
+rule ObserveOnlyElevatedPressureProposesAction {
+    when: ThermalSampleObserved(governor, sample)
+    requires: ThermalGovernor{governor}.mode = observe_only
+    requires: sample_is_supported_elevated(sample)
+    ensures: ThermalGovernor{governor}.state = elevated
+    ensures: ThermalGovernor{governor}.last_sample = sample
+    ensures: ThermalGovernor{governor}.proposed_action = proposed_deprioritization()
+}
+
+rule ObserveOnlyRecoveryProposesRestoration {
+    when: ThermalSampleObserved(governor, sample)
+    requires: ThermalGovernor{governor}.mode = observe_only
+    requires: ThermalGovernor{governor}.state = elevated
+    requires: sample_is_supported_nominal(sample)
+    requires: restoration_is_sustained_safe(governor, sample)
+    ensures: ThermalGovernor{governor}.state = nominal
+    ensures: ThermalGovernor{governor}.last_sample = sample
+    ensures: ThermalGovernor{governor}.proposed_action = proposed_restoration()
+}
+
+rule NominalSampleWithoutRestorationKeepsState {
+    when: ThermalSampleObserved(governor, sample)
+    requires: ThermalGovernor{governor}.mode = observe_only
+    requires: ThermalGovernor{governor}.state = nominal
+    requires: sample_is_supported_nominal(sample)
+    ensures: ThermalGovernor{governor}.state = nominal
+    ensures: ThermalGovernor{governor}.last_sample = sample
+    ensures: ThermalGovernor{governor}.proposed_action = no_proposed_action()
+}
+
+rule ObserveOnlyNeverAppliesPolicy {
+    when: ThermalSampleObserved(governor, sample)
+    requires: ThermalGovernor{governor}.mode = observe_only
+    ensures: ThermalGovernor{governor}.applied_action = none
+}
+
+rule ThermalResponseNeverUsesLifecycleControl {
+    when: ThermalResponseEvaluated(governor)
+    ensures: ThermalGovernor{governor}.applied_action in { none, deprioritize, restore }
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ThermalObservationSurface {
+    facing deployment_operator: String
+
+    exposes:
+        ThermalGovernor.mode
+        ThermalGovernor.state
+        ThermalGovernor.last_sample
+        ThermalGovernor.proposed_action
+        ThermalGovernor.applied_action
+
+    @guarantee ObserveOnlyActionIsDiagnosticOnly
+        -- In observe-only mode the proposed action is diagnostic state.
+        -- It never implies that native process policy changed.
+}
