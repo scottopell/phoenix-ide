@@ -317,9 +317,7 @@ CREATE TABLE durable_turns (
         (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
         OR (terminal_kind IS NULL AND terminal_reason IS NULL)
         OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
-    ),
-    FOREIGN KEY (conversation_id, canonical_message_id)
-        REFERENCES messages(conversation_id, message_id) ON DELETE RESTRICT
+    )
 );
 
 CREATE UNIQUE INDEX messages_conversation_message_id_unique

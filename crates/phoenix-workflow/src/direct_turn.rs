@@ -178,7 +178,6 @@ pub enum TurnCommand {
     Materialize {
         turn_id: TurnAuthorityId,
         expected_generation: u64,
-        message_id: CanonicalMessageId,
     },
     Complete {
         turn_id: TurnAuthorityId,
@@ -217,6 +216,7 @@ pub enum TurnOutcome {
         disposition: AcceptedDisposition,
     },
     TerminalReplay {
+        turn_id: TurnAuthorityId,
         generation: u64,
         terminal: TurnTerminal,
         disposition: AcceptedDisposition,
@@ -327,8 +327,7 @@ impl DurableTurnModel {
             TurnCommand::Materialize {
                 turn_id,
                 expected_generation,
-                message_id,
-            } => self.materialize(turn_id, expected_generation, message_id),
+            } => self.materialize(turn_id, expected_generation),
             TurnCommand::Complete {
                 turn_id,
                 expected_generation,
@@ -376,6 +375,7 @@ impl DurableTurnModel {
                     terminal,
                     disposition: stored,
                 } => TurnOutcome::TerminalReplay {
+                    turn_id: *existing_id,
                     generation: existing.generation,
                     terminal: terminal.clone(),
                     disposition: *stored,
@@ -428,12 +428,12 @@ impl DurableTurnModel {
         &mut self,
         turn_id: TurnAuthorityId,
         expected_generation: u64,
-        message_id: CanonicalMessageId,
     ) -> Result<TurnStep, TurnConflict> {
         let turn = self
             .turns
             .get_mut(&turn_id)
             .ok_or(TurnConflict::UnknownTurn)?;
+        let message_id = CanonicalMessageId(turn.client_key.as_str().to_string());
         if let Materialization::Materialized {
             message_id: canonical,
         } = &turn.materialization
@@ -506,6 +506,7 @@ impl DurableTurnModel {
                 if stored == &terminal {
                     return Ok(TurnStep {
                         outcome: TurnOutcome::TerminalReplay {
+                            turn_id,
                             generation: turn.generation,
                             terminal,
                             disposition: *disposition,
@@ -715,6 +716,7 @@ mod tests {
         assert_eq!(
             replay.outcome,
             TurnOutcome::TerminalReplay {
+                turn_id,
                 generation: 1,
                 terminal: TurnTerminal::Cancelled,
                 disposition: AcceptedDisposition::Runtime,
@@ -756,7 +758,6 @@ mod tests {
             .apply(TurnCommand::Materialize {
                 turn_id,
                 expected_generation: 0,
-                message_id: CanonicalMessageId("late".into()),
             })
             .is_err());
     }
@@ -777,7 +778,6 @@ mod tests {
             .apply(TurnCommand::Materialize {
                 turn_id: TurnAuthorityId(1),
                 expected_generation: 0,
-                message_id: CanonicalMessageId("message".into()),
             })
             .unwrap();
         model
@@ -791,7 +791,6 @@ mod tests {
             .apply(TurnCommand::Materialize {
                 turn_id: TurnAuthorityId(1),
                 expected_generation: 0,
-                message_id: CanonicalMessageId("message".into()),
             })
             .unwrap();
         assert!(matches!(
@@ -831,6 +830,7 @@ mod tests {
             replay,
             TurnStep {
                 outcome: TurnOutcome::TerminalReplay {
+                    turn_id,
                     generation: 1,
                     terminal: TurnTerminal::Cancelled,
                     disposition: AcceptedDisposition::Runtime,

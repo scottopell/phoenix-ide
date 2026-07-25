@@ -1572,6 +1572,13 @@ impl WorkflowRepository {
         &self,
         input: &CommitTransitionPlanCas,
     ) -> DbResult<CommitOutcome> {
+        if workflow_profile_kind(&self.pool, input.workflow_id)
+            .await?
+            .as_deref()
+            == Some(DIRECT_TURN_PROFILE_KIND)
+        {
+            return Ok(CommitOutcome::InvalidPlan);
+        }
         let mut tx = self.pool.begin().await?;
         let outcome = Self::commit_transition_plan_tx(&mut tx, input).await?;
         if outcome == CommitOutcome::Committed {

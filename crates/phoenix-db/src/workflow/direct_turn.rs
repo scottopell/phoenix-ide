@@ -78,6 +78,7 @@ impl WorkflowRepository {
                     terminal,
                     disposition,
                 } => TurnOutcome::TerminalReplay {
+                    turn_id: existing.id,
                     generation: existing.generation,
                     terminal: terminal.clone(),
                     disposition: *disposition,
@@ -254,7 +255,6 @@ impl WorkflowRepository {
             .apply(TurnCommand::Materialize {
                 turn_id,
                 expected_generation,
-                message_id: message_id.clone(),
             })
             .map_err(conflict)?;
         if matches!(step.outcome, TurnOutcome::Materialized { .. }) {
@@ -1214,6 +1214,7 @@ mod tests {
         assert_eq!(
             replay.outcome,
             TurnOutcome::TerminalReplay {
+                turn_id,
                 generation: 1,
                 terminal: TurnTerminal::Cancelled,
                 disposition: AcceptedDisposition::Runtime,
@@ -1248,6 +1249,7 @@ mod tests {
             replay,
             TurnStep {
                 outcome: TurnOutcome::TerminalReplay {
+                    turn_id,
                     generation: 1,
                     terminal: TurnTerminal::Cancelled,
                     disposition: AcceptedDisposition::Runtime,
@@ -1286,6 +1288,7 @@ mod tests {
         assert_eq!(
             replay.outcome,
             TurnOutcome::TerminalReplay {
+                turn_id,
                 generation: 1,
                 terminal: TurnTerminal::Failed {
                     reason: "exact".to_string(),
