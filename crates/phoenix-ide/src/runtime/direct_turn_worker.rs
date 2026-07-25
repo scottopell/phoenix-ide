@@ -111,7 +111,6 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
     }
 
     pub(crate) async fn run_once(&self) -> Result<Duration, String> {
-        let now = self.clock.now();
         let mut cursor = None;
         loop {
             let candidates = self
@@ -125,7 +124,7 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
                     turn_id: candidate.turn_id,
                     workflow_id: candidate.workflow_id,
                 });
-                self.dispatch_candidate(candidate, now).await?;
+                self.dispatch_candidate(candidate, self.clock.now()).await?;
             }
             if page_len < DISCOVERY_BATCH_LIMIT {
                 break;

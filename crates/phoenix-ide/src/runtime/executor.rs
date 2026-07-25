@@ -2615,10 +2615,12 @@ where
         self.execute_effect(Effect::RequestLlm).await.map(|_| ())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        // A fresh user turn always resets the parent tool-cycle counter
-        // (task 24680). Cap logic lives in the `Effect::RequestLlm` handler.
-        if matches!(event, Event::UserMessage { .. }) {
+        if matches!(
+            event,
+            Event::UserMessage { .. } | Event::AuthoritativeUserMessage { .. }
+        ) {
             self.parent_tool_cycle_count = 0;
         }
 
