@@ -103,10 +103,30 @@ impl WorkflowRepository {
                 }));
             }
         }
+        let existing_turns = sqlx::query(
+            "SELECT * FROM durable_turns WHERE conversation_id = ?1 AND terminal_kind IS NULL",
+        )
+        .bind(&input.conversation.0)
+        .fetch_all(&mut *tx.tx)
+        .await?
+        .into_iter()
+        .map(row_to_turn)
+        .collect::<DbResult<Vec<_>>>()?;
+        let mut model =
+            phoenix_workflow::DurableTurnModel::from_turns(existing_turns).map_err(conflict)?;
         let turn_id = TurnAuthorityId(
             next_global_id_tx(&mut tx, DIRECT_TURN_SEQUENCE_NAME, "turn_id").await?,
         );
         let workflow_id = next_global_workflow_id_tx(&mut tx).await?;
+        let step = model
+            .apply(TurnCommand::Accept {
+                turn_id,
+                conversation: input.conversation.clone(),
+                client_key: input.client_key.clone(),
+                prepared: input.prepared.clone(),
+                disposition: input.disposition,
+            })
+            .map_err(conflict)?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
         sqlx::query(
@@ -135,16 +155,7 @@ impl WorkflowRepository {
         if cut == TransactionCut::AfterCommit {
             return Err(injected_cut(cut));
         }
-        let mut model = phoenix_workflow::DurableTurnModel::default();
-        model
-            .apply(TurnCommand::Accept {
-                turn_id,
-                conversation: input.conversation.clone(),
-                client_key: input.client_key.clone(),
-                prepared: input.prepared.clone(),
-                disposition: input.disposition,
-            })
-            .map_err(conflict)
+        Ok(step)
     }
 
     pub async fn load_authoritative_turn(
