@@ -4531,7 +4531,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        let expected_pending = u32::try_from(
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > 51)
+                .count(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_pending_migrations(&pool).await.unwrap(),
+            expected_pending
+        );
 
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(work_scopes)")
             .fetch_all(&pool)
