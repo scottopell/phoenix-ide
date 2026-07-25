@@ -291,23 +291,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_authoritative_direct_turns",
         sql: MIGRATION_055,
     },
-    Migration {
-        version: 56,
-        name: "durable_turns_add_workflow_relation",
-        sql: MIGRATION_056,
-    },
 ];
-
-const MIGRATION_056: &str = r"
-ALTER TABLE durable_turns ADD COLUMN workflow_id INTEGER REFERENCES workflows(workflow_id) ON DELETE RESTRICT;
-CREATE UNIQUE INDEX durable_turns_workflow_id_unique
-    ON durable_turns(workflow_id)
-    WHERE workflow_id IS NOT NULL;
-";
 
 const MIGRATION_055: &str = r"
 CREATE TABLE durable_turns (
     turn_id INTEGER PRIMARY KEY,
+    workflow_id INTEGER NOT NULL UNIQUE REFERENCES workflows(workflow_id) ON DELETE RESTRICT,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     client_turn_key TEXT NOT NULL,
     prepared_fingerprint TEXT NOT NULL,
