@@ -683,8 +683,8 @@ mod tests {
 
         let scope_sock = test_work_scope_socket(&socket_dir);
         let scope_socket_name = scope_sock.file_name().unwrap().to_string_lossy();
-        // Permitted entries in the socket dir: the work scope's own socket
-        // and the Phoenix-shipped tmux config file. Anything
+        // Permitted entries in the owner root: the work scope's own socket,
+        // the Phoenix-shipped tmux config, and the watchdog's armed marker. Anything
         // else (e.g. a `weird`-labeled socket the agent tried to coerce
         // tmux into creating) is a structural escape and fails the
         // test.
@@ -694,13 +694,15 @@ mod tests {
             .filter(|entry| {
                 let name = entry.file_name();
                 let s = name.to_string_lossy();
-                !(s == "_phoenix.tmux.conf" || s.starts_with(scope_socket_name.as_ref()))
+                !(s == ".armed"
+                    || s == "_phoenix.tmux.conf"
+                    || s.starts_with(scope_socket_name.as_ref()))
             })
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(
             unexpected.is_empty(),
-            "only the work-scope socket + Phoenix tmux config should appear under {socket_dir:?}; \
+            "only owner metadata, the work-scope socket, and Phoenix tmux config should appear under {socket_dir:?}; \
              unexpected entries: {unexpected:?}"
         );
 

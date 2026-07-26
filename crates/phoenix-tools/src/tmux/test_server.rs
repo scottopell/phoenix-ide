@@ -57,52 +57,61 @@ impl TestTmuxServerOwner {
         );
 
         let script = r#"
-root=$1
-parent=$2
-[ "$(ps -o ppid= -p $$ | tr -d ' ')" = "$parent" ] || exit 1
-command -v tmux >/dev/null 2>&1 || exit 1
-while [ ! -f "$root/.cleanup-request" ] && [ "$(ps -o ppid= -p $$ | tr -d ' ')" = "$parent" ]; do
-  sleep 0.05
-done
-: > "$root/.cleanup-ack"
-attempt=0
-quiet=0
-while [ "$attempt" -lt 50 ]; do
-  unconfirmed=0
-  for socket in "$root"/*.sock; do
-    [ -S "$socket" ] || continue
-    if tmux -S "$socket" list-sessions >/dev/null 2>&1; then
-      if tmux -S "$socket" kill-server >/dev/null 2>&1; then
-        rm -f "$socket"
-      else
-        unconfirmed=1
-      fi
-    else
-      unconfirmed=1
-    fi
-  done
-  sockets=0
-  for socket in "$root"/*.sock; do
-    [ -S "$socket" ] && sockets=1
-  done
-  if [ "$unconfirmed" -eq 0 ] && [ "$sockets" -eq 0 ]; then
-    quiet=$((quiet + 1))
-  else
-    quiet=0
-  fi
-  if [ "$quiet" -ge 5 ]; then
-    rm -rf "$root"
-    exit 0
-  fi
-  attempt=$((attempt + 1))
-  sleep 0.1
-done
-exit 1
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+root = Path(sys.argv[1])
+parent = int(sys.argv[2])
+(root / ".armed").touch()
+while not (root / ".cleanup-request").exists() and os.getppid() == parent:
+    time.sleep(0.05)
+(root / ".cleanup-ack").touch()
+quiet = 0
+for _ in range(50):
+    unconfirmed = False
+    for socket in root.glob("*.sock"):
+        if not socket.is_socket():
+            continue
+        try:
+            probe = subprocess.run(
+                ["tmux", "-S", str(socket), "list-sessions"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if probe.returncode == 0:
+                killed = subprocess.run(
+                    ["tmux", "-S", str(socket), "kill-server"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if killed.returncode == 0:
+                    socket.unlink(missing_ok=True)
+                else:
+                    unconfirmed = True
+            else:
+                unconfirmed = True
+        except OSError:
+            unconfirmed = True
+    sockets = any(path.is_socket() for path in root.glob("*.sock"))
+    quiet = quiet + 1 if not unconfirmed and not sockets else 0
+    if quiet >= 5:
+        shutil.rmtree(root)
+        sys.exit(0)
+    time.sleep(0.1)
+sys.exit(1)
 "#;
         let parent_pid = std::process::id().to_string();
-        let mut command = Command::new("/bin/sh");
+        let mut command = Command::new("python3");
         command
-            .args(["-c", script, "phoenix-tmux-test-watchdog"])
+            .args(["-c", script])
             .arg(&canonical_root)
             .arg(parent_pid)
             .stdin(Stdio::null())
@@ -125,7 +134,9 @@ exit 1
                 Ok(())
             });
         }
-        let watchdog = command.spawn().expect("spawn tmux test watchdog");
+        let mut watchdog = command.spawn().expect("spawn tmux test watchdog");
+        wait_for_watchdog_arm(&mut watchdog, &canonical_root)
+            .expect("tmux test watchdog must arm before owner is exposed");
 
         Self {
             root: Some(root),
@@ -222,6 +233,29 @@ fn verify_no_live_servers(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn wait_for_watchdog_arm(watchdog: &mut Child, root: &Path) -> io::Result<()> {
+    let armed = root.join(".armed");
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    while !armed.exists() {
+        if let Some(status) = watchdog.try_wait()? {
+            return Err(io::Error::other(format!(
+                "tmux test watchdog exited before arming: {status}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            let _ = watchdog.kill();
+            let _ = watchdog.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tmux test watchdog did not arm",
+            ));
+        }
+        // test-timing-allow: the armed marker is the completion signal; the deadline only bounds failed startup
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 fn request_cleanup(root: &Path, graceful: bool) -> io::Result<()> {
     let request = root.join(".cleanup-request");
     let pending = root.join(".cleanup-request.pending");
@@ -313,6 +347,15 @@ mod tests {
         let socket = spawn_server(&owner, "normal");
         owner.shutdown();
         assert_ne!(probe_sync(&socket), ProbeResult::Live);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn idle_owner_does_not_require_tmux() {
+        let fake_bin = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new_with_watchdog_path(Some(fake_bin.path()));
+        let root = owner.path().to_path_buf();
+        owner.shutdown();
         assert!(!root.exists());
     }
 
