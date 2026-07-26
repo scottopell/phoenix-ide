@@ -5377,9 +5377,9 @@ def cmd_check(
 
     if profile_work and _CHECK_PROFILE is not None and sys.platform == "darwin":
         reporter.info(
-            "sampled flamegraph: run `samply record --save-only --output "
-            f"{_CHECK_PROFILE.artifact_dir / 'flamegraph.json.gz'} -- "
-            "./dev.py check --all --profile-work` for a correlated full-system sample"
+            "sampled stacks: run `xctrace record --template 'Time Profiler' "
+            f"--output {_CHECK_PROFILE.artifact_dir / 'full-check.trace'} --no-prompt "
+            f"--launch -- {ROOT / 'dev.py'} check --all --profile-work`"
         )
 
     if profile_work and _CHECK_PROFILE is not None:

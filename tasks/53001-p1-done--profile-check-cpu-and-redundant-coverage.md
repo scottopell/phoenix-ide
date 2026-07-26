@@ -171,3 +171,47 @@ This task’s default deliverable is instrumentation, baseline data, and recomme
 - **Not a general observability platform:** build the smallest repeatable work-audit pipeline needed to rank and validate QA reductions.
 - Compiler/cache warmness heavily affects compile/lint CPU. Record it and compare like-for-like rather than hiding it through averaging.
 - Shared worker/server setup cannot always be honestly assigned to one test. Preserve it as explicit shared cost instead of prorating it arbitrarily.
+
+## Initial baseline and candidate dossier
+
+A successful full profiled run on macOS arm64 is retained locally at `target/check-profile/27fe2d71ac9340fe80123b53035f6990/` (5,131 records; 2,746 Rust tests, 2,096 Vitest tests, 253 dev.py tests, and 21 E2E role/scenario windows). Two additional full accounting runs are retained at `target/check-profile/d5d59175b39c4c10b0389ade1d6eaa4a/` and `target/check-profile/fd124a8a65ad497ba2c5d86648491d16/`; the former exposed one unrelated timing-sensitive Vitest failure while under profiler load, and the latter passed. A 23 MB Instruments Time Profiler recording is retained at `target/check-profile/sampled-baseline/full-check.trace`. The artifacts are intentionally ignored because they contain host-local paths and high-volume raw data.
+
+### Step CPU ranking
+
+| Step | Exact CPU work | Wall time | Initial interpretation |
+|---|---:|---:|---|
+| Rust test execution | 358.6 core-s | 85.5 s | Largest target; individual attribution available |
+| Vitest | 124.2 core-s | 25.9 s | Second target; worker-window attribution available |
+| Rust test compile | 31.9 core-s | 54.9 s | Shared build cost, not test redundancy |
+| Codegen tests | 20.2 core-s | 11.4 s | Deliberately excluded from normal Rust test run; distinct side-effect contract |
+| E2E | 19.6 core-s | 52.8 s | Distinct real-binary/API boundary; optimize scenarios only with journey evidence |
+| Clippy | 19.5 core-s | 26.2 s | Static defect class, not test overlap |
+| ESLint | 11.1 core-s | 14.9 s | Static defect class, not test overlap |
+| musl smoke | 4.1 core-s | 8.6 s | Platform/build contract |
+| Rust test timing lint | 3.5 core-s | 3.0 s | Static test-architecture guard |
+| Stylelint | 2.4 core-s | 3.5 s | CSS defect class |
+| dev.py unit tests | 2.0 core-s | 4.1 s | Individual attribution available |
+| ast-grep | 2.0 core-s | 0.6 s | Structural defect classes |
+
+### Highest-value investigations
+
+1. **Git observation stress test — 16.2 core-s.** `observe_local_git_head_eventually_reports_consistent_snapshot_during_checkout` performs 400 real `git checkout` operations plus 200 observations. It is the single largest test and protects a real consistency race, so deletion is not justified. Investigate whether a deterministic seam can exercise the read-consistency algorithm while retaining one smaller real-git integration case.
+2. **Wake race repetition family — about 11.0 core-s across five top cases.** The repeated cancel/expiry/terminal/transfer races each create fresh SQLite repositories ten times and assert related single-winner invariants. These are strong concurrency checks, not obvious duplicates. Candidate: factor a shared state-machine/property matrix or lower repeated integration count only after mutation/fault evidence shows equivalent loser/outcome coverage.
+3. **Browser lifecycle family — at least 5.2 core-s in the top rows.** `cascade_last_restricted_owner...`, two `cascade_tears_down...` variants, and browser key/type tests launch browser resources. Similar teardown names suggest fixture/startup consolidation, but each ownership topology may be semantically unique; compare assertions before combining.
+4. **Hard-delete latest-message boundary pair — 3.5 core-s.** The exact-ceiling accept and over-ceiling reject tests are adjacent boundary values and likely share expensive fixture creation. Preserve both outcomes; consolidate fixture/data setup rather than delete either assertion.
+5. **Vitest output-accumulation case — 0.59 windowed core-s.** `ProcessInspectorPanel` scrollback-bound coverage is the highest UI test window in this run. Its semantic boundary appears unique; inspect rendering/setup overhead before treating it as redundant.
+6. **E2E perf_stream scenario — 0.59 harness core-s plus server work.** It covers the real streaming boundary and should not be replaced by unit line overlap. Determine whether payload volume can shrink while preserving framing/backpressure assertions.
+
+### Explicitly not deletion candidates from CPU data alone
+
+- Codegen vs normal Rust tests: the check already excludes `export_bindings` from the normal run, so the 20.2 core-s is not duplicate execution.
+- Compile, clippy, format, lint, spec, and platform lanes protect distinct build/static contracts even when they touch the same files.
+- Concurrency stress and real-browser/E2E tests may have high source overlap with unit tests while uniquely covering scheduling, process, protocol, or platform behavior.
+
+### Coverage/mutation status
+
+The profile ranks candidates without rerunning each test. Per-test LLVM/V8 coverage collection is not enabled by the normal profile because doing so would materially alter CPU work and toolchain behavior. Before deleting or reducing any candidate above, collect focused source coverage for that candidate family and introduce a deliberate fault at the asserted invariant; retain the change only if a named remaining test fails for the intended reason. No tests were deleted in this task.
+
+### Sampled-profile finding
+
+`samply` cannot launch and retain a Mach task port for the system-signed Python used by `dev.py` on macOS, so the executable probe fails with an actionable platform explanation. Instruments `xctrace` with the Time Profiler template successfully recorded a complete passing check run instead. The implementation therefore recommends xctrace on macOS rather than claiming the installed samply backend works for this command tree.
