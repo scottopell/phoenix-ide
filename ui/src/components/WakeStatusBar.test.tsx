@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api } from '../api';
+import { api, type WakeStatus } from '../api';
 import { WakeStatusBar } from './WakeStatusBar';
 
 vi.mock('../api', () => ({
@@ -11,7 +11,7 @@ vi.mock('../api', () => ({
 }));
 
 const now = new Date('2026-01-01T00:00:00Z').getTime();
-const active = {
+const active: WakeStatus = {
   pending_count: 1,
   soonest_expires_at: Math.floor(now / 1000) + 120,
   contracts: [{
