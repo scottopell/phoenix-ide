@@ -1250,8 +1250,10 @@ async fn spawn_session_owned(
             reason: format!("failed to invoke tmux: {e}"),
         })?;
     if let Some((marker, gate)) = creator_handoff {
-        std::fs::write(marker, child.id().unwrap_or_default().to_string())
-            .expect("publish tmux creator PID");
+        let pending = marker.with_extension("pending");
+        std::fs::write(&pending, child.id().unwrap_or_default().to_string())
+            .expect("write tmux creator PID");
+        std::fs::rename(pending, marker).expect("publish tmux creator PID");
         std::fs::write(gate, []).expect("release tmux creator gate");
     }
     let output = child
