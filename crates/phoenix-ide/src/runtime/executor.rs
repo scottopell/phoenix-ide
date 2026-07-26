@@ -2991,6 +2991,9 @@ where
             if let Some(tx) = &self.state_watcher {
                 let _ = tx.send(self.state.clone());
             }
+            if let Some(drain_event) = self.maybe_drain_steering_queue(&self.state.clone(), false) {
+                Box::pin(self.process_event(drain_event)).await?;
+            }
             return Ok(Vec::new());
         }
 
@@ -4028,7 +4031,7 @@ where
                 let (reserved_broadcast_range, reserved_seqs) =
                     self.broadcast_tx.reserve_next_persisted_message_range(1);
                 let _reserved_broadcast_range = reserved_broadcast_range;
-                match self
+                let materialization = self
                     .storage
                     .materialize_authoritative_user_message(
                         &crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
@@ -4041,8 +4044,16 @@ where
                             now: phoenix_workflow::Timestamp(now),
                         },
                     )
-                    .await?
-                {
+                    .await;
+                let materialization = match materialization {
+                    Ok(materialization) => materialization,
+                    Err(error) => {
+                        self.direct_turn_materialization_aborted = true;
+                        tracing::warn!(conversation_id = %self.context.conversation_id, %error, "direct-turn materialization failed; restoring reducer state for retry");
+                        return Ok(None);
+                    }
+                };
+                match materialization {
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized {
                         message,
                         active,

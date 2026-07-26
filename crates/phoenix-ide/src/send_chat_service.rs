@@ -302,7 +302,11 @@ impl SendChatApplicationService {
                                     turn.lifecycle,
                                     phoenix_workflow::TurnLifecycle::Terminal { .. }
                                 ) {
-                                    SendChatOutcome::AlreadyPersisted
+                                    SendChatOutcome::Rejected {
+                                        message: "The accepted message was cancelled or failed before delivery."
+                                            .to_string(),
+                                        code: "turn_terminal",
+                                    }
                                 } else {
                                     self.runtime.kick_direct_turn_worker();
                                     SendChatOutcome::Delivered

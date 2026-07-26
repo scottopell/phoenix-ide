@@ -236,7 +236,9 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
   const reconcileAuthoritative = useCallback((serverMessageIds: Iterable<string>) => {
     const ids = new Set(serverMessageIds);
     if (ids.size === 0) return;
-    updateMessages(prev => prev.filter(m => !ids.has(m.localId)));
+    updateMessages(prev => prev.filter(m =>
+      !ids.has(m.localId) && !ids.has(`${m.conversationId}:${m.localId}`)
+    ));
   }, [updateMessages]);
 
   // Retry a failed message (flip back to pending; the send effect picks it up)

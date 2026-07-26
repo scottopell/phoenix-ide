@@ -229,17 +229,20 @@ impl WorkflowRepository {
                 })?
                 .message_id()
                 .to_string();
-        if let Some(existing_conversation) = sqlx::query_scalar::<_, String>(
-            "SELECT conversation_id FROM messages WHERE message_id = ?1",
+        let legacy_message_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM messages
+                 WHERE conversation_id = ?1 AND message_id = ?2
+             )",
         )
+        .bind(&input.conversation().0)
         .bind(&submitted_message_id)
-        .fetch_optional(&mut *tx.tx)
+        .fetch_one(&mut *tx.tx)
         .await?
-        {
-            if existing_conversation != input.conversation().0 {
-                tx.rollback().await?;
-                return Err(prepared_semantics_changed(&input.prepared));
-            }
+            != 0;
+        if legacy_message_exists {
+            tx.rollback().await?;
+            return Err(prepared_semantics_changed(&input.prepared));
         }
         if input.disposition == AcceptedDisposition::Runtime {
             if let Some(owner) = sqlx::query_scalar::<_, i64>(
