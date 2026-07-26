@@ -1241,6 +1241,7 @@ fn default_socket_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::test_server::TestTmuxServerOwner;
     use tempfile::TempDir;
 
     fn scope(id: &str) -> ResourceScopeKey {
@@ -1411,14 +1412,13 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let reg =
-            TmuxRegistry::with_socket_dir_binary_and_sink(tmp.path().to_path_buf(), true, Some(tx));
+        let reg = owner.registry_with_sink(Some(tx));
 
         let scope = scope("conv-first-ensure");
         let arc = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("first ensure_live should materialize a live server");
 
@@ -1439,7 +1439,7 @@ mod tests {
         // A second ensure_live on an already-live server is a probe-noop:
         // no status change → no spurious re-emit.
         let _ = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("noop");
         assert!(
@@ -1447,7 +1447,7 @@ mod tests {
             "probe-noop on a live server must not re-emit"
         );
 
-        kill_socket(&socket_path_for(tmp.path(), "conv-first-ensure")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1455,12 +1455,12 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let owner = TestTmuxServerOwner::new();
+        let reg = owner.registry();
         let scope = scope("conv-rotate-server-token");
 
         let first = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("first ensure_live should succeed");
         let socket_path = first.read().await.socket_path.clone();
@@ -1469,7 +1469,7 @@ mod tests {
         kill_socket(&socket_path).await;
 
         let second = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .expect("respawn ensure_live should succeed");
         let second_token = second.read().await.server_token.clone();
@@ -1478,7 +1478,7 @@ mod tests {
             first_token, second_token,
             "respawning a missing/dead tmux server must rotate its token so stale wake bindings are fenced"
         );
-        kill_socket(&socket_path).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1486,19 +1486,19 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let legacy_worktree = tmp.path().join("legacy-worktree");
+        let owner = TestTmuxServerOwner::new();
+        let legacy_worktree = owner.path().join("legacy-worktree");
         std::fs::create_dir_all(&legacy_worktree).unwrap();
-        let legacy_socket = socket_path_for_worktree(tmp.path(), &legacy_worktree);
+        let legacy_socket = socket_path_for_worktree(owner.path(), &legacy_worktree);
         spawn_session(
             &legacy_socket,
-            &tmp.path().join("missing.conf"),
+            &owner.path().join("missing.conf"),
             &legacy_worktree,
         )
         .await
         .unwrap();
 
-        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let reg = owner.registry();
         let opaque_scope = scope("opaque-after-migration");
         let server = reg
             .ensure_live(
@@ -1511,7 +1511,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(server.read().await.socket_path, legacy_socket);
-        kill_socket(&legacy_socket).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1519,11 +1519,11 @@ mod tests {
         if which::which("tmux").is_err() {
             return;
         }
-        let tmp = TempDir::new().unwrap();
-        let reg = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        let owner = TestTmuxServerOwner::new();
+        let reg = owner.registry();
         let scope = scope("conv-token-fenced-kill");
         let first = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .unwrap();
         let socket_path = first.read().await.socket_path.clone();
@@ -1531,7 +1531,7 @@ mod tests {
         kill_socket(&socket_path).await;
 
         let replacement = reg
-            .ensure_live(&scope, tmp.path(), None, None)
+            .ensure_live(&scope, owner.path(), None, None)
             .await
             .unwrap();
         let replacement_token = replacement.read().await.server_token.clone();
@@ -1568,7 +1568,7 @@ mod tests {
         reg.kill_exact_window(&scope, &replacement_token, &window_id)
             .await
             .unwrap();
-        kill_socket(&socket_path).await;
+        owner.shutdown();
     }
 
     async fn kill_socket(socket_path: &Path) {

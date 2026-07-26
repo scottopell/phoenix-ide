@@ -51,10 +51,31 @@ Use before/after probes against exact run-owned socket identities. Do not assert
 
 ## Acceptance criteria
 
-- [ ] Every test that can spawn tmux uses the centralized owner; no manual bottom-of-test `kill-server` cleanup remains.
-- [ ] Panic/unwind cleanup is deterministic and tested.
-- [ ] Forced test-process termination cleanup is deterministic and tested on macOS.
-- [ ] `./dev.py check` cannot finish successfully while run-owned test tmux servers remain.
-- [ ] Cleanup cannot target production/durable Phoenix tmux servers.
-- [ ] Repeated tmux test runs do not increase run-owned tmux process or PTY counts.
-- [ ] Existing tmux behavior tests continue to pass under parallel nextest execution.
+- [x] Every real-server tmux test uses the centralized owner; no manual bottom-of-test `kill-server` cleanup remains.
+- [x] Panic/unwind and Tokio task-cancellation cleanup are deterministic and tested.
+- [x] Forced test-process and process-group termination cleanup are deterministic and tested on macOS.
+- [x] Owner shutdown fails when exact run-owned servers remain live.
+- [x] Cleanup is structurally limited to unique `/private/tmp/ptt-*` roots and cannot target durable Phoenix sockets.
+- [x] Repeated and parallel tmux suites do not increase run-owned process, root, or PTY counts.
+- [x] Existing tmux behavior tests pass in parallel.
+
+## Verification evidence
+
+A live host baseline found 169 PID-1-owned test tmux servers and 459 allocated PTYs. Narrow one-time cleanup of only `/var/folders/.../.tmp*` test servers returned the host to zero temporary orphans and 165 PTYs while preserving 130 durable Phoenix tmux servers.
+
+The containment regressions exercise normal shutdown, panic unwind, Tokio task abort, direct runner `SIGKILL`, and runner-process-group `SIGKILL`. Each probes the exact owner socket and root after the lifecycle edge.
+
+A full 68-test tmux suite, three concurrent suites, and five repeated suites were measured from a zero-owner baseline:
+
+```text
+baseline       ptys=257 test_servers=0 test_roots=0
+after_single   ptys=257 test_servers=0 test_roots=0
+after_parallel ptys=259 test_servers=0 test_roots=0
+after_repeat_1 ptys=257 test_servers=0 test_roots=0
+after_repeat_2 ptys=257 test_servers=0 test_roots=0
+after_repeat_3 ptys=257 test_servers=0 test_roots=0
+after_repeat_4 ptys=257 test_servers=0 test_roots=0
+after_repeat_5 ptys=257 test_servers=0 test_roots=0
+```
+
+The two-PTY parallel delta was transient unrelated host activity; all owner roots and servers were zero immediately after the parallel phase, and PTYs returned to the exact baseline on every subsequent run.

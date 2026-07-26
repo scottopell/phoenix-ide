@@ -53,6 +53,24 @@ pub async fn probe(socket_path: &Path) -> std::io::Result<ProbeResult> {
 }
 
 #[cfg(test)]
+pub(crate) fn probe_sync(socket_path: &Path) -> ProbeResult {
+    if !socket_path.exists() {
+        return ProbeResult::NoSocket;
+    }
+    let status = std::process::Command::new("tmux")
+        .args(["-S", &socket_path.to_string_lossy(), "ls"])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) if status.success() => ProbeResult::Live,
+        _ => ProbeResult::DeadSocket,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

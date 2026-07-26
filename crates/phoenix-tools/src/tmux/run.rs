@@ -849,7 +849,7 @@ fn error_envelope(error_id: &str, message: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux::registry::socket_path_for_worktree;
+    use crate::tmux::test_server::TestTmuxServerOwner;
     use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry};
     use crate::{RegisterWakeInput, RegisteredWake, WakeRegistrar};
     use phoenix_core::work_scope::ResourceScopeKey;
@@ -963,25 +963,15 @@ mod tests {
         ctx
     }
 
-    async fn kill_socket(socket_path: &Path) {
-        let _ = tokio::process::Command::new("tmux")
-            .args(["-S", &socket_path.to_string_lossy(), "kill-server"])
-            .env_remove("TMUX")
-            .status()
-            .await;
-    }
-
     #[tokio::test]
     async fn direct_conversations_run_in_immutable_working_dir() {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
         let cwd = cwd_tmp.path().canonicalize().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let ctx = ctx("tmux-run-direct-cwd", cwd.clone(), registry, None);
 
         let result = TmuxRunTool
@@ -1007,7 +997,7 @@ mod tests {
             .unwrap()
             .contains(&cwd.to_string_lossy().to_string()));
 
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-direct-cwd.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1015,13 +1005,11 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let unrelated_cwd = TempDir::new().unwrap();
         let worktree_tmp = TempDir::new().unwrap();
         let worktree = worktree_tmp.path().canonicalize().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let ctx = ctx(
             "tmux-run-worktree-cwd",
             unrelated_cwd.path().canonicalize().unwrap(),
@@ -1051,8 +1039,7 @@ mod tests {
             .unwrap()
             .contains(&worktree.to_string_lossy().to_string()));
 
-        let sock = socket_path_for_worktree(socket_tmp.path(), &worktree);
-        kill_socket(&sock).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1060,11 +1047,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let ctx = ctx(
             "tmux-run-quick-failure",
             cwd_tmp.path().canonicalize().unwrap(),
@@ -1102,7 +1087,7 @@ mod tests {
         );
         assert_eq!(v["captured_output"]["truncated"], false);
 
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-quick-failure.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1110,11 +1095,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(42)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-immediate",
@@ -1145,7 +1128,7 @@ mod tests {
             calls[0].contract_id,
             format!("tmux:tool-tmux-wake:{}", v["window_id"].as_str().unwrap())
         );
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-immediate.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1153,11 +1136,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(7)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-ready",
@@ -1193,7 +1174,7 @@ mod tests {
                 ..
             })
         ));
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-ready.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1201,11 +1182,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Error("boom")]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-error",
@@ -1227,7 +1206,7 @@ mod tests {
             .contains("durable wake registration failed: boom"));
         assert!(result.output().contains("window_id"));
         assert_eq!(registrar.register_calls().len(), 1);
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-error.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1235,11 +1214,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Replayed(77)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-replay",
@@ -1259,7 +1236,7 @@ mod tests {
         let v = parse_response(&result);
         assert_eq!(v["wake_registration"]["workflow_id"], 77);
         assert_eq!(registrar.register_calls().len(), 1);
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-replay.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1267,11 +1244,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(9)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-generation",
@@ -1299,7 +1274,7 @@ mod tests {
             panic!("expected tmux resource");
         };
         assert_eq!(identity.server_token, server_token);
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-generation.sock")).await;
+        owner.shutdown();
     }
 
     #[test]
@@ -1314,11 +1289,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(11)]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-exited",
@@ -1347,7 +1320,7 @@ mod tests {
         assert_eq!(v["status"], "exited");
         assert!(v.get("wake_registration").is_none());
         assert!(registrar.register_calls().is_empty());
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-exited.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1355,11 +1328,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(18)]);
         let ctx = ctx_with_registrar(
             "tmux-run-immediate-close",
@@ -1391,7 +1362,7 @@ mod tests {
                 ..
             })
         ));
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-immediate-close.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1399,11 +1370,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Conflict]);
         let ctx = ctx_with_registrar(
             "tmux-run-immediate-conflict",
@@ -1428,12 +1397,7 @@ mod tests {
         assert!(result.output().contains("wake registration conflicted"));
         assert!(result.output().contains("window_id"));
         assert_eq!(registrar.register_calls().len(), 1);
-        kill_socket(
-            &socket_tmp
-                .path()
-                .join("conv-tmux-run-immediate-conflict.sock"),
-        )
-        .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1441,11 +1405,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(19)]);
         let ctx = ctx_with_registrar(
             "tmux-run-no-preserve",
@@ -1482,7 +1444,7 @@ mod tests {
                 ..
             })
         ));
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-no-preserve.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1490,11 +1452,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let ctx = ctx_with_registrar(
             "tmux-run-wake-no-registrar",
             cwd_tmp.path().canonicalize().unwrap(),
@@ -1513,12 +1473,7 @@ mod tests {
         let v = parse_response(&result);
         assert_eq!(v["status"], "started");
         assert!(v.get("wake_registration").is_none());
-        kill_socket(
-            &socket_tmp
-                .path()
-                .join("conv-tmux-run-wake-no-registrar.sock"),
-        )
-        .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1526,11 +1481,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
         let mut ctx = ctx_with_registrar(
             "tmux-run-wake-global",
@@ -1553,7 +1506,7 @@ mod tests {
             "global terminal scope cannot own a durable wake"
         );
         assert!(registrar.register_calls().is_empty());
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-global.sock")).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1561,11 +1514,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Conflict]);
         let ctx = ctx_with_registrar(
             "tmux-run-wake-conflict",
@@ -1585,7 +1536,7 @@ mod tests {
         assert!(result.output().contains("wake registration conflicted"));
         assert!(result.output().contains("window_id"));
         assert_eq!(registrar.register_calls().len(), 1);
-        kill_socket(&socket_tmp.path().join("conv-tmux-run-wake-conflict.sock")).await;
+        owner.shutdown();
     }
 
     #[test]
@@ -1611,11 +1562,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let ctx = ctx(
             "tmux-run-trailing-comment",
             cwd_tmp.path().canonicalize().unwrap(),
@@ -1647,20 +1596,15 @@ mod tests {
             "pane output: {pane}"
         );
 
-        kill_socket(
-            &socket_tmp
-                .path()
-                .join("conv-tmux-run-trailing-comment.sock"),
-        )
-        .await;
+        owner.shutdown();
     }
 
     #[tokio::test]
     async fn window_name_rejects_pipe_delimiter() {
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
         let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
-            socket_tmp.path().to_path_buf(),
+            owner.path().to_path_buf(),
             false,
         ));
         let ctx = ctx(
@@ -1688,11 +1632,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let ctx = ctx(
             "tmux-run-close-after-ready",
             cwd_tmp.path().canonicalize().unwrap(),
@@ -1720,9 +1662,7 @@ mod tests {
         assert_eq!(v["status"], "ready");
         assert_eq!(v["exit_code"], 0);
         let window_id = v["window_id"].as_str().unwrap();
-        let sock = socket_tmp
-            .path()
-            .join("conv-tmux-run-close-after-ready.sock");
+        let sock = owner.path().join("conv-tmux-run-close-after-ready.sock");
         let capture = tokio::process::Command::new("tmux")
             .args([
                 "-S",
@@ -1740,7 +1680,7 @@ mod tests {
             !capture.success(),
             "window should be killed after observation"
         );
-        kill_socket(&sock).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
@@ -1748,11 +1688,9 @@ mod tests {
         if skip_unless_tmux() {
             return;
         }
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let registry = Arc::new(owner.registry());
         let ctx = ctx(
             "tmux-run-main-session",
             cwd_tmp.path().canonicalize().unwrap(),
@@ -1816,15 +1754,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(String::from_utf8_lossy(&display.stdout).trim(), "main");
-        kill_socket(&socket_path).await;
+        owner.shutdown();
     }
 
     #[tokio::test]
     async fn readiness_rejects_empty_text_and_orphan_timeout() {
-        let socket_tmp = TempDir::new().unwrap();
+        let owner = TestTmuxServerOwner::new();
         let cwd_tmp = TempDir::new().unwrap();
         let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
-            socket_tmp.path().to_path_buf(),
+            owner.path().to_path_buf(),
             false,
         ));
         let ctx = ctx(
