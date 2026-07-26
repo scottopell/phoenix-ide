@@ -817,7 +817,7 @@ impl WorkflowRepository {
                 .map_err(|e| {
                     DbError::Serialization(format!("encode direct-turn receipt event: {e}"))
                 })?,
-                receipt_event_requires_runtime_acceptance: false,
+                receipt_event_requires_runtime_acceptance: true,
                 request_runtime_acceptance_for_cancellation: false,
             })
             .await?;
