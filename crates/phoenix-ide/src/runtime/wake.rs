@@ -492,6 +492,7 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             };
+            let _steering_acceptance = manager.lock_steering_acceptance().await;
             let active_direct_turn =
                 phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone())
                     .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
@@ -508,7 +509,6 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             }
-            let _steering_acceptance = manager.lock_steering_acceptance().await;
             let handle = match manager.try_get_handle(&current.conversation_id).await {
                 Some(handle) => handle,
                 None => match manager.get_or_create(&current.conversation_id).await {
@@ -1278,6 +1278,40 @@ mod tests {
         repo.list_pending("conv").await.unwrap().len()
     }
 
+    async fn accept_unmaterialized_direct_turn(db: &Database) {
+        let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: "user message".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "user-1".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: "user message".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        phoenix_db::workflow::WorkflowRepository::new(db.pool().clone())
+            .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
+                client_key: phoenix_workflow::ClientTurnKey::new("user-1").unwrap(),
+                prepared: phoenix_workflow::PreparedTurn::from_exact_payload(
+                    &phoenix_workflow::ConversationAuthority("conv".to_string()),
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: phoenix_workflow::AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(15),
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn fired_bash_wake_renders_wait_compatible_observation() {
         let (_db, repo, scope) = open_repo().await;
@@ -2024,6 +2058,70 @@ mod tests {
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, ERROR_RETRY_MAX_INTERVAL);
         join.abort();
+    }
+
+    #[tokio::test]
+    async fn accepted_direct_turn_prevents_wake_materialization_and_adoption() {
+        let (db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: scope,
+                    handle_id: "b-1".to_string(),
+                },
+                cmd: "test command".to_string(),
+                label: None,
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                kill_attempted_at: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 1,
+                final_tail_truncated_before: false,
+                final_tail_partial: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        )
+        .run_once()
+        .await
+        .unwrap();
+        let pending = repo.list_pending("conv").await.unwrap();
+        let delivery_id = pending[0].canonical_delivery.delivery_id;
+
+        accept_unmaterialized_direct_turn(&db).await;
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+
+        deliver_pending(&manager, &repo, Timestamp(20))
+            .await
+            .unwrap();
+
+        assert!(repo
+            .get_delivery_message_link(phoenix_workflow::WorkflowId(workflow_id), delivery_id,)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(repo.list_pending("conv").await.unwrap().len(), 1);
+        assert!(db.get_messages("conv").await.unwrap().is_empty());
     }
 
     #[tokio::test]
