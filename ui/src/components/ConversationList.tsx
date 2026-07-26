@@ -191,7 +191,7 @@ export const ConversationRow = memo(function ConversationRow({
   menuRef,
 }: ConversationRowProps) {
   const displayState = getConvDisplayState(conv);
-  const isCompactCompletedChainMember = (listDensity === 'sidebar' || listDensity === 'mobile')
+  const isCompactCompletedChainMember = listDensity === 'sidebar'
     && isChainMember
     && !isChainLatest
     && !isActive
@@ -377,6 +377,95 @@ export const ConversationRow = memo(function ConversationRow({
   );
 });
 
+type MobileChainMemberPresentation = 'history-link' | 'conversation-row';
+
+function mobileChainMemberPresentation({
+  isActive,
+  isLatest,
+  displayState,
+}: {
+  isActive: boolean;
+  isLatest: boolean;
+  displayState: ReturnType<typeof getConvDisplayState>;
+}): MobileChainMemberPresentation {
+  return !isActive && !isLatest && !isActionableDisplayState(displayState)
+    ? 'history-link'
+    : 'conversation-row';
+}
+
+interface MobileChainHistoryLinkProps {
+  conv: Conversation;
+  chainIndex: number;
+  isMenuOpen: boolean;
+  isKeyboardSelected: boolean;
+  onClick: (conv: Conversation) => void;
+  onToggleMenu: (e: React.MouseEvent, convId: string) => void;
+  onRename: (conv: Conversation) => void;
+  onCloseMenu: () => void;
+  menuRef?: React.RefObject<HTMLDivElement> | undefined;
+}
+
+const MobileChainHistoryLink = memo(function MobileChainHistoryLink({
+  conv,
+  chainIndex,
+  isMenuOpen,
+  isKeyboardSelected,
+  onClick,
+  onToggleMenu,
+  onRename,
+  onCloseMenu,
+  menuRef,
+}: MobileChainHistoryLinkProps) {
+  const displayState = getConvDisplayState(conv);
+  const displayTitle = displayTitleFromConversation(conv);
+
+  return (
+    <li
+      className={`conv-chain-history-link${isKeyboardSelected ? ' keyboard-selected' : ''}`}
+      data-id={conv.id}
+    >
+      <button
+        type="button"
+        className="conv-chain-history-target"
+        onClick={() => onClick(conv)}
+        title={`Open conversation "${displayTitle}"`}
+      >
+        <span className={`conv-state-dot ${displayState}`} title={stateLabel(conv, displayState)} />
+        <span className="conv-chain-history-index">#{chainIndex + 1}</span>
+        <span className="conv-chain-history-title">{displayTitle}</span>
+      </button>
+      <div ref={menuRef} className="conv-chain-history-menu">
+        <button
+          type="button"
+          className="conv-chain-history-menu-btn"
+          onClick={(event) => onToggleMenu(event, conv.id)}
+          title="Actions"
+          aria-label={`Actions for ${displayTitle}`}
+          aria-haspopup="menu"
+          aria-expanded={isMenuOpen}
+        >
+          ⋮
+        </button>
+        {isMenuOpen && (
+          <div className="conv-item-actions">
+            <button
+              className="action-btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                onCloseMenu();
+                onRename(conv);
+              }}
+              title={`Rename conversation "${displayTitle}"`}
+            >
+              Rename
+            </button>
+          </div>
+        )}
+      </div>
+    </li>
+  );
+});
+
 interface ChainBlockProps {
   item: Extract<SidebarItem, { kind: 'chain' }>;
   collapsed: boolean;
@@ -552,27 +641,52 @@ export const ChainBlock = memo(function ChainBlock({
       )}
       {!collapsed && (
         <ul className="conv-chain-members">
-          {item.members.map((m, idx) => (
-            <ConversationRow
-              key={m.id}
-              conv={m}
-              isMenuOpen={expandedRowId === m.id}
-              isKeyboardSelected={keyboardSelectedId === m.id}
-              isActive={matchesRouteSegment(m, activeSlug)}
-              isChainMember
-              isChainLatest={m.id === item.latestMemberId}
-              listDensity={listDensity}
-              chainIndex={idx}
-              showArchived={showArchived}
-              onClick={onRowClick}
-              onToggleMenu={onRowToggleMenu}
-              onArchive={onArchive}
-              onDelete={onDelete}
-              onRename={onRename}
-              onCloseMenu={onCloseRowMenu}
-              menuRef={expandedRowId === m.id ? rowMenuRef : undefined}
-            />
-          ))}
+          {item.members.map((m, idx) => {
+            const isActive = matchesRouteSegment(m, activeSlug);
+            const isLatest = m.id === item.latestMemberId;
+            const presentation = listDensity === 'mobile'
+              ? mobileChainMemberPresentation({
+                  isActive,
+                  isLatest,
+                  displayState: getConvDisplayState(m),
+                })
+              : 'conversation-row';
+
+            return presentation === 'history-link' ? (
+              <MobileChainHistoryLink
+                key={m.id}
+                conv={m}
+                chainIndex={idx}
+                isMenuOpen={expandedRowId === m.id}
+                isKeyboardSelected={keyboardSelectedId === m.id}
+                onClick={onRowClick}
+                onToggleMenu={onRowToggleMenu}
+                onRename={onRename}
+                onCloseMenu={onCloseRowMenu}
+                menuRef={expandedRowId === m.id ? rowMenuRef : undefined}
+              />
+            ) : (
+              <ConversationRow
+                key={m.id}
+                conv={m}
+                isMenuOpen={expandedRowId === m.id}
+                isKeyboardSelected={keyboardSelectedId === m.id}
+                isActive={isActive}
+                isChainMember
+                isChainLatest={isLatest}
+                listDensity={listDensity}
+                chainIndex={idx}
+                showArchived={showArchived}
+                onClick={onRowClick}
+                onToggleMenu={onRowToggleMenu}
+                onArchive={onArchive}
+                onDelete={onDelete}
+                onRename={onRename}
+                onCloseMenu={onCloseRowMenu}
+                menuRef={expandedRowId === m.id ? rowMenuRef : undefined}
+              />
+            );
+          })}
         </ul>
       )}
     </li>

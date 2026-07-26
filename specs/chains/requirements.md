@@ -72,7 +72,20 @@ navigation surfaces, identifiable by the chain's root conversation as
 its identity
 
 THE SYSTEM SHALL render chain members visually nested under a
-collapsible chain header in the sidebar, in chain order (root → latest)
+collapsible chain header in conversation navigation, in chain order
+(root → latest)
+
+WHEN an expanded chain is displayed on a mobile-sized viewport
+THE SYSTEM SHALL render inactive intermediate members as dense history
+links rather than full conversation rows
+AND SHALL keep the current member and members requiring action visually
+distinct from inactive history
+AND SHALL keep every member identifiable and directly selectable
+AND SHALL provide a touch target of at least 44px for each member
+
+WHEN a chain is collapsed on a mobile-sized viewport
+THE SYSTEM SHALL present a compact summary that identifies the chain and
+its latest member
 
 WHEN a conversation has not been continued and was not itself a
 continuation
@@ -143,14 +156,6 @@ streaming pairs SHALL render below the active card in reverse
 chronological order, with the most recent pair immediately below the
 active card.
 
-WHEN a stored pair is not the active card and is not currently streaming
-THE SYSTEM SHALL render that history in a denser inactive treatment than
-the active card
-AND SHALL keep the full question text, answer text, freshness indicator,
-and failure state readable without reopening a separate detail surface
-AND SHALL preserve clear visual distinction between the active input card,
-a currently streaming answer, and inactive history
-
 WHEN a stored Q&A answer was produced before the chain grew (members
 were added, or members accumulated more messages, after the answer)
 THE SYSTEM SHALL show an age-of-answer freshness indicator on that
@@ -170,11 +175,8 @@ active card is visibly the same shape as past pairs (just unfilled), so
 the user understands their next question creates a new pair rather than
 continuing a thread. Reverse-chronological ordering keeps the freshest
 context next to the active card without requiring the user to scroll.
-Inactive history benefits from denser presentation because the user's
-attention is on composing the next question or reading the latest answer,
-not on re-editing prior cards; density should reduce repetition, not hide
-meaning. Surfacing failed/incomplete Q&A preserves the user's question
-text rather than losing it on stream failure.
+Surfacing failed/incomplete Q&A preserves the user's question text
+rather than losing it on stream failure.
 
 The freshness indicator is an **age-of-answer** signal, not a
 correctness-snapshot the answer was computed against. Under REQ-CHN-009

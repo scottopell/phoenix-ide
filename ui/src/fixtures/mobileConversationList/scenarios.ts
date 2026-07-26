@@ -292,7 +292,7 @@ const longStandaloneConversations: Conversation[] = Array.from({ length: 18 }, (
         ? pr(800 + n, 'draft', `Long list draft PR ${n}`)
         : n % 6 === 5
           ? pr(800 + n, 'closed', `Long list closed PR ${n}`)
-          : undefined,
+          : null,
   });
 });
 

@@ -47,7 +47,7 @@ describe('mobile conversation list fixture scenarios', () => {
     expect(root?.continued_in_conv_id).toBe('long-chain-link-02');
     expect(root?.chain_name).toBe('mobile long continuation chain');
 
-    const chainStates = new Set(chainRows.map((conv) => conv.state.type));
+    const chainStates = new Set(chainRows.map((conv) => conv.state?.type));
     expect(chainStates).toEqual(new Set([
       'awaiting_llm',
       'awaiting_task_approval',

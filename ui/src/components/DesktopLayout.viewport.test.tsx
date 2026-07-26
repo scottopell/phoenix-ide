@@ -22,9 +22,9 @@ describe('app viewport ownership', () => {
     (pathname) => expect(isViewportOwnedRoute(pathname, false)).toBe(true),
   );
 
-  it('contains the desktop home composer but not the mobile conversation list', () => {
+  it('contains the home route at every viewport size', () => {
     expect(isViewportOwnedRoute('/', true)).toBe(true);
-    expect(isViewportOwnedRoute('/', false)).toBe(false);
+    expect(isViewportOwnedRoute('/', false)).toBe(true);
   });
 
   it.each(['/about', '/settings/llm-language', '/usage', '/terminal', '/s/token', '/c/', '/c/a/b'])(

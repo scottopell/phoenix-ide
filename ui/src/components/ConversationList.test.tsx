@@ -1022,30 +1022,50 @@ describe('Mobile conversation list redesign', () => {
     expect(calls[calls.length - 1]![0]).toBe('/chains/root-id');
   });
 
-  it('minimizes completed non-latest members on mobile full-page lists', () => {
-    const doneRoot = makeConv('done-root', 'done-root', {
-      continued_in_conv_id: 'done-leaf',
-      presentation_mode: 'done',
-      state: { type: 'terminal' },
+  it('renders inactive intermediate mobile members as dense history links', () => {
+    const root = makeConv('history-root', 'history-root', {
+      continued_in_conv_id: 'history-middle',
+      presentation_mode: 'idle',
+      state: { type: 'idle' },
       updated_at: '2024-01-01T00:00:00Z',
     });
-    const doneLeaf = makeConv('done-leaf', 'done-leaf', { updated_at: '2024-02-01T00:00:00Z' });
+    const middle = makeConv('history-middle', 'history-middle', {
+      continued_in_conv_id: 'history-leaf',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+    const leaf = makeConv('history-leaf', 'history-leaf', { updated_at: '2024-03-01T00:00:00Z' });
+    const onConversationClick = vi.fn();
 
     const { container } = render(
       <MemoryRouter>
         <ConversationList
           {...defaultProps}
           listDensity="mobile"
-          conversations={[doneLeaf, doneRoot]}
+          conversations={[leaf, middle, root]}
+          activeSlug="history-leaf"
+          onConversationClick={onConversationClick}
         />
       </MemoryRouter>,
     );
 
-    fireEvent.click(container.querySelector('.conv-chain-caret')!);
-    expect(container.querySelector('[data-id="done-root"]')).toHaveClass('conv-item-chain-completed');
-    expect(container.querySelector('[data-id="done-root"] .conv-item-title')?.textContent).toBe('done-root');
-    expect(container.querySelector('[data-id="done-root"] .conv-project-label')?.textContent).toBe('project');
-    expect(container.querySelector('[data-id="done-leaf"] .conv-item-title')?.textContent).toBe('done-leaf');
+    const historyLinks = container.querySelectorAll('.conv-chain-history-link');
+    expect(historyLinks).toHaveLength(2);
+    expect(historyLinks[0]).toHaveAttribute('data-id', 'history-root');
+    expect(historyLinks[0]?.textContent).toContain('#1');
+    expect(historyLinks[0]?.textContent).toContain('history-root');
+    expect(historyLinks[1]).toHaveAttribute('data-id', 'history-middle');
+    expect(container.querySelector('[data-id="history-leaf"]')).toHaveClass('conv-item-chain-member', 'active');
+    expect(container.querySelectorAll('.conv-chain-latest-summary')).toHaveLength(0);
+
+    fireEvent.click(historyLinks[0]!.querySelector('.conv-chain-history-target')!);
+    expect(onConversationClick).toHaveBeenCalledWith(expect.objectContaining({ id: 'history-root' }));
+
+    fireEvent.click(historyLinks[0]!.querySelector('.conv-chain-history-menu-btn')!);
+    expect(within(historyLinks[0] as HTMLElement).getByText('Rename')).toBeTruthy();
+    fireEvent.click(within(historyLinks[0] as HTMLElement).getByText('Rename'));
+    expect(defaultProps.onRename).toHaveBeenCalledWith(expect.objectContaining({ id: 'history-root' }));
   });
 
   it('keeps the active mobile chain expanded even for completed chains', async () => {
@@ -1075,7 +1095,40 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
     expect(container.querySelector('[data-id="active-leaf"]')).toHaveClass('active');
     expect(container.querySelector('[data-id="active-leaf"] .conv-item-title')?.textContent).toBe('active-leaf');
-    expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(2);
+    expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(1);
+    expect(container.querySelector('[data-id="active-root"]')).toHaveClass('conv-chain-history-link');
+  });
+
+  it('keeps actionable intermediate members distinct from inactive history', () => {
+    const root = makeConv('mixed-root', 'mixed-root', {
+      continued_in_conv_id: 'mixed-action',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const actionable = makeConv('mixed-action', 'mixed-action', {
+      continued_in_conv_id: 'mixed-leaf',
+      presentation_mode: 'error',
+      state: { type: 'error', message: 'failed', error_kind: 'server_error' },
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+    const leaf = makeConv('mixed-leaf', 'mixed-leaf', { updated_at: '2024-03-01T00:00:00Z' });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          listDensity="mobile"
+          conversations={[leaf, actionable, root]}
+          activeSlug="mixed-leaf"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-id="mixed-root"]')).toHaveClass('conv-chain-history-link');
+    expect(container.querySelector('[data-id="mixed-action"]')).toHaveClass('conv-item-chain-member');
+    expect(container.querySelector('[data-id="mixed-action"]')).not.toHaveClass('conv-chain-history-link');
+    expect(container.querySelector('[data-id="mixed-action"] .conv-state-chip')?.textContent).toBe('Error');
   });
 
   it('auto-expands mobile chains with actionable latest members', () => {
