@@ -296,7 +296,37 @@ const MIGRATIONS: &[Migration] = &[
         name: "seed_workflow_global_sequences",
         sql: MIGRATION_056,
     },
+    Migration {
+        version: 57,
+        name: "normalize_direct_turn_attachments",
+        sql: MIGRATION_057,
+    },
 ];
+
+const MIGRATION_057: &str = r"
+CREATE TABLE IF NOT EXISTS durable_turn_submitted_images (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), media_type TEXT NOT NULL, data TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS durable_turn_submitted_files (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0), stored_path TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS durable_turn_delivery_images (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), media_type TEXT NOT NULL, data TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS durable_turn_delivery_files (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0), stored_path TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+";
 
 const MIGRATION_056: &str = r"
 INSERT OR IGNORE INTO workflow_global_sequences (sequence_name, next_value)

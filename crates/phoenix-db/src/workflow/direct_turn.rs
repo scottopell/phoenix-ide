@@ -366,37 +366,6 @@ impl WorkflowRepository {
             .transpose()
     }
 
-    async fn quarantine_corrupt_discovered_turn(
-        &self,
-        turn_id: TurnAuthorityId,
-        workflow_id: WorkflowId,
-        error: &DbError,
-    ) -> DbResult<()> {
-        let mut tx = self.begin_tx().await?;
-        sqlx::query(
-            "UPDATE durable_turns
-             SET terminal_kind = 'Failed', terminal_reason = ?2,
-                 generation = generation + 1, owns_conversation = 0
-             WHERE turn_id = ?1 AND terminal_kind IS NULL",
-        )
-        .bind(to_i64(turn_id.0, "turn_id")?)
-        .bind(format!("corrupt prepared payload: {error}"))
-        .execute(&mut *tx.tx)
-        .await?;
-        sqlx::query(
-            "UPDATE workflows SET status = 'Failed', generation = generation + 1
-             WHERE workflow_id = ?1 AND status NOT IN ('Completed', 'Failed', 'Cancelled')",
-        )
-        .bind(to_i64(workflow_id.0, "workflow_id")?)
-        .execute(&mut *tx.tx)
-        .await?;
-        mark_active_attempts_authority_lost_tx(&mut tx, workflow_id).await?;
-        delete_reclaimable_leases_tx(&mut tx, workflow_id).await?;
-        tx.invalidate_nonterminal_effects(workflow_id).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     pub async fn claim_authoritative_turn(
         &self,
         input: &ClaimAuthoritativeTurnInput,
@@ -659,8 +628,7 @@ impl WorkflowRepository {
                     prepared,
                 }),
                 Err(error) => {
-                    self.quarantine_corrupt_discovered_turn(turn_id, workflow_id, &error)
-                        .await?;
+                    tracing::error!(turn_id = turn_id.0, workflow_id = workflow_id.0, error = %error, "corrupt direct-turn payload blocks discovery");
                 }
             }
         }
