@@ -273,6 +273,12 @@ struct ProductionDirectTurnDispatcher {
 impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
     async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
         let handle = self.manager.get_or_create(conversation_id).await?;
+        if !matches!(
+            *handle.state_rx.borrow(),
+            phoenix_core::domain::sm_state::ConvState::Idle
+        ) {
+            return Err("direct-turn reducer is not idle".to_string());
+        }
         handle
             .event_tx
             .send(event)
