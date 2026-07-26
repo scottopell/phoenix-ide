@@ -15,14 +15,28 @@ use super::registry::TmuxRegistry;
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 
-pub(crate) struct TestTmuxServerOwner {
+/// Owns real tmux servers created by tests, including after abrupt runner death.
+pub struct TestTmuxServerOwner {
     root: Option<TempDir>,
     keepalive: Option<OwnedFd>,
     watchdog: Option<Child>,
 }
 
+impl Default for TestTmuxServerOwner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestTmuxServerOwner {
-    pub(crate) fn new() -> Self {
+    /// Creates an isolated short socket root and its detached cleanup watchdog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the temporary root, watchdog pipe, or watchdog process cannot
+    /// be created. Tests cannot safely continue without containment.
+    #[must_use]
+    pub fn new() -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
             .tempdir_in("/private/tmp")
@@ -103,14 +117,19 @@ exit "$status"
         self.root.as_ref().expect("owner is live").path()
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    /// Returns the unique socket root owned by this test fixture.
+    #[must_use]
+    pub fn path(&self) -> &Path {
         self.socket_dir()
     }
 
-    pub(crate) fn registry(&self) -> TmuxRegistry {
+    /// Creates a registry whose servers are confined to this owner's root.
+    #[must_use]
+    pub fn registry(&self) -> TmuxRegistry {
         TmuxRegistry::with_socket_dir(self.socket_dir().to_path_buf())
     }
 
+    #[cfg(test)]
     pub(crate) fn registry_with_sink(
         &self,
         sink: Option<super::registry::TmuxLifecycleSink>,
@@ -118,7 +137,13 @@ exit "$status"
         TmuxRegistry::with_socket_dir_binary_and_sink(self.socket_dir().to_path_buf(), true, sink)
     }
 
-    pub(crate) fn shutdown(mut self) {
+    /// Kills and verifies all exact servers under the owned root.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the watchdog cannot complete cleanup or any exact server
+    /// remains live. The root is preserved for recovery in that case.
+    pub fn shutdown(mut self) {
         self.shutdown_inner()
             .expect("tmux test cleanup must succeed");
     }

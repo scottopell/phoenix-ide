@@ -171,6 +171,9 @@ phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
 # Re-declared with test-support so phoenix-db's #[cfg(test)] `create_conversation`
 # explore-mode test wrapper is visible to this crate's tests. Dev-only.
 phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
+# Re-declared with test-support so runtime tests that spawn real tmux servers
+# use the same runner-death containment owner as phoenix-tools' own tests.
+phoenix-tools = { path = "../phoenix-tools", features = ["test-support"] }
 proptest = "1"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the
 # bounded-shutdown drain tests to exercise the SHUTDOWN_GRACE timeout

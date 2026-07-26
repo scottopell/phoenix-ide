@@ -14,8 +14,8 @@ pub mod probe;
 pub mod registry;
 pub mod run;
 
-#[cfg(test)]
-mod test_server;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_server;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

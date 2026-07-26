@@ -1065,11 +1065,9 @@ mod tests {
             return;
         }
         let (_db, repo, scope) = open_repo().await;
-        let socket_tmp = tempfile::TempDir::new().unwrap();
+        let tmux_owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
         let cwd_tmp = tempfile::TempDir::new().unwrap();
-        let tmux = Arc::new(phoenix_tools::TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let tmux = Arc::new(tmux_owner.registry());
         let resource_scope = crate::work_scope::ResourceScopeKey::Work(
             crate::work_scope::WorkScopeId::parse(&scope.0).unwrap(),
         );
@@ -1098,9 +1096,7 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
         drop(server);
-        let fresh_registry = Arc::new(phoenix_tools::TmuxRegistry::with_socket_dir(
-            socket_tmp.path().to_path_buf(),
-        ));
+        let fresh_registry = Arc::new(tmux_owner.registry());
         let workflow_id = register_tmux(&repo, &scope, &server_token, &window_id, 50).await;
         let inspector = Arc::new(RuntimeRegistryInspector::new(
             Arc::new(phoenix_tools::BashHandleRegistry::new()),
@@ -1118,11 +1114,7 @@ mod tests {
             .await
             .unwrap();
         assert!(binding.is_some());
-        tokio::process::Command::new("tmux")
-            .args(["-S", &socket_path.to_string_lossy(), "kill-server"])
-            .output()
-            .await
-            .unwrap();
+        tmux_owner.shutdown();
     }
 
     #[tokio::test]

@@ -52,7 +52,7 @@ pub async fn probe(socket_path: &Path) -> std::io::Result<ProbeResult> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn probe_sync(socket_path: &Path) -> ProbeResult {
     if !socket_path.exists() {
         return ProbeResult::NoSocket;
