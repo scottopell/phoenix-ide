@@ -4553,10 +4553,15 @@ async fn cleanup_browser_with_retry(
             inheritor_scope,
         )
     };
-    if let Err(first_error) = cleanup().await {
-        if let Err(retry_error) = cleanup().await {
-            tracing::warn!(conv_id = %conv.id, %first_error, %retry_error, "browser cleanup failed after retry; transferring cleanup to detached manager task");
-            browser_manager.request_kill_scope_until_success(work_scope.clone());
+    let mut attempt = 0_u64;
+    loop {
+        attempt += 1;
+        match cleanup().await {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::warn!(conv_id = %conv.id, attempt, %error, "browser cleanup failed; terminal transition waiting for retry");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         }
     }
 }

@@ -1026,6 +1026,7 @@ pub struct BrowserSessionManager {
     /// the lifecycle bridges. Unset (the test/default case) means idle cleanup
     /// reaps on age alone.
     scope_liveness_hook: std::sync::OnceLock<ScopeLivenessHook>,
+    shutting_down: AtomicBool,
 }
 
 impl BrowserSessionManager {
@@ -1045,6 +1046,7 @@ impl BrowserSessionManager {
             sessions: RwLock::new(HashMap::new()),
             lifecycle_sink: sink,
             scope_liveness_hook: std::sync::OnceLock::new(),
+            shutting_down: AtomicBool::new(false),
         });
 
         // Start background cleanup task with weak reference to avoid reference cycle
@@ -1191,6 +1193,11 @@ impl BrowserSessionManager {
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(BrowserError::OperationFailed(
+                "browser session manager is shutting down".to_string(),
+            ));
+        }
         self.get_session_with_creator(work_scope, actor).await
     }
 
@@ -1214,12 +1221,46 @@ impl BrowserSessionManager {
         self.get_session_with_creator(work_scope, &system).await
     }
 
+    fn ensure_accepting_sessions(&self) -> Result<(), BrowserError> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            Err(BrowserError::OperationFailed(
+                "browser session manager is shutting down".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn setup_session_listeners(session: Arc<RwLock<BrowserSession>>) {
+        match tokio::time::timeout(
+            SESSION_INIT_TIMEOUT,
+            BrowserSession::setup_console_listener(session.clone()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "Failed to set up console listener"),
+            Err(_) => tracing::warn!("console listener setup timed out"),
+        }
+        match tokio::time::timeout(
+            SESSION_INIT_TIMEOUT,
+            BrowserSession::setup_profiling_listener(session),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "Failed to set up profiling listener"),
+            Err(_) => tracing::warn!("profiling listener setup timed out"),
+        }
+    }
+
     async fn get_session_with_creator(
         &self,
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
         let key = session_key(work_scope, actor);
+        self.ensure_accepting_sessions()?;
 
         let mut sessions = loop {
             {
@@ -1250,6 +1291,7 @@ impl BrowserSessionManager {
             }
 
             let sessions = self.sessions.write().await;
+            self.ensure_accepting_sessions()?;
             if let Some(entry) = sessions.get(&key) {
                 if entry.teardown_failed.load(Ordering::SeqCst) {
                     return Err(BrowserError::OperationFailed(
@@ -1275,39 +1317,13 @@ impl BrowserSessionManager {
             break sessions;
         };
 
-        // Create new session
-
         tracing::info!(work_scope = %work_scope, "Creating new browser session");
         // BrowserSession::new bounds its own CDP launch (and may legitimately
         // run a multi-minute first-run chromium download, which is NOT bounded).
         let session = BrowserSession::new(&key).await?;
         let session_arc = Arc::new(RwLock::new(session));
 
-        // Listener setup is best-effort and bounded per call: a wedged CDP
-        // socket must not hang creation. On timeout we keep the (usable)
-        // session and skip the listener rather than tearing down a live browser.
-        match tokio::time::timeout(
-            SESSION_INIT_TIMEOUT,
-            BrowserSession::setup_console_listener(session_arc.clone()),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "Failed to set up console listener"),
-            Err(_) => tracing::warn!("console listener setup timed out"),
-        }
-
-        // Set up the profiling trace listener (REQ-BT-019.9 / .12).
-        match tokio::time::timeout(
-            SESSION_INIT_TIMEOUT,
-            BrowserSession::setup_profiling_listener(session_arc.clone()),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "Failed to set up profiling listener"),
-            Err(_) => tracing::warn!("profiling listener setup timed out"),
-        }
+        Self::setup_session_listeners(session_arc.clone()).await;
 
         sessions.insert(
             key.clone(),
@@ -1641,22 +1657,6 @@ impl BrowserSessionManager {
         self.observe_requested_kill(outcome, work_scope.clone(), audience);
     }
 
-    /// Transfer teardown ownership to a detached retry loop.
-    pub fn request_kill_scope_until_success(self: &Arc<Self>, work_scope: ResourceScopeKey) {
-        let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                match manager.kill_session(&work_scope).await {
-                    Ok(()) => break,
-                    Err(error) => {
-                        tracing::error!(%work_scope, %error, "detached browser cleanup retry failed");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        });
-    }
-
     /// Request session kill and return as soon as teardown has been queued.
     /// The session remains tracked as live until the spawned teardown task has
     /// actually terminated Chrome, removed the manager entry, and emitted the
@@ -1806,25 +1806,36 @@ impl BrowserSessionManager {
     /// # Errors
     /// Returns [`BrowserError`] when any session cannot confirm authoritative teardown.
     pub async fn shutdown_all(self: &Arc<Self>) -> Result<(), BrowserError> {
-        let scopes: HashSet<ResourceScopeKey> = self
-            .sessions
-            .read()
-            .await
-            .values()
-            .map(|entry| entry.scope.clone())
-            .collect();
-        if !scopes.is_empty() {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let mut failures = Vec::new();
+        loop {
+            let scopes: HashSet<ResourceScopeKey> = self
+                .sessions
+                .read()
+                .await
+                .values()
+                .map(|entry| entry.scope.clone())
+                .collect();
+            if scopes.is_empty() {
+                break;
+            }
             tracing::info!(count = scopes.len(), "Shutting down all browser sessions");
-        }
-        let failures: Vec<String> = futures::future::join_all(
-            scopes
+            failures.extend(
+                futures::future::join_all(
+                    scopes.into_iter().map(|scope| async move {
+                        (scope.clone(), self.kill_session(&scope).await)
+                    }),
+                )
+                .await
                 .into_iter()
-                .map(|scope| async move { (scope.clone(), self.kill_session(&scope).await) }),
-        )
-        .await
-        .into_iter()
-        .filter_map(|(scope, result)| result.err().map(|error| format!("{scope}: {error}")))
-        .collect();
+                .filter_map(|(scope, result)| {
+                    result.err().map(|error| format!("{scope}: {error}"))
+                }),
+            );
+            if !failures.is_empty() {
+                break;
+            }
+        }
         if failures.is_empty() {
             Ok(())
         } else {
@@ -1979,6 +1990,7 @@ impl Default for BrowserSessionManager {
             sessions: RwLock::new(HashMap::new()),
             lifecycle_sink: None,
             scope_liveness_hook: std::sync::OnceLock::new(),
+            shutting_down: AtomicBool::new(false),
         }
     }
 }
@@ -2030,6 +2042,17 @@ mod lifecycle_hook_tests {
             Some(Err(error)) if error == "first attempt failed"
         ));
         assert!(matches!(retry.result(), Some(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_closes_session_admission() {
+        let manager = BrowserSessionManager::new();
+        manager.shutdown_all().await.expect("empty shutdown");
+
+        let Err(error) = manager.get_session(&scope("after-shutdown")).await else {
+            panic!("shutdown manager must reject new sessions");
+        };
+        assert!(error.to_string().contains("shutting down"));
     }
 
     /// `kill_session` on a manager that never had a session for this scope

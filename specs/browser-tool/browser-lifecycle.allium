@@ -63,14 +63,6 @@ value BrowserSessionLifecycleEvent {
     kind: BrowserLifecycleKind
 }
 
-value BrowserCleanupOwnershipTransferred {
-    work_scope: WorkScope
-}
-
-value DetachedBrowserCleanup {
-    work_scope: WorkScope
-}
-
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -267,22 +259,17 @@ rule CascadeTeardownFailureRetained {
     ensures: not UserDataDirRemoved(user_data_dir_for_scope(work_scope))
 }
 
-rule TerminalLifecycleTransfersFailedCleanup {
-    when: BrowserCleanupOwnershipTransferred(work_scope)
+rule TerminalLifecycleWaitsForCleanup {
+    when: TerminalLifecycleTransitionRequested(work_scope)
 
     requires: exists BrowserSession{scope: work_scope, status: teardown_failed}
 
     ensures: BrowserSession.status = teardown_failed
-    ensures: DetachedBrowserCleanup.emitted(
-        work_scope: work_scope
-    )
 
     @guidance
-        -- A lifecycle operation that cannot retain its durable row transfers
-        -- this scope to a manager-owned detached retry loop before committing
-        -- the terminal row transition. The retry loop retains the typed
-        -- teardown_failed entry and retries actor-specific teardown until the
-        -- same scope reaches torn_down.
+        -- Terminal lifecycle cleanup retries authoritative scope teardown while
+        -- the durable owner still exists. The final archive/delete/abandon
+        -- transition occurs only after the scope reaches torn_down.
 }
 
 -- A retry is tied to one teardown generation. Its completion cannot be inferred
