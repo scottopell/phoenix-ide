@@ -220,10 +220,9 @@ rule CascadeTearsDownWhenNoInheritor {
     ensures: UserDataDirRemoved(user_data_dir_for_scope(work_scope))
 
     @guidance
-        -- The kill removes the map entry first, then drops the
-        -- ScopedSession value (which closes Chrome via Drop). The user
-        -- data dir is removed after the drop so the SingletonLock file
-        -- is released first.
+        -- The kill awaits explicit Chrome termination before removing the
+        -- user data dir and manager entry. Teardown completion therefore
+        -- means the process and its SingletonLock have been released.
 }
 
 -- REQ-BROWSER-WS-003: cleanup-cascade preservation when a live conversation
@@ -281,6 +280,7 @@ rule IdleSessionCleanedUp {
             work_scope: session.scope,
             active: false
         )
+        ensures: UserDataDirRemoved(user_data_dir_for_scope(session.scope))
 }
 
 -- REQ-BT-010: the skip path. An idle session whose scope is still live — a

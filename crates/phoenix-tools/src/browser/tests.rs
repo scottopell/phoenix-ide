@@ -105,7 +105,7 @@ macro_rules! require_network {
     };
 }
 
-/// Create a test context with a fresh browser session manager
+/// Create a test context with a fresh browser session manager and profile identity.
 fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManager>) {
     let manager = Arc::new(BrowserSessionManager::default());
     let ctx = ToolContext::new(
@@ -118,9 +118,17 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
         phoenix_terminal::ActiveTerminals::new(),
         Arc::new(crate::TmuxRegistry::new()),
         None,
-        phoenix_core::work_scope::WorkScopeId::parse("test-work").unwrap(),
+        phoenix_core::work_scope::WorkScopeId::new(),
     );
     (ctx, manager)
+}
+
+#[test]
+fn test_contexts_have_isolated_browser_scopes() {
+    let (first, _) = test_context("first");
+    let (second, _) = test_context("second");
+
+    assert_ne!(first.work_scope, second.work_scope);
 }
 
 // Vendored React UMD bundles + the shared test app, inlined into the
@@ -727,7 +735,7 @@ async fn test_browser_console_logs_local() {
 
     {
         let session = manager
-            .get_existing(&scope("test-work"))
+            .get_existing(&ctx.work_scope)
             .await
             .expect("session should exist after navigate");
         tokio::time::timeout(
@@ -2102,7 +2110,7 @@ async fn test_screencast_attach_emits_frames_and_url() {
     assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     let session_arc = manager
-        .get_existing(&scope("test-work"))
+        .get_existing(&ctx.work_scope)
         .await
         .expect("session should exist after navigate");
 

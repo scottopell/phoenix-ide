@@ -12,7 +12,7 @@ use chromiumoxide::{
 };
 use futures::StreamExt;
 use serde::{Serialize, Serializer};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -748,14 +748,8 @@ impl BrowserSession {
     /// last clone drops. Cascade then lies: cleanup completed but the
     /// process is still running.
     ///
-    /// Falls back to `Browser::kill` (SIGKILL) when `close` errors —
-    /// per chromiumoxide docs `close` is preferred but `kill` is the
-    /// escape hatch for the case where graceful close hangs.
+    /// Falls back to `Browser::kill` when graceful close does not complete.
     async fn terminate(&mut self) {
-        // Abort task handles first so they don't try to talk to a closing
-        // browser. Drop's task-abort logic is now redundant but harmless
-        // (abort on an already-aborted JoinHandle is a no-op).
-        self.handler_task.abort();
         if let Some(t) = &self.console_task {
             t.abort();
         }
@@ -763,15 +757,41 @@ impl BrowserSession {
             t.abort();
         }
 
-        match self.browser.close().await {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(error = %e, "browser graceful close failed; falling back to kill");
-                if let Some(Err(io_err)) = self.browser.kill().await {
-                    tracing::warn!(error = %io_err, "browser kill failed; OS process may linger");
+        let graceful = tokio::time::timeout(SESSION_INIT_TIMEOUT, async {
+            self.browser
+                .close()
+                .await
+                .map_err(|error| error.to_string())?;
+            self.browser
+                .wait()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await;
+
+        if !matches!(graceful, Ok(Ok(()))) {
+            match graceful {
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "browser graceful close failed; falling back to kill");
                 }
+                Err(_) => {
+                    tracing::warn!("browser graceful close timed out; falling back to kill");
+                }
+                Ok(Ok(())) => unreachable!(),
+            }
+            match tokio::time::timeout(SESSION_INIT_TIMEOUT, self.browser.kill()).await {
+                Ok(Some(Err(error))) => {
+                    tracing::warn!(%error, "browser kill failed; OS process may linger");
+                }
+                Err(_) => {
+                    tracing::warn!("browser kill timed out; OS process may linger");
+                }
+                Ok(Some(Ok(())) | None) => {}
             }
         }
+
+        self.handler_task.abort();
     }
 }
 
@@ -1402,13 +1422,20 @@ impl BrowserSessionManager {
         }
     }
 
-    /// Kill all sessions (called on shutdown)
-    pub async fn shutdown_all(&self) {
-        let mut sessions = self.sessions.write().await;
-        let count = sessions.len();
-        if count > 0 {
-            tracing::info!(count, "Shutting down all browser sessions");
-            sessions.clear();
+    /// Kill all sessions and wait for their Chrome processes and profiles to be released.
+    pub async fn shutdown_all(self: &Arc<Self>) {
+        let scopes: HashSet<ResourceScopeKey> = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .map(|entry| entry.scope.clone())
+            .collect();
+        if !scopes.is_empty() {
+            tracing::info!(count = scopes.len(), "Shutting down all browser sessions");
+        }
+        for scope in scopes {
+            self.kill_session(&scope).await;
         }
     }
 
@@ -1450,7 +1477,7 @@ impl BrowserSessionManager {
     /// backstop for scopes with no live conversation (or when no hook is
     /// wired). Re-checked every [`CLEANUP_INTERVAL`], so a scope that goes
     /// terminal is reaped on the next pass.
-    async fn cleanup_idle_sessions(&self) {
+    async fn cleanup_idle_sessions(self: &Arc<Self>) {
         let now = Instant::now();
         let mut idle_candidates: Vec<(String, ResourceScopeKey, Option<String>)> = Vec::new();
 
@@ -1478,28 +1505,24 @@ impl BrowserSessionManager {
         // timer re-checks it next interval. No hook means reap on age alone.
         let to_remove = self.filter_reapable(idle_candidates).await;
 
-        // Remove idle sessions
-        if !to_remove.is_empty() {
-            let mut removed_sessions = Vec::new();
-            {
-                let mut sessions = self.sessions.write().await;
-                for key in to_remove {
-                    tracing::info!(scope_key = %key, "Cleaning up idle browser session");
-                    if let Some(entry) = sessions.remove(&key) {
-                        let audience = match entry.authority {
-                            ResourceAuthority::Work => BrowserSessionAudience::Scope,
-                            ResourceAuthority::Restricted => BrowserSessionAudience::Conversation(
-                                entry.creator_conversation_id.clone(),
-                            ),
-                        };
-                        removed_sessions.push((entry.scope, audience));
+        for key in to_remove {
+            let scope = {
+                let sessions = self.sessions.read().await;
+                sessions.get(&key).map(|entry| entry.scope.clone())
+            };
+            if let Some(scope) = scope {
+                tracing::info!(scope_key = %key, "Cleaning up idle browser session");
+                match self.spawn_kill_session_by_key(key, scope).await {
+                    KillSessionOutcome::Absent => {}
+                    KillSessionOutcome::Started(handle) => {
+                        if let Err(error) = handle.await {
+                            tracing::warn!(%error, "idle browser kill task failed");
+                        }
+                    }
+                    KillSessionOutcome::AlreadyRequested { key, done } => {
+                        self.wait_for_kill_completion(&key, done).await;
                     }
                 }
-            }
-            // Emit outside the write lock so receivers don't deadlock if
-            // they re-enter the manager.
-            for (scope, audience) in removed_sessions {
-                self.emit_lifecycle(&scope, audience, false);
             }
         }
     }
@@ -1575,6 +1598,33 @@ mod lifecycle_hook_tests {
             "kill_session on absent scope must not emit a lifecycle event"
         );
         assert!(!manager.is_active(&scope).await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_waits_for_process_exit_and_profile_removal() {
+        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+            return;
+        }
+
+        let manager = BrowserSessionManager::new();
+        let scope = ResourceScopeKey::Work(WorkScopeId::new());
+        let profile = super::user_data_dir_for_key(&scope.stable_key());
+        let session = manager.get_session(&scope).await.expect("launch browser");
+
+        manager.shutdown_all().await;
+
+        assert!(!manager.is_active(&scope).await);
+        assert!(!std::path::Path::new(&profile).exists());
+        assert!(
+            session
+                .write()
+                .await
+                .browser
+                .try_wait()
+                .expect("read browser process status")
+                .is_some(),
+            "shutdown_all returned before Chrome exited"
+        );
     }
 
     /// `rekey_scope` on a manager with no session for `old` is a no-op:
