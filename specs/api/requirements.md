@@ -12,8 +12,8 @@ WHEN client requests conversation list
 THE SYSTEM SHALL return active conversations ordered by last update
 AND include conversation ID, slug, working directory, state, and timestamps
 
-WHEN client requests archived conversations
-THE SYSTEM SHALL return archived conversations separately
+WHEN the client requests History conversations
+THE SYSTEM SHALL return closed conversations separately from Open conversations
 
 **Rationale:** Users need to see and navigate their conversations.
 
@@ -135,31 +135,20 @@ THE SYSTEM SHALL include in state_data:
 
 ### REQ-API-006: Conversation Lifecycle
 
-WHEN client requests archive
-THE SYSTEM SHALL mark conversation as archived
-AND remove from active conversation list
-AND run the resource-cleanup cascade (REQ-BED-032) — releasing the
-    conversation's bash handles, tmux server (subject to scope-equality
-    preservation per REQ-TMUX-WS-002), worktree, and browser session
-    (subject to REQ-BROWSER-WS-002 preservation)
+WHEN the client requests Close conversation
+THE SYSTEM SHALL transition the conversation from Open to History through the explicit Close flow
+AND run the resource-cleanup cascade required by that Close flow
 
-THE SYSTEM SHALL NOT expose an `unarchive` operation. Archive is a
-terminal lifecycle transition; the row is preserved for retrospection
-but the conversation cannot resume in-place. The unified cleanup cascade
-reclaims a conversation's live resources, so a state in which "live
-resources reclaimed but row claims it can be resumed" is structurally
-incoherent — see REQ-BED-032 rationale.
+THE SYSTEM SHALL NOT expose `archive`, `unarchive`, `abandon`, or `mark_merged` as current ordinary lifecycle write operations
 
-WHEN client requests delete
-THE SYSTEM SHALL permanently remove conversation and all messages
-AND run the resource-cleanup cascade (REQ-BED-032)
+WHEN the client requests delete for a History conversation
+THE SYSTEM SHALL permanently remove the conversation and all messages
+AND run any remaining cleanup required for deletion
 
-WHEN client requests rename with new slug
-THE SYSTEM SHALL update slug if not already taken
+WHEN the client requests rename with a new slug
+THE SYSTEM SHALL update the slug if it is not already taken
 
-**Rationale:** Users manage conversation lifecycle and organization.
-Archive and delete share the same resource-release semantics; they
-differ only in whether the DB row (and message history) is preserved.
+**Rationale:** Users manage conversation lifecycle through Open, Close, History, and Delete permanently. The API should expose the same unified product model rather than preserving obsolete lifecycle verbs as current writes.
 
 ---
 

@@ -78,3 +78,43 @@ Append a completion note to this task body with these headings:
 
 **Commit**
 - `61a10b91fe33b93de104d6b80a6406056b994ce2`
+
+
+## Review correction round 2
+
+**Files changed**
+- `specs/projects/requirements.md`
+- `specs/work-lifecycle/requirements.md`
+- `specs/conversation-retrieval/requirements.md`
+- `specs/api/requirements.md`
+- `specs/agent-identity/requirements.md`
+
+**Decisions captured**
+- Replaced remaining normative Abandon / Mark as merged lifecycle language with explicit Close conversation semantics, keeping legacy mentions only as deprecated compatibility inputs.
+- Removed ordinary creation requirements for Managed / Work / Branch lifecycle modes and branch selection; Git-backed creation now provisions one detached default-branch disposable worktree with no mode picker.
+- Reframed write vs read-only distinctions as capability / authority rules rather than product lifecycle modes, while preserving the single-writer sub-agent rule.
+- Replaced auto-archive requirements with explicit Close / History language.
+- Reframed existing-branch work as repository activity inside the disposable worktree rather than as Branch mode conversation creation.
+- Preserved chain transcript Q&A value by restating it as unified-conversation transcript Q&A on the normal conversation surface.
+- Removed task-branch ownership side effects from task approval and Close semantics; branches and PRs are now repository facts Phoenix observes rather than lifecycle-owned artifacts Phoenix mutates.
+
+**Validation**
+- Semantic grep after corrections:
+  - `rg -n '(Work mode|Branch mode|task branch|auto-archive|archiv(e|ed)|Abandon action|Mark as merged|mark-merged|Clean up|chain page|chain route|Explore mode|Managed mode)' specs/projects/requirements.md specs/work-lifecycle/requirements.md specs/api/requirements.md specs/agent-identity/requirements.md specs/conversation-retrieval/requirements.md`
+  - Result after correction: only intentional legacy/deprecation matches remained:
+    - `specs/api/requirements.md:142` — negative requirement forbidding legacy lifecycle writes
+    - `specs/work-lifecycle/requirements.md:23` — deprecated compatibility note for legacy verbs
+    - `specs/projects/requirements.md:423` — negative requirement forbidding automatic archive/auto-close
+- AUTHORING timelessness spot-check:
+  - `rg -n 'task [0-9]{3,}|tasks/[0-9]|PR #|see #[0-9]|RESOLVED [0-9]|Open Question|Q[0-9]\. |Progress:|Status Summary|✅|currently|for now|at the moment|recently|previously|landed|MVP|rollout|stopgap' specs/projects/requirements.md specs/work-lifecycle/requirements.md specs/api/requirements.md specs/agent-identity/requirements.md specs/conversation-retrieval/requirements.md`
+  - Residual matches were unrelated pre-existing uses of `currently` in untouched API/spec text outside this task's semantic target.
+- Required checks:
+  - `./dev.py check --lanes spec-shape`
+  - `./dev.py tasks validate`
+
+**Review corrections**
+- Independent review found that the first pass still left normative chain-page / Abandon / Mark merged / Archive / Work mode / Branch mode / task-branch / auto-archive requirements across the touched requirement cluster.
+- This correction pass removed or deprecated those requirements in place, added explicit negative requirements where needed, and extended the edits to `specs/api/requirements.md` and `specs/agent-identity/requirements.md` so the grep-backed surface is consistent.
+
+**Commit**
+- Pending

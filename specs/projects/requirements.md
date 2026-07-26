@@ -1,10 +1,8 @@
-# Projects: Git-Backed Workspaces with Isolated Task Execution
+# Projects: Git-Backed Workspaces with Disposable Worktrees and Guided Task Handoffs
 
 ## User Story
 
-As a developer using PhoenixIDE, I need a structured way to explore codebases safely
-and execute changes in isolated branches so that I can think through approaches without
-risk and commit to changes with clear human oversight.
+As a developer using PhoenixIDE, I need Git-backed conversations to start in a predictable disposable workspace, preserve clear task handoffs, and let Phoenix coordinate write authority safely without making lifecycle or repository ownership depend on mode-specific branch ceremony.
 
 ## Transparency Contract
 
@@ -13,12 +11,12 @@ The user must be able to confidently answer these questions:
 **At a glance:**
 1. Which projects do I have active?
 2. For each project: how many conversations are open? Any active tasks?
-3. Is a conversation read-only (Explore) or writing (Work)?
+3. Is a conversation currently read-only planning, actively writing, or closed to History?
 
 **For any conversation:**
 4. What project does this belong to?
-5. What mode is it in and what tools are available?
-6. If Work mode: what task is it working on? Where is the worktree?
+5. What capabilities are currently available?
+6. If it owns a disposable worktree: what task is it pursuing, and where is that worktree?
 
 **For project health:**
 7. Are there any orphaned worktrees?
@@ -45,22 +43,19 @@ conversation mode and write permissions.
 
 ### REQ-PROJ-001: Open a Git Repository as a Project
 
-WHEN user creates a new conversation by providing a directory path
+WHEN the user creates a new conversation by providing a directory path
 THE SYSTEM SHALL detect whether the directory is inside a git repository
-AND if it is, treat the repository root as the project's canonical path
+AND, if it is, treat the repository root as the project's canonical path
 AND associate the conversation with that project
-AND initialize the conversation in Explore mode
+AND create the conversation as an Open Git-backed conversation without asking the user to choose Explore, Work, Managed, or Branch lifecycle modes
+AND provision one Phoenix-owned disposable worktree for that conversation using the repository's canonical default-branch starting point
+AND start that worktree at detached `HEAD`
 
 WHEN the directory is NOT inside a git repository
 THE SYSTEM SHALL create the conversation in Direct mode (REQ-PROJ-018)
 AND NOT associate it with any project
 
-**Rationale:** Users think in terms of projects (codebases, repositories), not raw
-directories. Git is the structural foundation of the isolation model — without it the
-system cannot create worktrees or maintain task history in a versioned, shareable form.
-However, Phoenix must remain useful for non-git directories (ad-hoc scripts, /tmp,
-miscellaneous files). Direct mode provides full tool access without git-backed
-safety features, letting users choose their level of structure.
+**Rationale:** Users think in terms of projects (codebases, repositories), not raw directories. In the current product model, a Git-backed conversation always starts from one disposable Phoenix-owned workspace rather than making the user choose among branch/lifecycle variants up front.
 
 ---
 
@@ -74,152 +69,84 @@ AND allow the user to select a suggested project's canonical path as the convers
 
 ---
 
-### REQ-PROJ-002: Default Conversation Mode Selection
+### REQ-PROJ-002: Git-Backed Creation Has No Mode or Branch Picker
 
-WHEN a conversation is created for any directory
-THE SYSTEM SHALL initialize the conversation in Direct mode by default
+WHEN the user creates a new conversation for a Git repository
+THE SYSTEM SHALL NOT ask the user to choose Managed, Work, Branch, Explore, or equivalent lifecycle modes
+AND SHALL NOT ask the user to choose a starting branch for ordinary conversation creation
+AND SHALL start from the repository's canonical default-branch commit in the detached disposable worktree defined by REQ-PROJ-001
+
+WHEN a conversation is created for a non-Git directory
+THE SYSTEM SHALL initialize it in Direct mode by default
 AND provide full tool access (bash, patch, all tools)
 
-WHEN a conversation is created for a git repository AND the user selects "Managed" mode
-THE SYSTEM SHALL initialize the conversation in Explore mode
-AND configure all tools in read-only mode
-AND (on the user's first message) create a worktree on a temp branch off the chosen base
-  branch and run the conversation in that worktree (REQ-PROJ-028)
-
-WHILE a conversation is in Explore mode (Managed workflow)
-THE SYSTEM SHALL prevent file writes to the project via any tool
-  (except drafting a task file under a taskmd-discovered task proposal directory — REQ-PROJ-003)
-AND SHALL allow broad local file reading and directory listing
-AND SHALL expose `bash` only when an OS sandbox is available to enforce read-only
-  command execution (REQ-BASH-012/013)
-
-WHEN the user selects "Managed" mode for a non-git directory
-THE SYSTEM SHALL reject the request (Managed mode requires a git repository)
-
-**Rationale:** Direct mode is the natural, zero-friction starting point for most work.
-The Managed (Explore/Work) lifecycle adds value for non-trivial changes that benefit
-from plan review and worktree isolation, but should be opt-in rather than mandatory.
-Explore is read-only and network-blocked; it is not a confidentiality boundary, so
-its read tools and sandboxed bash permit broad local reads while withholding write
-and network authority until Work mode.
+**Rationale:** The unified lifecycle removes branch- and mode-selection ceremony from ordinary conversation creation. Git-backed conversations begin in the same Phoenix-owned disposable workspace model; chat-only conversations remain Direct because there is no repository-backed worktree to provision.
 
 ---
 
-### REQ-PROJ-003: Propose a Task to Initiate Work Mode
+### REQ-PROJ-003: Propose a Task for Blocking Review
 
-WHILE a conversation is in Explore mode
-THE SYSTEM SHALL allow the agent to draft a markdown task file using the `patch`
-tool (whose Explore-mode allowlist is scoped to the project's discovered tasks directory).
-The recommended form is the taskmd 1.0 convention (`NNNNN-pX-status--slug.md`, status
-one of `ready` / `in-progress` / `brainstorming`) — taskmd-named files additionally
-yield id/priority/status/slug and a `ready` → `in-progress` rename on approval
-(REQ-PROJ-006) and **must live under the project's tasks directory**. Any other `.md`
-file is also accepted as a plain task brief — no structured metadata, no
-status rename — and may live anywhere in the worktree
+WHILE a Git-backed conversation is in a planning/read-only phase
+THE SYSTEM SHALL allow the agent to draft a markdown task file using the `patch` tool, scoped to the discovered tasks directory when task drafting rules require it
 
-WHEN agent calls the `propose_task` tool with a `task_file` path to a markdown file
-inside the worktree
+WHEN the agent calls the `propose_task` tool with a `task_file` path to a markdown file inside the conversation's allowed workspace
 THE SYSTEM SHALL intercept it at the LlmResponse handler (like submit_result)
 AND require it to be the only tool call in the response
-AND NOT execute any side effects (no git operations)
+AND NOT execute any immediate Git side effects
 AND read the file and persist the assistant message and a synthetic tool result atomically
 AND transition the conversation to AwaitingTaskApproval state
-AND pause agent execution until the user responds
+AND pause ordinary agent execution until the user responds
 
-WHEN the task file's name parses as a taskmd filename but the path is **not** under the
-project's discovered tasks directory
-THE SYSTEM SHALL reject the call (taskmd-named files must live under the tasks dir; a
-brief that wants to live elsewhere must not use the taskmd naming)
+WHEN the task file's name parses as a taskmd filename but the path is **not** under the project's discovered tasks directory
+THE SYSTEM SHALL reject the call
 
-WHEN the task file's name parses as taskmd but its status is not `ready` /
-`in-progress` / `brainstorming` (e.g. `done`)
-THE SYSTEM SHALL reject the call (a closed task cannot be proposed for approval).
-For a non-taskmd-named `.md` file there is no status segment, so this check does not apply.
+WHEN the task file's name parses as taskmd but its status is not `ready` / `in-progress` / `brainstorming`
+THE SYSTEM SHALL reject the call
 
-THE AwaitingTaskApproval state SHALL carry the `task_file` path plus a display copy of
-the title, priority (taken from a taskmd filename; `p2` for a plain-markdown file), and
-body (so the prose reader and SSE state payload need not re-read the file); on approval
-the executor SHALL re-read the file from disk as the source of truth
+THE AwaitingTaskApproval state SHALL carry the `task_file` path plus a display copy of the title, priority, and body; on approval the executor SHALL re-read the file from disk as the source of truth
 
-WHEN `propose_task` is called in a writing mode (Work, Branch, or Direct whose working
-directory is inside a git repository)
-THE SYSTEM SHALL treat it as a non-blocking fork proposal (REQ-PROJ-033/036), NOT the
-Explore gateway — this requirement governs only the Explore-mode parking behavior
-
-WHEN `propose_task` is called in Direct mode whose working directory is not inside a git
-repository
-THE SYSTEM SHALL NOT provide the tool at all (REQ-PROJ-036)
+WHEN `propose_task` is called in a non-Git Direct conversation
+THE SYSTEM SHALL NOT provide the tool at all
 
 WHEN `propose_task` is called by a sub-agent
-THE SYSTEM SHALL reject the call (task management is the parent conversation's job)
+THE SYSTEM SHALL reject the call because task-management authority belongs to the parent conversation
 
-**Rationale:** The task file is a real file the agent edits with `patch`, so revisions
-are file edits rather than full plans round-tripped through tool arguments. taskmd is
-the *default* (the filename carries id/priority/status/slug; Phoenix allocates no ID and
-reads no frontmatter), but it is not a hard dependency: a project that hasn't adopted
-taskmd can point `propose_task` at any markdown file and the Explore → Work cycle still
-works (see `crate::task_source::TaskSource` for the seam). `propose_task` itself is a
-pure data carrier (its `run()` is an unreachable fallback): no git work happens until
-the user approves.
+**Rationale:** The task file is a real file the agent edits with `patch`, so revisions are normal file edits rather than plan text hidden in tool arguments. Blocking review preserves user approval without making task approval synonymous with lifecycle mode changes.
 
 ---
 
-### REQ-PROJ-004: Review and Iterate on Task Plan Before Starting Work
+### REQ-PROJ-004: Review and Place an Approved Task
 
-WHEN conversation enters AwaitingTaskApproval state
+WHEN a conversation enters AwaitingTaskApproval state
 THE SYSTEM SHALL open the prose reader with the plan content from the state
-AND present Approve and Discard actions alongside the standard annotation feedback
+AND present **Continue here**, **Start in new conversation**, and **Request changes / discard** actions alongside the standard annotation feedback
 
-WHEN user sends annotation feedback
+WHEN the user sends annotation feedback
 THE SYSTEM SHALL close the prose reader
 AND deliver the annotations to the agent as a user message
-AND transition the conversation to Explore mode (Idle)
+AND return the conversation to its prior Open planning state
 AND the agent MAY revise the plan and call `propose_task` again
-  (which re-enters AwaitingTaskApproval and reopens the prose reader)
 
-WHEN the user approves the task AND the file's name parses as a taskmd filename
-THE SYSTEM SHALL parse the task ID, priority, status, and slug from the on-disk task
-  file's name (it allocates no ID; see REQ-PROJ-006)
-AND choose `task-{ID}-{slug}` as the desired execution branch (REQ-PROJ-028)
-AND if that branch name already exists locally or at `origin`, choose a suffixed execution
-  branch name and leave the existing ref untouched
-AND rename the worktree's temp branch in place to the chosen execution branch
-AND rename the task file to `...-in-progress--{slug}.md` if it isn't already
-AND commit the task file on that execution branch in the existing worktree
-AND, for Continue here, keep the same Open conversation and treat approval as a checkpoint with no additional lifecycle, environment, repository, or provenance side effect beyond the approved task commit
-AND, for Start in new conversation, create a separate Open conversation derived from the source conversation, with a fresh `WorkScope`, fresh worktree, and only the exact approved task as its starting context
-AND resume agent execution on the chosen branch in whichever Open conversation the approved handoff policy selects
+WHEN the user approves the task and chooses **Continue here**
+THE SYSTEM SHALL commit the approved task artifact according to REQ-PROJ-006
+AND keep the same Open conversation and the same `WorkScope`
+AND resume execution in that conversation
+AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
 
+WHEN the user approves the task and chooses **Start in new conversation**
+THE SYSTEM SHALL create a separate Open conversation derived from the source conversation
+AND provision a fresh detached-default-branch disposable worktree for the spawned conversation
+AND seed only the exact approved task as the spawned conversation's starting context
+AND preserve the approved task artifact independently of the source worktree's eventual closure
+AND resume execution in the spawned conversation
+AND leave the source conversation Open
+AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
 
-WHEN user approves the task AND the file is a plain-markdown brief (not a taskmd filename)
-THE SYSTEM SHALL choose `task-{sanitized-file-stem}-{conversation-id-prefix}` as the desired
-  execution branch (the conversation-id prefix prevents two conversations proposing files
-  with the same stem from sharing a default branch name)
-AND if that branch name already exists locally or at `origin`, choose a suffixed execution
-  branch name and leave the existing ref untouched
-AND rename the worktree's temp branch in place to the chosen execution branch
-AND NOT rename the file (a plain brief has no status segment) and NOT call `format_filename`
-AND commit the file at its own path on the execution branch
-AND, for Continue here, transition the same Open conversation to Work mode
-AND, for Start in new conversation, create a separate Open conversation derived from the source conversation, with a fresh `WorkScope`, fresh worktree, and only the exact approved task as its starting context
-AND record the `task_id` as the sanitized stem, kept non-empty for the conversation record; because there is no `task_title` parse, the display title — the body's `# H1`, falling back to the stem — is used
+WHEN the user rejects or discards the task
+THE SYSTEM SHALL return a rejection result to the agent
+AND SHALL NOT perform any Git side effects
 
-WHEN user discards the task
-THE SYSTEM SHALL return the conversation to Explore mode
-AND return a rejection result to the agent
-AND NOT perform any git operations (the task file stays on disk where the agent
-left it under the tasks directory — nothing to commit, nothing to clean up)
-
-**Rationale:** The Explore -> Work transition is a permission upgrade within an
-existing worktree (REQ-PROJ-028). The task file already exists on disk (the agent
-wrote it with `patch` in Explore mode); approval renames the temp branch, promotes the
-file's status to `in-progress` if needed, and commits it on the execution branch (never
-main -- work-lifecycle REQ-WL-002). A deterministic desired branch can already be occupied
-by another local or remote ref, so approval uses a suffixed execution branch rather than
-moving or overwriting the existing ref. Discarding is cheap: the worktree and temp branch already
-exist, and an uncommitted task file on the temp branch is harmless. The prose reader
-renders the file's body — surfaced via the display copy in the state, re-read from disk
-on approval.
+**Rationale:** Approval is a user decision about placement and authority, not a hidden transition into branch-backed lifecycle modes. The current product offers two deliberate placements — continue in the same conversation or start fresh in a new one — while keeping branch ownership out of the approval contract.
 
 ---
 
@@ -265,99 +192,60 @@ only loses an optimization, never correctness.
 
 ### REQ-PROJ-006: Task Files as Versioned Living Contracts
 
-WHEN the agent drafts a task file in Explore mode (REQ-PROJ-003)
-THE SYSTEM SHALL place it in the project's discovered tasks directory: Phoenix scans
-  immediate children of the repo root for taskmd sentinel files and prefers `tasks/`,
-  otherwise the lexically-first discovered taskmd directory, otherwise literal `tasks/`
-AND the filename SHALL follow the taskmd 1.0 convention `{ID}-{priority}-{status}--{slug}.md`
-  where `ID` is a 5-digit `DDNNN` value (per-directory prefix + monotonic counter) and the
-  agent picks the whole filename — the **filename is the sole authoritative source of the
-  task's metadata** (id, priority, status, slug); Phoenix neither writes nor reads any
-  body frontmatter
-AND the body SHALL be free-form markdown (conventionally an `# H1` title, a `## Plan`
-  section, and a `## Progress` section the agent updates as work proceeds)
+WHEN the agent drafts a task file for `propose_task`
+THE SYSTEM SHALL place taskmd-named drafts in the project's discovered tasks directory: Phoenix scans immediate children of the repo root for taskmd sentinel files and prefers `tasks/`, otherwise the lexically-first discovered taskmd directory, otherwise literal `tasks/`
+AND the filename SHALL follow the taskmd 1.0 convention `{ID}-{priority}-{status}--{slug}.md` when the project uses taskmd naming
+AND the **filename** SHALL remain the sole authoritative source of taskmd metadata
+AND the body SHALL be free-form markdown
 
-Note on frontmatter: taskmd's validator only checks the filename pattern, so a task file
-whose body happens to carry a YAML `created/priority/status/...` block is not *rejected* —
-but that block is decorative, never consulted, and may diverge from the filename, so it is
-not written. The filename always wins.
-
-WHEN the user approves the task (REQ-PROJ-004)
+WHEN the user approves a taskmd task
 THE SYSTEM SHALL parse the task ID, priority, status, and slug from the filename
-  (`taskmd_core::filename::parse_filename`) — it allocates no ID
 AND rename the file to `...-in-progress--{slug}.md` if its status is not already `in-progress`
-AND commit the file on the task branch (never on main or the base branch)
+AND persist the approved content so the chosen conversation placement can continue to use the exact approved task
 
-WHEN the agent updates the task file during Work mode (via the patch tool)
-THE SYSTEM SHALL allow edits to it on the task branch like any other file; those commits
-  reach main only when the PR is merged through the user's normal workflow
-AND the agent SHALL rename the file to `...-done--{slug}.md` (or `...-wont-do--{slug}.md`)
-  itself when the work closes — Phoenix does not rename it
+WHEN the agent later updates the task file during active work
+THE SYSTEM SHALL allow edits to it like any other workspace file
+AND the agent MAY rename it to `...-done--{slug}.md` or `...-wont-do--{slug}.md` when the work is complete
 
-Branch mode conversations (REQ-PROJ-024) do not have task files.
+WHEN the task file is not taskmd-named
+THE SYSTEM SHALL treat it as a plain task brief: the display title is the body's first `# H1` (falling back to a title-cased file stem), the display priority defaults to `p2`, and there is no structured id/status/slug contract
 
-WHEN the task file the agent points `propose_task` at is **not** a taskmd-named file
-(any other `.md` file inside the worktree — e.g. `docs/plan.md`, or even `README.md`)
-THE SYSTEM SHALL treat it as a plain task brief: the display title is the body's first
-  `# H1` (falling back to a title-cased file stem), the display priority defaults to `p2`,
-  there is no structured id/status/slug, no on-approve status rename, and the task branch
-  is named `task-{sanitized-stem}-{conversation-id-prefix}`
-AND the file is committed at its own path on the task branch (a plain `.md` file may live
-  anywhere in the worktree — only a *new* file drafted via `patch` is forced under the
-  tasks directory by the Explore-mode `patch` scope; the Explore prompt steers the agent
-  toward taskmd naming so a project that uses `taskmd validate` stays clean)
-
-**Rationale:** Task files live on the task branch alongside the code changes, keeping
-the branch self-contained — no commits to main (which may be protected), no two-path
-commit logic. taskmd 1.0's filename-is-truth model means there's nothing for Phoenix to
-keep in sync — no authoritative frontmatter, no ID allocation step on the Phoenix side;
-the agent owns the filename (including the `done` rename) the same way it owns the code.
-taskmd is the default but not a hard dependency: pointing `propose_task` at a plain
-`.md` file works too — the `TaskSource` seam (`crate::task_source`) picks taskmd when
-the filename parses, plain-markdown otherwise. A future explicit "task source" backend
-would slot in behind the same seam; that is outside this spec's current behavior.
+**Rationale:** The task artifact is the durable handoff, regardless of whether the user continues in the same conversation or starts a new one. taskmd metadata remains filename-based, but task approval no longer depends on creating or owning a dedicated Phoenix branch lifecycle.
 
 ---
 
-### REQ-PROJ-007: Work Mode Enables Writes Within the Worktree
+### REQ-PROJ-007: Git-Backed Write Authority Is Scoped to the Conversation Worktree
 
-WHILE a conversation is in Work mode
+WHILE a Git-backed conversation has write authority
 THE SYSTEM SHALL configure tools to operate within the conversation's worktree directory
-AND enable file write tools within the worktree
-AND allow bash commands that read and write files within the worktree
+AND enable file-write tools within that worktree
+AND allow bash commands that read and write files within that worktree
 
-WHEN a Work-mode tool attempts to write outside the worktree directory
+WHEN a tool with write authority attempts to write outside the worktree directory
 THE SYSTEM SHALL block the write
 AND return a descriptive error
 
-**Rationale:** Work mode's write access is scoped to the worktree, not the whole
-filesystem. This preserves the isolation guarantee: a Work conversation cannot modify
-main directly, and cannot modify another conversation's worktree.
+**Rationale:** Write authority is scoped to the disposable worktree, not to the whole filesystem and not to a lifecycle mode name. This preserves isolation without requiring a separate writing lifecycle label as a product concept.
 
 ---
 
-### REQ-PROJ-008: Work Sub-Agents Inherit the Worktree
+### REQ-PROJ-008: Sub-Agent Capabilities Inherit the Parent Workspace Authority
 
-WHEN a Work conversation spawns a sub-agent with Work mode requested
+WHEN a Git-backed parent conversation spawns a sub-agent with write authority requested
 THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
-AND configure the sub-agent in Work mode with write access to that worktree
-AND allow only one Work sub-agent per parent conversation at a time
+AND grant write access to that same worktree
+AND allow only one write-authority sub-agent per parent conversation at a time
 AND place the parent conversation in AwaitingSubAgentResult state for the duration
 
-WHEN a Work conversation spawns a sub-agent with Explore mode
+WHEN a Git-backed parent conversation spawns a sub-agent with read-only authority requested
 THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
-AND configure the sub-agent in Explore mode (read-only, no writes)
-AND allow multiple Explore sub-agents in parallel
+AND grant read-only authority there
+AND allow multiple read-only sub-agents in parallel
 
-WHEN an Explore conversation spawns sub-agents
-THE SYSTEM SHALL configure all sub-agents in Explore mode
-AND configure their working directory as the main branch checkout
+WHEN a planning/read-only conversation spawns sub-agents
+THE SYSTEM SHALL configure those sub-agents with read-only authority
 
-**Rationale:** Work sub-agents do implementation work inside the same isolated context
-as the parent — they must operate in the worktree, not on stale main. Explore
-sub-agents do read-only analysis of whatever directory they're given; from a Work
-conversation they analyze the current worktree state, which is what matters. The
-one-Work-sub-agent constraint maintains a single writer per worktree at all times.
+**Rationale:** The important distinction is execution authority, not lifecycle naming. Phoenix must preserve the single-writer guarantee for one worktree while still allowing parallel read-only analysis.
 
 ---
 
@@ -372,93 +260,54 @@ the no-squash-merge constraint lives in work-lifecycle REQ-WL-002.
 
 ### Work lifecycle and PR association (specified in dedicated specs)
 
-The terminal-action lifecycle of a Work or Branch conversation — abandon, mark-merged, and the
-PR-merge cleanup gate — is specified by the **work-lifecycle** spec (REQ-WL-001 through
-REQ-WL-003). PR association, status, and feedback freshness are specified by the
-**pr-association** spec (REQ-PRA-001 through REQ-PRA-004). Those specs hold the current
-normative requirements; this spec covers project setup, mode selection, worktrees, task
-authoring, and branch sourcing.
+The explicit **Close conversation** lifecycle and its PR-aware guidance are specified by the **work-lifecycle** spec (REQ-WL-001 through REQ-WL-003). PR association, status, and feedback freshness are specified by the **pr-association** spec (REQ-PRA-001 through REQ-PRA-004). This spec covers project setup, disposable worktrees, task authoring, and branch/repository provenance.
 
 ---
 
-### REQ-PROJ-012: Provide propose_task Tool to Agents
+### REQ-PROJ-012: Provide propose_task Tool to Parent Conversations
 
-WHEN agent is in Explore mode
-THE SYSTEM SHALL provide the `propose_task` tool (the Explore→Work gateway)
-WHICH accepts: `task_file` (required string) — a path, relative to the agent's working
-  directory, to an existing markdown (`.md`) file inside the worktree. A taskmd 1.0
-  filename (`NNNNN-pX-status--slug.md`, status one of `ready` / `in-progress` /
-  `brainstorming`, **required to be under the project's tasks directory**) additionally
-  derives id/priority/status/slug from the name; any other `.md` file is accepted as a
-  plain task brief (REQ-PROJ-006) and may live anywhere in the worktree
+WHEN a parent conversation is allowed to request task review or derived follow-up work
+THE SYSTEM SHALL provide the `propose_task` tool
+WHICH accepts `task_file` (required string): a path, relative to the agent's working directory, to an existing markdown (`.md`) file inside the allowed workspace
 
-WHEN agent is in a writing mode (Work, Branch, or Direct-in-a-git-repo)
-THE SYSTEM SHALL **also** provide `propose_task` (same `task_file` input), there serving
-as the non-blocking fork proposal of REQ-PROJ-033/036
+WHEN `propose_task` is called from a planning/read-only phase
+THE SYSTEM SHALL treat it as the blocking review path defined by REQ-PROJ-003 and REQ-PROJ-004
 
-WHEN `propose_task` is called in a writing mode (Work, Branch, or Direct-in-a-git-repo)
-THE SYSTEM SHALL treat it as a fork proposal (REQ-PROJ-033/036) rather than the Explore
-gateway described by this requirement
-AND in Direct mode whose working directory is not a git repository the tool is not
-provided at all (REQ-PROJ-036)
+WHEN `propose_task` is called from a Git-backed conversation that already has write authority
+THE SYSTEM SHALL treat it as a proposal to start a separate derived conversation rather than as an in-place lifecycle transition
 
-WHEN `propose_task` is called by a sub-agent (in any mode)
+WHEN `propose_task` is called in a Direct conversation whose working directory is not in a Git repository
+THE SYSTEM SHALL NOT provide the tool
+
+WHEN `propose_task` is called by a sub-agent
 THE SYSTEM SHALL reject the call
-AND explain that task management is the parent conversation's responsibility
+AND explain that task-management authority belongs to the parent conversation
 
 WHEN `propose_task` is not the only tool call in the response
 THE SYSTEM SHALL reject it
 
-`propose_task` is a pure data carrier — its `run()` is an unreachable fallback. It is
-intercepted at the LlmResponse handler (like submit_result for sub-agents) and never
-enters the tool executor. **In Explore mode** the file path and a display copy of its
-contents flow into the `AwaitingTaskApproval` state (the conversation parks). **In the
-writing modes** the interception is non-parking: it records a fork proposal and the
-conversation continues, never entering `AwaitingTaskApproval` (REQ-PROJ-033). The agent
-drafts the referenced file with the patch tool beforehand (or points at an existing task
-file).
+`propose_task` is a pure data carrier intercepted at the LlmResponse handler. It never performs Git side effects directly.
 
-During Work mode, the agent updates the task file directly using the patch tool like
-any other file. No dedicated `update_task` tool is needed.
-
-**Rationale:** `propose_task` is the agent's way of saying "here's a task file, please
-review it." The name signals human review is required. Referencing a file (rather than
-passing the plan inline) means revisions are ordinary file edits and the task's metadata
-lives where taskmd 1.0 keeps it — in the filename. The interception follows the
-established submit_result pattern, so no git work happens until approval.
+**Rationale:** `propose_task` is the agent's way of saying “here's a task artifact for human review.” The key distinction is whether the parent is asking for blocking approval in place or proposing a separate derived conversation — not whether the product is in one named lifecycle mode or another.
 
 ---
 
 ### REQ-PROJ-013: Platform Capability Detection
 
 WHEN the server starts
-THE SYSTEM SHALL ask `nono::Sandbox::support_info()` whether the host has an
-enforceable OS sandbox backend capable of applying the Explore bash network-block
-and unrelated-process signal-isolation policy
+THE SYSTEM SHALL ask `nono::Sandbox::support_info()` whether the host has an enforceable OS sandbox backend capable of applying the read-only planning bash network-block and unrelated-process signal-isolation policy
 
 THE SYSTEM SHALL re-check capabilities on every startup
 
 WHILE sandbox is not available
-THE SYSTEM SHALL provide top-level Explore mode with read-only/planning tools,
-browser tools, scoped task-proposal `patch`, `propose_task`, and parent
-coordination tools including `spawn_agents`
-AND SHALL NOT provide `bash`, `tmux`, `tmux_run`,
-or any tool that can execute arbitrary unsandboxed commands
+THE SYSTEM SHALL provide top-level planning/read-only conversations with read-only/planning tools, browser tools, scoped task-proposal `patch`, `propose_task`, and parent coordination tools including `spawn_agents`
+AND SHALL NOT provide `bash`, `tmux`, `tmux_run`, or any tool that can execute arbitrary unsandboxed commands
 
 WHILE sandbox is available
-THE SYSTEM SHALL provide top-level Explore mode with read-only/planning tools,
-scoped task-proposal `patch`, `propose_task`, browser tools, parent coordination
-tools including `spawn_agents`, and sandboxed `bash`
+THE SYSTEM SHALL provide top-level planning/read-only conversations with read-only/planning tools, scoped task-proposal `patch`, `propose_task`, browser tools, parent coordination tools including `spawn_agents`, and sandboxed `bash`
 AND SHALL NOT provide `tmux` or `tmux_run`
 
-**Rationale:** Capabilities are a property of the running environment, not the
-application. Sandbox capability gates bash, not delegation: `spawn_agents` is a
-read-only coordination tool in Explore, and spawned Explore sub-agents fall back
-to read/browser/submit tools without bash when sandboxing is unavailable. On
-systems with OS-level sandboxing, bash is useful in Explore mode
-for local investigation while preserving the read-only promise. On systems
-without sandboxing, withholding bash prevents writes and host-process signaling
-structurally. Re-checking on startup ensures the tool set matches the current host.
+**Rationale:** Capabilities are a property of the running environment, not the application. Sandbox capability gates bash, not delegation. Planning/read-only conversations and their sub-agents can still investigate locally without write authority when the host can enforce network blocking and unrelated-process signal isolation; otherwise withholding bash preserves that promise structurally. Re-checking on startup keeps the tool set aligned with the current host.
 
 ---
 
@@ -468,242 +317,119 @@ WHEN displaying the conversation sidebar
 THE SYSTEM SHALL show a project switcher (tabs) at the top of the sidebar
 AND group conversations under their project
 
-WHEN a project has active Work conversations
+WHEN a project has active Git-backed conversations pursuing tasks
 THE SYSTEM SHALL indicate the active task count next to the project name
 
 WHEN the user selects a project tab
 THE SYSTEM SHALL show only that project's conversations
 
 WHEN displaying a conversation
-THE SYSTEM SHALL indicate whether it is in Explore or Work mode
+THE SYSTEM SHALL indicate its current capabilities and whether it is Open or in History
 
-**Rationale:** Users manage multiple projects. A project switcher reduces cognitive
-load compared to a flat list mixing conversations from different codebases. Mode
-visibility prevents confusion about what a conversation can do.
+**Rationale:** Users manage multiple projects. A project switcher reduces cognitive load compared to a flat list mixing conversations from different codebases. Capability and lifecycle visibility prevent confusion without reintroducing obsolete mode labels.
 
 ---
 
 ### REQ-PROJ-015: Project Worktree Registry
 
-**Partially DESCOPED:** The dedicated worktree registry *table* is not implemented — `ConvMode::Work` on each conversation serves as the de facto registry, and querying all Work conversations for a project yields the active worktree list. The first three clauses below (register/deregister/reconcile on disk) are therefore conceptual descriptions of that de facto registry's behavior, not a separate table's behavior. The fourth clause (context-exhausted / continued-conversation exclusion) is **normative and active** — it constrains how the conceptual-registry reconciliation treats those conversations, regardless of the registry's storage shape.
-
-WHEN a worktree is created for a task
-THE SYSTEM SHALL register it in the project record with task ID, worktree path,
-branch name, conversation ID, and timestamp
-
-WHEN a worktree is deleted (merge or abandon)
-THE SYSTEM SHALL remove it from the registry
+WHEN a Phoenix-owned disposable worktree exists for a conversation
+THE SYSTEM SHALL register enough data to report its owning conversation, worktree path, and `WorkScope`
 
 WHEN the server starts
 THE SYSTEM SHALL reconcile the registry against worktrees on disk
 AND clean up orphaned registry entries
 AND report worktrees that exist on disk but have no registry entry
 
-WHEN a conversation is in context-exhausted state (REQ-BED-021)
-AND it has not transferred ownership through `continued_in_conv_id` (REQ-BED-030)
+WHEN a conversation is in context-exhausted state and has not transferred ownership through `continued_in_conv_id`
 THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
-AND SHALL NOT demote the conversation's mode
-  (the worktree is preserved pending explicit user action per REQ-BED-031)
 
 WHEN a transcript row has transferred execution through `continued_in_conv_id`
-THE SYSTEM SHALL treat that row as a history reference rather than a live worktree owner
-AND SHALL derive the latest execution row from the continuation topology rather than storing a second latest-owner authority
-AND SHALL preserve the worktree only while a non-archived live conversation remains the owner of the same `WorkScope`
+THE SYSTEM SHALL treat that row as a historical transcript segment rather than a live worktree owner
+AND SHALL derive the latest execution row from continuation topology rather than storing a second latest-owner authority
+AND SHALL preserve the worktree only while a non-History live conversation remains the owner of the same `WorkScope`
 
-WHEN a conversation undergoes a terminal-transition cascade (hard-delete,
-archive, abandon, mark-merged — REQ-BED-032 step 4)
-AND a live conversation OTHER THAN the one being deleted remains the owner of the same
-`WorkScope` — a continuation that inherits it, or a Work-mode sub-agent that
-shares its parent's `worktree_path` (REQ-PROJ-008)
-THE SYSTEM SHALL NOT remove the worktree from disk
-AND SHALL NOT delete the task branch
-  (the surviving live owner keeps its still-in-use checkout)
+WHEN teardown or startup reconciliation evaluates a Phoenix-owned worktree
+AND another live conversation still resolves to the same `WorkScope`
+THE SYSTEM SHALL preserve the worktree
 
-WHEN a conversation undergoes a terminal-transition cascade
-AND no live conversation other than the one being deleted resolves to its
-`WorkScope`
-THE SYSTEM SHALL remove the worktree and delete the task branch (Work mode) as
-the sole owner's normal cleanup
+WHEN teardown or startup reconciliation evaluates a Phoenix-owned worktree
+AND no other live conversation resolves to its `WorkScope`
+THE SYSTEM SHALL remove the worktree when safe to do so
+AND SHALL NOT create, delete, or rewrite a branch as part of that reclamation
 
-WHEN the server starts
-AND a Phoenix-owned worktree exists on disk
-AND no non-archived live conversation remains the owner of its `WorkScope`
-AND the worktree has no tracked or untracked changes
-THE SYSTEM SHALL remove the worktree
-AND SHALL apply its mode's branch disposition
-
-WHEN the server starts
-AND a Phoenix-owned worktree exists on disk
-AND no non-archived live conversation remains the owner of its `WorkScope`
-AND the worktree has tracked or untracked changes OR its status cannot be determined
+WHEN startup reconciliation finds tracked or untracked changes or cannot determine worktree safety
 THE SYSTEM SHALL retain the worktree for manual recovery
 AND SHALL report why safe reclamation was skipped
 
-**Rationale:** The registry enables the UI to show all active worktrees and detect
-orphans. Reconciliation on startup handles worktrees deleted externally or
-conversations that ended without cleanup. Context-exhausted conversations and
-an uncontinued context-exhausted row is an explicit exception: its worktree is held
-intentionally and must survive restart unchanged. Continued context-exhausted and
-handed-off rows have permanently transferred ownership; their live successors are
-scored independently as the current owners of the same scope. The cascade's any-live-owner
-guard is the same signal that gates the bash/tmux/browser cascades
-(REQ-BASH-WS-002): a Work-mode sub-agent inherits the parent's `worktree_path`,
-so removing the worktree or deleting the branch while the parent is live would
-destroy the parent's checkout out from under a running conversation. A "live
-conversation" here is one that is non-terminal AND not `archived` according to
-the persisted conversation rows in the DATABASE — not merely one that holds a
-live runtime handle. A non-terminal parent that lost its runtime handle (after
-a server restart or runtime eviction) still owns the shared worktree; deciding
-preservation from runtime handles alone would `git worktree remove --force` the
-shared worktree and `branch -D` the task branch even though the surviving
-parent row still resolves to the same `WorkScope` — data loss.
+**Rationale:** Worktree ownership belongs to the live `WorkScope`, not to stale mode data or branch ownership. Preserving or reclaiming the disposable workspace must never imply that Phoenix also owns a branch lifecycle.
 
 ---
 
 ### REQ-PROJ-016: Standalone Conversation Mode (Superseded)
 
-**SUPERSEDED BY REQ-PROJ-018.** Standalone mode was a distinct mode for
-non-git directories providing the full tool suite without git-backed
-features. It was folded into `ConvMode::Direct` — which now serves both
-git-backed and non-git working directories with identical semantics. See
-REQ-PROJ-018 for the canonical historical note and the current behavior.
-Retaining this REQ ID for traceability; content below describes the
-original pre-supersession design.
-
-WHEN a conversation is created for a directory that is not inside a git repository
-THE SYSTEM SHALL initialize the conversation in Standalone mode
-AND provide the full tool suite (bash, patch, and all other tools)
-AND NOT associate it with any project
-
-WHILE a conversation is in Standalone mode
-THE SYSTEM SHALL NOT provide the `propose_task` tool
-AND SHALL NOT allow transition to Explore or Work modes
-
-WHEN displaying a Standalone conversation
-THE SYSTEM SHALL NOT show Explore/Work mode indicators
-AND SHALL indicate that it is a standalone conversation (no project association)
-
-WHEN a Standalone conversation is created
-THE SYSTEM SHALL inform the user that the directory is not a git repository
-AND that project features (tasks, worktrees, branch isolation) are not available
-AND that file writes have no git safety net
-
-**Rationale:** Phoenix must be useful beyond git repositories. A user editing a script
-in `/tmp` or exploring a downloaded archive should not be forced to `git init` first.
-Standalone mode provides the full tool suite at the cost of git-backed safety features:
-no worktree isolation, no task tracking, no branch-based undo. This is an explicit
-trade-off the user accepts by working in a non-git directory. Making Standalone a
-distinct mode (rather than overloading Explore or Work) allows the UI to communicate
-the capability difference clearly and prevents accidental mixing of project and
-non-project behaviors.
+**SUPERSEDED BY REQ-PROJ-018.** `Standalone` was the historical name for the chat-only non-Git conversation shape now represented by Direct mode. Retaining this REQ ID for traceability only; the old standalone/work/explore mode split is no longer normative.
 
 ---
 
-### REQ-PROJ-017: Base Branch Tracking in Work Mode
+### REQ-PROJ-017: Record Detached Default-Branch Provenance Without Mode Semantics
 
-WHEN a conversation transitions to Work or Branch mode
-THE SYSTEM SHALL record the base branch in the conversation's mode data
+WHEN Phoenix provisions a Git-backed disposable worktree
+THE SYSTEM SHALL record the canonical default branch used to resolve the starting commit
+AND SHALL record the worktree path and any approved task metadata needed for truthful UI and provenance
+AND SHALL NOT require conversation ownership semantics to include a selected branch name, a dedicated branch-type discriminator, or a Phoenix-owned branch-lifecycle field
 
-THE Work and Branch modes SHALL each carry:
-- `worktree_path` -- path to the conversation's worktree
-- `branch_name` -- the task branch (Work) or the existing branch (Branch)
-- `base_branch` -- the branch the worktree was created from (== `branch_name` for Branch)
+THE Direct mode SHALL carry no Git-backed worktree metadata
 
-THE Work mode SHALL additionally carry:
-- `task_id` -- always present, the structural discriminator vs Branch mode
-- `task_title` -- human-readable title, for UI
+WHEN a conversation later closes
+THE SYSTEM SHALL release the worktree according to the Close contract
+AND SHALL NOT infer any branch-ownership mutation from the recorded starting provenance
 
-THE Branch mode SHALL NOT carry `task_id` or `task_title`
-
-THE Explore mode SHALL carry only `worktree_path` (an `Option` — `Some` for a top-level
-Managed Explore conversation, which runs in its own worktree on a temp branch before
-approval; `None` for an Explore sub-agent, which shares the parent's working directory)
-
-THE Direct mode SHALL carry no git metadata
-
-WHEN the "Mark as merged" action runs (work-lifecycle REQ-WL-002)
-THE SYSTEM SHALL delete the worktree (and delete the branch for Managed mode)
-
-WHEN the Abandon action runs (work-lifecycle REQ-WL-001)
-THE SYSTEM SHALL delete the worktree (and delete the branch for Managed mode)
-
-**Rationale:** Not all projects use `main` as their integration branch. A user may be
-working on a shared feature branch. Recording the base branch at worktree creation
-time supports this workflow. Branch mode uses the branch itself as both the branch
-name and the base branch.
+**Rationale:** Users still need to know where a conversation started, but the new model records that as provenance rather than as an owned lifecycle mode with branch-selection semantics.
 
 ---
 
 ### REQ-PROJ-018: Direct Mode
 
-Direct mode is the default for all new conversations, Git-backed and chat-only alike.
+Direct mode is the chat-only / non-worktree conversation shape.
 
-**Historical note — Standalone → Direct migration.** An earlier design
-split non-git directory conversations into a separate `Standalone` mode
-(see superseded REQ-PROJ-016 and the rationale in REQ-BED-027). In
-practice the two modes had identical runtime semantics for a **non-git** directory
-(full tool suite, no `propose_task`, no worktree, no task file, no branch, no project
-association beyond `cwd`), so the split produced no behavioral difference
-— only type-level ceremony. (A **git-backed** Direct conversation, which Standalone never
-covered, additionally has a project association via its repo and provides `propose_task`
-as a fork proposal — REQ-PROJ-033/036.) `Standalone` was folded into `Direct` via DB
-migration 001 (`UPDATE conversations SET conv_mode = REPLACE(conv_mode,
-'"Standalone"', '"Direct"')`), and the `ConvMode::Standalone` enum
-variant was removed from the code. All references to Standalone in the
-spec corpus have been updated to Direct; this REQ-PROJ-018 is the
-canonical landing for the history. If you encounter Standalone in old
-code comments, task files, or git history, treat it as an alias for
-Direct.
+**Historical note — Standalone → Direct migration.** An earlier design split non-Git directory conversations into a separate `Standalone` mode. That distinction was removed because both shapes represented the same chat-only semantics: full tool access in the target directory, no Phoenix-owned worktree, and no Git-backed lifecycle ownership.
 
 WHEN a conversation is created in Direct mode
 THE SYSTEM SHALL provide full tool access (bash, patch, all tools)
-AND set the working directory to the target directory (not a worktree)
-AND include `propose_task` (the fork proposal — REQ-PROJ-033/036) **only** when the
-  working directory is inside a git repository; otherwise omit it
+AND set the working directory to the target directory (not a Phoenix-owned worktree)
+AND include `propose_task` only when the working directory is inside a Git repository and the proposal can spawn a separate Git-backed conversation
 AND NOT create worktrees, branches, or task files for the Direct conversation itself
-  (an approved fork is a separate managed conversation)
 
-THE SYSTEM SHALL visually distinguish Direct mode from Explore mode in the UI
-AND present the mode choice (Direct vs Managed) on the new conversation page
-with descriptions explaining the trade-offs
+THE SYSTEM SHALL visually distinguish Direct mode from Git-backed worktree conversations in the UI
 
-WHEN a Direct-mode conversation targets a git repository
-THE SYSTEM SHALL associate it with the project (for MCP config, filtering, etc.)
-AND SHALL NOT restrict any tools based on git state
+WHEN a Direct conversation targets a Git repository
+THE SYSTEM SHALL associate it with the project for discovery/configuration purposes
+AND SHALL NOT treat that association as ownership of a Phoenix worktree lifecycle
 
-**Rationale:** The Explore/Work ceremony adds value for non-trivial changes that
-benefit from plan review and worktree isolation, but creates friction disproportionate
-to simple fixes. Direct mode is the zero-friction default; the Managed workflow is
-opt-in for users who want structured project management.
+**Rationale:** Direct mode remains useful for chat-only and ad hoc workflows, while Git-backed conversations use the disposable-worktree model. The important distinction is worktree ownership, not a branching lifecycle picker.
 
 ---
 
-### REQ-PROJ-019: Conversation List Filtering and Auto-Archive
+### REQ-PROJ-019: Conversation List Filtering and Explicit Close
 
 WHEN the conversation list contains more than 20 conversations
-THE SYSTEM SHALL provide filtering by conversation mode (Explore, Work, Branch, Direct)
+THE SYSTEM SHALL provide filtering by lifecycle and conversation shape
 AND provide filtering by project
 
-WHEN a conversation has been in Terminal state for more than 7 days
-THE SYSTEM SHALL automatically archive it
-AND the conversation SHALL still be accessible via the archive view
-
-WHEN the user applies a mode filter
-THE SYSTEM SHALL show only conversations matching the selected mode
+WHEN the user applies a filter
+THE SYSTEM SHALL show only conversations matching the selected filter
 AND persist the filter selection across page navigation
 
-**Rationale:** Active daily use produces dozens of conversations per week. Without
-filtering, the list becomes a flat chronological dump where active Work tasks are
-indistinguishable from three-day-old quick questions. Auto-archiving Terminal
-conversations prevents indefinite list growth from completed or abandoned tasks.
-Mode and project filters let the user focus on what matters: "show me my active
-Work conversations for this project."
+THE SYSTEM SHALL NOT automatically archive or auto-close conversations based on age alone
+AND SHALL keep closed conversations accessible through History after explicit Close
+
+**Rationale:** Users need list controls as activity grows, but the unified lifecycle requires an explicit Close decision rather than age-based automatic archival.
 
 ---
 
 ### REQ-PROJ-020: Branch Discovery (Local, No Network)
 
-WHEN the user opens the branch picker in Managed mode
+WHEN the user opens the branch picker from a repository-operations surface
 THE SYSTEM SHALL list local branches sorted by most-recent commit date (descending)
 AND detect the remote's default branch via cached symbolic ref (no network call)
 
@@ -792,403 +518,169 @@ branch health indicator.
 
 ---
 
-### REQ-PROJ-024: Branch Mode -- Work Directly on an Existing Branch
+### REQ-PROJ-024: Existing-Branch Work Is Repository State, Not Conversation-Creation Mode
 
-WHEN the user creates a conversation for a git repository AND selects "Branch" mode
-AND selects an existing branch
-THE SYSTEM SHALL create a worktree checked out to that branch (no new branch created)
-AND initialize the conversation directly in Work mode (no Explore phase)
-AND give the agent full tool access in the worktree
-AND deliver the user's first message to the agent immediately
+WHEN a Git-backed conversation begins in its Phoenix-owned detached worktree
+THE SYSTEM SHALL allow the agent or user to create, checkout, switch to, or stack branches later as repository operations inside that workspace
+AND SHALL NOT require a dedicated branch-specific conversation type or branch-selection step at conversation creation time
 
-WHEN the user selects "Branch" mode for a non-git directory
-THE SYSTEM SHALL reject the request (Branch mode requires a git repository)
+WHEN the user wants Phoenix to iterate on an existing branch or PR branch
+THE SYSTEM SHALL support that by operating within the conversation's disposable worktree after explicit checkout there
+AND SHALL NOT treat the checked-out branch as conversation-owned lifecycle state
 
-WHEN the user selects "Branch" mode without selecting a branch
-THE SYSTEM SHALL reject the request (Branch mode requires an explicit branch selection)
-
-THE SYSTEM SHALL NOT create a task file for Branch mode conversations
-THE SYSTEM SHALL NOT create a new branch -- the worktree checks out the existing branch
-
-**Rationale:** Branch mode serves the "fix my PR" workflow: the user has existing
-work on a branch and needs to iterate on it. The Explore phase is overhead when
-the user already knows the branch and the task. No task file because the branch
-pre-exists and the user manages its lifecycle through their normal PR workflow.
-No new branch because the point is to commit directly to the existing branch --
-the worktree provides isolation from the main checkout without the indirection
-of a task branch.
+**Rationale:** Users still need the “fix my PR” workflow, but the current product truth expresses it as repository activity within one conversation-owned worktree rather than as a separate Branch-mode conversation type.
 
 ---
 
-### REQ-PROJ-025: One Active Work Conversation Per Branch
+### REQ-PROJ-025: Reuse Live Conversation Context Instead of Branch-Creation Ceremony
 
-WHEN the user selects a branch in Branch mode AND a non-terminal conversation
-already has an active worktree on that branch
-THE SYSTEM SHALL prompt the user: "This branch is open in another conversation.
-Continue there?"
-AND offer a link to navigate to the existing conversation
+WHEN repository operations reveal that another live conversation already owns the relevant Phoenix worktree context for continuing the same unit of work
+THE SYSTEM SHALL prefer navigating or linking the user to that existing live conversation instead of silently duplicating ownership
 
-WHEN the user selects a branch AND an orphaned worktree exists for that branch
-(worktree on disk but no matching non-terminal conversation)
-THE SYSTEM SHALL prompt: "An orphaned worktree exists for this branch.
-Delete it and start fresh?"
-AND on confirmation, delete the orphaned worktree and create a new one
+WHEN orphaned worktrees exist on disk without a live owning conversation
+THE SYSTEM SHALL surface truthful recovery or cleanup guidance before reuse
 
-WHEN the user selects a branch AND a stale conversation exists (conversation
-references this branch but no worktree on disk)
-THE SYSTEM SHALL redirect the user to the existing conversation
-AND the existing conversation SHALL offer the standard Abandon action
-  (abandoning frees the branch for a fresh start)
-
-THE SYSTEM SHALL NOT redirect to terminal (abandoned, completed, merged)
-conversations -- only to active or idle ones
-
-**Rationale:** Git worktrees hold an exclusive lock on a branch -- two worktrees
-cannot check out the same branch. Rather than surfacing this as a git error,
-Phoenix makes the constraint visible at branch selection time. The one-per-branch
-rule prevents conflicting edits and encourages reusing conversations for
-iterative work on the same branch.
+**Rationale:** The user still benefits from avoiding duplicate live work contexts, but the guard now centers on live conversation/worktree ownership rather than on a Branch-mode picker or branch-name ownership rule.
 
 ---
 
-### Branch and Managed mode terminal lifecycle (specified in work-lifecycle)
+### Close lifecycle for Git-backed conversations (specified in work-lifecycle)
 
-Mark-merged and abandon for both Branch and Managed mode conversations — worktree and branch
-disposition, the PR-aware cleanup guidance, and the no-squash / no-push completion model — are
-specified by the **work-lifecycle** spec (REQ-WL-001 and REQ-WL-002).
+The explicit Close flow for Git-backed conversations — worktree/resource release, PR-aware guidance, and the no-ref-mutation rule — is specified by the **work-lifecycle** spec (REQ-WL-001 through REQ-WL-003).
 
 ---
 
-### REQ-PROJ-028: Managed Mode -- Worktree from First Message
+### REQ-PROJ-028: Worktree Provisioning Happens at Git-Backed Conversation Creation
 
-WHEN the user selects Managed mode AND sends their first message
-THE SYSTEM SHALL create the worktree and task branch immediately
-AND initialize the conversation in Explore mode within the worktree
-AND the agent SHALL read from the worktree (not the main checkout)
+WHEN a Git-backed conversation is created
+THE SYSTEM SHALL create the disposable worktree immediately
+AND SHALL start it from the repository's canonical default-branch commit at detached `HEAD`
+AND the agent SHALL read from that worktree rather than from the main checkout
 
-WHEN the agent calls `propose_task` in a Managed conversation with a worktree
-THE SYSTEM SHALL intercept the call (same as REQ-PROJ-003)
-AND on approval, transition the conversation from Explore to Work mode
-AND the agent SHALL begin writing in the same worktree (no second worktree created)
+WHEN task approval later grants write authority
+THE SYSTEM SHALL continue using the same worktree rather than creating a second workspace
 
-WHEN a Managed conversation with a worktree reaches Terminal state without
-ever entering Work mode (user never approved a task)
-THE SYSTEM SHALL delete the worktree and task branch during cleanup
-AND worktree reconciliation on server restart SHALL detect Explore conversations
-  with worktrees (not only Work conversations)
+WHEN a Git-backed conversation closes without ever receiving write authority
+THE SYSTEM SHALL still clean up the disposable worktree through the ordinary Close/reconciliation path
 
-**Rationale:** The Explore phase should read from the selected branch's code,
-not whatever the main checkout happens to be (which may be dirty, detached, or
-on a different branch). Creating the worktree at conversation start ensures the
-agent explores the right code. The Explore -> Work transition becomes a permission
-change (read-only to read-write) within the same worktree, not a workspace change.
-The cleanup clause ensures worktrees from abandoned Explore conversations don't
-accumulate on disk.
+**Rationale:** Planning and implementation should observe the same isolated filesystem view. Provisioning the detached worktree at conversation creation preserves that continuity without introducing Managed-mode or task-branch semantics.
 
 ---
 
-### REQ-PROJ-029: Branch Mode in the Mode Picker
+### REQ-PROJ-029: No Branch Picker in Ordinary Conversation Creation
 
-WHEN the directory is a git repository
-THE SYSTEM SHALL show three mode options: Direct, Managed, and Branch
-AND Branch mode SHALL require selecting an existing branch
+WHEN the directory is a Git repository
+THE SYSTEM SHALL NOT show a Branch-mode or Managed-mode picker for ordinary conversation creation
+AND SHALL NOT require the user to select a base branch or destination branch before starting the conversation
 
-WHEN the user selects Branch mode
-THE SYSTEM SHALL show the branch picker (same as Managed mode)
-AND the branch picker SHALL use the same search and discovery mechanisms
-(REQ-PROJ-020 through REQ-PROJ-023)
+Branch discovery and checkout capabilities MAY still be reused later inside the disposable worktree when the user or agent needs to inspect or switch repository state.
 
-WHEN the user selects Managed mode
-THE SYSTEM SHALL show the branch picker for selecting a base branch
-AND the label SHALL indicate "Base branch" (starting point for new work)
-
-WHEN the user selects Branch mode
-THE SYSTEM SHALL show the branch picker for selecting an existing branch
-AND the label SHALL indicate "Branch" (the branch to work on directly)
-
-**Rationale:** The mode picker is the decision point where the user declares
-their intent: "no git" (Direct), "start new work" (Managed), or "work on
-existing branch" (Branch). The branch picker is reused across Managed and
-Branch modes with different labeling to communicate the different semantics:
-"base branch" (starting point) vs "branch" (destination).
+**Rationale:** The unified creation flow optimizes for starting work quickly. Branch choice remains a repository operation available later, not a prerequisite lifecycle decision.
 
 
-### REQ-PROJ-033: Propose a Decoupled Task Fork from a Writing Mode
+### REQ-PROJ-033: Propose a Derived Task from an Already-Active Conversation
 
-WHILE a conversation is in a writing mode (Work, Branch, or Direct whose working
-directory is inside a git repository)
-THE SYSTEM SHALL provide the `propose_task` tool as a **fork proposal**: the agent's
-way of handing a self-contained, newly-discovered unit of work to a separate
-conversation without carrying it itself.
+WHILE a Git-backed conversation already has write authority, or a Direct conversation is operating inside a Git repository
+THE SYSTEM SHALL provide `propose_task` as a way to hand a self-contained unit of work to a separate derived conversation
 
-WHEN the agent calls `propose_task` with a `task_file` path to a markdown file inside
-its working tree
-THE SYSTEM SHALL intercept it at the LlmResponse handler (like the Explore-mode
-propose_task — REQ-PROJ-003)
+WHEN the agent calls `propose_task` with a markdown file inside its allowed workspace
+THE SYSTEM SHALL intercept it at the LlmResponse handler
 AND require it to be the only tool call in the response
-AND validate the `task_file` by the **same rules as REQ-PROJ-003**: it must be a regular
-`.md` file inside the conversation's **resolved root** — the Phoenix worktree for a
-Work/Branch origin, or the conversation's working directory (the user-supplied cwd inside
-the git repo) for a Direct origin, which has no Phoenix-managed worktree; a taskmd-pattern
-filename (`NNNNN-pX-status--slug.md`) is rejected unless it lives under the project's tasks
-directory and carries an open status (`ready` / `in-progress` / `brainstorming`) — a closed
-status such as `done` is rejected; any other `.md` file is accepted as a plain brief
-(REQ-PROJ-006). An invalid file is
-rejected via a synthetic tool error (the conversation keeps running), never silently
-reclassified
-AND read the file and capture a **content snapshot** (the file bytes plus the display
-title/priority derived exactly as in REQ-PROJ-003, the file path **normalized to
-repository-relative** — the agent's path is relative to its working directory, which for a
-Direct origin started in a subdirectory is a repo subdirectory, so it is resolved against
-the repo root so the fork commits it at the correct location — and a stable `proposal_id`)
-into a fork-proposal record
-AND **leave the referenced file untouched** in the origin worktree — Phoenix does NOT delete
-it. The snapshot bytes are authoritative, so the fork never depends on the origin copy; and
-Phoenix cannot distinguish a throwaway draft from real content (an untracked file may be a
-user's local `docs/plan.md`, not a disposable draft; a tracked file is plainly real), so
-silently removing it would risk destroying work. The shed brief now belongs to the fork; the
-still-running origin agent owns its own working tree and SHOULD NOT commit the shed brief into
-its branch/PR — doing so would re-entangle the very task it just shed
-AND persist the assistant message and a synthetic tool result reporting that the
-proposal was recorded and is pending the user's review
-AND **return the conversation to its running state so the agent continues its own work**
-(it SHALL NOT enter AwaitingTaskApproval and SHALL NOT pause)
+AND validate the file by the same taskmd/plain-brief rules as REQ-PROJ-003
+AND capture a content snapshot with normalized repository-relative path metadata and a stable `proposal_id`
+AND leave the referenced file untouched in the originating workspace
+AND persist a synthetic result reporting that the proposal was recorded for later review
+AND return the originating conversation to its running state so it may continue its own work
 
-THE fork proposal is a content snapshot, not a live file reference: the fork runs in a
-fresh worktree off the **repository's default branch** (REQ-PROJ-034) that does not
-contain the originating worktree's file, so the bytes captured at propose time are
-authoritative — the fork commits its own copy from the snapshot `body`, independent of the
-origin's working-tree copy, which Phoenix leaves in place (the agent owns it).
+WHEN `propose_task` is called from a planning/read-only phase
+THE SYSTEM SHALL keep the blocking review behavior of REQ-PROJ-003 rather than this derived-conversation path
 
-WHEN `propose_task` is called in Explore mode
-THE SYSTEM SHALL keep the existing parking behavior (REQ-PROJ-003) — Explore's
-propose_task is the in-place Explore→Work gateway, not a fork
-
-WHEN `propose_task` is called in Direct mode AND the working directory is **not** inside
-a git repository
-THE SYSTEM SHALL NOT provide the tool (a fork cuts from the repository's default branch, which requires a git repository)
+WHEN `propose_task` is called in Direct mode outside a Git repository
+THE SYSTEM SHALL NOT provide the tool
 
 WHEN `propose_task` is called by a sub-agent
-THE SYSTEM SHALL reject the call (task management is the parent conversation's job —
-REQ-PROJ-003)
+THE SYSTEM SHALL reject the call
 
-**Rationale:** A conversation refactoring one subsystem often discovers an unrelated,
-self-contained problem (a bug in a different module). Carrying that work dilutes the
-conversation's focus. A fork proposal lets the agent record "here is a separate task,
-fully described" and immediately drop it from its own context. The proposal is
-non-blocking precisely because the originating conversation has its own task to finish —
-unlike Explore, whose entire purpose is to become the proposed task. This is the same
-hand-off pattern as Explore's propose_task; the only new axis is that the originating
-conversation keeps going.
+**Rationale:** A conversation can discover an unrelated task that deserves its own fresh context. The derived-task proposal preserves that user value without turning task shedding into a branch-owned or mode-owned lifecycle fork.
 
 ---
 
-### REQ-PROJ-034: Approve a Fork Proposal — Spawn an Independent Conversation
+### REQ-PROJ-034: Approve a Derived Proposal by Spawning a Fresh Conversation
 
-WHEN a **`pending`** fork proposal exists on a conversation AND the originating conversation is not
-terminal
-THE SYSTEM SHALL surface it in that conversation's tool output with a Review affordance
-AND the user MAY open the same full-screen task-review interface used for Explore
-approvals (REQ-PROJ-004) to read the snapshot and Approve or Dismiss it (addressed by its
-`proposal_id`)
-AND the user's decision arrives asynchronously — the originating conversation does not
-wait on it and is unaffected by it
-AND once the proposal is resolved (`spawned`, `dismissed`, or `promoted` — REQ-PROJ-037)
-the Review affordance is withdrawn — a resolved proposal is no longer surfaced for review (it
-cannot be re-approved, re-dismissed, or re-promoted; the resolution is recorded once, idempotently)
+WHEN a `pending` derived-task proposal exists on a conversation and the originating conversation is still Open
+THE SYSTEM SHALL surface it for review in the same task-review interface used for blocking approvals
+AND SHALL resolve it exactly once as spawned, dismissed, or revision-requested
 
-WHEN the originating conversation reaches any terminal state — `is_terminal` per the
-bedrock model, i.e. terminal (abandoned / merged), context-exhausted, or handed-off — with
-a `pending` proposal still un-reviewed
-THE SYSTEM SHALL make that proposal moot: the Review affordance is withdrawn and the
-proposal can no longer be approved (REQ-PROJ-035, bound to origin)
+WHEN the user approves a `pending` derived proposal
+THE SYSTEM SHALL create a fresh top-level Open conversation in its own new disposable worktree
+AND SHALL start that worktree from the repository's canonical default branch at detached `HEAD`
+AND SHALL treat the new conversation as a separate derived conversation rather than as a continuation row
+AND SHALL write the snapshot's approved task artifact into the spawned workspace according to REQ-PROJ-006
+AND SHALL seed the spawned conversation's initial context with the approved task brief and nothing else from the source transcript
+AND SHALL record the proposal resolution as `spawned`
 
-WHEN the user approves a `pending` fork proposal
-THE SYSTEM SHALL create a fresh top-level conversation in Work mode, in its own new
-worktree (REQ-PROJ-005), on a new task branch **cut from the repository's default branch
-(the project's `main_ref` — REQ-PROJ-034a), not from the originating conversation's
-`base_branch` or HEAD** — uniformly for every origin mode (Work, Branch, Direct-in-git)
-AND SHALL treat the new conversation as a separate Open conversation derived from the source conversation rather than as a continuation row
-AND write the snapshot's bytes into the fork's worktree (a taskmd file under the tasks
-directory, a plain brief at its own path — classified as in REQ-PROJ-006); for a taskmd
-file, promote its status to `in-progress` before committing exactly as REQ-PROJ-006 does
-on Explore approval; then commit the task file on the fork's task branch
-AND seed the fork's LLM context with the task brief — the snapshot **body** itself, plus
-a line naming the fork's **resolved `branch_name`** (`task-{ID}-{slug}` for a taskmd file,
-`task-{stem}-{fork-id-prefix}` for a plain brief — never a fixed taskmd-shaped template,
-which would name a branch that was never created) — and nothing else (it inherits none of
-the originating conversation's transcript; the brief is in context, not merely a file the
-agent must discover)
-AND record the resolution of the proposal as **spawned** (referencing the new
-conversation), idempotently: a `pending` proposal spawns exactly one fork; approving an
-already-resolved proposal (`spawned`, `dismissed`, or `promoted` — REQ-PROJ-037) is rejected,
-so every resolution is single-use (a promoted proposal's snapshot already moved into an
-Explore refinement and must not also spawn a Work fork)
-
-WHEN the user dismisses a `pending` fork proposal
+WHEN the user dismisses a `pending` derived proposal
 THE SYSTEM SHALL spawn nothing
-AND record the resolution of the proposal as **dismissed**
-AND leave the originating conversation unaffected
+AND SHALL record the proposal resolution as `dismissed`
 
-**REQ-PROJ-034a (fork base):** The fork base is **always the repository's default branch**,
-named by the project's `main_ref` — a mandatory, immutable field resolved once at project
-creation (the remote's default branch when detectable, else the repository's checked-out
-branch at creation time). It is the same value regardless of origin mode; in particular a
-Branch-mode origin's `base_branch` equals the branch it is editing (REQ-PROJ-017), which
-is *not* an independent base, so the fork never uses it.
+WHEN the originating conversation is no longer Open before a pending derived proposal is reviewed
+THE SYSTEM SHALL retire that pending proposal rather than silently attaching it to a closed conversation lifecycle
 
-`main_ref` SHALL be the *resolved* default branch, not a hardcoded literal. Before fork
-approval relies on it, existing project rows whose `main_ref` was defaulted (e.g. to a
-literal `main`) SHALL be backfilled/reconciled to the actual resolved default branch
-(repos whose default is `master`/`develop`/etc. must not be sent to `main`). This is a
-schema-evolution obligation owned by a migration or a startup reconciliation, per the
-repo's "schema evolution belongs in migrations" rule — not a serde/default shim.
-
-THE fork SHALL be independent by construction: branching off the repository default branch
-means its eventual diff contains only its own work, reviewable and mergeable on its own
-with no entanglement with the originating conversation's in-progress changes. A fork
-therefore SHALL NOT be used for work that depends on the originator's uncommitted changes.
-
-**Rationale:** Approval is the human gate, moved off the blocking path. The originating
-conversation proposed and moved on; the user picks the proposal up whenever, in the
-familiar review surface. Spawning off the repository default branch keeps the fork a clean,
-independent unit — the alternatives (off the origin's HEAD, or off a Branch origin's own
-PR branch) would stack it on unmerged work and muddy its PR.
+**Rationale:** A derived task must begin as an independent fresh conversation. Starting from the canonical default-branch snapshot preserves clean separation without requiring a separate branch-specific conversation type or Phoenix-owned branch model.
 
 ---
 
-### REQ-PROJ-035: Fork Provenance and Decoupling Guarantees
+### REQ-PROJ-035: Derived-Conversation Provenance and Decoupling Guarantees
 
-WHEN a fork conversation is created (REQ-PROJ-034)
-THE SYSTEM SHALL record a provenance breadcrumb `spawned_from_conversation_id` on the
-fork, pointing at the originating conversation
-AND this field SHALL be distinct from `parent_conversation_id` (sub-agent / fresh-handoff
-lifecycle) and from `continued_in_conv_id` (chains — REQ-BED-030), and SHALL carry no
-lifecycle or notification semantics
+WHEN a derived conversation is created
+THE SYSTEM SHALL record provenance pointing at the originating conversation
+AND this provenance SHALL remain distinct from `parent_conversation_id` and `continued_in_conv_id`
+AND SHALL carry no lifecycle notification semantics
 
-THE SYSTEM SHALL NOT establish any lifecycle relationship between the originating
-conversation and the fork beyond derived-from provenance:
-- the fork SHALL NOT be a sub-agent of the originator (no AwaitingSubAgentResult, no
-  SubAgentResult — REQ-PROJ-008)
-- the fork SHALL NOT be a chain continuation of the originator (no `continued_in_conv_id`,
-  no shared chain root)
-- the originating conversation SHALL receive no notification of the fork's creation,
-  progress, completion, or failure, through the agent's context or otherwise
+THE SYSTEM SHALL NOT establish any lifecycle relationship between the originating conversation and the derived conversation beyond derived-from provenance
+AND the originating conversation SHALL receive no automatic notification of the derived conversation's later progress, completion, or failure inside the agent context
 
-WHEN a fork proposal's resolution is recorded (`spawned`, `dismissed`, or `promoted` —
-REQ-PROJ-034/037)
-THE SYSTEM SHALL track that resolution as control-plane state bound to the originating
-conversation's lifecycle (removed with the conversation)
-AND SHALL NOT inject it into the originating conversation's LLM context (a resolution the
-agent could read would itself be a lifecycle notification, which is forbidden above)
+WHEN a derived proposal's resolution is recorded
+THE SYSTEM SHALL track that resolution as control-plane state bound to the originating conversation record
+AND SHALL NOT inject it into the originating conversation's LLM context
 
-A fork proposal is **bound to its origin**: it lives with the originating conversation's
-transcript and is removed with that conversation when the conversation is hard-deleted.
-The terminal-state effect is narrower and applies only to the **unreviewed** case: a
-`pending` proposal does not survive the origin reaching any terminal state (`is_terminal`
-— terminal/abandoned/merged, context-exhausted, or handed-off) — it is retired (moot: the
-Review affordance is withdrawn and it can no longer be approved). A **resolved** resolution
-(`spawned`, `dismissed`, or `promoted`) is control-plane audit state that *does* persist
-through the origin's terminal lifecycle and is removed only on hard delete, so ordinary
-terminal cleanup (mark-merged / abandon) never erases the decoupled fork's provenance.
-
-**Rationale:** The whole point is to shed mental load — so the spawner must learn nothing
-about what it spawned. The decoupling is structural: the fork is created through the
-ordinary top-level-conversation path, never the sub-agent spawn path, so there is no
-parent event channel to carry a notification (it cannot leak because it does not exist).
-The breadcrumb exists only for the UI and audit; nothing keys behavior off it. Binding the
-proposal to its origin keeps the model simple — a proposal is an artifact of a
-conversation, not a free-floating queue item — at the cost that an unreviewed proposal
-dies with its conversation, which is acceptable because the proposal carries no commitment
-until approved.
+**Rationale:** Derived tasks are related for navigation and audit, not because they share one lifecycle. This preserves parallelism and prevents provenance from turning into hidden execution coupling.
 
 ---
 
-### REQ-PROJ-036: Fork-Eligible Mode Availability
+### REQ-PROJ-036: propose_task Availability by Conversation Capability
 
 THE `propose_task` tool SHALL be available as follows:
 
-| Origin mode | `propose_task` behavior |
-|-------------|-------------------------|
-| Explore | In-place Explore→Work gateway, parks in AwaitingTaskApproval (REQ-PROJ-003) |
-| Work | Fork proposal, non-blocking (REQ-PROJ-033) |
-| Branch | Fork proposal, non-blocking (REQ-PROJ-033) |
-| Direct, working dir inside a git repo | Fork proposal, non-blocking (REQ-PROJ-033) |
-| Direct, working dir not in a git repo | Not provided (no repository default branch to cut from) |
-| Any sub-agent | Not provided (REQ-PROJ-008) |
+| Conversation capability shape | `propose_task` behavior |
+|-------------------------------|-------------------------|
+| Git-backed planning/read-only conversation | Blocking review path (REQ-PROJ-003 / REQ-PROJ-004) |
+| Git-backed conversation with write authority | Derived-conversation proposal (REQ-PROJ-033) |
+| Direct conversation inside a Git repository | Derived-conversation proposal (REQ-PROJ-033) |
+| Direct conversation outside a Git repository | Not provided |
+| Any sub-agent | Not provided |
 
-A Direct origin owns no worktree or task ceremony of its own, yet the fork it proposes is
-a managed Work conversation (own worktree, own task branch off the repository's default
-branch). The fork is managed even when its origin is not. A follow-up fork is a separate,
-fresh Open conversation rather than a continuation of the origin.
+A Direct origin owns no Phoenix worktree of its own, yet a derived conversation it proposes may still become a fresh Git-backed Open conversation with its own disposable worktree.
 
-**Rationale:** Forking is meaningful from any mode that sits on a git history to branch
-from. Explore keeps its distinct, blocking gateway semantics because there the proposal
-*is* the conversation's purpose. Direct-not-in-a-repo is the one writing context with no
-branch to fork from, so it is excluded structurally rather than failing at spawn time.
+**Rationale:** Availability depends on whether the host can either review a task in place or spawn a Git-backed derived conversation, not on obsolete lifecycle mode labels.
 
 ---
 
-### REQ-PROJ-037: Request Changes — Promote a Fork Proposal to an Explore Refinement
+### REQ-PROJ-037: Request Changes on a Derived Proposal Opens a Fresh Refinement Conversation
 
-WHEN a `pending` fork proposal is under review (REQ-PROJ-034) AND the originating
-conversation is not terminal
-THE SYSTEM SHALL offer a third review action — **Request Changes** — alongside Approve and
-Dismiss, accepting a free-text change request from the user
+WHEN a `pending` derived proposal is under review and the originating conversation is still Open
+THE SYSTEM SHALL offer **Request Changes** alongside Approve and Dismiss
 
-WHEN the user chooses Request Changes with a change-request note
-THE SYSTEM SHALL create a fresh top-level **Explore** conversation, in its own new worktree
-(REQ-PROJ-005) cut from the repository's default branch (`main_ref` — REQ-PROJ-034a), the
-*same independent base* a direct approval would use, so the task being shaped is never
-entangled with the originating conversation's in-progress work
-AND write the snapshot's bytes as an **uncommitted draft under the tasks directory** on the
-temp branch — not at the brief's original path. Explore's `patch` allowlist is scoped to
-`tasks/` (REQ-PROJ-003), so a plain brief that lived elsewhere (e.g. `docs/plan.md`) could
-not be revised in place; the refinement draft therefore always lands under `tasks/`, where
-the agent can edit it, and the refinement's own approval re-derives the final taskmd-vs-plain
-shape (REQ-PROJ-006). The draft path is **deterministic and collision-free**:
-`tasks/{refinement-id-prefix}-{sanitized-stem}.md`, where the refinement-id prefix (from the
-`(proposal_id, "promote")`-derived conversation id) guarantees the same path on a
-crash-retry (deterministic recovery) and that the write never overwrites a pre-existing
-tracked task file. (The refinement is an **Explore** worktree, so it records neither a
-`task_file` nor a `plain_brief_path` — those are Work-mode markers; the draft is just an
-uncommitted scratch file the agent revises until its own Explore→Work approval.)
-AND seed the Explore agent's LLM context with the brief **body** plus the user's
-change-request note — and nothing else (it inherits none of the originating conversation's
-transcript; the brief and the requested changes are *in context*, not merely a file to
-discover)
-AND record the proposal's resolution as **`promoted`** (referencing the new Explore
-conversation), idempotently — a `pending` proposal promotes exactly once; promoting an
-already-`spawned`/`dismissed`/`promoted` proposal is rejected
-AND leave the originating conversation unaffected and uninformed — the decoupling of
-REQ-PROJ-035 holds unchanged: the origin is the *proposer*, never the *iterator*
+WHEN the user chooses Request Changes with a change request
+THE SYSTEM SHALL create a fresh Open refinement conversation in its own new disposable worktree from the repository's canonical default branch
+AND write the proposal snapshot as an editable draft task artifact in that refinement workspace
+AND seed the refinement conversation with the brief body plus the user's change request, and nothing else from the originating transcript
+AND record the proposal resolution as a single-use refinement outcome
+AND leave the originating conversation unaffected and uninformed inside the agent context
 
-THEREAFTER refinement proceeds entirely through the ordinary Explore propose / feedback /
-approve loop (REQ-PROJ-004): the agent revises the draft, the user sends annotation
-feedback, and the Explore agent's own `propose_task` re-enters AwaitingTaskApproval. The
-final managed Work conversation is produced by the **normal Explore→Work gateway**
-(in-place or fresh handoff — REQ-PROJ-006), not by fork-spawn. There is no second fork
-proposal and no path back to the original origin.
+THEREAFTER refinement proceeds through the ordinary blocking approval loop rather than through a second hidden fork mechanism.
 
-THE promoted Explore conversation SHALL carry the same `spawned_from_conversation_id`
-provenance breadcrumb pointing at the original proposing conversation (REQ-PROJ-035) — a
-non-live audit reference, so provenance survives even though the origin is decoupled and
-may later be hard-deleted.
-
-A `promoted` resolution is **terminal for the proposal**, exactly like `spawned` /
-`dismissed`: it persists as control-plane audit through the origin's ordinary terminal
-cleanup (mark-merged / abandon) and is removed only on hard delete (REQ-PROJ-035). The
-promoted Explore conversation has an **independent lifecycle**: abandoning or deleting it
-does not alter the `promoted` record, and the record carries no behaviour back to it.
-
-**Rationale:** "Request changes" means *"not ready to commit to Work — let me shape this
-first,"* which is precisely Explore's purpose. Promoting to Explore reuses the existing
-propose/feedback loop and review surface rather than inventing a parallel one, keeps the
-task on a disposable scratch branch until it is actually ready (no premature Work branch to
-abandon), and preserves decoupling by construction — the messages land in a *new*
-conversation's transcript, never the decoupled proposer's. Approve and Request Changes are
-distinct intents: Approve commits the brief as-is to a Work fork; Request Changes opens an
-agent-assisted iteration before any such commitment.
+**Rationale:** Requesting changes still has user value, but it now deliberately opens a fresh refinement conversation instead of implying an obsolete planning-mode taxonomy as a long-lived product lifecycle.
 
 ---
 

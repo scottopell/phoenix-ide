@@ -1,142 +1,80 @@
-# Work Lifecycle: Close Actions on Git-Backed Work Conversations
+# Work Lifecycle: Explicit Close for Git-Backed Conversations
 
 ## User Story
 
-As a developer using PhoenixIDE, I need clear, safe close actions on my Work and Branch
-conversations so that I can move finished or abandoned Git-backed work into History without accidentally
-destroying git state I care about, and without being blocked by Phoenix when I already know
-the outcome of my PR.
+As a developer using PhoenixIDE, I need one explicit way to close a Git-backed conversation so that I can retire finished or discarded work without Phoenix unexpectedly mutating branches, pull requests, or other repository state I still own.
 
 ## Scope
 
-This spec governs the **action semantics and git side effects** of:
+This spec governs the product-facing **Close conversation** action for Git-backed conversations and the advisory repository facts that help the user decide when to use it.
 
-- **Abandon** — discarding a Work or Branch conversation.
-- **Mark as merged** — signalling that a Work or Branch conversation's work has shipped.
-- **Close conversation** as the product lifecycle action those outcomes trigger.
-- **PR merge state** as the advisory gate that guides (but never triggers) the cleanup path.
+It owns:
+
+- the confirmation and loss-warning contract for Close on a Git-backed conversation;
+- the requirement that Close release Phoenix-owned worktree resources while leaving repository refs and PRs untouched;
+- the advisory use of PR state to guide the user toward closing when work appears shipped.
 
 It does **not** own:
 
-- **Transition legality** — when a terminal action is permitted based on conversation state
-  (`core_status ∈ {idle, error, recoverable_continuation_failure}`, `parent_status ∈ {absent, context_exhausted}`,
-  `mode ∈ {work, branch}`, no continuation pointer). That is bedrock's `TaskResolved` rule
-  and `TerminalActionRequiresNoContinuation` invariant (REQ-BED-029, REQ-BED-031). The
-  handlers in this spec validate against that gate; they do not define it.
-- **PR feedback freshness, explicit active-PR targeting, auto-fix, and remediation context** —
-  the `pr-association` spec.
-- **UI surface composition** — button labels, action zones, disposition derivation, tooltips.
-  The `work-actions-bar` spec owns these.
+- conversation-state legality and durable cancellation sequencing — bedrock and the unified lifecycle specs own those authorities;
+- PR feedback freshness, explicit active-PR targeting, auto-fix, and remediation context — the `pr-association` spec;
+- UI placement, wording variants, or action-bar composition — the `work-actions-bar` spec owns those concerns.
 
-Each terminal action's branch disposition depends only on the live conversation that currently owns the `WorkScope`, identically across both actions:
-
-| Mode | Worktree | Branch | Reason |
-|------|----------|--------|--------|
-| Managed (Work) | Deleted | Deleted | Phoenix created the task branch (`task-{ID}-{slug}`); it is Phoenix's artifact to clean up. |
-| Branch | Deleted | Kept | The branch is the user's pre-existing PR branch; it is not Phoenix's to delete. |
+Historical compatibility note: earlier Phoenix surfaces exposed **Abandon** and **Mark as merged** as separate lifecycle actions. That product split is deprecated. Any migration-time adapter that still recognizes those legacy verbs SHALL map them into the one Close flow while preserving Close's current confirmation and loss-safety contract; the legacy verbs are not current user-facing actions.
 
 ---
 
 ## Requirements
 
-### REQ-WL-001: Abandon a Conversation and Close It to History
+### REQ-WL-001: Close Is the Only User-Facing Terminal Action for Git-Backed Conversations
 
-WHEN the user initiates the Abandon action on a Work or Branch conversation
-THE SYSTEM SHALL present a confirmation dialog warning that the worktree will be deleted and
-  uncommitted work lost (subject to the diff snapshot)
+WHEN the user chooses to end a Git-backed conversation's active work
+THE SYSTEM SHALL expose **Close conversation** as the only ordinary lifecycle action
+AND SHALL move the conversation to read-only History only through that Close flow
 
-WHEN the user confirms abandonment
-THE SYSTEM SHALL capture a best-effort diff snapshot of the worktree *before* deleting it,
-  bounded per diff section with a truncation indicator, and persist it to conversation
-  history so the discarded work is recoverable from the record after the worktree is gone
-AND, when no other live conversation still owns that `WorkScope`, delete the worktree
-AND, when no other live conversation still owns that `WorkScope`, apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
-  keep the branch)
-AND resolve the conversation via bedrock's `TaskResolved` with outcome `abandoned`
-AND close the product conversation into History
-AND emit a synthetic system message describing the outcome
+WHEN legacy clients, stored intents, or migration adapters still reference `abandon` or `mark_merged`
+THE SYSTEM SHALL treat those values only as deprecated compatibility inputs
+AND SHALL require them to execute the same confirmation, loss inspection, cancellation, and finalization contract as Close
+AND SHALL NOT expose those deprecated verbs as current writable lifecycle choices in ordinary product surfaces
 
-WHEN the user cancels the confirmation dialog
-THE SYSTEM SHALL take no action
-AND the conversation SHALL remain in its current state
-
-**Design:** The diff snapshot preserves context even when the work is discarded — it is the
-recovery artifact, persisted with the conversation record so it is reviewable without git
-infrastructure. The branch disposition follows mode: Phoenix-created task branches are
-Phoenix's to clean up; user-owned PR branches survive abandon precisely because Phoenix did
-not create them. Worktree deletion is irreversible, so abandon (and only abandon) requires an
-explicit confirmation step before any git operation runs.
-
-**Legality gate:** bedrock's `TaskResolved` rule (REQ-BED-029, REQ-BED-031) governs when
-Abandon may be initiated. This requirement governs what happens after the user confirms.
+**Rationale:** The user-facing distinction between “abandoned” and “merged” conflated repository interpretation with lifecycle. The durable product truth is simpler: the conversation is either still Open or the user explicitly closed it into History.
 
 ---
 
-### REQ-WL-002: Mark as Merged and Close to History
+### REQ-WL-002: Close Releases Phoenix-Owned Resources but Never Mutates Branches or PRs
 
-WHEN the user initiates "Mark as merged" on a Work or Branch conversation
-THE SYSTEM SHALL, when no other live conversation still owns that `WorkScope`, delete the worktree
-AND, when no other live conversation still owns that `WorkScope`, apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
-  keep the branch)
-AND resolve the conversation via bedrock's `TaskResolved` with outcome `merged`
-AND close the product conversation into History
-AND emit a synthetic system message describing the outcome
+WHEN a Git-backed conversation successfully closes
+THE SYSTEM SHALL release the conversation's Phoenix-owned worktree resources
+AND SHALL remove the worktree only when no other live conversation still resolves to the same `WorkScope`
+AND SHALL leave every branch, tag, stash, remote-tracking ref, and pull request untouched
 
-THE SYSTEM SHALL NOT squash-merge to the base branch
-THE SYSTEM SHALL NOT push to origin (push is the agent's responsibility, run through the bash
-  tool when the user requests it)
-THE SYSTEM SHALL NOT perform any git operation before the user initiates the action
+THE SYSTEM SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or retarget any branch or pull request as a side effect of Close
 
-THE SYSTEM SHALL commit the task file on the task branch (never on main/base); that commit
-  reaches main only when the PR is merged through the user's normal workflow
+WHEN the worktree contains local state whose loss depends on worktree removal
+THE SYSTEM SHALL present Close's exact loss-warning contract before destructive teardown
+AND SHALL require explicit user confirmation before discarding that state
 
-**Design:** "Mark as merged" is a user assertion that the work has shipped via the user's
-normal PR workflow — the actual merge happened outside Phoenix. Phoenix performs WorkScope-owner
-cleanup only. Many repositories protect their main branch and require PR-based merges;
-squash-merging inside Phoenix would bypass code review and branch protection, so Phoenix never
-merges or pushes on the user's behalf. The task branch is deleted for Managed mode (Phoenix
-created it) and kept for Branch mode (the user owns it).
-
-**Legality gate:** bedrock's `TaskResolved` rule (REQ-BED-029, REQ-BED-031) governs when Mark
-as Merged may be initiated.
+**Rationale:** Phoenix owns the disposable environment, not repository history. Closing a conversation should reclaim Phoenix-owned resources while treating Git refs and PRs as user-owned facts Phoenix observes rather than lifecycle-owned artifacts Phoenix mutates.
 
 ---
 
-### REQ-WL-003: PR Merge State Is the Cleanup Gate
+### REQ-WL-003: Pull Request State Guides Close but Never Triggers It
 
-WHEN a Work or Branch conversation has an associated pull request
-AND `gh` can observe the pull request's state for the branch
-THE SYSTEM SHALL use the observed PR state to guide the cleanup action:
-WHEN a Work or Branch conversation has multiple associated pull requests
-THE SYSTEM SHALL summarize their mixed states honestly to the user-facing cleanup surface
-AND SHALL preserve cleanup as one WorkScope-owner action rather than one lifecycle per PR
+WHEN a Git-backed conversation has one or more associated pull requests
+AND Phoenix can observe their states
+THE SYSTEM SHALL use that observed PR state only as advisory guidance on the Close surface
 
-WHEN one explicit active PR is selected by `pr-association`
-THE SYSTEM SHALL allow sibling cleanup surfaces to name that PR specifically where PR-specific
-  wording is needed
-AND SHALL NOT treat that selected PR as the sole owner of task cleanup when other associated PR
-  history exists
+WHEN one associated pull request is confirmed merged
+THE SYSTEM SHALL present that fact as a strong signal that the conversation may be ready to close
 
-- a `gh`-confirmed merged PR is presented as the happy path for cleanup
-- an open, draft, failing, pending, or closed-unmerged PR annotates or discourages cleanup
-  with explanatory text while leaving terminal disposition user-initiated
+WHEN associated pull requests are open, draft, failing, pending, closed-unmerged, ambiguous, or unavailable
+THE SYSTEM SHALL surface that truthfully without blocking Close solely on PR state
 
-WHEN `gh` is unavailable or the conversation has no associated PR
-THE SYSTEM SHALL permit the user to initiate merged-work cleanup without `gh` confirmation
+WHEN multiple associated pull requests exist
+THE SYSTEM SHALL summarize their mixed states honestly
+AND SHALL preserve Close as one WorkScope-owner action rather than one lifecycle per PR
 
-THE SYSTEM SHALL NOT use PR merge state as an automatic trigger for the terminal transition —
-  cleanup occurs only when the user initiates the action
-THE SYSTEM SHALL NOT display local commits-ahead or commits-behind badges as the branch
-  health signal; PR state is the branch health signal
-THE SYSTEM SHALL NOT mutate, close, merge, or retarget any associated PR as part of cleanup
-AND SHALL NOT make PR feedback freshness a cleanup gate
+THE SYSTEM SHALL NOT automatically close a conversation because a PR appears merged, closed, missing, or stale
+AND SHALL NOT treat PR state as ownership of the conversation lifecycle
 
-**Design:** PR state makes the happy-path cleanup self-describing while preserving user-initiated
-cleanup for repositories where `gh` is not authenticated or configured. The advisory character
- of PR state is essential:
-Phoenix observes no push event and cannot continuously poll every branch, so it must not
-auto-terminate a conversation based on inferred remote state. "The PR is merged" is a
-condition the user is always better positioned to assert than Phoenix is to detect — the user
-knows when they clicked Merge. The data source is `GET /api/conversations/:id/pr-status`;
-`gh` failures are logged at `debug` and surfaced as compact, non-blocking UI hints so the
-conversation page stays usable without `gh`.
+**Rationale:** PR state helps the user understand whether work appears shipped, but Phoenix does not observe every repository event with enough authority to close work automatically. Close remains an explicit user decision.
