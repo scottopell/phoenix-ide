@@ -496,7 +496,9 @@ async def _send_chat_and_stream_async(
                 )
                 response.raise_for_status()
                 async for event in events:
-                    if _terminal_event(event.event, event.data) and await _snapshot_has_agent_after_message(
+                    if event.event != "ping":
+                        _terminal_event(event.event, event.data)
+                    if await _snapshot_has_agent_after_message(
                         client, base_url, conv_id, message_id
                     ):
                         return
