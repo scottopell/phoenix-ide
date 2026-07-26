@@ -148,6 +148,7 @@ exit "$status"
                     "tmux test watchdog did not finish cleanup",
                 ));
             }
+            // test-timing-allow: watchdog exit is the completion signal; the deadline only bounds failed cleanup
             thread::sleep(Duration::from_millis(20));
         };
         if !status.success() {
@@ -255,6 +256,7 @@ mod tests {
                 Instant::now() < deadline,
                 "timed out waiting for {description}"
             );
+            // test-timing-allow: cross-process marker/root state is the completion signal; the deadline only bounds a wedged fixture
             thread::sleep(Duration::from_millis(20));
         }
     }
