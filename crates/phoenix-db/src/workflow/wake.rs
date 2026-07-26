@@ -730,7 +730,7 @@ impl WakeRepository {
             "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                     work_scope_id, resource_kind, bash_handle_id,
                     tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-                    expires_at, prepared_fingerprint, fingerprint_needs_scope_upgrade
+                    registering_tool_round_id, expires_at, prepared_fingerprint, fingerprint_needs_scope_upgrade
              FROM wake_bindings
              WHERE conversation_id = ?1 AND contract_id = ?2
              LIMIT 1",
