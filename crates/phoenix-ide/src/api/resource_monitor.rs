@@ -17,7 +17,7 @@ const FRESHNESS_LEASE: Duration = Duration::from_millis(1_200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservationKey {
-    handles: Vec<(String, String, i32)>,
+    handles: Vec<(String, String, String, i32)>,
     terminal_sessions: Vec<i32>,
 }
 
@@ -31,6 +31,7 @@ impl ObservationKey {
             .map(|group| {
                 (
                     group.work_scope.stable_key(),
+                    group.control_scope.stable_key(),
                     group.handle_id.to_string(),
                     group.pgid,
                 )
@@ -47,6 +48,7 @@ impl ObservationKey {
 #[derive(Debug, Clone)]
 pub struct HandleObservationTarget {
     pub scope_key: String,
+    pub control_scope_key: String,
     pub handle_id: String,
     pub pids: BTreeSet<u32>,
 }
@@ -70,17 +72,32 @@ impl ResourceObservationGeneration {
             .collect()
     }
 
-    pub fn handle_pids(&self, scope_key: &str, handle_id: &str) -> Option<&BTreeSet<u32>> {
+    pub fn handle_pids(
+        &self,
+        scope_key: &str,
+        control_scope_key: &str,
+        handle_id: &str,
+    ) -> Option<&BTreeSet<u32>> {
         self.handles
             .iter()
-            .find(|target| target.scope_key == scope_key && target.handle_id == handle_id)
+            .find(|target| {
+                target.scope_key == scope_key
+                    && target.control_scope_key == control_scope_key
+                    && target.handle_id == handle_id
+            })
             .map(|target| &target.pids)
     }
 
-    pub fn visible_handle_pids(&self, scope_key: &str, handle_ids: &[String]) -> BTreeSet<u32> {
+    pub fn visible_handle_pids(
+        &self,
+        scope_key: &str,
+        handle_ids: &[(String, String)],
+    ) -> BTreeSet<u32> {
         handle_ids
             .iter()
-            .filter_map(|handle_id| self.handle_pids(scope_key, handle_id))
+            .filter_map(|(control_scope_key, handle_id)| {
+                self.handle_pids(scope_key, control_scope_key, handle_id)
+            })
             .flat_map(|pids| pids.iter().copied())
             .collect()
     }
@@ -195,6 +212,7 @@ async fn sample_generation(
                 bash_identities.extend(identities);
                 handles.push(HandleObservationTarget {
                     scope_key: group.work_scope.stable_key(),
+                    control_scope_key: group.control_scope.stable_key(),
                     handle_id: group.handle_id.to_string(),
                     pids,
                 });
@@ -297,11 +315,21 @@ mod tests {
         let samples = Arc::new(AtomicUsize::new(0));
         for key in [
             ObservationKey {
-                handles: vec![("conversation:c1".into(), "b-1".into(), 10)],
+                handles: vec![(
+                    "conversation:c1".into(),
+                    "conversation:c1".into(),
+                    "b-1".into(),
+                    10,
+                )],
                 terminal_sessions: Vec::new(),
             },
             ObservationKey {
-                handles: vec![("conversation:c1".into(), "b-2".into(), 20)],
+                handles: vec![(
+                    "conversation:c1".into(),
+                    "conversation:c1".into(),
+                    "b-2".into(),
+                    20,
+                )],
                 terminal_sessions: Vec::new(),
             },
         ] {
@@ -322,22 +350,27 @@ mod tests {
         generation.handles = vec![
             HandleObservationTarget {
                 scope_key: "conversation:c1".into(),
+                control_scope_key: "conversation:c1".into(),
                 handle_id: "b-1".into(),
                 pids: BTreeSet::from([10, 11]),
             },
             HandleObservationTarget {
                 scope_key: "conversation:c1".into(),
+                control_scope_key: "conversation:c1".into(),
                 handle_id: "b-2".into(),
                 pids: BTreeSet::from([11, 12]),
             },
         ];
         assert_eq!(
-            generation.visible_handle_pids("conversation:c1", &["b-1".into()]),
+            generation.visible_handle_pids(
+                "conversation:c1",
+                &[("conversation:c1".into(), "b-1".into())],
+            ),
             BTreeSet::from([10, 11])
         );
         assert_eq!(generation.all_bash_pids(), BTreeSet::from([10, 11, 12]));
         assert_eq!(
-            generation.handle_pids("conversation:c1", "b-1"),
+            generation.handle_pids("conversation:c1", "conversation:c1", "b-1"),
             Some(&BTreeSet::from([10, 11]))
         );
     }

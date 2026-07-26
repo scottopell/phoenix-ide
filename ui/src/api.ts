@@ -1755,9 +1755,13 @@ export const api = {
     scopeKey: string,
     handleId: string,
     conversationId: string,
+    controlScopeKey: string,
     since?: number,
   ): Promise<BashHandleInspectionType> {
-    const query = new URLSearchParams({ conversation_id: conversationId });
+    const query = new URLSearchParams({
+      conversation_id: conversationId,
+      control_scope_key: controlScopeKey,
+    });
     if (since !== undefined) query.set('since', String(since));
     const resp = await fetch(
       `/api/work-scope/${encodeURIComponent(scopeKey)}/bash/${encodeURIComponent(handleId)}/inspect?${query}`,

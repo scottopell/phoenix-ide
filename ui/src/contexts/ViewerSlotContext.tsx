@@ -43,7 +43,7 @@ export type ViewerSlot =
   | { kind: 'prose'; presentation: ViewerPresentation; file: ProseFile; patchContext: PatchContext | null }
   | { kind: 'diff'; presentation: DiffPresentation; target: DiffTarget }
   | { kind: 'browser' }
-  | { kind: 'inspect'; scopeKey: string; handleId: string }
+  | { kind: 'inspect'; scopeKey: string; controlScopeKey: string; handleId: string }
   | { kind: 'message'; presentation: ViewerPresentation; sequenceId: number }
   | { kind: 'commission-review'; presentation: ViewerPresentation; requestSequenceId: number };
 
@@ -57,7 +57,7 @@ export interface ViewerSlotCommands {
   openBrowser: () => void;
   /** Open the process inspector on a single bash handle, addressed by its
    *  `(scope_key, handle_id)` pair (REQ-PINSP-007). */
-  openInspect: (scopeKey: string, handleId: string) => void;
+  openInspect: (scopeKey: string, controlScopeKey: string, handleId: string) => void;
   /** Open a finalized chat message in the annotatable markdown viewer. */
   openMessage: (sequenceId: number, presentation: ViewerPresentation) => void;
   /** Open a commission review request/result pair by request agent message sequence id. */
@@ -90,6 +90,7 @@ const ROOT_PARAM = 'root';
 const LINE_PARAM = 'line';
 const END_LINE_PARAM = 'endLine';
 const SCOPE_PARAM = 'scope';
+const CONTROL_SCOPE_PARAM = 'controlScope';
 const HANDLE_PARAM = 'handle';
 const MESSAGE_PARAM = 'message';
 const REVIEW_PARAM = 'review';
@@ -106,6 +107,7 @@ const SLOT_PARAMS = [
   LINE_PARAM,
   END_LINE_PARAM,
   SCOPE_PARAM,
+  CONTROL_SCOPE_PARAM,
   HANDLE_PARAM,
   MESSAGE_PARAM,
   REVIEW_PARAM,
@@ -170,9 +172,13 @@ function deriveSlot(
       return { slot: { kind: 'browser' }, malformed: false };
     case 'inspect': {
       const scope = searchParams.get(SCOPE_PARAM);
+      const controlScope = searchParams.get(CONTROL_SCOPE_PARAM);
       const handle = searchParams.get(HANDLE_PARAM);
-      if (!scope || !handle) return { slot: { kind: 'none' }, malformed: true };
-      return { slot: { kind: 'inspect', scopeKey: scope, handleId: handle }, malformed: false };
+      if (!scope || !controlScope || !handle) return { slot: { kind: 'none' }, malformed: true };
+      return {
+        slot: { kind: 'inspect', scopeKey: scope, controlScopeKey: controlScope, handleId: handle },
+        malformed: false,
+      };
     }
     case 'message': {
       const sequenceId = parseMessageParam(searchParams.get(MESSAGE_PARAM));
@@ -298,12 +304,13 @@ export function ViewerSlotProvider({
     });
   }, [setPatchContext, writeUrl]);
 
-  const openInspect = useCallback((inspectScopeKey: string, handleId: string) => {
+  const openInspect = useCallback((inspectScopeKey: string, controlScopeKey: string, handleId: string) => {
     setPatchContext(null);
     writeUrl((next) => {
       clearSlotParams(next);
       next.set(VIEWER_PARAM, 'inspect');
       next.set(SCOPE_PARAM, inspectScopeKey);
+      next.set(CONTROL_SCOPE_PARAM, controlScopeKey);
       next.set(HANDLE_PARAM, handleId);
     });
   }, [setPatchContext, writeUrl]);

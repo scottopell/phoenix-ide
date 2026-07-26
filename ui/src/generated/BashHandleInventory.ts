@@ -25,6 +25,10 @@ export type BashHandleInventory = {
  */
 handle_id: string, 
 /**
+ * Stable key of the control namespace that resolves this handle.
+ */
+control_scope_key: string, 
+/**
  * Optional human-readable label set on the run call.
  */
 label?: string, 

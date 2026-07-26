@@ -39,6 +39,7 @@ const stopBrowser = vi.mocked(api.stopWorkScopeBrowserSession);
 function bash(over: Partial<BashHandleInventory> = {}): BashHandleInventory {
   return {
     handle_id: 'b-1',
+    control_scope_key: 'work:scope-1',
     cmd: 'sleep 100',
     state: 'running',
     started_at: new Date().toISOString(),

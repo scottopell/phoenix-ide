@@ -49,17 +49,21 @@ pub struct InspectionAssembly {
 /// allocates a handle table. Returns `None` when the scope has no handle
 /// table or the handle id is absent — a not-found condition (REQ-PINSP-001).
 pub async fn assemble_inspection(
-    work_scope: &ResourceScopeKey,
+    lifecycle_scope: &ResourceScopeKey,
+    control_scope: &ResourceScopeKey,
     handle_id: &str,
     since: Option<u64>,
     actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Option<InspectionAssembly> {
-    let table = bash_handles.get_existing(work_scope).await?;
+    let table = bash_handles.get_existing(control_scope).await?;
     let handle = table
         .read()
         .await
         .get(&HandleId::new(handle_id.to_string()))?;
+    if &handle.lifecycle_scope != lifecycle_scope {
+        return None;
+    }
     if actor.is_some_and(|access| {
         !access.can_control(&handle.creator_conversation_id, handle.authority)
     }) {
@@ -141,6 +145,7 @@ mod tests {
     use super::*;
     use crate::bash::handle::{FinalCause, Handle, HandleId, KillSignal};
     use crate::bash::ring::RING_BUFFER_BYTES;
+    use phoenix_core::work_scope::ResourceAuthority;
     use std::time::{Duration, SystemTime};
 
     fn scope() -> ResourceScopeKey {
@@ -153,14 +158,18 @@ mod tests {
     async fn unknown_scope_or_handle_is_none() {
         let bash = Arc::new(BashHandleRegistry::new());
         // No table at all.
-        assert!(assemble_inspection(&scope(), "b-1", None, None, &bash)
-            .await
-            .is_none());
+        assert!(
+            assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
+                .await
+                .is_none()
+        );
         // Table exists but handle absent.
         let _ = bash.get_or_create(&scope()).await;
-        assert!(assemble_inspection(&scope(), "b-999", None, None, &bash)
-            .await
-            .is_none());
+        assert!(
+            assemble_inspection(&scope(), &scope(), "b-999", None, None, &bash)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -183,7 +192,7 @@ mod tests {
         let actor = EffectiveResourceAccess::new("sibling-a", ResourceAuthority::Restricted);
 
         assert!(
-            assemble_inspection(&scope(), "b-private", None, Some(&actor), &bash)
+            assemble_inspection(&scope(), &scope(), "b-private", None, Some(&actor), &bash)
                 .await
                 .is_none()
         );
@@ -204,7 +213,7 @@ mod tests {
         );
         table.write().await.insert(handle);
 
-        let assembly = assemble_inspection(&scope(), "b-1", None, None, &bash)
+        let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
             .await
             .expect("inspection");
         let inv = &assembly.inspection;
@@ -220,6 +229,38 @@ mod tests {
             "assembler leaves resources for caller"
         );
         assert_eq!(assembly.live_pgid, Some(4321));
+    }
+
+    #[tokio::test]
+    async fn distinct_lifecycle_and_control_scopes_address_the_same_handle() {
+        let bash = Arc::new(BashHandleRegistry::new());
+        let control_scope = ResourceScopeKey::Coordinator;
+        let lifecycle_scope = scope();
+        let table = bash.get_or_create(&control_scope).await;
+        let handle = Handle::new_live_for_actor_with_lifecycle(
+            control_scope.clone(),
+            lifecycle_scope.clone(),
+            HandleId::new("b-1"),
+            "coordinator".into(),
+            ResourceAuthority::Restricted,
+            "sleep 10".into(),
+            None,
+            4321,
+            1234,
+            RING_BUFFER_BYTES,
+        );
+        table.write().await.insert(handle);
+
+        assert!(
+            assemble_inspection(&lifecycle_scope, &control_scope, "b-1", None, None, &bash,)
+                .await
+                .is_some()
+        );
+        assert!(
+            assemble_inspection(&control_scope, &control_scope, "b-1", None, None, &bash,)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -240,7 +281,7 @@ mod tests {
             .await;
         table.write().await.insert(handle);
 
-        let assembly = assemble_inspection(&scope(), "b-1", None, None, &bash)
+        let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
             .await
             .expect("inspection");
         assert_eq!(
@@ -276,7 +317,7 @@ mod tests {
             .await;
         table.write().await.insert(handle);
 
-        let assembly = assemble_inspection(&scope(), "b-1", None, None, &bash)
+        let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
             .await
             .expect("inspection");
         let inv = &assembly.inspection;

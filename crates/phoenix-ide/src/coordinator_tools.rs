@@ -39,7 +39,7 @@ impl Tool for ExplicitCwdSandboxedBash {
 
     fn description(&self) -> String {
         format!(
-            "{}\n\nCoordinator usage: every op=run call must include cwd set to an authoritative active WorkScope cwd or worktree path from Coordinator context. There is no default repository or working directory. peek, wait, and kill use the handle and do not need cwd.",
+            "{}\n\nCoordinator usage: every op=run call must include work_scope_id and cwd copied from the same authoritative active WorkScope row in Coordinator context. There is no default repository or working directory. peek, wait, and kill use the handle and do not need either field.",
             SandboxedBashTool.description()
         )
     }
@@ -49,7 +49,7 @@ impl Tool for ExplicitCwdSandboxedBash {
         language: phoenix_core::llm_language::LlmLanguage,
     ) -> String {
         format!(
-            "{}\n\nCoordinator: every op=run need cwd from active WorkScope path in context. No default repo or cwd. peek, wait, kill use handle without cwd.",
+            "{}\n\nCoordinator: every op=run needs work_scope_id and cwd from the same active WorkScope row in context. No default repo or cwd. peek, wait, kill use handle without either field.",
             SandboxedBashTool.description_for_language(language)
         )
     }
@@ -61,14 +61,24 @@ impl Tool for ExplicitCwdSandboxedBash {
             "minLength": 1,
             "description": "Server-side working directory for op=run. It must exactly identify an active persisted WorkScope cwd or worktree path. There is no default."
         });
+        schema["properties"]["work_scope_id"] = json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Authoritative active WorkScope id paired with cwd for op=run."
+        });
         schema["if"] = json!({
             "properties": { "op": { "const": "run" } },
             "required": ["op"]
         });
-        schema["then"] = json!({ "required": ["cmd", "cwd"] });
+        schema["then"] = json!({ "required": ["cmd", "cwd", "work_scope_id"] });
         schema["else"] = json!({
             "required": ["handle"],
-            "not": { "required": ["cwd"] }
+            "not": {
+                "anyOf": [
+                    { "required": ["cwd"] },
+                    { "required": ["work_scope_id"] }
+                ]
+            }
         });
         schema
     }
@@ -77,14 +87,27 @@ impl Tool for ExplicitCwdSandboxedBash {
         true
     }
 
-    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+    async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
+        let work_scope_id = input
+            .as_object_mut()
+            .and_then(|object| object.remove("work_scope_id"))
+            .and_then(|value| value.as_str().map(str::to_string));
         let invocation = match BashInvocation::from_with_explicit_run_directory(input) {
             Ok(invocation) => invocation,
             Err(error) => return ToolOutput::error(error),
         };
         let context_input = invocation.to_context_tool_value();
         if let Some(cwd) = invocation.explicit_working_directory() {
-            let binding = match self.0.validate_active_work_scope_cwd(cwd).await {
+            let Some(work_scope_id) = work_scope_id.as_deref() else {
+                return ToolOutput::error(
+                    "Coordinator bash run requires work_scope_id paired with cwd",
+                );
+            };
+            let binding = match self
+                .0
+                .validate_active_work_scope_cwd(work_scope_id, cwd)
+                .await
+            {
                 Ok(path) => path,
                 Err(error) => return ToolOutput::error(error),
             };
@@ -96,6 +119,8 @@ impl Tool for ExplicitCwdSandboxedBash {
                     binding.work_scope_id,
                 )
                 .await
+        } else if work_scope_id.is_some() {
+            ToolOutput::error("`work_scope_id` is only valid for bash op=run")
         } else {
             SandboxedBashTool
                 .run_shared_sandboxed(context_input, ctx)
@@ -444,12 +469,21 @@ mod tests {
         let schema = tool.input_schema();
         assert!(schema["properties"].get("cwd").is_some());
         assert_eq!(schema["required"], json!(["op"]));
-        assert_eq!(schema["then"]["required"], json!(["cmd", "cwd"]));
+        assert_eq!(
+            schema["then"]["required"],
+            json!(["cmd", "cwd", "work_scope_id"])
+        );
         assert_eq!(schema["else"]["required"], json!(["handle"]));
-        assert_eq!(schema["else"]["not"]["required"], json!(["cwd"]));
+        assert_eq!(
+            schema["else"]["not"]["anyOf"],
+            json!([
+                { "required": ["cwd"] },
+                { "required": ["work_scope_id"] }
+            ])
+        );
         let alternate =
             tool.description_for_language(phoenix_core::llm_language::LlmLanguage::Caveman);
-        assert!(alternate.contains("every op=run need cwd"));
+        assert!(alternate.contains("every op=run needs work_scope_id and cwd"));
         assert!(alternate.contains("No default repo or cwd"));
 
         let output = tool.run(json!({"op": "run", "cmd": "pwd"}), context).await;
@@ -464,12 +498,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = tool
             .run(
-                json!({"op": "run", "cmd": "pwd", "cwd": dir.path()}),
+                json!({
+                    "op": "run",
+                    "cmd": "pwd",
+                    "cwd": dir.path(),
+                    "work_scope_id": "missing-scope"
+                }),
                 context,
             )
             .await;
 
         assert!(!output.is_success());
-        assert!(output.output().contains("active persisted WorkScope"));
+        assert!(output.output().contains("active persisted environment"));
     }
 }

@@ -3077,14 +3077,16 @@ async fn get_work_scope_inventory(
     if inventory.bash.iter().any(|handle| handle.state.is_live()) {
         let generation = state.resource_monitor.observe(&state).await;
         for handle in &mut inventory.bash {
-            if let Some(pids) = generation.handle_pids(&scope_key, &handle.handle_id) {
+            if let Some(pids) =
+                generation.handle_pids(&scope_key, &handle.control_scope_key, &handle.handle_id)
+            {
                 handle.health = Some(super::resource_monitor::health_for_pids(&generation, pids));
             }
         }
         let visible_handle_ids = inventory
             .bash
             .iter()
-            .map(|handle| handle.handle_id.clone())
+            .map(|handle| (handle.control_scope_key.clone(), handle.handle_id.clone()))
             .collect::<Vec<_>>();
         let visible_pids = generation.visible_handle_pids(&scope_key, &visible_handle_ids);
         inventory.health = (!visible_pids.is_empty())
@@ -3162,6 +3164,7 @@ async fn stop_work_scope_browser_session(
 #[derive(serde::Deserialize)]
 struct InspectQuery {
     conversation_id: String,
+    control_scope_key: String,
     since: Option<u64>,
 }
 
@@ -3180,10 +3183,20 @@ async fn inspect_bash_handle(
 ) -> Result<Json<phoenix_core::domain::process_inspection::BashHandleInspection>, AppError> {
     let work_scope = crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
         .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
+    let control_scope = crate::work_scope::ResourceScopeKey::from_stable_key(
+        &query.control_scope_key,
+    )
+    .ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "malformed control-scope key: {}",
+            query.control_scope_key
+        ))
+    })?;
     let actor = work_scope_actor(&state, &work_scope, &query.conversation_id).await?;
 
     let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
         &work_scope,
+        &control_scope,
         &handle_id,
         query.since,
         Some(&actor),
@@ -3198,14 +3211,16 @@ async fn inspect_bash_handle(
 
     if assembly.live_pgid.is_some() {
         let generation = state.resource_monitor.observe(&state).await;
-        let health = generation.handle_pids(&scope_key, &handle_id).map_or_else(
-            || phoenix_core::domain::work_scope_inventory::ResourceHealth {
-                cpu_percent: None,
-                memory_bytes: None,
-                process_count: None,
-            },
-            |pids| super::resource_monitor::health_for_pids(&generation, pids),
-        );
+        let health = generation
+            .handle_pids(&scope_key, &query.control_scope_key, &handle_id)
+            .map_or_else(
+                || phoenix_core::domain::work_scope_inventory::ResourceHealth {
+                    cpu_percent: None,
+                    memory_bytes: None,
+                    process_count: None,
+                },
+                |pids| super::resource_monitor::health_for_pids(&generation, pids),
+            );
         assembly.inspection.resources_sampled_at = Some(generation.sampled_at);
         assembly.inspection.resources =
             Some(phoenix_core::domain::process_inspection::ResourceSample {
@@ -10630,6 +10645,7 @@ pub(crate) mod hard_delete_cascade_tests {
             Path((scope.stable_key(), "b-1".to_string())),
             Query(super::InspectQuery {
                 conversation_id: actor_id.into(),
+                control_scope_key: scope.stable_key(),
                 since: None,
             }),
         )
@@ -10719,6 +10735,7 @@ pub(crate) mod hard_delete_cascade_tests {
             Path((scope.stable_key(), "b-1".to_string())),
             Query(super::InspectQuery {
                 conversation_id: actor_id.into(),
+                control_scope_key: scope.stable_key(),
                 since: None,
             }),
         )
@@ -10752,6 +10769,7 @@ pub(crate) mod hard_delete_cascade_tests {
             Path(("bogus-no-namespace".to_string(), "b-1".to_string())),
             Query(super::InspectQuery {
                 conversation_id: "conv-inspect".into(),
+                control_scope_key: crate::scope("conv-inspect").stable_key(),
                 since: None,
             }),
         )
@@ -10771,6 +10789,7 @@ pub(crate) mod hard_delete_cascade_tests {
             Path((scope.stable_key(), "b-404".to_string())),
             Query(super::InspectQuery {
                 conversation_id: "conv-inspect".into(),
+                control_scope_key: scope.stable_key(),
                 since: None,
             }),
         )

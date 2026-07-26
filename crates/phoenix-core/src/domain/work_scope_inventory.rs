@@ -89,6 +89,8 @@ impl BashHandleState {
 pub struct BashHandleInventory {
     /// `Handle.handle_id` (e.g. `b-1`).
     pub handle_id: String,
+    /// Stable key of the control namespace that resolves this handle.
+    pub control_scope_key: String,
     /// Optional human-readable label set on the run call.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -240,6 +242,7 @@ mod tests {
     fn live_bash_handle_omits_terminal_only_fields() {
         let inv = BashHandleInventory {
             handle_id: "b-1".into(),
+            control_scope_key: "work:scope-1".into(),
             label: Some("dev".into()),
             cmd: "npm run dev".into(),
             state: BashHandleState::Running,
@@ -265,6 +268,7 @@ mod tests {
     fn tombstoned_bash_handle_omits_live_only_fields() {
         let inv = BashHandleInventory {
             handle_id: "b-2".into(),
+            control_scope_key: "coordinator".into(),
             label: None,
             cmd: "true".into(),
             state: BashHandleState::Tombstoned,

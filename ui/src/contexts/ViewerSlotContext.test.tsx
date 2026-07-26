@@ -148,8 +148,8 @@ describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
     const h = renderSlot();
     expect(h.get().slot.kind).toBe('none');
 
-    act(() => { h.get().openInspect('scope-1', 'b-7'); });
-    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-1', handleId: 'b-7' });
+    act(() => { h.get().openInspect('scope-1', 'scope-1', 'b-7'); });
+    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-1', controlScopeKey: 'scope-1', handleId: 'b-7' });
     expect(h.search()).toContain('viewer=inspect');
     expect(h.search()).toContain('scope=scope-1');
     expect(h.search()).toContain('handle=b-7');
@@ -160,8 +160,8 @@ describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
   });
 
   it('parses an inspect URL on cold entry (URL-as-source-of-truth)', () => {
-    const h = renderSlot('/c/conv-A?viewer=inspect&scope=scope-9&handle=b-3');
-    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-9', handleId: 'b-3' });
+    const h = renderSlot('/c/conv-A?viewer=inspect&scope=scope-9&controlScope=coordinator&handle=b-3');
+    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-9', controlScopeKey: 'coordinator', handleId: 'b-3' });
   });
 
   it('normalizes an inspect URL missing scope or handle to none', async () => {
@@ -176,7 +176,7 @@ describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
 
   it('clears inspect params when switching to another viewer kind', () => {
     const h = renderSlot();
-    act(() => { h.get().openInspect('scope-1', 'b-7'); });
+    act(() => { h.get().openInspect('scope-1', 'scope-1', 'b-7'); });
     expect(h.search()).toContain('scope=scope-1');
 
     act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
@@ -184,10 +184,10 @@ describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
     expect(h.search()).not.toContain('scope=');
     expect(h.search()).not.toContain('handle=');
 
-    act(() => { h.get().openInspect('scope-2', 'b-9'); });
+    act(() => { h.get().openInspect('scope-2', 'scope-2', 'b-9'); });
     expect(h.search()).not.toContain('file=');
     expect(h.search()).not.toContain('root=');
-    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-2', handleId: 'b-9' });
+    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-2', controlScopeKey: 'scope-2', handleId: 'b-9' });
   });
 });
 
