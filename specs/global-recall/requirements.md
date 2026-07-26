@@ -102,7 +102,10 @@ THE Coordinator SHALL use the normal transcript, composer, streaming, continuati
 
 THE SYSTEM SHALL NOT present the Coordinator as ordinary project coding work or as a user-created open-work item
 
-THE SYSTEM SHALL reject archive and hard-delete operations targeting the Coordinator identity so its transcript and singleton identity remain durable
+THE SYSTEM SHALL reject archive and hard-delete operations targeting any member of the Coordinator continuation chain so its transcript and singleton identity remain durable
+
+WHEN a chain lifecycle operation contains a Coordinator conversation
+THE SYSTEM SHALL reject the entire operation before mutating any chain member
 
 ---
 

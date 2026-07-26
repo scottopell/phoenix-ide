@@ -57,12 +57,9 @@ async fn assemble_bash(
     actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Vec<BashHandleInventory> {
-    let Some(table) = bash_handles.get_existing(work_scope).await else {
-        return Vec::new();
-    };
-    let table = table.read().await;
+    let handles = bash_handles.lifecycle_owned_handles(work_scope).await;
     let mut out = Vec::new();
-    for handle in table.all() {
+    for handle in &handles {
         if actor.is_none_or(|access| {
             access.can_control(&handle.creator_conversation_id, handle.authority)
         }) {
@@ -225,6 +222,38 @@ mod tests {
         assert!(h.duration_ms.is_none());
         // output_bytes is always present (0 at spawn, no output written yet).
         assert_eq!(h.output_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn inventory_finds_handle_by_lifecycle_scope_across_control_scope() {
+        use phoenix_core::work_scope::ResourceAuthority;
+
+        let bash = Arc::new(BashHandleRegistry::new());
+        let coordinator = bash.get_or_create(&ResourceScopeKey::Coordinator).await;
+        coordinator
+            .write()
+            .await
+            .insert(Handle::new_live_for_actor_with_lifecycle(
+                ResourceScopeKey::Coordinator,
+                scope(),
+                HandleId::new("b-coordinator"),
+                "coordinator".to_string(),
+                ResourceAuthority::Work,
+                "git status".to_string(),
+                None,
+                4321,
+                1234,
+                RING_BUFFER_BYTES,
+            ));
+        let tmux = Arc::new(TmuxRegistry::with_socket_dir(
+            "/tmp/phoenix-inv-test".into(),
+        ));
+        let browser = BrowserSessionManager::new();
+
+        let inventory = assemble_inventory(&scope(), None, true, &bash, &tmux, &browser).await;
+
+        assert_eq!(inventory.bash.len(), 1);
+        assert_eq!(inventory.bash[0].handle_id, "b-coordinator");
     }
 
     #[tokio::test]

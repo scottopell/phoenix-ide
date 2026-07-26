@@ -43,6 +43,9 @@ Work conversations share the table identified by their durable WorkScope;
 Coordinator continuations share the singleton Coordinator table; the namespaces
 are disjoint. The registry is in-memory only, with no SQLite shadow store or
 cross-restart persistence.
+Coordinator-started processes retain that Coordinator control scope while carrying
+the validated WorkScope as a distinct lifecycle owner, so WorkScope inventory and
+teardown include them without moving or duplicating handles.
 
 A live handle owns a 4MB byte-bounded ring buffer with monotonic per-line
 offsets; reader tasks split incoming pipe bytes on newlines and append to

@@ -633,8 +633,7 @@ mod tests {
         });
         let restored: ToolInput = serde_json::from_value(durable).unwrap();
         let ToolInput::Bash(BashInvocation::Run {
-            working_directory:
-                crate::domain::bash_types::BashWorkingDirectory::Explicit(cwd),
+            working_directory: crate::domain::bash_types::BashWorkingDirectory::Explicit(cwd),
             ..
         }) = restored
         else {

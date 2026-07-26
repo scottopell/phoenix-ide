@@ -2982,13 +2982,13 @@ impl Database {
             .map_err(DbError::Sqlx)
     }
 
-    /// Whether this conversation is the singleton Coordinator.
+    /// Whether this conversation belongs to the durable Coordinator chain.
     ///
     /// # Errors
     /// Returns an error when the singleton relation cannot be queried.
     pub async fn is_coordinator_conversation(&self, conversation_id: &str) -> DbResult<bool> {
         let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM conversations WHERE coordinator_head = 1 AND id = ?1",
+            "SELECT 1 FROM conversations WHERE runtime_role = 'coordinator' AND id = ?1",
         )
         .bind(conversation_id)
         .fetch_optional(&self.pool)
@@ -14617,7 +14617,7 @@ mod tests {
             db.coordinator_conversation_id().await.unwrap().as_deref(),
             Some(continuation.id.as_str())
         );
-        assert!(!db
+        assert!(db
             .is_coordinator_conversation(&coordinator.id)
             .await
             .unwrap());

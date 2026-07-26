@@ -741,7 +741,9 @@ THE SYSTEM SHALL reuse the same Explore read-only sandbox execution path
 AND SHALL require each `op="run"` call to provide a cwd that Phoenix canonicalizes and validates against an active persisted WorkScope environment
 AND SHALL NOT assign the Coordinator a default cwd
 AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
-AND SHALL keep Coordinator handle lifecycle outside WorkScope inventory reconciliation
+AND SHALL keep Coordinator-controlled terminal events from triggering branch-observation reconciliation
+AND SHALL retain Coordinator as the control scope for `peek`, `wait`, and `kill`
+AND SHALL bind each running process to the validated WorkScope as its lifecycle owner so WorkScope process inventory and teardown include the process
 
 WHEN conversation is in Direct, Work, or Branch mode
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash

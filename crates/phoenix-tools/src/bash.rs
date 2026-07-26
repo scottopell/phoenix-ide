@@ -58,9 +58,13 @@ impl SandboxedBashTool {
         input: Value,
         ctx: ToolContext,
         working_dir: std::path::PathBuf,
+        lifecycle_owner: phoenix_core::work_scope::WorkScopeId,
     ) -> ToolOutput {
-        self.run_shared_sandboxed(input, ctx.with_working_dir(working_dir))
-            .await
+        self.run_shared_sandboxed(
+            input,
+            ctx.with_working_dir_and_bash_lifecycle_owner(working_dir, lifecycle_owner),
+        )
+        .await
     }
 }
 

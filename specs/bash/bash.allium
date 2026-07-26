@@ -216,6 +216,11 @@ entity Handle {
     -- (a continuation chain) share the handle (REQ-BASH-WS-001).
     resource_scope: ResourceScope
 
+    -- The persisted WorkScope whose retirement terminates this process. It may
+    -- differ from resource_scope when Coordinator controls a command running
+    -- in an inspected WorkScope.
+    lifecycle_scope: ResourceScope
+
     -- Stable identifier within a work scope. Format is implementation
     -- detail (sequential "b-1", "b-2", ... is fine); Allium contract is
     -- only that the pair (resource_scope, handle_id) is unique.
@@ -449,6 +454,7 @@ rule HandleSpawned {
 
     ensures: Handle.created(
         resource_scope:       resource_scope,
+        lifecycle_scope:      resource_scope,
         handle_id:        h_id,
         cmd:              cmd,
         label:            label,
@@ -1164,6 +1170,11 @@ invariant LiveHandleCapBound {
 invariant HandleResourceScopeScoped {
     for h in Handle:
         h.resource_scope != null
+}
+
+invariant HandleLifecycleScopePresent {
+    for h in Handle:
+        h.lifecycle_scope != null
 }
 
 invariant CoordinatorHandleHasNoDurableWake {
