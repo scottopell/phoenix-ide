@@ -1012,9 +1012,11 @@ impl BrowserSessionManager {
     /// The `HashMap` is the single source of truth for session liveness —
     /// callers must not maintain a parallel bool.
     pub async fn is_active(&self, work_scope: &ResourceScopeKey) -> bool {
-        self.sessions.read().await.values().any(|entry| {
-            entry.scope == *work_scope && !entry.teardown_failed.load(Ordering::SeqCst)
-        })
+        self.sessions
+            .read()
+            .await
+            .values()
+            .any(|entry| entry.scope == *work_scope)
     }
 
     pub async fn is_active_for_actor(
@@ -1025,8 +1027,7 @@ impl BrowserSessionManager {
         self.sessions
             .read()
             .await
-            .get(&session_key(work_scope, actor))
-            .is_some_and(|entry| !entry.teardown_failed.load(Ordering::SeqCst))
+            .contains_key(&session_key(work_scope, actor))
     }
 
     /// Publish a lifecycle edge if a sink is wired. Best-effort: dropped
@@ -1484,25 +1485,48 @@ impl BrowserSessionManager {
             .filter(|(_, entry)| entry.scope == *work_scope)
             .map(|(key, _)| key.clone())
             .collect();
+        let mut started = Vec::new();
+        let mut already_requested = Vec::new();
         for key in keys {
             match self
                 .spawn_kill_session_by_key(key, work_scope.clone())
                 .await
             {
                 KillSessionOutcome::Absent => {}
-                KillSessionOutcome::Started(handle) => {
-                    handle.await.map_err(|error| {
-                        BrowserError::OperationFailed(format!(
-                            "browser kill task failed for {work_scope}: {error}"
-                        ))
-                    })??;
-                }
+                KillSessionOutcome::Started(handle) => started.push(handle),
                 KillSessionOutcome::AlreadyRequested { key, done } => {
-                    self.wait_for_kill_completion(&key, done).await?;
+                    already_requested.push((key, done));
                 }
             }
         }
-        Ok(())
+
+        let mut failures = Vec::new();
+        for result in futures::future::join_all(started).await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error.to_string()),
+                Err(error) => failures.push(format!("browser kill task failed: {error}")),
+            }
+        }
+        for result in futures::future::join_all(
+            already_requested
+                .into_iter()
+                .map(|(key, done)| async move { self.wait_for_kill_completion(&key, done).await }),
+        )
+        .await
+        {
+            if let Err(error) = result {
+                failures.push(error.to_string());
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BrowserError::OperationFailed(format!(
+                "browser teardown failures for {work_scope}: {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     /// Kill all sessions and wait for their Chrome processes and profiles to be released.
