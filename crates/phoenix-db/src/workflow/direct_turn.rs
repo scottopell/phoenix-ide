@@ -188,7 +188,7 @@ impl WorkflowRepository {
                         disposition: input.disposition,
                     })
             {
-                return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+                return Err(prepared_semantics_changed(&existing.prepared));
             }
             return Ok(TurnStep {
                 outcome: TurnOutcome::ExactReplay {
@@ -216,9 +216,7 @@ impl WorkflowRepository {
         {
             if existing_conversation != input.conversation.0 {
                 tx.rollback().await?;
-                return Err(conflict(TurnConflict::CanonicalMessageAlreadyBound {
-                    canonical: CanonicalMessageId(submitted_message_id),
-                }));
+                return Err(prepared_semantics_changed(&input.prepared));
             }
         }
         if input.disposition == AcceptedDisposition::Runtime {
@@ -602,6 +600,7 @@ impl WorkflowRepository {
                     workflow_id: WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
                     conversation: ConversationAuthority(row.get("conversation_id")),
                     prepared: PreparedTurn::rehydrate(
+                        &ConversationAuthority(row.get("conversation_id")),
                         row.get("prepared_fingerprint"),
                         row.get("prepared_payload"),
                     )
@@ -1099,9 +1098,15 @@ fn verify_prepared_payload(
         }));
     }
     if prepared != &stored {
-        return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+        return Err(prepared_semantics_changed(&turn.prepared));
     }
     Ok(())
+}
+
+fn prepared_semantics_changed(prepared: &PreparedTurn) -> DbError {
+    conflict(TurnConflict::PreparedSemanticsChanged {
+        authoritative_fingerprint: prepared.fingerprint().to_string(),
+    })
 }
 
 async fn update_conversation_state_for_adoption_tx(
@@ -1258,11 +1263,11 @@ fn verify_existing_materialized_message_without_sequence(
     prepared: &PreparedDirectTurnPayload,
 ) -> DbResult<()> {
     if message.conversation_id != turn.conversation.0 {
-        return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+        return Err(prepared_semantics_changed(&turn.prepared));
     }
     let (expected_content, expected_display) = prepared.message_content_and_display_data();
     if message.content != expected_content || message.display_data != expected_display {
-        return Err(conflict(TurnConflict::PreparedSemanticsChanged));
+        return Err(prepared_semantics_changed(&turn.prepared));
     }
     Ok(())
 }
@@ -1573,6 +1578,7 @@ fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
         client_key: ClientTurnKey::try_from(row.get::<String, _>("client_turn_key"))
             .map_err(|e| DbError::Serialization(e.to_string()))?,
         prepared: PreparedTurn::rehydrate(
+            &ConversationAuthority(row.get("conversation_id")),
             row.get("prepared_fingerprint"),
             row.get("prepared_payload"),
         )
@@ -1683,7 +1689,9 @@ fn conflict(conflict: TurnConflict) -> DbError {
 fn map_constraint(error: sqlx::Error) -> DbError {
     match error {
         sqlx::Error::Database(database) if database.is_unique_violation() => {
-            DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged)
+            DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged {
+                authoritative_fingerprint: "sqlite constraint".to_string(),
+            })
         }
         other => DbError::Sqlx(other),
     }
