@@ -4657,7 +4657,7 @@ pub(super) async fn run_resource_cleanup_cascade(
 
     // Step 6: browser session. Same any-live-owner rule as tmux
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
-    crate::tools::browser::session::cascade_browser_on_delete(
+    if let Err(error) = crate::tools::browser::session::cascade_browser_on_delete(
         state.runtime.browser_sessions(),
         &work_scope,
         &crate::work_scope::EffectiveResourceAccess::new(
@@ -4672,7 +4672,9 @@ pub(super) async fn run_resource_cleanup_cascade(
         inheritor_scope,
     )
     .await
-    .map_err(|error| AppError::Internal(format!("browser cleanup failed: {error}")))?;
+    {
+        tracing::warn!(conv_id = %id, %error, "browser cleanup failed; lifecycle operation will continue");
+    }
 
     Ok(())
 }

@@ -926,6 +926,7 @@ struct ScopedSession {
     session: Arc<RwLock<BrowserSession>>,
     kill_done: Arc<Notify>,
     kill_requested: Arc<AtomicBool>,
+    teardown_failed: Arc<AtomicBool>,
 }
 
 enum KillSessionOutcome {
@@ -1011,11 +1012,9 @@ impl BrowserSessionManager {
     /// The `HashMap` is the single source of truth for session liveness —
     /// callers must not maintain a parallel bool.
     pub async fn is_active(&self, work_scope: &ResourceScopeKey) -> bool {
-        self.sessions
-            .read()
-            .await
-            .values()
-            .any(|entry| entry.scope == *work_scope)
+        self.sessions.read().await.values().any(|entry| {
+            entry.scope == *work_scope && !entry.teardown_failed.load(Ordering::SeqCst)
+        })
     }
 
     pub async fn is_active_for_actor(
@@ -1026,7 +1025,8 @@ impl BrowserSessionManager {
         self.sessions
             .read()
             .await
-            .contains_key(&session_key(work_scope, actor))
+            .get(&session_key(work_scope, actor))
+            .is_some_and(|entry| !entry.teardown_failed.load(Ordering::SeqCst))
     }
 
     /// Publish a lifecycle edge if a sink is wired. Best-effort: dropped
@@ -1134,6 +1134,12 @@ impl BrowserSessionManager {
             {
                 let sessions = self.sessions.read().await;
                 if let Some(entry) = sessions.get(&key) {
+                    if entry.teardown_failed.load(Ordering::SeqCst) {
+                        return Err(BrowserError::OperationFailed(
+                            "browser session teardown failed; retry cleanup before reuse"
+                                .to_string(),
+                        ));
+                    }
                     if entry.kill_requested.load(Ordering::SeqCst) {
                         let kill_done = entry.kill_done.clone();
                         drop(sessions);
@@ -1149,6 +1155,11 @@ impl BrowserSessionManager {
 
             let sessions = self.sessions.write().await;
             if let Some(entry) = sessions.get(&key) {
+                if entry.teardown_failed.load(Ordering::SeqCst) {
+                    return Err(BrowserError::OperationFailed(
+                        "browser session teardown failed; retry cleanup before reuse".to_string(),
+                    ));
+                }
                 if entry.kill_requested.load(Ordering::SeqCst) {
                     let kill_done = entry.kill_done.clone();
                     drop(sessions);
@@ -1206,6 +1217,7 @@ impl BrowserSessionManager {
                 session: session_arc.clone(),
                 kill_done: Arc::new(Notify::new()),
                 kill_requested: Arc::new(AtomicBool::new(false)),
+                teardown_failed: Arc::new(AtomicBool::new(false)),
             },
         );
         // Drop the write lock before emitting — the receiver may grab the
@@ -1238,6 +1250,11 @@ impl BrowserSessionManager {
         if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
             return Err(BrowserError::AccessDenied);
         }
+        if entry.teardown_failed.load(Ordering::SeqCst) {
+            return Err(BrowserError::OperationFailed(
+                "browser session teardown failed; retry cleanup before reuse".to_string(),
+            ));
+        }
         Ok(Some(entry.session.clone()))
     }
 
@@ -1257,7 +1274,9 @@ impl BrowserSessionManager {
         let sessions = self.sessions.read().await;
         let hit = sessions
             .values()
-            .find(|entry| entry.scope == *work_scope)
+            .find(|entry| {
+                entry.scope == *work_scope && !entry.teardown_failed.load(Ordering::SeqCst)
+            })
             .map(|entry| entry.session.clone());
         if hit.is_none() {
             tracing::debug!(
@@ -1289,13 +1308,14 @@ impl BrowserSessionManager {
         key: String,
         work_scope: ResourceScopeKey,
     ) -> KillSessionOutcome {
-        let Some((session, kill_requested, kill_done)) = ({
+        let Some((session, kill_requested, kill_done, teardown_failed)) = ({
             let sessions = self.sessions.read().await;
             sessions.get(&key).map(|entry| {
                 (
                     entry.session.clone(),
                     entry.kill_requested.clone(),
                     entry.kill_done.clone(),
+                    entry.teardown_failed.clone(),
                 )
             })
         }) else {
@@ -1309,6 +1329,7 @@ impl BrowserSessionManager {
                 done: kill_done,
             };
         }
+        teardown_failed.store(false, Ordering::SeqCst);
 
         let requested_scope = work_scope;
         let manager = Arc::clone(self);
@@ -1325,6 +1346,7 @@ impl BrowserSessionManager {
             };
             if let Err(error) = termination {
                 tracing::warn!(work_scope = %requested_scope, %error, "browser termination failed; retaining tracked session");
+                teardown_failed.store(true, Ordering::SeqCst);
                 kill_requested.store(false, Ordering::SeqCst);
                 kill_done.notify_waiters();
                 return Err(BrowserError::OperationFailed(error.to_string()));
@@ -1343,8 +1365,15 @@ impl BrowserSessionManager {
             };
 
             let user_data_dir = user_data_dir_for_key(&key);
-            if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
-                tracing::warn!(path = %user_data_dir, error = %e, "Failed to clean up browser data dir");
+            if let Err(error) = tokio::fs::remove_dir_all(&user_data_dir).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    teardown_failed.store(true, Ordering::SeqCst);
+                    kill_requested.store(false, Ordering::SeqCst);
+                    kill_done.notify_waiters();
+                    return Err(BrowserError::OperationFailed(format!(
+                        "failed to remove browser profile {user_data_dir}: {error}"
+                    )));
+                }
             }
 
             let removed = {
@@ -1491,10 +1520,23 @@ impl BrowserSessionManager {
         if !scopes.is_empty() {
             tracing::info!(count = scopes.len(), "Shutting down all browser sessions");
         }
-        for scope in scopes {
-            self.kill_session(&scope).await?;
+        let failures: Vec<String> = futures::future::join_all(
+            scopes
+                .into_iter()
+                .map(|scope| async move { (scope.clone(), self.kill_session(&scope).await) }),
+        )
+        .await
+        .into_iter()
+        .filter_map(|(scope, result)| result.err().map(|error| format!("{scope}: {error}")))
+        .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BrowserError::OperationFailed(format!(
+                "browser shutdown failures: {}",
+                failures.join("; ")
+            )))
         }
-        Ok(())
     }
 
     /// Of the idle `(key, scope)` candidates, return the keys that may be
