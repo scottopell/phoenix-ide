@@ -102,6 +102,8 @@ THE Coordinator SHALL use the normal transcript, composer, streaming, continuati
 
 THE SYSTEM SHALL NOT present the Coordinator as ordinary project coding work or as a user-created open-work item
 
+THE SYSTEM SHALL reject archive and hard-delete operations targeting the Coordinator identity so its transcript and singleton identity remain durable
+
 ---
 
 ### REQ-GR-007: Bound Phoenix-Wide Coordinator Capabilities

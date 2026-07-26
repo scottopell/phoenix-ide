@@ -3,9 +3,9 @@
 ## Requirements Summary
 
 The bash tool owns a normative branch-observation contract used by sibling multi-PR specs: the
-terminal lifecycle edge of a bash handle is a supported WorkScope reconciliation boundary for
-authoritative local Git observation. That reconciliation path is implemented and traced here to
-its actual runtime symbols and tests.
+terminal lifecycle edge of a Work-owned bash handle is a supported WorkScope reconciliation
+boundary for authoritative local Git observation. Coordinator-owned handle lifecycle is consumed
+without WorkScope wake registration or inventory reconciliation.
 
 The bash tool executes shell commands as pipe-backed children of the Phoenix
 process. Commands run via `bash -c` with combined stdout/stderr captured into
@@ -23,7 +23,7 @@ a bounded tail before the terminal tool result lands. On process exit, the live
 ring is demoted to a compact in-memory tombstone retained until the
 conversation is hard-deleted or the Phoenix process exits.
 
-A per-WorkScope cap of 8 live handles is enforced with an explicit
+A per-resource-scope cap of 8 live handles is enforced with an explicit
 `handle_cap_reached` error listing existing handles — no silent eviction.
 Persistence across Phoenix or system restart belongs to the separate
 `tmux` tool (see `specs/tmux-integration/`); this tool is "cheap and
@@ -37,13 +37,12 @@ assumption that SIGHUP cascade would clean up children when Phoenix died.
 
 ## Technical Summary
 
-`BashTool` is a stateless `Tool` reached via `ToolContext.bash_handles()`,
-which mirrors the existing browser-session pattern: `async fn bash_handles(&self)
--> Result<Arc<RwLock<WorkScopeHandles>>, BashHandleError>`. The handle
-registry holds per-`WorkScope` maps of live handles and tombstones — keyed by
-`WorkScope` like the browser, tmux, and terminal registries, so a continuation
-chain on one worktree shares one table. In-memory only — no SQLite shadow
-store, no cross-restart persistence (the agent uses `tmux` for that).
+`BashTool` is a stateless `Tool` reached via `ToolContext.bash_handles()`.
+The registry holds per-`ResourceScopeKey` maps of live handles and tombstones.
+Work conversations share the table identified by their durable WorkScope;
+Coordinator continuations share the singleton Coordinator table; the namespaces
+are disjoint. The registry is in-memory only, with no SQLite shadow store or
+cross-restart persistence.
 
 A live handle owns a 4MB byte-bounded ring buffer with monotonic per-line
 offsets; reader tasks split incoming pipe bytes on newlines and append to
@@ -105,8 +104,8 @@ entirely.
 | **REQ-BASH-011:** Command Safety Checks | 🔄 Relocated | Enforcement moved to the permission seam (specs/permissions/); `brush-parser` AST walk (`bash_check`) unchanged, now invoked by the seam |
 | **REQ-BASH-012:** Explore `nono` Sandbox | ✅ Complete | `SandboxedBashTool` uses a Phoenix child-process launcher; the server never applies the irreversible sandbox to itself |
 | **REQ-BASH-013:** Fail-Closed Explore Bash | ✅ Complete | Startup uses `nono::Sandbox::support_info()`; unsupported hosts omit bash from top-level Explore registries |
-| **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | 🔄 Rewrite | Was REQ-BASH-010; tool stays stateless, registry reached via `ctx.bash_handles()` matching browser pattern |
-| **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ❌ New | Registry keyed by `WorkScope`, not conversation id; handles survive the continuation boundary; symmetric with tmux/browser/terminal |
+| **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | ✅ Complete | Tool stays stateless; `ctx.bash_handles()` resolves the caller's structural resource scope |
+| **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ✅ Complete | Work handles use durable WorkScope identity; Coordinator continuations share a disjoint singleton scope |
 | **REQ-BASH-WS-002:** Hard-Delete Cascade Respects Inheritor Scope | ❌ New | `cascade_bash_on_delete` consults inheritor `WorkScope` and skips teardown on scope match, like `cascade_terminal/browser_on_delete` |
 | **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill, and compact conversation summaries retain identity/status/duration/output-tail rather than a generic done badge |
 
@@ -142,10 +141,10 @@ The corresponding Allium spec is `specs/bash/bash.allium`. It models:
 - Reaper rules: `PhoenixSetsSubreaperOnStartup` and
   `PhoenixKillsLiveHandlesOnShutdown` cover the new
   `PR_SET_CHILD_SUBREAPER` / kill-tree machinery.
-- Invariants: per-`WorkScope` live-handle cap, `WorkScope`-scoped handle
+- Invariants: per-resource-scope live-handle cap, resource-scoped handle
   ownership, monotonic line offsets, kill_pending_kernel implies the
   process is alive (pid/pgid available for re-signalling).
-- Surface `AgentBashAccess` with structural `WorkScope` scoping and
+- Surface `AgentBashAccess` with structural resource-scope scoping and
   guarantees `HandleOwnership`, `NoSilentEviction`, and
   `NoAutoEscalation`.
 

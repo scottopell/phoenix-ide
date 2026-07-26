@@ -4706,6 +4706,8 @@ where
                                     input: input.clone(),
                                     error: "approved_commission_review is runtime-only and cannot be emitted by the model".to_string(),
                                 }
+                            } else if is_coordinator {
+                                ToolInput::from_name_and_value_with_explicit_working_directory(name, input.clone())
                             } else {
                                 ToolInput::from_name_and_value(name, input.clone())
                             };
@@ -8045,7 +8047,7 @@ mod continuation_prompt_tests {
 
     #[test]
     fn rejected_tool_call_includes_arguments_without_tool_discriminant() {
-        let call = ToolCall::new("t1", ToolInput::Bash(BashToolInput::run("cargo test")));
+        let call = ToolCall::new("t1", ToolInput::from(BashToolInput::run("cargo test")));
         let rendered = render_rejected_tool_call(&call);
         assert!(rendered.starts_with("bash: "), "got: {rendered}");
         assert!(rendered.contains("cargo test"), "args missing: {rendered}");
@@ -8058,7 +8060,7 @@ mod continuation_prompt_tests {
     #[test]
     fn rejected_tool_call_truncates_oversized_arguments_on_char_boundary() {
         let big = "é".repeat(2000); // multi-byte chars stress the boundary walk
-        let call = ToolCall::new("t1", ToolInput::Bash(BashToolInput::run(big)));
+        let call = ToolCall::new("t1", ToolInput::from(BashToolInput::run(big)));
         let rendered = render_rejected_tool_call(&call);
         assert!(rendered.ends_with("… (truncated)"), "got tail: {rendered}");
         // Truncated near the char cap, not the full 2000-char payload, and
@@ -8074,7 +8076,7 @@ mod continuation_prompt_tests {
     fn continuation_prompt_lists_rejected_calls_and_drops_brevity_framing() {
         let calls = vec![ToolCall::new(
             "t1",
-            ToolInput::Bash(BashToolInput::run("git push")),
+            ToolInput::from(BashToolInput::run("git push")),
         )];
         let prompt = build_continuation_prompt(&calls);
         assert!(prompt.contains("handoff"), "should frame as handoff");
@@ -9693,7 +9695,7 @@ mod steer_drain_detector_tests {
         ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(crate::tools::BashToolInput::run("echo hi")),
+                ToolInput::from(crate::tools::BashToolInput::run("echo hi")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],
@@ -13043,7 +13045,7 @@ mod tool_generation_guard_tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 tool_use_id,
-                ToolInput::Bash(crate::tools::BashToolInput::run("cmd")),
+                ToolInput::from(crate::tools::BashToolInput::run("cmd")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],

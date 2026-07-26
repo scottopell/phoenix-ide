@@ -49,17 +49,17 @@ pub struct BashTool;
 pub struct SandboxedBashTool;
 
 impl SandboxedBashTool {
-    pub async fn run_for_coordinator(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        operations::dispatch_coordinator_sandboxed(input, ctx).await
+    pub async fn run_shared_sandboxed(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        operations::dispatch_shared_sandboxed(input, ctx).await
     }
 
-    pub async fn run_for_coordinator_in_cwd(
+    pub async fn run_shared_sandboxed_in_cwd(
         &self,
         input: Value,
         ctx: ToolContext,
         working_dir: std::path::PathBuf,
     ) -> ToolOutput {
-        self.run_for_coordinator(input, ctx.with_working_dir(working_dir))
+        self.run_shared_sandboxed(input, ctx.with_working_dir(working_dir))
             .await
     }
 }
