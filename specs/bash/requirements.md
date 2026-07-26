@@ -723,6 +723,7 @@ THE Explore bash sandbox SHALL provide:
   rejected when it overlaps protected repo/Git/Phoenix paths
 - inherited `PATH` preservation
 - blocked network access
+- process isolation that prevents signaling unrelated host processes while permitting control of processes created inside the same sandbox
 - a reduced environment that strips ambient SCM/OAuth, LLM-provider, and
   cloud/vendor credential variables
 
@@ -739,6 +740,8 @@ WHEN the Coordinator exposes `bash`
 THE SYSTEM SHALL reuse the same Explore read-only sandbox execution path
 AND SHALL require each `op="run"` call to provide a cwd that Phoenix canonicalizes and validates against an active persisted WorkScope environment
 AND SHALL NOT assign the Coordinator a default cwd
+AND SHALL keep background-command handles available for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
+AND SHALL keep Coordinator handle lifecycle outside WorkScope inventory reconciliation
 
 WHEN conversation is in Direct, Work, or Branch mode
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
@@ -752,7 +755,7 @@ user-selected paths, so sandboxed bash follows the same broad-read model. Readab
 credential files, Phoenix data files, procfs process environments, and other
 ordinary readable filesystem content are part of that accepted read model; protecting
 sensitive reads is a separate feature with its own threat model. The sandbox
-constrains writes, network, and the ambient environment
+constrains writes, network, unrelated-process signaling, and the ambient environment
 it directly passes to the child process. `nono` is the sandbox abstraction; it
 uses the platform's supported backend (Landlock on Linux, Seatbelt on macOS) and
 reports support at startup.
@@ -762,7 +765,7 @@ reports support at startup.
 ### REQ-BASH-013: Fail-Closed Explore Bash Availability
 
 WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
-with network-block support is available
+with network-block and unrelated-process isolation support is available
 THE SYSTEM SHALL detect this at startup
 AND SHALL NOT expose `bash` in top-level Explore mode or the Coordinator
 AND SHALL continue to expose the remaining read-only/planning tools for those modes

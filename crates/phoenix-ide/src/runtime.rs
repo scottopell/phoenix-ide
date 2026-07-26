@@ -253,6 +253,13 @@ struct WorkScopeReconciliationRequest {
     terminal_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashLifecycleBridgeAction {
+    Ignore,
+    Broadcast,
+    Reconcile,
+}
+
 /// Handle to interact with a running conversation
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
@@ -1566,6 +1573,16 @@ impl RuntimeManager {
     /// REQ-PROJ-025 guarantees at most
     /// one non-terminal conversation per scope, so this lands on the one live
     /// member.
+    fn bash_lifecycle_bridge_action(event: &BashLifecycleEvent) -> BashLifecycleBridgeAction {
+        match (&event.work_scope, event.phase.schedules_reconciliation()) {
+            (ResourceScopeKey::Work(_), true) => BashLifecycleBridgeAction::Reconcile,
+            (ResourceScopeKey::Work(_), false) => BashLifecycleBridgeAction::Broadcast,
+            (ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal, _) => {
+                BashLifecycleBridgeAction::Ignore
+            }
+        }
+    }
+
     pub async fn start_work_scope_bridge(self: &Arc<Self>) {
         let bash_rx = self.bash_lifecycle_rx.write().await.take();
         let tmux_rx = self.tmux_lifecycle_rx.write().await.take();
@@ -1591,32 +1608,39 @@ impl RuntimeManager {
                     else => break,
                 };
                 match event {
-                    BridgeEvent::Bash(event) if event.phase.schedules_reconciliation() => {
-                        manager.broadcast_work_scope_update(&event.work_scope).await;
-                        let generation = manager
-                            .db()
-                            .active_work_scope_pr_selection(
-                                event
-                                    .work_scope
-                                    .work_scope_id()
-                                    .expect("bash events have work scope identity"),
-                            )
-                            .await
-                            .ok()
-                            .flatten()
-                            .map_or(0, |state| state.inference_generation);
-                        manager
-                            .reconcile_work_scope_after_bash_terminal(
-                                WorkScopeReconciliationRequest {
-                                    work_scope: event.work_scope,
-                                    terminal_generation: generation,
-                                },
-                            )
-                            .await;
-                    }
-                    BridgeEvent::Bash(event) => {
-                        manager.broadcast_work_scope_update(&event.work_scope).await;
-                    }
+                    BridgeEvent::Bash(event) => match Self::bash_lifecycle_bridge_action(&event) {
+                        BashLifecycleBridgeAction::Ignore => {
+                            tracing::debug!(
+                                scope = %event.work_scope,
+                                phase = ?event.phase,
+                                "skipping work-scope reconciliation for non-Work bash lifecycle"
+                            );
+                        }
+                        BashLifecycleBridgeAction::Broadcast => {
+                            manager.broadcast_work_scope_update(&event.work_scope).await;
+                        }
+                        BashLifecycleBridgeAction::Reconcile => {
+                            manager.broadcast_work_scope_update(&event.work_scope).await;
+                            let ResourceScopeKey::Work(work_scope_id) = &event.work_scope else {
+                                unreachable!("bridge action requires Work scope");
+                            };
+                            let generation = manager
+                                .db()
+                                .active_work_scope_pr_selection(work_scope_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map_or(0, |state| state.inference_generation);
+                            manager
+                                .reconcile_work_scope_after_bash_terminal(
+                                    WorkScopeReconciliationRequest {
+                                        work_scope: event.work_scope,
+                                        terminal_generation: generation,
+                                    },
+                                )
+                                .await;
+                        }
+                    },
                     BridgeEvent::Tmux(work_scope) | BridgeEvent::Browser(work_scope) => {
                         manager.broadcast_work_scope_update(&work_scope).await;
                     }
@@ -3418,6 +3442,49 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             worktree_path: worktree_path.to_string(),
         },
         ConvMode::Direct => ModeContext::Direct,
+    }
+}
+
+#[cfg(test)]
+mod bash_lifecycle_bridge_tests {
+    use super::{BashLifecycleBridgeAction, RuntimeManager};
+    use crate::tools::{BashLifecycleEvent, BashLifecyclePhase};
+    use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+
+    #[test]
+    fn coordinator_lifecycle_is_not_sent_to_work_scope_reconciliation() {
+        for phase in [
+            BashLifecyclePhase::Spawned,
+            BashLifecyclePhase::KillPendingKernel,
+            BashLifecyclePhase::Terminal,
+        ] {
+            assert_eq!(
+                RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
+                    work_scope: ResourceScopeKey::Coordinator,
+                    phase,
+                }),
+                BashLifecycleBridgeAction::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn work_lifecycle_retains_broadcast_and_reconciliation() {
+        let scope = ResourceScopeKey::Work(WorkScopeId::parse("scope").unwrap());
+        assert_eq!(
+            RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
+                work_scope: scope.clone(),
+                phase: BashLifecyclePhase::Spawned,
+            }),
+            BashLifecycleBridgeAction::Broadcast
+        );
+        assert_eq!(
+            RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
+                work_scope: scope,
+                phase: BashLifecyclePhase::Terminal,
+            }),
+            BashLifecycleBridgeAction::Reconcile
+        );
     }
 }
 

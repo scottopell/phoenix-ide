@@ -433,7 +433,7 @@ established submit_result pattern, so no git work happens until approval.
 WHEN the server starts
 THE SYSTEM SHALL ask `nono::Sandbox::support_info()` whether the host has an
 enforceable OS sandbox backend capable of applying the Explore bash network-block
-policy
+and unrelated-process signal-isolation policy
 
 THE SYSTEM SHALL re-check capabilities on every startup
 
@@ -456,8 +456,8 @@ read-only coordination tool in Explore, and spawned Explore sub-agents fall back
 to read/browser/submit tools without bash when sandboxing is unavailable. On
 systems with OS-level sandboxing, bash is useful in Explore mode
 for local investigation while preserving the read-only promise. On systems
-without sandboxing, withholding bash prevents writes structurally. Re-checking on
-startup ensures the tool set matches the current host.
+without sandboxing, withholding bash prevents writes and host-process signaling
+structurally. Re-checking on startup ensures the tool set matches the current host.
 
 ---
 
