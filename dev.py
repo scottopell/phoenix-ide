@@ -8,6 +8,7 @@
 """Development tasks for phoenix-ide."""
 
 import argparse
+import contextvars
 import contextlib
 import dataclasses
 import datetime
@@ -19,6 +20,7 @@ import json
 import os
 import plistlib
 import re
+import resource
 import shutil
 import signal
 import socket
@@ -51,6 +53,8 @@ _DEFAULT_DEV_TRACE_ENDPOINT = (
 )
 _DEV_TRACING = None
 _DEV_TRACE_AVAILABLE = None
+_DEV_CURRENT_SPAN = contextvars.ContextVar("phoenix_dev_current_span", default=None)
+_CHECK_PROFILE = None
 _DEV_TRACE_PACKAGES = (
     "opentelemetry-sdk>=1.39,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.39,<2",
@@ -80,10 +84,9 @@ class _DevTracing:
         self.command_span = None
         self.command_started_at = None
 
-    def start_span(self, name: str, attributes: dict | None = None):
-        context = None
-        if self.command_span is not None:
-            context = self.trace_api.set_span_in_context(self.command_span)
+    def start_span(self, name: str, attributes: dict | None = None, parent=None):
+        parent = parent or _DEV_CURRENT_SPAN.get() or self.command_span
+        context = self.trace_api.set_span_in_context(parent) if parent is not None else None
         return self.tracer.start_span(name, context=context, attributes=attributes)
 
     def finish_span(self, span, attributes: dict, failed: bool = False) -> None:
@@ -95,6 +98,67 @@ class _DevTracing:
 
     def shutdown(self) -> None:
         self.provider.shutdown()
+
+
+@dataclasses.dataclass
+class CheckWorkProfile:
+    run_id: str
+    artifact_dir: Path
+    started_self: resource.struct_rusage
+    started_children: resource.struct_rusage
+    started_thread_ns: int
+
+    @classmethod
+    def start(cls):
+        import uuid
+        run_id = uuid.uuid4().hex
+        artifact_dir = ROOT / "target" / "check-profile" / run_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        return cls(
+            run_id=run_id,
+            artifact_dir=artifact_dir,
+            started_self=resource.getrusage(resource.RUSAGE_SELF),
+            started_children=resource.getrusage(resource.RUSAGE_CHILDREN),
+            started_thread_ns=time.thread_time_ns(),
+        )
+
+    def measurement_path(self, lane: str, step: str) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", f"{lane}-{step}").strip("-")
+        return self.artifact_dir / "processes" / f"{safe}.json"
+
+
+def _cpu_attributes(user_ms: float, system_ms: float, provenance: str, **extra) -> dict:
+    return {
+        "cpu.user_ms": max(0.0, user_ms),
+        "cpu.system_ms": max(0.0, system_ms),
+        "cpu.total_ms": max(0.0, user_ms + system_ms),
+        "cpu.provenance": provenance,
+        **extra,
+    }
+
+
+def _rusage_delta_attributes(before, after, provenance: str) -> dict:
+    return _cpu_attributes(
+        (after.ru_utime - before.ru_utime) * 1000.0,
+        (after.ru_stime - before.ru_stime) * 1000.0,
+        provenance,
+    )
+
+
+def _read_cpu_measurement(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+        return _cpu_attributes(
+            float(value["user_cpu_ms"]),
+            float(value["system_cpu_ms"]),
+            str(value["provenance"]),
+            **{
+                "cpu.tree_closure": str(value["tree_closure"]),
+                "cpu.measurement_path": str(path.relative_to(ROOT)),
+            },
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def _dev_trace_endpoint(environ: dict[str, str] | None = None) -> str | None:
@@ -194,8 +258,15 @@ def _start_dev_command_tracing(command: str) -> None:
     if _DEV_TRACING is None:
         return
     _DEV_TRACING.command_started_at = time.monotonic()
+    attributes = {"dev.command": command}
+    if _CHECK_PROFILE is not None:
+        attributes.update({
+            "check.profile_work": True,
+            "check.profile_run_id": _CHECK_PROFILE.run_id,
+            "check.profile_artifact_dir": str(_CHECK_PROFILE.artifact_dir.relative_to(ROOT)),
+        })
     _DEV_TRACING.command_span = _DEV_TRACING.tracer.start_span(
-        "dev.command", attributes={"dev.command": command}
+        "dev.command", attributes=attributes
     )
 
 
@@ -211,20 +282,51 @@ def _shutdown_dev_tracing(error: BaseException | None) -> None:
             failed = error.code not in (None, 0)
         if tracing.command_span is not None:
             elapsed = max(0.0, time.monotonic() - tracing.command_started_at)
-            tracing.finish_span(tracing.command_span, {
+            attributes = {
                 "dev.elapsed_seconds": elapsed,
                 "dev.success": not failed,
-            }, failed=failed)
+            }
+            if _CHECK_PROFILE is not None:
+                self_usage = resource.getrusage(resource.RUSAGE_SELF)
+                child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+                self_cpu = _rusage_delta_attributes(
+                    _CHECK_PROFILE.started_self, self_usage, "exact_process"
+                )
+                child_cpu = _rusage_delta_attributes(
+                    _CHECK_PROFILE.started_children, child_usage, "exact_waited_children"
+                )
+                attributes.update(_cpu_attributes(
+                    self_cpu["cpu.user_ms"] + child_cpu["cpu.user_ms"],
+                    self_cpu["cpu.system_ms"] + child_cpu["cpu.system_ms"],
+                    "exact_process_plus_waited_children",
+                    **{"cpu.tree_closure": "command_reaped_descendants_unverified"},
+                ))
+            tracing.finish_span(tracing.command_span, attributes, failed=failed)
             tracing.command_span = None
         tracing.shutdown()
     except Exception as shutdown_error:
         print(f"  ⚠ dev trace export failed: {shutdown_error}", file=sys.stderr)
 
 
-def _begin_dev_span(name: str, attributes: dict | None = None):
+def _begin_dev_span(name: str, attributes: dict | None = None, parent=None):
     if _DEV_TRACING is None:
         return _NOOP_SPAN
-    return _DEV_TRACING.start_span(name, attributes)
+    parent = parent or _DEV_CURRENT_SPAN.get()
+    return _DEV_TRACING.start_span(name, attributes, parent=parent)
+
+
+class _DevSpanScope:
+    def __init__(self, span):
+        self.span = span
+        self.token = None
+
+    def __enter__(self):
+        self.token = _DEV_CURRENT_SPAN.set(self.span)
+        return self.span
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        assert self.token is not None
+        _DEV_CURRENT_SPAN.reset(self.token)
 
 
 def _finish_dev_span(span, attributes: dict, failed: bool = False) -> None:
@@ -4229,13 +4331,19 @@ def _finish_check_step_span(
     timed_out: bool,
     lock_wait: float,
     returncode: int,
+    cpu_attributes: dict | None = None,
 ) -> None:
-    _finish_dev_span(span, {
+    attributes = {
         "check.elapsed_seconds": elapsed,
         "check.timed_out": timed_out,
         "cargo.lock_wait_seconds": lock_wait,
         "process.exit_code": returncode,
-    }, failed=returncode != 0)
+    }
+    if cpu_attributes:
+        attributes.update(cpu_attributes)
+    elif _CHECK_PROFILE is not None:
+        attributes.update({"cpu.provenance": "unavailable"})
+    _finish_dev_span(span, attributes, failed=returncode != 0)
 
 
 def cmd_check(
@@ -4243,6 +4351,7 @@ def cmd_check(
     lanes: str | None = None,
     pretty: bool = False,
     compiler_cache: str | None = None,
+    profile_work: bool = False,
 ):
     """Run lint, format check, tests, and task validation in parallel.
 
@@ -4353,8 +4462,21 @@ def cmd_check(
             "check.step": name,
         })
 
+        measurement_path = None
+        launched_cmd = cmd
+        if profile_work and _CHECK_PROFILE is not None:
+            measurement_path = _CHECK_PROFILE.measurement_path(lane, name)
+            measurement_path.parent.mkdir(parents=True, exist_ok=True)
+            launched_cmd = [
+                sys.executable, str(ROOT / "scripts" / "check_profile_command.py"),
+                "--output", str(measurement_path), "--", *cmd,
+            ]
+            env["PHOENIX_CHECK_PROFILE_DIR"] = str(_CHECK_PROFILE.artifact_dir)
+            env["PHOENIX_CHECK_PROFILE_LANE"] = lane
+            env["PHOENIX_CHECK_PROFILE_STEP"] = name
+
         proc = subprocess.Popen(
-            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            launched_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, env=env, start_new_session=True, bufsize=1,
         )
 
@@ -4419,12 +4541,17 @@ def cmd_check(
         with results_lock:
             results.append((name, rc, elapsed, output))
         reporter.step_done(lane, name, rc, elapsed)
+        cpu_attributes = (
+            _read_cpu_measurement(measurement_path)
+            if measurement_path is not None else None
+        )
         _finish_check_step_span(
             span,
             elapsed=elapsed,
             timed_out=timed_out,
             lock_wait=lock_wait,
             returncode=rc,
+            cpu_attributes=cpu_attributes,
         )
         return rc
 
@@ -5060,13 +5187,28 @@ def cmd_check(
     reporter.banner("\nRunning checks in parallel...\n")
 
     def _lane(fn):
-        """Wrap a lane body with reporter lifecycle events."""
+        """Wrap a lane body with reporter lifecycle and trace events."""
         def wrapped():
             lane = threading.current_thread().name
             reporter.lane_start(lane)
+            span = _begin_dev_span("dev.check.lane", {"check.lane": lane})
+            started_thread_ns = time.thread_time_ns()
+            failed = False
             try:
-                fn()
+                with _DevSpanScope(span):
+                    fn()
+            except BaseException:
+                failed = True
+                raise
             finally:
+                attributes = {}
+                if profile_work:
+                    thread_cpu_ms = (time.thread_time_ns() - started_thread_ns) / 1_000_000.0
+                    attributes = _cpu_attributes(
+                        thread_cpu_ms, 0.0, "exact_thread",
+                        **{"cpu.scope": "dev.py_lane_orchestration_only"},
+                    )
+                _finish_dev_span(span, attributes, failed=failed)
                 reporter.lane_done(lane)
         return wrapped
 
@@ -8905,6 +9047,10 @@ def main():
         "--compiler-cache", choices=_COMPILER_CACHE_BACKENDS, default=None,
         help="Rust compiler cache (default: PHOENIX_COMPILER_CACHE or auto)",
     )
+    check_parser.add_argument(
+        "--profile-work", action="store_true", default=False,
+        help="Record hierarchical CPU work in the dev trace and target/check-profile/",
+    )
 
     check_plan_parser = sub.add_parser(
         "check-plan",
@@ -9077,6 +9223,9 @@ def main():
     if pretty:
         _bootstrap_rich()
 
+    global _CHECK_PROFILE
+    if args.command == "check" and getattr(args, "profile_work", False):
+        _CHECK_PROFILE = CheckWorkProfile.start()
     _bootstrap_dev_tracing()
     _start_dev_command_tracing(args.command)
 
@@ -9101,6 +9250,7 @@ def main():
             lanes=args.lanes,
             pretty=pretty,
             compiler_cache=args.compiler_cache,
+            profile_work=args.profile_work,
         )
     elif args.command == "check-plan":
         cmd_check_plan(gate=not args.check_all, lanes=args.lanes, fmt=args.format)

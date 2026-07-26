@@ -25,9 +25,9 @@ class FakeTracing:
         self.started = []
         self.finished = []
 
-    def start_span(self, name, attributes=None):
+    def start_span(self, name, attributes=None, parent=None):
         span = FakeSpan()
-        self.started.append((name, attributes, span))
+        self.started.append((name, attributes, span, parent))
         return span
 
     def finish_span(self, span, attributes, failed=False):
@@ -123,6 +123,17 @@ class DevTracingTests(unittest.TestCase):
         environment = execvpe.call_args.args[2]
         self.assertIn("--offline", command)
         self.assertEqual("1", environment["_PHOENIX_DEV_TRACE_BOOTSTRAP"])
+
+    def test_nested_span_scope_supplies_parent(self):
+        tracing = FakeTracing()
+        self.dev._DEV_TRACING = tracing
+        parent = FakeSpan()
+
+        with self.dev._DevSpanScope(parent):
+            child = self.dev._begin_dev_span("child")
+
+        self.assertIsInstance(child, FakeSpan)
+        self.assertIs(parent, tracing.started[0][3])
 
     def test_cargo_lock_timer_accumulates_multiple_intervals(self):
         timer = self.dev.CargoLockWaitTimer(started_at=10.0)
