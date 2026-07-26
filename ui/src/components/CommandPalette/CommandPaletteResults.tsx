@@ -1,16 +1,19 @@
 import { useEffect, useRef } from 'react';
-import type { PaletteItem } from './types';
+import type { PaletteItem, SearchScope, SearchStatus } from './types';
 import { getConversationState } from './sources/ConversationSource';
 
 interface Props {
   results: PaletteItem[];
   selectedIndex: number;
   mode: 'search' | 'action';
+  searchStatus: SearchStatus;
+  query: string;
+  scope: SearchScope;
   onHover: (index: number) => void;
   onClick: (index: number) => void;
 }
 
-export function CommandPaletteResults({ results, selectedIndex, mode, onHover, onClick }: Props) {
+export function CommandPaletteResults({ results, selectedIndex, mode, searchStatus, query, scope, onHover, onClick }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
 
   // Scroll selected item into view
@@ -22,8 +25,31 @@ export function CommandPaletteResults({ results, selectedIndex, mode, onHover, o
 
   if (results.length === 0) {
     return (
-      <div className="cp-results-empty">
-        {mode === 'action' ? 'No matching commands' : 'No results'}
+      <div className="cp-results-empty" data-testid="cp-empty-state">
+        {mode === 'action'
+          ? 'No matching commands'
+          : searchStatus.kind === 'awaiting-query'
+            ? 'Type a query to search conversation content'
+            : searchStatus.kind === 'debouncing'
+              ? 'Waiting for more typing…'
+              : searchStatus.kind === 'loading'
+                ? scope === 'conversation-content'
+                  ? 'Searching conversation content…'
+                  : 'Searching…'
+                : searchStatus.kind === 'warming'
+                  ? searchStatus.message
+                  : searchStatus.kind === 'error'
+                    ? searchStatus.message
+                    : query
+                      ? scope === 'conversation-content'
+                        ? 'No conversation content results'
+                        : scope === 'conversation-slugs'
+                          ? 'No conversation results'
+                          : 'No results'
+                      : scope === 'conversation-slugs'
+                        ? 'Start typing to search conversations'
+                        : 'Start typing to search'}
+
       </div>
     );
   }
@@ -59,6 +85,11 @@ export function CommandPaletteResults({ results, selectedIndex, mode, onHover, o
                 <span className="cp-result-title">{item.title}</span>
                 {item.subtitle && mode !== 'action' && (
                   <span className="cp-result-subtitle">{item.subtitle}</span>
+                )}
+                {item.badge && mode !== 'action' && (
+                  <span className="cp-result-subtitle">
+                    <span className="cp-inline-indicator">{item.badge}</span>
+                  </span>
                 )}
                 {item.snippet && mode !== 'action' && (
                   <span className="cp-result-snippet">{item.snippet}</span>

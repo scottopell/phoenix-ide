@@ -40,16 +40,43 @@ The user (and any consuming surface) must be able to answer:
 
 ### REQ-RET-001: Scope-Filtered Retrieval Primitive
 
-WHEN a caller requests retrieval with a query string, a scope, and a
-result limit `top_k`
+WHEN a caller requests retrieval with a query string, a scope, a result
+limit `top_k`, and a typed result policy
 THE SYSTEM SHALL return up to `top_k` message chunks drawn only from
-conversations admitted by the scope, ranked by relevance to the query
+conversations admitted by the scope and result policy, ranked by relevance
+to the query
 
 THE scope SHALL be one of:
 - `Conversations(ids)` — retrieval is restricted to messages whose
   conversation id is in the given set (the chain case)
 - `Global` — retrieval spans every conversation in the database (the
   application-wide case)
+- `GlobalExcluding(ids)` — retrieval spans every conversation except those
+  whose id is in the supplied set
+
+THE result policy SHALL select structurally:
+- whether all in-scope conversations or only user-visible top-level
+  conversations are eligible
+- whether every ranked message chunk or only the strongest chunk per
+  conversation is returned
+- whether every query token requires an exact lexical match or the final
+  content-bearing token may match by prefix
+
+WHEN user-visible top-level eligibility is selected
+THE SYSTEM SHALL include active and archived user-initiated top-level
+conversations
+AND SHALL exclude Coordinator, child/sub-agent, and archived
+`deletion_pending` conversations before ranking and limiting
+
+WHEN strongest-chunk-per-conversation grouping is selected
+THE SYSTEM SHALL perform grouping before applying `top_k`
+SO THAT repeated matches in one conversation cannot consume another
+matching conversation's place in the result set
+
+WHEN final-token-prefix matching is selected
+THE SYSTEM SHALL construct the prefix expression from normalized literal
+terms
+AND SHALL NOT interpret user input as retrieval-backend operators
 
 THE query SHALL be accepted as **natural language** (a user's question),
 and the primitive SHALL build whatever backend query that requires so
@@ -72,10 +99,10 @@ of REQ-RET-008, used by an agent after retrieval has pointed it at a
 conversation) is a distinct, non-ranked operation and is permitted —
 it, too, is scope-bound, but it is not a parallel retrieval strategy.
 
-**Rationale:** The scope parameter is the *only* axis that separates
-chain recall from application-wide recall. Making it a parameter of one
-primitive — rather than two parallel code paths — is what guarantees
-both surfaces answer with the same quality. Routing all *ranking*
+**Rationale:** The scope and typed result policy are the axes that specialize
+a retrieval request. Keeping them as parameters of one primitive — rather
+than separate ranking paths — guarantees every surface uses the same index
+and relevance backend. Routing all *ranking*
 through this entry point keeps relevance strategy in one place that can
 be improved (e.g. swapping the backend) once for everyone. Fetching a
 known conversation's content is not ranking and does not compete with

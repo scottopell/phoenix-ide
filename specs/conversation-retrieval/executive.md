@@ -3,14 +3,7 @@
 ## Requirements Summary
 
 Conversation Retrieval is a single, scope-filtered retrieval primitive
-over the content of every conversation Phoenix has recorded. Given a
-natural-language query and a **scope** — a set of conversation ids, or
-"everything" — it returns the most relevant message chunks with their
-provenance (which conversation, which message, when, what role). The
-primitive has exactly one index over all messages; callers differ only
-in the scope they pass. Chain Q&A passes the chain's member ids;
-a future application-wide Q&A passes the global scope. Both read from
-the same index through the same call.
+over the content of every conversation Phoenix has recorded. Given a typed retrieval request containing a natural-language query, a **scope** — a set of conversation ids, or "everything" — and a result policy, it returns the most relevant message chunks with their provenance (which conversation, which message, when, what role). The primitive has exactly one index over all messages. Chain Q&A passes the chain's member ids and requests ordinary message hits; application-wide consumers pass the global scope. The command palette additionally requests user-visible top-level rows, final-token prefix matching, and the best hit per conversation. All read from the same index through the same call.
 
 The first consumer is a read-only **agentic** Q&A loop (chains'
 REQ-CHN-009): the primitive is exposed to that agent as a search tool,
@@ -44,10 +37,7 @@ backend is FTS5/BM25 (lexical), chosen because the bundled SQLite ships
 FTS5 — no new dependency, no embedding provider, no network on the
 query path. The trait is the seam: a vector backend (embeddings +
 similarity) or a hybrid backend (rank-fused lexical + vector) drops in
-behind it without changing any caller. Scope is an enum
-(`Conversations(set)` / `Global`, with `Project` and `Since` as named
-extension points), applied as a query predicate rather than a
-post-filter so `top_k` is honored after scoping.
+behind it without changing any caller. Scope is an enum (`Conversations(set)` / `Global` / `GlobalExcluding(set)`) and the typed request also selects visibility, result grouping, and lexical match mode. Scope and visibility are applied as query predicates, and best-per-conversation grouping is applied in SQL before the final limit, so the requested bound is honored after all eligibility and grouping rules.
 
 Chain Q&A consumes this primitive as a **read-only agent loop**, not a
 one-shot bundle: the agent is given a search tool (this primitive, scoped
@@ -67,7 +57,7 @@ tracks implementation status.
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-RET-001:** Scope-Filtered Retrieval Primitive | ✅ Complete | `Fts5Retriever::retrieve` over `RetrievalScope` |
+| **REQ-RET-001:** Scope-Filtered Retrieval Primitive | ✅ Complete | `Fts5Retriever::retrieve` over typed `RetrievalRequest` policy |
 | **REQ-RET-002:** One Index Over All Conversation Messages | ✅ Complete | Single `message_fts` table over all messages |
 | **REQ-RET-003:** Index Is a Rebuildable Derived Cache | ✅ Complete | Migration-introduced FTS5 table and indexed row locator + idempotent `Fts5Retriever::reconcile` backfill |
 | **REQ-RET-004:** Text Extracted From Typed Message Content | ✅ Complete | Shared `ContentBlock::render_text` extraction, also used by the chain-qa read path |
@@ -91,9 +81,6 @@ structural. Application-wide Q&A uses the same `Global` retrieval scope.
   a product decision to add semantic ambient memory. A vector backend
   additionally requires an embedding provider (the Anthropic provider
   offers none) and a chunk-splitting strategy for long messages.
-- **Application-wide Q&A surface.** The `Global` scope is the substrate;
-  the surface that uses it (and the dashboard it lives on) is specified
-  elsewhere.
 - **Re-ranking or query rewriting inside the primitive.** One `retrieve`
   call is one ranked lookup; the consuming agent supplies iteration by
   calling it repeatedly (REQ-RET-008).

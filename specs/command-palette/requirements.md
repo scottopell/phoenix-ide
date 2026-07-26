@@ -135,20 +135,52 @@ AND show results without requiring scroll for common cases (8-10 items visible)
 
 ---
 
-### REQ-CP-009: Source-Scoped Search
+### REQ-CP-009: Conversation-Scoped Search
 
 WHEN user types `c` followed by whitespace in search mode
-THE SYSTEM SHALL search only conversations
-AND SHALL use the text after the prefix as the conversation slug query
+THE SYSTEM SHALL search conversation message content through the ranked retrieval primitive defined by `specs/conversation-retrieval/`
+AND SHALL use the text after the prefix as the natural-language content query
+AND SHALL preserve the full prefixed text in the input field
+
+WHEN the conversation content query is empty
+THE SYSTEM SHALL prompt the user to enter content search text
+AND SHALL NOT issue an unbounded retrieval query
+
+WHEN conversation content matches
+THE SYSTEM SHALL show at most one result per conversation
+AND SHALL order conversations by the relevance of their strongest matching message
+AND SHALL show a bounded match excerpt for each conversation
+AND SHALL include active and archived user-initiated top-level conversations
+AND SHALL exclude Coordinator, sub-agent, deletion-pending, and hidden message content before applying the result limit
+AND SHALL identify archived conversations inline
+
+WHEN building the lexical query for conversation content search
+THE SYSTEM SHALL match natural-language content terms using disjunction
+AND SHALL allow the final content-bearing term to match a token prefix
+AND SHALL NOT interpret user input as raw FTS operators
+
+WHEN the retrieval index has not completed startup reconciliation
+THE SYSTEM SHALL indicate that conversation search is warming
+AND SHALL NOT present an empty result as authoritative
+
+WHEN conversation content retrieval fails
+THE SYSTEM SHALL distinguish the failure from an authoritative no-match result
+
+WHEN user types `cs` followed by whitespace in search mode
+THE SYSTEM SHALL search only conversation slugs
+AND SHALL use the text after the prefix as a fuzzy slug query
 AND SHALL preserve the full prefixed text in the input field
 
 WHEN the conversation slug query is empty
-THE SYSTEM SHALL show the default conversation results
+THE SYSTEM SHALL show the default recent conversation results
 
-WHEN input begins with `c` without following whitespace
+WHEN input begins with `c` or `cs` without following whitespace
 THE SYSTEM SHALL treat the input as an unscoped search query
 
-WHEN user removes the conversation scope prefix
+WHEN parsing scoped search input
+THE SYSTEM SHALL recognize the longest valid prefix first
+
+WHEN user removes a conversation scope prefix
 THE SYSTEM SHALL resume searching all sources available in the current context
 
-**Rationale:** A short, explicit scope lets keyboard users avoid file and code results while retaining fuzzy slug matching and predictable first-result selection.
+**Rationale:** Content recall and known-slug navigation are different journeys. Separate short prefixes keep both keyboard-efficient while routing content relevance through the application-wide retrieval contract rather than inventing a palette-specific index or ranking path.

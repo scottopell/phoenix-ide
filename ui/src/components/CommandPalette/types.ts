@@ -4,7 +4,16 @@ import type React from 'react';
 
 export type ClosedState = { status: 'closed' };
 
-export type SearchScope = 'global' | 'conversations';
+export type SearchScope = 'global' | 'conversation-content' | 'conversation-slugs';
+
+export type SearchStatus =
+  | { kind: 'idle' }
+  | { kind: 'awaiting-query' }
+  | { kind: 'debouncing' }
+  | { kind: 'loading' }
+  | { kind: 'warming'; message: string }
+  | { kind: 'error'; message: string }
+  | { kind: 'ready' };
 
 export type OpenState = {
   status: 'open';
@@ -14,6 +23,7 @@ export type OpenState = {
   rawInput: string; // Exact text in input field
   selectedIndex: number;
   results: PaletteItem[];
+  searchStatus: SearchStatus;
 };
 
 export type PaletteState = ClosedState | OpenState;
@@ -22,6 +32,11 @@ export type PaletteEvent =
   | { type: 'OPEN' }
   | { type: 'CLOSE' }
   | { type: 'SET_QUERY'; rawInput: string }
+  | { type: 'SEARCH_AWAITING_QUERY' }
+  | { type: 'SEARCH_DEBOUNCING' }
+  | { type: 'SEARCH_LOADING' }
+  | { type: 'SEARCH_WARMING'; message: string }
+  | { type: 'SEARCH_ERROR'; message: string }
   | { type: 'SET_RESULTS'; results: PaletteItem[] }
   | { type: 'SELECT_NEXT' }
   | { type: 'SELECT_PREV' }
@@ -33,6 +48,7 @@ export interface PaletteItem {
   id: string;
   title: string;
   subtitle?: string;
+  badge?: string;
   /** Match snippet for code search results. */
   snippet?: string;
   icon?: React.ReactNode;

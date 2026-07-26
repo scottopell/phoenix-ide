@@ -144,6 +144,13 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSearchMetadata {
+    pub id: String,
+    pub slug: String,
+    pub archived: bool,
+}
+
 pub(crate) async fn persist_continuation_start_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,

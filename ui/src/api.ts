@@ -79,6 +79,30 @@ export type { BashRingWindow } from './generated/BashRingWindow';
 export type { BashRingLine } from './generated/BashRingLine';
 import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
 
+export interface ConversationContentSearchHit {
+  conversation_id: string;
+  slug: string;
+  archived: boolean;
+  message_id: string;
+  message_type: string;
+  created_at: string;
+  snippet: string;
+  score: number;
+}
+
+export interface ConversationContentSearchResponse {
+  hits: ConversationContentSearchHit[];
+}
+
+export class ConversationSearchWarmingError extends Error {
+  readonly errorType = 'conversation_search_warming';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConversationSearchWarmingError';
+  }
+}
+
 export type { ModelEffort } from './generated/ModelEffort';
 import type { ModelEffort } from './generated/ModelEffort';
 import type { EffortSource } from './generated/EffortSource';

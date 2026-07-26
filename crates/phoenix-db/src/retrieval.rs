@@ -36,6 +36,73 @@ pub enum RetrievalScope {
     GlobalExcluding(Vec<String>),
 }
 
+/// Which rows inside the selected scope are eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalVisibility {
+    /// User-visible top-level conversations only, across active and archived.
+    UserTopLevel,
+    /// All conversations in scope, regardless of archival state.
+    All,
+}
+
+/// How multiple hits from one conversation should be reduced before the final
+/// limit is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalGrouping {
+    /// Return every matching message chunk.
+    None,
+    /// Keep only the best hit per conversation before the outer limit.
+    BestPerConversation,
+}
+
+/// How the caller wants natural-language query terms translated into the FTS
+/// MATCH expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalMatchMode {
+    /// Every content-bearing term must match exactly as a token.
+    ExactTerms,
+    /// The final content-bearing term may match by token prefix.
+    FinalTokenPrefix,
+}
+
+/// Structured retrieval request so callers choose scope, visibility policy,
+/// grouping, and limit as one coherent value.
+#[derive(Debug, Clone)]
+pub struct RetrievalRequest {
+    query: String,
+    scope: RetrievalScope,
+    visibility: RetrievalVisibility,
+    grouping: RetrievalGrouping,
+    match_mode: RetrievalMatchMode,
+    limit: usize,
+}
+
+impl RetrievalRequest {
+    #[must_use]
+    pub fn natural_language(query: impl Into<String>, scope: RetrievalScope, limit: usize) -> Self {
+        Self {
+            query: query.into(),
+            scope,
+            visibility: RetrievalVisibility::All,
+            grouping: RetrievalGrouping::None,
+            match_mode: RetrievalMatchMode::ExactTerms,
+            limit,
+        }
+    }
+
+    #[must_use]
+    pub fn palette_conversation_search(query: impl Into<String>, limit: usize) -> Self {
+        Self {
+            query: query.into(),
+            scope: RetrievalScope::Global,
+            visibility: RetrievalVisibility::UserTopLevel,
+            grouping: RetrievalGrouping::BestPerConversation,
+            match_mode: RetrievalMatchMode::FinalTokenPrefix,
+            limit,
+        }
+    }
+}
+
 /// Identity of a chunk *within* its message (REQ-RET-006). One chunk per
 /// message in the lexical backend (`ordinal` 0, `char_range` `None`); a
 /// chunking backend assigns a distinct ordinal/range per chunk. Present
@@ -87,9 +154,7 @@ pub trait MessageRetriever: Send + Sync {
     /// Returns [`RetrievalError`] if the backing query fails.
     async fn retrieve(
         &self,
-        query: &str,
-        scope: RetrievalScope,
-        top_k: usize,
+        request: RetrievalRequest,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError>;
 
     /// Whether startup reconciliation has completed. Consumers that query broad
@@ -267,14 +332,12 @@ impl MessageRetriever for Fts5Retriever {
 
     async fn retrieve(
         &self,
-        query: &str,
-        scope: RetrievalScope,
-        top_k: usize,
+        request: RetrievalRequest,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let Some(match_expr) = build_fts_query(query) else {
+        let Some(match_expr) = build_fts_query(&request.query, request.match_mode) else {
             return Ok(Vec::new());
         };
-        let (scope_ids, excluding): (&[String], bool) = match &scope {
+        let (scope_ids, excluding): (&[String], bool) = match &request.scope {
             RetrievalScope::Global => (&[], false),
             RetrievalScope::GlobalExcluding(ids) => (ids, true),
             RetrievalScope::Conversations(ids) => {
@@ -286,15 +349,30 @@ impl MessageRetriever for Fts5Retriever {
         };
 
         let mut sql = String::from(
-            "SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
-             meta.message_type, meta.created_at, \
-             snippet(message_fts, 0, '', '', '…', 24) AS snippet, bm25(message_fts) AS score \
-             FROM message_fts \
-             JOIN message_fts_rows meta ON meta.fts_rowid = message_fts.rowid \
-             JOIN messages source ON source.message_id = meta.message_id \
-             WHERE message_fts MATCH ? \
-               AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
+            "WITH ranked_hits AS (\
+                 SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
+                        meta.message_type, meta.created_at, \
+                        snippet(message_fts, 0, '', '', '…', 24) AS snippet, \
+                        bm25(message_fts) AS score",
         );
+        sql.push_str(
+            " FROM message_fts \
+               JOIN message_fts_rows meta ON meta.fts_rowid = message_fts.rowid \
+               JOIN messages source ON source.message_id = meta.message_id \
+               JOIN conversations c ON c.id = meta.conversation_id \
+               WHERE message_fts MATCH ? \
+                 AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
+        );
+        if request.visibility == RetrievalVisibility::UserTopLevel {
+            sql.push_str(
+                " AND c.user_initiated = 1 AND c.runtime_role != 'coordinator' \
+                  AND c.parent_conversation_id IS NULL \
+                  AND NOT (c.archived = 1 AND EXISTS (\
+                      SELECT 1 FROM conversation_creation_jobs j \
+                      WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
+                  ))",
+            );
+        }
         if !scope_ids.is_empty() {
             if excluding {
                 sql.push_str(" AND meta.conversation_id NOT IN (");
@@ -309,20 +387,46 @@ impl MessageRetriever for Fts5Retriever {
             }
             sql.push(')');
         }
-        sql.push_str(" ORDER BY score LIMIT ?");
+        sql.push(')');
+        match request.grouping {
+            RetrievalGrouping::None => {
+                sql.push_str(
+                    " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, snippet, score \
+                      FROM ranked_hits \
+                      ORDER BY score, created_at DESC \
+                      LIMIT ?",
+                );
+            }
+            RetrievalGrouping::BestPerConversation => {
+                sql.push_str(
+                    ", grouped_hits AS (\
+                         SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, snippet, score, \
+                                ROW_NUMBER() OVER (\
+                                    PARTITION BY conversation_id \
+                                    ORDER BY score, created_at DESC, message_id\
+                                ) AS conversation_rank \
+                         FROM ranked_hits\
+                     ) \
+                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, snippet, score \
+                     FROM grouped_hits \
+                     WHERE conversation_rank = 1 \
+                     ORDER BY score, created_at DESC \
+                     LIMIT ?",
+                );
+            }
+        }
 
-        // `sql` interpolates only a placeholder count (one `?` per scoped id);
-        // every value — the MATCH expression, the ids, the limit — is bound, so
-        // there is no injection surface.
         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(match_expr);
         for id in scope_ids {
             q = q.bind(id);
         }
-        let limit = i64::try_from(top_k).unwrap_or(i64::MAX);
+        let limit = i64::try_from(request.limit).unwrap_or(i64::MAX);
         q = q.bind(limit);
 
-        let rows = q.try_map(parse_chunk_row).fetch_all(&self.pool).await?;
-        Ok(rows)
+        q.try_map(parse_chunk_row)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
     }
 
     async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError> {
@@ -666,21 +770,33 @@ const STOPWORDS: &[&str] = &[
 /// Build an FTS5 MATCH expression from a natural-language question
 /// (REQ-RET-001). Tokenizes on non-alphanumerics, lowercases, drops stop
 /// words and FTS5-operator characters, and joins the remaining content terms
-/// with `OR` (each quoted as a literal). Returns `None` when nothing
-/// content-bearing remains (the caller returns an empty result).
-fn build_fts_query(natural: &str) -> Option<String> {
-    let terms: Vec<String> = natural
+/// with `OR` (each quoted as a literal). The final content-bearing token is a
+/// prefix term so incomplete palette input can match the start of the last
+/// word typed. Returns `None` when nothing content-bearing remains (the caller
+/// returns an empty result).
+fn build_fts_query(natural: &str, match_mode: RetrievalMatchMode) -> Option<String> {
+    let mut terms: Vec<String> = natural
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(str::to_lowercase)
         .filter(|t| !STOPWORDS.contains(&t.as_str()))
-        .map(|t| format!("\"{t}\""))
         .collect();
     if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" OR "))
+        return None;
     }
+    let last = terms.len() - 1;
+    let terms: Vec<String> = terms
+        .drain(..)
+        .enumerate()
+        .map(|(idx, t)| {
+            if idx == last && match_mode == RetrievalMatchMode::FinalTokenPrefix {
+                format!("\"{t}\"*")
+            } else {
+                format!("\"{t}\"")
+            }
+        })
+        .collect();
+    Some(terms.join(" OR "))
 }
 
 /// Stable, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used to
@@ -701,10 +817,19 @@ mod tests {
     use super::*;
     use crate::Database;
     use phoenix_core::domain::db_schema::MessageContent;
+    use std::collections::HashSet;
+
+    fn global_request(query: &str) -> RetrievalRequest {
+        RetrievalRequest::natural_language(query, RetrievalScope::Global, 10)
+    }
 
     #[test]
     fn build_query_drops_filler_and_ors_terms() {
-        let q = build_fts_query("what did we decide about the auth schema").unwrap();
+        let q = build_fts_query(
+            "what did we decide about the auth schema",
+            RetrievalMatchMode::ExactTerms,
+        )
+        .unwrap();
         assert!(q.contains("\"auth\""));
         assert!(q.contains("\"schema\""));
         assert!(q.contains("\"decide\""));
@@ -715,8 +840,20 @@ mod tests {
 
     #[test]
     fn build_query_empty_when_only_stopwords() {
-        assert!(build_fts_query("what did we do").is_none());
-        assert!(build_fts_query("   ").is_none());
+        assert!(build_fts_query("what did we do", RetrievalMatchMode::ExactTerms).is_none());
+        assert!(build_fts_query("   ", RetrievalMatchMode::ExactTerms).is_none());
+    }
+
+    #[test]
+    fn build_query_keeps_exact_terms_exact() {
+        let q = build_fts_query("observed kang", RetrievalMatchMode::ExactTerms).unwrap();
+        assert_eq!(q, "\"observed\" OR \"kang\"");
+    }
+
+    #[test]
+    fn build_query_prefixes_only_for_palette_mode() {
+        let q = build_fts_query("observed kang", RetrievalMatchMode::FinalTokenPrefix).unwrap();
+        assert_eq!(q, "\"observed\" OR \"kang\"*");
     }
 
     #[test]
@@ -792,7 +929,7 @@ mod tests {
 
         // Global finds the rate-limiter message.
         let hits = r
-            .retrieve("how does the rate limiter work", RetrievalScope::Global, 10)
+            .retrieve(global_request("how does the rate limiter work"))
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -801,22 +938,28 @@ mod tests {
 
         // Scoped to c-b only: the rate-limiter query returns nothing in-scope.
         let scoped = r
-            .retrieve(
-                "rate limiter",
-                RetrievalScope::Conversations(vec!["c-b".into()]),
-                10,
-            )
+            .retrieve(RetrievalRequest {
+                query: "rate limiter".to_string(),
+                scope: RetrievalScope::Conversations(vec!["c-b".into()]),
+                visibility: RetrievalVisibility::All,
+                grouping: RetrievalGrouping::None,
+                match_mode: RetrievalMatchMode::ExactTerms,
+                limit: 10,
+            })
             .await
             .unwrap();
         assert!(scoped.is_empty());
 
         // Scoped to c-b: its own content is found.
         let scoped = r
-            .retrieve(
-                "auth schema",
-                RetrievalScope::Conversations(vec!["c-b".into()]),
-                10,
-            )
+            .retrieve(RetrievalRequest {
+                query: "auth schema".to_string(),
+                scope: RetrievalScope::Conversations(vec!["c-b".into()]),
+                visibility: RetrievalVisibility::All,
+                grouping: RetrievalGrouping::None,
+                match_mode: RetrievalMatchMode::ExactTerms,
+                limit: 10,
+            })
             .await
             .unwrap();
         assert_eq!(scoped.len(), 1);
@@ -839,7 +982,7 @@ mod tests {
         let retriever = Fts5Retriever::new(db.pool().clone());
         assert_eq!(
             retriever
-                .retrieve("confidential recovery", RetrievalScope::Global, 10)
+                .retrieve(global_request("confidential recovery"))
                 .await
                 .unwrap()
                 .len(),
@@ -851,7 +994,7 @@ mod tests {
             .unwrap();
 
         assert!(retriever
-            .retrieve("confidential recovery", RetrievalScope::Global, 10)
+            .retrieve(global_request("confidential recovery"))
             .await
             .unwrap()
             .is_empty());
@@ -870,30 +1013,18 @@ mod tests {
         .await
         .unwrap();
         let r = Fts5Retriever::new(db.pool().clone());
-        assert_eq!(
-            r.retrieve("alpha", RetrievalScope::Global, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(r.retrieve(global_request("alpha")).await.unwrap().len(), 1);
 
         db.update_tool_message_content("t1", "compiling crate omega")
             .await
             .unwrap();
         // Old term gone, new term present.
         assert!(r
-            .retrieve("alpha", RetrievalScope::Global, 10)
+            .retrieve(global_request("alpha"))
             .await
             .unwrap()
             .is_empty());
-        assert_eq!(
-            r.retrieve("omega", RetrievalScope::Global, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(r.retrieve(global_request("omega")).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -909,17 +1040,11 @@ mod tests {
         .await
         .unwrap();
         let r = Fts5Retriever::new(db.pool().clone());
-        assert_eq!(
-            r.retrieve("zebra", RetrievalScope::Global, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(r.retrieve(global_request("zebra")).await.unwrap().len(), 1);
 
         db.delete_conversation("c-a").await.unwrap();
         assert!(r
-            .retrieve("zebra", RetrievalScope::Global, 10)
+            .retrieve(global_request("zebra"))
             .await
             .unwrap()
             .is_empty());
@@ -957,14 +1082,11 @@ mod tests {
 
         // Real message is searchable again; orphan is gone.
         assert_eq!(
-            r.retrieve("marmalade", RetrievalScope::Global, 10)
-                .await
-                .unwrap()
-                .len(),
+            r.retrieve(global_request("marmalade")).await.unwrap().len(),
             1
         );
         assert!(r
-            .retrieve("ghost", RetrievalScope::Global, 10)
+            .retrieve(global_request("ghost"))
             .await
             .unwrap()
             .is_empty());
@@ -1140,11 +1262,263 @@ mod tests {
         fts_upsert(db.pool(), &msg).await.unwrap();
 
         let r = Fts5Retriever::new(db.pool().clone());
+        let hits = r.retrieve(global_request("kangaroo")).await.unwrap();
+        assert_eq!(hits.len(), 1, "repeated upsert must not duplicate the row");
+    }
+
+    #[tokio::test]
+    async fn final_content_token_matches_by_prefix_when_requested() {
+        let db = seed().await;
+        db.add_message(
+            "prefix-1",
+            "c-a",
+            &MessageContent::user("searchable kangaroo"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+
         let hits = r
-            .retrieve("kangaroo", RetrievalScope::Global, 10)
+            .retrieve(RetrievalRequest {
+                query: "searchable kang".to_string(),
+                scope: RetrievalScope::Global,
+                visibility: RetrievalVisibility::All,
+                grouping: RetrievalGrouping::None,
+                match_mode: RetrievalMatchMode::FinalTokenPrefix,
+                limit: 10,
+            })
             .await
             .unwrap();
-        assert_eq!(hits.len(), 1, "repeated upsert must not duplicate the row");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "prefix-1");
+    }
+
+    #[tokio::test]
+    async fn exact_match_mode_does_not_prefix_match_final_token() {
+        let db = seed().await;
+        db.add_message(
+            "exact-1",
+            "c-a",
+            &MessageContent::user("searchable kangaroo"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+
+        let hits = r
+            .retrieve(RetrievalRequest::natural_language(
+                "kang",
+                RetrievalScope::Global,
+                10,
+            ))
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn best_per_conversation_grouping_filters_before_limit() {
+        let db = seed().await;
+        db.add_message(
+            "active-a",
+            "c-a",
+            &MessageContent::user("uniquealpha one"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "active-b",
+            "c-a",
+            &MessageContent::user("uniquealpha two"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "archived-a",
+            "c-b",
+            &MessageContent::user("uniquealpha archive"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.archive_conversation("c-b").await.unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+
+        let hits = r
+            .retrieve(RetrievalRequest {
+                query: "uniquealpha".to_string(),
+                scope: RetrievalScope::Global,
+                visibility: RetrievalVisibility::UserTopLevel,
+                grouping: RetrievalGrouping::BestPerConversation,
+                match_mode: RetrievalMatchMode::ExactTerms,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "active and archived user conversations survive pre-limit grouping"
+        );
+        let conversations: HashSet<_> = hits.into_iter().map(|h| h.conversation_id).collect();
+        assert!(conversations.contains("c-a"));
+        assert!(conversations.contains("c-b"));
+    }
+
+    #[tokio::test]
+    async fn best_per_conversation_grouping_does_not_starve_other_conversations() {
+        let db = seed().await;
+        db.create_conversation("c-c", "c", "/tmp/c", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..12 {
+            db.add_message(
+                &format!("m-many-{index}"),
+                "c-a",
+                &MessageContent::user(format!("starveterm repeated {index}")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        db.add_message(
+            "m-other",
+            "c-c",
+            &MessageContent::user("starveterm survivor"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+
+        let hits = r
+            .retrieve(RetrievalRequest {
+                query: "starveterm".to_string(),
+                scope: RetrievalScope::Global,
+                visibility: RetrievalVisibility::UserTopLevel,
+                grouping: RetrievalGrouping::BestPerConversation,
+                match_mode: RetrievalMatchMode::ExactTerms,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let conversations: std::collections::HashSet<_> =
+            hits.into_iter().map(|h| h.conversation_id).collect();
+        assert!(conversations.contains("c-a"));
+        assert!(conversations.contains("c-c"));
+    }
+
+    #[tokio::test]
+    async fn user_top_level_excludes_archived_deletion_pending_before_limit() {
+        let db = seed().await;
+        db.create_conversation("c-c", "c", "/tmp/c", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "m-arch-visible",
+            "c-b",
+            &MessageContent::user("pendingdelete target"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "m-active-visible",
+            "c-c",
+            &MessageContent::user("pendingdelete survivor"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.archive_conversation("c-b").await.unwrap();
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("name"))
+            .collect();
+        if columns.iter().any(|name| name == "status") {
+            sqlx::query(
+                "INSERT INTO conversation_creation_jobs (
+                    id, conversation_id, message_id, status, stage, attempt, generation,
+                    intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                    failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+                 ) VALUES (
+                    'job-delete', 'c-b', NULL, 'deletion_pending', 'finalize', 0, 0,
+                    '{\"kind\":\"direct\",\"cwd\":\"/tmp/b\",\"prompt\":\"x\",\"model\":null,\"images\":[],\"files\":[]}',
+                    NULL, '2026-01-01T00:00:00Z', NULL, NULL, NULL, NULL,
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                 )",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "INSERT INTO conversation_creation_jobs (
+                    id, conversation_id, message_id, phase, intent_json,
+                    error, accepted_at, provisioning_started_at, completed_at, failed_at,
+                    created_at, updated_at
+                 ) VALUES (
+                    'job-delete', 'c-b', NULL, 'accepted',
+                    '{\"kind\":\"direct\",\"cwd\":\"/tmp/b\",\"prompt\":\"x\",\"model\":null,\"images\":[],\"files\":[]}',
+                    'deletion_pending sentinel',
+                    '2026-01-01T00:00:00Z', NULL, NULL, NULL,
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                 )",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "ALTER TABLE conversation_creation_jobs RENAME TO conversation_creation_jobs_base",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "CREATE VIEW conversation_creation_jobs AS
+                 SELECT id, conversation_id,
+                        CASE
+                            WHEN error = 'deletion_pending sentinel' THEN 'deletion_pending'
+                            ELSE phase
+                        END AS status
+                 FROM conversation_creation_jobs_base",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        let r = Fts5Retriever::new(db.pool().clone());
+
+        let hits = r
+            .retrieve(RetrievalRequest {
+                query: "pendingdelete".to_string(),
+                scope: RetrievalScope::Global,
+                visibility: RetrievalVisibility::UserTopLevel,
+                grouping: RetrievalGrouping::BestPerConversation,
+                match_mode: RetrievalMatchMode::ExactTerms,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id, "c-c");
     }
 
     #[tokio::test]

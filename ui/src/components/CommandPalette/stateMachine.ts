@@ -27,6 +27,7 @@ export function transition(
         rawInput: '',
         selectedIndex: 0,
         results: [],
+        searchStatus: { kind: 'idle' },
       };
     }
 
@@ -37,12 +38,18 @@ export function transition(
       if (state.status !== 'open') return state;
       const rawInput = event.rawInput;
       const isAction = rawInput.startsWith('>');
-      const conversationScopeMatch = isAction ? null : rawInput.match(/^c\s(.*)$/s);
+      const conversationSlugScopeMatch = isAction ? null : rawInput.match(/^cs\s(.*)$/s);
+      const conversationContentScopeMatch = isAction ? null : rawInput.match(/^c\s(.*)$/s);
+      const scopedQuery = conversationSlugScopeMatch?.[1] ?? conversationContentScopeMatch?.[1];
       const query = isAction
         ? rawInput.slice(1).trimStart()
-        : conversationScopeMatch?.[1] ?? rawInput;
+        : scopedQuery ?? rawInput;
       const mode = isAction ? 'action' : 'search';
-      const scope = conversationScopeMatch ? 'conversations' : 'global';
+      const scope = conversationSlugScopeMatch
+        ? 'conversation-slugs'
+        : conversationContentScopeMatch
+          ? 'conversation-content'
+          : 'global';
 
       // Action mode computes from its in-memory list. Search mode clears prior
       // results synchronously so rows from a previous query or scope cannot be
@@ -59,12 +66,42 @@ export function transition(
         rawInput,
         selectedIndex: 0,
         results,
+        searchStatus: isAction
+          ? { kind: 'ready' }
+          : scope === 'conversation-content' && query.trim().length === 0
+            ? { kind: 'awaiting-query' }
+            : { kind: 'idle' },
       };
+    }
+
+    case 'SEARCH_AWAITING_QUERY': {
+      if (state.status !== 'open' || state.mode !== 'search') return state;
+      return { ...state, searchStatus: { kind: 'awaiting-query' } };
+    }
+
+    case 'SEARCH_DEBOUNCING': {
+      if (state.status !== 'open' || state.mode !== 'search') return state;
+      return { ...state, searchStatus: { kind: 'debouncing' } };
+    }
+
+    case 'SEARCH_LOADING': {
+      if (state.status !== 'open' || state.mode !== 'search') return state;
+      return { ...state, searchStatus: { kind: 'loading' } };
+    }
+
+    case 'SEARCH_WARMING': {
+      if (state.status !== 'open' || state.mode !== 'search') return state;
+      return { ...state, searchStatus: { kind: 'warming', message: event.message } };
+    }
+
+    case 'SEARCH_ERROR': {
+      if (state.status !== 'open' || state.mode !== 'search') return state;
+      return { ...state, searchStatus: { kind: 'error', message: event.message } };
     }
 
     case 'SET_RESULTS': {
       if (state.status !== 'open') return state;
-      return { ...state, results: event.results, selectedIndex: 0 };
+      return { ...state, results: event.results, selectedIndex: 0, searchStatus: { kind: 'ready' } };
     }
 
     case 'SELECT_NEXT': {

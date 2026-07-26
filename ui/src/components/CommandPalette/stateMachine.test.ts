@@ -6,12 +6,12 @@ function openPalette() {
 }
 
 describe('command palette query parsing', () => {
-  it('treats c followed by whitespace as conversation scope', () => {
+  it('treats c followed by whitespace as conversation content scope', () => {
     const scoped = transition(openPalette(), { type: 'SET_QUERY', rawInput: 'c ' });
     expect(scoped).toMatchObject({
       status: 'open',
       mode: 'search',
-      scope: 'conversations',
+      scope: 'conversation-content',
       query: '',
       rawInput: 'c ',
       selectedIndex: 0,
@@ -21,9 +21,21 @@ describe('command palette query parsing', () => {
     expect(filtered).toMatchObject({
       status: 'open',
       mode: 'search',
-      scope: 'conversations',
+      scope: 'conversation-content',
       query: 'emo',
       rawInput: 'c emo',
+      selectedIndex: 0,
+    });
+  });
+
+  it('prefers cs over c when both prefixes could match', () => {
+    const scoped = transition(openPalette(), { type: 'SET_QUERY', rawInput: 'cs emo' });
+    expect(scoped).toMatchObject({
+      status: 'open',
+      mode: 'search',
+      scope: 'conversation-slugs',
+      query: 'emo',
+      rawInput: 'cs emo',
       selectedIndex: 0,
     });
   });
@@ -44,7 +56,7 @@ describe('command palette query parsing', () => {
     const scoped = transition(withGlobalResults, { type: 'SET_QUERY', rawInput: 'c ' });
     expect(scoped).toMatchObject({
       status: 'open',
-      scope: 'conversations',
+      scope: 'conversation-content',
       selectedIndex: 0,
       results: [],
     });
@@ -68,5 +80,30 @@ describe('command palette query parsing', () => {
       scope: 'global',
       query: 'c emo',
     });
+  });
+});
+
+describe('command palette async search status', () => {
+  it('tracks debouncing, loading, warming, error, and ready states', () => {
+    const open = transition(openPalette(), { type: 'SET_QUERY', rawInput: 'c bug' });
+    expect(open).toMatchObject({
+      status: 'open',
+      searchStatus: { kind: 'idle' },
+    });
+
+    const debouncing = transition(open, { type: 'SEARCH_DEBOUNCING' });
+    expect(debouncing).toMatchObject({ searchStatus: { kind: 'debouncing' } });
+
+    const loading = transition(debouncing, { type: 'SEARCH_LOADING' });
+    expect(loading).toMatchObject({ searchStatus: { kind: 'loading' } });
+
+    const warming = transition(loading, { type: 'SEARCH_WARMING', message: 'Index warming' });
+    expect(warming).toMatchObject({ searchStatus: { kind: 'warming', message: 'Index warming' } });
+
+    const errored = transition(loading, { type: 'SEARCH_ERROR', message: 'Search failed' });
+    expect(errored).toMatchObject({ searchStatus: { kind: 'error', message: 'Search failed' } });
+
+    const ready = transition(loading, { type: 'SET_RESULTS', results: [] });
+    expect(ready).toMatchObject({ searchStatus: { kind: 'ready' } });
   });
 });
