@@ -78,4 +78,4 @@ Append a completion note with these headings:
 - No speculative provenance helper, root/predecessor cache, lifecycle authority on work scope, or downstream close-orchestration contract was added; the only new structural element is the singular `ProductConversation` aggregate required to make mixed lifecycle unrepresentable.
 
 **Commit**
-- `a2b1ad73d6de640d6c8483e0bd4f33910943c0f5`
+- `33ead621da5e303800cc75c47a754fee9335cdab`
