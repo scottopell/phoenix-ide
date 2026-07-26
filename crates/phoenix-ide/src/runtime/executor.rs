@@ -2619,10 +2619,7 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
-        if matches!(
-            event,
-            Event::UserMessage { .. } | Event::AuthoritativeUserMessage { .. }
-        ) {
+        if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;
         }
 
@@ -2715,6 +2712,8 @@ where
 
             // Pure state transition
             let terminal_event = current_event.clone();
+            let authoritative_event =
+                matches!(current_event, Event::AuthoritativeUserMessage { .. });
             let result = match transition(&self.state, &self.context, current_event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2735,6 +2734,9 @@ where
                 }
             };
 
+            if authoritative_event {
+                self.parent_tool_cycle_count = 0;
+            }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
             let generated_events = self.apply_transition_result(result).await?;
             events_to_process.extend(generated_events);
