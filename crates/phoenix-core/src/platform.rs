@@ -21,7 +21,9 @@ impl PlatformCapability {
     #[must_use]
     pub fn detect() -> Self {
         let support = nono::Sandbox::support_info();
-        if support.is_supported && network_block_supported() {
+        let network_block = network_block_supported();
+        let process_isolation = process_isolation_supported();
+        if support.is_supported && network_block && process_isolation {
             Self::Nono {
                 platform: support.platform.to_string(),
                 details: support.details,
@@ -29,8 +31,14 @@ impl PlatformCapability {
         } else {
             Self::None {
                 details: if support.is_supported {
+                    let missing = match (network_block, process_isolation) {
+                        (false, false) => "network blocking and process isolation",
+                        (false, true) => "network blocking",
+                        (true, false) => "process isolation",
+                        (true, true) => unreachable!("supported sandbox returned unavailable"),
+                    };
                     format!(
-                        "{}; network blocking unavailable for Explore bash",
+                        "{}; {missing} unavailable for Explore bash",
                         support.details
                     )
                 } else {
@@ -52,8 +60,18 @@ fn network_block_supported() -> bool {
     network_block_supported_impl()
 }
 
+#[must_use]
+fn process_isolation_supported() -> bool {
+    process_isolation_supported_impl()
+}
+
 #[cfg(target_os = "macos")]
 fn network_block_supported_impl() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn process_isolation_supported_impl() -> bool {
     true
 }
 
@@ -63,8 +81,18 @@ fn network_block_supported_impl() -> bool {
         || nono::sandbox::probe_seccomp_block_network_support().unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
+fn process_isolation_supported_impl() -> bool {
+    nono::detect_abi().is_ok_and(|abi| abi.has_scoping())
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn network_block_supported_impl() -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_isolation_supported_impl() -> bool {
     false
 }
 

@@ -32,7 +32,10 @@ use super::registry::{BashHandleError, LiveHandleSummary, ResourceScopeKeyHandle
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
-use crate::{work_scope_identity, RegisterWakeInput, RegisteredWake, ToolContext, ToolOutput};
+use crate::{
+    work_scope_identity, RegisterWakeInput, RegisteredWake, ResourceScopeKey, ToolContext,
+    ToolOutput,
+};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
@@ -1477,6 +1480,24 @@ async fn shape_handle_response(
     ToolOutput::success(serialized).with_display(value)
 }
 
+fn durable_wake_scope(
+    ctx: &ToolContext,
+    handle: &Handle,
+) -> Result<Option<phoenix_workflow::wake_profile::WorkScopeIdentity>, String> {
+    match &ctx.work_scope {
+        ResourceScopeKey::Coordinator => {
+            tracing::debug!(
+                handle = %handle.handle_id,
+                "skipping durable wake registration for Coordinator bash handle"
+            );
+            Ok(None)
+        }
+        ResourceScopeKey::Work(_) | ResourceScopeKey::GlobalTerminal => {
+            work_scope_identity(&ctx.work_scope).map(Some)
+        }
+    }
+}
+
 async fn background_run_response(
     handle: &Arc<Handle>,
     elapsed: Duration,
@@ -1496,8 +1517,9 @@ async fn background_run_response(
         return response;
     };
 
-    let registration_scope = match work_scope_identity(&ctx.work_scope) {
-        Ok(scope) => scope,
+    let registration_scope = match durable_wake_scope(ctx, handle) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return response,
         Err(error) => return ToolOutput::error(error),
     };
     let resource = phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
@@ -2007,8 +2029,11 @@ mod tests {
         if let Some(registrar) = registrar {
             ctx = ctx.with_wake_registrar(Some(registrar));
         }
-        if matches!(work_scope, ResourceScopeKey::GlobalTerminal) {
-            ctx.work_scope = ResourceScopeKey::GlobalTerminal;
+        if matches!(
+            work_scope,
+            ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal
+        ) {
+            ctx.work_scope = work_scope.clone();
         }
         ctx
     }
@@ -2321,6 +2346,28 @@ mod tests {
         assert!(output.is_success(), "{}", output.output());
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "exited");
+        assert!(registrar.register_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinator_background_run_preserves_handle_without_durable_wake() {
+        let registrar = MockWakeRegistrar::with_behaviors(vec![RegistrarBehavior::Registered(1)]);
+        let ctx = ctx_with_registrar(&ResourceScopeKey::Coordinator, Some(registrar.clone()));
+        let output = run_run(
+            "sleep 10",
+            None,
+            0,
+            ReadArgs::default(),
+            &ctx,
+            BashSpawnMode::Direct,
+        )
+        .await;
+
+        assert!(output.is_success(), "{}", output.output());
+        let value: Value = serde_json::from_str(output.output()).expect("json");
+        assert_eq!(value["status"], "still_running");
+        assert!(value["handle"].as_str().is_some());
+        assert!(value["wake_registration"].is_null(), "got: {value}");
         assert!(registrar.register_calls().is_empty());
     }
 

@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use nono::{AccessMode, CapabilitySet, Sandbox};
+use nono::{AccessMode, CapabilitySet, Sandbox, SignalMode};
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 
 const REPO_ROOT_ENV: &str = "PHOENIX_SANDBOX_REPO_ROOT";
@@ -93,6 +93,7 @@ impl ExploreReadOnlyPolicy {
 
     fn capability_set(&self) -> Result<CapabilitySet, String> {
         let mut caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::Isolated)
             .allow_path("/", AccessMode::Read)
             .map_err(|e| e.to_string())?
             .allow_path(&self.scratch_dir, AccessMode::ReadWrite)

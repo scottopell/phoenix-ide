@@ -41,6 +41,55 @@ fn explore_sandbox_enforces_read_only_policy() {
 
     let bin = env!("CARGO_BIN_EXE_phoenix_ide");
 
+    let mut outside_process = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn outside process");
+    let outside_pid = outside_process.id();
+    let external_signal = sandbox_run(
+        bin,
+        &SandboxFixture {
+            repo: &repo,
+            scratch: &scratch,
+            home: &home,
+            platform_temp: &platform_temp,
+            sensitive: &sensitive,
+        },
+        &format!("kill -0 {outside_pid}"),
+    );
+    let outside_still_running = outside_process
+        .try_wait()
+        .expect("inspect outside process")
+        .is_none();
+    if outside_still_running {
+        outside_process.kill().expect("clean up outside process");
+    }
+    outside_process.wait().expect("reap outside process");
+    assert!(
+        !external_signal.status.success(),
+        "sandbox signaled an external process: {external_signal:?}"
+    );
+    assert!(
+        outside_still_running,
+        "external process exited during sandbox signal probe"
+    );
+
+    let descendant_signal = sandbox_run(
+        bin,
+        &SandboxFixture {
+            repo: &repo,
+            scratch: &scratch,
+            home: &home,
+            platform_temp: &platform_temp,
+            sensitive: &sensitive,
+        },
+        "sleep 30 & child=$!; kill \"$child\"; wait \"$child\" 2>/dev/null || test $? -eq 143",
+    );
+    assert!(
+        descendant_signal.status.success(),
+        "sandbox could not signal its own descendant: {descendant_signal:?}"
+    );
+
     let read = sandbox_run(
         bin,
         &SandboxFixture {
