@@ -117,4 +117,4 @@ Append a completion note to this task body with these headings:
 - This correction pass removed or deprecated those requirements in place, added explicit negative requirements where needed, and extended the edits to `specs/api/requirements.md` and `specs/agent-identity/requirements.md` so the grep-backed surface is consistent.
 
 **Commit**
-- Pending
+- `e9f888c9851e659aa27c80187ccce7c71ec8cbc8`
