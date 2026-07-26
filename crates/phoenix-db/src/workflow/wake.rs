@@ -1188,15 +1188,16 @@ impl WakeRepository {
         let head = tx.fetch_workflow_head(workflow_id).await?.ok_or_else(|| {
             DbError::Serialization("wake workflow head missing after receipt".to_string())
         })?;
+        let tail_free_terminal = Self::tail_free_terminal(&terminal);
         let next_snapshot = WakeRegistrationSnapshot {
             contract_id: binding.contract_id.clone(),
             resource: binding.resource.clone(),
             registered: true,
-            terminal: Some(terminal.clone()),
+            terminal: Some(tail_free_terminal.clone()),
             runtime_availability: wake_profile::RuntimeAvailability::Idle,
         };
         let event = WakeRegistrationEvent::TerminalProjected {
-            terminal: Box::new(terminal.clone()),
+            terminal: Box::new(tail_free_terminal),
         };
         if !tx
             .commit_transition_head_cas(
@@ -4117,6 +4118,7 @@ fn projection_parts(
             let reason = match reason {
                 WakeForgottenReason::PhoenixRestart => "PhoenixRestart",
                 WakeForgottenReason::CascadeDestroyedHandle => "CascadeDestroyedHandle",
+                WakeForgottenReason::BashWaiterPanicked => "BashWaiterPanicked",
                 WakeForgottenReason::TmuxHandleMissing => "TmuxHandleMissing",
                 WakeForgottenReason::SubagentHandleMissing => {
                     unreachable!("subagent wake bindings not implemented")
@@ -4589,6 +4591,7 @@ fn projection_from_row(
             reason: match row.get::<String, _>("forgotten_reason").as_str() {
                 "PhoenixRestart" => WakeForgottenReason::PhoenixRestart,
                 "CascadeDestroyedHandle" => WakeForgottenReason::CascadeDestroyedHandle,
+                "BashWaiterPanicked" => WakeForgottenReason::BashWaiterPanicked,
                 "TmuxHandleMissing" => WakeForgottenReason::TmuxHandleMissing,
                 other => {
                     return Err(DbError::Serialization(format!(
@@ -8801,11 +8804,35 @@ mod tests {
         .fetch_one(repo.workflow_repo.pool())
         .await
         .unwrap();
-        for payload in [receipt_payload, event_payload, observation_payload] {
+        let snapshot_payload: Vec<u8> =
+            sqlx::query_scalar("SELECT snapshot_payload FROM workflows WHERE workflow_id = ?1")
+                .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+                .fetch_one(repo.workflow_repo.pool())
+                .await
+                .unwrap();
+        let transition_payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT event_payload FROM workflow_transitions WHERE workflow_id = ?1 ORDER BY transition_id DESC LIMIT 1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+        .fetch_one(repo.workflow_repo.pool())
+        .await
+        .unwrap();
+        for payload in [
+            receipt_payload,
+            event_payload,
+            observation_payload,
+            snapshot_payload,
+            transition_payload,
+        ] {
             let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
             let tail = payload
                 .pointer("/Fired/evidence/TmuxWindow/final_tail")
                 .or_else(|| payload.pointer("/TmuxWindow/final_tail"))
+                .or_else(|| payload.pointer("/terminal/Fired/evidence/TmuxWindow/final_tail"))
+                .or_else(|| {
+                    payload
+                        .pointer("/TerminalProjected/terminal/Fired/evidence/TmuxWindow/final_tail")
+                })
                 .expect("terminal payload contains a tail field for codec compatibility");
             assert_eq!(tail, &serde_json::json!([]));
         }

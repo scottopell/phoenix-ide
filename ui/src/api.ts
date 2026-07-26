@@ -1214,6 +1214,9 @@ export type TaskApprovalHandoff = 'continue_in_current_conversation' | 'start_fr
 export interface WakeContractStatus {
   workflow_id: number;
   contract_id: string;
+  resource_kind: string;
+  handle_id: string;
+  terminal_status: 'pending';
   expires_at: number;
 }
 

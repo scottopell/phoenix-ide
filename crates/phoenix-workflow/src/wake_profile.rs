@@ -218,6 +218,7 @@ pub enum WakeCancellationReason {
 pub enum WakeForgottenReason {
     PhoenixRestart,
     CascadeDestroyedHandle,
+    BashWaiterPanicked,
     SubagentHandleMissing,
     TmuxHandleMissing,
 }

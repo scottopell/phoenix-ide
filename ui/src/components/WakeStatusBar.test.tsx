@@ -17,6 +17,9 @@ const active = {
   contracts: [{
     workflow_id: 1,
     contract_id: 'wake-1',
+    resource_kind: 'Bash',
+    handle_id: 'b-1',
+    terminal_status: 'pending',
     expires_at: Math.floor(now / 1000) + 120,
   }],
 };
@@ -57,6 +60,7 @@ describe('WakeStatusBar', () => {
 
     const view = render(<WakeStatusBar conversationId="conv-a" />);
     expect(await screen.findByText('⏰ 1 pending wake')).toBeInTheDocument();
+    expect(screen.getByText('cancel Bash:b-1')).toBeInTheDocument();
 
     view.rerender(<WakeStatusBar conversationId="conv-b" />);
 

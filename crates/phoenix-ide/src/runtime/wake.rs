@@ -594,7 +594,7 @@ async fn deliver_pending(
                         workflow_id: delivery.workflow_id,
                         delivery_id: delivery.canonical_delivery.delivery_id,
                         conversation_id: delivery.conversation_id.clone(),
-                        rendered_content: render_terminal_result(delivery),
+                        rendered_content: render_materialized_terminal_result(delivery),
                         display_data,
                         auto_resume,
                         created_at: now,
@@ -729,6 +729,10 @@ fn terminal_kind(
             crate::runtime::WakeContractTerminalKind::Forgotten
         }
     }
+}
+
+fn render_materialized_terminal_result(pending: &WakePendingDelivery) -> String {
+    crate::runtime::executor::cap_tool_output_text(render_terminal_result(pending))
 }
 
 fn render_terminal_result(pending: &WakePendingDelivery) -> String {
@@ -931,6 +935,57 @@ async fn inspect_live_bash(
     }))
 }
 
+async fn inspect_bash_handle(
+    handle: &Arc<phoenix_tools::bash::handle::Handle>,
+    identity: &BashResourceIdentity,
+) -> InspectionOutcome {
+    let state = handle.state().await;
+    match state.as_ref() {
+        HandleState::Live(live) => {
+            if matches!(
+                *handle.exit_observer().borrow(),
+                Some(phoenix_tools::bash::handle::ExitState::WaiterPanicked)
+            ) {
+                InspectionOutcome::Forgotten(WakeForgottenReason::BashWaiterPanicked)
+            } else {
+                inspect_live_bash(handle, identity, live).await
+            }
+        }
+        HandleState::Tombstoned(tomb) => {
+            let status = match &tomb.final_cause {
+                FinalCause::Exited { .. } => BashTerminalStatus::Exited,
+                FinalCause::Killed { .. } => BashTerminalStatus::Killed,
+            };
+            let final_tail_start_offset = tomb
+                .final_tail
+                .first()
+                .map_or(tomb.next_offset_at_exit, |line| line.offset);
+            let tail = tomb
+                .final_tail
+                .iter()
+                .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
+                .collect();
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: identity.clone(),
+                cmd: handle.cmd.clone(),
+                label: handle.label.clone(),
+                status,
+                occurred_at: system_time_to_timestamp(tomb.finished_at),
+                exit_code: tomb.exit_code,
+                duration_ms: Some(tomb.duration_ms),
+                signal_number: tomb.signal_number,
+                kill_signal_sent: tomb.kill_signal_sent.map(|sig| sig.as_str().to_string()),
+                kill_attempted_at: tomb.kill_attempted_at.map(system_time_to_timestamp),
+                final_tail_start_offset,
+                final_tail_end_offset: tomb.next_offset_at_exit,
+                final_tail_truncated_before: final_tail_start_offset > 0,
+                final_tail_partial: None,
+                final_tail: tail,
+            }))
+        }
+    }
+}
+
 impl TerminalInspector for RuntimeRegistryInspector {
     fn inspect<'a>(
         &'a self,
@@ -955,50 +1010,7 @@ impl TerminalInspector for RuntimeRegistryInspector {
                             WakeForgottenReason::PhoenixRestart,
                         ));
                     };
-                    let state = handle.state().await;
-                    match state.as_ref() {
-                        HandleState::Live(live) => {
-                            Ok(inspect_live_bash(&handle, identity, live).await)
-                        }
-                        HandleState::Tombstoned(tomb) => {
-                            let status = match &tomb.final_cause {
-                                FinalCause::Exited { .. } => BashTerminalStatus::Exited,
-                                FinalCause::Killed { .. } => BashTerminalStatus::Killed,
-                            };
-                            let final_tail_start_offset = tomb
-                                .final_tail
-                                .first()
-                                .map_or(tomb.next_offset_at_exit, |line| line.offset);
-                            let tail = tomb
-                                .final_tail
-                                .iter()
-                                .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
-                                .collect();
-                            Ok(InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(
-                                BashTerminalEvidence {
-                                    identity: identity.clone(),
-                                    cmd: handle.cmd.clone(),
-                                    label: handle.label.clone(),
-                                    status,
-                                    occurred_at: system_time_to_timestamp(tomb.finished_at),
-                                    exit_code: tomb.exit_code,
-                                    duration_ms: Some(tomb.duration_ms),
-                                    signal_number: tomb.signal_number,
-                                    kill_signal_sent: tomb
-                                        .kill_signal_sent
-                                        .map(|sig| sig.as_str().to_string()),
-                                    kill_attempted_at: tomb
-                                        .kill_attempted_at
-                                        .map(system_time_to_timestamp),
-                                    final_tail_start_offset,
-                                    final_tail_end_offset: tomb.next_offset_at_exit,
-                                    final_tail_truncated_before: final_tail_start_offset > 0,
-                                    final_tail_partial: None,
-                                    final_tail: tail,
-                                },
-                            )))
-                        }
-                    }
+                    Ok(inspect_bash_handle(&handle, identity).await)
                 }
                 WakeResourceIdentity::TmuxWindow(identity) => {
                     let scope = work_scope_from_identity(&identity.work_scope);
@@ -1334,6 +1346,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialized_wake_result_uses_shared_tool_output_cap() {
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: scope,
+                    handle_id: "b-1".to_string(),
+                },
+                cmd: "test command".to_string(),
+                label: None,
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                kill_attempted_at: None,
+                final_tail_start_offset: 0,
+                final_tail_end_offset: 200,
+                final_tail_truncated_before: false,
+                final_tail_partial: None,
+                final_tail: vec!["x".repeat(2_000); 200],
+            })),
+        );
+        WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        )
+        .run_once()
+        .await
+        .unwrap();
+        let pending = repo.list_pending("conv").await.unwrap();
+
+        let rendered = render_materialized_terminal_result(&pending[0]);
+
+        assert!(rendered.len() <= 100 * 1024);
+        assert!(rendered.contains("…[truncated "));
+    }
+
+    #[tokio::test]
     async fn fired_bash_wake_renders_wait_compatible_observation() {
         let (_db, repo, scope) = open_repo().await;
         let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
@@ -1514,6 +1571,38 @@ mod tests {
         let wait = worker.run_once().await.unwrap();
         assert_eq!(pending_count(&repo).await, 0);
         assert_eq!(wait, LIVE_HANDLE_POLL_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn waiter_panicked_bash_resolves_as_forgotten_without_polling_to_expiry() {
+        use phoenix_tools::bash::handle::{ExitState, Handle, HandleId};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+
+        let (_db, _repo, scope) = open_repo().await;
+        let handle = Handle::new_live(
+            work_scope_from_identity(&scope),
+            HandleId::new("b-1"),
+            "test command".to_string(),
+            None,
+            123,
+            123,
+            RING_BUFFER_BYTES,
+        );
+        handle.publish_exit(ExitState::WaiterPanicked);
+
+        let outcome = inspect_bash_handle(
+            &handle,
+            &BashResourceIdentity {
+                work_scope: scope,
+                handle_id: "b-1".to_string(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            InspectionOutcome::Forgotten(WakeForgottenReason::BashWaiterPanicked)
+        ));
     }
 
     #[tokio::test]

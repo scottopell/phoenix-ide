@@ -685,7 +685,7 @@ const IMAGE_TOKEN_ESTIMATE: usize = 1500;
 // string_slice: every index below is snapped to a char boundary via the
 // `is_char_boundary` loops before it is used, so the slices cannot panic.
 #[allow(clippy::string_slice)]
-fn cap_tool_output_text(text: String) -> String {
+pub(crate) fn cap_tool_output_text(text: String) -> String {
     let total = text.len();
     if total <= MAX_TOOL_OUTPUT_BYTES {
         return text;

@@ -120,7 +120,7 @@ export function WakeStatusBar({ conversationId }: { conversationId: string }) {
                 }
               }}
             >
-              {cancelling ? `cancelling ${contract.contract_id}` : `cancel ${contract.contract_id}`}
+              {cancelling ? 'cancelling' : 'cancel'} {contract.resource_kind}:{contract.handle_id}
             </button>
           );
         })}
