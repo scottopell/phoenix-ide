@@ -677,9 +677,7 @@ async fn register_tmux_wake_if_live(
     let Some(tool_use_id) = ctx.tool_use_id() else {
         return response;
     };
-    let Some(tool_round_id) = ctx.tool_round_id() else {
-        return response;
-    };
+    let tool_round_id = ctx.tool_round_id().unwrap_or(tool_use_id);
     let registration_scope = match work_scope_identity(&ctx.work_scope) {
         Ok(scope) => scope,
         Err(error) => return ToolOutput::error(error),
@@ -707,9 +705,9 @@ async fn register_tmux_wake_if_live(
         conversation_id: ctx.conversation_id.clone(),
         root_conversation_id: ctx.root_conversation_id.clone(),
         registering_tool_use_id: tool_use_id.to_string(),
-        registering_tool_round_id: tool_round_id.to_string(),
         registration_scope,
         resource,
+        registering_tool_round_id: tool_round_id.to_string(),
         max_wait_seconds: TMUX_WAKE_EXPIRY.as_secs(),
         prepared_fingerprint,
     };
