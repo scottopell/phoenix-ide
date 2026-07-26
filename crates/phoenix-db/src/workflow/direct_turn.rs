@@ -60,6 +60,12 @@ impl WorkflowRepository {
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
         let mut tx = self.begin_tx().await?;
+        if input.prepared.target() != &input.conversation {
+            tx.rollback().await?;
+            return Err(conflict(TurnConflict::CorruptAggregate(
+                "prepared turn target disagrees with accepted conversation",
+            )));
+        }
         if let Some(existing) =
             load_by_scoped_key(&mut tx.tx, &input.conversation, &input.client_key).await?
         {
@@ -859,7 +865,7 @@ mod tests {
             conversation: ConversationAuthority(conversation.to_string()),
             client_key: ClientTurnKey::new(key).unwrap(),
             prepared: PreparedTurn::from_exact_payload(
-                &ConversationAuthority("conv-a".to_string()),
+                &ConversationAuthority(conversation.to_string()),
                 vec![seed],
             ),
             disposition: AcceptedDisposition::Runtime,

@@ -50,6 +50,7 @@ pub struct CanonicalMessageId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedTurn {
+    target: ConversationAuthority,
     fingerprint: String,
     payload: Vec<u8>,
 }
@@ -59,6 +60,7 @@ impl PreparedTurn {
     pub fn from_exact_payload(target: &ConversationAuthority, payload: Vec<u8>) -> Self {
         let fingerprint = prepared_fingerprint(target, &payload);
         Self {
+            target: target.clone(),
             fingerprint,
             payload,
         }
@@ -80,9 +82,15 @@ impl PreparedTurn {
             ));
         }
         Ok(Self {
+            target: target.clone(),
             fingerprint,
             payload,
         })
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &ConversationAuthority {
+        &self.target
     }
 
     #[must_use]
