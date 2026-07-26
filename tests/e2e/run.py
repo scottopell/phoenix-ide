@@ -53,6 +53,7 @@ import asyncio
 import contextlib
 import json
 import os
+import resource
 import shutil
 import socket
 import subprocess
@@ -123,17 +124,35 @@ def _append_jsonl(path: Path, value: dict) -> None:
         output.write("\n")
 
 
-def _process_cpu_times(pid: int) -> tuple[float, float]:
-    with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as stat_file:
-        stat = stat_file.read()
-    rparen = stat.rfind(")")
-    if rparen < 0:
-        raise ValueError(f"unexpected /proc/{pid}/stat format")
-    fields = stat[rparen + 2 :].split()
-    hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-    user_seconds = int(fields[11]) / hz
-    system_seconds = int(fields[12]) / hz
-    return user_seconds, system_seconds
+def _process_cpu_times(pid: int) -> tuple[float, float] | None:
+    if pid == os.getpid():
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return usage.ru_utime, usage.ru_stime
+    if sys.platform == "linux":
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as stat_file:
+                stat = stat_file.read()
+        except FileNotFoundError:
+            return None
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            return None
+        fields = stat[rparen + 2 :].split()
+        hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        return int(fields[11]) / hz, int(fields[12]) / hz
+    if sys.platform == "darwin":
+        sample = subprocess.run(
+            ["ps", "-o", "time=", "-p", str(pid)],
+            capture_output=True, text=True, check=False,
+        )
+        text = sample.stdout.strip()
+        if sample.returncode != 0 or not text:
+            return None
+        parts = text.replace("-", ":").split(":")
+        factors = (86400, 3600, 60, 1)[-len(parts):]
+        total = sum(float(value) * factor for value, factor in zip(parts, factors))
+        return total, 0.0
+    return None
 
 
 def _profile_writer(profile_dir: Path | None):
@@ -148,21 +167,26 @@ def _cpu_window_record(
     started_wall_ns: int,
     started_monotonic_ns: int,
     finished_monotonic_ns: int,
-    start_cpu: tuple[float, float],
-    finish_cpu: tuple[float, float],
+    start_cpu: tuple[float, float] | None,
+    finish_cpu: tuple[float, float] | None,
     extra: dict | None = None,
 ) -> dict:
-    user_cpu_ms = max(0.0, (finish_cpu[0] - start_cpu[0]) * 1000.0)
-    system_cpu_ms = max(0.0, (finish_cpu[1] - start_cpu[1]) * 1000.0)
+    available = start_cpu is not None and finish_cpu is not None
+    user_cpu_ms = (
+        max(0.0, (finish_cpu[0] - start_cpu[0]) * 1000.0) if available else None
+    )
+    system_cpu_ms = (
+        max(0.0, (finish_cpu[1] - start_cpu[1]) * 1000.0) if available else None
+    )
     record = {
         "schema_version": SCHEMA_VERSION,
-        "provenance": PROVENANCE,
+        "provenance": PROVENANCE if available else "unavailable",
         "identity": identity,
         "started_unix_ns": started_wall_ns,
         "wall_ms": (finished_monotonic_ns - started_monotonic_ns) / 1_000_000.0,
         "user_cpu_ms": user_cpu_ms,
         "system_cpu_ms": system_cpu_ms,
-        "total_cpu_ms": user_cpu_ms + system_cpu_ms,
+        "total_cpu_ms": user_cpu_ms + system_cpu_ms if available else None,
     }
     if extra:
         record.update(extra)
@@ -176,8 +200,8 @@ def _write_cpu_window(
     started_wall_ns: int,
     started_monotonic_ns: int,
     finished_monotonic_ns: int,
-    start_cpu: tuple[float, float],
-    finish_cpu: tuple[float, float],
+    start_cpu: tuple[float, float] | None,
+    finish_cpu: tuple[float, float] | None,
     extra: dict | None = None,
 ) -> None:
     destination = _profile_writer(profile_dir)

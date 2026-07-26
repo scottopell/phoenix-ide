@@ -34,10 +34,10 @@ export interface TestCpuProfileWriter {
   appendLine(record: TestCpuProfileRecord): void
 }
 
-const profileDir = process.env.PHOENIX_CHECK_PROFILE_DIR
+const profileDir = process.env['PHOENIX_CHECK_PROFILE_DIR']
 
 export function currentWorkerId(): string {
-  return process.env.VITEST_POOL_ID ?? process.env.VITEST_WORKER_ID ?? 'worker-unknown'
+  return process.env['VITEST_POOL_ID'] ?? process.env['VITEST_WORKER_ID'] ?? 'worker-unknown'
 }
 
 export function isCpuProfilingEnabled(): boolean {
