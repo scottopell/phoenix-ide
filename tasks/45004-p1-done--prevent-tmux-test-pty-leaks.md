@@ -79,3 +79,16 @@ after_repeat_5 ptys=257 test_servers=0 test_roots=0
 ```
 
 The two-PTY parallel delta was transient unrelated host activity; all owner roots and servers were zero immediately after the parallel phase, and PTYs returned to the exact baseline on every subsequent run.
+
+After Codex identified and the implementation migrated the remaining real-server runtime test, the final matrix ran both the complete `phoenix-tools` tmux suite and `startup_restart_discovery_reuses_live_tmux_socket_without_registry_entry`:
+
+```text
+baseline       ptys=288 test_servers=0 test_roots=0
+after_single   ptys=288 test_servers=0 test_roots=0
+after_parallel ptys=288 test_servers=0 test_roots=0
+after_repeat_1 ptys=288 test_servers=0 test_roots=0
+after_repeat_2 ptys=288 test_servers=0 test_roots=0
+after_repeat_3 ptys=288 test_servers=0 test_roots=0
+after_repeat_4 ptys=288 test_servers=0 test_roots=0
+after_repeat_5 ptys=288 test_servers=0 test_roots=0
+```
