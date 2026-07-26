@@ -451,6 +451,18 @@ async fn next_global_id_tx(
 }
 
 async fn next_global_workflow_id_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<WorkflowId> {
+    let floor =
+        sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(workflow_id), 0) + 1 FROM workflows")
+            .fetch_one(&mut *tx.tx)
+            .await?;
+    sqlx::query(
+        "INSERT INTO workflow_global_sequences (sequence_name, next_value)
+         VALUES ('workflow', ?1)
+         ON CONFLICT(sequence_name) DO UPDATE SET next_value = MAX(next_value, excluded.next_value)",
+    )
+    .bind(floor)
+    .execute(&mut *tx.tx)
+    .await?;
     Ok(WorkflowId(
         next_global_id_tx(tx, "workflow", "workflow_id").await?,
     ))
