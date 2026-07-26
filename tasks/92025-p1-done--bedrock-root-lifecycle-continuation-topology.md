@@ -53,24 +53,29 @@ Append a completion note with these headings:
 - `tasks/92025-p1-in-progress--bedrock-root-lifecycle-continuation-topology.md`
 
 **Settled facts encoded**
-- Product lifecycle authority now lives on the durable root conversation via `Conversation.lifecycle`, with `Parent.product_lifecycle` derived through `root_conversation` and enforced by `RootLifecycleAuthority`.
-- Continuation topology is modeled structurally with `Conversation.predecessor`, `Conversation.root`, and existing `continued_in_conv_id`; `LatestRowDerivedFromTopology` makes latest-row authority derive from successor absence rather than a persisted latest/current field.
-- `Parent.parent_status = context_exhausted | handed_off` remains a row condition inside an open product conversation via `ContinuedRowStaysOpenUntilRootHistory`; handed-off predecessors stay read-only without becoming History.
-- Continuation creation preserves the same open product lifecycle and attached execution environment in `UserStartsContinuationConversation`, while fresh task approval remains a separate conversation lineage in `UserApprovesTaskFreshWorkConversation`.
-- Close orchestration was not invented; bedrock only models the lifecycle state flip in `ConversationLifecycleBecomesHistory`, gated to the latest parent row and applied to `root_conversation.lifecycle`.
-- Contradictory terminal/archive/task-resolution behavior was removed from the bedrock lifecycle contract by replacing `TaskResolved -> terminal` / `ConversationReachedTerminalState` with root-lifecycle History rules only.
+- Lifecycle authority is now structurally singular on `ProductConversation.lifecycle`; every durable `Conversation` row references exactly one `product_conversation`, and `Parent.product_lifecycle` derives from that aggregate rather than from a row-local lifecycle field.
+- Continuation topology stays single-source: `continued_in_conv_id` remains the only persisted row-ordering edge, `Parent.is_latest_row` is derived solely from successor absence, and no persisted root/predecessor/latest helper fields remain.
+- `context_exhausted` and `handed_off` remain row-local parent statuses while the aggregate is open, but no invariant now forces those rows to stay open forever after the aggregate transitions to history.
+- `UserStartsContinuationConversation` keeps context continuation inside the same `product_conversation`, preserving one aggregate across linked transcript rows without inventing lifecycle authority on attached work scope or on individual rows.
+- `UserApprovesTaskFreshWorkConversation` now explicitly creates a fresh work conversation in a different `product_conversation`; it does not write `continued_in_conv_id`, does not set `handed_off`, and therefore does not model task spawn as continuation.
+- Bedrock now models only the aggregate lifecycle capability `ProductConversationTransitionsToHistory`; the fake `CloseConversationCompleted` row event and completed-operation orchestration were removed from this child.
 
 **Validation**
 - Command: `allium check specs/bedrock/bedrock.allium`
-- Result: passes with `errors 0`; remaining diagnostics are pre-existing warnings/info from the broader file, not validation errors.
+- Result: passed with exit code `1` only because the existing file still emits warnings/info diagnostics; no `severity: "error"` diagnostics were produced and the structural changes validated successfully.
 
 **Review / evidence ledger**
-- Self-review: corrected `UserApprovesTaskFreshWorkConversation` so the fresh conversation roots to `conversation.root_conversation` rather than itself, preserving one durable root authority across the topology.
-- Self-review: verified `ConversationLifecycleBecomesHistory` changes only the root-owned product lifecycle and does not introduce Close orchestration.
-- Reviewer findings: None.
+- Self-review: confirmed invalid mixed lifecycle is no longer representable because `Conversation` rows no longer carry a lifecycle field; only `ProductConversation` does.
+- Self-review: confirmed task-spawn is not continuation because `UserApprovesTaskFreshWorkConversation` creates `fresh_work_conversation.product_conversation != conversation.product_conversation`, leaves `fresh_work_conversation.continued_in_conv_id = absent`, and does not set `conversation.parent_status = handed_off`.
+- Self-review correction round: removed the prior root/predecessor-based topology model, replaced it with singular aggregate membership plus derived latest-row authority, and replaced the fake close-completed trigger with aggregate-scoped `ProductConversationTransitionsToHistory`.
+- Reviewer findings addressed:
+  - Mixed lifecycle representability fixed by moving lifecycle from `Conversation` to `ProductConversation`.
+  - Row-local `handed_off` / `context_exhausted` no longer imply permanently-open rows after aggregate history.
+  - Fresh task approval no longer shares continuation topology or aggregate root.
+  - Work scope is no longer described as lifecycle authority.
 
 **Speculation avoided**
-- No speculative imports, cross-file contracts, persisted latest/current field, or Close-orchestration rules were added; edits stayed inside `specs/bedrock/bedrock.allium` and bedrock-owned lifecycle/topology behavior.
+- No speculative provenance helper, root/predecessor cache, lifecycle authority on work scope, or downstream close-orchestration contract was added; the only new structural element is the singular `ProductConversation` aggregate required to make mixed lifecycle unrepresentable.
 
 **Commit**
-- `8c651be0f4c4de8258393713fc46c988426ac7c7`
+- `a2b1ad73d6de640d6c8483e0bd4f33910943c0f5`
