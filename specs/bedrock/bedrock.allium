@@ -118,18 +118,15 @@ entity Conversation {
     context_usage_ratio: Decimal
     model_context_window: Integer
 
-    -- Soft-state archive flag (orthogonal to core_status). Set when a
-    -- conversation is archived; the row's core_status may still read
-    -- non-terminal. Resource-liveness predicates (work-scope cascades, idle
-    -- reaping) treat an archived conversation as NOT a live owner even while
-    -- non-terminal, so archiving a chain does not leak the shared scope's
-    -- resources. Those predicates derive liveness from the persisted
-    -- conversation rows (this entity), NOT from the set of live runtime
-    -- handles: a conversation that is non-terminal and not archived is a live
-    -- owner even when it holds no runtime handle (after a server restart or
-    -- runtime eviction). Counting only handles would tear down a scope whose
-    -- surviving owner is handle-less.
-    archived: Boolean = false
+    lifecycle: open | history
+
+    -- Conversation rows linked by continued_in_conv_id form one product
+    -- conversation rooted at the durable first row. Lifecycle belongs to that
+    -- root-owned product conversation, not independently to each transcript row.
+    -- Bedrock derives the live/latest row from topology: the latest row is the
+    -- row with no continuation successor.
+    root: Conversation?
+    predecessor: Conversation?
 
     -- Core status transitions (shared)
     transitions core_status {
@@ -227,7 +224,7 @@ entity Conversation {
 -- CANNOT reach Completed or Failed (sub-agent-only).
 variant Parent : Conversation {
     parent_status: awaiting_recovery | awaiting_task_approval
-                  | awaiting_user_response | context_exhausted | handed_off | terminal
+                  | awaiting_user_response | context_exhausted | handed_off
 
     -- Provenance breadcrumb for a fork (projects/ ForkProposalApproved). Points at
     -- the conversation whose agent proposed this one. Lives on Parent, not the shared
@@ -252,7 +249,13 @@ variant Parent : Conversation {
     continuation_summary: String when parent_status = context_exhausted
     successor: Conversation when parent_status = handed_off
 
-    is_terminal: parent_status in { context_exhausted, handed_off, terminal }
+    open_row_condition: parent_status in { context_exhausted, handed_off }
+    is_latest_row: continued_in_conv_id = absent
+    root_conversation: this when root = absent else root
+    product_lifecycle: history when root_conversation.lifecycle = history else open
+    row_accepts_user_messages: product_lifecycle = open
+        and parent_status != context_exhausted
+        and parent_status != handed_off
 
     -- Parent-only status transitions.
     -- Recovery/approval/question states exit by resetting to a core_status
@@ -269,8 +272,9 @@ variant Parent : Conversation {
     --   awaiting_recovery      -> idle            (conversation-turn recovery exits)
     --   awaiting_recovery      -> awaiting_continuation (continuation recovery succeeds)
     --   awaiting_recovery      -> recoverable_continuation_failure (continuation recovery fails)
-    --   awaiting_continuation  -> context_exhausted (continuation -> terminal)
-    --   terminal states: context_exhausted, terminal
+    --   awaiting_continuation  -> context_exhausted (continuation checkpoint)
+    --   context_exhausted and handed_off are row conditions inside an Open
+    --   product conversation, not product-lifecycle History.
     --
     -- The rules below (parent-only section) realise each transition.
 }
@@ -341,7 +345,7 @@ config {
 rule UserSendsMessage {
     when: UserSendsMessage(conversation, text, images?)
     requires: conversation.core_status in { idle, error }
-    requires: not conversation.is_terminal
+    requires: conversation.product_lifecycle = open
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
@@ -677,6 +681,7 @@ rule RejectMessageDuringUserQuestion {
 rule RejectMessageContextExhausted {
     when: UserSendsMessage(conversation, text, images?)
     requires: conversation.parent_status = context_exhausted
+    requires: conversation.product_lifecycle = open
     ensures: MessageRejected(conversation, reason: context_exhausted)
 }
 
@@ -989,6 +994,8 @@ rule UserApprovesTaskFreshWorkConversation {
     let successor = conversation.continued_in_conv_id
     ensures: FreshWorkConversationCreated(conversation, successor)
     ensures: conversation.continued_in_conv_id = successor
+    ensures: successor.predecessor = conversation
+    ensures: successor.root = conversation.root_conversation
     ensures: conversation.parent_status = handed_off
     ensures: conversation.successor = successor
     ensures: successor.mode = work
@@ -1080,6 +1087,7 @@ rule ContinuationSummaryReceived {
         -- Persist the summary message and context-exhausted state atomically.
         -- Derive the summary message identity from operation_id so replay cannot
         -- create a second committed summary.
+    ensures: conversation.lifecycle = open
 }
 
 rule ContinuationFailureBecomesRecoverable {
@@ -1155,41 +1163,31 @@ rule IgnoreStaleOrDuplicateContinuationResult {
         or conversation.continuation_operation_id != operation_id
     ensures: conversation.core_status = previous(conversation.core_status)
     ensures: ContinuationResultIgnored(conversation, operation_id)
+
+rule UserStartsContinuationConversation {
+    when: UserStartsContinuationConversation(conversation, new_conv)
+    requires: conversation.parent_status = context_exhausted
+    requires: conversation.continued_in_conv_id = absent
+    requires: conversation.product_lifecycle = open
+    ensures: conversation.continued_in_conv_id = new_conv
+    ensures: new_conv.predecessor = conversation
+    ensures: new_conv.root = conversation.root_conversation
+    ensures: new_conv.lifecycle = open
+    ensures: new_conv.mode = conversation.mode
+    ensures: new_conv.working_dir = conversation.working_dir
+}
 }
 
 -- ===========================================================
 -- PARENT 8. TERMINAL (REQ-BED-029)
 -- ===========================================================
 
-rule TaskResolved {
-    when: TaskResolved(conversation, outcome)
-    -- A conversation may be terminalized from any disposable, non-running
-    -- condition. `idle` is the ordinary resting state; a *stuck*
-    -- conversation must be disposable too, so the user is never forced to
-    -- coax out a successful LLM turn just to dispose of work that has
-    -- already been merged or abandoned. Three stuck conditions qualify:
-    --   - core_status = error: a non-running terminal-error state (e.g. a
-    --     usage-limit window the user merged around externally).
-    --   - core_status = recoverable_continuation_failure: continuation retry
-    --     remains available, but no work is currently running.
-    --   - parent_status = context_exhausted: an orthogonal axis to
-    --     core_status; the turn could not complete and there is no edge out
-    --     of context_exhausted back into a running state.
-    --   - a continued predecessor is excluded because live WorkScope
-    --     ownership has moved to its continuation.
-    -- This must stay consistent with the MarkAsMerged / ConfirmAbandon
-    -- gates in specs/work-lifecycle/ (which permit core_status = idle, error,
-    -- or recoverable_continuation_failure
-    -- plus parent_status = absent or context_exhausted) and with the
-    -- UserDismissesError resume policy: a stuck conversation that is not
-    -- running is always disposable.
-    requires: conversation.core_status = idle
-           or conversation.core_status = error
-           or conversation.core_status = recoverable_continuation_failure
-           or conversation.parent_status = context_exhausted
-    requires: conversation.mode in { work, branch }
-    ensures: conversation.parent_status = terminal
-    ensures: ConversationBecameTerminal(conversation)
+rule ConversationLifecycleBecomesHistory {
+    when: CloseConversationCompleted(conversation)
+    requires: conversation.kind = Parent
+    requires: conversation.is_latest_row
+    requires: conversation.lifecycle = open
+    ensures: conversation.root_conversation.lifecycle = history
 }
 
 ------------------------------------------------------------
@@ -1328,15 +1326,15 @@ rule SubAgentTurnLimitHardStop {
 -- Rules: Lifecycle and cross-cutting
 ------------------------------------------------------------
 
--- Lifecycle announcement: fires when any conversation reaches terminal.
-rule ConversationReachedTerminalState {
-    when: conversation: Conversation.is_terminal becomes true
-    ensures: ConversationBecameTerminal(conversation)
+-- Lifecycle announcement: fires when the root-owned product lifecycle enters History.
+rule ConversationLifecycleEnteredHistory {
+    when: conversation: Parent.product_lifecycle becomes history
+    ensures: ConversationBecameHistory(conversation)
 
     @guidance
-        -- Downstream specs (terminal, metrics) subscribe to this event.
-        -- Consumers should check conversation.kind if they care only
-        -- about parent conversations.
+        -- Downstream specs consume the product-lifecycle transition on the
+        -- durable root-owned conversation rather than inferring History from
+        -- row-local conditions such as handed_off or context_exhausted.
 }
 
 -- REQ-BED-032: User hard-deletes a conversation when the conversation is
@@ -1396,11 +1394,10 @@ rule UserHardDeletesConversationRule {
         -- have happened." A property test that runs the handler and
         -- checks the post-state suffices.
         --
-        -- Archive / abandon / mark-merged share this cascade only AFTER
-        -- wake-plane destructive-lifecycle admission either rejects for
-        -- pending wakes or serializes behind a closed registration fence.
-        -- Bedrock does not auto-cancel pending wakes as part of terminal
-        -- lifecycle admission; wake-profile owns that choice structurally.
+        -- Close conversation / History and hard-delete are distinct flows.
+        -- This hard-delete cascade does not model Close orchestration; Close's
+        -- product-lifecycle transition is owned by ConversationLifecycleBecomesHistory.
+        -- Wake-plane destructive-lifecycle admission remains owned elsewhere.
         -- UI-only state changes (close-tab, blur) do NOT trigger this rule
         -- — tmux servers and browser sessions deliberately survive them
         -- (specs/tmux-integration/ REQ-TMUX-008; specs/browser-tool/
@@ -1502,6 +1499,22 @@ invariant SpawnLimit {
             implies c.accumulated_sub_agents.count <= config.max_sub_agents_per_spawn
 }
 
+invariant RootLifecycleAuthority {
+    for c in Parent:
+        c.product_lifecycle = c.root_conversation.lifecycle
+}
+
+invariant ContinuedRowStaysOpenUntilRootHistory {
+    for c in Parent:
+        c.parent_status in { context_exhausted, handed_off }
+            implies c.product_lifecycle = open
+}
+
+invariant LatestRowDerivedFromTopology {
+    for c in Parent:
+        c.is_latest_row = (c.continued_in_conv_id = absent)
+}
+
 -- REQ-BED-005a: Bounded cancellation liveness.
 -- cancelling_tool and cancelling_sub_agents are never livelocks: each has a
 -- deadline-driven exit to idle (CancellingToolDeadlineFires,
@@ -1565,6 +1578,7 @@ surface UserConversation {
         UserStartsContinuationConversation(conversation, new_conv)
             when conversation.parent_status = context_exhausted
                  and conversation.continued_in_conv_id = absent
+                 and conversation.product_lifecycle = open
 
     @guarantee IdempotentMessages
         -- Duplicate message submissions (same message_id) are

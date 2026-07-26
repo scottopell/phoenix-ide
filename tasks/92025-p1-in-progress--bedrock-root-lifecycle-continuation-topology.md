@@ -44,3 +44,33 @@ Append a completion note with these headings:
 - **Review / evidence ledger** — self-review findings, reviewer findings, and any corrections made; write `None` if none
 - **Speculation avoided** — explicit note that no speculative helpers/contracts/imports were added beyond the task contract
 - **Commit** — commit hash that landed the work
+
+
+## Completion evidence
+
+**Files changed**
+- `specs/bedrock/bedrock.allium`
+- `tasks/92025-p1-in-progress--bedrock-root-lifecycle-continuation-topology.md`
+
+**Settled facts encoded**
+- Product lifecycle authority now lives on the durable root conversation via `Conversation.lifecycle`, with `Parent.product_lifecycle` derived through `root_conversation` and enforced by `RootLifecycleAuthority`.
+- Continuation topology is modeled structurally with `Conversation.predecessor`, `Conversation.root`, and existing `continued_in_conv_id`; `LatestRowDerivedFromTopology` makes latest-row authority derive from successor absence rather than a persisted latest/current field.
+- `Parent.parent_status = context_exhausted | handed_off` remains a row condition inside an open product conversation via `ContinuedRowStaysOpenUntilRootHistory`; handed-off predecessors stay read-only without becoming History.
+- Continuation creation preserves the same open product lifecycle and attached execution environment in `UserStartsContinuationConversation`, while fresh task approval remains a separate conversation lineage in `UserApprovesTaskFreshWorkConversation`.
+- Close orchestration was not invented; bedrock only models the lifecycle state flip in `ConversationLifecycleBecomesHistory`, gated to the latest parent row and applied to `root_conversation.lifecycle`.
+- Contradictory terminal/archive/task-resolution behavior was removed from the bedrock lifecycle contract by replacing `TaskResolved -> terminal` / `ConversationReachedTerminalState` with root-lifecycle History rules only.
+
+**Validation**
+- Command: `allium check specs/bedrock/bedrock.allium`
+- Result: passes with `errors 0`; remaining diagnostics are pre-existing warnings/info from the broader file, not validation errors.
+
+**Review / evidence ledger**
+- Self-review: corrected `UserApprovesTaskFreshWorkConversation` so the fresh conversation roots to `conversation.root_conversation` rather than itself, preserving one durable root authority across the topology.
+- Self-review: verified `ConversationLifecycleBecomesHistory` changes only the root-owned product lifecycle and does not introduce Close orchestration.
+- Reviewer findings: None.
+
+**Speculation avoided**
+- No speculative imports, cross-file contracts, persisted latest/current field, or Close-orchestration rules were added; edits stayed inside `specs/bedrock/bedrock.allium` and bedrock-owned lifecycle/topology behavior.
+
+**Commit**
+- Pending
