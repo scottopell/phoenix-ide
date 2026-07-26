@@ -18,7 +18,9 @@ use tokio::sync::Mutex;
 
 const FRESHNESS_LEASE: Duration = Duration::from_millis(1_200);
 const SAFE_PRESSURE_DURATION: chrono::Duration = chrono::Duration::milliseconds(1_200);
-const MAX_SAFE_OBSERVATION_GAP: chrono::Duration = chrono::Duration::milliseconds(1_200);
+// The 1.2s generation lease plus first-sample CPU measurement can place two
+// healthy observations more than 1.2s apart under the 1s UI polling cadence.
+const MAX_SAFE_OBSERVATION_GAP: chrono::Duration = chrono::Duration::milliseconds(2_500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservationKey {
@@ -65,6 +67,7 @@ pub struct ResourceObservationGeneration {
     pub observations: BTreeMap<u32, ProcessObservation>,
     pub api_pids: BTreeSet<u32>,
     pub terminal_pids: Option<BTreeSet<u32>>,
+    pub live_terminal_session_count: u32,
     pub handles: Vec<HandleObservationTarget>,
     pub live_bash_work_scopes: BTreeSet<String>,
     pub covered_bash_identities: BTreeSet<ProcessIdentity>,
@@ -439,6 +442,7 @@ async fn sample_generation(
     live_groups: Vec<phoenix_tools::bash::registry::LiveHandleProcessGroup>,
     terminal_sessions: BTreeSet<i32>,
 ) -> ResourceObservationGeneration {
+    let live_terminal_session_count = u32::try_from(terminal_sessions.len()).unwrap_or(u32::MAX);
     let api_identities = sysinfo::get_current_pid()
         .ok()
         .map(sysinfo::Pid::as_u32)
@@ -523,6 +527,7 @@ async fn sample_generation(
         observations: rows.into_iter().map(|row| (row.pid, row)).collect(),
         api_pids: api_identities.keys().copied().collect(),
         terminal_pids: terminal_identities.map(|ids| ids.keys().copied().collect()),
+        live_terminal_session_count,
         handles,
         live_bash_work_scopes,
         covered_bash_identities,
@@ -567,6 +572,7 @@ mod tests {
             observations: BTreeMap::new(),
             api_pids: BTreeSet::new(),
             terminal_pids: Some(BTreeSet::new()),
+            live_terminal_session_count: 0,
             handles: Vec::new(),
             live_bash_work_scopes: BTreeSet::new(),
             covered_bash_identities: BTreeSet::new(),
@@ -697,6 +703,34 @@ mod tests {
             ThermalGovernorStateSample::Elevated
         );
         let restored = state.observe(&sustained_nominal, &BTreeSet::new());
+        assert_eq!(restored.state, ThermalGovernorStateSample::Nominal);
+        assert_eq!(
+            restored.proposed_action,
+            ThermalGovernorActionSample::Restore
+        );
+    }
+
+    #[test]
+    fn cache_lease_sized_gap_remains_contiguous() {
+        let now = Utc::now();
+        let elevated = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Elevated,
+            sampled_at: now,
+        };
+        let first_nominal = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Nominal,
+            sampled_at: now + chrono::Duration::milliseconds(1),
+        };
+        let after_lease_and_sampling = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Nominal,
+            sampled_at: now + chrono::Duration::milliseconds(2_201),
+        };
+        let mut state = ThermalDecisionState::default();
+
+        state.observe(&elevated, &BTreeSet::new());
+        state.observe(&first_nominal, &BTreeSet::new());
+        let restored = state.observe(&after_lease_and_sampling, &BTreeSet::new());
+
         assert_eq!(restored.state, ThermalGovernorStateSample::Nominal);
         assert_eq!(
             restored.proposed_action,

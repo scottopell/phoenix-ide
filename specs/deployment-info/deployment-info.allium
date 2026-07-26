@@ -2,7 +2,7 @@
 
 config {
     minimum_safe_pressure_duration: Duration = 1_200.ms
-    maximum_safe_observation_gap: Duration = 1_200.ms
+    maximum_safe_observation_gap: Duration = 2_500.ms
 }
 -- deployment-info.allium
 --
@@ -58,6 +58,10 @@ enum ThermalActionKind {
     | restore
 }
 
+enum ObserveOnlyAppliedAction {
+    none
+}
+
 enum UnavailableReason {
     unsupported_platform
     | provider_failure
@@ -96,7 +100,7 @@ entity ThermalGovernor {
     state: GovernorState
     last_sample: ThermalSample?
     proposed_action: ProposedAction
-    applied_action: ThermalActionKind
+    applied_action: ObserveOnlyAppliedAction
     covered_target_identities: Set<NativeProcessIdentity>
     hypothetically_deprioritized_identities: Set<NativeProcessIdentity>
 

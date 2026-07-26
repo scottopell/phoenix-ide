@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
-pub use phoenix_mcp::{oauth, McpClientManager, McpTransportKind};
+pub use phoenix_mcp::{oauth, McpClientManager, McpServerStatus};
 
 /// Wraps a single MCP tool as a Phoenix Tool.
 pub struct McpTool {

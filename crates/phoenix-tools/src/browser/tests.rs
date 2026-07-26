@@ -368,6 +368,16 @@ async fn test_eval_inner_text_not_undefined() {
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
 
+    let wait_tool = BrowserWaitForSelectorTool;
+    let waited = wait_tool
+        .run(json!({"selector": "body p", "timeout": "5s"}), ctx.clone())
+        .await;
+    assert!(
+        waited.is_success(),
+        "Body readiness failed: {}",
+        waited.output()
+    );
+
     let eval_tool = BrowserEvalTool;
     let result = eval_tool
         .run(

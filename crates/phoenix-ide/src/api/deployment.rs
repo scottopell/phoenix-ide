@@ -239,6 +239,13 @@ pub struct ThermalGovernorActionSnapshot {
     pub target_identities: Vec<ThermalTargetIdentitySnapshot>,
 }
 
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ObserveOnlyAppliedAction {
+    None,
+}
+
 #[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ThermalCoverageSnapshot {
@@ -255,7 +262,7 @@ pub struct ThermalGovernorSnapshot {
     pub state: ThermalGovernorState,
     pub last_sample: ThermalSampleSnapshot,
     pub proposed_action: ThermalGovernorActionSnapshot,
-    pub applied_action: ThermalGovernorActionKind,
+    pub applied_action: ObserveOnlyAppliedAction,
     pub coverage: ThermalCoverageSnapshot,
 }
 
@@ -964,7 +971,7 @@ fn thermal_snapshot_from_generation(
                 && proposed_action != ThermalGovernorActionKind::None,
             target_identities,
         },
-        applied_action: ThermalGovernorActionKind::None,
+        applied_action: ObserveOnlyAppliedAction::None,
         coverage,
     }
 }
@@ -1058,10 +1065,7 @@ fn thermal_coverage_snapshot(
 ) -> ThermalCoverageSnapshot {
     let bash = generation.all_bash_pids();
     let work_scopes = &generation.live_bash_work_scopes;
-    let has_terminal = generation
-        .terminal_pids
-        .as_ref()
-        .is_some_and(|pids| !pids.is_empty());
+    let has_terminal = generation.live_terminal_session_count > 0;
     log_thermal_coverage_gaps(has_browser, has_terminal, has_mcp);
     let mut uncovered_reasons = Vec::new();
     if has_browser {
@@ -1165,12 +1169,9 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
     };
     let mcp_status = state.mcp_manager.status().await;
     let has_mcp = !mcp_status.is_empty();
-    let has_local_mcp = mcp_status.iter().any(|server| {
-        matches!(
-            server.transport,
-            phoenix_tools::mcp::McpTransportKind::Stdio
-        )
-    });
+    let has_local_mcp = mcp_status
+        .iter()
+        .any(phoenix_tools::mcp::McpServerStatus::is_live_local_process);
 
     AboutResourcesSnapshot {
         sampled_at: generation.sampled_at,
@@ -1555,6 +1556,9 @@ mod tests {
             },
             observations,
             api_pids,
+            live_terminal_session_count: terminal_pids
+                .as_ref()
+                .map_or(0, |pids| u32::try_from(pids.len()).unwrap_or(u32::MAX)),
             terminal_pids,
             live_bash_work_scopes: handles
                 .iter()
@@ -1610,6 +1614,25 @@ mod tests {
             .uncovered_reasons
             .iter()
             .any(|reason| reason.contains("MCP servers are excluded")));
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("terminal processes are excluded")));
+    }
+
+    #[test]
+    fn terminal_enumeration_failure_still_reports_active_coverage_gap() {
+        let mut generation = generation_with_thermal(
+            thermal_sample(Some(ThermalPressureSample::Nominal), None),
+            BTreeSet::new(),
+            None,
+            Vec::new(),
+            BTreeMap::new(),
+        );
+        generation.live_terminal_session_count = 1;
+
+        let coverage = thermal_coverage_snapshot(&generation, false, false);
+
         assert!(coverage
             .uncovered_reasons
             .iter()
@@ -1703,7 +1726,7 @@ mod tests {
 
         assert_eq!(snapshot.mode, ThermalGovernorMode::ObserveOnly);
         assert_eq!(snapshot.state, ThermalGovernorState::Elevated);
-        assert_eq!(snapshot.applied_action, ThermalGovernorActionKind::None);
+        assert_eq!(snapshot.applied_action, ObserveOnlyAppliedAction::None);
         assert_eq!(
             snapshot.proposed_action.kind,
             ThermalGovernorActionKind::Deprioritize

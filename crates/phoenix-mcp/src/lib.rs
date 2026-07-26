@@ -375,6 +375,14 @@ pub struct McpServerStatus {
     pub auth_redirect_warning: Option<String>,
 }
 
+impl McpServerStatus {
+    #[must_use]
+    pub fn is_live_local_process(&self) -> bool {
+        matches!(self.transport, McpTransportKind::Stdio)
+            && matches!(self.state, McpConnState::Ready)
+    }
+}
+
 /// A connect/handshake/authorization failure retained for the status API
 /// (REQ-MCP-018). Carries the transport/auth of the configured server so the
 /// panel can render it without the server being in the connected map.
@@ -3889,6 +3897,34 @@ pub struct PreconfiguredClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_status(state: McpConnState, transport: McpTransportKind) -> McpServerStatus {
+        McpServerStatus {
+            name: "test".into(),
+            state,
+            transport,
+            auth: McpAuthKind::None,
+            tool_count: 0,
+            tools: Vec::new(),
+            enabled: true,
+            pending_oauth_url: None,
+            last_error: None,
+            auth_redirect_warning: None,
+        }
+    }
+
+    #[test]
+    fn only_ready_stdio_status_represents_a_live_local_process() {
+        assert!(server_status(McpConnState::Ready, McpTransportKind::Stdio).is_live_local_process());
+        assert!(
+            !server_status(McpConnState::Failed, McpTransportKind::Stdio).is_live_local_process()
+        );
+        assert!(
+            !server_status(McpConnState::Unauthorized, McpTransportKind::Stdio)
+                .is_live_local_process()
+        );
+        assert!(!server_status(McpConnState::Ready, McpTransportKind::Http).is_live_local_process());
+    }
 
     #[test]
     fn test_read_all_configs_does_not_panic() {
