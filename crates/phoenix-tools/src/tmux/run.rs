@@ -911,7 +911,7 @@ mod tests {
         assert_eq!(v["status"], "ready");
         assert!(v["exit_code"].is_null());
         let window_id = v["window_id"].as_str().unwrap();
-        let sock = owner.path().join("conv-tmux-run-close-after-ready.sock");
+        let sock = crate::tmux::registry::socket_path_for_worktree(owner.path(), cwd_tmp.path());
         let capture = tokio::process::Command::new("tmux")
             .args([
                 "-S",
