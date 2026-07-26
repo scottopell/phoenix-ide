@@ -377,6 +377,21 @@ pub fn fetcher_cache_dir() -> PathBuf {
     PhoenixRuntimeEnvironment::detect().chromium_cache_dir()
 }
 
+#[derive(Debug)]
+enum BrowserTerminationError {
+    KillFailed(String),
+    KillTimedOut,
+}
+
+impl std::fmt::Display for BrowserTerminationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KillFailed(error) => write!(formatter, "browser kill failed: {error}"),
+            Self::KillTimedOut => formatter.write_str("browser kill timed out"),
+        }
+    }
+}
+
 impl BrowserSession {
     /// Directory where the fetcher caches downloaded Chrome binaries
     pub(crate) fn fetcher_cache_dir() -> PathBuf {
@@ -749,7 +764,7 @@ impl BrowserSession {
     /// process is still running.
     ///
     /// Falls back to `Browser::kill` when graceful close does not complete.
-    async fn terminate(&mut self) {
+    async fn terminate(&mut self) -> Result<(), BrowserTerminationError> {
         if let Some(t) = &self.console_task {
             t.abort();
         }
@@ -782,16 +797,15 @@ impl BrowserSession {
             }
             match tokio::time::timeout(SESSION_INIT_TIMEOUT, self.browser.kill()).await {
                 Ok(Some(Err(error))) => {
-                    tracing::warn!(%error, "browser kill failed; OS process may linger");
+                    return Err(BrowserTerminationError::KillFailed(error.to_string()));
                 }
-                Err(_) => {
-                    tracing::warn!("browser kill timed out; OS process may linger");
-                }
+                Err(_) => return Err(BrowserTerminationError::KillTimedOut),
                 Ok(Some(Ok(())) | None) => {}
             }
         }
 
         self.handler_task.abort();
+        Ok(())
     }
 }
 
@@ -1045,9 +1059,10 @@ impl BrowserSessionManager {
             notified.as_mut().enable();
             let still_waiting_for_same_kill = {
                 let sessions = self.sessions.read().await;
-                sessions
-                    .get(key)
-                    .is_some_and(|entry| Arc::ptr_eq(&entry.kill_done, &done))
+                sessions.get(key).is_some_and(|entry| {
+                    Arc::ptr_eq(&entry.kill_done, &done)
+                        && entry.kill_requested.load(Ordering::SeqCst)
+                })
             };
             if !still_waiting_for_same_kill {
                 break;
@@ -1286,9 +1301,15 @@ impl BrowserSessionManager {
             // independent of the sessions map lock. If an in-flight browser tool
             // holds this guard, keep the session tracked as live until the guard
             // is released and Chrome has actually been terminated.
-            {
+            let termination = {
                 let mut session_guard = session.write().await;
-                session_guard.terminate().await;
+                session_guard.terminate().await
+            };
+            if let Err(error) = termination {
+                tracing::warn!(work_scope = %requested_scope, %error, "browser termination failed; retaining tracked session");
+                kill_requested.store(false, Ordering::SeqCst);
+                kill_done.notify_waiters();
+                return;
             }
 
             let still_tracked = {
