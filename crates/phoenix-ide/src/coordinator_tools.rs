@@ -61,6 +61,15 @@ impl Tool for ExplicitCwdSandboxedBash {
             "minLength": 1,
             "description": "Server-side working directory for op=run. It must exactly identify an active persisted WorkScope cwd or worktree path. There is no default."
         });
+        schema["if"] = json!({
+            "properties": { "op": { "const": "run" } },
+            "required": ["op"]
+        });
+        schema["then"] = json!({ "required": ["cmd", "cwd"] });
+        schema["else"] = json!({
+            "required": ["handle"],
+            "not": { "required": ["cwd"] }
+        });
         schema
     }
 
@@ -75,12 +84,17 @@ impl Tool for ExplicitCwdSandboxedBash {
         };
         let context_input = invocation.to_context_tool_value();
         if let Some(cwd) = invocation.explicit_working_directory() {
-            let resolved = match self.0.validate_active_work_scope_cwd(cwd).await {
+            let binding = match self.0.validate_active_work_scope_cwd(cwd).await {
                 Ok(path) => path,
                 Err(error) => return ToolOutput::error(error),
             };
             SandboxedBashTool
-                .run_shared_sandboxed_in_cwd(context_input, ctx, resolved)
+                .run_shared_sandboxed_in_cwd(
+                    context_input,
+                    ctx,
+                    binding.path,
+                    binding.work_scope_id,
+                )
                 .await
         } else {
             SandboxedBashTool
@@ -429,6 +443,9 @@ mod tests {
         let schema = tool.input_schema();
         assert!(schema["properties"].get("cwd").is_some());
         assert_eq!(schema["required"], json!(["op"]));
+        assert_eq!(schema["then"]["required"], json!(["cmd", "cwd"]));
+        assert_eq!(schema["else"]["required"], json!(["handle"]));
+        assert_eq!(schema["else"]["not"]["required"], json!(["cwd"]));
         let alternate =
             tool.description_for_language(phoenix_core::llm_language::LlmLanguage::Caveman);
         assert!(alternate.contains("every op=run need cwd"));

@@ -221,6 +221,21 @@ impl ResourceScopeKeyHandles {
             .collect()
     }
 
+    fn remove_lifecycle_owned_by(
+        &mut self,
+        lifecycle_scope: &ResourceScopeKey,
+    ) -> Vec<Arc<Handle>> {
+        let ids: Vec<_> = self
+            .handles
+            .iter()
+            .filter(|(_, handle)| &handle.lifecycle_scope == lifecycle_scope)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.handles.remove(&id))
+            .collect()
+    }
+
     /// REQ-BASH-005: enforce the cap before allocating a new handle id /
     /// spawning a process.
     ///
@@ -434,12 +449,12 @@ impl BashHandleRegistry {
     pub async fn snapshot_live_process_groups(&self) -> Vec<LiveHandleProcessGroup> {
         let mut out = Vec::new();
         let map = self.inner.read().await;
-        for (work_scope, entry) in map.iter() {
+        for entry in map.values() {
             let scope_handles = entry.read().await;
             for handle in scope_handles.all() {
                 if let Some(pgid) = handle.live_pgid().await {
                     out.push(LiveHandleProcessGroup {
-                        work_scope: work_scope.clone(),
+                        work_scope: handle.lifecycle_scope.clone(),
                         handle_id: handle.handle_id.clone(),
                         pgid,
                     });
@@ -447,6 +462,51 @@ impl BashHandleRegistry {
             }
         }
         out
+    }
+
+    pub async fn lifecycle_owned_handles(
+        &self,
+        lifecycle_scope: &ResourceScopeKey,
+    ) -> Vec<Arc<Handle>> {
+        let entries: Vec<_> = self.inner.read().await.values().cloned().collect();
+        let mut handles = Vec::new();
+        for entry in entries {
+            handles.extend(
+                entry
+                    .read()
+                    .await
+                    .all()
+                    .filter(|handle| &handle.lifecycle_scope == lifecycle_scope)
+                    .cloned(),
+            );
+        }
+        handles
+    }
+
+    async fn remove_lifecycle_owned(&self, lifecycle_scope: &ResourceScopeKey) -> Vec<Arc<Handle>> {
+        let entries: Vec<_> = self
+            .inner
+            .read()
+            .await
+            .iter()
+            .map(|(scope, entry)| (scope.clone(), entry.clone()))
+            .collect();
+        let mut removed = Vec::new();
+        let mut empty_scopes = Vec::new();
+        for (scope, entry) in entries {
+            let mut table = entry.write().await;
+            removed.extend(table.remove_lifecycle_owned_by(lifecycle_scope));
+            if table.all().next().is_none() {
+                empty_scopes.push(scope);
+            }
+        }
+        if !empty_scopes.is_empty() {
+            let mut registry = self.inner.write().await;
+            for scope in empty_scopes {
+                registry.remove(&scope);
+            }
+        }
+        removed
     }
 
     /// Remove a `ResourceScopeKey`'s handle table outright. Used by the
@@ -536,14 +596,13 @@ pub async fn cascade_bash_on_delete(
         return kill_selected_handles(registry, work_scope, handles).await;
     }
     let mut report = CascadeBashReport::default();
-
-    let Some(entry) = registry.remove(work_scope).await else {
+    let handles = registry.remove_lifecycle_owned(work_scope).await;
+    if handles.is_empty() {
         return report;
-    };
+    }
 
     {
-        let scope_handles = entry.read().await;
-        for h in scope_handles.all() {
+        for h in &handles {
             let Some(group_id) = h.live_pgid().await else {
                 continue;
             };
@@ -861,6 +920,46 @@ mod tests {
         assert!(registry.remove(&scope("conv-1")).await.is_some());
         assert_eq!(registry.scope_count().await, 0);
         assert!(registry.remove(&scope("conv-1")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn work_scope_teardown_removes_coordinator_controlled_handle() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let lifecycle_scope = scope("inspected-work");
+        let coordinator_table = registry.get_or_create(&ResourceScopeKey::Coordinator).await;
+        let handle = Handle::new_live_for_actor_with_lifecycle(
+            ResourceScopeKey::Coordinator,
+            lifecycle_scope.clone(),
+            HandleId::new("b-coordinator"),
+            "coordinator".to_string(),
+            phoenix_core::work_scope::ResourceAuthority::Work,
+            "pwd".to_string(),
+            None,
+            12345,
+            12345,
+            RING_BUFFER_BYTES,
+        );
+        coordinator_table.write().await.insert(handle.clone());
+        handle
+            .transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(0) },
+                std::time::Duration::from_millis(1),
+                std::time::SystemTime::now(),
+                crate::bash::handle::TOMBSTONE_TAIL_LINES,
+            )
+            .await;
+
+        assert_eq!(
+            registry
+                .lifecycle_owned_handles(&lifecycle_scope)
+                .await
+                .len(),
+            1
+        );
+        let report =
+            cascade_bash_on_delete(&registry, &lifecycle_scope, &work_actor("owner"), None).await;
+        assert!(report.kill_failures.is_empty());
+        assert!(coordinator_table.read().await.all().next().is_none());
     }
 
     #[tokio::test]

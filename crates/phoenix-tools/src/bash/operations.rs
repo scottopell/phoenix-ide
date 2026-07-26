@@ -664,8 +664,9 @@ fn spawn_child(
     // pgid == pid because we made the child a process group leader.
     let pgid = i32::try_from(pid).unwrap_or(0);
 
-    let handle = Handle::new_live_for_actor(
+    let handle = Handle::new_live_for_actor_with_lifecycle(
         ctx.work_scope.clone(),
+        ctx.bash_lifecycle_scope(),
         handle_id,
         ctx.resource_access.conversation_id().to_string(),
         ctx.resource_access.authority(),

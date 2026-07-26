@@ -64,7 +64,7 @@ use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_core::domain::sm_state::ExploreBashCapability;
 use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::platform::PlatformCapability;
-use phoenix_core::work_scope::ResourceScopeKey;
+use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 use phoenix_workflow::wake_profile::{
     WakeCancellationReason, WakeRegistrationIntent, WakeResourceIdentity, WorkScopeIdentity,
 };
@@ -351,6 +351,12 @@ enum ToolExecutionEnvironment {
 }
 
 #[derive(Clone)]
+enum BashLifecycleOwner {
+    ControlScope,
+    Work(WorkScopeId),
+}
+
+#[derive(Clone)]
 pub struct ToolContext {
     /// Cancellation signal for long-running operations
     pub cancel: CancellationToken,
@@ -404,6 +410,8 @@ pub struct ToolContext {
     /// survive context-exhaustion continuations; Direct conversations fall
     /// back to the conversation id.
     pub work_scope: ResourceScopeKey,
+
+    bash_lifecycle_owner: BashLifecycleOwner,
 
     /// Optional sink for typed ephemeral bash progress snapshots.
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
@@ -497,6 +505,7 @@ impl ToolContext {
             tmux_registry,
             worktree_path: None,
             work_scope: ResourceScopeKey::Coordinator,
+            bash_lifecycle_owner: BashLifecycleOwner::ControlScope,
             bash_progress_sink: None,
             tool_use_id: None,
             wake_registrar: None,
@@ -519,9 +528,23 @@ impl ToolContext {
         }
     }
 
-    fn with_working_dir(mut self, working_dir: PathBuf) -> Self {
+    fn with_working_dir_and_bash_lifecycle_owner(
+        mut self,
+        working_dir: PathBuf,
+        work_scope_id: WorkScopeId,
+    ) -> Self {
         self.execution_environment = ToolExecutionEnvironment::Filesystem(working_dir);
+        self.bash_lifecycle_owner = BashLifecycleOwner::Work(work_scope_id);
         self
+    }
+
+    fn bash_lifecycle_scope(&self) -> ResourceScopeKey {
+        match &self.bash_lifecycle_owner {
+            BashLifecycleOwner::ControlScope => self.work_scope.clone(),
+            BashLifecycleOwner::Work(work_scope_id) => {
+                ResourceScopeKey::Work(work_scope_id.clone())
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -558,6 +581,7 @@ impl ToolContext {
             worktree_path,
             work_scope,
             bash_progress_sink: None,
+            bash_lifecycle_owner: BashLifecycleOwner::ControlScope,
             tool_use_id: None,
             wake_registrar: None,
         }

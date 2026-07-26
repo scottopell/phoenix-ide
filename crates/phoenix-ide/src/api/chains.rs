@@ -375,6 +375,9 @@ pub async fn archive_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
+    for id in &member_ids {
+        super::handlers::refuse_if_coordinator(&state, id, "archive").await?;
+    }
 
     for id in &member_ids {
         let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
@@ -434,6 +437,9 @@ pub async fn delete_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
+    for id in &member_ids {
+        super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
+    }
 
     for id in &member_ids {
         let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;

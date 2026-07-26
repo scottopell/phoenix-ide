@@ -179,6 +179,7 @@ pub enum ExitState {
 #[allow(clippy::struct_field_names)]
 pub struct Handle {
     pub work_scope: ResourceScopeKey,
+    pub lifecycle_scope: ResourceScopeKey,
     pub handle_id: HandleId,
     pub creator_conversation_id: String,
     pub authority: ResourceAuthority,
@@ -261,6 +262,34 @@ impl Handle {
         pid: u32,
         ring_bytes_cap: usize,
     ) -> Arc<Self> {
+        Self::new_live_for_actor_with_lifecycle(
+            work_scope.clone(),
+            work_scope,
+            handle_id,
+            creator_conversation_id,
+            authority,
+            cmd,
+            label,
+            pgid,
+            pid,
+            ring_bytes_cap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    #[must_use]
+    pub fn new_live_for_actor_with_lifecycle(
+        work_scope: ResourceScopeKey,
+        lifecycle_scope: ResourceScopeKey,
+        handle_id: HandleId,
+        creator_conversation_id: String,
+        authority: ResourceAuthority,
+        cmd: String,
+        label: Option<String>,
+        pgid: i32,
+        pid: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Self> {
         let live = LiveData {
             pgid,
             pid,
@@ -269,6 +298,7 @@ impl Handle {
         let (tx, rx) = watch::channel::<Option<ExitState>>(None);
         Arc::new(Self {
             work_scope,
+            lifecycle_scope,
             handle_id,
             creator_conversation_id,
             authority,

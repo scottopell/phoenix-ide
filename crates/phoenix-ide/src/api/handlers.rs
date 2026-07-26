@@ -4316,7 +4316,11 @@ async fn refuse_if_chain_member(state: &AppState, id: &str, op: &str) -> Result<
     Err(AppError::Conflict(Box::new(response)))
 }
 
-async fn refuse_if_coordinator(state: &AppState, id: &str, op: &str) -> Result<(), AppError> {
+pub(super) async fn refuse_if_coordinator(
+    state: &AppState,
+    id: &str,
+    op: &str,
+) -> Result<(), AppError> {
     if state
         .runtime
         .db()
@@ -11441,6 +11445,54 @@ pub(crate) mod hard_delete_cascade_tests {
                 "{id} must be gone after chain delete"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn chain_delete_preflights_coordinator_role_before_mutation() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["cc-a", "cc-b"]).await;
+        sqlx::query(
+            "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = NULL WHERE id = 'cc-b'",
+        )
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let err = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("cc-a".to_string()),
+        )
+        .await
+        .expect_err("Coordinator chain must be immutable");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "coordinator_lifecycle");
+            }
+            other => panic!("expected 409, got {other:?}"),
+        }
+        assert!(state.db.get_conversation("cc-a").await.is_ok());
+        assert!(state.db.get_conversation("cc-b").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn chain_archive_preflights_coordinator_role_before_mutation() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["ca-a", "ca-b"]).await;
+        sqlx::query(
+            "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = NULL WHERE id = 'ca-b'",
+        )
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        crate::api::chains::archive_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("ca-a".to_string()),
+        )
+        .await
+        .expect_err("Coordinator chain must be immutable");
+        assert!(!state.db.get_conversation("ca-a").await.unwrap().archived);
+        assert!(!state.db.get_conversation("ca-b").await.unwrap().archived);
     }
 
     /// If any member of a chain is busy, `delete_chain_handler` refuses

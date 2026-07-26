@@ -147,6 +147,12 @@ pub(crate) struct GlobalReadService {
     message_retriever: Arc<dyn crate::db::MessageRetriever>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ValidatedWorkScopeCwd {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) work_scope_id: phoenix_core::work_scope::WorkScopeId,
+}
+
 impl GlobalReadService {
     pub(crate) fn new(
         db: crate::db::Database,
@@ -238,30 +244,31 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
     pub(crate) async fn validate_active_work_scope_cwd(
         &self,
         requested_cwd: &str,
-    ) -> Result<std::path::PathBuf, String> {
+    ) -> Result<ValidatedWorkScopeCwd, String> {
         let canonical = crate::conversation_cwd::validate_conversation_cwd(requested_cwd)
             .map_err(|error| format!("invalid Coordinator bash cwd: {error}"))?
             .path_buf();
         let canonical_text = canonical.to_string_lossy();
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(
-                 SELECT 1 FROM work_scopes
-                 WHERE lifecycle = 'active'
-                   AND environment_kind <> 'none'
-                   AND (cwd = ?1 OR worktree_path = ?1)
-             )",
+        let work_scope_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM work_scopes
+             WHERE lifecycle = 'active'
+               AND environment_kind <> 'none'
+               AND (cwd = ?1 OR worktree_path = ?1)
+             LIMIT 1",
         )
         .bind(canonical_text.as_ref())
-        .fetch_one(self.db.pool())
+        .fetch_optional(self.db.pool())
         .await
-        .map_err(|error| format!("failed to validate Coordinator bash cwd: {error}"))?;
-        if exists == 0 {
-            return Err(
-                "Coordinator bash cwd does not identify an active persisted WorkScope environment"
-                    .to_string(),
-            );
-        }
-        Ok(canonical)
+        .map_err(|error| format!("failed to validate explicit bash cwd: {error}"))?
+        .ok_or_else(|| {
+            "explicit bash cwd does not identify an active persisted WorkScope environment"
+                .to_string()
+        })?;
+        Ok(ValidatedWorkScopeCwd {
+            path: canonical,
+            work_scope_id: phoenix_core::work_scope::WorkScopeId::parse(work_scope_id)
+                .map_err(|error| format!("invalid persisted WorkScope id: {error}"))?,
+        })
     }
 
     pub(crate) async fn query_database(
@@ -1179,13 +1186,11 @@ mod tests {
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
         let service = GlobalReadService::new(db.clone(), retriever);
 
-        assert_eq!(
-            service
-                .validate_active_work_scope_cwd(canonical.to_str().unwrap())
-                .await
-                .unwrap(),
-            canonical
-        );
+        let binding = service
+            .validate_active_work_scope_cwd(canonical.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(binding.path, canonical);
         assert!(service
             .validate_active_work_scope_cwd(dir.path().to_str().unwrap())
             .await
@@ -1248,12 +1253,10 @@ mod tests {
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
         let service = GlobalReadService::new(db, retriever);
 
-        assert_eq!(
-            service
-                .validate_active_work_scope_cwd(alias.to_str().unwrap())
-                .await
-                .unwrap(),
-            canonical
-        );
+        let binding = service
+            .validate_active_work_scope_cwd(alias.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(binding.path, canonical);
     }
 }
