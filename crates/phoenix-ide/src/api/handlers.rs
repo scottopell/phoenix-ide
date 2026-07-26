@@ -4555,7 +4555,7 @@ async fn cleanup_browser_with_retry(
     };
     if let Err(first_error) = cleanup().await {
         if let Err(retry_error) = cleanup().await {
-            tracing::error!(conv_id = %conv.id, %first_error, %retry_error, "browser cleanup failed after retry; transferring cleanup to detached manager task");
+            tracing::warn!(conv_id = %conv.id, %first_error, %retry_error, "browser cleanup failed after retry; transferring cleanup to detached manager task");
             browser_manager.request_kill_session_for_actor_until_success(
                 work_scope.clone(),
                 browser_actor.clone(),
