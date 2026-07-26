@@ -1461,13 +1461,16 @@ mod tests {
         );
     }
 
-    /// First `ensure_live` for a scope must emit a work-scope update whose
-    /// status reflects the SETTLED state after probe/spawn (`live`), never
-    /// the transient `not_probed` seen at insertion. (Regression for the
-    /// emit-on-create ordering, where the create emit fired at `not_probed`
-    /// and the later create→live transition was suppressed, stranding the
-    /// inventory at `not_probed` until a manual refresh.) Requires a real
-    /// tmux binary to drive the spawn; skipped otherwise.
+    #[test]
+    fn production_style_registry_ignores_owner_marker_for_spawn_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".armed"), []).unwrap();
+        let registry = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        assert!(!registry.contain_test_spawns);
+        let owned = registry.with_test_spawn_containment();
+        assert!(owned.contain_test_spawns);
+    }
+
     #[tokio::test]
     async fn first_ensure_live_emits_settled_live_status() {
         if which::which("tmux").is_err() {

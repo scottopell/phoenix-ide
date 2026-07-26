@@ -411,6 +411,28 @@ mod tests {
     }
 
     #[test]
+    fn socket_symlink_is_unlinked_without_invoking_tmux() {
+        let fake_bin = TempDir::new().unwrap();
+        let fake_tmux = fake_bin.path().join("tmux");
+        let invoked = fake_bin.path().join("invoked");
+        fs::write(
+            &fake_tmux,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", invoked.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_tmux, permissions).unwrap();
+
+        let owner = TestTmuxServerOwner::new_with_watchdog_path(Some(fake_bin.path()));
+        let root = owner.path().to_path_buf();
+        std::os::unix::fs::symlink("/tmp/not-a-test-socket", root.join("escape.sock")).unwrap();
+        owner.shutdown();
+        assert!(!invoked.exists(), "watchdog must not pass symlinks to tmux");
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn cleanup_failure_preserves_root_without_reentrant_drop() {
         let fake_bin = TempDir::new().unwrap();
         let fake_tmux = fake_bin.path().join("tmux");
