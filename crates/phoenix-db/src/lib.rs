@@ -16082,17 +16082,16 @@ mod tests {
         let workflow_id = phoenix_workflow::WorkflowId(44);
         let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
             contract_id: "contract-44".into(),
+            root_conversation_id: "conv-wake".into(),
             conversation_id: "conv-wake".into(),
-            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
-                kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
-                stable_key: "conv-wake".into(),
-            },
+            registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
+                "conv-wake".into(),
+            ),
             resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
                 phoenix_workflow::wake_profile::BashResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity {
-                        kind: phoenix_workflow::wake_profile::WorkScopeKind::Conversation,
-                        stable_key: "conv-wake".into(),
-                    },
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
+                        "conv-wake".into(),
+                    ),
                     handle_id: "b-44".into(),
                 },
             ),

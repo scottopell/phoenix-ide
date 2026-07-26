@@ -115,30 +115,6 @@ impl WakeRegistrar for ProductionWakeRegistrar {
     fn notify_activation_committed(&self) {
         self.kick();
     }
-
-    async fn rekey_work_scope(
-        &self,
-        conversation_id: &str,
-        old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-        new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-        resources: crate::tools::WakeScopeRekeyResources,
-    ) -> Result<u64, String> {
-        let moved = self
-            .repo
-            .rekey_active_work_scope(
-                conversation_id,
-                old_scope,
-                new_scope,
-                resources.bash,
-                resources.tmux_window,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        if moved > 0 {
-            self.kick();
-        }
-        Ok(moved)
-    }
 }
 
 pub(crate) async fn run(
@@ -1300,14 +1276,14 @@ mod tests {
 
     #[tokio::test]
     async fn fired_bash_wake_renders_wait_compatible_observation() {
-        let (_db, repo) = open_repo().await;
-        let workflow_id = register_bash(&repo, "b-1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             workflow_id,
             InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                 identity: BashResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
                 cmd: "cargo test".to_string(),
@@ -1485,12 +1461,12 @@ mod tests {
         use phoenix_tools::bash::handle::{Handle, HandleId};
         use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
 
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "b-1", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 50).await;
         let bash = Arc::new(phoenix_tools::BashHandleRegistry::new());
-        let scope = WorkScope::Conversation("conv".to_string());
+        let resource_scope = work_scope_from_identity(&scope);
         let handle = Handle::new_live(
-            scope.clone(),
+            resource_scope.clone(),
             HandleId::new("b-1"),
             "sleep 60".to_string(),
             None,
@@ -1509,7 +1485,7 @@ mod tests {
             panic!("expected live handle");
         };
         live.ring.lock().await.append(b"unterminated");
-        bash.get_or_create(&scope)
+        bash.get_or_create(&resource_scope)
             .await
             .write()
             .await
@@ -1587,9 +1563,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_lost_bash_delivers_one_interruption_and_unparks_conversation() {
+        let (db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "missing", 50).await;
+        let worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(RuntimeRegistryInspector::new(
+                Arc::new(phoenix_tools::BashHandleRegistry::new()),
+                Arc::new(phoenix_tools::TmuxRegistry::new()),
+            )),
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(99),
+        );
+        worker.run_once().await.unwrap();
+
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let handle = manager.get_or_create("conv").await.unwrap();
+
+        deliver_pending(&manager, &repo, Timestamp(20))
+            .await
+            .unwrap();
+        let messages_after_first_delivery = db.get_messages("conv").await.unwrap();
+        let interruption = messages_after_first_delivery
+            .last()
+            .expect("wake interruption");
+        assert!(matches!(
+            &interruption.content,
+            crate::db::MessageContent::User(user)
+                if user.is_meta
+                    && user.text.contains("forgotten")
+                    && user.text.contains("PhoenixRestart")
+        ));
+        assert!(!handle_is_idle(&handle));
+
+        worker.run_once().await.unwrap();
+        deliver_pending(&manager, &repo, Timestamp(21))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_messages("conv").await.unwrap().len(),
+            messages_after_first_delivery.len()
+        );
+    }
+
+    #[tokio::test]
     async fn overdue_missing_bash_is_forgotten_before_expiry() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "missing", 50).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "missing", 50).await;
         let inspector = RuntimeRegistryInspector::new(
             Arc::new(phoenix_tools::BashHandleRegistry::new()),
             Arc::new(phoenix_tools::TmuxRegistry::new()),
@@ -1812,7 +1840,7 @@ mod tests {
         assert_eq!(*kick_rx.borrow(), 2);
 
         let registration_replay = registrar
-            .register(register_input("b-1", "b-1", 50))
+            .register(register_input(&scope, "b-1", "b-1", 50))
             .await
             .unwrap();
         assert!(matches!(
@@ -1846,8 +1874,8 @@ mod tests {
 
     #[tokio::test]
     async fn live_handle_poll_is_short_and_bounded_by_expiry() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "b-1", 12).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 12).await;
         let clock = Arc::new(TestClock::new(10));
         let worker = WakeWorker::new(
             repo,
@@ -1861,14 +1889,14 @@ mod tests {
 
     #[tokio::test]
     async fn post_expiry_terminal_evidence_yields_to_expiry() {
-        let (_db, repo) = open_repo().await;
-        register_bash(&repo, "b-1", 12).await;
+        let (_db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 12).await;
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             1,
             InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                 identity: BashResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     handle_id: "b-1".to_string(),
                 },
                 cmd: "test command".to_string(),
@@ -2081,7 +2109,7 @@ mod tests {
 
     #[tokio::test]
     async fn newly_obtained_non_idle_runtime_is_not_delivery_eligible() {
-        let (db, _repo) = open_repo().await;
+        let (db, _repo, _scope) = open_repo().await;
         let manager = Arc::new(crate::runtime::RuntimeManager::new(
             db,
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),
@@ -2119,7 +2147,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_runtime_identity_does_not_accept_wake_event() {
-        let (db, repo) = open_repo().await;
+        let (db, repo, _scope) = open_repo().await;
         let manager = Arc::new(crate::runtime::RuntimeManager::new(
             db,
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),
@@ -2142,9 +2170,9 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn mixed_materialized_batch_uses_batch_auto_resume_decision() {
-        let (db, repo) = open_repo().await;
-        let fired_id = register_bash(&repo, "b-fired", 50).await;
-        let cancelled_id = register_bash(&repo, "b-cancelled", 50).await;
+        let (db, repo, scope) = open_repo().await;
+        let fired_id = register_bash(&repo, &scope, "b-fired", 50).await;
+        let cancelled_id = register_bash(&repo, &scope, "b-cancelled", 50).await;
         let (kick_tx, _) = watch::channel(0u64);
         ProductionWakeRegistrar::new(repo.clone(), kick_tx)
             .cancel(CancelWakeInput {
@@ -2159,7 +2187,7 @@ mod tests {
             fired_id,
             InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                 identity: BashResourceIdentity {
-                    work_scope: conv_scope(),
+                    work_scope: scope.clone(),
                     handle_id: "b-fired".to_string(),
                 },
                 cmd: "test command".to_string(),

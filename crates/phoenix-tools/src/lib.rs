@@ -177,24 +177,11 @@ impl RegisteredWake {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WakeScopeRekeyResources {
-    pub bash: bool,
-    pub tmux_window: bool,
-}
-
 #[async_trait]
 pub trait WakeRegistrar: Send + Sync {
     async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String>;
     async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String>;
     fn notify_activation_committed(&self);
-    async fn rekey_work_scope(
-        &self,
-        conversation_id: &str,
-        old_scope: &WorkScopeIdentity,
-        new_scope: &WorkScopeIdentity,
-        resources: WakeScopeRekeyResources,
-    ) -> Result<u64, String>;
 }
 
 /// Converts a resource scope to the persisted identity that may own a durable wake.
@@ -1394,6 +1381,7 @@ mod tests {
         assert!(names(&ToolRegistry::explore(
             "tasks",
             Vec::new(),
+            Vec::new(),
             sandbox_policy()
         ))
         .contains("wait_until"));
@@ -1703,17 +1691,6 @@ mod wake_registrar_seam_tests {
         }
 
         fn notify_activation_committed(&self) {}
-
-        async fn rekey_work_scope(
-            &self,
-            _conversation_id: &str,
-            _old_scope: &WorkScopeIdentity,
-            _new_scope: &WorkScopeIdentity,
-            _resources: crate::WakeScopeRekeyResources,
-        ) -> Result<u64, String> {
-            self.calls.lock().await.push("rekey".to_string());
-            Ok(0)
-        }
     }
 
     fn test_context() -> ToolContext {

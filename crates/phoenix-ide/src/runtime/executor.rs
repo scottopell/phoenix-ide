@@ -6151,38 +6151,7 @@ where
                 // this write is a no-op — worktree_path == conv.cwd already.
                 // For legacy Managed conversations whose cwd was the repo root,
                 // this is load-bearing: it moves cwd to the new worktree path.
-                let old_scope = self.context.resource_scope.clone();
                 promote_runtime_context_to_work(&mut self.context, &approval_result);
-                let new_scope = self.context.resource_scope.clone();
-
-                let bash_moved = self.bash_handles.rekey_scope(&old_scope, &new_scope).await;
-                let browser_moved = self
-                    .browser_sessions
-                    .rekey_scope(&old_scope, &new_scope)
-                    .await;
-                let tmux_moved = self.tmux_registry.rekey_scope(&old_scope, &new_scope).await;
-                let wake_moved = if let Some(registrar) = self.wake_registrar.as_ref() {
-                    registrar
-                        .rekey_work_scope(
-                            &self.context.conversation_id,
-                            &crate::tools::work_scope_identity(&old_scope)?,
-                            &crate::tools::work_scope_identity(&new_scope)?,
-                            crate::tools::WakeScopeRekeyResources {
-                                bash: bash_moved,
-                                tmux_window: tmux_moved,
-                            },
-                        )
-                        .await?
-                } else {
-                    0
-                };
-
-                if bash_moved || browser_moved || tmux_moved || wake_moved > 0 {
-                    self.bash_handles.emit_lifecycle(
-                        &new_scope,
-                        phoenix_tools::bash::BashLifecyclePhase::Spawned,
-                    );
-                }
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -9391,16 +9360,6 @@ mod context_exhausted_preserves_worktree_tests {
         }
 
         fn notify_activation_committed(&self) {}
-
-        async fn rekey_work_scope(
-            &self,
-            _conversation_id: &str,
-            _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-            _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-            _resources: crate::tools::WakeScopeRekeyResources,
-        ) -> Result<u64, String> {
-            Ok(0)
-        }
     }
 
     #[async_trait::async_trait]
@@ -9423,16 +9382,6 @@ mod context_exhausted_preserves_worktree_tests {
         fn notify_activation_committed(&self) {
             self.activation_notifications
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        async fn rekey_work_scope(
-            &self,
-            _conversation_id: &str,
-            _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-            _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-            _resources: crate::tools::WakeScopeRekeyResources,
-        ) -> Result<u64, String> {
-            Ok(0)
         }
     }
 
