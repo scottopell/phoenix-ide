@@ -1864,6 +1864,7 @@ where
     active_direct_turn: Option<Box<crate::runtime::traits::ActiveDirectTurn>>,
     pending_direct_turn_terminal: Option<Box<crate::runtime::traits::ActiveDirectTurnTerminal>>,
     direct_turn_cancellation_initiated: bool,
+    direct_turn_materialization_aborted: bool,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
     /// a system message. `0` disables the cap. Read once at construction
     /// time from `PHOENIX_PARENT_TOOL_CYCLE_CAP`, with
@@ -1990,6 +1991,7 @@ where
             grace_turn_granted: false,
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
+            direct_turn_materialization_aborted: false,
             active_direct_turn: None,
             pending_direct_turn_terminal: None,
             direct_turn_cancellation_initiated: false,
@@ -2819,6 +2821,7 @@ where
         result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
+        self.direct_turn_materialization_aborted = false;
 
         // Update state. Bump the entry timestamp on phase change so every
         // SseEvent::StateChange the executor subsequently emits carries a
@@ -2967,8 +2970,13 @@ where
                 .await?;
         } else {
             for effect in result.effects {
+                let is_authoritative_persist =
+                    matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 if let Some(gen_event) = self.execute_effect(effect).await? {
                     generated_events.push(gen_event);
+                }
+                if is_authoritative_persist && self.direct_turn_materialization_aborted {
+                    break;
                 }
             }
         }
@@ -3024,8 +3032,13 @@ where
                     _ => {}
                 }
             }
+            let is_authoritative_persist =
+                matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);
+            }
+            if is_authoritative_persist && self.direct_turn_materialization_aborted {
+                break;
             }
         }
 
@@ -3923,7 +3936,7 @@ where
                 self.pending_direct_turn_terminal = Some(Box::new(
                     crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
                 ));
-            } else if matches!(event, Event::LlmResponse { .. }) {
+            } else {
                 self.pending_direct_turn_terminal = Some(Box::new(
                     crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
                 ));
@@ -3942,6 +3955,12 @@ where
             };
             self.pending_direct_turn_terminal = Some(Box::new(
                 crate::runtime::traits::ActiveDirectTurnTerminal::Failed { reason },
+            ));
+            return;
+        }
+        if new_state.is_terminal() {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
             ));
         }
     }
@@ -3988,6 +4007,7 @@ where
                     phoenix_db::workflow::DirectTurnMaterializationEligibility::Fresh => {}
                     phoenix_db::workflow::DirectTurnMaterializationEligibility::ExactReplay
                     | phoenix_db::workflow::DirectTurnMaterializationEligibility::StaleAuthority => {
+                        self.direct_turn_materialization_aborted = true;
                         return Ok(None);
                     }
                 }
@@ -4018,10 +4038,10 @@ where
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
-                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority => Err(
-                        "direct-turn materialization became replay/stale after broadcast sequence reservation"
-                            .to_string(),
-                    ),
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority => {
+                        self.direct_turn_materialization_aborted = true;
+                        Ok(None)
+                    }
                 }
             }
 
@@ -8680,6 +8700,16 @@ mod authoritative_user_message_effect_tests {
                 crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
             ),
             (
+                Event::TaskResolved {
+                    system_message: "done".to_string(),
+                    repo_root: "/tmp".to_string(),
+                },
+                ConvState::HandedOff {
+                    successor_conv_id: "next".to_string(),
+                },
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            ),
+            (
                 Event::LlmError {
                     message: "provider failed".to_string(),
                     error_kind: crate::db::ErrorKind::InvalidRequest,
@@ -8757,7 +8787,39 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn fresh_then_replay_or_stale_materialization_is_hard_error_without_broadcast() {
+    async fn stale_or_replay_materialization_aborts_without_request_llm_or_state_persist() {
+        for preflight in [
+            DirectTurnMaterializationEligibility::ExactReplay,
+            DirectTurnMaterializationEligibility::StaleAuthority,
+        ] {
+            let (mut rt, storage, mut rx) = runtime(
+                preflight,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+
+            let result = crate::state_machine::transition::TransitionResult::new(
+                ConvState::LlmRequesting { attempt: 1 },
+            )
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::RequestLlm);
+
+            rt.apply_transition_result(result).await.unwrap();
+
+            assert_eq!(storage.recorded_materialize_authoritative_user_message_calls().len(), 0);
+            assert_eq!(storage.get_current_state("conv-direct"), None);
+            assert!(rt.llm_task_handle.is_none());
+            assert!(!matches!(rt.state, ConvState::Idle));
+            assert_no_broadcast(&mut rx);
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_then_replay_or_stale_materialization_aborts_without_broadcast() {
         for materialize in [
             AuthoritativeUserMessageMaterialization::ExactReplay,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
@@ -8765,21 +8827,14 @@ mod authoritative_user_message_effect_tests {
             let (mut rt, storage, mut rx) =
                 runtime(DirectTurnMaterializationEligibility::Fresh, materialize);
 
-            let err = rt
-                .execute_effect(Effect::PersistAuthoritativeUserMessage {
-                    payload: payload("msg-direct"),
-                    authority: authority(),
-                    idempotent: true,
-                })
-                .await
-                .expect_err(
-                    "fresh preflight followed by replay/stale materialization is impossible",
-                );
+            rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: true,
+            })
+            .await
+            .unwrap();
 
-            assert!(
-                err.contains("direct-turn materialization became replay/stale"),
-                "unexpected error: {err}"
-            );
             assert_no_broadcast(&mut rx);
             assert_eq!(
                 storage
@@ -8787,6 +8842,7 @@ mod authoritative_user_message_effect_tests {
                     .len(),
                 1
             );
+            assert!(rt.direct_turn_materialization_aborted);
         }
     }
 }

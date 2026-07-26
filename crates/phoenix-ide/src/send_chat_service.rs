@@ -95,10 +95,11 @@ impl SendChatApplicationService {
         let submitted = submitted_identity_from_request(&req);
         match lookup_durable_replay(&self.db, &req, &submitted).await? {
             DurableReplayOutcome::Missing => {}
-            DurableReplayOutcome::ExactMaterialized => {
+            DurableReplayOutcome::ExactMaterialized
+            | DurableReplayOutcome::ExactUnmaterializedTerminal => {
                 return Ok(SendChatOutcome::AlreadyPersisted);
             }
-            DurableReplayOutcome::ExactUnmaterialized => {
+            DurableReplayOutcome::ExactUnmaterializedLive => {
                 self.runtime.kick_direct_turn_worker();
                 return Ok(SendChatOutcome::Delivered);
             }
@@ -269,10 +270,17 @@ impl SendChatApplicationService {
                     .await
                 {
                     Ok(ScopedDirectTurnReplayLookup::Exact { turn, .. }) => {
-                        if matches!(turn.materialization, Materialization::Unmaterialized) {
-                            self.runtime.kick_direct_turn_worker();
-                        }
-                        return Ok(SendChatOutcome::Delivered);
+                        return Ok(match turn.materialization {
+                            Materialization::Unmaterialized => {
+                                if matches!(turn.lifecycle, phoenix_workflow::TurnLifecycle::Terminal { .. }) {
+                                    SendChatOutcome::AlreadyPersisted
+                                } else {
+                                    self.runtime.kick_direct_turn_worker();
+                                    SendChatOutcome::Delivered
+                                }
+                            }
+                            Materialization::Materialized { .. } => SendChatOutcome::AlreadyPersisted,
+                        });
                     }
                     Ok(ScopedDirectTurnReplayLookup::Missing)
                     | Err(ScopedDirectTurnReplayError::SubmittedIdentityChanged { .. }) => {
@@ -412,7 +420,8 @@ async fn expand_message(
 enum DurableReplayOutcome {
     Missing,
     ExactMaterialized,
-    ExactUnmaterialized,
+    ExactUnmaterializedLive,
+    ExactUnmaterializedTerminal,
 }
 
 async fn lookup_durable_replay(
@@ -432,7 +441,13 @@ async fn lookup_durable_replay(
     {
         Ok(ScopedDirectTurnReplayLookup::Missing) => Ok(DurableReplayOutcome::Missing),
         Ok(ScopedDirectTurnReplayLookup::Exact { turn, .. }) => match turn.materialization {
-            Materialization::Unmaterialized => Ok(DurableReplayOutcome::ExactUnmaterialized),
+            Materialization::Unmaterialized => {
+                if matches!(turn.lifecycle, phoenix_workflow::TurnLifecycle::Terminal { .. }) {
+                    Ok(DurableReplayOutcome::ExactUnmaterializedTerminal)
+                } else {
+                    Ok(DurableReplayOutcome::ExactUnmaterializedLive)
+                }
+            }
             Materialization::Materialized { .. } => Ok(DurableReplayOutcome::ExactMaterialized),
         },
         Err(ScopedDirectTurnReplayError::SubmittedIdentityChanged { .. }) => {
@@ -892,7 +907,7 @@ mod tests {
             lookup_durable_replay(&db, &req, &submitted_identity_from_request(&req))
                 .await
                 .unwrap(),
-            DurableReplayOutcome::ExactUnmaterialized
+            DurableReplayOutcome::ExactUnmaterializedLive
         );
 
         let mut changed_expansion = req.clone();
@@ -939,6 +954,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lookup_durable_replay_distinguishes_terminal_unmaterialized_turns() {
+        let mut req = request();
+        req.conversation_id = "conv-terminal-replay".to_string();
+        let db = db_with_conversation(&req.conversation_id).await;
+        let repo = WorkflowRepository::new(db.pool().clone());
+        let payload = prepared_payload(&req, "accepted before terminal");
+        let turn = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
+                prepared: prepared_turn(
+                    &ConversationAuthority(req.conversation_id.clone()),
+                    &payload,
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = turn.outcome else {
+            panic!("expected created turn")
+        };
+        repo.terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
+            turn_id,
+            expected_generation: 0,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lookup_durable_replay(&db, &req, &submitted_identity_from_request(&req))
+                .await
+                .unwrap(),
+            DurableReplayOutcome::ExactUnmaterializedTerminal
+        );
+    }
+
+
+    #[tokio::test]
     async fn lookup_durable_replay_precedes_archived_rejection_policy() {
         let mut req = request();
         req.conversation_id = "conv-archived-replay".to_string();
@@ -962,7 +1015,7 @@ mod tests {
             lookup_durable_replay(&db, &req, &submitted_identity_from_request(&req))
                 .await
                 .unwrap(),
-            DurableReplayOutcome::ExactUnmaterialized
+            DurableReplayOutcome::ExactUnmaterializedLive
         );
     }
 
