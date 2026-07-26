@@ -389,7 +389,10 @@ mod tests {
     }
 
     fn prepared_turn(message_id: &str) -> PreparedTurn {
-        PreparedTurn::from_exact_payload(prepared_payload(message_id).to_exact_bytes().unwrap())
+        PreparedTurn::from_exact_payload(
+            &ConversationAuthority("conv-a".to_string()),
+            prepared_payload(message_id).to_exact_bytes().unwrap(),
+        )
     }
 
     async fn accept(repo: &WorkflowRepository, key: &str) -> phoenix_workflow::TurnAuthorityId {
@@ -403,7 +406,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = step.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = step.outcome else {
             panic!("expected created turn")
         };
         turn_id
@@ -662,7 +665,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = step.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = step.outcome else {
             panic!("expected created turn")
         };
         let malformed = b"not-json";
