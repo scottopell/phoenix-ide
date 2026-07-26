@@ -164,7 +164,7 @@ pub struct TmuxInventory {
     pub status: TmuxServerStatus,
 }
 
-/// Two-value liveness of a browser session.
+/// Point-in-time lifecycle state of a browser session.
 ///
 /// Named distinctly from the SSE `BrowserSessionState` event (which signals
 /// up/down edges) — this is the inventory's point-in-time liveness.

@@ -147,7 +147,7 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
                 match failure {
                     Ok(failure)
                         if failure.work_scope == work_scope
-                            && failure.audience.matches_conversation(&conversation_id) =>
+                            && failure.audience.matches_actor(&actor) =>
                     {
                         let _ = ws_sender
                             .send(Message::Binary(status_frame(&format!("error: {}", failure.error))))

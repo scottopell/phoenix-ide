@@ -708,6 +708,23 @@ describe('browser open affordance (Phase 3)', () => {
     expect(stopBrowser).toHaveBeenCalledWith('ws-1', 'conv-1');
   });
 
+  it('a teardown-failed browser remains visible and retryable but cannot be opened', async () => {
+    const failedBrowser = inv([], { browser: { state: 'teardown_failed', idle_ms: 0 } });
+    getInv.mockResolvedValue(failedBrowser);
+
+    await act(async () => {
+      render(browserSectionTree({ inventory: failedBrowser, onSlot: () => {} }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('stop failed')).toBeTruthy();
+    expect(screen.getByTestId('browser-stop-button')).toBeTruthy();
+    expect(screen.queryByTestId('browser-open-button')).toBeNull();
+    expect(document.querySelector('.ws-glyph--err')).toBeTruthy();
+  });
+
   it('browser stop uses the live inventory scope rather than the requested prop scope', async () => {
     const liveBrowser = inv([], {
       scope_key: 'worktree:/tmp/promoted',

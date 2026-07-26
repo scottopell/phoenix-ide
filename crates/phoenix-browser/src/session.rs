@@ -888,10 +888,10 @@ pub enum BrowserSessionAudience {
 
 impl BrowserSessionAudience {
     #[must_use]
-    pub fn matches_conversation(&self, conversation_id: &str) -> bool {
+    pub fn matches_actor(&self, actor: &EffectiveResourceAccess) -> bool {
         match self {
-            Self::Scope => true,
-            Self::Conversation(target) => target == conversation_id,
+            Self::Scope => actor.authority() == ResourceAuthority::Work,
+            Self::Conversation(target) => target == actor.conversation_id(),
         }
     }
 }

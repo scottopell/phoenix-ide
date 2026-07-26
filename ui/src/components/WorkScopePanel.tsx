@@ -351,7 +351,7 @@ function BrowserRow({
     state === 'torn_down'
       ? { glyph: '○', cls: 'ws-glyph--muted', text: 'torn down' }
       : state === 'teardown_failed'
-        ? { glyph: '✗', cls: 'ws-glyph--error', text: 'stop failed' }
+        ? { glyph: '✗', cls: 'ws-glyph--err', text: 'stop failed' }
         : idle
           ? { glyph: '○', cls: 'ws-glyph--warn', text: `idle ${formatDuration(idleMs)}` }
           : { glyph: '●', cls: 'ws-glyph--live', text: 'live' };

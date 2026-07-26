@@ -58,7 +58,7 @@ correct weight (see `design.md`, "Why No Allium Spec").
 | **REQ-WSUI-001:** WorkScope Inventory Projection | Proposed | Read-projection over in-memory registries; no new persistence |
 | **REQ-WSUI-002:** Bash Handle Inventory | Proposed | Sourced from the `WorkScope`-keyed bash registry (`specs/bash/` REQ-BASH-WS-001) |
 | **REQ-WSUI-003:** Tmux Inventory | Proposed | Server presence + in-memory `TmuxServer.status`; no session/window enumeration |
-| **REQ-WSUI-004:** Browser Session Inventory | Proposed | `BrowserSessionManager::is_active` → `live`/`torn_down`; relative `idle_ms`, no wall-clock |
+| **REQ-WSUI-004:** Browser Session Inventory | Complete | Manager metadata → `live`/`teardown_failed`/`torn_down`; relative `idle_ms`, no wall-clock; failed teardown remains retryable without session reuse |
 | **REQ-WSUI-005:** Sub-Agents Excluded | Proposed | Sub-agents own `SubAgentViewerDock` |
 | **REQ-WSUI-006:** Inventory Pull Endpoint | Proposed | `GET /api/work-scope/:scope_key/inventory`; `get_conversation` shape |
 | **REQ-WSUI-007:** Inventory Push Event | Proposed | `WorkScopeUpdate` `SseWireEvent`; full snapshot, no deltas |
