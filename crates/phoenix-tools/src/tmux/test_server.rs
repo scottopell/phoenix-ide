@@ -17,6 +17,7 @@ use super::registry::TmuxRegistry;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 
 const WATCHDOG_PROGRAM: &str = r#"
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -78,12 +79,14 @@ for _ in range(50):
     creators = False
     for marker in root.glob(".creating-*"):
         try:
-            pid = int(marker.read_text())
-            os.kill(pid, 0)
-            creators = True
-        except ProcessLookupError:
-            marker.unlink(missing_ok=True)
-        except (OSError, ValueError):
+            with marker.open("r+") as marker_file:
+                try:
+                    fcntl.flock(marker_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    marker.unlink(missing_ok=True)
+                    marker.with_suffix(".locked").unlink(missing_ok=True)
+                except BlockingIOError:
+                    creators = True
+        except OSError:
             creators = True
     quiet = quiet + 1 if not unconfirmed and not sockets and not creators else 0
     if quiet >= 5:

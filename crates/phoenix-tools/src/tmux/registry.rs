@@ -1150,7 +1150,7 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
 /// any in-app terminal that later attaches) in the Phoenix repo
 /// instead of the conversation's project directory.
 ///
-type TestCreatorHandoff = (PathBuf, PathBuf);
+type TestCreatorHandoff = (PathBuf, PathBuf, PathBuf);
 
 fn tmux_spawn_command(
     socket_path: &Path,
@@ -1165,8 +1165,10 @@ fn tmux_spawn_command(
     let marker = root.join(format!(".creating-{}", uuid::Uuid::new_v4()));
     let gate = root.join(format!(".creator-gate-{}", uuid::Uuid::new_v4()));
     let wrapper = r#"
+import fcntl
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -1174,6 +1176,7 @@ import time
 parent = int(sys.argv[1])
 gate = Path(sys.argv[2])
 marker = Path(sys.argv[3])
+locked = marker.with_suffix(".locked")
 root = marker.parent
 while (
     root.exists()
@@ -1184,12 +1187,20 @@ while (
     time.sleep(0.01)
 if not gate.exists():
     sys.exit(1)
-try:
-    completed = subprocess.run(sys.argv[4:], check=False)
-    sys.exit(completed.returncode)
-finally:
-    gate.unlink(missing_ok=True)
-    marker.unlink(missing_ok=True)
+with marker.open("r+") as marker_file:
+    fcntl.flock(marker_file, fcntl.LOCK_EX)
+    locked.touch()
+    child = subprocess.Popen(sys.argv[4:], start_new_session=True)
+    try:
+        sys.exit(child.wait(timeout=5))
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+        sys.exit(124)
+    finally:
+        locked.unlink(missing_ok=True)
+        gate.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
 "#;
     let mut command = tokio::process::Command::new("python3");
     command
@@ -1200,7 +1211,72 @@ finally:
         .arg(&marker)
         .arg("tmux");
     command.args(tmux_args);
-    (command, Some((marker, gate)))
+    let locked = marker.with_extension("locked");
+    (command, Some((marker, gate, locked)))
+}
+
+/// # Errors
+/// Returns a [`TmuxError`] when the `tmux new-session` process fails to
+/// spawn or exits non-zero.
+async fn contained_spawn_failure(
+    child: &mut tokio::process::Child,
+    socket_path: &Path,
+    reason: String,
+) -> TmuxError {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    TmuxError::SpawnFailed {
+        socket_path: socket_path.to_path_buf(),
+        reason,
+    }
+}
+
+async fn publish_creator_handoff(
+    child: &mut tokio::process::Child,
+    socket_path: &Path,
+    handoff: TestCreatorHandoff,
+) -> Result<(), TmuxError> {
+    let (marker, gate, locked) = handoff;
+    let pending = marker.with_extension("pending");
+    if let Err(error) = std::fs::write(&pending, child.id().unwrap_or_default().to_string()) {
+        return Err(contained_spawn_failure(
+            child,
+            socket_path,
+            format!("failed to write creator identity: {error}"),
+        )
+        .await);
+    }
+    if let Err(error) = std::fs::rename(pending, marker) {
+        return Err(contained_spawn_failure(
+            child,
+            socket_path,
+            format!("failed to publish creator identity: {error}"),
+        )
+        .await);
+    }
+    if let Err(error) = std::fs::write(gate, []) {
+        return Err(contained_spawn_failure(
+            child,
+            socket_path,
+            format!("failed to release creator gate: {error}"),
+        )
+        .await);
+    }
+    if let Err(error) = tokio::time::timeout(Duration::from_secs(2), async {
+        while !locked.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    {
+        return Err(contained_spawn_failure(
+            child,
+            socket_path,
+            format!("creator ownership lock was not acquired: {error}"),
+        )
+        .await);
+    }
+    Ok(())
 }
 
 /// # Errors
@@ -1240,7 +1316,7 @@ async fn spawn_session_owned(
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
     set_tmux_server_env(&mut cmd);
-    let child = cmd
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1249,12 +1325,8 @@ async fn spawn_session_owned(
             socket_path: socket_path.to_path_buf(),
             reason: format!("failed to invoke tmux: {e}"),
         })?;
-    if let Some((marker, gate)) = creator_handoff {
-        let pending = marker.with_extension("pending");
-        std::fs::write(&pending, child.id().unwrap_or_default().to_string())
-            .expect("write tmux creator PID");
-        std::fs::rename(pending, marker).expect("publish tmux creator PID");
-        std::fs::write(gate, []).expect("release tmux creator gate");
+    if let Some(handoff) = creator_handoff {
+        publish_creator_handoff(&mut child, socket_path, handoff).await?;
     }
     let output = child
         .wait_with_output()
