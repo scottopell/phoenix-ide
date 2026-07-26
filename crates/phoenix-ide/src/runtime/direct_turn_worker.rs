@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_payload_is_terminally_quarantined() {
+    async fn malformed_payload_is_skipped_without_dispatch() {
         let (repo, dispatcher) = fixture().await;
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
@@ -701,7 +701,7 @@ mod tests {
                 .fetch_one(repo.pool())
                 .await
                 .unwrap();
-        assert_eq!(terminal_kind, "Failed");
+        assert!(terminal_kind.is_empty());
     }
 
     #[tokio::test]
