@@ -1,6 +1,8 @@
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+use std::os::fd::AsRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
