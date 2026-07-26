@@ -1163,6 +1163,47 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelector('[data-id="needs-leaf"].conv-item-chain-member')).toBeNull();
   });
 
+  it('summarizes attention required by hidden non-latest members', () => {
+    const root = makeConv('attention-root', 'attention-root', {
+      continued_in_conv_id: 'attention-error',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const error = makeConv('attention-error', 'attention-error', {
+      continued_in_conv_id: 'attention-working',
+      presentation_mode: 'error',
+      state: { type: 'error', message: 'failed', error_kind: 'server_error' },
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+    const working = makeConv('attention-working', 'attention-working', {
+      continued_in_conv_id: 'attention-latest',
+      presentation_mode: 'working',
+      state: { type: 'awaiting_llm' },
+      updated_at: '2024-03-01T00:00:00Z',
+    });
+    const latest = makeConv('attention-latest', 'attention-latest', {
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-04-01T00:00:00Z',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          listDensity="mobile"
+          conversations={[latest, working, error, root]}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
+    expect(container.querySelector('.conv-chain-latest-summary .conv-state-chip')?.textContent).toBe('Completed');
+    expect(container.querySelector('.conv-chain-attention')).toHaveClass('error');
+    expect(container.querySelector('.conv-chain-attention')?.textContent).toBe('1 error · 1 working');
+  });
+
   it('progressively reveals long mobile chains without mounting every member', () => {
     const members = Array.from({ length: 45 }, (_, index) => makeConv(
       `bounded-${index + 1}`,
@@ -1196,6 +1237,43 @@ describe('Mobile conversation list redesign', () => {
     fireEvent.click(container.querySelector('.conv-chain-history-more')!);
     expect(container.querySelectorAll('.conv-chain-members [data-id]')).toHaveLength(45);
     expect(container.querySelector('.conv-chain-history-more')).toBeNull();
+  });
+
+  it('retains older actionable members inside the bounded progressive window', () => {
+    const members = Array.from({ length: 45 }, (_, index) => makeConv(
+      `priority-bounded-${index + 1}`,
+      `priority-bounded-${index + 1}`,
+      {
+        continued_in_conv_id: index < 44 ? `priority-bounded-${index + 2}` : null,
+        presentation_mode: index === 3 ? 'error' : index === 8 ? 'working' : 'done',
+        state: index === 3
+          ? { type: 'error', message: 'failed', error_kind: 'server_error' }
+          : index === 8 ? { type: 'awaiting_llm' } : { type: 'terminal' },
+        updated_at: new Date(Date.UTC(2024, 0, index + 1)).toISOString(),
+      },
+    ));
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          listDensity="mobile"
+          conversations={[...members].reverse()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(container.querySelector('.conv-chain-caret')!);
+    const visibleIds = Array.from(container.querySelectorAll('.conv-chain-members [data-id]'))
+      .map((element) => element.getAttribute('data-id'));
+    expect(visibleIds).toHaveLength(20);
+    expect(visibleIds).toContain('priority-bounded-4');
+    expect(visibleIds).toContain('priority-bounded-9');
+    expect(visibleIds).toEqual([...visibleIds].sort((left, right) => {
+      const leftIndex = Number(left?.split('-').at(-1));
+      const rightIndex = Number(right?.split('-').at(-1));
+      return leftIndex - rightIndex;
+    }));
   });
 
   it('keeps a hidden active member visible without exceeding the progressive bound', () => {

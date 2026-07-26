@@ -172,6 +172,34 @@ function isActionableDisplayState(displayState: ReturnType<typeof getConvDisplay
   return displayState === 'working' || displayState === 'error' || displayState === 'awaiting-approval';
 }
 
+type ChainAttention = {
+  displayState: 'error' | 'awaiting-approval' | 'working';
+  label: string;
+};
+
+function chainAttention(members: Conversation[], latestMemberId: string): ChainAttention | null {
+  const counts = { error: 0, approval: 0, working: 0 };
+  for (const member of members) {
+    if (member.id === latestMemberId) continue;
+    const displayState = getConvDisplayState(member);
+    if (displayState === 'error') counts.error += 1;
+    else if (displayState === 'awaiting-approval') counts.approval += 1;
+    else if (displayState === 'working') counts.working += 1;
+  }
+
+  const parts = [
+    counts.error > 0 ? `${counts.error} ${counts.error === 1 ? 'error' : 'errors'}` : null,
+    counts.approval > 0 ? `${counts.approval} need approval` : null,
+    counts.working > 0 ? `${counts.working} working` : null,
+  ].filter((part): part is string => part !== null);
+  if (parts.length === 0) return null;
+
+  return {
+    displayState: counts.error > 0 ? 'error' : counts.approval > 0 ? 'awaiting-approval' : 'working',
+    label: parts.join(' · '),
+  };
+}
+
 export const SidebarPrBadge = PrBadge;
 
 export const ConversationRow = memo(function ConversationRow({
@@ -475,11 +503,21 @@ function visibleMobileChainMembers(
 ): Conversation[] {
   if (members.length <= visibleCount) return members;
 
-  const start = members.length - visibleCount;
-  const active = members.slice(0, start).find((member) => matchesRouteSegment(member, activeSlug));
-  if (!active) return members.slice(start);
+  const priorityIds = new Set(
+    members
+      .filter((member) => matchesRouteSegment(member, activeSlug)
+        || isActionableDisplayState(getConvDisplayState(member)))
+      .map((member) => member.id),
+  );
+  let remainingSlots = Math.max(0, visibleCount - priorityIds.size);
+  for (let index = members.length - 1; index >= 0 && remainingSlots > 0; index -= 1) {
+    const member = members[index];
+    if (!member || priorityIds.has(member.id)) continue;
+    priorityIds.add(member.id);
+    remainingSlots -= 1;
+  }
 
-  return [active, ...members.slice(start + 1)];
+  return members.filter((member) => priorityIds.has(member.id));
 }
 
 interface ChainBlockProps {
@@ -549,6 +587,7 @@ export const ChainBlock = memo(function ChainBlock({
     ? visibleMobileChainMembers(item.members, visibleMemberCount, activeSlug)
     : item.members;
   const hiddenMemberCount = item.members.length - visibleMembers.length;
+  const attention = chainAttention(item.members, item.latestMemberId);
   return (
     <li
       className={`conv-chain-block ${collapsed ? 'collapsed' : 'expanded'}`}
@@ -659,6 +698,9 @@ export const ChainBlock = memo(function ChainBlock({
             <span className="conv-item-time">{formatRelativeTime(latestMember.updated_at)}</span>
           </span>
           <span className="conv-chain-summary-meta">
+            {attention && (
+              <span className={`conv-chain-attention ${attention.displayState}`}>{attention.label}</span>
+            )}
             {latestContext && <span className="conv-project-label">{latestContext}</span>}
             {latestMember.cached_pr && <PrBadge pr={latestMember.cached_pr} interactive={false} />}
           </span>

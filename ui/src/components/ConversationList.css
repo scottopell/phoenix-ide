@@ -290,6 +290,32 @@
   vertical-align: middle;
 }
 
+.mobile-list-density .conv-chain-attention {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.mobile-list-density .conv-chain-attention.error {
+  background: color-mix(in srgb, var(--accent-red) 18%, transparent);
+  color: var(--accent-red);
+}
+
+.mobile-list-density .conv-chain-attention.awaiting-approval {
+  background: color-mix(in srgb, var(--accent-yellow) 18%, transparent);
+  color: var(--accent-yellow);
+}
+
+.mobile-list-density .conv-chain-attention.working {
+  background: color-mix(in srgb, var(--accent-purple) 18%, transparent);
+  color: var(--accent-purple);
+}
+
 /* Mobile chain history links are owned by MobileChainHistoryLink. */
 .mobile-list-density .conv-chain-history-link {
   position: relative;
