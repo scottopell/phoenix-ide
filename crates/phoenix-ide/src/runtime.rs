@@ -191,7 +191,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     /// Serializes legacy steering admission until the normalized queue row is visible.
-    steering_acceptance_receipts: AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>,
+    steering_acceptance_receipts:
+        Arc<AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1390,10 +1391,12 @@ impl RuntimeManager {
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
+        let steering_acceptance_receipts = Arc::new(AsyncMutex::new(HashMap::new()));
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
                 wake_kick_tx.clone(),
+                Arc::clone(&steering_acceptance_receipts),
             ));
         Self {
             db,
@@ -1415,7 +1418,7 @@ impl RuntimeManager {
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
-            steering_acceptance_receipts: AsyncMutex::new(HashMap::new()),
+            steering_acceptance_receipts,
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,

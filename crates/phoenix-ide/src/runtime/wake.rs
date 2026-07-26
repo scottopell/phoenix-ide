@@ -45,11 +45,31 @@ fn fresh_process_incarnation() -> ProcessIncarnation {
 pub(crate) struct ProductionWakeRegistrar {
     repo: WakeRepository,
     kick_tx: watch::Sender<u64>,
+    acceptance_lock: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<(String, String), crate::runtime::SteeringAcceptanceReceipt>,
+        >,
+    >,
 }
 
 impl ProductionWakeRegistrar {
-    pub(crate) fn new(repo: WakeRepository, kick_tx: watch::Sender<u64>) -> Self {
-        Self { repo, kick_tx }
+    pub(crate) fn new(
+        repo: WakeRepository,
+        kick_tx: watch::Sender<u64>,
+        acceptance_lock: Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<
+                    (String, String),
+                    crate::runtime::SteeringAcceptanceReceipt,
+                >,
+            >,
+        >,
+    ) -> Self {
+        Self {
+            repo,
+            kick_tx,
+            acceptance_lock,
+        }
     }
 
     fn kick(&self) {
@@ -69,6 +89,7 @@ impl WakeRegistrar for ProductionWakeRegistrar {
         );
         let prepared_fingerprint = input.prepared_fingerprint.clone();
         let intent = input.into_intent(now);
+        let _acceptance_guard = self.acceptance_lock.lock().await;
         let outcome = self
             .repo
             .register(&intent, &prepared_fingerprint, now)
@@ -1808,10 +1829,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_registration_waits_for_lifecycle_acceptance_lock() {
+        let (_db, repo, scope) = open_repo().await;
+        let (kick_tx, _) = watch::channel(0u64);
+        let acceptance_lock = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let lifecycle_guard = acceptance_lock.lock().await;
+        let registrar = ProductionWakeRegistrar::new(repo, kick_tx, Arc::clone(&acceptance_lock));
+        let registration = tokio::spawn(async move {
+            registrar
+                .register(register_input(&scope, "b-1", "fp-1", 50))
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!registration.is_finished());
+        drop(lifecycle_guard);
+
+        assert!(matches!(
+            registration.await.unwrap().unwrap(),
+            RegisteredWake::Registered { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn production_registrar_replays_and_conflicts_exactly() {
         let (_db, repo, scope) = open_repo().await;
         let (kick_tx, kick_rx) = watch::channel(0u64);
-        let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+        let registrar = ProductionWakeRegistrar::new(
+            repo,
+            kick_tx,
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        );
 
         let before_registration = Timestamp(
             std::time::SystemTime::now()
@@ -1858,7 +1906,11 @@ mod tests {
         let (_db, repo, scope) = open_repo().await;
         let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
         let (kick_tx, kick_rx) = watch::channel(0u64);
-        let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+        let registrar = ProductionWakeRegistrar::new(
+            repo,
+            kick_tx,
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        );
 
         let cancelled = registrar
             .cancel(CancelWakeInput {
@@ -2283,14 +2335,18 @@ mod tests {
         let fired_id = register_bash(&repo, &scope, "b-fired", 50).await;
         let cancelled_id = register_bash(&repo, &scope, "b-cancelled", 50).await;
         let (kick_tx, _) = watch::channel(0u64);
-        ProductionWakeRegistrar::new(repo.clone(), kick_tx)
-            .cancel(CancelWakeInput {
-                workflow_id: phoenix_workflow::WorkflowId(cancelled_id),
-                timestamp: Timestamp(5),
-                reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
-            })
-            .await
-            .unwrap();
+        ProductionWakeRegistrar::new(
+            repo.clone(),
+            kick_tx,
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        )
+        .cancel(CancelWakeInput {
+            workflow_id: phoenix_workflow::WorkflowId(cancelled_id),
+            timestamp: Timestamp(5),
+            reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+        })
+        .await
+        .unwrap();
         let inspector = Arc::new(MockInspector::new());
         inspector.push(
             fired_id,

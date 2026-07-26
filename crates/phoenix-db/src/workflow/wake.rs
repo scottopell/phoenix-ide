@@ -1096,7 +1096,7 @@ impl WakeRepository {
                 now: observation_time,
                 observed_at: evidence_time,
                 observation_codec: local_codec(&wake_profile::terminal_codec()),
-                observation_payload: json_blob(evidence)?,
+                observation_payload: json_blob(&Self::tail_free_evidence(evidence))?,
             })
             .await?;
         if observation.outcome != AuthorityOutcome::Authorized {
@@ -1146,9 +1146,9 @@ impl WakeRepository {
                 attempt_id: Some(authority.attempt_id),
                 origin: ReceiptOrigin::Execution,
                 receipt_codec: local_codec(&wake_profile::terminal_codec()),
-                receipt_payload: json_blob(&terminal)?,
+                receipt_payload: json_blob(&Self::tail_free_terminal(&terminal))?,
                 receipt_event_codec: local_codec(&wake_profile::terminal_codec()),
-                receipt_event_payload: json_blob(&terminal)?,
+                receipt_event_payload: json_blob(&Self::tail_free_terminal(&terminal))?,
                 receipt_event_requires_runtime_acceptance: false,
                 request_runtime_acceptance_for_cancellation: false,
             })
@@ -1241,6 +1241,24 @@ impl WakeRepository {
                 canonical_delivery: canonical.delivery.expect("authorized delivery"),
             },
         })
+    }
+
+    fn tail_free_evidence(evidence: &WakeTerminalEvidence) -> WakeTerminalEvidence {
+        let mut evidence = evidence.clone();
+        match &mut evidence {
+            WakeTerminalEvidence::Bash(evidence) => evidence.final_tail.clear(),
+            WakeTerminalEvidence::TmuxWindow(evidence) => evidence.final_tail.clear(),
+            WakeTerminalEvidence::Subagent(_) => {}
+        }
+        evidence
+    }
+
+    fn tail_free_terminal(terminal: &WakeTerminalPayload) -> WakeTerminalPayload {
+        let mut terminal = terminal.clone();
+        if let WakeTerminalPayload::Fired { evidence, .. } = &mut terminal {
+            *evidence = Self::tail_free_evidence(evidence);
+        }
+        terminal
     }
 
     pub async fn record_terminal_allocated(
@@ -8730,6 +8748,75 @@ mod tests {
                 panic!("expected fired bash receipt, got {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_terminal_payloads_omit_normalized_tail_lines() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let input = tmux_intent();
+        let workflow_id = next_test_workflow_id(&repo).await.unwrap();
+        repo.register_allocated(workflow_id, &input, "fp-tail-free", Timestamp(10))
+            .await
+            .unwrap();
+        let started = unwrap_started(
+            repo.claim_observation_if_eligible(
+                workflow_id,
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap(),
+        );
+        repo.record_terminal_evidence(
+            workflow_id,
+            started.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &tmux_evidence(18),
+        )
+        .await
+        .unwrap();
+
+        let receipt_payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT receipt_payload FROM workflow_receipts WHERE workflow_id = ?1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+        .fetch_one(repo.workflow_repo.pool())
+        .await
+        .unwrap();
+        let event_payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT payload_blob FROM workflow_deliveries WHERE workflow_id = ?1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+        .fetch_one(repo.workflow_repo.pool())
+        .await
+        .unwrap();
+        let observation_payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT observation_payload FROM workflow_authoritative_observations WHERE workflow_id = ?1",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+        .fetch_one(repo.workflow_repo.pool())
+        .await
+        .unwrap();
+        for payload in [receipt_payload, event_payload, observation_payload] {
+            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            let tail = payload
+                .pointer("/Fired/evidence/TmuxWindow/final_tail")
+                .or_else(|| payload.pointer("/TmuxWindow/final_tail"))
+                .expect("terminal payload contains a tail field for codec compatibility");
+            assert_eq!(tail, &serde_json::json!([]));
+        }
+        let normalized: Vec<String> = sqlx::query_scalar(
+            "SELECT line FROM wake_terminal_receipt_tails WHERE workflow_id = ?1 ORDER BY ordinal",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+        .fetch_all(repo.workflow_repo.pool())
+        .await
+        .unwrap();
+        assert_eq!(normalized, vec!["tail-1"]);
     }
 
     #[tokio::test]

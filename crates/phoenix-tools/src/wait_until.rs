@@ -1,4 +1,3 @@
-use crate::bash::handle::HandleId;
 use crate::{
     work_scope_identity, RegisterWakeInput, RegisteredWake, Tool, ToolContext, ToolOutput,
     ToolOutputDisposition,
@@ -41,7 +40,7 @@ impl Tool for WaitUntilTool {
 
     fn description(&self) -> String {
         format!(
-            "Registers a durable wake contract instead of polling. Use when you have nothing else to do until a known handle reaches a terminal state. Input: wait_until {{ handle: {{ kind, id }}, condition, max_wait_seconds }}. V1 supports only condition=\"{CONDITION_HANDLE_TERMINAL}\". This Bash-first slice accepts only handle.kind=\"Bash\" and rejects other handle kinds explicitly. max_wait_seconds defaults to {WAKE_DEFAULT_SECONDS} and is capped at {WAKE_MAX_SECONDS}. Success returns an immediate registration receipt and parks the turn until Phoenix delivers the later terminal result; registration errors do not park."
+            "Registers a durable wake contract instead of polling. If you have anything else useful to do, do that; if you have nothing to do until the handle resolves, use wait_until rather than synchronous bash op=wait. A synchronous wait blocks at least one turn, while a wake contract consumes zero turns until it fires. Cancel a registered contract with phoenix-client.py --conversation <id> --wake-cancel <contract_id>. Input: wait_until {{ handle: {{ kind, id }}, condition, max_wait_seconds }}. V1 supports only condition=\"{CONDITION_HANDLE_TERMINAL}\". This Bash-first slice accepts only handle.kind=\"Bash\" and rejects other handle kinds explicitly. max_wait_seconds defaults to {WAKE_DEFAULT_SECONDS} and is capped at {WAKE_MAX_SECONDS}. Success returns an immediate registration receipt and parks the turn until Phoenix delivers the later terminal result; registration errors do not park."
         )
     }
 
@@ -365,6 +364,15 @@ mod tests {
             .cloned()
             .or_else(|| serde_json::from_str(out.output()).ok())
             .expect("json output")
+    }
+
+    #[test]
+    fn description_explains_wait_tradeoff_and_cancellation() {
+        let description = WaitUntilTool.description();
+        assert!(description.contains("synchronous bash op=wait"));
+        assert!(description.contains("at least one turn"));
+        assert!(description.contains("zero turns until it fires"));
+        assert!(description.contains("--wake-cancel <contract_id>"));
     }
 
     #[test]
