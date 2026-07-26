@@ -92,3 +92,13 @@ after_repeat_3 ptys=288 test_servers=0 test_roots=0
 after_repeat_4 ptys=288 test_servers=0 test_roots=0
 after_repeat_5 ptys=288 test_servers=0 test_roots=0
 ```
+
+The final decisive validation ran the actual repository check runner from a verified zero-orphan baseline, not a filtered test command:
+
+```text
+before: legacy_orphans=0 owner_servers=0 ptys=168
+./dev.py check: all 18 applicable checks passed
+after:  legacy_orphans=0 owner_servers=0 ptys=168
+```
+
+Serial full-package attribution also completed all `phoenix_ide` tests and all 535 active `phoenix-tools` tests with zero persistent servers. Real tmux tests briefly daemonize during execution as expected; their owners returned the host to zero after each completed suite.
