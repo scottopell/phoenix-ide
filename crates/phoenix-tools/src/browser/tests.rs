@@ -1283,7 +1283,7 @@ async fn test_click_button() {
     // Click the button
     let click_tool = BrowserClickTool;
     let result = click_tool
-        .run(json!({"selector": "#btn"}), ctx.clone())
+        .run(json!({"selector": "#btn", "wait": true}), ctx.clone())
         .await;
 
     assert!(result.is_success(), "Click failed: {}", result.output());

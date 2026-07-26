@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 const FRESHNESS_LEASE: Duration = Duration::from_millis(1_200);
 const SAFE_PRESSURE_DURATION: chrono::Duration = chrono::Duration::milliseconds(1_200);
+const MAX_SAFE_OBSERVATION_GAP: chrono::Duration = chrono::Duration::milliseconds(1_200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservationKey {
@@ -131,11 +132,11 @@ pub enum ReportedThermalSample {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThermalGovernorDecisionSample {
     pub state: ThermalGovernorStateSample,
     pub proposed_action: ThermalGovernorActionSample,
-    pub proposed_target_count: u32,
+    pub proposed_targets: BTreeSet<ProcessIdentity>,
     pub reported_sample: ReportedThermalSample,
 }
 
@@ -190,6 +191,7 @@ pub fn health_for_pids(
 struct ThermalDecisionState {
     state: ThermalGovernorStateSample,
     nominal_since: Option<DateTime<Utc>>,
+    last_observed_at: Option<DateTime<Utc>>,
     proposed_action: ThermalGovernorActionSample,
     proposed_targets: BTreeSet<ProcessIdentity>,
     hypothetically_deprioritized: BTreeSet<ProcessIdentity>,
@@ -201,6 +203,7 @@ impl Default for ThermalDecisionState {
         Self {
             state: ThermalGovernorStateSample::Nominal,
             nominal_since: None,
+            last_observed_at: None,
             proposed_action: ThermalGovernorActionSample::None,
             proposed_targets: BTreeSet::new(),
             hypothetically_deprioritized: BTreeSet::new(),
@@ -259,13 +262,19 @@ impl ThermalDecisionState {
                 pressure: ThermalPressureSample::Nominal,
                 sampled_at,
             } if self.state == ThermalGovernorStateSample::Elevated => {
+                let gap_is_contiguous = self.last_observed_at.is_some_and(|last| {
+                    let gap = *sampled_at - last;
+                    gap >= chrono::Duration::zero() && gap <= MAX_SAFE_OBSERVATION_GAP
+                });
+                if !gap_is_contiguous {
+                    self.nominal_since = Some(*sampled_at);
+                }
                 let nominal_since = self.nominal_since.get_or_insert(*sampled_at);
                 if *sampled_at - *nominal_since >= SAFE_PRESSURE_DURATION {
                     self.state = ThermalGovernorStateSample::Nominal;
                     self.nominal_since = None;
                     self.proposed_action = ThermalGovernorActionSample::Restore;
-                    self.proposed_targets
-                        .clone_from(&self.hypothetically_deprioritized);
+                    self.proposed_targets = std::mem::take(&mut self.hypothetically_deprioritized);
                 }
             }
             ThermalObservationSample::Available {
@@ -287,6 +296,10 @@ impl ThermalDecisionState {
                 }
             }
         }
+        self.last_observed_at = match sample {
+            ThermalObservationSample::Available { sampled_at, .. } => Some(*sampled_at),
+            ThermalObservationSample::Unavailable { .. } => None,
+        };
         if self.state != previous_state {
             tracing::debug!(
                 previous_state = ?previous_state,
@@ -299,7 +312,7 @@ impl ThermalDecisionState {
         ThermalGovernorDecisionSample {
             state: self.state,
             proposed_action: self.proposed_action,
-            proposed_target_count: u32::try_from(self.proposed_targets.len()).unwrap_or(u32::MAX),
+            proposed_targets: self.proposed_targets.clone(),
             reported_sample,
         }
     }
@@ -504,7 +517,7 @@ async fn sample_generation(
         thermal_decision: ThermalGovernorDecisionSample {
             state: ThermalGovernorStateSample::Unavailable,
             proposed_action: ThermalGovernorActionSample::None,
-            proposed_target_count: 0,
+            proposed_targets: BTreeSet::new(),
             reported_sample,
         },
         observations: rows.into_iter().map(|row| (row.pid, row)).collect(),
@@ -545,7 +558,7 @@ mod tests {
             thermal_decision: ThermalGovernorDecisionSample {
                 state: ThermalGovernorStateSample::Unavailable,
                 proposed_action: ThermalGovernorActionSample::None,
-                proposed_target_count: 0,
+                proposed_targets: BTreeSet::new(),
                 reported_sample: ReportedThermalSample::Unavailable {
                     attempted_at: Utc::now(),
                     reason: ThermalProviderUnavailableReason::UnsupportedPlatform,
@@ -692,6 +705,39 @@ mod tests {
     }
 
     #[test]
+    fn long_gap_restarts_safe_pressure_duration() {
+        let now = Utc::now();
+        let elevated = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Elevated,
+            sampled_at: now,
+        };
+        let first_nominal = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Nominal,
+            sampled_at: now + chrono::Duration::milliseconds(1),
+        };
+        let after_gap = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Nominal,
+            sampled_at: now + chrono::Duration::seconds(10),
+        };
+        let sustained_after_gap = ThermalObservationSample::Available {
+            pressure: ThermalPressureSample::Nominal,
+            sampled_at: now + chrono::Duration::milliseconds(11_200),
+        };
+        let mut state = ThermalDecisionState::default();
+
+        state.observe(&elevated, &BTreeSet::new());
+        state.observe(&first_nominal, &BTreeSet::new());
+        let not_restored = state.observe(&after_gap, &BTreeSet::new());
+        assert_eq!(not_restored.state, ThermalGovernorStateSample::Elevated);
+        let restored = state.observe(&sustained_after_gap, &BTreeSet::new());
+        assert_eq!(restored.state, ThermalGovernorStateSample::Nominal);
+        assert_eq!(
+            restored.proposed_action,
+            ThermalGovernorActionSample::Restore
+        );
+    }
+
+    #[test]
     fn restoration_targets_only_identities_hypothetically_deprioritized() {
         let now = Utc::now();
         let elevated = ThermalObservationSample::Available {
@@ -717,7 +763,7 @@ mod tests {
         let mut state = ThermalDecisionState::default();
 
         let deprioritize = state.observe(&elevated, &BTreeSet::from([original]));
-        assert_eq!(deprioritize.proposed_target_count, 1);
+        assert_eq!(deprioritize.proposed_targets, BTreeSet::from([original]));
         state.observe(&first_nominal, &BTreeSet::from([replacement]));
         let membership_changed = ThermalObservationSample::Available {
             pressure: ThermalPressureSample::Nominal,
@@ -731,8 +777,9 @@ mod tests {
             restore.proposed_action,
             ThermalGovernorActionSample::Restore
         );
-        assert_eq!(restore.proposed_target_count, 1);
+        assert_eq!(restore.proposed_targets, BTreeSet::from([original]));
         assert_eq!(state.proposed_targets, BTreeSet::from([original]));
+        assert!(state.hypothetically_deprioritized.is_empty());
     }
 
     #[test]

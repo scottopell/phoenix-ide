@@ -2,6 +2,7 @@
 
 config {
     minimum_safe_pressure_duration: Duration = 1_200.ms
+    maximum_safe_observation_gap: Duration = 1_200.ms
 }
 -- deployment-info.allium
 --
@@ -131,7 +132,8 @@ entity ThermalGovernor {
 --   sample.raw_temperature_available = false.
 -- restoration_is_sustained_safe(governor, sample) -> Boolean
 --   Nominal pressure has remained continuously observed for at least
---   config.minimum_safe_pressure_duration; observation count alone is insufficient.
+--   config.minimum_safe_pressure_duration, with no gap between observations greater
+--   than config.maximum_safe_observation_gap; observation count alone is insufficient.
 -- proposed_deprioritization(governor) -> ProposedAction
 --   Returns a deprioritize action targeting the currently covered PID/start identities.
 -- proposed_restoration(governor) -> ProposedAction
@@ -153,10 +155,9 @@ invariant ProposedActionTargetEffectMatchesIdentities {
         not governor.proposed_action.target_identities.empty()
 }
 
-invariant RestorationTargetsOnlyPreviouslyDeprioritizedIdentities {
+invariant RestorationTransfersPreviouslyDeprioritizedIdentities {
     governor.proposed_action.kind = restore implies
-        governor.proposed_action.target_identities.all(identity =>
-            governor.hypothetically_deprioritized_identities.contains(identity))
+        governor.hypothetically_deprioritized_identities.empty()
 }
 
 rule ThermalSampleRecordsCapability {
@@ -207,6 +208,7 @@ rule ObserveOnlyRecoveryProposesRestoration {
     ensures: ThermalGovernor{governor}.state = nominal
     ensures: ThermalGovernor{governor}.last_sample = sample
     ensures: ThermalGovernor{governor}.proposed_action = proposed_restoration(governor)
+    ensures: ThermalGovernor{governor}.hypothetically_deprioritized_identities.empty()
 }
 
 rule NominalSampleWithoutRestorationKeepsState {

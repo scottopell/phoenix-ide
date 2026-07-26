@@ -1879,6 +1879,11 @@ impl BrowserSessionManager {
         }
     }
 
+    /// Return the number of browser sessions currently tracked.
+    pub async fn active_session_count(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
     /// Kill all sessions and wait for their Chrome processes and profiles to be released.
     ///
     /// # Errors

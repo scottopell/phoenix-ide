@@ -89,7 +89,7 @@ function resourcesSnapshot(overrides: Partial<AboutResourcesSnapshot> = {}): Abo
         sampled_at: '2026-06-01T00:00:03Z',
         raw_temperature: { kind: 'unavailable' },
       },
-      proposed_action: { kind: 'none', affects_targets: false },
+      proposed_action: { kind: 'none', affects_targets: false, target_identities: [] },
       applied_action: 'none',
       coverage: {
         eligible_work_scope_count: 1,
@@ -418,7 +418,7 @@ describe('AboutDeploymentPage disk usage health', () => {
           unavailable_reason: 'provider_failure',
           raw_temperature: { kind: 'unavailable' },
         },
-        proposed_action: { kind: 'deprioritize', affects_targets: false },
+        proposed_action: { kind: 'deprioritize', affects_targets: false, target_identities: [] },
         coverage: {
           eligible_work_scope_count: 1,
           eligible_process_count: 2,
