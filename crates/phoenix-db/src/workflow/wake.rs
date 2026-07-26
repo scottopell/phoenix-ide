@@ -577,6 +577,15 @@ impl WakeRepository {
                 WakeRegistrationOutcome::Conflict
             });
         }
+        let scope_active: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM work_scopes WHERE id = ?1 AND lifecycle = 'active'")
+                .bind(input.registration_scope.as_str())
+                .fetch_optional(&mut *tx.tx)
+                .await?;
+        if scope_active.is_none() {
+            tx.commit().await?;
+            return Ok(WakeRegistrationOutcome::Conflict);
+        }
         retire_inactive_resource_bindings_tx(&mut tx, input, now).await?;
         if fetch_unresolved_resource_binding_tx(&mut tx, input)
             .await?

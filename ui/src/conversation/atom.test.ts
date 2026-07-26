@@ -538,6 +538,7 @@ describe('conversationReducer', () => {
           contract_id: 'wake-42',
           resource_kind: 'BashHandle',
           handle_id: 'b-1',
+          condition: 'handle_terminal',
           expires_at: 600,
         }],
       });

@@ -1062,6 +1062,12 @@ fn handle_core_tool_complete(
             let mut all_results = completed_results.clone();
             all_results.push(result);
 
+            let tool_round_succeeded = all_results.iter().all(|result| {
+                matches!(
+                    result.outcome,
+                    phoenix_core::domain::db_schema::ToolOutcome::Success { .. }
+                )
+            });
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect(
                     "tool_use/tool_result count mismatch in last-tool-with-subagents transition",
@@ -1070,7 +1076,8 @@ fn handle_core_tool_complete(
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: pending_sub_agents.clone(),
                 completed_results: vec![],
-                park_after_tool_round: *park_after_tool_round || event_requests_park,
+                park_after_tool_round: (*park_after_tool_round || event_requests_park)
+                    && tool_round_succeeded,
                 spawn_tool_id: None,
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -1119,13 +1126,19 @@ fn handle_core_tool_complete(
             let spawn_id = result.tool_use_id.clone();
             all_results.push(result);
 
+            let tool_round_succeeded = all_results.iter().all(|result| {
+                matches!(
+                    result.outcome,
+                    phoenix_core::domain::db_schema::ToolOutcome::Success { .. }
+                )
+            });
             let checkpoint = CheckpointData::tool_round(assistant_message.clone(), all_results)
                 .expect("tool_use/tool_result count mismatch in spawn-agents-last transition");
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: all_pending.clone(),
                 completed_results: vec![],
-                park_after_tool_round: *park_after_tool_round,
+                park_after_tool_round: *park_after_tool_round && tool_round_succeeded,
                 spawn_tool_id: Some(spawn_id),
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -5477,6 +5490,75 @@ mod tests {
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn failed_regular_tool_prevents_park_after_successful_sub_agent_fan_in() {
+        use crate::state::{AssistantMessage, PendingSubAgent, ToolCall, ToolInput};
+        use phoenix_core::domain::{
+            db_schema::ToolResult, llm_types::ContentBlock, sm_state::SubAgentMode,
+        };
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "final".to_string(),
+                ToolInput::Unknown {
+                    name: "wait_until".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![ToolResult::error(
+                "failed".to_string(),
+                "sibling failed".to_string(),
+            )],
+            pending_sub_agents: vec![PendingSubAgent {
+                agent_id: "agent-1".to_string(),
+                task: "finish".to_string(),
+                mode: SubAgentMode::Explore,
+            }],
+            assistant_message: AssistantMessage::new(
+                "round".to_string(),
+                vec![
+                    ContentBlock::tool_use("failed", "bash", serde_json::json!({})),
+                    ContentBlock::tool_use("final", "wait_until", serde_json::json!({})),
+                ],
+                None,
+                None,
+            ),
+            park_after_tool_round: false,
+        };
+
+        let awaiting = transition(
+            &state,
+            &test_context(),
+            Event::ToolCompleteAndPark {
+                tool_use_id: "final".to_string(),
+                result: ToolResult::success("final".to_string(), "registered".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            awaiting.new_state,
+            ConvState::AwaitingSubAgents {
+                park_after_tool_round: false,
+                ..
+            }
+        ));
+        let completed = transition(
+            &awaiting.new_state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "agent-1".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "finished".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            completed.new_state,
+            ConvState::LlmRequesting { .. }
+        ));
     }
 
     #[test]
