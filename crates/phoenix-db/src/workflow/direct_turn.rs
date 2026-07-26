@@ -655,7 +655,22 @@ impl WorkflowRepository {
                     prepared,
                 }),
                 Err(error) => {
-                    tracing::error!(turn_id = turn_id.0, workflow_id = workflow_id.0, error = %error, "corrupt direct-turn payload blocks discovery");
+                    tracing::error!(turn_id = turn_id.0, workflow_id = workflow_id.0, error = %error, "quarantining corrupt direct-turn payload during discovery");
+                    match self
+                        .quarantine_corrupt_direct_turn(
+                            turn_id,
+                            format!("prepared payload cannot be decoded: {error}"),
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(quarantine_error) => tracing::error!(
+                            turn_id = turn_id.0,
+                            workflow_id = workflow_id.0,
+                            error = %quarantine_error,
+                            "failed to quarantine corrupt direct-turn payload"
+                        ),
+                    }
                 }
             }
         }
@@ -663,6 +678,29 @@ impl WorkflowRepository {
             candidates: out,
             next_cursor,
         })
+    }
+
+    pub async fn quarantine_corrupt_direct_turn(
+        &self,
+        turn_id: TurnAuthorityId,
+        reason: String,
+    ) -> DbResult<TurnStep> {
+        let generation =
+            sqlx::query_scalar::<_, i64>("SELECT generation FROM durable_turns WHERE turn_id = ?1")
+                .bind(
+                    i64::try_from(turn_id.0)
+                        .map_err(|_| DbError::Serialization("turn id overflow".to_string()))?,
+                )
+                .fetch_one(&self.pool)
+                .await?;
+        self.terminate_authoritative_turn(TurnCommand::Fail {
+            turn_id,
+            expected_generation: u64::try_from(generation).map_err(|_| {
+                DbError::Serialization("negative direct-turn generation".to_string())
+            })?,
+            reason,
+        })
+        .await
     }
 
     pub async fn preflight_direct_turn_materialization(

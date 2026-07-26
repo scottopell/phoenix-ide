@@ -276,8 +276,9 @@ impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
         if !matches!(
             *handle.state_rx.borrow(),
             phoenix_core::domain::sm_state::ConvState::Idle
+                | phoenix_core::domain::sm_state::ConvState::Error { .. }
         ) {
-            return Err("direct-turn reducer is not idle".to_string());
+            return Err("direct-turn reducer cannot accept a new user turn".to_string());
         }
         handle
             .event_tx
