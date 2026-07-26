@@ -479,6 +479,9 @@ async def _send_chat_and_stream_async(
     chat_url = f"{base_url}/api/conversations/{conv_id}/chat"
     transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
     async with httpx.AsyncClient(timeout=transport_timeout) as client:
+        baseline = await client.get(f"{base_url}/api/conversations/{conv_id}")
+        baseline.raise_for_status()
+        baseline_count = len(baseline.json().get("messages", []))
         async with asyncio.timeout(timeout):
             async with aconnect_sse(client, "GET", stream_url) as source:
                 events = source.aiter_sse()
@@ -498,9 +501,10 @@ async def _send_chat_and_stream_async(
                 async for event in events:
                     if event.event != "ping":
                         _terminal_event(event.event, event.data)
-                    if await _snapshot_has_agent_after_message(
-                        client, base_url, conv_id, message_id
-                    ):
+                    snapshot = await client.get(f"{base_url}/api/conversations/{conv_id}")
+                    snapshot.raise_for_status()
+                    messages = snapshot.json().get("messages", [])
+                    if len(messages) >= baseline_count + 2 and messages[-1].get("message_type") == "agent":
                         return
             raise RuntimeError("SSE stream closed before the continuation completed")
 
