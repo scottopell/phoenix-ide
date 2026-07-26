@@ -3740,6 +3740,7 @@ async fn cancel_active_direct_turn(
     Ok(true)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3813,6 +3814,30 @@ async fn cancel_conversation(
             }));
         }
         let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
+        if state
+            .runtime
+            .effective_conversation_state(&id)
+            .await
+            .is_some_and(|state| state.is_busy())
+        {
+            let handle = state.runtime.get_or_create(&id).await.map_err(|error| {
+                AppError::Internal(format!("failed to get conversation runtime: {error}"))
+            })?;
+            handle
+                .event_tx
+                .send(Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!("failed to send cancel event: {error}"))
+                })?;
+            return Ok(Json(CancelResponse {
+                ok: true,
+                no_op: false,
+            }));
+        }
         if !cancelled_direct_turn {
             tracing::debug!(
                 conv_id = %id,
