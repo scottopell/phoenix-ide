@@ -298,15 +298,12 @@ impl WorkflowRepository {
         };
         let stored = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload())
             .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let stored_fingerprint =
-            phoenix_core::domain::sm_event::exact_payload_fingerprint(turn.prepared.payload());
-        if turn.prepared.fingerprint() != stored_fingerprint {
-            return Err(DbError::Serialization(format!(
-                "direct-turn prepared payload fingerprint mismatch for turn {}: stored {}, computed {}",
-                turn.id.0, turn.prepared.fingerprint(), stored_fingerprint
-            ))
-            .into());
-        }
+        PreparedTurn::rehydrate(
+            &turn.conversation,
+            turn.prepared.fingerprint().to_string(),
+            turn.prepared.payload().to_vec(),
+        )
+        .map_err(DbError::DirectTurnConflict)?;
         if !stored.submitted_identity_matches(submitted) {
             return Err(SubmittedIdentityChanged {
                 turn,
@@ -1893,7 +1890,10 @@ mod tests {
     }
 
     fn prepared_turn(target: &ConversationAuthority, message_id: &str) -> PreparedTurn {
-        PreparedTurn::from_exact_payload(target, prepared_payload(message_id).to_exact_bytes().unwrap())
+        PreparedTurn::from_exact_payload(
+            target,
+            prepared_payload(message_id).to_exact_bytes().unwrap(),
+        )
     }
 
     fn materialize_input(
@@ -2591,9 +2591,9 @@ mod tests {
             .await
             .unwrap();
         let TurnOutcome::Created {
-            turn_id: first_id,
-            ..
-        } = first.outcome else {
+            turn_id: first_id, ..
+        } = first.outcome
+        else {
             panic!("expected first runtime turn")
         };
         let first_workflow = repo.workflow_id_for_turn(first_id).await.unwrap().unwrap();
@@ -2602,9 +2602,9 @@ mod tests {
             .await
             .unwrap();
         let TurnOutcome::Created {
-            turn_id: second_id,
-            ..
-        } = second.outcome else {
+            turn_id: second_id, ..
+        } = second.outcome
+        else {
             panic!("expected second runtime turn")
         };
         let second_workflow = repo.workflow_id_for_turn(second_id).await.unwrap().unwrap();
@@ -2752,12 +2752,14 @@ mod tests {
         );
         let TurnOutcome::Created {
             turn_id: left_id, ..
-        } = left.unwrap().outcome else {
+        } = left.unwrap().outcome
+        else {
             panic!("expected left creation")
         };
         let TurnOutcome::Created {
             turn_id: right_id, ..
-        } = right.unwrap().outcome else {
+        } = right.unwrap().outcome
+        else {
             panic!("expected right creation")
         };
         let left_workflow = first.workflow_id_for_turn(left_id).await.unwrap().unwrap();
@@ -3086,7 +3088,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ScopedDirectTurnReplayError::Db(DbError::Serialization(_))));
+        assert!(matches!(
+            err,
+            ScopedDirectTurnReplayError::Db(DbError::Serialization(_))
+        ));
     }
 
     #[tokio::test]
@@ -3102,7 +3107,10 @@ mod tests {
             .lookup_scoped_direct_turn_replay(&input.conversation, &input.client_key, &submitted)
             .await
             .unwrap_err();
-        assert!(matches!(err, ScopedDirectTurnReplayError::Db(DbError::Serialization(_))));
+        assert!(matches!(
+            err,
+            ScopedDirectTurnReplayError::Db(DbError::Serialization(_))
+        ));
     }
 
     #[tokio::test]

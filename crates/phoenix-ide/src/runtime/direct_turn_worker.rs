@@ -669,15 +669,17 @@ mod tests {
             panic!("expected created turn")
         };
         let malformed = b"not-json";
+        let malformed_prepared = PreparedTurn::from_exact_payload(
+            &ConversationAuthority("conv-a".to_string()),
+            malformed.to_vec(),
+        );
         sqlx::query(
             "UPDATE durable_turns
              SET prepared_payload = ?1, prepared_fingerprint = ?2
              WHERE turn_id = ?3",
         )
         .bind(malformed.as_slice())
-        .bind(phoenix_core::domain::sm_event::exact_payload_fingerprint(
-            malformed,
-        ))
+        .bind(malformed_prepared.fingerprint())
         .bind(i64::try_from(turn_id.0).unwrap())
         .execute(repo.pool())
         .await
