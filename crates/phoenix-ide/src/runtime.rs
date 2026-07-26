@@ -2818,6 +2818,35 @@ impl RuntimeManager {
             conversation_id,
         )
         .await?;
+        let active_direct_turn = if let Some(active) = active_direct_turn {
+            let recovered_terminal = match &initial_state {
+                ConvState::Idle | ConvState::HandedOff { .. } => {
+                    Some(crate::runtime::traits::ActiveDirectTurnTerminal::Completed)
+                }
+                ConvState::Error { message, .. } => {
+                    Some(crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                        reason: message.clone(),
+                    })
+                }
+                ConvState::ContextExhausted { summary } => {
+                    Some(crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                        reason: summary.clone(),
+                    })
+                }
+                _ => None,
+            };
+            if let Some(terminal) = recovered_terminal {
+                crate::runtime::traits::MessageStore::terminate_active_direct_turn(
+                    &storage, &active, terminal,
+                )
+                .await?;
+                None
+            } else {
+                Some(active)
+            }
+        } else {
+            None
+        };
 
         let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
