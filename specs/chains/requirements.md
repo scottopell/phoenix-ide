@@ -143,6 +143,14 @@ streaming pairs SHALL render below the active card in reverse
 chronological order, with the most recent pair immediately below the
 active card.
 
+WHEN a stored pair is not the active card and is not currently streaming
+THE SYSTEM SHALL render that history in a denser inactive treatment than
+the active card
+AND SHALL keep the full question text, answer text, freshness indicator,
+and failure state readable without reopening a separate detail surface
+AND SHALL preserve clear visual distinction between the active input card,
+a currently streaming answer, and inactive history
+
 WHEN a stored Q&A answer was produced before the chain grew (members
 were added, or members accumulated more messages, after the answer)
 THE SYSTEM SHALL show an age-of-answer freshness indicator on that
@@ -162,8 +170,11 @@ active card is visibly the same shape as past pairs (just unfilled), so
 the user understands their next question creates a new pair rather than
 continuing a thread. Reverse-chronological ordering keeps the freshest
 context next to the active card without requiring the user to scroll.
-Surfacing failed/incomplete Q&A preserves the user's question text
-rather than losing it on stream failure.
+Inactive history benefits from denser presentation because the user's
+attention is on composing the next question or reading the latest answer,
+not on re-editing prior cards; density should reduce repetition, not hide
+meaning. Surfacing failed/incomplete Q&A preserves the user's question
+text rather than losing it on stream failure.
 
 The freshness indicator is an **age-of-answer** signal, not a
 correctness-snapshot the answer was computed against. Under REQ-CHN-009
