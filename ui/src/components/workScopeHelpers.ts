@@ -18,7 +18,11 @@ export const BROWSER_IDLE_THRESHOLD_MS = 60_000;
 /** Whether a browser session reads as idle: live on the wire but quiet past the
  *  threshold. "idle" is a purely client-side presentation over `idle_ms`. */
 export function isBrowserIdle(browser: BrowserSession): boolean {
-  return browser.state === 'live' && browser.idle_ms >= BROWSER_IDLE_THRESHOLD_MS;
+  return (
+    browser.state === 'live' &&
+    browser.idle_ms !== null &&
+    browser.idle_ms >= BROWSER_IDLE_THRESHOLD_MS
+  );
 }
 
 /** A bash handle that reads as "running right now". */

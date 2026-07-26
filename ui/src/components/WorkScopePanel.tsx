@@ -338,7 +338,7 @@ function BrowserRow({
   onError,
 }: {
   state: 'live' | 'teardown_pending' | 'teardown_failed' | 'torn_down';
-  idleMs: number;
+  idleMs: number | null;
   scopeKey: string;
   conversationId: string;
   inspectable: boolean;
@@ -346,7 +346,7 @@ function BrowserRow({
   onError: (message: string) => void;
 }) {
   // "idle" is a client-side display over idle_ms; the wire state stays live.
-  const idle = state === 'live' && idleMs >= BROWSER_IDLE_THRESHOLD_MS;
+  const idle = state === 'live' && idleMs !== null && idleMs >= BROWSER_IDLE_THRESHOLD_MS;
   const display =
     state === 'torn_down'
       ? { glyph: '○', cls: 'ws-glyph--muted', text: 'torn down' }

@@ -141,9 +141,9 @@ fn project_tmux_status(status: ServerStatus) -> TmuxServerStatus {
     }
 }
 
-/// Project browser liveness + idle time. `None` when no session is live for
-/// the scope. `idle_ms` is derived from the session's monotonic last-activity
-/// `Instant` at assembly time.
+/// Project browser liveness + idle time. `None` when no session is tracked for
+/// the scope. Live-session `idle_ms` is derived from the session's monotonic
+/// last-activity `Instant`; teardown states report it as unavailable.
 async fn assemble_browser(
     work_scope: &ResourceScopeKey,
     actor: Option<&EffectiveResourceAccess>,
@@ -161,7 +161,9 @@ async fn assemble_browser(
         BrowserInventoryState::TeardownPending => BrowserSessionLiveness::TeardownPending,
         BrowserInventoryState::TeardownFailed => BrowserSessionLiveness::TeardownFailed,
     };
-    let idle_ms = u64::try_from(metadata.idle.as_millis()).unwrap_or(u64::MAX);
+    let idle_ms = metadata
+        .idle
+        .map(|idle| u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
     Some(BrowserInventory { state, idle_ms })
 }
 

@@ -4,9 +4,10 @@ import type { BrowserSessionLiveness } from "./BrowserSessionLiveness";
 /**
  * The browser session projection for a scope.
  *
- * `idle_ms` is computed at assembly time from the session's monotonic
- * last-activity `Instant` (`Instant::elapsed().as_millis()`); there is
- * deliberately no wall-clock timestamp on the wire, because the source is a
- * monotonic clock with no absolute value.
+ * For a live session, `idle_ms` is computed at assembly time from the
+ * session's monotonic last-activity `Instant` (`Instant::elapsed().as_millis()`).
+ * It is unavailable while teardown owns the session lock and after teardown.
+ * There is deliberately no wall-clock timestamp on the wire, because the
+ * source is a monotonic clock with no absolute value.
  */
-export type BrowserInventory = { state: BrowserSessionLiveness, idle_ms: number, };
+export type BrowserInventory = { state: BrowserSessionLiveness, idle_ms: number | null, };

@@ -184,15 +184,16 @@ pub enum BrowserSessionLiveness {
 
 /// The browser session projection for a scope.
 ///
-/// `idle_ms` is computed at assembly time from the session's monotonic
-/// last-activity `Instant` (`Instant::elapsed().as_millis()`); there is
-/// deliberately no wall-clock timestamp on the wire, because the source is a
-/// monotonic clock with no absolute value.
+/// For a live session, `idle_ms` is computed at assembly time from the
+/// session's monotonic last-activity `Instant` (`Instant::elapsed().as_millis()`).
+/// It is unavailable while teardown owns the session lock and after teardown.
+/// There is deliberately no wall-clock timestamp on the wire, because the
+/// source is a monotonic clock with no absolute value.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BrowserInventory {
     pub state: BrowserSessionLiveness,
-    pub idle_ms: u64,
+    pub idle_ms: Option<u64>,
 }
 
 #[cfg(test)]

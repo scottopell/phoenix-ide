@@ -900,8 +900,16 @@ impl BrowserSessionAudience {
 pub enum BrowserSessionLifecycleKind {
     Active,
     TeardownPending,
+    TeardownRetryPending,
     Inactive,
     TeardownFailed,
+}
+
+impl BrowserSessionLifecycleKind {
+    #[must_use]
+    pub const fn viewer_active(self) -> bool {
+        matches!(self, Self::Active | Self::TeardownPending)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -927,7 +935,7 @@ pub enum BrowserInventoryState {
 #[derive(Clone, Copy, Debug)]
 pub struct BrowserInventoryMetadata {
     pub state: BrowserInventoryState,
-    pub idle: Duration,
+    pub idle: Option<Duration>,
 }
 
 /// Predicate answering "does this `ResourceScopeKey` still own a live (non-terminal)
@@ -1150,15 +1158,9 @@ impl BrowserSessionManager {
                         BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
                     }
                 };
-                let lifecycle = (entry.scope.clone(), audience);
-                attempt.complete(Err(error.clone()));
-                Some(lifecycle)
+                Some((entry.scope.clone(), audience))
             })
         };
-        if lifecycle.is_none() {
-            attempt.complete(Err(error));
-            return;
-        }
         if let Some((scope, audience)) = lifecycle {
             self.emit_lifecycle(
                 &scope,
@@ -1166,6 +1168,7 @@ impl BrowserSessionManager {
                 BrowserSessionLifecycleKind::TeardownFailed,
             );
         }
+        attempt.complete(Err(error));
     }
 
     async fn wait_for_kill_completion(
@@ -1378,13 +1381,13 @@ impl BrowserSessionManager {
             (entry.session.clone(), state)
         };
         if state != BrowserInventoryState::Live {
-            return Some(BrowserInventoryMetadata {
-                state,
-                idle: Duration::ZERO,
-            });
+            return Some(BrowserInventoryMetadata { state, idle: None });
         }
         let idle = session.read().await.last_activity.elapsed();
-        Some(BrowserInventoryMetadata { state, idle })
+        Some(BrowserInventoryMetadata {
+            state,
+            idle: Some(idle),
+        })
     }
 
     /// Return actor-authorized control-plane idle metadata without exposing the
@@ -1422,13 +1425,13 @@ impl BrowserSessionManager {
             (entry.session.clone(), state)
         };
         if state != BrowserInventoryState::Live {
-            return Ok(Some(BrowserInventoryMetadata {
-                state,
-                idle: Duration::ZERO,
-            }));
+            return Ok(Some(BrowserInventoryMetadata { state, idle: None }));
         }
         let idle = session.read().await.last_activity.elapsed();
-        Ok(Some(BrowserInventoryMetadata { state, idle }))
+        Ok(Some(BrowserInventoryMetadata {
+            state,
+            idle: Some(idle),
+        }))
     }
 
     /// Return the actor's reusable browser session.
@@ -1509,7 +1512,7 @@ impl BrowserSessionManager {
         key: String,
         work_scope: ResourceScopeKey,
     ) -> KillSessionOutcome {
-        let (session, attempt, audience) = {
+        let (session, attempt, audience, lifecycle_kind) = {
             let sessions = self.sessions.write().await;
             let Some(entry) = sessions.get(&key) else {
                 return KillSessionOutcome::Absent;
@@ -1529,19 +1532,20 @@ impl BrowserSessionManager {
             }
             let attempt = KillAttempt::new();
             *current = Some(attempt.clone());
+            let lifecycle_kind = if entry.teardown_failed.load(Ordering::SeqCst) {
+                BrowserSessionLifecycleKind::TeardownRetryPending
+            } else {
+                BrowserSessionLifecycleKind::TeardownPending
+            };
             let audience = match entry.authority {
                 ResourceAuthority::Work => BrowserSessionAudience::Scope,
                 ResourceAuthority::Restricted => {
                     BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
                 }
             };
-            (entry.session.clone(), attempt, audience)
+            (entry.session.clone(), attempt, audience, lifecycle_kind)
         };
-        self.emit_lifecycle(
-            &work_scope,
-            audience,
-            BrowserSessionLifecycleKind::TeardownPending,
-        );
+        self.emit_lifecycle(&work_scope, audience, lifecycle_kind);
 
         let requested_scope = work_scope;
         let manager = Arc::clone(self);
@@ -1612,12 +1616,12 @@ impl BrowserSessionManager {
                     }
                 };
                 drop(entry);
-                task_attempt.complete(Ok(()));
                 manager.emit_lifecycle(
                     &removed_scope,
                     audience,
                     BrowserSessionLifecycleKind::Inactive,
                 );
+                task_attempt.complete(Ok(()));
                 Ok(())
             }),
         }
@@ -2066,6 +2070,15 @@ mod lifecycle_hook_tests {
             Some(Err(error)) if error == "first attempt failed"
         ));
         assert!(matches!(retry.result(), Some(Ok(()))));
+    }
+
+    #[test]
+    fn viewer_activity_distinguishes_initial_teardown_from_failed_retry() {
+        assert!(BrowserSessionLifecycleKind::Active.viewer_active());
+        assert!(BrowserSessionLifecycleKind::TeardownPending.viewer_active());
+        assert!(!BrowserSessionLifecycleKind::TeardownRetryPending.viewer_active());
+        assert!(!BrowserSessionLifecycleKind::TeardownFailed.viewer_active());
+        assert!(!BrowserSessionLifecycleKind::Inactive.viewer_active());
     }
 
     #[tokio::test]

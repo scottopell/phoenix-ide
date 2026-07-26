@@ -29,9 +29,7 @@ pub use traits::*;
 
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
-use crate::tools::browser::session::{
-    BrowserSessionAudience, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
-};
+use crate::tools::browser::session::{BrowserSessionAudience, BrowserSessionLifecycleEvent};
 use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, ExploreToolPolicy,
     TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
@@ -1518,11 +1516,7 @@ impl RuntimeManager {
                     let Some(broadcaster) = broadcaster else {
                         continue;
                     };
-                    let active = matches!(
-                        kind,
-                        BrowserSessionLifecycleKind::Active
-                            | BrowserSessionLifecycleKind::TeardownPending
-                    );
+                    let active = kind.viewer_active();
                     if broadcaster
                         .send_seq(|seq| SseEvent::BrowserSessionState {
                             sequence_id: seq,

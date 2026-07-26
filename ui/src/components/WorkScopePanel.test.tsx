@@ -126,7 +126,7 @@ describe('hasLiveResource', () => {
     expect(hasLiveResource(inv([]))).toBe(false);
     expect(hasLiveResource(inv([bash({ state: 'tombstoned' })]))).toBe(false);
     expect(hasLiveResource(inv([], { tmux: { status: 'gone' } }))).toBe(false);
-    expect(hasLiveResource(inv([], { browser: { state: 'torn_down', idle_ms: 0 } }))).toBe(false);
+    expect(hasLiveResource(inv([], { browser: { state: 'torn_down', idle_ms: null } }))).toBe(false);
   });
 
   it('is true for a running bash handle (bash-only)', () => {
@@ -144,8 +144,8 @@ describe('hasLiveResource', () => {
   });
 
   it('polls while browser teardown is pending but stops after stable failure', () => {
-    expect(hasLiveResource(inv([], { browser: { state: 'teardown_pending', idle_ms: 0 } }))).toBe(true);
-    expect(hasLiveResource(inv([], { browser: { state: 'teardown_failed', idle_ms: 0 } }))).toBe(false);
+    expect(hasLiveResource(inv([], { browser: { state: 'teardown_pending', idle_ms: null } }))).toBe(true);
+    expect(hasLiveResource(inv([], { browser: { state: 'teardown_failed', idle_ms: null } }))).toBe(false);
   });
 });
 
@@ -714,7 +714,7 @@ describe('browser open affordance (Phase 3)', () => {
   });
 
   it('a teardown-failed browser remains visible and retryable but cannot be opened', async () => {
-    const failedBrowser = inv([], { browser: { state: 'teardown_failed', idle_ms: 0 } });
+    const failedBrowser = inv([], { browser: { state: 'teardown_failed', idle_ms: null } });
     getInv.mockResolvedValue(failedBrowser);
 
     await act(async () => {
@@ -774,7 +774,7 @@ describe('browser open affordance (Phase 3)', () => {
   });
 
   it('a torn_down browser does NOT render open → (even though rows are inspectable)', async () => {
-    const deadBrowser = inv([], { browser: { state: 'torn_down', idle_ms: 0 } });
+    const deadBrowser = inv([], { browser: { state: 'torn_down', idle_ms: null } });
     getInv.mockResolvedValue(deadBrowser);
 
     await act(async () => {

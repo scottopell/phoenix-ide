@@ -126,8 +126,8 @@ push.
 
 WHEN the inventory includes a browser section
 THE SYSTEM SHALL report the session `state` (one of `live`, `teardown_pending`,
-`teardown_failed`, `torn_down`) and `idle_ms`, the elapsed milliseconds since the session's last
-activity.
+`teardown_failed`, `torn_down`) and `idle_ms`, which is the elapsed milliseconds
+since the session's last activity when that value is available.
 
 THE wire `state` SHALL be sourced from `BrowserSessionManager` membership and
 teardown state: a reusable entry maps to `live`, an entry with an outstanding
@@ -143,10 +143,16 @@ WHEN state is `teardown_failed`
 THE SYSTEM SHALL stop automatic polling, visibly report the failure in collapsed and expanded surfaces, and keep the stop action available for retry
 AND SHALL NOT expose the retained session for browser reuse or viewer opening.
 
+WHEN state is `live`
 THE SYSTEM SHALL compute `idle_ms` at assembly time as the elapsed duration
-since the live `BrowserSession`'s last activity (a monotonic `Instant`). The
-inventory SHALL NOT report a wall-clock last-activity timestamp, because the
-source has no absolute-clock value.
+since the live `BrowserSession`'s last activity (a monotonic `Instant`).
+
+WHEN state is `teardown_pending`, `teardown_failed`, or `torn_down`
+THE SYSTEM SHALL report `idle_ms` as unavailable rather than fabricate an
+elapsed duration while teardown may own the session lock or no session exists.
+
+THE inventory SHALL NOT report a wall-clock last-activity timestamp, because
+the source has no absolute-clock value.
 
 WHEN no browser session exists for the scope
 THE SYSTEM SHALL report the browser section as absent (equivalently, state

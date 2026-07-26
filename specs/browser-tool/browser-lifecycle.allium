@@ -75,6 +75,7 @@ enum WorkScopeKind {
 enum BrowserLifecycleKind {
     active
     | teardown_pending
+    | teardown_retry_pending
     | inactive
     | teardown_failed
 }
@@ -122,7 +123,8 @@ entity BrowserSession {
 -- teardown_failed session still occupies the HashMap key and cannot be replaced.
 invariant OneSessionPerScope {
     for s in BrowserSession where s.status != torn_down:
-        count(BrowserSession{scope: s.scope}) <= 1
+        count(BrowserSession{scope: s.scope, status: live})
+            + count(BrowserSession{scope: s.scope, status: teardown_failed}) <= 1
 }
 
 -- Disjoint namespaces: a Worktree scope with the same `inner` as a
@@ -258,6 +260,17 @@ rule CascadeTeardownFailureRetained {
         kind: teardown_failed
     )
     ensures: not UserDataDirRemoved(user_data_dir_for_scope(work_scope))
+}
+
+rule FailedTeardownRetryStarts {
+    when: BrowserTeardownRetryStarted(work_scope)
+
+    requires: exists BrowserSession{scope: work_scope, status: teardown_failed}
+
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: work_scope,
+        kind: teardown_retry_pending
+    )
 }
 
 -- A retry is tied to one teardown generation. Its completion cannot be inferred
