@@ -60,7 +60,7 @@ value WorkScope {
 -- the same scope (continuation members).
 value BrowserSessionLifecycleEvent {
     work_scope: WorkScope
-    active: Boolean
+    kind: BrowserLifecycleKind
 }
 
 ------------------------------------------------------------
@@ -72,11 +72,18 @@ enum WorkScopeKind {
     | conversation
 }
 
+enum BrowserLifecycleKind {
+    active
+    | inactive
+    | teardown_failed
+}
+
 -- Session lifecycle status. The HashMap membership is the single source of
--- truth — `live` iff the manager holds a map entry for the scope.
+-- truth — `live` or `teardown_failed` iff the manager holds a map entry for the scope.
 enum SessionStatus {
     uninitialized
     | live
+    | teardown_failed
     | torn_down
 }
 
@@ -84,7 +91,7 @@ enum SessionStatus {
 -- Entities
 ------------------------------------------------------------
 
--- One BrowserSession per WorkScope. Continuation conversations that
+-- One tracked BrowserSession per WorkScope. Continuation conversations that
 -- resolve to the same scope share the entity rather than creating their
 -- own (REQ-BROWSER-WS-001, REQ-BROWSER-WS-002).
 entity BrowserSession {
@@ -94,7 +101,10 @@ entity BrowserSession {
 
     transitions status {
         uninitialized -> live
+        live -> teardown_failed
         live -> torn_down
+        teardown_failed -> teardown_failed
+        teardown_failed -> torn_down
         terminal: torn_down
     }
 
@@ -147,7 +157,7 @@ rule SessionCreatedOnFirstGet {
     )
     ensures: BrowserSessionLifecycleEvent.emitted(
         work_scope: scope,
-        active: true
+        kind: active
     )
 
     @guidance
@@ -201,7 +211,7 @@ rule ContinuationReusesSession {
 -- of the idle reaper, which fails closed and preserves on an unreadable DB —
 -- there preserving is the safe error response, here it is the unsafe one.
 rule CascadeTearsDownWhenNoInheritor {
-    when: CleanupCascadeRunFor(conversation, inheritor_scope)
+    when: BrowserTeardownSucceeded(conversation, inheritor_scope)
 
     let work_scope = resolve_work_scope(conversation)
 
@@ -215,7 +225,7 @@ rule CascadeTearsDownWhenNoInheritor {
     )
     ensures: BrowserSessionLifecycleEvent.emitted(
         work_scope: work_scope,
-        active: false
+        kind: inactive
     )
     ensures: UserDataDirRemoved(user_data_dir_for_scope(work_scope))
 
@@ -223,6 +233,61 @@ rule CascadeTearsDownWhenNoInheritor {
         -- The kill awaits explicit Chrome termination before removing the
         -- user data dir and manager entry. Teardown completion therefore
         -- means the process and its SingletonLock have been released.
+}
+
+-- REQ-BROWSER-WS-003: cleanup-cascade preservation when a live conversation
+-- A failed process termination or profile removal retains the manager entry as
+-- a retryable control-plane resource, but the session is not reusable.
+rule CascadeTeardownFailureRetained {
+    when: BrowserTeardownFailed(conversation, inheritor_scope)
+
+    let work_scope = resolve_work_scope(conversation)
+
+    requires: inheritor_scope != Some(work_scope)
+    requires: exists BrowserSession{scope: work_scope, status: live}
+
+    ensures: BrowserSession.transitioned(
+        scope: work_scope,
+        from: live,
+        to: teardown_failed
+    )
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: work_scope,
+        kind: teardown_failed
+    )
+    ensures: not UserDataDirRemoved(user_data_dir_for_scope(work_scope))
+}
+
+-- A retry is tied to one teardown generation. Its completion cannot be inferred
+-- from a later generation's state.
+rule FailedTeardownRetrySucceeds {
+    when: BrowserTeardownRetrySucceeded(work_scope)
+
+    requires: exists BrowserSession{scope: work_scope, status: teardown_failed}
+
+    ensures: BrowserSession.transitioned(
+        scope: work_scope,
+        from: teardown_failed,
+        to: torn_down
+    )
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: work_scope,
+        kind: inactive
+    )
+    ensures: UserDataDirRemoved(user_data_dir_for_scope(work_scope))
+}
+
+rule FailedTeardownRetryFails {
+    when: BrowserTeardownRetryFailed(work_scope)
+
+    requires: exists BrowserSession{scope: work_scope, status: teardown_failed}
+
+    ensures: BrowserSession.status = teardown_failed
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: work_scope,
+        kind: teardown_failed
+    )
+    ensures: not UserDataDirRemoved(user_data_dir_for_scope(work_scope))
 }
 
 -- REQ-BROWSER-WS-003: cleanup-cascade preservation when a live conversation
@@ -278,7 +343,7 @@ rule IdleSessionCleanedUp {
         ensures: session.status = torn_down
         ensures: BrowserSessionLifecycleEvent.emitted(
             work_scope: session.scope,
-            active: false
+            kind: inactive
         )
 }
 
@@ -309,12 +374,15 @@ rule IdleSessionPreservedWhileScopeLive {
 -- may have multiple continuation members subscribed to SSE; all of them
 -- need the state edge.
 rule LifecycleEventFannedOut {
-    when: BrowserSessionLifecycleEvent.emitted(scope, active)
+    when: BrowserSessionLifecycleEvent.emitted(scope, kind)
 
     ensures: for c in bedrock/Conversation
              where resolve_work_scope(c) = scope
              and live_runtime_exists(c):
-        SseEvent.BrowserSessionState.delivered(c, active)
+        SseEvent.BrowserSessionState.delivered(
+            c,
+            kind = active
+        )
 
     @guidance
         -- The bridge iterates the runtimes map and, for each handle,

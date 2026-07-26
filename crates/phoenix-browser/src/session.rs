@@ -900,7 +900,7 @@ impl BrowserSessionAudience {
 pub enum BrowserSessionLifecycleKind {
     Active,
     Inactive,
-    InventoryOnly,
+    TeardownFailed,
 }
 
 #[derive(Debug, Clone)]
@@ -961,6 +961,8 @@ struct ScopedSession {
     kill_done: Arc<Notify>,
     kill_requested: Arc<AtomicBool>,
     teardown_failed: Arc<AtomicBool>,
+    kill_generation: Arc<std::sync::atomic::AtomicU64>,
+    failed_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 enum KillSessionOutcome {
@@ -968,10 +970,12 @@ enum KillSessionOutcome {
     Started {
         key: String,
         handle: JoinHandle<Result<(), BrowserError>>,
+        generation: u64,
     },
     AlreadyRequested {
         key: String,
         done: Arc<Notify>,
+        generation: u64,
     },
 }
 
@@ -1100,10 +1104,11 @@ impl BrowserSessionManager {
         }
     }
 
-    async fn mark_kill_task_failed(&self, key: &str) {
+    async fn mark_kill_task_failed(&self, key: &str, generation: u64) {
         let sessions = self.sessions.read().await;
         if let Some(entry) = sessions.get(key) {
             entry.teardown_failed.store(true, Ordering::SeqCst);
+            entry.failed_generation.store(generation, Ordering::SeqCst);
             entry.kill_requested.store(false, Ordering::SeqCst);
             entry.kill_done.notify_waiters();
         }
@@ -1113,6 +1118,7 @@ impl BrowserSessionManager {
         &self,
         key: &str,
         done: Arc<Notify>,
+        generation: u64,
     ) -> Result<(), BrowserError> {
         loop {
             let notified = done.notified();
@@ -1122,13 +1128,13 @@ impl BrowserSessionManager {
                 let sessions = self.sessions.read().await;
                 sessions.get(key).is_some_and(|entry| {
                     Arc::ptr_eq(&entry.kill_done, &done)
+                        && entry.kill_generation.load(Ordering::SeqCst) == generation
                         && entry.kill_requested.load(Ordering::SeqCst)
                 })
             };
             if !still_waiting_for_same_kill {
                 let failed = self.sessions.read().await.get(key).is_some_and(|entry| {
-                    Arc::ptr_eq(&entry.kill_done, &done)
-                        && !entry.kill_requested.load(Ordering::SeqCst)
+                    entry.failed_generation.load(Ordering::SeqCst) == generation
                 });
                 return if failed {
                     Err(BrowserError::OperationFailed(
@@ -1195,8 +1201,10 @@ impl BrowserSessionManager {
                     }
                     if entry.kill_requested.load(Ordering::SeqCst) {
                         let kill_done = entry.kill_done.clone();
+                        let generation = entry.kill_generation.load(Ordering::SeqCst);
                         drop(sessions);
-                        self.wait_for_kill_completion(&key, kill_done).await?;
+                        self.wait_for_kill_completion(&key, kill_done, generation)
+                            .await?;
                         continue;
                     }
                     if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
@@ -1215,8 +1223,10 @@ impl BrowserSessionManager {
                 }
                 if entry.kill_requested.load(Ordering::SeqCst) {
                     let kill_done = entry.kill_done.clone();
+                    let generation = entry.kill_generation.load(Ordering::SeqCst);
                     drop(sessions);
-                    self.wait_for_kill_completion(&key, kill_done).await?;
+                    self.wait_for_kill_completion(&key, kill_done, generation)
+                        .await?;
                     continue;
                 }
                 if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
@@ -1271,6 +1281,8 @@ impl BrowserSessionManager {
                 kill_done: Arc::new(Notify::new()),
                 kill_requested: Arc::new(AtomicBool::new(false)),
                 teardown_failed: Arc::new(AtomicBool::new(false)),
+                kill_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                failed_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
         // Drop the write lock before emitting — the receiver may grab the
@@ -1416,33 +1428,37 @@ impl BrowserSessionManager {
         key: String,
         work_scope: ResourceScopeKey,
     ) -> KillSessionOutcome {
-        let Some((session, kill_requested, kill_done, teardown_failed)) = ({
-            let sessions = self.sessions.read().await;
-            sessions.get(&key).map(|entry| {
-                (
-                    entry.session.clone(),
-                    entry.kill_requested.clone(),
-                    entry.kill_done.clone(),
-                    entry.teardown_failed.clone(),
-                )
-            })
-        }) else {
-            return KillSessionOutcome::Absent;
-        };
-
-        if kill_requested.swap(true, Ordering::SeqCst) {
-            tracing::debug!(work_scope = %work_scope, "browser kill already requested");
-            return KillSessionOutcome::AlreadyRequested {
-                key,
-                done: kill_done,
+        let (session, kill_requested, kill_done, teardown_failed, failed_generation, generation) = {
+            let sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get(&key) else {
+                return KillSessionOutcome::Absent;
             };
-        }
-        teardown_failed.store(false, Ordering::SeqCst);
+            if entry.kill_requested.load(Ordering::SeqCst) {
+                tracing::debug!(work_scope = %work_scope, "browser kill already requested");
+                return KillSessionOutcome::AlreadyRequested {
+                    key,
+                    done: entry.kill_done.clone(),
+                    generation: entry.kill_generation.load(Ordering::SeqCst),
+                };
+            }
+            let generation = entry.kill_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            entry.kill_requested.store(true, Ordering::SeqCst);
+            entry.teardown_failed.store(false, Ordering::SeqCst);
+            (
+                entry.session.clone(),
+                entry.kill_requested.clone(),
+                entry.kill_done.clone(),
+                entry.teardown_failed.clone(),
+                entry.failed_generation.clone(),
+                generation,
+            )
+        };
 
         let requested_scope = work_scope;
         let manager = Arc::clone(self);
         KillSessionOutcome::Started {
             key,
+            generation,
             handle: tokio::spawn(async move {
                 tracing::info!(work_scope = %requested_scope, "Killing browser session");
 
@@ -1453,6 +1469,7 @@ impl BrowserSessionManager {
                 if let Err(error) = termination {
                     tracing::warn!(work_scope = %requested_scope, %error, "browser termination failed; retaining tracked session");
                     teardown_failed.store(true, Ordering::SeqCst);
+                    failed_generation.store(generation, Ordering::SeqCst);
                     kill_requested.store(false, Ordering::SeqCst);
                     kill_done.notify_waiters();
                     return Err(BrowserError::OperationFailed(error.to_string()));
@@ -1474,6 +1491,7 @@ impl BrowserSessionManager {
                 if let Err(error) = tokio::fs::remove_dir_all(&user_data_dir).await {
                     if error.kind() != std::io::ErrorKind::NotFound {
                         teardown_failed.store(true, Ordering::SeqCst);
+                        failed_generation.store(generation, Ordering::SeqCst);
                         kill_requested.store(false, Ordering::SeqCst);
                         kill_done.notify_waiters();
                         return Err(BrowserError::OperationFailed(format!(
@@ -1533,17 +1551,27 @@ impl BrowserSessionManager {
         tokio::spawn(async move {
             let result = match outcome {
                 KillSessionOutcome::Absent => Ok(()),
-                KillSessionOutcome::Started { key, handle } => match handle.await {
+                KillSessionOutcome::Started {
+                    key,
+                    handle,
+                    generation,
+                } => match handle.await {
                     Ok(result) => result,
                     Err(error) => {
-                        manager.mark_kill_task_failed(&key).await;
+                        manager.mark_kill_task_failed(&key, generation).await;
                         Err(BrowserError::OperationFailed(format!(
                             "browser kill task failed: {error}"
                         )))
                     }
                 },
-                KillSessionOutcome::AlreadyRequested { key, done } => {
-                    manager.wait_for_kill_completion(&key, done).await
+                KillSessionOutcome::AlreadyRequested {
+                    key,
+                    done,
+                    generation,
+                } => {
+                    manager
+                        .wait_for_kill_completion(&key, done, generation)
+                        .await
                 }
             };
             if let Err(error) = result {
@@ -1557,7 +1585,7 @@ impl BrowserSessionManager {
                 manager.emit_lifecycle(
                     &work_scope,
                     audience,
-                    BrowserSessionLifecycleKind::InventoryOnly,
+                    BrowserSessionLifecycleKind::TeardownFailed,
                 );
             }
             Ok::<(), BrowserError>(())
@@ -1619,18 +1647,24 @@ impl BrowserSessionManager {
             .await
         {
             KillSessionOutcome::Absent => Ok(()),
-            KillSessionOutcome::Started { key, handle } => match handle.await {
+            KillSessionOutcome::Started {
+                key,
+                handle,
+                generation,
+            } => match handle.await {
                 Ok(result) => result,
                 Err(error) => {
-                    self.mark_kill_task_failed(&key).await;
+                    self.mark_kill_task_failed(&key, generation).await;
                     Err(BrowserError::OperationFailed(format!(
                         "browser kill task failed: {error}"
                     )))
                 }
             },
-            KillSessionOutcome::AlreadyRequested { key, done } => {
-                self.wait_for_kill_completion(&key, done).await
-            }
+            KillSessionOutcome::AlreadyRequested {
+                key,
+                done,
+                generation,
+            } => self.wait_for_kill_completion(&key, done, generation).await,
         }
     }
 
@@ -1663,18 +1697,26 @@ impl BrowserSessionManager {
                 .await
             {
                 KillSessionOutcome::Absent => {}
-                KillSessionOutcome::Started { key, handle } => started.push((key, handle)),
-                KillSessionOutcome::AlreadyRequested { key, done } => {
-                    already_requested.push((key, done));
+                KillSessionOutcome::Started {
+                    key,
+                    handle,
+                    generation,
+                } => started.push((key, handle, generation)),
+                KillSessionOutcome::AlreadyRequested {
+                    key,
+                    done,
+                    generation,
+                } => {
+                    already_requested.push((key, done, generation));
                 }
             }
         }
 
         let mut failures = Vec::new();
-        for (key, result) in futures::future::join_all(
+        for (key, generation, result) in futures::future::join_all(
             started
                 .into_iter()
-                .map(|(key, handle)| async move { (key, handle.await) }),
+                .map(|(key, handle, generation)| async move { (key, generation, handle.await) }),
         )
         .await
         {
@@ -1682,16 +1724,16 @@ impl BrowserSessionManager {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => failures.push(error.to_string()),
                 Err(error) => {
-                    self.mark_kill_task_failed(&key).await;
+                    self.mark_kill_task_failed(&key, generation).await;
                     failures.push(format!("browser kill task failed: {error}"));
                 }
             }
         }
-        for result in futures::future::join_all(
-            already_requested
-                .into_iter()
-                .map(|(key, done)| async move { self.wait_for_kill_completion(&key, done).await }),
-        )
+        for result in futures::future::join_all(already_requested.into_iter().map(
+            |(key, done, generation)| async move {
+                self.wait_for_kill_completion(&key, done, generation).await
+            },
+        ))
         .await
         {
             if let Err(error) = result {
@@ -1819,18 +1861,26 @@ impl BrowserSessionManager {
                 tracing::info!(scope_key = %key, "Cleaning up idle browser session");
                 match self.spawn_kill_session_by_key(key, scope).await {
                     KillSessionOutcome::Absent => {}
-                    KillSessionOutcome::Started { key, handle } => started.push((key, handle)),
-                    KillSessionOutcome::AlreadyRequested { key, done } => {
-                        already_requested.push((key, done));
+                    KillSessionOutcome::Started {
+                        key,
+                        handle,
+                        generation,
+                    } => started.push((key, handle, generation)),
+                    KillSessionOutcome::AlreadyRequested {
+                        key,
+                        done,
+                        generation,
+                    } => {
+                        already_requested.push((key, done, generation));
                     }
                 }
             }
         }
 
-        for (key, result) in futures::future::join_all(
+        for (key, generation, result) in futures::future::join_all(
             started
                 .into_iter()
-                .map(|(key, handle)| async move { (key, handle.await) }),
+                .map(|(key, handle, generation)| async move { (key, generation, handle.await) }),
         )
         .await
         {
@@ -1838,16 +1888,16 @@ impl BrowserSessionManager {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(%error, "idle browser termination failed"),
                 Err(error) => {
-                    self.mark_kill_task_failed(&key).await;
+                    self.mark_kill_task_failed(&key, generation).await;
                     tracing::warn!(%error, "idle browser kill task failed");
                 }
             }
         }
-        for result in futures::future::join_all(
-            already_requested
-                .into_iter()
-                .map(|(key, done)| async move { self.wait_for_kill_completion(&key, done).await }),
-        )
+        for result in futures::future::join_all(already_requested.into_iter().map(
+            |(key, done, generation)| async move {
+                self.wait_for_kill_completion(&key, done, generation).await
+            },
+        ))
         .await
         {
             if let Err(error) = result {

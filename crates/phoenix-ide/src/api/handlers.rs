@@ -4870,7 +4870,7 @@ async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::
             .is_some_and(|tmux| tmux.status != TmuxServerStatus::Gone)
         || inventory
             .browser
-            .is_some_and(|browser| browser.state == BrowserSessionLiveness::Live)
+            .is_some_and(|browser| browser.state != BrowserSessionLiveness::TornDown)
         || state.terminals.get(&scope).is_some();
     if live_resource {
         tracing::debug!(work_scope = %scope_id, "work scope retirement blocked by live runtime resource");

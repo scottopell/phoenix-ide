@@ -1518,19 +1518,14 @@ impl RuntimeManager {
                     let Some(broadcaster) = broadcaster else {
                         continue;
                     };
-                    let active = match kind {
-                        BrowserSessionLifecycleKind::Active => Some(true),
-                        BrowserSessionLifecycleKind::Inactive => Some(false),
-                        BrowserSessionLifecycleKind::InventoryOnly => None,
-                    };
-                    if active.is_none_or(|active| {
-                        broadcaster
-                            .send_seq(|seq| SseEvent::BrowserSessionState {
-                                sequence_id: seq,
-                                active,
-                            })
-                            .is_ok()
-                    }) {
+                    let active = matches!(kind, BrowserSessionLifecycleKind::Active);
+                    if broadcaster
+                        .send_seq(|seq| SseEvent::BrowserSessionState {
+                            sequence_id: seq,
+                            active,
+                        })
+                        .is_ok()
+                    {
                         delivered += 1;
                     }
                 }
