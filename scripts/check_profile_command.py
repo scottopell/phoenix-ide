@@ -18,7 +18,8 @@ import uuid
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROVENANCE = "windowed_process"
+PROCESS_TREE_PROVENANCE = "exact_process_tree"
+WINDOW_PROVENANCE = "windowed_process"
 
 
 def _write_atomic(path: Path, value: dict) -> None:
@@ -60,10 +61,11 @@ def _record(
     user_cpu_ms: float,
     system_cpu_ms: float,
     extra: dict | None = None,
+    provenance: str = WINDOW_PROVENANCE,
 ) -> dict:
     record = {
         "schema_version": SCHEMA_VERSION,
-        "provenance": PROVENANCE,
+        "provenance": provenance,
         "identity": identity,
         "started_unix_ns": started_wall_ns,
         "wall_ms": (finished_monotonic_ns - started_monotonic_ns) / 1_000_000.0,
@@ -143,17 +145,34 @@ def measure(
     else:
         returncode = 1
 
+    nextest_name = os.environ.get("NEXTEST_TEST_NAME")
+    nextest_binary = os.environ.get("NEXTEST_BINARY_ID")
+    if nextest_name is None and "--exact" in command:
+        exact_index = command.index("--exact")
+        if exact_index + 1 < len(command):
+            nextest_name = command[exact_index + 1]
+    if nextest_binary is None and nextest_name is not None:
+        nextest_binary = Path(command[0]).name
+    inferred_identity = (
+        f"rust:{nextest_binary}:{nextest_name}"
+        if nextest_name and nextest_binary else f"command:{command[0]}"
+    )
     record = _record(
-        identity=identity or f"command:{command[0]}",
+        identity=identity or inferred_identity,
         started_wall_ns=started_wall_ns,
         started_monotonic_ns=started_monotonic_ns,
         finished_monotonic_ns=finished_monotonic_ns,
         user_cpu_ms=usage.ru_utime * 1000.0,
         system_cpu_ms=usage.ru_stime * 1000.0,
+        provenance=PROCESS_TREE_PROVENANCE,
         extra={
             "command": command,
             "pid": child_pid,
             "returncode": returncode,
+            "kind": "rust_test" if nextest_name else "command",
+            "test_name": nextest_name,
+            "binary_id": nextest_binary,
+            "attempt": os.environ.get("NEXTEST_ATTEMPT"),
             # wait4 is exact for the command and descendants it reaped. A daemonized
             # descendant is outside that accounting boundary and cannot be proven
             # closed portably from this wrapper.

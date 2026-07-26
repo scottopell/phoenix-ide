@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -134,6 +135,35 @@ class DevTracingTests(unittest.TestCase):
 
         self.assertIsInstance(child, FakeSpan)
         self.assertIs(parent, tracing.started[0][3])
+
+    def test_profile_record_attributes_normalize_runner_units(self):
+        source = self.dev.ROOT / "target" / "record.jsonl"
+        attributes = self.dev._profile_record_attributes({
+            "provenance": "windowed_process",
+            "test_name": "renders",
+            "cpu_user_us": 1250,
+            "cpu_system_us": 750,
+            "wall_time_ms": 4.5,
+            "status": "pass",
+        }, source)
+
+        self.assertEqual(2.0, attributes["cpu.total_ms"])
+        self.assertEqual("renders", attributes["check.test.identity"])
+        self.assertEqual("pass", attributes["check.test.status"])
+
+    def test_nextest_profile_config_wraps_only_run_phase(self):
+        with tempfile.TemporaryDirectory(dir=self.dev.ROOT / "target") as directory:
+            profile = self.dev.CheckWorkProfile(
+                run_id="run", artifact_dir=Path(directory),
+                started_self=mock.Mock(), started_children=mock.Mock(),
+                started_thread_ns=0,
+            )
+            config = self.dev._write_nextest_profile_config(profile).read_text()
+
+        self.assertIn('experimental = ["wrapper-scripts"]', config)
+        self.assertIn('run-wrapper = "phoenix-cpu"', config)
+        self.assertNotIn("list-wrapper", config)
+        self.assertIn("check_profile_command.py", config)
 
     def test_cargo_lock_timer_accumulates_multiple_intervals(self):
         timer = self.dev.CargoLockWaitTimer(started_at=10.0)

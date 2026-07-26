@@ -161,6 +161,83 @@ def _read_cpu_measurement(path: Path) -> dict | None:
         return None
 
 
+def _profile_record_attributes(record: dict, source: Path) -> dict | None:
+    try:
+        user_ms = float(record.get("user_cpu_ms", record.get("cpu_user_us", 0.0) / 1000.0))
+        system_ms = float(record.get("system_cpu_ms", record.get("cpu_system_us", 0.0) / 1000.0))
+        identity = str(record.get("identity") or record.get("full_test_name") or record["test_name"])
+        attributes = _cpu_attributes(user_ms, system_ms, str(record["provenance"]))
+        attributes.update({
+            "check.test.identity": identity,
+            "check.profile_record": str(source.relative_to(ROOT)),
+            "check.wall_ms": float(record.get("wall_ms", record.get("wall_time_ms", 0.0))),
+        })
+        for source_key, attribute in (
+            ("kind", "check.test.kind"),
+            ("status", "check.test.status"),
+            ("file", "check.test.file"),
+            ("scenario", "check.test.scenario"),
+            ("process_role", "process.role"),
+            ("returncode", "process.exit_code"),
+            ("tree_closure", "cpu.tree_closure"),
+        ):
+            value = record.get(source_key)
+            if value is not None:
+                attributes[attribute] = value
+        command = record.get("command")
+        if command:
+            attributes["process.command"] = json.dumps(command, separators=(",", ":"))
+        return attributes
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _emit_profile_record_spans(profile_dir: Path, parent, patterns: tuple[str, ...]) -> int:
+    emitted = 0
+    for pattern in patterns:
+        for path in sorted(profile_dir.glob(pattern)):
+            try:
+                records = (
+                    [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+                    if path.suffix == ".jsonl" else [json.loads(path.read_text())]
+                )
+            except (OSError, ValueError, TypeError):
+                continue
+            for record in records:
+                attributes = _profile_record_attributes(record, path)
+                if attributes is None:
+                    continue
+                span = _begin_dev_span("dev.check.test", {
+                    "check.test.identity": attributes["check.test.identity"],
+                }, parent=parent)
+                _finish_dev_span(
+                    span, attributes,
+                    failed=record.get("status") in {"fail", "failed"}
+                    or int(record.get("returncode", 0)) != 0,
+                )
+                emitted += 1
+    return emitted
+
+
+def _write_nextest_profile_config(profile: CheckWorkProfile) -> Path:
+    config = profile.artifact_dir / "nextest-profile.toml"
+    wrapper = ROOT / "scripts" / "check_profile_command.py"
+    output_dir = profile.artifact_dir / "rust-tests"
+    command = json.dumps([
+        sys.executable, str(wrapper), "--output-dir", str(output_dir), "--",
+    ])
+    config.write_text(
+        'nextest-version = "0.9.98"\n'
+        'experimental = ["wrapper-scripts"]\n\n'
+        '[scripts.wrapper.phoenix-cpu]\n'
+        f'command = {command}\n\n'
+        '[[profile.phoenix-cpu.scripts]]\n'
+        'filter = "all()"\n'
+        'run-wrapper = "phoenix-cpu"\n'
+    )
+    return config
+
+
 def _dev_trace_endpoint(environ: dict[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
     configured = env.get(_DEV_TRACE_ENDPOINT_ENV)
@@ -311,6 +388,9 @@ def _shutdown_dev_tracing(error: BaseException | None) -> None:
 def _begin_dev_span(name: str, attributes: dict | None = None, parent=None):
     if _DEV_TRACING is None:
         return _NOOP_SPAN
+    attributes = dict(attributes or {})
+    if _CHECK_PROFILE is not None:
+        attributes.setdefault("check.profile_run_id", _CHECK_PROFILE.run_id)
     parent = parent or _DEV_CURRENT_SPAN.get()
     return _DEV_TRACING.start_span(name, attributes, parent=parent)
 
@@ -4545,6 +4625,19 @@ def cmd_check(
             _read_cpu_measurement(measurement_path)
             if measurement_path is not None else None
         )
+        child_span_count = 0
+        if profile_work and _CHECK_PROFILE is not None:
+            patterns = {
+                "cargo test": ("rust-tests/*.json",),
+                "vitest": ("vitest-cpu-*.jsonl",),
+                "dev.py unit tests": ("python-test-cpu.jsonl",),
+                "e2e": ("e2e-scenario-cpu.jsonl",),
+            }.get(name, ())
+            child_span_count = _emit_profile_record_spans(
+                _CHECK_PROFILE.artifact_dir, span, patterns
+            )
+            if cpu_attributes is not None:
+                cpu_attributes["check.profile_child_spans"] = child_span_count
         _finish_check_step_span(
             span,
             elapsed=elapsed,
@@ -5128,7 +5221,13 @@ def cmd_check(
             compile_p, codegen_p = [], []
         if has_nextest:
             compile_cmd = ["cargo", "nextest", "run", *compile_p, "--no-run"]
-            test_cmd = ["cargo", "nextest", "run", *_pflags(),
+            nextest_profile_args = []
+            if profile_work and _CHECK_PROFILE is not None:
+                nextest_config = _write_nextest_profile_config(_CHECK_PROFILE)
+                nextest_profile_args = [
+                    "--config-file", str(nextest_config), "--profile", "phoenix-cpu",
+                ]
+            test_cmd = ["cargo", "nextest", *nextest_profile_args, "run", *_pflags(),
                         "-E", "not test(/export_bindings/)",
                         "--test-threads", str(test_threads)]
             codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
@@ -5275,6 +5374,26 @@ def cmd_check(
                 "a subprocess may be orphaned; investigate before retrying",
             ))
             print(f"  ✗ {label:<18s} ({LANE_JOIN_TIMEOUT}s)")
+
+    if profile_work and _CHECK_PROFILE is not None and sys.platform == "darwin":
+        reporter.info(
+            "sampled flamegraph: run `samply record --save-only --output "
+            f"{_CHECK_PROFILE.artifact_dir / 'flamegraph.json.gz'} -- "
+            "./dev.py check --all --profile-work` for a correlated full-system sample"
+        )
+
+    if profile_work and _CHECK_PROFILE is not None:
+        report = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "check_profile_report.py"),
+             str(_CHECK_PROFILE.artifact_dir)],
+            capture_output=True, text=True, check=False,
+        )
+        if report.returncode == 0:
+            reporter.info(
+                f"CPU work profile: {_CHECK_PROFILE.artifact_dir.relative_to(ROOT)}/summary.md"
+            )
+        else:
+            reporter.info(f"CPU work report failed: {report.stderr.strip()}")
 
     total_elapsed = time.monotonic() - t_start
     failures = [(n, out) for n, rc, _, out in results if rc != 0]

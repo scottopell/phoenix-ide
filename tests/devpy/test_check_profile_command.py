@@ -33,7 +33,7 @@ class CheckProfileCommandTests(unittest.TestCase):
         self.assertEqual("out\n", result.stdout)
         self.assertEqual("err\n", result.stderr)
         self.assertEqual(1, measurement["schema_version"])
-        self.assertEqual("windowed_process", measurement["provenance"])
+        self.assertEqual("exact_process_tree", measurement["provenance"])
         self.assertEqual(7, measurement["returncode"])
         self.assertGreater(measurement["total_cpu_ms"], 0)
         self.assertAlmostEqual(
@@ -71,7 +71,7 @@ class CheckProfileCommandTests(unittest.TestCase):
         self.assertEqual(0, result.returncode)
         self.assertEqual(1, len(records))
 
-    def test_output_jsonl_appends_versioned_window_record(self):
+    def test_output_jsonl_appends_versioned_process_tree_record(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "records.jsonl"
             result = subprocess.run([
@@ -91,7 +91,7 @@ class CheckProfileCommandTests(unittest.TestCase):
         self.assertEqual(0, result.returncode)
         self.assertEqual(1, len(lines))
         record = json.loads(lines[0])
-        self.assertEqual("windowed_process", record["provenance"])
+        self.assertEqual("exact_process_tree", record["provenance"])
         self.assertEqual("python_unittest:demo.test_case", record["identity"])
         self.assertIn("wall_ms", record)
 
