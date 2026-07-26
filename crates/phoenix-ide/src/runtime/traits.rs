@@ -16,6 +16,12 @@ pub struct ActiveDirectTurn {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedActiveDirectTurn {
+    pub active: ActiveDirectTurn,
+    pub materialized: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum AuthoritativeUserMessageMaterialization {
     Materialized {
@@ -145,7 +151,7 @@ pub trait MessageStore: Send + Sync {
     async fn load_active_direct_turn(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<ActiveDirectTurn>, String>;
+    ) -> Result<Option<LoadedActiveDirectTurn>, String>;
 
     async fn terminate_active_direct_turn(
         &self,
@@ -472,7 +478,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     async fn load_active_direct_turn(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<ActiveDirectTurn>, String> {
+    ) -> Result<Option<LoadedActiveDirectTurn>, String> {
         (**self).load_active_direct_turn(conversation_id).await
     }
 
@@ -872,16 +878,22 @@ impl MessageStore for DatabaseStorage {
     async fn load_active_direct_turn(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<ActiveDirectTurn>, String> {
+    ) -> Result<Option<LoadedActiveDirectTurn>, String> {
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
         repo.load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
             conversation_id.to_string(),
         ))
         .await
         .map(|turn| {
-            turn.map(|turn| ActiveDirectTurn {
-                turn_id: turn.id,
-                generation: turn.generation,
+            turn.map(|turn| LoadedActiveDirectTurn {
+                materialized: matches!(
+                    turn.materialization,
+                    phoenix_workflow::Materialization::Materialized { .. }
+                ),
+                active: ActiveDirectTurn {
+                    turn_id: turn.id,
+                    generation: turn.generation,
+                },
             })
         })
         .map_err(|error| error.to_string())

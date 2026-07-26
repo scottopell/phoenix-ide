@@ -889,8 +889,16 @@ impl MessageStore for InMemoryStorage {
     async fn load_active_direct_turn(
         &self,
         _conversation_id: &str,
-    ) -> Result<Option<crate::runtime::traits::ActiveDirectTurn>, String> {
-        Ok(self.active_direct_turn.lock().unwrap().clone())
+    ) -> Result<Option<crate::runtime::traits::LoadedActiveDirectTurn>, String> {
+        Ok(self
+            .active_direct_turn
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|active| crate::runtime::traits::LoadedActiveDirectTurn {
+                active,
+                materialized: true,
+            }))
     }
 
     async fn terminate_active_direct_turn(
