@@ -165,4 +165,4 @@ Append a completion note to this task body with these headings:
 - This pass extended the edits across every current grep hit, fixed the last chain-page and terminal-verb references, and documented the one retained compatibility hit explicitly.
 
 **Commit**
-- Pending final commit for this correction round.
+- `78ccded872f6abeb988f783c0f10d26144717ed6`
