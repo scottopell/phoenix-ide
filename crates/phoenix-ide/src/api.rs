@@ -156,12 +156,10 @@ impl AppState {
             .start_direct_turn_worker()
             .await
             .map_err(std::io::Error::other)?;
-        if AGENT_FACING_WAKE_REGISTRATION.0 {
-            runtime
-                .start_wake_worker()
-                .await
-                .map_err(std::io::Error::other)?;
-        }
+        runtime
+            .start_wake_worker()
+            .await
+            .map_err(std::io::Error::other)?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
         handlers::start_attachment_cleanup_task(db.clone());

@@ -5047,6 +5047,7 @@ mod tests {
                 },
             ),
             registering_tool_use_id: "tool-52".to_string(),
+            registering_tool_round_id: "round-52".to_string(),
             registered_at: phoenix_workflow::Timestamp(3),
             expires_at: phoenix_workflow::Timestamp(100),
         };

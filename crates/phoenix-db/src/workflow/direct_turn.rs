@@ -3402,6 +3402,7 @@ mod tests {
                 },
             ),
             registering_tool_use_id: "tool-direct-cross-profile".to_string(),
+            registering_tool_round_id: "round-direct-cross-profile".to_string(),
             registered_at: Timestamp(42),
             expires_at: Timestamp(100),
         };

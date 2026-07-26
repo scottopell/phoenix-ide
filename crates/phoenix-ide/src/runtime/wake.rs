@@ -509,16 +509,6 @@ async fn deliver_pending(
                 continue;
             }
             let _steering_acceptance = manager.lock_steering_acceptance().await;
-            let rendered = render_terminal_result(&current);
-            let display_data = Some(serde_json::json!({
-                "type": "wake_result",
-                "adopted": false,
-                "terminal": &current.receipt.terminal,
-            }));
-            let auto_resume = !matches!(
-                current.receipt.terminal,
-                phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { .. }
-            );
             let handle = match manager.try_get_handle(&current.conversation_id).await {
                 Some(handle) => handle,
                 None => match manager.get_or_create(&current.conversation_id).await {
@@ -543,8 +533,8 @@ async fn deliver_pending(
                 .list_pending(&current.conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            conversation_pending.truncate(CONVERSATION_DELIVERY_BATCH_LIMIT);
             sort_pending_for_materialization(&mut conversation_pending);
+            conversation_pending.truncate(CONVERSATION_DELIVERY_BATCH_LIMIT);
             let mut unmaterialized = Vec::new();
             for delivery in &conversation_pending {
                 if repo

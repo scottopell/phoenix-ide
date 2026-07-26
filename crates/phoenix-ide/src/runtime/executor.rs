@@ -2712,6 +2712,9 @@ where
 
         if let Some(registration) = wake_registration {
             self.publish_wake_registration(registration);
+            if let Some(registrar) = &self.wake_registrar {
+                registrar.notify_activation_committed();
+            }
         }
 
         // Process chained events (e.g., SpawnAgentsComplete from execute_effect)
@@ -2807,6 +2810,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         if matches!(self.state, ConvState::Idle)
             && matches!(
@@ -5604,9 +5608,6 @@ where
                     let _ = self.broadcast_tx.send_message(msg);
                 }
                 drop(reserved_broadcast_range);
-                if let Some(registrar) = &self.wake_registrar {
-                    registrar.notify_activation_committed();
-                }
             }
         }
         Ok(None)
@@ -9417,7 +9418,7 @@ mod context_exhausted_preserves_worktree_tests {
     }
 
     #[tokio::test]
-    async fn successful_tool_checkpoint_notifies_wake_activation() {
+    async fn successful_tool_checkpoint_waits_for_registration_before_wake_activation() {
         use crate::db::{ToolOutcome, ToolResult};
         use crate::state_machine::{AssistantMessage, CheckpointData};
 
@@ -9458,7 +9459,7 @@ mod context_exhausted_preserves_worktree_tests {
             registrar
                 .activation_notifications
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
     }
 
