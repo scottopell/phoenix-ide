@@ -740,7 +740,7 @@ WHEN the Coordinator exposes `bash`
 THE SYSTEM SHALL reuse the same Explore read-only sandbox execution path
 AND SHALL require each `op="run"` call to provide a cwd that Phoenix canonicalizes and validates against an active persisted WorkScope environment
 AND SHALL NOT assign the Coordinator a default cwd
-AND SHALL keep background-command handles available for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
+AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
 AND SHALL keep Coordinator handle lifecycle outside WorkScope inventory reconciliation
 
 WHEN conversation is in Direct, Work, or Branch mode
@@ -768,6 +768,7 @@ WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
 with network-block and unrelated-process isolation support is available
 THE SYSTEM SHALL detect this at startup
 AND SHALL NOT expose `bash` in top-level Explore mode or the Coordinator
+AND SHALL tell the Coordinator that Bash is unavailable rather than presenting invocation guidance for an absent tool
 AND SHALL continue to expose the remaining read-only/planning tools for those modes
 
 WHEN degraded mode is active

@@ -4819,7 +4819,7 @@ where
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
             let system_prompt = if is_coordinator {
-                crate::system_prompt::build_coordinator_system_prompt(llm_language)
+                crate::system_prompt::build_coordinator_system_prompt(llm_language, explore_bash)
             } else {
                 build_system_prompt(
                     working_dir.as_deref().expect("filesystem conversation has cwd"),

@@ -84,12 +84,12 @@ impl Tool for CoordinatorBash {
                 Err(error) => return ToolOutput::error(error),
             };
             return SandboxedBashTool
-                .run_with_context_cwd(input, ctx, resolved)
+                .run_for_coordinator_in_cwd(input, ctx, resolved)
                 .await;
         } else if cwd.is_some() {
             return ToolOutput::error("cwd is only valid for bash op=run".to_string());
         }
-        SandboxedBashTool.run(input, ctx).await
+        SandboxedBashTool.run_for_coordinator(input, ctx).await
     }
 }
 
