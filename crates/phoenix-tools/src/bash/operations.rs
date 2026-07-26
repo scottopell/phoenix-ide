@@ -551,7 +551,8 @@ async fn run_run(
                 // detached waiter started below carries the sink so it can
                 // emit the terminal edge off-thread.
                 registry.emit_lifecycle(
-                    &ctx.work_scope,
+                    &handle.lifecycle_scope,
+                    &handle.work_scope,
                     crate::bash::registry::BashLifecyclePhase::Spawned,
                 );
                 let progress_reporter = ctx
@@ -1033,11 +1034,13 @@ async fn run_waiter(
         // not double-emit. Best-effort: a closed sink is logged by the bridge.
         if let Some(sink) = &lifecycle_sink {
             if let Err(e) = sink.send(crate::bash::registry::BashLifecycleEvent {
-                work_scope: handle.work_scope.clone(),
+                lifecycle_scope: handle.lifecycle_scope.clone(),
+                control_scope: handle.work_scope.clone(),
                 phase: crate::bash::registry::BashLifecyclePhase::Terminal,
             }) {
                 tracing::debug!(
-                    work_scope = %handle.work_scope,
+                    lifecycle_scope = %handle.lifecycle_scope,
+                    control_scope = %handle.work_scope,
                     error = %e,
                     "dropping bash terminal lifecycle event — sink closed"
                 );
@@ -1267,7 +1270,11 @@ async fn run_kill(
             // state the inventory reflects (REQ-WSUI-007). Emit a non-
             // reconciling lifecycle phase now; the later true terminal
             // transition still emits from the waiter after final I/O drains.
-            ctx.bash_handle_registry().emit_lifecycle(&ctx.work_scope, crate::bash::registry::BashLifecyclePhase::KillPendingKernel);
+            ctx.bash_handle_registry().emit_lifecycle(
+                &handle.lifecycle_scope,
+                &handle.work_scope,
+                crate::bash::registry::BashLifecyclePhase::KillPendingKernel,
+            );
             shape_handle_response(
                 &handle,
                 &ReadArgs::default(),
@@ -2522,7 +2529,8 @@ mod tests {
 
         let spawned = rx.recv().await.expect("spawned event");
         assert_eq!(spawned.phase, BashLifecyclePhase::Spawned);
-        assert_eq!(spawned.work_scope, ctx.work_scope);
+        assert_eq!(spawned.lifecycle_scope, ctx.work_scope);
+        assert_eq!(spawned.control_scope, ctx.work_scope);
 
         // Wait for the trap-installed marker to appear in the ring. Deterministic
         // proof the trap is in place; no wall-clock assumption about bash startup.
@@ -2571,7 +2579,8 @@ mod tests {
 
         let kill_pending = rx.recv().await.expect("kill-pending event");
         assert_eq!(kill_pending.phase, BashLifecyclePhase::KillPendingKernel);
-        assert_eq!(kill_pending.work_scope, ctx.work_scope);
+        assert_eq!(kill_pending.lifecycle_scope, ctx.work_scope);
+        assert_eq!(kill_pending.control_scope, ctx.work_scope);
         assert!(
             !kill_pending.phase.schedules_reconciliation(),
             "kill_pending must not trigger terminal reconciliation"

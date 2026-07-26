@@ -170,13 +170,13 @@ function useHealthAttention(health: BashHandleInventory['health']): HealthAttent
  *  renders this, so it never calls the hook — the standalone work-scope dock and
  *  plain tests can render bash rows without a provider. An inspectable row does
  *  need the provider; it is rendered inside one by construction. */
-function BashInspectButton({ scopeKey, handleId }: { scopeKey: string; handleId: string }) {
+function BashInspectButton({ scopeKey, controlScopeKey, handleId }: { scopeKey: string; controlScopeKey: string; handleId: string }) {
   const { openInspect } = useViewerSlotCommands();
   return (
     <button
       type="button"
       className="ws-row-inspect"
-      onClick={() => openInspect(scopeKey, handleId)}
+      onClick={() => openInspect(scopeKey, controlScopeKey, handleId)}
       title="Open the process inspector for this handle"
     >
       inspect →
@@ -300,7 +300,13 @@ function BashRow({
               <span className="ws-detail-val">{attention}</span>
             </div>
           )}
-          {inspectable && <BashInspectButton scopeKey={scopeKey} handleId={handle.handle_id} />}
+          {inspectable && (
+            <BashInspectButton
+              scopeKey={scopeKey}
+              controlScopeKey={handle.control_scope_key}
+              handleId={handle.handle_id}
+            />
+          )}
         </div>
       )}
     </div>
@@ -579,7 +585,7 @@ function WorkScopeBody({
               <div className="ws-empty">no handles</div>
             ) : (
               inventory.bash.map((h) => (
-                <BashRow key={h.handle_id} handle={h} now={now} scopeKey={scopeKey} inspectable={inspectable} healthFresh={healthIsFresh(inventory.health_sampled_at, now)} />
+                <BashRow key={`${h.control_scope_key}:${h.handle_id}`} handle={h} now={now} scopeKey={scopeKey} inspectable={inspectable} healthFresh={healthIsFresh(inventory.health_sampled_at, now)} />
               ))
             )}
           </section>

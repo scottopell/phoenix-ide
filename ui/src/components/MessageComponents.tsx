@@ -1360,7 +1360,7 @@ function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; han
     <button
       type="button"
       className="bash-inspect"
-      onClick={() => openInspect(workScopeKey, handle)}
+      onClick={() => openInspect(workScopeKey, workScopeKey, handle)}
       title="Open the process inspector for this handle"
     >
       inspect →

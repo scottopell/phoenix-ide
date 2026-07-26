@@ -85,6 +85,7 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
             let output_bytes = live.ring.lock().await.output_bytes();
             BashHandleInventory {
                 handle_id: handle.handle_id.to_string(),
+                control_scope_key: handle.work_scope.stable_key(),
                 label: handle.label.clone(),
                 cmd: handle.cmd.clone(),
                 state: bash_state,
@@ -100,6 +101,7 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
         }
         HandleState::Tombstoned(tomb) => BashHandleInventory {
             handle_id: handle.handle_id.to_string(),
+            control_scope_key: handle.work_scope.stable_key(),
             label: handle.label.clone(),
             cmd: handle.cmd.clone(),
             state: BashHandleState::Tombstoned,

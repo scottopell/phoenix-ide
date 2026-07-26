@@ -443,6 +443,7 @@ rule HandleSpawned {
     when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
 
     let resource_scope = resolve_resource_scope(conversation)
+    let lifecycle_scope = resolve_bash_lifecycle_scope(conversation)
 
     requires: count(Handle{resource_scope: resource_scope, status: running})
               < config.live_handle_cap
@@ -454,7 +455,7 @@ rule HandleSpawned {
 
     ensures: Handle.created(
         resource_scope:       resource_scope,
-        lifecycle_scope:      resource_scope,
+        lifecycle_scope:  lifecycle_scope,
         handle_id:        h_id,
         cmd:              cmd,
         label:            label,

@@ -2140,6 +2140,7 @@ function ConversationPageContent({
           <Suspense fallback={null}>
             <ProcessInspectorPanel
               scopeKey={inspectSlot.scopeKey}
+              controlScopeKey={inspectSlot.controlScopeKey}
               handleId={inspectSlot.handleId}
               conversationId={conversationId}
               onClose={handleCloseInspector}
@@ -2830,6 +2831,7 @@ function ConversationPageContent({
           <ProcessInspectorPanel
             scopeKey={inspectSlot.scopeKey}
             handleId={inspectSlot.handleId}
+            controlScopeKey={inspectSlot.controlScopeKey}
             conversationId={conversationId}
             onClose={handleCloseInspector}
           />
@@ -2931,6 +2933,7 @@ function ConversationPageContent({
               ) : inspectViewerOpen && inspectSlot ? (
                 <ProcessInspectorPanel
                   scopeKey={inspectSlot.scopeKey}
+              controlScopeKey={inspectSlot.controlScopeKey}
                   handleId={inspectSlot.handleId}
                   conversationId={conversationId}
                   onClose={handleCloseInspector}

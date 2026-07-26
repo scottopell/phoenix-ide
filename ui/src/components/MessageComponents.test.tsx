@@ -2956,7 +2956,7 @@ describe('bash tool inspector affordance', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('location-search')).toHaveTextContent(
-        '?viewer=inspect&scope=ws-test-123&handle=b-17',
+        '?viewer=inspect&scope=ws-test-123&controlScope=ws-test-123&handle=b-17',
       );
     });
   });

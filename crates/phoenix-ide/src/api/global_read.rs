@@ -243,6 +243,7 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
 
     pub(crate) async fn validate_active_work_scope_cwd(
         &self,
+        requested_work_scope_id: &str,
         requested_cwd: &str,
     ) -> Result<ValidatedWorkScopeCwd, String> {
         let canonical = crate::conversation_cwd::validate_conversation_cwd(requested_cwd)
@@ -251,17 +252,18 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         let canonical_text = canonical.to_string_lossy();
         let work_scope_id = sqlx::query_scalar::<_, String>(
             "SELECT id FROM work_scopes
-             WHERE lifecycle = 'active'
+             WHERE id = ?1
+               AND lifecycle = 'active'
                AND environment_kind <> 'none'
-               AND (cwd = ?1 OR worktree_path = ?1)
-             LIMIT 1",
+               AND (cwd = ?2 OR worktree_path = ?2)",
         )
+        .bind(requested_work_scope_id)
         .bind(canonical_text.as_ref())
         .fetch_optional(self.db.pool())
         .await
         .map_err(|error| format!("failed to validate explicit bash cwd: {error}"))?
         .ok_or_else(|| {
-            "explicit bash cwd does not identify an active persisted WorkScope environment"
+            "explicit bash WorkScope id and cwd do not identify the same active persisted environment"
                 .to_string()
         })?;
         Ok(ValidatedWorkScopeCwd {
@@ -1185,17 +1187,23 @@ mod tests {
         .unwrap();
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
         let service = GlobalReadService::new(db.clone(), retriever);
+        let work_scope_id = db
+            .get_conversation("scope-owner")
+            .await
+            .unwrap()
+            .work_scope_id
+            .unwrap();
 
         let binding = service
-            .validate_active_work_scope_cwd(canonical.to_str().unwrap())
+            .validate_active_work_scope_cwd(work_scope_id.as_str(), canonical.to_str().unwrap())
             .await
             .unwrap();
         assert_eq!(binding.path, canonical);
         assert!(service
-            .validate_active_work_scope_cwd(dir.path().to_str().unwrap())
+            .validate_active_work_scope_cwd(work_scope_id.as_str(), dir.path().to_str().unwrap())
             .await
             .unwrap_err()
-            .contains("active persisted WorkScope"));
+            .contains("active persisted environment"));
 
         sqlx::query(
             "UPDATE work_scopes
@@ -1209,10 +1217,10 @@ mod tests {
         .await
         .unwrap();
         assert!(service
-            .validate_active_work_scope_cwd(canonical.to_str().unwrap())
+            .validate_active_work_scope_cwd(work_scope_id.as_str(), canonical.to_str().unwrap())
             .await
             .unwrap_err()
-            .contains("active persisted WorkScope"));
+            .contains("active persisted environment"));
         let snapshot = service.coordinator_snapshot().await.unwrap();
         assert!(snapshot.contains("\"cwd\": null"), "{snapshot}");
         assert!(snapshot.contains("\"worktree_path\": null"), "{snapshot}");
@@ -1251,10 +1259,16 @@ mod tests {
         .await
         .unwrap();
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
-        let service = GlobalReadService::new(db, retriever);
+        let service = GlobalReadService::new(db.clone(), retriever);
+        let work_scope_id = db
+            .get_conversation("scope-owner")
+            .await
+            .unwrap()
+            .work_scope_id
+            .unwrap();
 
         let binding = service
-            .validate_active_work_scope_cwd(alias.to_str().unwrap())
+            .validate_active_work_scope_cwd(work_scope_id.as_str(), alias.to_str().unwrap())
             .await
             .unwrap();
         assert_eq!(binding.path, canonical);

@@ -30,7 +30,7 @@ The inspector is a single-handle, live view rendered in the meta-viewer slot
 (`specs/viewer_slot/`) — the right-side surface that hosts exactly one of the
 prose reader, the diff viewer, or the live browser view at a time. The inspector
 is a fourth viewer kind in that slot. It is launched from a work-scope panel
-bash row and addresses one handle by its `(scope_key, handle_id)` pair.
+bash row and addresses one handle by its `(lifecycle_scope_key, control_scope_key, handle_id)` pair.
 
 **Transport boundary:** the inspector is a *polling* read view. While open it
 fetches a combined snapshot from a pull endpoint about once per second,
@@ -56,7 +56,7 @@ no per-process drill-down here (see `design.md`, Non-Goals / Future Work).
 
 ### REQ-PINSP-001: Combined Inspection Snapshot
 
-WHEN the system assembles a `BashHandleInspection` for a `(scope_key,
+WHEN the system assembles a `BashHandleInspection` for a `(lifecycle_scope_key, control_scope_key,
 handle_id)` pair
 THE SYSTEM SHALL produce a single snapshot carrying the handle's identity and
 state, an output delta, and a resource sample, drawn only from the in-memory
@@ -226,7 +226,7 @@ THE SYSTEM SHALL open the process inspector for that handle in the meta-viewer
 slot (`specs/viewer_slot/`), closing any other viewer per the slot's
 one-at-a-time contract (`specs/viewer_slot/` REQ-VS-007).
 
-THE inspector SHALL be a viewer kind addressed by the handle's `(scope_key,
+THE inspector SHALL be a viewer kind addressed by the handle's `(lifecycle_scope_key, control_scope_key,
 handle_id)` in the slot's URL contract, so the slot's URL-as-source-of-truth
 behaviour (`specs/viewer_slot/` REQ-VS-005, REQ-VS-006) restores the same
 inspector on cold reload.
@@ -243,7 +243,7 @@ THE SYSTEM SHALL close the inspector per the slot's conversation-change reset
 what the right-side meta-viewer slot is for. Making it a viewer kind — rather
 than an ad-hoc overlay — inherits the slot's mutex, close, conversation-reset,
 and URL-restoration behaviour for free, with no parallel view-state machine
-(`specs/viewer_slot/`). The `(scope_key, handle_id)` pair is the inspector's
+(`specs/viewer_slot/`). The `(lifecycle_scope_key, control_scope_key, handle_id)` pair is the inspector's
 identity, the analogue of prose's file path: encoding it in the URL is what lets
 a cold reload restore the same handle's inspector.
 

@@ -60,6 +60,7 @@ pub struct LiveHandleSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveHandleProcessGroup {
     pub work_scope: ResourceScopeKey,
+    pub control_scope: ResourceScopeKey,
     pub handle_id: HandleId,
     pub pgid: i32,
 }
@@ -277,7 +278,8 @@ impl BashLifecyclePhase {
 
 #[derive(Debug, Clone)]
 pub struct BashLifecycleEvent {
-    pub work_scope: ResourceScopeKey,
+    pub lifecycle_scope: ResourceScopeKey,
+    pub control_scope: ResourceScopeKey,
     pub phase: BashLifecyclePhase,
 }
 
@@ -351,17 +353,24 @@ impl BashHandleRegistry {
     /// wired. Best-effort: a dropped receiver / closed channel is logged at
     /// `debug` (capability gap) and does not affect handle correctness.
     /// Mirrors `BrowserSessionManager::emit_lifecycle`.
-    pub fn emit_lifecycle(&self, work_scope: &ResourceScopeKey, phase: BashLifecyclePhase) {
+    pub fn emit_lifecycle(
+        &self,
+        lifecycle_scope: &ResourceScopeKey,
+        control_scope: &ResourceScopeKey,
+        phase: BashLifecyclePhase,
+    ) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
         };
         let event = BashLifecycleEvent {
-            work_scope: work_scope.clone(),
+            lifecycle_scope: lifecycle_scope.clone(),
+            control_scope: control_scope.clone(),
             phase,
         };
         if let Err(e) = sink.send(event) {
             tracing::debug!(
-                work_scope = %work_scope,
+                lifecycle_scope = %lifecycle_scope,
+                control_scope = %control_scope,
                 error = %e,
                 "dropping bash lifecycle event — sink closed"
             );
@@ -455,6 +464,7 @@ impl BashHandleRegistry {
                 if let Some(pgid) = handle.live_pgid().await {
                     out.push(LiveHandleProcessGroup {
                         work_scope: handle.lifecycle_scope.clone(),
+                        control_scope: handle.work_scope.clone(),
                         handle_id: handle.handle_id.clone(),
                         pgid,
                     });
@@ -633,7 +643,7 @@ pub async fn cascade_bash_on_delete(
     // the bridge would leave the collapsed work-scope badge showing the
     // killed handles (REQ-WSUI-007). NOT emitted on the preserved early
     // return above, where nothing changed.
-    registry.emit_lifecycle(work_scope, BashLifecyclePhase::Terminal);
+    registry.emit_lifecycle(work_scope, work_scope, BashLifecyclePhase::Terminal);
 
     report
 }
@@ -667,7 +677,7 @@ async fn kill_selected_handles(
             }
         }
     }
-    registry.emit_lifecycle(work_scope, BashLifecyclePhase::Terminal);
+    registry.emit_lifecycle(work_scope, work_scope, BashLifecyclePhase::Terminal);
     report
 }
 
@@ -728,14 +738,16 @@ mod tests {
         let registry = BashHandleRegistry::with_lifecycle_sink(Some(tx));
         let a = scope("conv-A");
         let b = scope("conv-B");
-        registry.emit_lifecycle(&a, BashLifecyclePhase::Spawned);
-        registry.emit_lifecycle(&b, BashLifecyclePhase::Terminal);
+        registry.emit_lifecycle(&a, &a, BashLifecyclePhase::Spawned);
+        registry.emit_lifecycle(&b, &b, BashLifecyclePhase::Terminal);
 
         let e1 = rx.try_recv().expect("first event missing");
-        assert_eq!(e1.work_scope, a);
+        assert_eq!(e1.lifecycle_scope, a);
+        assert_eq!(e1.control_scope, a);
         assert_eq!(e1.phase, BashLifecyclePhase::Spawned);
         let e2 = rx.try_recv().expect("second event missing");
-        assert_eq!(e2.work_scope, b);
+        assert_eq!(e2.lifecycle_scope, b);
+        assert_eq!(e2.control_scope, b);
         assert_eq!(e2.phase, BashLifecyclePhase::Terminal);
         assert!(rx.try_recv().is_err(), "no more events expected");
     }
@@ -743,7 +755,8 @@ mod tests {
     #[tokio::test]
     async fn emit_lifecycle_without_sink_is_no_op() {
         let registry = BashHandleRegistry::new();
-        registry.emit_lifecycle(&scope("conv-X"), BashLifecyclePhase::Spawned);
+        let scope = scope("conv-X");
+        registry.emit_lifecycle(&scope, &scope, BashLifecyclePhase::Spawned);
         assert!(registry.lifecycle_sink().is_none());
     }
 
@@ -1068,7 +1081,8 @@ mod tests {
         let _ = cascade_bash_on_delete(&registry, &s, &work_actor("owner"), None).await;
 
         let evt = rx.try_recv().expect("teardown must emit a lifecycle edge");
-        assert_eq!(evt.work_scope, s);
+        assert_eq!(evt.lifecycle_scope, s);
+        assert_eq!(evt.control_scope, s);
         assert!(rx.try_recv().is_err(), "exactly one edge per teardown");
     }
 

@@ -1465,6 +1465,7 @@ describe('conversationReducer', () => {
       scope_key: scopeKey,
       bash: bashIds.map((id) => ({
         handle_id: id,
+        control_scope_key: scopeKey,
         cmd: `cmd ${id}`,
         state: 'running' as const,
         started_at: '2024-01-01T00:00:00Z',
