@@ -61,10 +61,11 @@ correct weight (see `design.md`, "Why No Allium Spec").
 | **REQ-WSUI-004:** Browser Session Inventory | Complete | Manager metadata → `live`/`teardown_pending`/`teardown_failed`/`torn_down`; nullable relative `idle_ms`, no wall-clock; failed teardown remains retryable without session reuse |
 | **REQ-WSUI-005:** Sub-Agents Excluded | Complete | Sub-agents own `SubAgentViewerDock` |
 | **REQ-WSUI-006:** Inventory Pull Endpoint | Complete | `GET /api/work-scope/:scope_key/inventory`; `get_conversation` shape |
+| **REQ-WSUI-006b:** Browser Session Stop Endpoint | Complete | Queue-only stop for current scope plus the pre-rekey conversation scope during Explore-to-Work approval |
 | **REQ-WSUI-007:** Inventory Push Event | Complete | `WorkScopeUpdate` `SseWireEvent`; full snapshot, no deltas |
 | **REQ-WSUI-008:** Push Event Routing | Complete | Single non-terminal conversation per scope (REQ-PROJ-025) |
 | **REQ-WSUI-009:** Chain Page Active-Member Scope Query | Complete | Active (latest) member's scope key, root fallback; standalone dock sharing the section's rows; no per-member fan-out; SSE-less dock polls while collapsed |
 | **REQ-WSUI-010:** Conversation Page Section | Complete | `WorkScopeSection` in left `FileExplorerPanel`, stacked with Files/Skills/Tasks; collapsed-rail badge; atom `workScope` field |
 | **REQ-WSUI-011:** CLI Client Not a Visualization Surface | Complete | `phoenix-client.py` text-only; CLI subcommand is future work |
 
-**Progress:** 11 of 11 implemented.
+**Progress:** 12 of 12 implemented.

@@ -346,7 +346,7 @@ rule CascadePreservesOnScopeMatch {
 -- still owned by any live conversation — a continuation or a live sibling
 -- such as a Work-mode sub-agent sharing its parent's scope.
 rule IdleSessionCleanedUp {
-    when: IdleCleanupTickFires()
+    when: IdleBrowserTeardownSucceeded(session)
 
     for session in BrowserSession where session.status = live:
         let scope_is_live = bedrock/Conversations.any(c =>
@@ -361,6 +361,22 @@ rule IdleSessionCleanedUp {
             kind: inactive
         )
         ensures: UserDataDirRemoved(user_data_dir_for_scope(session.scope))
+}
+
+rule IdleSessionTeardownFailureRetained {
+    when: IdleBrowserTeardownFailed(session)
+
+    requires: session.status = live
+    requires: (now - session.last_activity) > IDLE_TIMEOUT
+    requires: not bedrock/Conversations.any(c =>
+        resolve_work_scope(c) = session.scope and not c.is_terminal and not c.archived)
+
+    ensures: session.status = teardown_failed
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: session.scope,
+        kind: teardown_failed
+    )
+    ensures: not UserDataDirRemoved(user_data_dir_for_scope(session.scope))
 }
 
 -- REQ-BT-010: the skip path. An idle session whose scope is still live — a

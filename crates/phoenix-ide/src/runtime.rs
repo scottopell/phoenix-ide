@@ -29,7 +29,9 @@ pub use traits::*;
 
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
-use crate::tools::browser::session::{BrowserSessionAudience, BrowserSessionLifecycleEvent};
+use crate::tools::browser::session::{
+    BrowserSessionAudience, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
+};
 use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, ExploreToolPolicy,
     TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
@@ -1376,6 +1378,51 @@ impl RuntimeManager {
         &self.browser_sessions
     }
 
+    async fn retire_scope_after_browser_teardown(&self, work_scope: &ResourceScopeKey) {
+        use phoenix_core::domain::work_scope_inventory::{
+            BrowserSessionLiveness, TmuxServerStatus,
+        };
+
+        let Some(scope_id) = work_scope.work_scope_id() else {
+            return;
+        };
+        let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
+            work_scope,
+            None,
+            true,
+            &self.bash_handles,
+            &self.tmux_registry,
+            &self.browser_sessions,
+        )
+        .await;
+        let live_resource = inventory.bash.iter().any(|handle| handle.state.is_live())
+            || inventory
+                .tmux
+                .is_some_and(|tmux| tmux.status != TmuxServerStatus::Gone)
+            || inventory
+                .browser
+                .is_some_and(|browser| browser.state != BrowserSessionLiveness::TornDown)
+            || self.terminals.get(work_scope).is_some();
+        if live_resource {
+            return;
+        }
+
+        let proof = phoenix_core::work_scope::WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(scope_id.clone());
+        match self
+            .db
+            .retire_work_scope(proof, "browser teardown removed final runtime resource")
+            .await
+        {
+            Ok(phoenix_core::work_scope::WorkScopeRetirementOutcome::Retired) => {
+                tracing::debug!(work_scope = %scope_id, "retired unowned work scope after browser teardown");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(work_scope = %scope_id, %error, "work scope retirement after browser teardown failed");
+            }
+        }
+    }
+
     /// Get the bash handle registry (REQ-BASH-007 shutdown kill-tree,
     /// REQ-BASH-006 hard-delete cascade).
     pub fn bash_handles(&self) -> &Arc<BashHandleRegistry> {
@@ -1552,6 +1599,11 @@ impl RuntimeManager {
                             "dropping work-scope forward of browser edge — channel closed"
                         );
                     }
+                }
+                if kind == BrowserSessionLifecycleKind::Inactive {
+                    manager
+                        .retire_scope_after_browser_teardown(&work_scope)
+                        .await;
                 }
             }
             tracing::info!("Browser lifecycle bridge stopped");
