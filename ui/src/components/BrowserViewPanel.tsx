@@ -106,8 +106,8 @@ export function BrowserViewPanel({
     setStopError(null);
     try {
       await api.stopConversationBrowserSession(conversationId);
-      // A successful response confirms teardown. Keep presenting the pending
-      // state until the server lifecycle edge unmounts this viewer.
+      // A successful response confirms the request was queued. Keep presenting
+      // pending until teardown emits either the lifecycle edge or a viewer error.
     } catch (err) {
       stoppingRef.current = false;
       setStopping(false);

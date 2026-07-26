@@ -886,6 +886,16 @@ pub enum BrowserSessionAudience {
     Conversation(String),
 }
 
+impl BrowserSessionAudience {
+    #[must_use]
+    pub fn matches_conversation(&self, conversation_id: &str) -> bool {
+        match self {
+            Self::Scope => true,
+            Self::Conversation(target) => target == conversation_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BrowserSessionLifecycleEvent {
     pub work_scope: ResourceScopeKey,
@@ -900,6 +910,13 @@ pub struct BrowserSessionLifecycleEvent {
 /// that). `None` for tests / contexts that don't care about lifecycle.
 pub type BrowserSessionLifecycleSink =
     tokio::sync::mpsc::UnboundedSender<BrowserSessionLifecycleEvent>;
+
+#[derive(Clone, Debug)]
+pub struct BrowserSessionTeardownFailure {
+    pub work_scope: ResourceScopeKey,
+    pub audience: BrowserSessionAudience,
+    pub error: String,
+}
 
 /// Predicate answering "does this `ResourceScopeKey` still own a live (non-terminal)
 /// conversation?". Injected by the runtime after construction (the manager is
@@ -952,6 +969,7 @@ pub struct BrowserSessionManager {
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
     lifecycle_sink: Option<BrowserSessionLifecycleSink>,
+    teardown_failures: tokio::sync::broadcast::Sender<BrowserSessionTeardownFailure>,
     /// Set-once predicate gating idle reaping on `ResourceScopeKey` liveness. The
     /// runtime installs it via [`Self::set_scope_liveness_hook`] when it wires
     /// the lifecycle bridges. Unset (the test/default case) means idle cleanup
@@ -972,9 +990,11 @@ impl BrowserSessionManager {
     /// emits `SseEvent::BrowserSessionState`.
     #[must_use]
     pub fn with_lifecycle_sink(sink: Option<BrowserSessionLifecycleSink>) -> Arc<Self> {
+        let (teardown_failures, _) = tokio::sync::broadcast::channel(32);
         let manager = Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
             lifecycle_sink: sink,
+            teardown_failures,
             scope_liveness_hook: std::sync::OnceLock::new(),
         });
 
@@ -1235,9 +1255,54 @@ impl BrowserSessionManager {
 
         Ok(session_arc)
     }
+
+    /// Return control-plane idle metadata without exposing the session for reuse.
+    #[must_use]
+    pub async fn inventory_idle(&self, work_scope: &ResourceScopeKey) -> Option<Duration> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .find(|entry| entry.scope == *work_scope)?
+            .session
+            .clone();
+        let idle = session.read().await.last_activity.elapsed();
+        Some(idle)
+    }
+
+    /// Return actor-authorized control-plane idle metadata without exposing the
+    /// session for reuse.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError::AccessDenied`] when the actor cannot control the
+    /// retained session.
+    pub async fn inventory_idle_for_actor(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+    ) -> Result<Option<Duration>, BrowserError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(&session_key(work_scope, actor)) else {
+                return Ok(None);
+            };
+            if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
+                return Err(BrowserError::AccessDenied);
+            }
+            entry.session.clone()
+        };
+        let idle = session.read().await.last_activity.elapsed();
+        Ok(Some(idle))
+    }
+
+    /// Return the actor's reusable browser session.
+    ///
     /// # Errors
     /// Returns [`BrowserError::AccessDenied`] when an existing session belongs
-    /// to an actor with stronger or different restricted authority.
+    /// to an actor with stronger or different restricted authority, or
+    /// [`BrowserError::OperationFailed`] when retained teardown failure makes
+    /// the session unusable.
     pub async fn get_existing_for_actor(
         &self,
         work_scope: &ResourceScopeKey,
@@ -1408,15 +1473,58 @@ impl BrowserSessionManager {
         }))
     }
 
+    pub fn subscribe_teardown_failures(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<BrowserSessionTeardownFailure> {
+        self.teardown_failures.subscribe()
+    }
+
+    fn observe_requested_kill(
+        self: &Arc<Self>,
+        outcome: KillSessionOutcome,
+        work_scope: ResourceScopeKey,
+        audience: BrowserSessionAudience,
+    ) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = match outcome {
+                KillSessionOutcome::Absent => Ok(()),
+                KillSessionOutcome::Started(handle) => handle.await.map_err(|error| {
+                    BrowserError::OperationFailed(format!("browser kill task failed: {error}"))
+                })?,
+                KillSessionOutcome::AlreadyRequested { key, done } => {
+                    manager.wait_for_kill_completion(&key, done).await
+                }
+            };
+            if let Err(error) = result {
+                let _ = manager
+                    .teardown_failures
+                    .send(BrowserSessionTeardownFailure {
+                        work_scope,
+                        audience,
+                        error: error.to_string(),
+                    });
+            }
+            Ok::<(), BrowserError>(())
+        });
+    }
+
     pub async fn request_kill_session_for_actor(
         self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
     ) {
         let key = session_key(work_scope, actor);
-        let _ = self
+        let outcome = self
             .spawn_kill_session_by_key(key, work_scope.clone())
             .await;
+        let audience = match actor.authority() {
+            ResourceAuthority::Work => BrowserSessionAudience::Scope,
+            ResourceAuthority::Restricted => {
+                BrowserSessionAudience::Conversation(actor.conversation_id().to_string())
+            }
+        };
+        self.observe_requested_kill(outcome, work_scope.clone(), audience);
     }
 
     /// Request session kill and return as soon as teardown has been queued.
@@ -1433,9 +1541,10 @@ impl BrowserSessionManager {
             .map(|(key, _)| key.clone())
             .collect();
         for key in keys {
-            let _ = self
+            let outcome = self
                 .spawn_kill_session_by_key(key, work_scope.clone())
                 .await;
+            self.observe_requested_kill(outcome, work_scope.clone(), BrowserSessionAudience::Scope);
         }
     }
 
@@ -1685,9 +1794,11 @@ impl Drop for BrowserSession {
 
 impl Default for BrowserSessionManager {
     fn default() -> Self {
+        let (teardown_failures, _) = tokio::sync::broadcast::channel(32);
         Self {
             sessions: RwLock::new(HashMap::new()),
             lifecycle_sink: None,
+            teardown_failures,
             scope_liveness_hook: std::sync::OnceLock::new(),
         }
     }

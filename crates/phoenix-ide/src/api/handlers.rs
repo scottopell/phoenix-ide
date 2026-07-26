@@ -3117,9 +3117,8 @@ async fn stop_conversation_browser_session(
     state
         .runtime
         .browser_sessions()
-        .kill_session_for_actor(&work_scope, &actor)
-        .await
-        .map_err(|error| AppError::Internal(format!("browser stop failed: {error}")))?;
+        .request_kill_session_for_actor(&work_scope, &actor)
+        .await;
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -3141,9 +3140,8 @@ async fn stop_work_scope_browser_session(
     state
         .runtime
         .browser_sessions()
-        .kill_session_for_actor(&work_scope, &actor)
-        .await
-        .map_err(|error| AppError::Internal(format!("browser stop failed: {error}")))?;
+        .request_kill_session_for_actor(&work_scope, &actor)
+        .await;
 
     Ok(Json(SuccessResponse { success: true }))
 }

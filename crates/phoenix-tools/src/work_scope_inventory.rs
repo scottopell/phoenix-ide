@@ -149,15 +149,14 @@ async fn assemble_browser(
     actor: Option<&EffectiveResourceAccess>,
     browser_sessions: &Arc<BrowserSessionManager>,
 ) -> Option<BrowserInventory> {
-    let session = match actor {
+    let idle = match actor {
         Some(access) => browser_sessions
-            .get_existing_for_actor(work_scope, access)
+            .inventory_idle_for_actor(work_scope, access)
             .await
             .ok()??,
-        None => browser_sessions.get_existing(work_scope).await?,
+        None => browser_sessions.inventory_idle(work_scope).await?,
     };
-    let last_activity = session.read().await.last_activity;
-    let idle_ms = u64::try_from(last_activity.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
     Some(BrowserInventory {
         state: BrowserSessionLiveness::Live,
         idle_ms,
