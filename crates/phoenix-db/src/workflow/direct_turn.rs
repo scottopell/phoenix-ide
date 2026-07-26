@@ -1,9 +1,12 @@
 use super::WorkflowRepository;
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::db_schema::{ConvState, Message, MessageContent};
+use phoenix_core::domain::db_schema::{
+    ConvState, FileAttachment, ImageData, Message, MessageContent,
+};
 use phoenix_core::domain::sm_event::{
-    DirectTurnAttemptAuthority, PreparedDirectTurnPayload, SubmittedDirectTurnIdentity,
+    DirectTurnAttemptAuthority, PreparedDirectTurnPayload, SubmittedDirectTurnFileAttachment,
+    SubmittedDirectTurnIdentity,
 };
 use phoenix_workflow::{
     direct_turn_profile, AcceptedDisposition, AttemptId, AttemptStatus, AuthorityOutcome,
@@ -184,8 +187,13 @@ impl WorkflowRepository {
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
         let mut tx = self.begin_immediate_tx().await?;
-        if let Some(existing) =
-            load_by_scoped_key(&mut tx.tx, input.conversation(), &input.client_key).await?
+        if let Some(existing) = load_by_scoped_key(
+            &self.pool,
+            &mut tx.tx,
+            input.conversation(),
+            &input.client_key,
+        )
+        .await?
         {
             tx.rollback().await?;
             if existing.prepared != input.prepared
@@ -239,7 +247,7 @@ impl WorkflowRepository {
                 }));
             }
         } else if let Some(owner) =
-            load_active_runtime_turn_tx(&mut tx.tx, input.conversation()).await?
+            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, input.conversation()).await?
         {
             if owner.conversation != *input.conversation() {
                 tx.rollback().await?;
@@ -252,6 +260,9 @@ impl WorkflowRepository {
         let workflow_id = super::next_global_workflow_id_tx(&mut tx).await?;
         insert_direct_turn_workflow_tx(&mut tx, workflow_id, turn_id, input).await?;
         let disposition = disposition_sql(input.disposition);
+        let prepared_payload =
+            PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
             "INSERT INTO durable_turns (
                 turn_id, conversation_id, client_turn_key, prepared_fingerprint,
@@ -263,13 +274,18 @@ impl WorkflowRepository {
         .bind(&input.conversation().0)
         .bind(input.client_key.as_str())
         .bind(input.prepared.fingerprint())
-        .bind(input.prepared.payload())
+        .bind(
+            prepared_payload
+                .to_normalized_bytes_without_attachments()
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
         .bind(disposition)
         .bind(i64::from(input.disposition == AcceptedDisposition::Runtime))
         .bind(to_i64(workflow_id.0, "workflow_id")?)
         .execute(&mut *tx.tx)
         .await
         .map_err(map_constraint)?;
+        insert_prepared_turn_attachments_tx(&mut tx.tx, turn_id, &prepared_payload).await?;
         if cut == TransactionCut::BeforeCommit {
             tx.rollback().await?;
             return Err(injected_cut(cut));
@@ -298,7 +314,10 @@ impl WorkflowRepository {
             .bind(to_i64(turn_id.0, "turn_id")?)
             .fetch_optional(&self.pool)
             .await?;
-        row.map(row_to_turn).transpose()
+        match row {
+            Some(row) => Ok(Some(row_to_turn_pool(&self.pool, row).await?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn lookup_scoped_direct_turn_replay(
@@ -311,8 +330,7 @@ impl WorkflowRepository {
         else {
             return Ok(ScopedDirectTurnReplayLookup::Missing);
         };
-        let stored = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload())
-            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let stored = load_prepared_payload_pool(&self.pool, turn.id).await?;
         PreparedTurn::rehydrate(
             &turn.conversation,
             turn.prepared.fingerprint().to_string(),
@@ -354,7 +372,8 @@ impl WorkflowRepository {
     ) -> DbResult<ClaimAuthoritativeTurnResult> {
         let mut tx = self.begin_tx().await?;
         let Some(canonical_turn) =
-            load_turn_for_workflow_tx(&mut tx.tx, input.turn_id, input.workflow_id).await?
+            load_turn_for_workflow_tx(&self.pool, &mut tx.tx, input.turn_id, input.workflow_id)
+                .await?
         else {
             tx.rollback().await?;
             return Ok(ClaimAuthoritativeTurnResult {
@@ -539,7 +558,7 @@ impl WorkflowRepository {
         conversation: &ConversationAuthority,
     ) -> DbResult<Option<DurableTurn>> {
         let mut tx = self.pool.begin().await?;
-        let turn = load_active_runtime_turn_tx(&mut tx, conversation).await?;
+        let turn = load_active_runtime_turn_tx(&self.pool, &mut tx, conversation).await?;
         tx.rollback().await?;
         Ok(turn)
     }
@@ -597,21 +616,16 @@ impl WorkflowRepository {
         .bind(capped_limit)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(DiscoverableAcceptedTurn {
-                    turn_id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
-                    workflow_id: WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
-                    conversation: ConversationAuthority(row.get("conversation_id")),
-                    prepared: PreparedTurn::rehydrate(
-                        &ConversationAuthority(row.get("conversation_id")),
-                        row.get("prepared_fingerprint"),
-                        row.get("prepared_payload"),
-                    )
-                    .map_err(|error| DbError::Serialization(format!("{error:?}")))?,
-                })
-            })
-            .collect()
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(DiscoverableAcceptedTurn {
+                turn_id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
+                workflow_id: WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
+                conversation: ConversationAuthority(row.get("conversation_id")),
+                prepared: load_prepared_turn_from_row(&self.pool, &row).await?,
+            });
+        }
+        Ok(out)
     }
 
     pub async fn preflight_direct_turn_materialization(
@@ -642,8 +656,9 @@ impl WorkflowRepository {
         else {
             return Ok(DirectTurnMaterializationEligibility::StaleAuthority);
         };
-        let turn = row_to_turn(row)?;
-        verify_prepared_payload(&turn, &input.prepared)?;
+        let turn = row_to_turn_tx(&mut tx.tx, row).await?;
+        let stored_prepared = load_prepared_payload_tx(&mut tx.tx, turn.id).await?;
+        verify_prepared_payload(&turn, &stored_prepared, &input.prepared)?;
         if !matches!(turn.lifecycle, TurnLifecycle::Accepted { .. })
             || turn.generation != input.authority.generation.0
         {
@@ -718,10 +733,12 @@ impl WorkflowRepository {
     ) -> DbResult<MaterializeAuthoritativeTurnResult> {
         let mut tx = self.begin_tx().await?;
         let turn_id = input.turn_id;
-        let turn = load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
-            .await?
-            .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
-        verify_prepared_payload(&turn, &input.prepared)?;
+        let turn =
+            load_turn_for_workflow_tx(&self.pool, &mut tx.tx, turn_id, input.authority.workflow_id)
+                .await?
+                .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
+        let stored_prepared = load_prepared_payload_tx(&mut tx.tx, turn.id).await?;
+        verify_prepared_payload(&turn, &stored_prepared, &input.prepared)?;
         let canonical_message_id = canonical_message_id_for_turn(&turn, &input.prepared);
         let mut model =
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
@@ -817,7 +834,7 @@ impl WorkflowRepository {
             Some(existing)
         };
         let canonical_turn =
-            load_turn_for_workflow_tx(&mut tx.tx, turn_id, input.authority.workflow_id)
+            load_turn_for_workflow_tx(&self.pool, &mut tx.tx, turn_id, input.authority.workflow_id)
                 .await?
                 .ok_or_else(|| {
                     DbError::Serialization("direct-turn missing after materialization".to_string())
@@ -875,7 +892,7 @@ impl WorkflowRepository {
             .fetch_optional(&mut *tx.tx)
             .await?
             .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
-        let turn = row_to_turn(row)?;
+        let turn = row_to_turn_tx(&mut tx.tx, row).await?;
         let workflow_id = workflow_id_for_turn_tx(&mut tx.tx, turn_id).await?;
         let head = tx
             .fetch_workflow_head(workflow_id)
@@ -1080,10 +1097,11 @@ fn terminal_commit_timestamp() -> Timestamp {
 }
 
 async fn load_active_runtime_turn_tx(
+    _pool: &sqlx::SqlitePool,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conversation: &ConversationAuthority,
 ) -> DbResult<Option<DurableTurn>> {
-    sqlx::query(
+    let row = sqlx::query(
         "SELECT * FROM durable_turns
          WHERE conversation_id = ?1
            AND disposition = 'Runtime'
@@ -1092,23 +1110,28 @@ async fn load_active_runtime_turn_tx(
     )
     .bind(&conversation.0)
     .fetch_optional(&mut **tx)
-    .await?
-    .map(row_to_turn)
-    .transpose()
+    .await?;
+    match row {
+        Some(row) => Ok(Some(row_to_turn_tx(tx, row).await?)),
+        None => Ok(None),
+    }
 }
 
 async fn load_turn_for_workflow_tx(
+    _pool: &sqlx::SqlitePool,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     turn_id: TurnAuthorityId,
     workflow_id: WorkflowId,
 ) -> DbResult<Option<DurableTurn>> {
-    sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1 AND workflow_id = ?2")
+    let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1 AND workflow_id = ?2")
         .bind(to_i64(turn_id.0, "turn_id")?)
         .bind(to_i64(workflow_id.0, "workflow_id")?)
         .fetch_optional(&mut **tx)
-        .await?
-        .map(row_to_turn)
-        .transpose()
+        .await?;
+    match row {
+        Some(row) => Ok(Some(row_to_turn_tx(tx, row).await?)),
+        None => Ok(None),
+    }
 }
 
 fn local_codec_owned(codec: &phoenix_workflow::CodecRef) -> LocalCodec {
@@ -1123,13 +1146,36 @@ fn timestamp_to_datetime(timestamp: Timestamp) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
+fn rehydrate_prepared_from_parts(
+    fingerprint: String,
+    conversation: &ConversationAuthority,
+    payload: &PreparedDirectTurnPayload,
+) -> DbResult<PreparedTurn> {
+    let exact = payload
+        .to_exact_bytes()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    PreparedTurn::rehydrate(conversation, fingerprint, exact).map_err(conflict)
+}
+
+async fn load_prepared_turn_from_row(
+    pool: &sqlx::SqlitePool,
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<PreparedTurn> {
+    let conversation = ConversationAuthority(row.get("conversation_id"));
+    let payload = load_prepared_payload_pool(
+        pool,
+        TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
+    )
+    .await?;
+    rehydrate_prepared_from_parts(row.get("prepared_fingerprint"), &conversation, &payload)
+}
+
 fn verify_prepared_payload(
     turn: &DurableTurn,
+    stored: &PreparedDirectTurnPayload,
     prepared: &PreparedDirectTurnPayload,
 ) -> DbResult<()> {
-    let stored = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload())
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
-    if prepared != &stored {
+    if prepared != stored {
         return Err(prepared_semantics_changed(&turn.prepared));
     }
     Ok(())
@@ -1139,6 +1185,198 @@ fn prepared_semantics_changed(prepared: &PreparedTurn) -> DbError {
     conflict(TurnConflict::PreparedSemanticsChanged {
         authoritative_fingerprint: prepared.fingerprint().to_string(),
     })
+}
+
+async fn load_prepared_payload_pool(
+    pool: &sqlx::SqlitePool,
+    turn_id: TurnAuthorityId,
+) -> DbResult<PreparedDirectTurnPayload> {
+    let payload: Vec<u8> =
+        sqlx::query_scalar("SELECT prepared_payload FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .fetch_one(pool)
+            .await?;
+    let submitted_images = load_prepared_turn_submitted_images(pool, turn_id).await?;
+    let submitted_files = load_prepared_turn_submitted_files(pool, turn_id).await?;
+    let delivery_images = load_prepared_turn_delivery_images(pool, turn_id).await?;
+    let delivery_files = load_prepared_turn_delivery_files(pool, turn_id).await?;
+    PreparedDirectTurnPayload::rehydrate_from_normalized_bytes(
+        &payload,
+        submitted_images,
+        submitted_files,
+        delivery_images,
+        delivery_files,
+    )
+    .map_err(|error| DbError::Serialization(error.to_string()))
+}
+
+async fn load_prepared_payload_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    turn_id: TurnAuthorityId,
+) -> DbResult<PreparedDirectTurnPayload> {
+    let payload: Vec<u8> =
+        sqlx::query_scalar("SELECT prepared_payload FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .fetch_one(&mut **tx)
+            .await?;
+    let submitted_images = load_prepared_turn_submitted_images(tx.as_mut(), turn_id).await?;
+    let submitted_files = load_prepared_turn_submitted_files(tx.as_mut(), turn_id).await?;
+    let delivery_images = load_prepared_turn_delivery_images(tx.as_mut(), turn_id).await?;
+    let delivery_files = load_prepared_turn_delivery_files(tx.as_mut(), turn_id).await?;
+    PreparedDirectTurnPayload::rehydrate_from_normalized_bytes(
+        &payload,
+        submitted_images,
+        submitted_files,
+        delivery_images,
+        delivery_files,
+    )
+    .map_err(|error| DbError::Serialization(error.to_string()))
+}
+
+async fn load_prepared_turn_submitted_images<'c, E>(
+    executor: E,
+    turn_id: TurnAuthorityId,
+) -> DbResult<Vec<ImageData>>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
+    sqlx::query("SELECT media_type, data FROM durable_turn_submitted_images WHERE turn_id = ?1 ORDER BY ordinal")
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .map(|row: sqlx::sqlite::SqliteRow| ImageData {
+            data: row.get("data"),
+            media_type: row.get("media_type"),
+        })
+        .fetch_all(executor)
+        .await
+        .map_err(DbError::Sqlx)
+}
+
+async fn load_prepared_turn_submitted_files<'c, E>(
+    executor: E,
+    turn_id: TurnAuthorityId,
+) -> DbResult<Vec<SubmittedDirectTurnFileAttachment>>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "SELECT original_name, media_type, size_bytes, stored_path
+         FROM durable_turn_submitted_files WHERE turn_id = ?1 ORDER BY ordinal",
+    )
+    .bind(to_i64(turn_id.0, "turn_id")?)
+    .map(
+        |row: sqlx::sqlite::SqliteRow| SubmittedDirectTurnFileAttachment {
+            original_name: row.get("original_name"),
+            media_type: row.get("media_type"),
+            size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
+            stored_path: row.get("stored_path"),
+        },
+    )
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::Sqlx)
+}
+
+async fn load_prepared_turn_delivery_images<'c, E>(
+    executor: E,
+    turn_id: TurnAuthorityId,
+) -> DbResult<Vec<ImageData>>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
+    sqlx::query("SELECT media_type, data FROM durable_turn_delivery_images WHERE turn_id = ?1 ORDER BY ordinal")
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .map(|row: sqlx::sqlite::SqliteRow| ImageData {
+            data: row.get("data"),
+            media_type: row.get("media_type"),
+        })
+        .fetch_all(executor)
+        .await
+        .map_err(DbError::Sqlx)
+}
+
+async fn load_prepared_turn_delivery_files<'c, E>(
+    executor: E,
+    turn_id: TurnAuthorityId,
+) -> DbResult<Vec<FileAttachment>>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "SELECT original_name, media_type, size_bytes, stored_path
+         FROM durable_turn_delivery_files WHERE turn_id = ?1 ORDER BY ordinal",
+    )
+    .bind(to_i64(turn_id.0, "turn_id")?)
+    .map(|row: sqlx::sqlite::SqliteRow| FileAttachment {
+        original_name: row.get("original_name"),
+        media_type: row.get("media_type"),
+        size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
+        stored_path: row.get("stored_path"),
+    })
+    .fetch_all(executor)
+    .await
+    .map_err(DbError::Sqlx)
+}
+
+async fn insert_prepared_turn_attachments_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    turn_id: TurnAuthorityId,
+    prepared: &PreparedDirectTurnPayload,
+) -> DbResult<()> {
+    for (ordinal, image) in prepared.submitted.images.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO durable_turn_submitted_images (turn_id, ordinal, media_type, data)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(&image.media_type)
+        .bind(&image.data)
+        .execute(&mut **tx)
+        .await?;
+    }
+    for (ordinal, file) in prepared.submitted.files.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO durable_turn_submitted_files
+             (turn_id, ordinal, original_name, media_type, size_bytes, stored_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(&file.original_name)
+        .bind(&file.media_type)
+        .bind(i64::try_from(file.size_bytes).unwrap_or(i64::MAX))
+        .bind(&file.stored_path)
+        .execute(&mut **tx)
+        .await?;
+    }
+    for (ordinal, image) in prepared.delivery.images.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO durable_turn_delivery_images (turn_id, ordinal, media_type, data)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(&image.media_type)
+        .bind(&image.data)
+        .execute(&mut **tx)
+        .await?;
+    }
+    for (ordinal, file) in prepared.delivery.files.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO durable_turn_delivery_files
+             (turn_id, ordinal, original_name, media_type, size_bytes, stored_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(&file.original_name)
+        .bind(&file.media_type)
+        .bind(i64::try_from(file.size_bytes).unwrap_or(i64::MAX))
+        .bind(&file.stored_path)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn update_conversation_state_for_adoption_tx(
@@ -1502,17 +1740,22 @@ fn local_codec(codec: &phoenix_workflow::CodecRef) -> LocalCodec {
 }
 
 async fn load_by_scoped_key(
+    _pool: &sqlx::SqlitePool,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conversation: &ConversationAuthority,
     client_key: &ClientTurnKey,
 ) -> DbResult<Option<DurableTurn>> {
-    sqlx::query("SELECT * FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2")
-        .bind(&conversation.0)
-        .bind(client_key.as_str())
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(row_to_turn)
-        .transpose()
+    let row = sqlx::query(
+        "SELECT * FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2",
+    )
+    .bind(&conversation.0)
+    .bind(client_key.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    match row {
+        Some(row) => Ok(Some(row_to_turn_tx(tx, row).await?)),
+        None => Ok(None),
+    }
 }
 
 async fn load_by_scoped_key_pool(
@@ -1520,17 +1763,30 @@ async fn load_by_scoped_key_pool(
     conversation: &ConversationAuthority,
     client_key: &ClientTurnKey,
 ) -> DbResult<Option<DurableTurn>> {
-    sqlx::query("SELECT * FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2")
-        .bind(&conversation.0)
-        .bind(client_key.as_str())
-        .fetch_optional(pool)
-        .await?
-        .map(row_to_turn)
-        .transpose()
+    let row = sqlx::query(
+        "SELECT * FROM durable_turns WHERE conversation_id = ?1 AND client_turn_key = ?2",
+    )
+    .bind(&conversation.0)
+    .bind(client_key.as_str())
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(row) => Ok(Some(row_to_turn_pool(pool, row).await?)),
+        None => Ok(None),
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
+fn row_to_turn_stub(
+    row: sqlx::sqlite::SqliteRow,
+) -> DbResult<(
+    TurnAuthorityId,
+    ConversationAuthority,
+    ClientTurnKey,
+    u64,
+    TurnLifecycle,
+    Materialization,
+)> {
     let disposition = match row.get::<String, _>("disposition").as_str() {
         "Runtime" => AcceptedDisposition::Runtime,
         "Steering" => AcceptedDisposition::Steering,
@@ -1599,25 +1855,65 @@ fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
             "owns_conversation disagrees with turn lifecycle".to_string(),
         ));
     }
-    Ok(DurableTurn {
-        id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
-        conversation: ConversationAuthority(row.get("conversation_id")),
-        client_key: ClientTurnKey::try_from(row.get::<String, _>("client_turn_key"))
+    Ok((
+        TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
+        ConversationAuthority(row.get("conversation_id")),
+        ClientTurnKey::try_from(row.get::<String, _>("client_turn_key"))
             .map_err(|e| DbError::Serialization(e.to_string()))?,
-        prepared: PreparedTurn::rehydrate(
-            &ConversationAuthority(row.get("conversation_id")),
-            row.get("prepared_fingerprint"),
-            row.get("prepared_payload"),
-        )
-        .map_err(conflict)?,
-        generation: to_u64(row.get("generation"), "generation")?,
+        to_u64(row.get("generation"), "generation")?,
         lifecycle,
-        materialization: row.get::<Option<String>, _>("canonical_message_id").map_or(
+        row.get::<Option<String>, _>("canonical_message_id").map_or(
             Materialization::Unmaterialized,
             |message_id| Materialization::Materialized {
                 message_id: CanonicalMessageId(message_id),
             },
         ),
+    ))
+}
+
+async fn row_to_turn_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    row: sqlx::sqlite::SqliteRow,
+) -> DbResult<DurableTurn> {
+    let fingerprint: String = row.get("prepared_fingerprint");
+    let (id, conversation, client_key, generation, lifecycle, materialization) =
+        row_to_turn_stub(row)?;
+    let prepared = load_prepared_payload_tx(tx, id).await?;
+    Ok(DurableTurn {
+        id,
+        conversation: conversation.clone(),
+        client_key,
+        prepared: rehydrate_prepared_from_parts(fingerprint, &conversation, &prepared)?,
+        generation,
+        lifecycle,
+        materialization,
+    })
+}
+
+async fn row_to_turn_pool(
+    pool: &sqlx::SqlitePool,
+    row: sqlx::sqlite::SqliteRow,
+) -> DbResult<DurableTurn> {
+    let (id, conversation, client_key, generation, lifecycle, materialization) =
+        row_to_turn_stub(row)?;
+    let fingerprint_row =
+        sqlx::query("SELECT prepared_fingerprint FROM durable_turns WHERE turn_id = ?1")
+            .bind(to_i64(id.0, "turn_id")?)
+            .fetch_one(pool)
+            .await?;
+    let prepared = load_prepared_payload_pool(pool, id).await?;
+    Ok(DurableTurn {
+        id,
+        conversation: conversation.clone(),
+        client_key,
+        prepared: rehydrate_prepared_from_parts(
+            fingerprint_row.get("prepared_fingerprint"),
+            &conversation,
+            &prepared,
+        )?,
+        generation,
+        lifecycle,
+        materialization,
     })
 }
 
@@ -1912,6 +2208,44 @@ mod tests {
                 llm_text: None,
                 images: Vec::new(),
                 files: Vec::new(),
+                user_agent: Some("agent/test".to_string()),
+                skill_invocation: None,
+            },
+        )
+    }
+
+    fn prepared_payload_with_attachments(message_id: &str) -> PreparedDirectTurnPayload {
+        PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: format!("submitted-{message_id}"),
+                images: vec![ImageData {
+                    data: "SUBMITTED_IMAGE".to_string(),
+                    media_type: "image/png".to_string(),
+                }],
+                files: vec![SubmittedDirectTurnFileAttachment {
+                    original_name: "submitted.txt".to_string(),
+                    media_type: "text/plain".to_string(),
+                    size_bytes: 3,
+                    stored_path: "/tmp/submitted.txt".to_string(),
+                }],
+                message_id: message_id.to_string(),
+                user_agent: Some("agent/test".to_string()),
+                skill_invocation: None,
+                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: format!("delivery-{message_id}"),
+                llm_text: Some(format!("expanded-{message_id}")),
+                images: vec![ImageData {
+                    data: "DELIVERY_IMAGE".to_string(),
+                    media_type: "image/jpeg".to_string(),
+                }],
+                files: vec![FileAttachment {
+                    original_name: "delivery.txt".to_string(),
+                    media_type: "text/plain".to_string(),
+                    size_bytes: 5,
+                    stored_path: "/tmp/delivery.txt".to_string(),
+                }],
                 user_agent: Some("agent/test".to_string()),
                 skill_invocation: None,
             },
@@ -3202,6 +3536,149 @@ mod tests {
             canonical_message_id("conv-b-scope", "message-conv-b-scope-same-key")
         );
         assert_ne!(message_a.message_id, message_b.message_id);
+    }
+
+    #[tokio::test]
+    async fn prepared_turn_attachments_round_trip_via_normalized_tables() {
+        let repo = repo().await;
+        let conversation = ConversationAuthority("conv-a".to_string());
+        let payload = prepared_payload_with_attachments("message-conv-a-attachments");
+        let prepared =
+            PreparedTurn::from_exact_payload(&conversation, payload.to_exact_bytes().unwrap());
+        let input = AcceptAuthoritativeTurn {
+            client_key: ClientTurnKey::new("attachments").unwrap(),
+            prepared: prepared.clone(),
+            disposition: AcceptedDisposition::Runtime,
+            accepted_at: Timestamp(77),
+        };
+        let created = repo.accept_authoritative_turn(&input).await.unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+
+        let stored_payload: Vec<u8> =
+            sqlx::query_scalar("SELECT prepared_payload FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id.0).unwrap())
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        let stored_json: serde_json::Value = serde_json::from_slice(&stored_payload).unwrap();
+        assert!(stored_json["submitted"].get("images").is_none());
+        assert!(stored_json["submitted"].get("files").is_none());
+        assert!(stored_json["delivery"].get("images").is_none());
+        assert!(stored_json["delivery"].get("files").is_none());
+
+        let loaded = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.prepared, prepared);
+
+        let submitted_images: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turn_submitted_images WHERE turn_id = ?1",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let submitted_files: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turn_submitted_files WHERE turn_id = ?1",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let delivery_images: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turn_delivery_images WHERE turn_id = ?1",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let delivery_files: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turn_delivery_files WHERE turn_id = ?1",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                submitted_images,
+                submitted_files,
+                delivery_images,
+                delivery_files
+            ),
+            (1, 1, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_rehydrates_normalized_delivery_attachments_into_message() {
+        let repo = repo().await;
+        let conversation = ConversationAuthority("conv-a".to_string());
+        let payload = prepared_payload_with_attachments("message-conv-a-materialized-attachments");
+        let prepared =
+            PreparedTurn::from_exact_payload(&conversation, payload.to_exact_bytes().unwrap());
+        let created = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("materialized-attachments").unwrap(),
+                prepared,
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(80),
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 81))
+            .await
+            .unwrap();
+        let result = repo
+            .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+                turn_id,
+                authority: claim.authority.unwrap(),
+                prepared: payload.clone(),
+                sequence_id: 81,
+                created_at: Timestamp(81),
+                accepted_state: ConvState::LlmRequesting { attempt: 1 },
+                state_updated_at: timestamp_to_datetime(Timestamp(81)),
+                now: Timestamp(81),
+            })
+            .await
+            .unwrap();
+        let message = result.message.unwrap();
+        let (images, files) = message.content.attachments();
+        assert_eq!(images, payload.delivery.images);
+        assert_eq!(files, payload.delivery.files);
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_rehydrates_normalized_submitted_attachments() {
+        let repo = repo().await;
+        let conversation = ConversationAuthority("conv-replay".to_string());
+        let payload = prepared_payload_with_attachments("message-conv-replay-attachments");
+        let prepared =
+            PreparedTurn::from_exact_payload(&conversation, payload.to_exact_bytes().unwrap());
+        let input = AcceptAuthoritativeTurn {
+            client_key: ClientTurnKey::new("replay-attachments").unwrap(),
+            prepared,
+            disposition: AcceptedDisposition::Runtime,
+            accepted_at: Timestamp(90),
+        };
+        repo.accept_authoritative_turn(&input).await.unwrap();
+        let replay = repo
+            .lookup_scoped_direct_turn_replay(&conversation, &input.client_key, &payload.submitted)
+            .await
+            .unwrap();
+        let ScopedDirectTurnReplayLookup::Exact { prepared, .. } = replay else {
+            panic!("expected exact replay")
+        };
+        assert_eq!(*prepared, payload);
     }
 
     #[tokio::test]

@@ -345,6 +345,42 @@ CREATE TABLE durable_turns (
         REFERENCES messages(conversation_id, message_id) ON DELETE RESTRICT
 );
 
+CREATE TABLE durable_turn_submitted_images (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+
+CREATE TABLE durable_turn_submitted_files (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+
+CREATE TABLE durable_turn_delivery_images (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+
+CREATE TABLE durable_turn_delivery_files (
+    turn_id INTEGER NOT NULL REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+
 CREATE UNIQUE INDEX messages_conversation_message_id_unique
     ON messages(conversation_id, message_id);
 
@@ -2940,6 +2976,37 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    #[tokio::test]
+    async fn migration_055_creates_direct_turn_attachment_tables() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE workflows (workflow_id INTEGER PRIMARY KEY);
+             CREATE TABLE conversations (id TEXT PRIMARY KEY);
+             CREATE TABLE messages (conversation_id TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY (conversation_id, message_id));",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_055).execute(&pool).await.unwrap();
+
+        for table in [
+            "durable_turn_submitted_images",
+            "durable_turn_submitted_files",
+            "durable_turn_delivery_images",
+            "durable_turn_delivery_files",
+        ] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "missing table {table}");
+        }
     }
 
     #[tokio::test]

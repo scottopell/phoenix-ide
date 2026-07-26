@@ -138,6 +138,116 @@ pub enum PreparedDirectTurnPayloadCodecError {
 
 impl PreparedDirectTurnPayload {
     pub const VERSION: u32 = 1;
+    fn normalized_value_without_attachments(
+        &self,
+    ) -> Result<serde_json::Value, PreparedDirectTurnPayloadCodecError> {
+        let mut value =
+            serde_json::to_value(self).map_err(PreparedDirectTurnPayloadCodecError::Encode)?;
+        if let Some(submitted) = value.get_mut("submitted") {
+            if let Some(obj) = submitted.as_object_mut() {
+                obj.remove("images");
+                obj.remove("files");
+            }
+        }
+        if let Some(delivery) = value.get_mut("delivery") {
+            if let Some(obj) = delivery.as_object_mut() {
+                obj.remove("images");
+                obj.remove("files");
+            }
+        }
+        Ok(value)
+    }
+
+    /// # Errors
+    /// Returns an error when the normalized payload cannot be serialized.
+    pub fn to_normalized_bytes_without_attachments(
+        &self,
+    ) -> Result<Vec<u8>, PreparedDirectTurnPayloadCodecError> {
+        serde_json::to_vec(&self.normalized_value_without_attachments()?)
+            .map_err(PreparedDirectTurnPayloadCodecError::Encode)
+    }
+
+    /// # Errors
+    /// Returns an error when the normalized payload cannot be decoded.
+    pub fn rehydrate_from_normalized_bytes(
+        bytes: &[u8],
+        submitted_images: Vec<ImageData>,
+        submitted_files: Vec<SubmittedDirectTurnFileAttachment>,
+        delivery_images: Vec<ImageData>,
+        delivery_files: Vec<FileAttachment>,
+    ) -> Result<Self, PreparedDirectTurnPayloadCodecError> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(PreparedDirectTurnPayloadCodecError::Decode)?;
+        let Some(root) = value.as_object_mut() else {
+            return Err(PreparedDirectTurnPayloadCodecError::Decode(
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "prepared payload root must be object",
+                )),
+            ));
+        };
+        let Some(submitted) = root.get_mut("submitted") else {
+            return Err(PreparedDirectTurnPayloadCodecError::Decode(
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "prepared payload missing submitted",
+                )),
+            ));
+        };
+        let Some(submitted_obj) = submitted.as_object_mut() else {
+            return Err(PreparedDirectTurnPayloadCodecError::Decode(
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "prepared payload submitted must be object",
+                )),
+            ));
+        };
+        submitted_obj.insert(
+            "images".to_string(),
+            serde_json::to_value(submitted_images)
+                .map_err(PreparedDirectTurnPayloadCodecError::Encode)?,
+        );
+        submitted_obj.insert(
+            "files".to_string(),
+            serde_json::to_value(submitted_files)
+                .map_err(PreparedDirectTurnPayloadCodecError::Encode)?,
+        );
+        let Some(delivery) = root.get_mut("delivery") else {
+            return Err(PreparedDirectTurnPayloadCodecError::Decode(
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "prepared payload missing delivery",
+                )),
+            ));
+        };
+        let Some(delivery_obj) = delivery.as_object_mut() else {
+            return Err(PreparedDirectTurnPayloadCodecError::Decode(
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "prepared payload delivery must be object",
+                )),
+            ));
+        };
+        delivery_obj.insert(
+            "images".to_string(),
+            serde_json::to_value(delivery_images)
+                .map_err(PreparedDirectTurnPayloadCodecError::Encode)?,
+        );
+        delivery_obj.insert(
+            "files".to_string(),
+            serde_json::to_value(delivery_files)
+                .map_err(PreparedDirectTurnPayloadCodecError::Encode)?,
+        );
+        let payload: Self =
+            serde_json::from_value(value).map_err(PreparedDirectTurnPayloadCodecError::Decode)?;
+        if payload.v != Self::VERSION {
+            return Err(PreparedDirectTurnPayloadCodecError::UnsupportedVersion {
+                actual: payload.v,
+                expected: Self::VERSION,
+            });
+        }
+        Ok(payload)
+    }
 
     #[must_use]
     pub const fn from_parts(
