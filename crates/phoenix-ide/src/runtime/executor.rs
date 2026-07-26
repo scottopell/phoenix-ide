@@ -2793,6 +2793,16 @@ where
         .await
     }
 
+    async fn request_registered_wake_cancellation(&mut self) {
+        if let Err(error) = self.cancel_registered_wakes().await {
+            tracing::warn!(
+                %error,
+                owed = self.wake_cancellations_owed.len(),
+                "wake cleanup remains owed after user cancellation"
+            );
+        }
+    }
+
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         if matches!(self.state, ConvState::Idle)
             && matches!(
@@ -2811,7 +2821,7 @@ where
         }
 
         if matches!(event, Event::UserCancel { .. }) {
-            self.cancel_registered_wakes().await?;
+            self.request_registered_wake_cancellation().await;
         }
         if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;

@@ -14327,6 +14327,7 @@ mod wake_handler_tests {
                 },
             ),
             registering_tool_use_id: format!("tool-{workflow_id}"),
+            registering_tool_round_id: "round-test".to_string(),
             registered_at: phoenix_workflow::Timestamp(10),
             expires_at: phoenix_workflow::Timestamp(100 + workflow_id),
         };

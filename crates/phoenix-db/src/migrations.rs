@@ -316,7 +316,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_bash_wake_partial_output",
         sql: MIGRATION_060,
     },
+    Migration {
+        version: 61,
+        name: "persist_wake_tool_round_identity",
+        sql: MIGRATION_061,
+    },
 ];
+
+const MIGRATION_061: &str = r"
+ALTER TABLE wake_bindings ADD COLUMN registering_tool_round_id TEXT NOT NULL DEFAULT '';
+";
 
 const MIGRATION_060: &str = r"
 ALTER TABLE wake_terminal_receipts ADD COLUMN bash_partial TEXT;

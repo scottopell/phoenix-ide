@@ -163,6 +163,7 @@ impl Tool for WaitUntilTool {
             conversation_id: ctx.conversation_id.clone(),
             root_conversation_id: ctx.root_conversation_id.clone(),
             registering_tool_use_id: tool_use_id.to_string(),
+            registering_tool_round_id: tool_round_id.to_string(),
             registration_scope,
             resource: resource.clone(),
             max_wait_seconds,

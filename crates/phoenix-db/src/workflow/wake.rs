@@ -113,6 +113,7 @@ pub struct WakeBindingRecord {
     pub registration_scope: wake_types::WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
     pub registering_tool_use_id: String,
+    pub registering_tool_round_id: String,
     pub expires_at: Timestamp,
     pub prepared_fingerprint: String,
     fingerprint_needs_scope_upgrade: bool,
@@ -636,6 +637,7 @@ impl WakeRepository {
             resource: input.resource.clone(),
             expires_at: input.expires_at,
             registering_tool_use_id: input.registering_tool_use_id.clone(),
+            registering_tool_round_id: "round-test".to_string(),
         };
         let plan = CommitTransitionPlanCas {
             workflow_id,
@@ -3517,6 +3519,7 @@ fn replay_receipt(existing: &WakeBindingRecord) -> WakeRegistrationReceipt {
         resource: existing.resource.clone(),
         expires_at: existing.expires_at,
         registering_tool_use_id: existing.registering_tool_use_id.clone(),
+        registering_tool_round_id: existing.registering_tool_round_id.clone(),
     }
 }
 
@@ -3538,7 +3541,8 @@ async fn retire_inactive_resource_bindings_tx(
                AND COALESCE(b.tmux_server_token, '') = ?5
                AND COALESCE(b.tmux_window_id, '') = ?6
                AND b.activated_at IS NULL
-               AND b.created_at < ?7
+               AND b.registering_tool_round_id <> ?7
+               AND b.created_at < ?8
          )",
     )
     .bind(i64::from(wake_profile::PROTOCOL_VERSION))
@@ -3547,6 +3551,7 @@ async fn retire_inactive_resource_bindings_tx(
     .bind(bash_handle_id(&input.resource).unwrap_or_default())
     .bind(tmux_server_token(&input.resource).unwrap_or_default())
     .bind(tmux_window_id(&input.resource).unwrap_or_default())
+    .bind(&input.registering_tool_round_id)
     .bind(to_i64(now.0, "registered_at")?)
     .execute(&mut *tx.tx)
     .await?;
@@ -3560,7 +3565,7 @@ async fn fetch_existing_binding_tx(
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 work_scope_id, resource_kind, bash_handle_id,
-                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
+                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id, registering_tool_round_id,
                 expires_at, prepared_fingerprint, fingerprint_needs_scope_upgrade
          FROM wake_bindings
          WHERE profile_kind = 'wake' AND profile_version = ?1 AND conversation_id = ?2
@@ -3588,7 +3593,7 @@ async fn fetch_unresolved_resource_binding_tx(
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 work_scope_id, resource_kind, bash_handle_id,
-                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
+                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id, registering_tool_round_id,
                 expires_at, prepared_fingerprint, fingerprint_needs_scope_upgrade
          FROM wake_bindings
          WHERE profile_kind = 'wake' AND profile_version = ?1 AND conversation_id = ?2
@@ -3616,7 +3621,7 @@ async fn fetch_binding_by_workflow_tx(
     let row = sqlx::query(
         "SELECT workflow_id, conversation_id, contract_id, profile_kind, profile_version,
                 work_scope_id, resource_kind, bash_handle_id,
-                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
+                tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id, registering_tool_round_id,
                 expires_at, prepared_fingerprint, fingerprint_needs_scope_upgrade
          FROM wake_bindings WHERE workflow_id = ?1",
     )
@@ -3638,8 +3643,8 @@ async fn insert_binding_tx(
             workflow_id, conversation_id, contract_id, profile_kind, profile_version,
             work_scope_id, resource_kind, bash_handle_id,
             tmux_server_token, tmux_window_id, tmux_completion_policy, registering_tool_use_id,
-            expires_at, prepared_fingerprint, observe_effect_id, created_at
-         ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            registering_tool_round_id, expires_at, prepared_fingerprint, observe_effect_id, created_at
+         ) VALUES (?1, ?2, ?3, 'wake', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )
     .bind(i64::try_from(workflow_id.0).map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(&input.conversation_id)
@@ -3652,6 +3657,7 @@ async fn insert_binding_tx(
     .bind(tmux_window_id(&input.resource))
     .bind(tmux_completion_policy(&input.resource))
     .bind(&input.registering_tool_use_id)
+    .bind(&input.registering_tool_round_id)
     .bind(i64::try_from(input.expires_at.0).map_err(|e| DbError::Serialization(e.to_string()))?)
     .bind(prepared_fingerprint)
     .bind(
@@ -3689,6 +3695,7 @@ fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeBindingRecord
         registration_scope: wake_types::WorkScopeIdentity(row.get("work_scope_id")),
         resource: resource_from_row(row)?,
         registering_tool_use_id: row.get("registering_tool_use_id"),
+        registering_tool_round_id: row.get("registering_tool_round_id"),
         expires_at: Timestamp(
             u64::try_from(row.get::<i64, _>("expires_at"))
                 .map_err(|e| DbError::Serialization(e.to_string()))?,
@@ -4984,6 +4991,7 @@ mod tests {
                 completion_policy: wake_types::TmuxCompletionPolicy::KeepOpen,
             }),
             registering_tool_use_id: "tool-2".into(),
+            registering_tool_round_id: "round-test".to_string(),
             registered_at: Timestamp(10),
             expires_at: Timestamp(100),
         }
@@ -5081,6 +5089,7 @@ mod tests {
                 handle_id: "b-1".into(),
             }),
             registering_tool_use_id: "tool-1".into(),
+            registering_tool_round_id: "round-test".to_string(),
             registered_at: Timestamp(10),
             expires_at: Timestamp(100),
         }
@@ -7622,6 +7631,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_tool_round_preserves_multiple_prepared_waits() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let first = intent();
+        let mut second = first.clone();
+        second.contract_id = "contract-2".to_string();
+        second.registering_tool_use_id = "tool-2".to_string();
+        second.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
+            work_scope: second.registration_scope.clone(),
+            handle_id: "b-2".to_string(),
+        });
+
+        assert!(matches!(
+            repo.register_allocated(WorkflowId(201), &first, "fp-1", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        assert!(matches!(
+            repo.register_allocated(WorkflowId(202), &second, "fp-2", Timestamp(11))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        assert!(repo.fetch_binding(WorkflowId(201)).await.unwrap().is_some());
+        assert!(repo.fetch_binding(WorkflowId(202)).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn concurrent_duplicate_resource_returns_typed_outcomes() {
         let (_dir, repo, restarted) = open_repo_pair().await;
         let first = intent();
@@ -7791,6 +7829,7 @@ mod tests {
                 handle_id: "b-pending".into(),
             }),
             registering_tool_use_id: "tool-p".into(),
+            registering_tool_round_id: "round-test".to_string(),
             registered_at: Timestamp(10),
             expires_at: Timestamp(100),
         };

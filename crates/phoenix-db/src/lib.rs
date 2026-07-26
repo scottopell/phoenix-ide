@@ -15638,6 +15638,7 @@ mod tests {
                 },
             ),
             registering_tool_use_id: "tool-del".into(),
+            registering_tool_round_id: "round-test".to_string(),
             registered_at: phoenix_workflow::Timestamp(10),
             expires_at: phoenix_workflow::Timestamp(100),
         };
@@ -16100,6 +16101,7 @@ mod tests {
                 },
             ),
             registering_tool_use_id: "tool-wake".into(),
+            registering_tool_round_id: "round-test".to_string(),
             registered_at: phoenix_workflow::Timestamp(10),
             expires_at: phoenix_workflow::Timestamp(100),
         };

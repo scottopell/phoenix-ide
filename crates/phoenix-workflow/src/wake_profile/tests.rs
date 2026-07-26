@@ -50,6 +50,7 @@ fn barrier_event_and_manual_choices_round_trip_helpers() {
         }),
         expires_at: Timestamp(9),
         registering_tool_use_id: "tool-use".into(),
+        registering_tool_round_id: "round-test".to_string(),
     };
     let events = barrier_events(receipt.clone());
     assert_eq!(

@@ -97,6 +97,7 @@ pub struct WakeRegistrationIntent {
     pub registration_scope: WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
     pub registering_tool_use_id: String,
+    pub registering_tool_round_id: String,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
 }
@@ -114,6 +115,7 @@ pub struct WakeRegistrationReceipt {
     pub resource: WakeResourceIdentity,
     pub expires_at: Timestamp,
     pub registering_tool_use_id: String,
+    pub registering_tool_round_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1219,6 +1219,7 @@ mod tests {
                 handle_id: handle.to_string(),
             }),
             registering_tool_use_id: "tool-use".to_string(),
+            registering_tool_round_id: "round-test".to_string(),
             registered_at: Timestamp(1),
             expires_at: Timestamp(expires_at),
         };
@@ -1252,6 +1253,7 @@ mod tests {
                 completion_policy: TmuxCompletionPolicy::KeepOpen,
             }),
             registering_tool_use_id: "tool-use".to_string(),
+            registering_tool_round_id: "round-test".to_string(),
             registered_at: Timestamp(1),
             expires_at: Timestamp(expires_at),
         };
@@ -1755,6 +1757,7 @@ mod tests {
             conversation_id: "conv".to_string(),
             root_conversation_id: "root".to_string(),
             registering_tool_use_id: "tool-use".to_string(),
+            registering_tool_round_id: "round-test".to_string(),
             registration_scope: scope.clone(),
             resource: WakeResourceIdentity::Bash(BashResourceIdentity {
                 work_scope: scope.clone(),

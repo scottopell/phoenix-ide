@@ -120,6 +120,7 @@ pub struct RegisterWakeInput {
     pub conversation_id: String,
     pub root_conversation_id: String,
     pub registering_tool_use_id: String,
+    pub registering_tool_round_id: String,
     pub registration_scope: WorkScopeIdentity,
     pub resource: WakeResourceIdentity,
     pub max_wait_seconds: u64,
@@ -136,6 +137,7 @@ impl RegisterWakeInput {
             registration_scope: self.registration_scope,
             resource: self.resource,
             registering_tool_use_id: self.registering_tool_use_id,
+            registering_tool_round_id: self.registering_tool_round_id,
             registered_at,
             expires_at: Timestamp(registered_at.0.saturating_add(self.max_wait_seconds)),
         }
