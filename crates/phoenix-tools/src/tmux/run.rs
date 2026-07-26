@@ -429,14 +429,6 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            let response = if exited {
-                response
-            } else {
-                if close_after_completion {
-                    let _ = kill_window(config_path, socket_path, &target.window_id).await;
-                }
-                response
-            };
             if close_after_completion && exited {
                 let _ = kill_window(config_path, socket_path, &target.window_id).await;
             }
@@ -885,7 +877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_text_with_keep_closed_observes_then_kills_window() {
+    async fn wait_for_text_with_keep_closed_leaves_running_window_available() {
         if skip_unless_tmux() {
             return;
         }
@@ -902,12 +894,12 @@ mod tests {
         let result = TmuxRunTool
             .run(
                 json!({
-                    "cmd": "echo closes-after-ready",
+                    "cmd": "echo ready; sleep 2",
                     "name": "tmux-run-close-after-ready",
                     "keep_open_on_exit": false,
                     "readiness": {
                         "mode": "wait_for_text",
-                        "text": "__PHOENIX_EXIT__",
+                        "text": "ready",
                         "timeout_seconds": 5
                     }
                 }),
@@ -917,7 +909,7 @@ mod tests {
         assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "ready");
-        assert_eq!(v["exit_code"], 0);
+        assert!(v["exit_code"].is_null());
         let window_id = v["window_id"].as_str().unwrap();
         let sock = owner.path().join("conv-tmux-run-close-after-ready.sock");
         let capture = tokio::process::Command::new("tmux")
@@ -934,8 +926,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !capture.success(),
-            "window should be killed after observation"
+            capture.success(),
+            "running window must remain available after readiness observation"
         );
         owner.shutdown();
     }
