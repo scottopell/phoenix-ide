@@ -1518,7 +1518,11 @@ impl RuntimeManager {
                     let Some(broadcaster) = broadcaster else {
                         continue;
                     };
-                    let active = matches!(kind, BrowserSessionLifecycleKind::Active);
+                    let active = matches!(
+                        kind,
+                        BrowserSessionLifecycleKind::Active
+                            | BrowserSessionLifecycleKind::TeardownPending
+                    );
                     if broadcaster
                         .send_seq(|seq| SseEvent::BrowserSessionState {
                             sequence_id: seq,

@@ -74,6 +74,7 @@ enum WorkScopeKind {
 
 enum BrowserLifecycleKind {
     active
+    | teardown_pending
     | inactive
     | teardown_failed
 }
@@ -259,19 +260,6 @@ rule CascadeTeardownFailureRetained {
     ensures: not UserDataDirRemoved(user_data_dir_for_scope(work_scope))
 }
 
-rule TerminalLifecycleWaitsForCleanup {
-    when: TerminalLifecycleTransitionRequested(work_scope)
-
-    requires: exists BrowserSession{scope: work_scope, status: teardown_failed}
-
-    ensures: BrowserSession.status = teardown_failed
-
-    @guidance
-        -- Terminal lifecycle cleanup retries authoritative scope teardown while
-        -- the durable owner still exists. The final archive/delete/abandon
-        -- transition occurs only after the scope reaches torn_down.
-}
-
 -- A retry is tied to one teardown generation. Its completion cannot be inferred
 -- from a later generation's state.
 rule FailedTeardownRetrySucceeds {
@@ -396,7 +384,7 @@ rule LifecycleEventFannedOut {
              and live_runtime_exists(c):
         SseEvent.BrowserSessionState.delivered(
             c,
-            kind = active
+            kind = active or kind = teardown_pending
         )
 
     @guidance

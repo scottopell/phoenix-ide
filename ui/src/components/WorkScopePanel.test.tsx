@@ -212,7 +212,7 @@ describe('WorkScopeSection resource health', () => {
 
     await renderExpanded();
     expect(screen.getByText('245% · 128.0 MB · 4p')).toBeTruthy();
-    expect(screen.getByText('high CPU')).toBeTruthy();
+    expect(screen.getByText(/high CPU/)).toBeTruthy();
     openBashDetail();
     expect(screen.getByText('health')).toBeTruthy();
   });

@@ -899,6 +899,7 @@ impl BrowserSessionAudience {
 #[derive(Debug, Clone, Copy)]
 pub enum BrowserSessionLifecycleKind {
     Active,
+    TeardownPending,
     Inactive,
     TeardownFailed,
 }
@@ -1376,6 +1377,12 @@ impl BrowserSessionManager {
             };
             (entry.session.clone(), state)
         };
+        if state != BrowserInventoryState::Live {
+            return Some(BrowserInventoryMetadata {
+                state,
+                idle: Duration::ZERO,
+            });
+        }
         let idle = session.read().await.last_activity.elapsed();
         Some(BrowserInventoryMetadata { state, idle })
     }
@@ -1414,6 +1421,12 @@ impl BrowserSessionManager {
             };
             (entry.session.clone(), state)
         };
+        if state != BrowserInventoryState::Live {
+            return Ok(Some(BrowserInventoryMetadata {
+                state,
+                idle: Duration::ZERO,
+            }));
+        }
         let idle = session.read().await.last_activity.elapsed();
         Ok(Some(BrowserInventoryMetadata { state, idle }))
     }
@@ -1496,7 +1509,7 @@ impl BrowserSessionManager {
         key: String,
         work_scope: ResourceScopeKey,
     ) -> KillSessionOutcome {
-        let (session, attempt) = {
+        let (session, attempt, audience) = {
             let sessions = self.sessions.write().await;
             let Some(entry) = sessions.get(&key) else {
                 return KillSessionOutcome::Absent;
@@ -1516,8 +1529,19 @@ impl BrowserSessionManager {
             }
             let attempt = KillAttempt::new();
             *current = Some(attempt.clone());
-            (entry.session.clone(), attempt)
+            let audience = match entry.authority {
+                ResourceAuthority::Work => BrowserSessionAudience::Scope,
+                ResourceAuthority::Restricted => {
+                    BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
+                }
+            };
+            (entry.session.clone(), attempt, audience)
         };
+        self.emit_lifecycle(
+            &work_scope,
+            audience,
+            BrowserSessionLifecycleKind::TeardownPending,
+        );
 
         let requested_scope = work_scope;
         let manager = Arc::clone(self);

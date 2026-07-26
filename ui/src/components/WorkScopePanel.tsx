@@ -658,12 +658,14 @@ export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expa
   const count = workScopeLiveCount(inventory);
   const freshHealth = healthIsFresh(inventory?.health_sampled_at, now) ? inventory?.health : undefined;
   const healthWarning = useHealthAttention(freshHealth);
+  const resourceSummary = summarizeWorkScope(inventory, count);
+  const summary = healthWarning ? `${healthWarning} · ${resourceSummary}` : resourceSummary;
 
   return (
     <GroundingSection
       icon="●"
       title="Work"
-      summary={error ? 'inventory unavailable' : healthWarning ?? summarizeWorkScope(inventory, count)}
+      summary={error ? 'inventory unavailable' : summary}
       count={count}
       expanded={expanded}
       attention={Boolean(healthWarning) || Boolean(error) || inventory?.browser?.state === 'teardown_failed'}
