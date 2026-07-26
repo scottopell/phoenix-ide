@@ -145,6 +145,9 @@ pub struct BashTerminalEvidence {
     pub duration_ms: Option<u64>,
     pub signal_number: Option<i32>,
     pub kill_signal_sent: Option<String>,
+    // owned: pre-kill-metadata evidence had no attempt timestamp
+    #[serde(default)]
+    pub kill_attempted_at: Option<Timestamp>,
     // owned: pre-window-metadata evidence had no offsets; zero is its exact projection
     #[serde(default)]
     pub final_tail_start_offset: u64,

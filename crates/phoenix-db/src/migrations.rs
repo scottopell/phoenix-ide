@@ -321,7 +321,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_wake_tool_round_identity",
         sql: MIGRATION_061,
     },
+    Migration {
+        version: 62,
+        name: "persist_bash_wake_kill_attempt",
+        sql: MIGRATION_062,
+    },
 ];
+
+const MIGRATION_062: &str = r"
+ALTER TABLE wake_terminal_receipts ADD COLUMN kill_attempted_at INTEGER CHECK (kill_attempted_at IS NULL OR kill_attempted_at >= 0);
+";
 
 const MIGRATION_061: &str = r"
 ALTER TABLE wake_bindings ADD COLUMN registering_tool_round_id TEXT NOT NULL DEFAULT '';

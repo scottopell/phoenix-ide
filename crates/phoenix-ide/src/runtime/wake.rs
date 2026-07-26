@@ -658,6 +658,10 @@ fn wake_bash_window(
     }
 }
 
+fn timestamp_seconds(timestamp: Timestamp) -> String {
+    timestamp.0.to_string()
+}
+
 fn timestamp_rfc3339(timestamp: Timestamp) -> String {
     chrono::DateTime::from_timestamp(i64::try_from(timestamp.0).unwrap_or(i64::MAX), 0)
         .unwrap_or(chrono::DateTime::UNIX_EPOCH)
@@ -729,9 +733,9 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
                         exit_code: evidence.exit_code,
                         signal_number: evidence.signal_number,
                         duration_ms: evidence.duration_ms.unwrap_or_default(),
-                        finished_at: timestamp_rfc3339(evidence.occurred_at),
+                        finished_at: timestamp_seconds(evidence.occurred_at),
                         kill_signal_sent: evidence.kill_signal_sent.clone(),
-                        kill_attempted_at: None,
+                        kill_attempted_at: evidence.kill_attempted_at.map(timestamp_seconds),
                         window: wake_bash_window(evidence),
                         display: None,
                         signal_sent: None,
@@ -748,7 +752,9 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
                         label: evidence.label.clone(),
                         window: wake_bash_window(evidence),
                         kill_signal_sent: evidence.kill_signal_sent.clone().unwrap_or_default(),
-                        kill_attempted_at: timestamp_rfc3339(evidence.occurred_at),
+                        kill_attempted_at: timestamp_seconds(
+                            evidence.kill_attempted_at.unwrap_or(evidence.occurred_at),
+                        ),
                         display: None,
                         signal_sent: None,
                         waited_ms: None,
@@ -895,6 +901,7 @@ async fn inspect_live_bash(
         duration_ms: None,
         signal_number: None,
         kill_signal_sent: Some(kill_attempt.signal_sent.as_str().to_string()),
+        kill_attempted_at: None,
         final_tail_start_offset: window.start_offset,
         final_tail_end_offset: window.end_offset,
         final_tail_truncated_before: window.truncated_before,
@@ -959,6 +966,9 @@ impl TerminalInspector for RuntimeRegistryInspector {
                                     kill_signal_sent: tomb
                                         .kill_signal_sent
                                         .map(|sig| sig.as_str().to_string()),
+                                    kill_attempted_at: tomb
+                                        .kill_attempted_at
+                                        .map(system_time_to_timestamp),
                                     final_tail_start_offset,
                                     final_tail_end_offset: tomb.next_offset_at_exit,
                                     final_tail_truncated_before: final_tail_start_offset > 0,
@@ -1288,6 +1298,7 @@ mod tests {
                 duration_ms: Some(25),
                 signal_number: None,
                 kill_signal_sent: None,
+                kill_attempted_at: None,
                 final_tail_start_offset: 40,
                 final_tail_end_offset: 42,
                 final_tail_truncated_before: true,
@@ -1316,7 +1327,7 @@ mod tests {
         assert_eq!(rendered["final_cause"], "exited");
         assert_eq!(rendered["exit_code"], 0);
         assert_eq!(rendered["duration_ms"], 25);
-        assert_eq!(rendered["finished_at"], "1970-01-01T00:00:10+00:00");
+        assert_eq!(rendered["finished_at"], "10");
         assert_eq!(rendered["start_offset"], 40);
         assert_eq!(rendered["end_offset"], 42);
         assert_eq!(rendered["truncated_before"], true);
@@ -1366,6 +1377,7 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                kill_attempted_at: None,
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
@@ -1514,7 +1526,7 @@ mod tests {
         let rendered: serde_json::Value =
             serde_json::from_str(&render_terminal_result(&pending[0])).unwrap();
         assert_eq!(rendered["status"], "kill_pending_kernel");
-        assert_eq!(rendered["kill_attempted_at"], "1970-01-01T00:00:09+00:00");
+        assert_eq!(rendered["kill_attempted_at"], "9");
         assert_eq!(rendered["kill_signal_sent"], "TERM");
         assert_eq!(rendered["partial"], "unterminated");
         assert!(rendered.get("finished_at").is_none());
@@ -1714,6 +1726,7 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                kill_attempted_at: None,
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 0,
                 final_tail_truncated_before: false,
@@ -1902,6 +1915,7 @@ mod tests {
                 duration_ms: Some(1),
                 signal_number: None,
                 kill_signal_sent: None,
+                kill_attempted_at: None,
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 0,
                 final_tail_truncated_before: false,
@@ -1968,6 +1982,7 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                kill_attempted_at: None,
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
@@ -2032,6 +2047,7 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                kill_attempted_at: None,
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
@@ -2193,6 +2209,7 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                kill_attempted_at: None,
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,
@@ -2297,6 +2314,7 @@ mod tests {
                 duration_ms: Some(5),
                 signal_number: None,
                 kill_signal_sent: None,
+                kill_attempted_at: None,
                 final_tail_start_offset: 0,
                 final_tail_end_offset: 1,
                 final_tail_truncated_before: false,

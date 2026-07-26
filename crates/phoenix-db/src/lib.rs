@@ -15694,6 +15694,7 @@ mod tests {
                         duration_ms: Some(12),
                         signal_number: None,
                         kill_signal_sent: None,
+                        kill_attempted_at: None,
                         final_tail_start_offset: 0,
                         final_tail_end_offset: 1,
                         final_tail_truncated_before: false,

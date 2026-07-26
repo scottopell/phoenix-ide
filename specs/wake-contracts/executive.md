@@ -112,7 +112,7 @@ remain explicit runtime errors until their end-to-end lifecycle is implemented.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| REQ-WAKE-001 Registration | Partial | Unified explicit registration, typed park disposition, and immediate receipt are implemented for Bash handles |
+| REQ-WAKE-001 Registration | Complete | `wait_until` provides explicit durable Bash registration, typed park disposition, and immediate receipt; unsupported handle kinds remain outside the Bash slice |
 | REQ-WAKE-002 Persistence | Partial | Durable Bash bindings, receipts, exactly-once restart reconciliation, and terminal delivery are implemented |
 | REQ-WAKE-003 Router Service | Partial | Background observation and replay-safe delivery are active for explicit Bash waits; no ordinary tool implicitly enrolls a handle |
 | REQ-WAKE-004 `is_busy()` Derivation | Proposed | Reads contract table; no new state machine variant |
