@@ -1,4 +1,8 @@
 -- allium: 3
+
+config {
+    minimum_safe_pressure_duration: Duration = 1_200.ms
+}
 -- deployment-info.allium
 --
 -- Focused behavioural specification for the observe-only macOS thermal
@@ -71,9 +75,15 @@ value ThermalSample {
     raw_temperature_available: Boolean
 }
 
+value NativeProcessIdentity {
+    pid: Integer
+    start_identity: Integer
+}
+
 value ProposedAction {
     kind: ThermalActionKind
     affects_targets: Boolean
+    target_identities: Set<NativeProcessIdentity>
 }
 
 ------------------------------------------------------------
@@ -86,7 +96,8 @@ entity ThermalGovernor {
     last_sample: ThermalSample?
     proposed_action: ProposedAction
     applied_action: ThermalActionKind
-    has_covered_targets: Boolean
+    covered_target_identities: Set<NativeProcessIdentity>
+    hypothetically_deprioritized_identities: Set<NativeProcessIdentity>
 
     transitions state {
         nominal -> elevated
@@ -119,14 +130,13 @@ entity ThermalGovernor {
 -- raw_temperature_unavailable(sample) -> Boolean
 --   sample.raw_temperature_available = false.
 -- restoration_is_sustained_safe(governor, sample) -> Boolean
---   The governor's hysteresis condition for leaving elevated state is satisfied
---   by the observed safer pressure sample.
+--   Nominal pressure has remained continuously observed for at least
+--   config.minimum_safe_pressure_duration; observation count alone is insufficient.
 -- proposed_deprioritization(governor) -> ProposedAction
---   Returns ProposedAction{ kind: deprioritize,
---   affects_targets: governor.has_covered_targets }.
+--   Returns a deprioritize action targeting the currently covered PID/start identities.
 -- proposed_restoration(governor) -> ProposedAction
---   Returns ProposedAction{ kind: restore,
---   affects_targets: governor.has_covered_targets }.
+--   Returns a restore action targeting only PID/start identities previously retained
+--   as hypothetically deprioritized, never newly covered identities.
 -- no_proposed_action() -> ProposedAction
 --   Returns ProposedAction{ kind: none, affects_targets: false }.
 
@@ -138,12 +148,15 @@ invariant ThermalSampleAvailabilityIsExclusive {
         sample.pressure = null and sample.unavailable_reason != null)
 }
 
-invariant ProposedActionTargetEffectMatchesCoverage {
-    (governor.proposed_action.kind = none
-        and not governor.proposed_action.affects_targets)
-    or
-    (governor.proposed_action.kind != none
-        and governor.proposed_action.affects_targets = governor.has_covered_targets)
+invariant ProposedActionTargetEffectMatchesIdentities {
+    governor.proposed_action.affects_targets =
+        not governor.proposed_action.target_identities.empty()
+}
+
+invariant RestorationTargetsOnlyPreviouslyDeprioritizedIdentities {
+    governor.proposed_action.kind = restore implies
+        governor.proposed_action.target_identities.all(identity =>
+            governor.hypothetically_deprioritized_identities.contains(identity))
 }
 
 rule ThermalSampleRecordsCapability {
@@ -230,7 +243,8 @@ surface ThermalObservationSurface {
         ThermalGovernor.last_sample
         ThermalGovernor.proposed_action
         ThermalGovernor.applied_action
-        ThermalGovernor.has_covered_targets
+        ThermalGovernor.covered_target_identities
+        ThermalGovernor.hypothetically_deprioritized_identities
 
     @guarantee ObserveOnlyActionIsDiagnosticOnly
         -- In observe-only mode the proposed action is diagnostic state.

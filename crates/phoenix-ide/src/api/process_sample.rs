@@ -186,7 +186,7 @@ pub(crate) fn session_member_identities_for_sampling(
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ProcessIdentity {
     pub pid: u32,
     pub start_time: u128,

@@ -941,7 +941,7 @@ fn thermal_snapshot_from_generation(
         last_sample,
         proposed_action: ThermalGovernorActionSnapshot {
             kind: proposed_action,
-            affects_targets: coverage.covered_process_count > 0
+            affects_targets: generation.thermal_decision.proposed_target_count > 0
                 && proposed_action != ThermalGovernorActionKind::None,
         },
         applied_action: ThermalGovernorActionKind::None,
@@ -1017,6 +1017,12 @@ fn thermal_coverage_snapshot(
             "live Bash WorkScopes are eligible, but native process attribution is unavailable"
                 .to_string(),
         );
+    }
+    if generation.bash_sample_failure_count > 0 {
+        uncovered_reasons.push(format!(
+            "{} Bash process target(s) exited or changed identity during resource sampling",
+            generation.bash_sample_failure_count
+        ));
     }
     ThermalCoverageSnapshot {
         eligible_work_scope_count: u32::try_from(work_scopes.len()).unwrap_or(u32::MAX),
@@ -1432,6 +1438,14 @@ mod tests {
                 }
             }
         };
+        let covered_bash_identities: BTreeSet<crate::api::process_sample::ProcessIdentity> =
+            observations
+                .keys()
+                .map(|pid| crate::api::process_sample::ProcessIdentity {
+                    pid: *pid,
+                    start_time: u128::from(*pid),
+                })
+                .collect();
         ResourceObservationGeneration {
             sampled_at: Utc::now(),
             host: HostResources {
@@ -1450,6 +1464,8 @@ mod tests {
             thermal_decision: crate::api::resource_monitor::ThermalGovernorDecisionSample {
                 state: ThermalGovernorStateSample::Elevated,
                 proposed_action: ThermalGovernorActionSample::Deprioritize,
+                proposed_target_count: u32::try_from(covered_bash_identities.len())
+                    .unwrap_or(u32::MAX),
                 reported_sample,
             },
             observations,
@@ -1459,6 +1475,8 @@ mod tests {
                 .iter()
                 .map(|handle| handle.scope_key.clone())
                 .collect(),
+            covered_bash_identities,
+            bash_sample_failure_count: 0,
             handles,
             bash_attribution_available: true,
         }
@@ -1538,6 +1556,31 @@ mod tests {
             .uncovered_reasons
             .iter()
             .any(|reason| reason.contains("native process attribution is unavailable")));
+    }
+
+    #[test]
+    fn post_enumeration_bash_failure_reports_explicit_coverage_gap() {
+        let mut generation = generation_with_thermal(
+            thermal_sample(Some(ThermalPressureSample::Elevated), None),
+            BTreeSet::new(),
+            Some(BTreeSet::new()),
+            vec![crate::api::resource_monitor::HandleObservationTarget {
+                scope_key: "work:test".into(),
+                handle_id: "b-1".into(),
+                pids: BTreeSet::from([2]),
+            }],
+            BTreeMap::new(),
+        );
+        generation.bash_sample_failure_count = 1;
+
+        let coverage = thermal_coverage_snapshot(&generation);
+
+        assert_eq!(coverage.eligible_process_count, 1);
+        assert_eq!(coverage.covered_process_count, 0);
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("exited or changed identity")));
     }
 
     #[test]
