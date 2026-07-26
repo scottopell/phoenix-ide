@@ -217,6 +217,7 @@ pub struct WakeActiveUnresolvedRow {
     pub workflow_id: WorkflowId,
     pub conversation_id: String,
     pub contract_id: String,
+    pub resource: WakeResourceIdentity,
     pub expires_at: Timestamp,
 }
 
@@ -2077,7 +2078,7 @@ impl WakeRepository {
     ) -> DbResult<Vec<WakeActiveUnresolvedRow>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let rows = sqlx::query(
-            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.expires_at
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.work_scope_id, b.resource_kind, b.bash_handle_id, b.tmux_server_token, b.tmux_window_id, b.tmux_completion_policy, b.expires_at
              FROM wake_bindings b
              JOIN workflows w ON w.workflow_id = b.workflow_id
              WHERE w.status = 'Active'
@@ -2103,7 +2104,7 @@ impl WakeRepository {
     ) -> DbResult<Vec<WakeActiveUnresolvedRow>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let rows = sqlx::query(
-            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.expires_at
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.work_scope_id, b.resource_kind, b.bash_handle_id, b.tmux_server_token, b.tmux_window_id, b.tmux_completion_policy, b.expires_at
              FROM wake_bindings b
              JOIN workflows w ON w.workflow_id = b.workflow_id
              WHERE b.conversation_id = ?1
@@ -2269,7 +2270,7 @@ impl WakeRepository {
     ) -> DbResult<Vec<WakeExpiredUnresolvedRow>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let rows = sqlx::query(
-            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.expires_at
+            "SELECT b.workflow_id, b.conversation_id, b.contract_id, b.work_scope_id, b.resource_kind, b.bash_handle_id, b.tmux_server_token, b.tmux_window_id, b.tmux_completion_policy, b.expires_at
              FROM wake_bindings b
              JOIN workflows w ON w.workflow_id = b.workflow_id
              WHERE w.status = 'Active'
@@ -3684,6 +3685,7 @@ fn parse_active_unresolved_row(row: &sqlx::sqlite::SqliteRow) -> DbResult<WakeAc
         workflow_id: WorkflowId(to_u64(row.get::<i64, _>("workflow_id"), "workflow_id")?),
         conversation_id: row.get("conversation_id"),
         contract_id: row.get("contract_id"),
+        resource: resource_from_row(row)?,
         expires_at: Timestamp(to_u64(row.get::<i64, _>("expires_at"), "expires_at")?),
     })
 }

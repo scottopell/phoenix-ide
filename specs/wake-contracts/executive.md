@@ -119,7 +119,7 @@ remain explicit runtime errors until their end-to-end lifecycle is implemented.
 | REQ-WAKE-005 V1 Condition Kinds | Partial | `HandleTerminal` is agent-accessible for Bash; tmux and sub-agent registration remain unsupported |
 | REQ-WAKE-006 Wake Event Delivery | Partial | Bash Fired / Expired / Forgotten results use durable materialization and exactly-once auto-resume |
 | REQ-WAKE-007 Mandatory Timeout | Partial | Bash registration defaults to 600s and is capped at 1800s |
-| REQ-WAKE-008 User Status + Cancel | Partial | Conversation UI, HTTP status/cancel routes, and `phoenix-client.py --wake-status/--wake-cancel` are implemented; CLI status output still lacks the required handle and terminal-status detail |
+| REQ-WAKE-008 User Status + Cancel | Complete | Conversation UI, HTTP status/cancel routes, and `phoenix-client.py --wake-status/--wake-cancel` expose contract identity, handle identity, pending status, expiry, and cancellation |
 | REQ-WAKE-009 Conv-Scoped | Proposed | Not WorkScope-scoped; explicit deconfliction |
 | REQ-WAKE-010 Independent Contracts | Proposed | No auto-cancel on sibling fire |
 | REQ-WAKE-011 Terminal Cause | Partial | Typed Fired / Expired / Cancelled / Forgotten projections exist in the durable substrate |

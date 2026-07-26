@@ -3680,6 +3680,9 @@ struct WakeStatusResponse {
 struct WakeContractStatus {
     workflow_id: u64,
     contract_id: String,
+    resource_kind: &'static str,
+    handle_id: String,
+    terminal_status: &'static str,
     expires_at: u64,
 }
 
@@ -3698,10 +3701,26 @@ async fn get_wake_status(
         .map_err(|error| AppError::Internal(error.to_string()))?;
     let contracts: Vec<_> = rows
         .into_iter()
-        .map(|row| WakeContractStatus {
-            workflow_id: row.workflow_id.0,
-            contract_id: row.contract_id,
-            expires_at: row.expires_at.0,
+        .map(|row| {
+            let (resource_kind, handle_id) = match row.resource {
+                phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(identity) => {
+                    ("Bash", identity.handle_id)
+                }
+                phoenix_workflow::wake_profile::WakeResourceIdentity::TmuxWindow(identity) => {
+                    ("TmuxWindow", identity.window_id)
+                }
+                phoenix_workflow::wake_profile::WakeResourceIdentity::Subagent(identity) => {
+                    ("Subagent", identity.child_conversation_id)
+                }
+            };
+            WakeContractStatus {
+                workflow_id: row.workflow_id.0,
+                contract_id: row.contract_id,
+                resource_kind,
+                handle_id,
+                terminal_status: "pending",
+                expires_at: row.expires_at.0,
+            }
         })
         .collect();
     Ok(axum::Json(WakeStatusResponse {

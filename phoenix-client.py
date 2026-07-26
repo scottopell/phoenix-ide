@@ -552,7 +552,8 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         for contract in status.get('contracts', []):
             click.echo(
                 f"  {contract['contract_id']}  workflow={contract['workflow_id']}  "
-                f"expires_at={contract['expires_at']}"
+                f"handle={contract['resource_kind']}:{contract['handle_id']}  "
+                f"status={contract['terminal_status']}  expires_at={contract['expires_at']}"
             )
         return
 
