@@ -1,6 +1,13 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+const profileDir = process.env.PHOENIX_CHECK_PROFILE_DIR
+const setupFiles = ['./src/test-setup.ts']
+
+if (profileDir) {
+  setupFiles.push('./src/testCpuProfile.setup.ts')
+}
+
 export default defineConfig({
   plugins: [react()],
   test: {
@@ -19,6 +26,11 @@ export default defineConfig({
       },
     },
     globals: true,
-    setupFiles: './src/test-setup.ts',
+    setupFiles,
+    sequence: {
+      setupFiles: 'list',
+    },
   },
 })
+
+export { setupFiles, profileDir }
