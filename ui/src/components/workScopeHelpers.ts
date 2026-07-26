@@ -63,6 +63,6 @@ export function hasLiveResource(inv: WorkScopeInventory | null): boolean {
   if (inv.bash.some((h) => isLive(h.state))) return true;
   if (inv.tmux != null && (inv.tmux.status === 'live' || inv.tmux.status === 'not_probed'))
     return true;
-  if (inv.browser?.state === 'live') return true;
+  if (inv.browser && inv.browser.state !== 'torn_down') return true;
   return false;
 }

@@ -916,13 +916,6 @@ pub struct BrowserSessionLifecycleEvent {
 pub type BrowserSessionLifecycleSink =
     tokio::sync::mpsc::UnboundedSender<BrowserSessionLifecycleEvent>;
 
-#[derive(Clone, Debug)]
-pub struct BrowserSessionTeardownFailure {
-    pub work_scope: ResourceScopeKey,
-    pub audience: BrowserSessionAudience,
-    pub error: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserInventoryState {
     Live,
@@ -1027,7 +1020,6 @@ pub struct BrowserSessionManager {
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
     lifecycle_sink: Option<BrowserSessionLifecycleSink>,
-    teardown_failures: tokio::sync::broadcast::Sender<BrowserSessionTeardownFailure>,
     /// Set-once predicate gating idle reaping on `ResourceScopeKey` liveness. The
     /// runtime installs it via [`Self::set_scope_liveness_hook`] when it wires
     /// the lifecycle bridges. Unset (the test/default case) means idle cleanup
@@ -1048,11 +1040,9 @@ impl BrowserSessionManager {
     /// emits `SseEvent::BrowserSessionState`.
     #[must_use]
     pub fn with_lifecycle_sink(sink: Option<BrowserSessionLifecycleSink>) -> Arc<Self> {
-        let (teardown_failures, _) = tokio::sync::broadcast::channel(32);
         let manager = Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
             lifecycle_sink: sink,
-            teardown_failures,
             scope_liveness_hook: std::sync::OnceLock::new(),
         });
 
@@ -1105,7 +1095,8 @@ impl BrowserSessionManager {
         self.sessions
             .read()
             .await
-            .contains_key(&session_key(work_scope, actor))
+            .get(&session_key(work_scope, actor))
+            .is_some_and(|entry| !entry.teardown_failed.load(Ordering::SeqCst))
     }
 
     /// Publish a lifecycle edge if a sink is wired. Best-effort: dropped
@@ -1136,9 +1127,21 @@ impl BrowserSessionManager {
     }
 
     async fn complete_kill_failure(&self, key: &str, attempt: &Arc<KillAttempt>, error: String) {
+        if !attempt.complete(Err(error)) {
+            return;
+        }
         let lifecycle = {
             let sessions = self.sessions.read().await;
-            sessions.get(key).map(|entry| {
+            sessions.get(key).and_then(|entry| {
+                let is_current = entry
+                    .current_kill
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, attempt));
+                if !is_current {
+                    return None;
+                }
                 entry.teardown_failed.store(true, Ordering::SeqCst);
                 let audience = match entry.authority {
                     ResourceAuthority::Work => BrowserSessionAudience::Scope,
@@ -1146,17 +1149,15 @@ impl BrowserSessionManager {
                         BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
                     }
                 };
-                (entry.scope.clone(), audience)
+                Some((entry.scope.clone(), audience))
             })
         };
-        if attempt.complete(Err(error)) {
-            if let Some((scope, audience)) = lifecycle {
-                self.emit_lifecycle(
-                    &scope,
-                    audience,
-                    BrowserSessionLifecycleKind::TeardownFailed,
-                );
-            }
+        if let Some((scope, audience)) = lifecycle {
+            self.emit_lifecycle(
+                &scope,
+                audience,
+                BrowserSessionLifecycleKind::TeardownFailed,
+            );
         }
     }
 
@@ -1562,12 +1563,6 @@ impl BrowserSessionManager {
         }
     }
 
-    pub fn subscribe_teardown_failures(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<BrowserSessionTeardownFailure> {
-        self.teardown_failures.subscribe()
-    }
-
     fn observe_requested_kill(
         self: &Arc<Self>,
         outcome: KillSessionOutcome,
@@ -1602,13 +1597,7 @@ impl BrowserSessionManager {
                 }
             };
             if let Err(error) = result {
-                let _ = manager
-                    .teardown_failures
-                    .send(BrowserSessionTeardownFailure {
-                        work_scope: work_scope.clone(),
-                        audience: audience.clone(),
-                        error: error.to_string(),
-                    });
+                tracing::warn!(%work_scope, ?audience, %error, "requested browser teardown failed");
             }
             Ok::<(), BrowserError>(())
         });
@@ -1630,6 +1619,26 @@ impl BrowserSessionManager {
             }
         };
         self.observe_requested_kill(outcome, work_scope.clone(), audience);
+    }
+
+    /// Transfer teardown ownership to a detached retry loop.
+    pub fn request_kill_session_for_actor_until_success(
+        self: &Arc<Self>,
+        work_scope: ResourceScopeKey,
+        actor: EffectiveResourceAccess,
+    ) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match manager.kill_session_for_actor(&work_scope, &actor).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::error!(%work_scope, %error, "detached browser cleanup retry failed");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
     }
 
     /// Request session kill and return as soon as teardown has been queued.
@@ -1950,11 +1959,9 @@ impl Drop for BrowserSession {
 
 impl Default for BrowserSessionManager {
     fn default() -> Self {
-        let (teardown_failures, _) = tokio::sync::broadcast::channel(32);
         Self {
             sessions: RwLock::new(HashMap::new()),
             lifecycle_sink: None,
-            teardown_failures,
             scope_liveness_hook: std::sync::OnceLock::new(),
         }
     }

@@ -53,7 +53,6 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
     // tell the client and close — they can reconnect later when the agent
     // does something browser-related.
     let manager = state.runtime.browser_sessions().clone();
-    let mut teardown_failures = manager.subscribe_teardown_failures();
     let Some((work_scope, actor)) = resolve_viewer_work_scope(&state, &conversation_id).await
     else {
         let _ = ws_sender.send(Message::Close(None)).await;
@@ -141,22 +140,6 @@ async fn handle_socket(socket: WebSocket, conversation_id: String, state: AppSta
                     }
                     // Anything else is silently ignored — view-only.
                     Some(Ok(_)) => {}
-                }
-            }
-            failure = teardown_failures.recv() => {
-                match failure {
-                    Ok(failure)
-                        if failure.work_scope == work_scope
-                            && failure.audience.matches_actor(&actor) =>
-                    {
-                        let _ = ws_sender
-                            .send(Message::Binary(status_frame(&format!("error: {}", failure.error))))
-                            .await;
-                        let _ = ws_sender.send(Message::Close(None)).await;
-                        break;
-                    }
-                    Ok(_) | Err(RecvError::Lagged(_)) => {}
-                    Err(RecvError::Closed) => break,
                 }
             }
             event = rx.recv() => {

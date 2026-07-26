@@ -142,6 +142,10 @@ describe('hasLiveResource', () => {
   it('is true for a live browser session (browser-only)', () => {
     expect(hasLiveResource(inv([], { browser: { state: 'live', idle_ms: 120_000 } }))).toBe(true);
   });
+
+  it('returns true for teardown-failed browser so cleanup retries keep polling', () => {
+    expect(hasLiveResource(inv([], { browser: { state: 'teardown_failed', idle_ms: 0 } }))).toBe(true);
+  });
 });
 
 describe('bash glyph: liveness vs outcome', () => {

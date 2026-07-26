@@ -55,16 +55,16 @@ correct weight (see `design.md`, "Why No Allium Spec").
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-WSUI-001:** WorkScope Inventory Projection | Proposed | Read-projection over in-memory registries; no new persistence |
-| **REQ-WSUI-002:** Bash Handle Inventory | Proposed | Sourced from the `WorkScope`-keyed bash registry (`specs/bash/` REQ-BASH-WS-001) |
-| **REQ-WSUI-003:** Tmux Inventory | Proposed | Server presence + in-memory `TmuxServer.status`; no session/window enumeration |
+| **REQ-WSUI-001:** WorkScope Inventory Projection | Complete | Read-projection over in-memory registries; no new persistence |
+| **REQ-WSUI-002:** Bash Handle Inventory | Complete | Sourced from the `WorkScope`-keyed bash registry (`specs/bash/` REQ-BASH-WS-001) |
+| **REQ-WSUI-003:** Tmux Inventory | Complete | Server presence + in-memory `TmuxServer.status`; no session/window enumeration |
 | **REQ-WSUI-004:** Browser Session Inventory | Complete | Manager metadata → `live`/`teardown_failed`/`torn_down`; relative `idle_ms`, no wall-clock; failed teardown remains retryable without session reuse |
-| **REQ-WSUI-005:** Sub-Agents Excluded | Proposed | Sub-agents own `SubAgentViewerDock` |
-| **REQ-WSUI-006:** Inventory Pull Endpoint | Proposed | `GET /api/work-scope/:scope_key/inventory`; `get_conversation` shape |
-| **REQ-WSUI-007:** Inventory Push Event | Proposed | `WorkScopeUpdate` `SseWireEvent`; full snapshot, no deltas |
-| **REQ-WSUI-008:** Push Event Routing | Proposed | Single non-terminal conversation per scope (REQ-PROJ-025) |
-| **REQ-WSUI-009:** Chain Page Active-Member Scope Query | Proposed | Active (latest) member's scope key, root fallback; standalone dock sharing the section's rows; no per-member fan-out; SSE-less dock polls while collapsed |
-| **REQ-WSUI-010:** Conversation Page Section | Proposed | `WorkScopeSection` in left `FileExplorerPanel`, stacked with Files/Skills/Tasks; collapsed-rail badge; atom `workScope` field |
-| **REQ-WSUI-011:** CLI Client Not a Visualization Surface | Proposed | `phoenix-client.py` text-only; CLI subcommand is future work |
+| **REQ-WSUI-005:** Sub-Agents Excluded | Complete | Sub-agents own `SubAgentViewerDock` |
+| **REQ-WSUI-006:** Inventory Pull Endpoint | Complete | `GET /api/work-scope/:scope_key/inventory`; `get_conversation` shape |
+| **REQ-WSUI-007:** Inventory Push Event | Complete | `WorkScopeUpdate` `SseWireEvent`; full snapshot, no deltas |
+| **REQ-WSUI-008:** Push Event Routing | Complete | Single non-terminal conversation per scope (REQ-PROJ-025) |
+| **REQ-WSUI-009:** Chain Page Active-Member Scope Query | Complete | Active (latest) member's scope key, root fallback; standalone dock sharing the section's rows; no per-member fan-out; SSE-less dock polls while collapsed |
+| **REQ-WSUI-010:** Conversation Page Section | Complete | `WorkScopeSection` in left `FileExplorerPanel`, stacked with Files/Skills/Tasks; collapsed-rail badge; atom `workScope` field |
+| **REQ-WSUI-011:** CLI Client Not a Visualization Surface | Complete | `phoenix-client.py` text-only; CLI subcommand is future work |
 
-**Progress:** 1 of 11 implemented.
+**Progress:** 11 of 11 implemented.
