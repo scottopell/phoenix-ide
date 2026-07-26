@@ -22,7 +22,7 @@
 -- pr-association; this spec remains singular in ownership of cleanup. Multiple
 -- associated PRs may be summarized by sibling surfaces, and one explicit active
 -- PR may be named for clarity, but cleanup is still one user-initiated
--- task/worktree action and never mutates PRs.
+-- WorkScope-owner action and never mutates PRs.
 
 use "../bedrock/bedrock.allium" as bedrock
 
@@ -31,7 +31,8 @@ use "../bedrock/bedrock.allium" as bedrock
 ------------------------------------------------------------
 
 -- The git worktree managed by Phoenix for a Work or Branch conversation.
--- One worktree per conversation; path is deterministic from conversation id.
+-- One live WorkScope owner at a time may remove it; predecessors in the
+-- chain can retain the path as history references after handoff.
 -- A worktree exists only for mode in { work, branch } (Direct and Explore
 -- conversations are not subjects of the terminal actions here).
 external entity Worktree {
@@ -67,7 +68,7 @@ enum PrCheckState    { passing | pending | failing | unknown }
 --
 --   has_live_worktree_co_owner(conversation: Conversation) -> Boolean
 --       True when at least one live conversation (non-terminal AND not
---       archived), other than this one, resolves to the same work scope:
+--       archived), other than this one, still owns the same work scope:
 --       a context continuation that inherited the worktree (REQ-BED-030),
 --       or a Work-mode sub-agent sharing the parent's worktree_path
 --       (REQ-PROJ-008). Liveness is derived from persisted conversation

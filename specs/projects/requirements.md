@@ -187,7 +187,7 @@ AND rename the worktree's temp branch in place to the chosen execution branch
 AND rename the task file to `...-in-progress--{slug}.md` if it isn't already
 AND commit the task file on that execution branch in the existing worktree
 AND transition the conversation from Explore to Work mode within the same worktree
-  (storing worktree_path, the chosen branch_name, base_branch, task_id, task_title)
+  (storing worktree_path, `work_scope_id`, the chosen branch_name, base_branch, task_id, task_title)
 AND resume agent execution with the chosen branch name
 
 WHEN user approves the task AND the file is a plain-markdown brief (not a taskmd filename)
@@ -506,11 +506,11 @@ AND SHALL NOT demote the conversation's mode
 
 WHEN a conversation has transferred ownership through `continued_in_conv_id`
 THE SYSTEM SHALL treat that row as a history reference rather than a live worktree owner
-AND SHALL preserve the worktree only while a non-archived live conversation resolves to the same `WorkScope`
+AND SHALL preserve the worktree only while a non-archived live conversation remains the owner of the same `WorkScope`
 
 WHEN a conversation undergoes a terminal-transition cascade (hard-delete,
 archive, abandon, mark-merged — REQ-BED-032 step 4)
-AND a live conversation OTHER THAN the one being deleted resolves to the same
+AND a live conversation OTHER THAN the one being deleted remains the owner of the same
 `WorkScope` — a continuation that inherits it, or a Work-mode sub-agent that
 shares its parent's `worktree_path` (REQ-PROJ-008)
 THE SYSTEM SHALL NOT remove the worktree from disk
@@ -525,14 +525,14 @@ the sole owner's normal cleanup
 
 WHEN the server starts
 AND a Phoenix-owned worktree exists on disk
-AND no non-archived live conversation resolves to its `WorkScope`
+AND no non-archived live conversation remains the owner of its `WorkScope`
 AND the worktree has no tracked or untracked changes
 THE SYSTEM SHALL remove the worktree
 AND SHALL apply its mode's branch disposition
 
 WHEN the server starts
 AND a Phoenix-owned worktree exists on disk
-AND no non-archived live conversation resolves to its `WorkScope`
+AND no non-archived live conversation remains the owner of its `WorkScope`
 AND the worktree has tracked or untracked changes OR its status cannot be determined
 THE SYSTEM SHALL retain the worktree for manual recovery
 AND SHALL report why safe reclamation was skipped
@@ -543,7 +543,7 @@ conversations that ended without cleanup. Context-exhausted conversations and
 an uncontinued context-exhausted row is an explicit exception: its worktree is held
 intentionally and must survive restart unchanged. Continued context-exhausted and
 handed-off rows have permanently transferred ownership; their live successors are
-scored independently as owners of the same scope. The cascade's any-live-owner
+scored independently as the current owners of the same scope. The cascade's any-live-owner
 guard is the same signal that gates the bash/tmux/browser cascades
 (REQ-BASH-WS-002): a Work-mode sub-agent inherits the parent's `worktree_path`,
 so removing the worktree or deleting the branch while the parent is live would
@@ -1216,5 +1216,5 @@ AND SHALL keep the worktree checkout's remote relationship distinct from the bas
 
 ### REQ-PROJ-WS-001: WorkScope as Resource Owner
 
-Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from conversation ids, working directories, or worktree paths. Conversations retaining one identity share its resources; conversations with distinct identities remain isolated even when their environments use the same path.
+Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from conversation ids, working directories, or worktree paths. Continuations and fresh Work handoffs that keep one unit of work alive transfer that same `work_scope_id` to the live successor instead of minting a parallel owner. Conversations retaining one identity share its resources; conversations with distinct identities remain isolated even when their environments use the same path.
 

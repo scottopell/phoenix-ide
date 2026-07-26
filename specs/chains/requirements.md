@@ -249,8 +249,8 @@ merged / closed), checks, and feedback-freshness signal
 THE SYSTEM SHALL address this through the **same single `work_scope_key`**
 the runtime-resource dock uses (the chain root's scope; `specs/work-scope-ui/`
 REQ-WSUI-009), not by fanning out per member — a chain's members share one
-work scope, and at most one is non-terminal (`specs/projects/`
-REQ-PROJ-025), so one scope key is complete
+work scope, and at most one live conversation owns that scope at a time (`specs/bedrock/`
+REQ-BED-030; `specs/projects/` REQ-PROJ-WS-001), so one scope key is complete
 
 THE work identity SHALL be sourced from the members' `ConvMode` git
 metadata, and the PR `display_state` / checks / feedback-freshness SHALL
@@ -281,7 +281,8 @@ on registry change) — PR state changes are not registry events, so they
 ride the PR-status pipeline that already models them. Keeping the chain
 concept while surfacing its work identity — rather than renaming the
 chain to a "work scope" — is deliberate: continuation lineage and
-resource ownership are distinct, and their near-1:1 correspondence is a
+resource ownership are distinct. The live conversation in a lineage may transfer
+ownership of the same `WorkScope` over time, so the correspondence is a
 strong default, not an invariant to hard-code.
 
 ---

@@ -659,7 +659,7 @@ notifications, when present, SHALL be optional.
 
 ### REQ-DWF-CREATE-003: Resource Reconciliation and Completion
 
-Worktree effects SHALL reserve normalized ownership, hold the canonical
+Worktree effects SHALL reserve normalized `WorkScope` ownership, hold the canonical
 repository mutation lock for destructive work, and inspect before replay. Owned
 complete resources MAY be adopted; owned partial resources MAY be repaired or
 compensated; foreign or conflicting resources SHALL enter durable conflict or

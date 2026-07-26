@@ -31,10 +31,11 @@
 -- Design basis:
 --   WorkScope-owned PR association is a standing runtime invariant: settled
 --   branch observations and PR identity are learned from authoritative local and
---   provider observations, persisted by WorkScope, and reused by status/action
---   surfaces until fresher facts replace them. PR-specific surfaces target one
---   explicit active PR whose provenance is either inferred or pinned; any
---   singular primary-PR ranking that remains is compatibility projection only.
+--   provider observations, persisted by WorkScope, and reused across
+--   continuations and fresh Work handoffs until fresher facts replace them.
+--   PR-specific surfaces target one explicit active PR whose provenance is
+--   either inferred or pinned; any singular primary-PR ranking that remains is
+--   compatibility projection only.
 --
 -- Requirement traceability: REQ-PRA-000 through REQ-PRA-004. The rules below
 --   model durable WorkScope-owned association, explicit active-PR targeting,
@@ -55,7 +56,8 @@ use "../bedrock/bedrock.allium" as bedrock
 
 -- The durable-owner key for work-affine resources. The runtime resolves a
 -- conversation to either a worktree scope or a conversation scope; continuations
--- that inherit a worktree resolve to the same WorkScope as their predecessor.
+-- and fresh Work handoffs that inherit a worktree resolve to the same WorkScope
+-- as their predecessor.
 value WorkScope {
     kind: WorkScopeKind
     inner: String

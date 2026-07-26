@@ -192,8 +192,9 @@ entity Conversation {
     working_dir: String
 
     -- REQ-BED-030: continuation pointer. When set, this conversation has
-    -- been continued and the worktree (if any) belongs to the
-    -- continuation. Used by reconcile, abandon/mark-merged gates, and
+    -- been continued and the live `WorkScope` ownership (and inherited
+    -- worktree, if any) belongs to the continuation. This row remains as
+    -- history/navigation only. Used by reconcile, abandon/mark-merged gates, and
     -- the FE "Continued in X" affordance. Single-valued by construction
     -- (see TerminalActionRequiresNoContinuation in projects).
     continued_in_conv_id: Conversation?
@@ -1174,6 +1175,8 @@ rule TaskResolved {
     --   - parent_status = context_exhausted: an orthogonal axis to
     --     core_status; the turn could not complete and there is no edge out
     --     of context_exhausted back into a running state.
+    --   - a continued predecessor is excluded because live WorkScope
+    --     ownership has moved to its continuation.
     -- This must stay consistent with the MarkAsMerged / ConfirmAbandon
     -- gates in specs/work-lifecycle/ (which permit core_status = idle, error,
     -- or recoverable_continuation_failure

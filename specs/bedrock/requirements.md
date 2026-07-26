@@ -660,7 +660,7 @@ THE SYSTEM SHALL rename the worktree's temp branch in place to `task-{NNNN}-{slu
 WHEN the user approves the task while in AwaitingTaskApproval with the
 `start_fresh_work_conversation` handoff policy
 THE SYSTEM SHALL perform the same task approval git operations
-AND create a fresh Work conversation that owns the approved task branch/worktree
+AND create a fresh Work conversation that becomes the live owner of the approved `WorkScope`, task branch, and worktree
 AND link the Explore predecessor to that Work successor through `continued_in_conv_id`
 AND mark the Explore predecessor read-only as `HandedOff`
 AND dispatch the next LLM request only in the Work successor
@@ -738,10 +738,11 @@ THE SYSTEM SHALL create a new conversation that inherits:
   - for Work mode, the parent's task_id and associated task file
 
 WHEN the parent has a worktree
-THE SYSTEM SHALL transfer worktree ownership atomically in a single database transaction:
+THE SYSTEM SHALL transfer `WorkScope` ownership atomically in a single database transaction:
   - the parent retains its `worktree_path` field as a read-only reference for history navigation
   - the continuation's `worktree_path` is set to the same value
-  - the worktree registry's owner pointer moves from parent to continuation
+  - the continuation inherits the same `work_scope_id`
+  - the live owner of that `WorkScope` moves from parent to continuation
   - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
 
 WHEN a continuation successor is newly created
@@ -759,8 +760,8 @@ matches that intent directly and eliminates the need for `git stash`/restore
 ceremony or a separate auto-stash feature. Transferring ownership rather than
 destroying and recreating is the only shape that preserves uncommitted work
 structurally, without a separate auto-stash mechanism. Single-continuation
-policy keeps worktree ownership unambiguous: at any moment, exactly one
-conversation in the parent→continuation chain owns the worktree.
+policy keeps work ownership unambiguous: at any moment, exactly one
+live conversation in the parent→continuation chain owns the `WorkScope` and therefore the inherited worktree.
 
 **Dependencies:** REQ-BED-021, REQ-PROJ-025, work-lifecycle REQ-WL-001/REQ-WL-002, REQ-PROJ-028
 

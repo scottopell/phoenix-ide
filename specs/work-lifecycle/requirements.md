@@ -27,8 +27,7 @@ It does **not** own:
 - **UI surface composition** — button labels, action zones, disposition derivation, tooltips.
   The `work-actions-bar` spec owns these.
 
-Each terminal action's branch disposition depends only on conversation mode, identically
-across both actions:
+Each terminal action's branch disposition depends only on the live conversation that currently owns the `WorkScope`, identically across both actions:
 
 | Mode | Worktree | Branch | Reason |
 |------|----------|--------|--------|
@@ -49,8 +48,8 @@ WHEN the user confirms abandonment
 THE SYSTEM SHALL capture a best-effort diff snapshot of the worktree *before* deleting it,
   bounded per diff section with a truncation indicator, and persist it to conversation
   history so the discarded work is recoverable from the record after the worktree is gone
-AND delete the worktree
-AND apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
+AND, when no other live conversation still owns that `WorkScope`, delete the worktree
+AND, when no other live conversation still owns that `WorkScope`, apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
   keep the branch)
 AND resolve the conversation via bedrock's `TaskResolved` with outcome `abandoned`
 AND emit a synthetic system message describing the outcome
@@ -74,8 +73,8 @@ Abandon may be initiated. This requirement governs what happens after the user c
 ### REQ-WL-002: Mark as Merged
 
 WHEN the user initiates "Mark as merged" on a Work or Branch conversation
-THE SYSTEM SHALL delete the worktree
-AND apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
+THE SYSTEM SHALL, when no other live conversation still owns that `WorkScope`, delete the worktree
+AND, when no other live conversation still owns that `WorkScope`, apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
   keep the branch)
 AND resolve the conversation via bedrock's `TaskResolved` with outcome `merged`
 AND emit a synthetic system message describing the outcome
@@ -89,7 +88,7 @@ THE SYSTEM SHALL commit the task file on the task branch (never on main/base); t
   reaches main only when the PR is merged through the user's normal workflow
 
 **Design:** "Mark as merged" is a user assertion that the work has shipped via the user's
-normal PR workflow — the actual merge happened outside Phoenix. Phoenix performs worktree
+normal PR workflow — the actual merge happened outside Phoenix. Phoenix performs WorkScope-owner
 cleanup only. Many repositories protect their main branch and require PR-based merges;
 squash-merging inside Phoenix would bypass code review and branch protection, so Phoenix never
 merges or pushes on the user's behalf. The task branch is deleted for Managed mode (Phoenix

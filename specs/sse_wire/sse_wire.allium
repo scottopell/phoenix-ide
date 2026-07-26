@@ -145,7 +145,7 @@ value UserFacingError {
 -- Conversation copy.
 value ConversationMetadataUpdate {
     cwd: String?
-    -- branch_name, worktree_path, conv_mode_label, base_branch,
+    -- branch_name, worktree_path, work_scope_id, conv_mode_label, base_branch,
     -- task_title: opaque
 }
 

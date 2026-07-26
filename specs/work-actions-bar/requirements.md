@@ -302,7 +302,7 @@ WHEN the conversation's `continued_in_conv_id` is set
 THE SYSTEM SHALL render the bar with no RESOLVE or FINISH verbs and no primary
 AND SHALL show a muted inline note: "Continued — actions belong on the continuation."
 
-The continuation is the live conversation; any terminal decision belongs there. bedrock
+The continuation is the live conversation and therefore the current `WorkScope` owner; any terminal decision belongs there. bedrock
 REQ-BED-031 also forbids terminal actions on a context-exhausted parent that has a
 continuation, so the suppressed bar matches the server-side legality gate.
 

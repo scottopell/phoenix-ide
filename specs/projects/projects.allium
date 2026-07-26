@@ -56,8 +56,9 @@ value WorktreePath {
 
 enum TaskFileStatus { in_progress | done | wont_do }
 
--- Worktree lifecycle is determined by conversation.mode (work vs branch).
--- No separate WorktreeKind enum needed -- the mode IS the kind.
+-- Worktree lifecycle is determined by the live conversation that currently owns
+-- the shared WorkScope (work vs branch). No separate WorktreeKind enum needed
+-- -- the mode IS the kind.
 
 -- A branch entry as presented to the user in the branch picker.
 value BranchEntry {
@@ -667,8 +668,9 @@ rule TaskApprovalExecuted {
 }
 
 -- Fresh approval performs the same git approval work but creates a Work
--- successor and links the Explore predecessor through continued_in_conv_id so
--- Chains retain one derived lineage graph.
+-- successor, transfers the same WorkScope to that live successor, and links
+-- the Explore predecessor through continued_in_conv_id so Chains retain one
+-- derived lineage graph.
 rule TaskApprovalFreshHandoffExecuted {
     when: UserApprovesTask(conversation, decision)
     requires: decision = approved_start_fresh
