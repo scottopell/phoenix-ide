@@ -3301,6 +3301,30 @@ mod tests {
         );
     }
 
+    fn valid_direct_turn_payload(message_id: &str) -> Vec<u8> {
+        phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: "gate".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: message_id.to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::ExpandReferences,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: "gate".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        )
+        .to_exact_bytes()
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn generic_delivery_resolution_rejects_direct_turn_workflow() {
         let (_dir, repo, _) = open_repo_pair().await;
@@ -3318,7 +3342,7 @@ mod tests {
                 client_key: ClientTurnKey::new("gate-delivery").unwrap(),
                 prepared: PreparedTurn::from_exact_payload(
                     &ConversationAuthority("conv-a".to_string()),
-                    vec![1],
+                    valid_direct_turn_payload("gate-delivery"),
                 ),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at,
@@ -3368,7 +3392,7 @@ mod tests {
                 client_key: ClientTurnKey::new("gate-head").unwrap(),
                 prepared: PreparedTurn::from_exact_payload(
                     &ConversationAuthority("conv-a".to_string()),
-                    vec![2],
+                    valid_direct_turn_payload("gate-head"),
                 ),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at,
