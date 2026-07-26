@@ -12,7 +12,7 @@ function setMobileViewport() {
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
-      matches: query === '(max-width: 768px)',
+      matches: query === '(max-width: 768px)' || query === '(max-width: 1024px)',
       media: query,
       onchange: null,
       addEventListener: vi.fn(),

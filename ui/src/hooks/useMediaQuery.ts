@@ -33,5 +33,6 @@ export function useMediaQuery(query: string): boolean {
 // browser resize across the boundary updates every consumer reactively
 // instead of leaving stale `isDesktop` snapshots scattered through the tree.
 export const useIsDesktop = () => useMediaQuery('(min-width: 1025px)');
+export const useIsCompactLayout = () => useMediaQuery('(max-width: 1024px)');
 export const useIsWideDesktop = () => useMediaQuery('(min-width: 1280px)');
 export const useIsMobile = () => useMediaQuery('(max-width: 768px)');

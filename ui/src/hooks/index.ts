@@ -38,7 +38,7 @@ export type { Density } from './useDensity';
 export { useScopedState } from './useScopedState';
 export { useInlineReferences } from './useInlineReferences';
 export type { UseInlineReferencesParams, InlineReferences } from './useInlineReferences';
-export { useMediaQuery, useIsDesktop, useIsWideDesktop, useIsMobile } from './useMediaQuery';
+export { useMediaQuery, useIsDesktop, useIsCompactLayout, useIsWideDesktop, useIsMobile } from './useMediaQuery';
 
 // Export state machine for testing
 export {

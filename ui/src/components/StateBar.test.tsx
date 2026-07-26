@@ -167,10 +167,12 @@ describe('mobile terminal launcher', () => {
       },
     });
 
-    expect(screen.queryByRole('button', { name: 'Open terminal' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Open terminal/ })).not.toBeInTheDocument();
     fireEvent.click(document.querySelector('.statebar-chevron')!);
 
-    const launcher = screen.getByRole('button', { name: 'Open terminal' });
+    const launcher = screen.getByRole('button', {
+      name: 'Open terminal, running, /repo/worktree, 3 unread lines',
+    });
     expect(launcher).toHaveTextContent('Terminal');
     expect(launcher).toHaveTextContent('/repo/worktree');
     expect(launcher).toHaveTextContent('+3');
@@ -184,7 +186,7 @@ function setMobileViewport(matches = true) {
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
-      matches: query === '(max-width: 768px)' ? matches : false,
+      matches: query === '(max-width: 1024px)' ? matches : false,
       media: query,
       onchange: null,
       addEventListener: vi.fn((_event: string, cb: (event: MediaQueryListEvent) => void) => listeners.add(cb)),

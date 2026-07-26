@@ -453,6 +453,7 @@ function ConversationPageContent({
   });
   const terminalLauncherRef = useRef<HTMLButtonElement>(null);
   const terminalCloseRef = useRef<HTMLButtonElement>(null);
+  const mobileTerminalSheetRef = useRef<HTMLDivElement>(null);
 
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
@@ -1948,6 +1949,7 @@ function ConversationPageContent({
   );
   const showTerminal =
     !!conversationId &&
+    routePrefix !== '/global' &&
     !isArchived &&
     convStateForChildren.type !== 'terminal' &&
     convStateForChildren.type !== 'handed_off' &&
@@ -1966,10 +1968,44 @@ function ConversationPageContent({
 
   useEffect(() => {
     if (!showMobileTerminal) return;
+    const sheet = mobileTerminalSheetRef.current;
+    const parent = sheet?.parentElement;
+    if (!sheet || !parent) return;
+    const background = Array.from(parent.children).filter(
+      (child): child is HTMLElement => child instanceof HTMLElement && child !== sheet && !child.inert,
+    );
+    background.forEach((element) => { element.inert = true; });
+    return () => background.forEach((element) => { element.inert = false; });
+  }, [showMobileTerminal]);
+
+  useEffect(() => {
+    if (!showMobileTerminal) return;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.stopPropagation();
-      handleCloseMobileTerminal();
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        handleCloseMobileTerminal();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const sheet = mobileTerminalSheetRef.current;
+      if (!sheet) return;
+      const focusable = Array.from(sheet.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )).filter((element) => element.getAttribute('aria-hidden') !== 'true');
+      if (focusable.length === 0) {
+        event.preventDefault();
+        sheet.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
@@ -2201,7 +2237,7 @@ function ConversationPageContent({
       || commissionReviewViewerOpen
     );
 
-  const terminalSplitPane = showTerminal && routePrefix !== '/global' ? (
+  const terminalSplitPane = showTerminal ? (
     <>
       <PaneDivider
         orientation="horizontal"
@@ -2637,10 +2673,12 @@ function ConversationPageContent({
       {!isDesktop && showTerminal && (
         <div
           className={`mobile-terminal-sheet${showMobileTerminal ? ' mobile-terminal-sheet--open' : ''}`}
+          ref={mobileTerminalSheetRef}
           role={showMobileTerminal ? 'dialog' : undefined}
           aria-modal={showMobileTerminal ? true : undefined}
           aria-label={showMobileTerminal ? 'Terminal' : undefined}
           aria-hidden={!showMobileTerminal}
+          tabIndex={showMobileTerminal ? -1 : undefined}
         >
           <div className="mobile-terminal-sheet-header">
             <strong>Terminal</strong>

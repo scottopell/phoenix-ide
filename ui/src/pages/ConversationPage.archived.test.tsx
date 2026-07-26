@@ -197,7 +197,12 @@ const catchUpMessage: Message = {
   created_at: '2024-01-01T00:00:02Z',
 };
 
-function renderPage(conversation: Conversation, routeSegment: string = conversation.slug, initialSearch = '') {
+function renderPage(
+  conversation: Conversation,
+  routeSegment: string = conversation.slug,
+  initialSearch = '',
+  routePrefix: '/c' | '/global' = '/c',
+) {
   const store = new ConversationStore();
   store.dispatch(conversation.slug, {
     type: 'set_initial_data',
@@ -248,9 +253,12 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={draftStore}>
         <ConversationReadinessProvider>
-          <MemoryRouter initialEntries={[`/c/${routeSegment}${initialSearch}`]}>
+          <MemoryRouter initialEntries={[`${routePrefix}/${routeSegment}${initialSearch}`]}>
             <Routes>
-              <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              <Route
+                path={`${routePrefix}/:slug`}
+                element={<DesktopLayout><ConversationPage routePrefix={routePrefix} /></DesktopLayout>}
+              />
             </Routes>
           </MemoryRouter>
         </ConversationReadinessProvider>
@@ -847,6 +855,15 @@ describe('ConversationPage archived read-only rendering', () => {
   it('moves the mobile terminal out of persistent conversation chrome into a launcher sheet', async () => {
     viewportFlags.isDesktop = false;
     viewportFlags.isWideDesktop = false;
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: query === '(max-width: 1024px)',
+        media: query,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    });
 
     renderPage(makeConversation());
 
@@ -858,6 +875,32 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(document.querySelector('.mobile-terminal-sheet')).toContainElement(terminal);
 
     expect(document.querySelector('.mobile-terminal-sheet')).not.toHaveClass('mobile-terminal-sheet--open');
+
+    fireEvent.click(document.querySelector('.statebar-chevron')!);
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/ }));
+    const close = screen.getByRole('button', { name: 'Close terminal' });
+    expect(close).toHaveFocus();
+    fireEvent.keyDown(close, { key: 'Tab', shiftKey: true });
+    expect(close).toHaveFocus();
+    expect(document.querySelector('.conversation-column')).toHaveProperty('inert', true);
+
+    fireEvent.click(close);
+    expect(document.querySelector('.conversation-column')).toHaveProperty('inert', false);
+    return waitFor(() => {
+      expect(screen.getByRole('button', { name: /Open terminal/ })).toHaveFocus();
+    });
+  });
+
+  it('does not expose a conversation terminal on coordinator routes', async () => {
+    viewportFlags.isDesktop = false;
+    viewportFlags.isWideDesktop = false;
+
+    const conversation = makeConversation();
+    renderPage(conversation, conversation.slug, '', '/global');
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(screen.queryByTestId('terminal-panel')).not.toBeInTheDocument();
+    expect(document.querySelector('.mobile-terminal-sheet')).toBeNull();
   });
 
   it('cold-loads a UUID route via id metadata and id full-history paths', async () => {

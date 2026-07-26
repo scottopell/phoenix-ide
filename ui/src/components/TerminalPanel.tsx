@@ -1044,14 +1044,19 @@ export function TerminalPanel({
 
   // For the rich HUD: prefer reported_cwd, fall back to conversation cwd.
   const effectiveCwd = reportedCwd ?? cwd ?? '';
+  const launcherActivity: TerminalPanelStatus['activity'] = isDisconnected
+    ? 'disconnected'
+    : currentCommand !== null
+      ? 'running'
+      : activity;
 
   useEffect(() => {
     onStatusChange?.({
-      activity,
+      activity: launcherActivity,
       unreadLines: unreadDisplay,
       cwd: effectiveCwd,
     });
-  }, [activity, effectiveCwd, onStatusChange, unreadDisplay]);
+  }, [effectiveCwd, launcherActivity, onStatusChange, unreadDisplay]);
 
   const snippet: ShellSnippet | null = getSnippetForShell(shell);
   const shellLabel = shellDisplayName(shell);

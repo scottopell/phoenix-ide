@@ -547,7 +547,7 @@
   outline-offset: 2px;
 }
 
-@media (width <= 768px) {
+@media (width <= 1024px) {
   #state-bar.statebar-mobile {
     height: auto;
     min-height: 44px;

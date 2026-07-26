@@ -21,7 +21,7 @@ import {
 } from "../api";
 import type { ConversationPrStatusHandle } from "../hooks/useConversationPrStatus";
 import type { ConnectionState } from "../hooks";
-import { useIsMobile } from "../hooks";
+import { useIsCompactLayout } from "../hooks";
 import { getStateDescription, isAgentWorking } from "../utils";
 import {
   getConversationIdentity,
@@ -510,15 +510,14 @@ export function StateBar({
   void _deprecatedToolStartedAt;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
-  // Mobile breakpoint mirrors the @media (max-width: 768px) block in index.css.
-  const isMobile = useIsMobile();
+  const usesCompactLayout = useIsCompactLayout();
   const [mobileExpanded, setMobileExpanded] = useState(false);
   // Collapse the mobile-expanded section when the viewport widens past
   // mobile — otherwise a user who expanded on phone, rotated to landscape,
   // would see a desktop bar with a stale "expanded" affordance.
   useEffect(() => {
-    if (!isMobile) setMobileExpanded(false);
-  }, [isMobile]);
+    if (!usesCompactLayout) setMobileExpanded(false);
+  }, [usesCompactLayout]);
   const pickerRef = useRef<HTMLSpanElement>(null);
 
   // Live elapsed-time counter, generalized for every working phase
@@ -939,7 +938,7 @@ export function StateBar({
       ? unavailablePrHint(prStatus.unavailable_reason)
       : null;
   const prRailAvailability = prStatusHandle
-    ? derivePrRailAvailability(prStatusHandle, isMobile)
+    ? derivePrRailAvailability(prStatusHandle, usesCompactLayout)
     : null;
   const workActionsPrRailOwnsSelection = Boolean(
     workActionsAvailable
@@ -1079,7 +1078,15 @@ export function StateBar({
       </button>
     ) : null;
 
-  if (isMobile) {
+  const terminalLauncherAccessibleName = terminalLauncher
+    ? `Open terminal, ${terminalLauncher.status.activity}, ${terminalLauncher.status.cwd || 'Shell'}${
+      terminalLauncher.status.unreadLines > 0
+        ? `, ${terminalLauncher.status.unreadLines} unread lines`
+        : ''
+    }`
+    : undefined;
+
+  if (usesCompactLayout) {
     const toggleMobileExpanded = () => setMobileExpanded((v) => !v);
     const handleCollapsedKey = (e: ReactKeyboardEvent) => {
       if (e.key === "Enter" || e.key === " ") {
@@ -1224,7 +1231,7 @@ export function StateBar({
                       event.stopPropagation();
                       terminalLauncher.onOpen();
                     }}
-                    aria-label="Open terminal"
+                    aria-label={terminalLauncherAccessibleName}
                   >
                     <TerminalSquare size={20} aria-hidden="true" />
                     <span className="statebar-terminal-launcher-copy">
@@ -1389,7 +1396,7 @@ export function StateBar({
             </button>
           )}
         </div>
-        {isMobile && (
+        {usesCompactLayout && (
           <button
             type="button"
             className="statebar-chevron"
