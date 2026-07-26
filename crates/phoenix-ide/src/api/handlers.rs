@@ -3117,8 +3117,9 @@ async fn stop_conversation_browser_session(
     state
         .runtime
         .browser_sessions()
-        .request_kill_session_for_actor(&work_scope, &actor)
-        .await;
+        .kill_session_for_actor(&work_scope, &actor)
+        .await
+        .map_err(|error| AppError::Internal(format!("browser stop failed: {error}")))?;
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -3140,8 +3141,9 @@ async fn stop_work_scope_browser_session(
     state
         .runtime
         .browser_sessions()
-        .request_kill_session_for_actor(&work_scope, &actor)
-        .await;
+        .kill_session_for_actor(&work_scope, &actor)
+        .await
+        .map_err(|error| AppError::Internal(format!("browser stop failed: {error}")))?;
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -4531,6 +4533,35 @@ async fn scope_still_owned_after_delete(
     }))
 }
 
+async fn cleanup_browser_with_retry(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+    work_scope: &crate::work_scope::ResourceScopeKey,
+    inheritor_scope: Option<&crate::work_scope::ResourceScopeKey>,
+) {
+    let browser_manager = state.runtime.browser_sessions();
+    let browser_actor = crate::work_scope::EffectiveResourceAccess::new(
+        conv.id.clone(),
+        match conv.conv_mode {
+            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        },
+    );
+    let cleanup = || {
+        crate::tools::browser::session::cascade_browser_on_delete(
+            browser_manager,
+            work_scope,
+            &browser_actor,
+            inheritor_scope,
+        )
+    };
+    if let Err(first_error) = cleanup().await {
+        if let Err(retry_error) = cleanup().await {
+            tracing::error!(conv_id = %conv.id, %first_error, %retry_error, "browser cleanup failed after immediate retry; lifecycle operation will continue");
+        }
+    }
+}
+
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
 /// factored out so hard-delete, archive, abandon, and mark-merged share the
 /// exact same resource teardown. Authoritative failures (worktree-removal,
@@ -4657,24 +4688,7 @@ pub(super) async fn run_resource_cleanup_cascade(
 
     // Step 6: browser session. Same any-live-owner rule as tmux
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
-    if let Err(error) = crate::tools::browser::session::cascade_browser_on_delete(
-        state.runtime.browser_sessions(),
-        &work_scope,
-        &crate::work_scope::EffectiveResourceAccess::new(
-            conv.id.clone(),
-            match conv.conv_mode {
-                crate::db::ConvMode::Explore { .. } => {
-                    crate::work_scope::ResourceAuthority::Restricted
-                }
-                _ => crate::work_scope::ResourceAuthority::Work,
-            },
-        ),
-        inheritor_scope,
-    )
-    .await
-    {
-        tracing::warn!(conv_id = %id, %error, "browser cleanup failed; lifecycle operation will continue");
-    }
+    cleanup_browser_with_retry(state, conv, &work_scope, inheritor_scope).await;
 
     Ok(())
 }
