@@ -2200,6 +2200,24 @@ mod lifecycle_hook_tests {
         );
     }
 
+    #[test]
+    fn shared_explore_stop_does_not_target_private_sub_agent_key() {
+        let shared = scope("pre-rekey-conversation-scope");
+        let user_explore = EffectiveResourceAccess::shared_restricted("user-explore");
+        let private_sub_agent =
+            EffectiveResourceAccess::new("explore-child", ResourceAuthority::Restricted);
+        let work_actor = EffectiveResourceAccess::new("work-parent", ResourceAuthority::Work);
+
+        assert_eq!(
+            super::session_key(&shared, &user_explore),
+            super::session_key(&shared, &work_actor)
+        );
+        assert_ne!(
+            super::session_key(&shared, &user_explore),
+            super::session_key(&shared, &private_sub_agent)
+        );
+    }
+
     /// Test the full create-emit + kill-emit pair end-to-end using a
     /// hand-rolled `BrowserSession` substitute is not possible without a
     /// real chrome (the struct's fields require live `Browser` and `Page`

@@ -3106,16 +3106,27 @@ async fn stop_conversation_browser_session(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let work_scope = conversation_work_scope(&conversation)?;
+    let current_actor = crate::work_scope::EffectiveResourceAccess::new(
+        conversation.id.clone(),
+        match conversation.conv_mode {
+            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        },
+    );
     let browser_sessions = state.runtime.browser_sessions();
-    browser_sessions.request_kill_session(&work_scope).await;
+    browser_sessions
+        .request_kill_session_for_actor(&work_scope, &current_actor)
+        .await;
 
     let conversation_scope = crate::work_scope::ResourceScopeKey::Work(
         crate::work_scope::WorkScopeId::parse(conversation.id.clone())
             .map_err(|error| AppError::Internal(error.to_string()))?,
     );
     if conversation_scope != work_scope {
+        let pre_rekey_actor =
+            crate::work_scope::EffectiveResourceAccess::shared_restricted(conversation.id);
         browser_sessions
-            .request_kill_session(&conversation_scope)
+            .request_kill_session_for_actor(&conversation_scope, &pre_rekey_actor)
             .await;
     }
 
