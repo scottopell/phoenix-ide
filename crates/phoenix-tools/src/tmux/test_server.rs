@@ -137,6 +137,8 @@ impl TestTmuxServerOwner {
             "tmux test root must be under a short system temporary directory"
         );
 
+        fs::write(canonical_root.join(".parent-heartbeat"), [])
+            .expect("initialize tmux test owner heartbeat");
         let parent_pid = std::process::id().to_string();
         let mut command = Command::new("python3");
         command

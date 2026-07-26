@@ -1150,36 +1150,57 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
 /// any in-app terminal that later attaches) in the Phoenix repo
 /// instead of the conversation's project directory.
 ///
+type TestCreatorHandoff = (PathBuf, PathBuf);
+
 fn tmux_spawn_command(
     socket_path: &Path,
     tmux_args: &[String],
     contain_test_spawn: bool,
-) -> tokio::process::Command {
+) -> (tokio::process::Command, Option<TestCreatorHandoff>) {
     let Some(root) = socket_path.parent().filter(|_| contain_test_spawn) else {
         let mut command = tokio::process::Command::new("tmux");
         command.args(tmux_args);
-        return command;
+        return (command, None);
     };
     let marker = root.join(format!(".creating-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&marker, []).expect("publish tmux test creation ownership");
-    let wrapper = r"
+    let gate = root.join(format!(".creator-gate-{}", uuid::Uuid::new_v4()));
+    let wrapper = r#"
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
-marker = Path(sys.argv[1])
-marker.write_text(str(os.getpid()))
+parent = int(sys.argv[1])
+gate = Path(sys.argv[2])
+marker = Path(sys.argv[3])
+root = marker.parent
+while (
+    root.exists()
+    and not (root / ".cleanup-request").exists()
+    and not gate.exists()
+    and os.getppid() == parent
+):
+    time.sleep(0.01)
+if not gate.exists():
+    sys.exit(1)
 try:
-    completed = subprocess.run(sys.argv[2:], check=False)
+    completed = subprocess.run(sys.argv[4:], check=False)
     sys.exit(completed.returncode)
 finally:
+    gate.unlink(missing_ok=True)
     marker.unlink(missing_ok=True)
-";
+"#;
     let mut command = tokio::process::Command::new("python3");
-    command.arg("-c").arg(wrapper).arg(marker).arg("tmux");
-    command.args(tmux_args);
     command
+        .arg("-c")
+        .arg(wrapper)
+        .arg(std::process::id().to_string())
+        .arg(&gate)
+        .arg(&marker)
+        .arg("tmux");
+    command.args(tmux_args);
+    (command, Some((marker, gate)))
 }
 
 /// # Errors
@@ -1211,18 +1232,30 @@ async fn spawn_session_owned(
         "-s".to_string(),
         TMUX_DEFAULT_SESSION.to_string(),
     ];
-    let mut cmd = tmux_spawn_command(socket_path, &tmux_args, contain_test_spawn);
+    let (mut cmd, creator_handoff) =
+        tmux_spawn_command(socket_path, &tmux_args, contain_test_spawn);
     // A tmux pane shell inherits the tmux *server's* environment, captured here.
     // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
     // than inheriting Phoenix's env, which would leak server secrets into every
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
     set_tmux_server_env(&mut cmd);
-    let output = cmd
+    let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
+        .map_err(|e| TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!("failed to invoke tmux: {e}"),
+        })?;
+    if let Some((marker, gate)) = creator_handoff {
+        std::fs::write(marker, child.id().unwrap_or_default().to_string())
+            .expect("publish tmux creator PID");
+        std::fs::write(gate, []).expect("release tmux creator gate");
+    }
+    let output = child
+        .wait_with_output()
         .await
         .map_err(|e| TmuxError::SpawnFailed {
             socket_path: socket_path.to_path_buf(),
