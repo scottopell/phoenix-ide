@@ -1003,12 +1003,8 @@ fn thermal_coverage_snapshot(
     generation: &ResourceObservationGeneration,
 ) -> ThermalCoverageSnapshot {
     let bash = generation.all_bash_pids();
-    let work_scopes = generation
-        .handles
-        .iter()
-        .map(|target| target.scope_key.as_str())
-        .collect::<BTreeSet<_>>();
-    let uncovered_reasons = vec![
+    let work_scopes = &generation.live_bash_work_scopes;
+    let mut uncovered_reasons = vec![
         "browser sessions are excluded because authoritative native process ownership is not exposed"
             .to_string(),
         "terminal processes are excluded because resource sampling does not retain their WorkScope owner"
@@ -1016,6 +1012,12 @@ fn thermal_coverage_snapshot(
         "local stdio MCP servers are excluded because authoritative native process ownership is not exposed"
             .to_string(),
     ];
+    if !generation.bash_attribution_available {
+        uncovered_reasons.push(
+            "live Bash WorkScopes are eligible, but native process attribution is unavailable"
+                .to_string(),
+        );
+    }
     ThermalCoverageSnapshot {
         eligible_work_scope_count: u32::try_from(work_scopes.len()).unwrap_or(u32::MAX),
         eligible_process_count: u32::try_from(bash.len()).unwrap_or(u32::MAX),
@@ -1453,6 +1455,10 @@ mod tests {
             observations,
             api_pids,
             terminal_pids,
+            live_bash_work_scopes: handles
+                .iter()
+                .map(|handle| handle.scope_key.clone())
+                .collect(),
             handles,
             bash_attribution_available: true,
         }
@@ -1505,6 +1511,33 @@ mod tests {
             .uncovered_reasons
             .iter()
             .any(|reason| reason.contains("terminal processes are excluded")));
+    }
+
+    #[test]
+    fn failed_bash_attribution_preserves_eligible_scope_and_reports_gap() {
+        let mut generation = generation_with_thermal(
+            thermal_sample(Some(ThermalPressureSample::Elevated), None),
+            BTreeSet::new(),
+            Some(BTreeSet::new()),
+            vec![crate::api::resource_monitor::HandleObservationTarget {
+                scope_key: "work:test".into(),
+                handle_id: "b-1".into(),
+                pids: BTreeSet::new(),
+            }],
+            BTreeMap::new(),
+        );
+        generation.handles.clear();
+        generation.bash_attribution_available = false;
+
+        let coverage = thermal_coverage_snapshot(&generation);
+
+        assert_eq!(coverage.eligible_work_scope_count, 1);
+        assert_eq!(coverage.eligible_process_count, 0);
+        assert_eq!(coverage.covered_process_count, 0);
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("native process attribution is unavailable")));
     }
 
     #[test]

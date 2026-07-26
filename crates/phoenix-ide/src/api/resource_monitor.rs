@@ -65,9 +65,11 @@ pub struct ResourceObservationGeneration {
     pub api_pids: BTreeSet<u32>,
     pub terminal_pids: Option<BTreeSet<u32>>,
     pub handles: Vec<HandleObservationTarget>,
+    pub live_bash_work_scopes: BTreeSet<String>,
     pub bash_attribution_available: bool,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThermalPressureSample {
     Nominal,
@@ -82,6 +84,7 @@ pub enum ThermalProviderUnavailableReason {
     Unreadable,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThermalObservationSample {
     Available {
@@ -255,6 +258,7 @@ impl ThermalDecisionState {
                 ..
             } => {
                 self.consecutive_nominal_samples = 0;
+                self.proposed_action = ThermalGovernorActionSample::None;
                 if self.state == ThermalGovernorStateSample::Unavailable {
                     self.state = ThermalGovernorStateSample::Nominal;
                 }
@@ -397,6 +401,10 @@ async fn sample_generation(
         .collect::<BTreeMap<_, _>>();
 
     let mut handles = Vec::with_capacity(live_groups.len());
+    let live_bash_work_scopes = live_groups
+        .iter()
+        .map(|group| group.work_scope.stable_key())
+        .collect();
     let mut bash_identities = BTreeMap::<u32, ProcessIdentity>::new();
     let mut bash_attribution_available = true;
     for group in live_groups {
@@ -457,6 +465,7 @@ async fn sample_generation(
         api_pids: api_identities.keys().copied().collect(),
         terminal_pids: terminal_identities.map(|ids| ids.keys().copied().collect()),
         handles,
+        live_bash_work_scopes,
         bash_attribution_available,
     }
 }
@@ -497,6 +506,7 @@ mod tests {
             api_pids: BTreeSet::new(),
             terminal_pids: Some(BTreeSet::new()),
             handles: Vec::new(),
+            live_bash_work_scopes: BTreeSet::new(),
             bash_attribution_available: true,
         }
     }
@@ -546,6 +556,9 @@ mod tests {
             restored.proposed_action,
             ThermalGovernorActionSample::Restore
         );
+        let settled = state.observe(&nominal);
+        assert_eq!(settled.state, ThermalGovernorStateSample::Nominal);
+        assert_eq!(settled.proposed_action, ThermalGovernorActionSample::None);
     }
 
     #[test]

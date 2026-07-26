@@ -29,6 +29,10 @@
 enum ThermalPressure {
     nominal
     | elevated
+}
+
+enum ThermalSampleAvailability {
+    available
     | unavailable
 }
 
@@ -60,7 +64,8 @@ enum UnavailableReason {
 ------------------------------------------------------------
 
 value ThermalSample {
-    pressure: ThermalPressure
+    availability: ThermalSampleAvailability
+    pressure: ThermalPressure?
     sampled_at: Timestamp
     unavailable_reason: UnavailableReason?
     raw_temperature_available: Boolean
@@ -81,6 +86,7 @@ entity ThermalGovernor {
     last_sample: ThermalSample?
     proposed_action: ProposedAction
     applied_action: ThermalActionKind
+    has_covered_targets: Boolean
 
     transitions state {
         nominal -> elevated
@@ -97,11 +103,11 @@ entity ThermalGovernor {
 ------------------------------------------------------------
 
 -- sample_is_supported_nominal(sample) -> Boolean
---   sample.pressure = nominal and sample.unavailable_reason = null.
+--   sample.availability = available and sample.pressure = nominal.
 -- sample_is_supported_elevated(sample) -> Boolean
---   sample.pressure = elevated and sample.unavailable_reason = null.
+--   sample.availability = available and sample.pressure = elevated.
 -- sample_is_unavailable(sample) -> Boolean
---   sample.pressure = unavailable and sample.unavailable_reason != null.
+--   sample.availability = unavailable.
 -- last_good_sample_exists(governor) -> Boolean
 --   The governor has retained a prior supported thermal sample.
 -- last_good_sample_is_stale(governor, sample) -> Boolean
@@ -115,16 +121,34 @@ entity ThermalGovernor {
 -- restoration_is_sustained_safe(governor, sample) -> Boolean
 --   The governor's hysteresis condition for leaving elevated state is satisfied
 --   by the observed safer pressure sample.
--- proposed_deprioritization() -> ProposedAction
---   Returns ProposedAction{ kind: deprioritize, affects_targets: true }.
--- proposed_restoration() -> ProposedAction
---   Returns ProposedAction{ kind: restore, affects_targets: true }.
+-- proposed_deprioritization(governor) -> ProposedAction
+--   Returns ProposedAction{ kind: deprioritize,
+--   affects_targets: governor.has_covered_targets }.
+-- proposed_restoration(governor) -> ProposedAction
+--   Returns ProposedAction{ kind: restore,
+--   affects_targets: governor.has_covered_targets }.
 -- no_proposed_action() -> ProposedAction
 --   Returns ProposedAction{ kind: none, affects_targets: false }.
 
+invariant ThermalSampleAvailabilityIsExclusive {
+    (sample.availability = available implies
+        sample.pressure != null and sample.unavailable_reason = null)
+    and
+    (sample.availability = unavailable implies
+        sample.pressure = null and sample.unavailable_reason != null)
+}
+
+invariant ProposedActionTargetEffectMatchesCoverage {
+    (governor.proposed_action.kind = none
+        and not governor.proposed_action.affects_targets)
+    or
+    (governor.proposed_action.kind != none
+        and governor.proposed_action.affects_targets = governor.has_covered_targets)
+}
+
 rule ThermalSampleRecordsCapability {
     when: ThermalSampleObserved(governor, sample)
-    requires: sample.pressure in { nominal, elevated }
+    requires: sample.availability = available
     ensures: ThermalGovernor{governor}.last_sample = sample
 }
 
@@ -158,7 +182,7 @@ rule ObserveOnlyElevatedPressureProposesAction {
     requires: sample_is_supported_elevated(sample)
     ensures: ThermalGovernor{governor}.state = elevated
     ensures: ThermalGovernor{governor}.last_sample = sample
-    ensures: ThermalGovernor{governor}.proposed_action = proposed_deprioritization()
+    ensures: ThermalGovernor{governor}.proposed_action = proposed_deprioritization(governor)
 }
 
 rule ObserveOnlyRecoveryProposesRestoration {
@@ -169,7 +193,7 @@ rule ObserveOnlyRecoveryProposesRestoration {
     requires: restoration_is_sustained_safe(governor, sample)
     ensures: ThermalGovernor{governor}.state = nominal
     ensures: ThermalGovernor{governor}.last_sample = sample
-    ensures: ThermalGovernor{governor}.proposed_action = proposed_restoration()
+    ensures: ThermalGovernor{governor}.proposed_action = proposed_restoration(governor)
 }
 
 rule NominalSampleWithoutRestorationKeepsState {
@@ -206,6 +230,7 @@ surface ThermalObservationSurface {
         ThermalGovernor.last_sample
         ThermalGovernor.proposed_action
         ThermalGovernor.applied_action
+        ThermalGovernor.has_covered_targets
 
     @guarantee ObserveOnlyActionIsDiagnosticOnly
         -- In observe-only mode the proposed action is diagnostic state.
