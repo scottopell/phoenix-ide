@@ -16078,6 +16078,12 @@ mod tests {
         db.create_conversation("conv-wake", "wake", "/tmp", true, None, None)
             .await
             .unwrap();
+        let conversation = db.get_conversation("conv-wake").await.unwrap();
+        let work_scope_id = conversation
+            .work_scope_id
+            .expect("created conversation has a work scope")
+            .as_str()
+            .to_string();
         let repo = crate::workflow::wake::WakeRepository::new(db.pool.clone());
         let workflow_id = phoenix_workflow::WorkflowId(44);
         let intent = phoenix_workflow::wake_profile::WakeRegistrationIntent {
@@ -16085,13 +16091,11 @@ mod tests {
             root_conversation_id: "conv-wake".into(),
             conversation_id: "conv-wake".into(),
             registration_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                "conv-wake".into(),
+                work_scope_id.clone(),
             ),
             resource: phoenix_workflow::wake_profile::WakeResourceIdentity::Bash(
                 phoenix_workflow::wake_profile::BashResourceIdentity {
-                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(
-                        "conv-wake".into(),
-                    ),
+                    work_scope: phoenix_workflow::wake_profile::WorkScopeIdentity(work_scope_id),
                     handle_id: "b-44".into(),
                 },
             ),
