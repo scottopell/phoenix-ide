@@ -67,4 +67,4 @@ correct weight (see `design.md`, "Why No Allium Spec").
 | **REQ-WSUI-010:** Conversation Page Section | Proposed | `WorkScopeSection` in left `FileExplorerPanel`, stacked with Files/Skills/Tasks; collapsed-rail badge; atom `workScope` field |
 | **REQ-WSUI-011:** CLI Client Not a Visualization Surface | Proposed | `phoenix-client.py` text-only; CLI subcommand is future work |
 
-**Progress:** 0 of 11 implemented.
+**Progress:** 1 of 11 implemented.

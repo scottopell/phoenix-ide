@@ -896,13 +896,18 @@ impl BrowserSessionAudience {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum BrowserSessionLifecycleKind {
+    Active,
+    Inactive,
+    InventoryOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct BrowserSessionLifecycleEvent {
     pub work_scope: ResourceScopeKey,
     pub audience: BrowserSessionAudience,
-    /// `true` on session creation, `false` on session removal (kill or
-    /// idle cleanup).
-    pub active: bool,
+    pub kind: BrowserSessionLifecycleKind,
 }
 
 /// Sink the manager publishes lifecycle events into. A bounded `mpsc` keeps
@@ -1075,7 +1080,7 @@ impl BrowserSessionManager {
         &self,
         work_scope: &ResourceScopeKey,
         audience: BrowserSessionAudience,
-        active: bool,
+        kind: BrowserSessionLifecycleKind,
     ) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
@@ -1083,12 +1088,12 @@ impl BrowserSessionManager {
         let event = BrowserSessionLifecycleEvent {
             work_scope: work_scope.clone(),
             audience,
-            active,
+            kind,
         };
         if let Err(e) = sink.send(event) {
             tracing::debug!(
                 work_scope = %work_scope,
-                active,
+                ?kind,
                 error = %e,
                 "dropping browser session lifecycle event — sink closed"
             );
@@ -1278,7 +1283,7 @@ impl BrowserSessionManager {
                 BrowserSessionAudience::Conversation(actor.conversation_id().to_string())
             }
         };
-        self.emit_lifecycle(work_scope, audience, true);
+        self.emit_lifecycle(work_scope, audience, BrowserSessionLifecycleKind::Active);
 
         Ok(session_arc)
     }
@@ -1501,7 +1506,11 @@ impl BrowserSessionManager {
                     }
                 };
                 drop(entry);
-                manager.emit_lifecycle(&removed_scope, audience, false);
+                manager.emit_lifecycle(
+                    &removed_scope,
+                    audience,
+                    BrowserSessionLifecycleKind::Inactive,
+                );
                 kill_done.notify_waiters();
                 Ok(())
             }),
@@ -1545,7 +1554,11 @@ impl BrowserSessionManager {
                         audience: audience.clone(),
                         error: error.to_string(),
                     });
-                manager.emit_lifecycle(&work_scope, audience, true);
+                manager.emit_lifecycle(
+                    &work_scope,
+                    audience,
+                    BrowserSessionLifecycleKind::InventoryOnly,
+                );
             }
             Ok::<(), BrowserError>(())
         });
@@ -1879,7 +1892,7 @@ mod lifecycle_hook_tests {
 
     use super::{
         BrowserSession, BrowserSessionAudience, BrowserSessionLifecycleEvent,
-        BrowserSessionLifecycleSink, BrowserSessionManager,
+        BrowserSessionLifecycleKind, BrowserSessionLifecycleSink, BrowserSessionManager,
     };
     use phoenix_core::work_scope::{
         EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey, WorkScopeId,
@@ -2021,19 +2034,31 @@ mod lifecycle_hook_tests {
         let (manager, mut rx) = install_sink();
         let a = scope("conv-A");
         let b = scope("conv-B");
-        manager.emit_lifecycle(&a, BrowserSessionAudience::Scope, true);
-        manager.emit_lifecycle(&a, BrowserSessionAudience::Scope, false);
-        manager.emit_lifecycle(&b, BrowserSessionAudience::Scope, true);
+        manager.emit_lifecycle(
+            &a,
+            BrowserSessionAudience::Scope,
+            BrowserSessionLifecycleKind::Active,
+        );
+        manager.emit_lifecycle(
+            &a,
+            BrowserSessionAudience::Scope,
+            BrowserSessionLifecycleKind::Inactive,
+        );
+        manager.emit_lifecycle(
+            &b,
+            BrowserSessionAudience::Scope,
+            BrowserSessionLifecycleKind::Active,
+        );
 
         let e1 = rx.try_recv().expect("first event missing");
         assert_eq!(e1.work_scope, a);
-        assert!(e1.active);
+        assert!(matches!(e1.kind, BrowserSessionLifecycleKind::Active));
         let e2 = rx.try_recv().expect("second event missing");
         assert_eq!(e2.work_scope, a);
-        assert!(!e2.active);
+        assert!(matches!(e2.kind, BrowserSessionLifecycleKind::Inactive));
         let e3 = rx.try_recv().expect("third event missing");
         assert_eq!(e3.work_scope, b);
-        assert!(e3.active);
+        assert!(matches!(e3.kind, BrowserSessionLifecycleKind::Active));
         assert!(rx.try_recv().is_err(), "no more events expected");
     }
 
@@ -2043,7 +2068,11 @@ mod lifecycle_hook_tests {
     async fn emit_lifecycle_without_sink_is_no_op() {
         let manager = BrowserSessionManager::default();
         let scope = scope("conv-X");
-        manager.emit_lifecycle(&scope, BrowserSessionAudience::Scope, true);
+        manager.emit_lifecycle(
+            &scope,
+            BrowserSessionAudience::Scope,
+            BrowserSessionLifecycleKind::Active,
+        );
         assert!(!manager.is_active(&scope).await);
     }
 

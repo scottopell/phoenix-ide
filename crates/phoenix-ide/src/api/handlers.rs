@@ -4536,7 +4536,7 @@ async fn cleanup_browser_with_retry(
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
     inheritor_scope: Option<&crate::work_scope::ResourceScopeKey>,
-) -> Result<(), AppError> {
+) {
     let browser_manager = state.runtime.browser_sessions();
     let browser_actor = crate::work_scope::EffectiveResourceAccess::new(
         conv.id.clone(),
@@ -4555,12 +4555,9 @@ async fn cleanup_browser_with_retry(
     };
     if let Err(first_error) = cleanup().await {
         if let Err(retry_error) = cleanup().await {
-            return Err(AppError::Internal(format!(
-                "browser cleanup failed after retry: {first_error}; {retry_error}"
-            )));
+            tracing::error!(conv_id = %conv.id, %first_error, %retry_error, "browser cleanup failed after retry; lifecycle operation will continue");
         }
     }
-    Ok(())
 }
 
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
@@ -4689,7 +4686,7 @@ pub(super) async fn run_resource_cleanup_cascade(
 
     // Step 6: browser session. Same any-live-owner rule as tmux
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
-    cleanup_browser_with_retry(state, conv, &work_scope, inheritor_scope).await?;
+    cleanup_browser_with_retry(state, conv, &work_scope, inheritor_scope).await;
 
     Ok(())
 }

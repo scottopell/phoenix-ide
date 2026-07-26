@@ -29,7 +29,9 @@ pub use traits::*;
 
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
-use crate::tools::browser::session::{BrowserSessionAudience, BrowserSessionLifecycleEvent};
+use crate::tools::browser::session::{
+    BrowserSessionAudience, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
+};
 use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, ExploreToolPolicy,
     TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
@@ -1457,7 +1459,7 @@ impl RuntimeManager {
                 let BrowserSessionLifecycleEvent {
                     work_scope,
                     audience,
-                    active,
+                    kind,
                 } = event;
 
                 // Fan out to every live runtime handle whose conversation
@@ -1516,13 +1518,19 @@ impl RuntimeManager {
                     let Some(broadcaster) = broadcaster else {
                         continue;
                     };
-                    if broadcaster
-                        .send_seq(|seq| SseEvent::BrowserSessionState {
-                            sequence_id: seq,
-                            active,
-                        })
-                        .is_ok()
-                    {
+                    let active = match kind {
+                        BrowserSessionLifecycleKind::Active => Some(true),
+                        BrowserSessionLifecycleKind::Inactive => Some(false),
+                        BrowserSessionLifecycleKind::InventoryOnly => None,
+                    };
+                    if active.is_none_or(|active| {
+                        broadcaster
+                            .send_seq(|seq| SseEvent::BrowserSessionState {
+                                sequence_id: seq,
+                                active,
+                            })
+                            .is_ok()
+                    }) {
                         delivered += 1;
                     }
                 }
@@ -1530,7 +1538,7 @@ impl RuntimeManager {
                 if delivered == 0 {
                     tracing::debug!(
                         work_scope = %work_scope,
-                        active,
+                        ?kind,
                         "dropping browser session lifecycle event — no live runtime handle on scope"
                     );
                 }
