@@ -145,11 +145,25 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
     manager
 }
 
+async fn shutdown_browser_sessions(manager: &Arc<RuntimeManager>) {
+    let browser_sessions = manager.browser_sessions();
+    let mut attempt = 0_u64;
+    loop {
+        attempt += 1;
+        match browser_sessions.shutdown_all().await {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::warn!(attempt, %error, "drive-turn browser shutdown failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 /// Drive one user turn through the same runtime, provider adapters, and tool
 /// registry used by the Phoenix server.
 ///
 /// # Errors
-///
 /// Returns an error if validation/bootstrap fails or the runtime does not reach
 /// a stable state within the requested timeout.
 ///
@@ -252,13 +266,8 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
             "drive-turn tmux cleanup partially failed"
         );
     }
-    let browser_shutdown = manager
-        .browser_sessions()
-        .shutdown_all()
-        .await
-        .map_err(|error| DriveTurnError::Runtime(format!("browser shutdown failed: {error}")));
+    shutdown_browser_sessions(&manager).await;
     crate::tools::bash::shutdown_kill_tree(manager.bash_handles()).await;
-    browser_shutdown?;
     result
 }
 
