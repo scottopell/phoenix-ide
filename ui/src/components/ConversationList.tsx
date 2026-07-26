@@ -769,13 +769,10 @@ export function ConversationList({
     const latestMember = item.members.find(m => m.id === item.latestMemberId);
     const isCompleted = getConvDisplayState(latestMember) === 'terminal';
     if (effectiveListDensity === 'mobile') {
-      const hasPriorityMember = item.members.some((m) =>
-        matchesRouteSegment(m, activeSlug) || isActionableDisplayState(getConvDisplayState(m))
-      );
-      return hasPriorityMember ? false : !collapsedChains.has(item.rootId);
+      return !collapsedChains.has(item.rootId);
     }
     return isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
-  }, [activeSlug, collapsedChains, effectiveListDensity]);
+  }, [collapsedChains, effectiveListDensity]);
 
   const keyboardItems = useMemo(() => {
     const out: Conversation[] = [];
@@ -848,9 +845,16 @@ export function ConversationList({
       const latestMember = item.members.find(m => m.id === item.latestMemberId);
       const isCompleted = getConvDisplayState(latestMember) === 'terminal';
       const collapsed = effectiveListDensity === 'mobile'
-        ? false
+        ? !collapsedChains.has(item.rootId)
         : isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
       if (collapsed) {
+        if (effectiveListDensity === 'mobile') {
+          listRootRef.current
+            ?.querySelector<HTMLElement>(`.conv-chain-block[data-chain-root="${item.rootId}"]`)
+            ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+          lastRevealedActiveSlugRef.current = activeSlug;
+          return;
+        }
         setCollapsedChains((prev) => {
           const next = new Set(prev);
           if (isCompleted) next.add(item.rootId);

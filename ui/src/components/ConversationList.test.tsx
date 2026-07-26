@@ -1050,6 +1050,7 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
+    fireEvent.click(container.querySelector('.conv-chain-caret')!);
     const historyLinks = container.querySelectorAll('.conv-chain-history-link');
     expect(historyLinks).toHaveLength(2);
     expect(historyLinks[0]).toHaveAttribute('data-id', 'history-root');
@@ -1068,7 +1069,7 @@ describe('Mobile conversation list redesign', () => {
     expect(defaultProps.onRename).toHaveBeenCalledWith(expect.objectContaining({ id: 'history-root' }));
   });
 
-  it('keeps the active mobile chain expanded even for completed chains', async () => {
+  it('keeps the active mobile chain collapsed until the user explicitly expands it', async () => {
     const root = makeConv('active-root', 'active-root', {
       continued_in_conv_id: 'active-leaf',
       presentation_mode: 'done',
@@ -1092,10 +1093,14 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
+    expect(container.querySelector('.conv-chain-latest-summary')?.textContent).toContain('active-leaf');
+    expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(0);
+    expect(container.querySelectorAll('.conv-chain-history-link')).toHaveLength(0);
+
+    fireEvent.click(container.querySelector('.conv-chain-caret')!);
     expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
     expect(container.querySelector('[data-id="active-leaf"]')).toHaveClass('active');
-    expect(container.querySelector('[data-id="active-leaf"] .conv-item-title')?.textContent).toBe('active-leaf');
-    expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(1);
     expect(container.querySelector('[data-id="active-root"]')).toHaveClass('conv-chain-history-link');
   });
 
@@ -1125,13 +1130,14 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
+    fireEvent.click(container.querySelector('.conv-chain-caret')!);
     expect(container.querySelector('[data-id="mixed-root"]')).toHaveClass('conv-chain-history-link');
     expect(container.querySelector('[data-id="mixed-action"]')).toHaveClass('conv-item-chain-member');
     expect(container.querySelector('[data-id="mixed-action"]')).not.toHaveClass('conv-chain-history-link');
     expect(container.querySelector('[data-id="mixed-action"] .conv-state-chip')?.textContent).toBe('Error');
   });
 
-  it('auto-expands mobile chains with actionable latest members', () => {
+  it('keeps actionable latest members in the collapsed summary', () => {
     const root = makeConv('needs-root', 'needs-root', {
       continued_in_conv_id: 'needs-leaf',
       presentation_mode: 'done',
@@ -1150,9 +1156,9 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
-    expect(container.querySelector('.conv-chain-latest-summary')).toBeNull();
-    expect(container.querySelector('[data-id="needs-leaf"] .conv-state-dot')).toHaveClass('awaiting-approval');
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
+    expect(container.querySelector('.conv-chain-latest-summary .conv-state-dot')).toHaveClass('awaiting-approval');
+    expect(container.querySelector('[data-id="needs-leaf"].conv-item-chain-member')).toBeNull();
   });
 
   it('shows a visible context-full status label in mobile metadata', () => {

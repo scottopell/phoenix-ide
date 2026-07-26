@@ -83,9 +83,13 @@ distinct from inactive history
 AND SHALL keep every member identifiable and directly selectable
 AND SHALL provide a touch target of at least 44px for each member
 
-WHEN a chain is collapsed on a mobile-sized viewport
-THE SYSTEM SHALL present a compact summary that identifies the chain and
-its latest member
+WHEN a chain is displayed on a mobile-sized viewport
+THE SYSTEM SHALL keep the chain collapsed until the user explicitly
+expands it
+AND SHALL NOT automatically expose inactive intermediate members merely
+because the latest member is current or requires action
+AND SHALL present a compact summary that identifies the chain and its
+latest member, including the latest member's state
 
 WHEN a conversation has not been continued and was not itself a
 continuation
