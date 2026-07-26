@@ -158,6 +158,7 @@ async fn assemble_browser(
     };
     let state = match metadata.state {
         BrowserInventoryState::Live => BrowserSessionLiveness::Live,
+        BrowserInventoryState::TeardownPending => BrowserSessionLiveness::TeardownPending,
         BrowserInventoryState::TeardownFailed => BrowserSessionLiveness::TeardownFailed,
     };
     let idle_ms = u64::try_from(metadata.idle.as_millis()).unwrap_or(u64::MAX);

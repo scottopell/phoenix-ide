@@ -174,6 +174,8 @@ pub struct TmuxInventory {
 pub enum BrowserSessionLiveness {
     /// A session is present in the manager for this scope.
     Live,
+    /// An authoritative teardown attempt is outstanding.
+    TeardownPending,
     /// A retained session could not complete teardown and remains retryable.
     TeardownFailed,
     /// No session is present.

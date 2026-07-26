@@ -125,18 +125,22 @@ push.
 ### REQ-WSUI-004: Browser Session Inventory
 
 WHEN the inventory includes a browser section
-THE SYSTEM SHALL report the session `state` (one of `live`, `teardown_failed`,
-`torn_down`) and `idle_ms`, the elapsed milliseconds since the session's last
+THE SYSTEM SHALL report the session `state` (one of `live`, `teardown_pending`,
+`teardown_failed`, `torn_down`) and `idle_ms`, the elapsed milliseconds since the session's last
 activity.
 
 THE wire `state` SHALL be sourced from `BrowserSessionManager` membership and
-teardown state: a reusable entry maps to `live`, a retained entry whose teardown
+teardown state: a reusable entry maps to `live`, an entry with an outstanding
+teardown attempt maps to `teardown_pending`, a retained entry whose teardown
 failed maps to `teardown_failed`, and absence maps to `torn_down`. `idle` SHALL
 NOT be a wire state; it is a frontend presentation derived from `idle_ms` (see
 REQ-WSUI-010).
 
+WHEN state is `teardown_pending`
+THE SYSTEM SHALL keep polling until teardown reaches `teardown_failed` or `torn_down`.
+
 WHEN state is `teardown_failed`
-THE SYSTEM SHALL keep the stop action available for retry
+THE SYSTEM SHALL stop automatic polling, visibly report the failure in collapsed and expanded surfaces, and keep the stop action available for retry
 AND SHALL NOT expose the retained session for browser reuse or viewer opening.
 
 THE SYSTEM SHALL compute `idle_ms` at assembly time as the elapsed duration
@@ -324,7 +328,7 @@ frontend-chosen threshold
 THE section MAY present the browser row as "idle" — a purely client-side
 rendering derived from `idle_ms`, distinct from the wire `state` (REQ-WSUI-004).
 
-WHEN the browser row reports `state` `live` or `teardown_failed`
+WHEN the browser row reports `state` `live`, `teardown_pending`, or `teardown_failed`
 THE section and standalone dock SHALL expose a stop action that invokes REQ-WSUI-006b with the inventory's `scope_key`. The conversation-page section MAY expose an open action only for a `live` browser viewer; the standalone dock SHALL NOT require a viewer slot in order to stop or retry teardown.
 
 **Rationale:** The right side of the layout is reserved for the meta viewer

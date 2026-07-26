@@ -337,7 +337,7 @@ function BrowserRow({
   onStopped,
   onError,
 }: {
-  state: 'live' | 'teardown_failed' | 'torn_down';
+  state: 'live' | 'teardown_pending' | 'teardown_failed' | 'torn_down';
   idleMs: number;
   scopeKey: string;
   conversationId: string;
@@ -350,9 +350,11 @@ function BrowserRow({
   const display =
     state === 'torn_down'
       ? { glyph: '○', cls: 'ws-glyph--muted', text: 'torn down' }
-      : state === 'teardown_failed'
-        ? { glyph: '✗', cls: 'ws-glyph--err', text: 'stop failed' }
-        : idle
+      : state === 'teardown_pending'
+        ? { glyph: '…', cls: 'ws-glyph--warn', text: 'stopping' }
+        : state === 'teardown_failed'
+          ? { glyph: '✗', cls: 'ws-glyph--err', text: 'stop failed' }
+          : idle
           ? { glyph: '○', cls: 'ws-glyph--warn', text: `idle ${formatDuration(idleMs)}` }
           : { glyph: '●', cls: 'ws-glyph--live', text: 'live' };
   return (
@@ -623,6 +625,8 @@ function summarizeWorkScope(inv: WorkScopeInventory | null, count: number): stri
   if (terminal > 0) parts.push(`${terminal} done`);
   if (inv.tmux?.status === 'live') parts.push('tmux');
   if (inv.browser?.state === 'live') parts.push(isBrowserIdle(inv.browser) ? 'browser idle' : 'browser live');
+  if (inv.browser?.state === 'teardown_pending') parts.push('browser stopping');
+  if (inv.browser?.state === 'teardown_failed') parts.push('browser stop failed');
   return parts.join(' · ') || 'no live resources';
 }
 
@@ -662,7 +666,7 @@ export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expa
       summary={error ? 'inventory unavailable' : healthWarning ?? summarizeWorkScope(inventory, count)}
       count={count}
       expanded={expanded}
-      attention={Boolean(healthWarning) || Boolean(error)}
+      attention={Boolean(healthWarning) || Boolean(error) || inventory?.browser?.state === 'teardown_failed'}
       onToggle={() => onToggleExpanded(!expanded)}
     >
       <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>
@@ -695,7 +699,14 @@ export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collap
     !collapsed,
   );
   const count = workScopeLiveCount(inventory);
-  const browserGlyph = inventory?.browser?.state === 'live' ? '◉' : null;
+  const browserGlyph =
+    inventory?.browser?.state === 'live'
+      ? { glyph: '◉', title: 'browser session live' }
+      : inventory?.browser?.state === 'teardown_pending'
+        ? { glyph: '…', title: 'browser session stopping' }
+        : inventory?.browser?.state === 'teardown_failed'
+          ? { glyph: '✗', title: 'browser stop failed — expand to retry' }
+          : null;
   const tmuxLive = inventory?.tmux?.status === 'live';
 
   if (collapsed) {
@@ -713,8 +724,8 @@ export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collap
             {count}
           </button>
           {browserGlyph && (
-            <span className="ws-collapsed-ind" title="browser session live">
-              {browserGlyph}
+            <span className="ws-collapsed-ind" title={browserGlyph.title}>
+              {browserGlyph.glyph}
             </span>
           )}
           {tmuxLive && (

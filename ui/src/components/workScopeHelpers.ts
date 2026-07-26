@@ -56,13 +56,13 @@ export function workScopeLiveCount(inv: WorkScopeInventory | null): number {
  *    - any bash handle is running / kill_pending_kernel, OR
  *    - a tmux server entry exists and is live or not-yet-probed
  *      (i.e. a server exists; a `gone` entry is terminal and need not poll), OR
- *    - a browser session is live.
+ *    - a browser session is live or has an outstanding teardown attempt.
  *  Self-limiting by construction: once nothing matches, the poll stops. */
 export function hasLiveResource(inv: WorkScopeInventory | null): boolean {
   if (inv == null) return false;
   if (inv.bash.some((h) => isLive(h.state))) return true;
   if (inv.tmux != null && (inv.tmux.status === 'live' || inv.tmux.status === 'not_probed'))
     return true;
-  if (inv.browser && inv.browser.state !== 'torn_down') return true;
+  if (inv.browser?.state === 'live' || inv.browser?.state === 'teardown_pending') return true;
   return false;
 }

@@ -919,6 +919,7 @@ pub type BrowserSessionLifecycleSink =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserInventoryState {
     Live,
+    TeardownPending,
     TeardownFailed,
 }
 
@@ -1127,9 +1128,6 @@ impl BrowserSessionManager {
     }
 
     async fn complete_kill_failure(&self, key: &str, attempt: &Arc<KillAttempt>, error: String) {
-        if !attempt.complete(Err(error)) {
-            return;
-        }
         let lifecycle = {
             let sessions = self.sessions.read().await;
             sessions.get(key).and_then(|entry| {
@@ -1149,9 +1147,15 @@ impl BrowserSessionManager {
                         BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
                     }
                 };
-                Some((entry.scope.clone(), audience))
+                let lifecycle = (entry.scope.clone(), audience);
+                attempt.complete(Err(error.clone()));
+                Some(lifecycle)
             })
         };
+        if lifecycle.is_none() {
+            attempt.complete(Err(error));
+            return;
+        }
         if let Some((scope, audience)) = lifecycle {
             self.emit_lifecycle(
                 &scope,
@@ -1341,7 +1345,15 @@ impl BrowserSessionManager {
         let (session, state) = {
             let sessions = self.sessions.read().await;
             let entry = sessions.values().find(|entry| entry.scope == *work_scope)?;
-            let state = if entry.teardown_failed.load(Ordering::SeqCst) {
+            let state = if entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|attempt| attempt.result().is_none())
+            {
+                BrowserInventoryState::TeardownPending
+            } else if entry.teardown_failed.load(Ordering::SeqCst) {
                 BrowserInventoryState::TeardownFailed
             } else {
                 BrowserInventoryState::Live
@@ -1371,7 +1383,15 @@ impl BrowserSessionManager {
             if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
                 return Err(BrowserError::AccessDenied);
             }
-            let state = if entry.teardown_failed.load(Ordering::SeqCst) {
+            let state = if entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|attempt| attempt.result().is_none())
+            {
+                BrowserInventoryState::TeardownPending
+            } else if entry.teardown_failed.load(Ordering::SeqCst) {
                 BrowserInventoryState::TeardownFailed
             } else {
                 BrowserInventoryState::Live
@@ -1622,15 +1642,11 @@ impl BrowserSessionManager {
     }
 
     /// Transfer teardown ownership to a detached retry loop.
-    pub fn request_kill_session_for_actor_until_success(
-        self: &Arc<Self>,
-        work_scope: ResourceScopeKey,
-        actor: EffectiveResourceAccess,
-    ) {
+    pub fn request_kill_scope_until_success(self: &Arc<Self>, work_scope: ResourceScopeKey) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                match manager.kill_session_for_actor(&work_scope, &actor).await {
+                match manager.kill_session(&work_scope).await {
                     Ok(()) => break,
                     Err(error) => {
                         tracing::error!(%work_scope, %error, "detached browser cleanup retry failed");
