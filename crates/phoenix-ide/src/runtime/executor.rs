@@ -8797,20 +8797,26 @@ mod authoritative_user_message_effect_tests {
                 AuthoritativeUserMessageMaterialization::StaleAuthority,
             );
 
-            let result = crate::state_machine::transition::TransitionResult::new(
-                ConvState::LlmRequesting { attempt: 1 },
-            )
-            .with_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
-                authority: authority(),
-                idempotent: false,
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::RequestLlm);
+            let result =
+                crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                    attempt: 1,
+                })
+                .with_effect(Effect::PersistAuthoritativeUserMessage {
+                    payload: payload("msg-direct"),
+                    authority: authority(),
+                    idempotent: false,
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::RequestLlm);
 
             rt.apply_transition_result(result).await.unwrap();
 
-            assert_eq!(storage.recorded_materialize_authoritative_user_message_calls().len(), 0);
+            assert_eq!(
+                storage
+                    .recorded_materialize_authoritative_user_message_calls()
+                    .len(),
+                0
+            );
             assert_eq!(storage.get_current_state("conv-direct"), None);
             assert!(rt.llm_task_handle.is_none());
             assert!(!matches!(rt.state, ConvState::Idle));

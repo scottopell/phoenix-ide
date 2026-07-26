@@ -272,14 +272,19 @@ impl SendChatApplicationService {
                     Ok(ScopedDirectTurnReplayLookup::Exact { turn, .. }) => {
                         return Ok(match turn.materialization {
                             Materialization::Unmaterialized => {
-                                if matches!(turn.lifecycle, phoenix_workflow::TurnLifecycle::Terminal { .. }) {
+                                if matches!(
+                                    turn.lifecycle,
+                                    phoenix_workflow::TurnLifecycle::Terminal { .. }
+                                ) {
                                     SendChatOutcome::AlreadyPersisted
                                 } else {
                                     self.runtime.kick_direct_turn_worker();
                                     SendChatOutcome::Delivered
                                 }
                             }
-                            Materialization::Materialized { .. } => SendChatOutcome::AlreadyPersisted,
+                            Materialization::Materialized { .. } => {
+                                SendChatOutcome::AlreadyPersisted
+                            }
                         });
                     }
                     Ok(ScopedDirectTurnReplayLookup::Missing)
@@ -442,7 +447,10 @@ async fn lookup_durable_replay(
         Ok(ScopedDirectTurnReplayLookup::Missing) => Ok(DurableReplayOutcome::Missing),
         Ok(ScopedDirectTurnReplayLookup::Exact { turn, .. }) => match turn.materialization {
             Materialization::Unmaterialized => {
-                if matches!(turn.lifecycle, phoenix_workflow::TurnLifecycle::Terminal { .. }) {
+                if matches!(
+                    turn.lifecycle,
+                    phoenix_workflow::TurnLifecycle::Terminal { .. }
+                ) {
                     Ok(DurableReplayOutcome::ExactUnmaterializedTerminal)
                 } else {
                     Ok(DurableReplayOutcome::ExactUnmaterializedLive)
@@ -989,7 +997,6 @@ mod tests {
             DurableReplayOutcome::ExactUnmaterializedTerminal
         );
     }
-
 
     #[tokio::test]
     async fn lookup_durable_replay_precedes_archived_rejection_policy() {
