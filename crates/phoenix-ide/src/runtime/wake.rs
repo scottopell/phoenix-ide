@@ -570,7 +570,7 @@ async fn deliver_pending(
                 let display_data = Some(serde_json::json!({
                     "type": "wake_result",
                     "adopted": false,
-                    "terminal": &delivery.receipt.terminal,
+                    "terminal_kind": terminal_kind(&delivery.receipt.terminal),
                 }));
                 let auto_resume = !matches!(
                     delivery.receipt.terminal,
@@ -2328,7 +2328,7 @@ mod tests {
                 display_data: Some(serde_json::json!({
                     "type": "wake_result",
                     "adopted": false,
-                    "terminal": &pending.receipt.terminal,
+                    "terminal_kind": terminal_kind(&pending.receipt.terminal),
                 })),
                 auto_resume: true,
                 created_at: Timestamp(20),

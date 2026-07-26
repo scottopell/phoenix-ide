@@ -3659,15 +3659,15 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        let interrupted_contract_ids = recovery::interrupted_wake_contract_ids(&messages);
+        let interrupted_wake_round = recovery::interrupted_wake_round(&messages);
         let has_owed_wake_work =
             phoenix_db::workflow::wake::WakeRepository::new(self.db.pool().clone())
-                .has_owed_work_for_contracts(conversation_id, &interrupted_contract_ids)
+                .has_owed_work_for_contracts(conversation_id, &interrupted_wake_round.contract_ids)
                 .await
                 .map_err(|e| e.to_string())?;
         let decision = recovery::suppress_auto_continue_for_owed_wake(
             recovery::should_auto_continue(&messages),
-            has_owed_wake_work,
+            has_owed_wake_work && !interrupted_wake_round.has_sibling_error,
         );
 
         tracing::debug!(

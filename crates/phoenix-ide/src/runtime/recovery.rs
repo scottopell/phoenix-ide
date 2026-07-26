@@ -70,7 +70,12 @@ impl RecoveryDecision {
     }
 }
 
-pub fn interrupted_wake_contract_ids(messages: &[Message]) -> Vec<String> {
+pub struct InterruptedWakeRound {
+    pub contract_ids: Vec<String>,
+    pub has_sibling_error: bool,
+}
+
+pub fn interrupted_wake_round(messages: &[Message]) -> InterruptedWakeRound {
     let Some((agent_index, wait_tool_use_ids)) =
         messages
             .iter()
@@ -94,28 +99,39 @@ pub fn interrupted_wake_contract_ids(messages: &[Message]) -> Vec<String> {
                 ))
             })
     else {
-        return Vec::new();
+        return InterruptedWakeRound {
+            contract_ids: Vec::new(),
+            has_sibling_error: false,
+        };
     };
 
-    messages[agent_index + 1..]
-        .iter()
-        .filter_map(|message| {
-            let MessageContent::Tool(tool) = &message.content else {
-                return None;
-            };
-            if tool.is_error || !wait_tool_use_ids.contains(tool.tool_use_id.as_str()) {
-                return None;
+    let mut contract_ids = Vec::new();
+    let mut has_sibling_error = false;
+    for message in &messages[agent_index + 1..] {
+        let MessageContent::Tool(tool) = &message.content else {
+            continue;
+        };
+        if tool.is_error {
+            has_sibling_error = true;
+            continue;
+        }
+        if !wait_tool_use_ids.contains(tool.tool_use_id.as_str()) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&tool.content) else {
+            continue;
+        };
+        if value.get("status").and_then(serde_json::Value::as_str) == Some("registered") {
+            if let Some(contract_id) = value.get("contract_id").and_then(serde_json::Value::as_str)
+            {
+                contract_ids.push(contract_id.to_owned());
             }
-            let value: serde_json::Value = serde_json::from_str(&tool.content).ok()?;
-            if value.get("status").and_then(serde_json::Value::as_str) != Some("registered") {
-                return None;
-            }
-            value
-                .get("contract_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .collect()
+        }
+    }
+    InterruptedWakeRound {
+        contract_ids,
+        has_sibling_error,
+    }
 }
 
 pub fn suppress_auto_continue_for_owed_wake(
@@ -151,14 +167,18 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
         // Treat it as a settled Idle, never an interrupted tool turn.
         return RecoveryDecision::idle(reason);
     }
-    let adopted_wake_tail = messages
+    let mut adopted_wake_tail = messages
         .iter()
         .rev()
         .take_while(|message| is_adopted_wake_result(message));
-    if adopted_wake_tail
-        .filter_map(wake_terminal_object)
-        .any(|terminal| !terminal.contains_key("Cancelled"))
-    {
+    if adopted_wake_tail.any(|message| {
+        message
+            .display_data
+            .as_ref()
+            .and_then(|data| data.get("terminal_kind"))
+            .and_then(serde_json::Value::as_str)
+            != Some("cancelled")
+    }) {
         return RecoveryDecision::auto_continue(RecoveryReason::AdoptedWakeResult);
     }
 
@@ -252,10 +272,6 @@ fn is_adopted_wake_result(message: &Message) -> bool {
         })
 }
 
-fn wake_terminal_object(message: &Message) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    message.display_data.as_ref()?.get("terminal")?.as_object()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,15 +301,10 @@ mod tests {
 
     fn adopted_wake_msg(seq: i64, cancelled: bool) -> Message {
         let mut message = user_msg(seq, "wake result");
-        let terminal = if cancelled {
-            json!({ "Cancelled": {} })
-        } else {
-            json!({ "Bash": {} })
-        };
         message.display_data = Some(json!({
             "type": "wake_result",
             "adopted": true,
-            "terminal": terminal,
+            "terminal_kind": if cancelled { "cancelled" } else { "fired" },
         }));
         message
     }
@@ -1096,10 +1107,9 @@ mod owed_wake_tests {
             agent(3, "current-tool"),
             tool(4, "current-tool", "current-wake"),
         ];
-        assert_eq!(
-            interrupted_wake_contract_ids(&messages),
-            vec!["current-wake"]
-        );
+        let interrupted = interrupted_wake_round(&messages);
+        assert_eq!(interrupted.contract_ids, vec!["current-wake"]);
+        assert!(!interrupted.has_sibling_error);
     }
 
     #[test]
@@ -1139,7 +1149,70 @@ mod owed_wake_tests {
             },
         ];
 
-        assert!(interrupted_wake_contract_ids(&messages).is_empty());
+        assert!(interrupted_wake_round(&messages).contract_ids.is_empty());
+    }
+
+    #[test]
+    fn interrupted_wake_round_reports_sibling_tool_error() {
+        use chrono::Utc;
+        use phoenix_core::domain::db_schema::{ToolContent, ToolContentImage};
+        let messages = vec![
+            Message {
+                message_id: "agent".to_string(),
+                conversation_id: "conv".to_string(),
+                sequence_id: 1,
+                message_type: MessageType::Agent,
+                content: MessageContent::Agent(vec![
+                    ContentBlock::ToolUse {
+                        id: "wait".to_string(),
+                        name: "wait_until".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "bash".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ]),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            Message {
+                message_id: "wait-result".to_string(),
+                conversation_id: "conv".to_string(),
+                sequence_id: 2,
+                message_type: MessageType::Tool,
+                content: MessageContent::Tool(ToolContent {
+                    tool_use_id: "wait".to_string(),
+                    content: r#"{"status":"registered","contract_id":"wake-1"}"#.to_string(),
+                    is_error: false,
+                    images: Vec::<ToolContentImage>::new(),
+                }),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            Message {
+                message_id: "bash-result".to_string(),
+                conversation_id: "conv".to_string(),
+                sequence_id: 3,
+                message_type: MessageType::Tool,
+                content: MessageContent::Tool(ToolContent {
+                    tool_use_id: "bash".to_string(),
+                    content: "[Tool execution interrupted by server restart]".to_string(),
+                    is_error: true,
+                    images: Vec::<ToolContentImage>::new(),
+                }),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+        ];
+
+        let interrupted = interrupted_wake_round(&messages);
+        assert_eq!(interrupted.contract_ids, vec!["wake-1"]);
+        assert!(interrupted.has_sibling_error);
     }
 
     #[test]
