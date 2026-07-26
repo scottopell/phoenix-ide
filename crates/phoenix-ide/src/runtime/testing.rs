@@ -2077,16 +2077,16 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "t1",
-                ToolInput::Bash(crate::tools::BashToolInput::run("cmd1")),
+                ToolInput::from(crate::tools::BashToolInput::run("cmd1")),
             ),
             remaining_tools: vec![
                 ToolCall::new(
                     "t2",
-                    ToolInput::Bash(crate::tools::BashToolInput::run("cmd2")),
+                    ToolInput::from(crate::tools::BashToolInput::run("cmd2")),
                 ),
                 ToolCall::new(
                     "t3",
-                    ToolInput::Bash(crate::tools::BashToolInput::run("cmd3")),
+                    ToolInput::from(crate::tools::BashToolInput::run("cmd3")),
                 ),
             ],
             completed_results: vec![],
@@ -2330,7 +2330,7 @@ mod tests {
         // Two tools, one of which is terminal
         let bash_call = ToolCall::new(
             "tool-1",
-            ToolInput::Bash(crate::tools::BashToolInput::run("ls")),
+            ToolInput::from(crate::tools::BashToolInput::run("ls")),
         );
         let submit_call = ToolCall::new(
             "tool-2",
@@ -3047,7 +3047,7 @@ mod tests {
         let new_state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "new-id",
-                ToolInput::Bash(crate::tools::BashToolInput::run("cmd")),
+                ToolInput::from(crate::tools::BashToolInput::run("cmd")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],

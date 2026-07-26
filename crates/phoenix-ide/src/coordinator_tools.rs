@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::send_chat_service::{SendChatApplicationService, SendChatRequest, SendChatServiceError};
 use crate::tools::{ExploreToolPolicy, SandboxedBashTool, Tool, ToolContext, ToolOutput};
+use phoenix_core::domain::bash_types::BashInvocation;
 
 pub(crate) fn tools(
     service: GlobalReadService,
@@ -23,15 +24,15 @@ pub(crate) fn tools(
         }),
     ];
     if explore_policy.has_sandboxed_bash() {
-        tools.push(Arc::new(CoordinatorBash(service)));
+        tools.push(Arc::new(ExplicitCwdSandboxedBash(service)));
     }
     tools
 }
 
-struct CoordinatorBash(GlobalReadService);
+struct ExplicitCwdSandboxedBash(GlobalReadService);
 
 #[async_trait]
-impl Tool for CoordinatorBash {
+impl Tool for ExplicitCwdSandboxedBash {
     fn name(&self) -> &'static str {
         "bash"
     }
@@ -67,29 +68,25 @@ impl Tool for CoordinatorBash {
         true
     }
 
-    async fn run(&self, mut input: Value, ctx: ToolContext) -> ToolOutput {
-        let is_run = input.get("op").and_then(Value::as_str) == Some("run");
-        let cwd = input
-            .as_object_mut()
-            .and_then(|object| object.remove("cwd"));
-        if is_run {
-            let Some(cwd) = cwd.as_ref().and_then(Value::as_str) else {
-                return ToolOutput::error(
-                    "Coordinator bash op=run requires cwd; there is no default working directory"
-                        .to_string(),
-                );
-            };
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        let invocation = match BashInvocation::from_with_explicit_run_directory(input) {
+            Ok(invocation) => invocation,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let context_input = invocation.to_context_tool_value();
+        if let Some(cwd) = invocation.explicit_working_directory() {
             let resolved = match self.0.validate_active_work_scope_cwd(cwd).await {
                 Ok(path) => path,
                 Err(error) => return ToolOutput::error(error),
             };
-            return SandboxedBashTool
-                .run_for_coordinator_in_cwd(input, ctx, resolved)
-                .await;
-        } else if cwd.is_some() {
-            return ToolOutput::error("cwd is only valid for bash op=run".to_string());
+            SandboxedBashTool
+                .run_shared_sandboxed_in_cwd(context_input, ctx, resolved)
+                .await
+        } else {
+            SandboxedBashTool
+                .run_shared_sandboxed(context_input, ctx)
+                .await
         }
-        SandboxedBashTool.run_for_coordinator(input, ctx).await
     }
 }
 
@@ -406,7 +403,7 @@ mod tests {
         }
     }
 
-    async fn tool_and_context() -> (CoordinatorBash, ToolContext) {
+    async fn tool_and_context() -> (ExplicitCwdSandboxedBash, ToolContext) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("coordinator-bash.db");
         let db = crate::db::Database::open(db_path.to_str().unwrap())
@@ -414,7 +411,7 @@ mod tests {
             .unwrap();
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
-        let tool = CoordinatorBash(GlobalReadService::new(db, retriever));
+        let tool = ExplicitCwdSandboxedBash(GlobalReadService::new(db, retriever));
         let context = ToolContext::new_without_filesystem(
             CancellationToken::new(),
             "coordinator".to_string(),

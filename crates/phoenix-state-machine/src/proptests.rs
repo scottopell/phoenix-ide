@@ -52,7 +52,7 @@ fn arb_think_input() -> impl Strategy<Value = ThinkInput> {
 
 fn arb_tool_input() -> impl Strategy<Value = ToolInput> {
     prop_oneof![
-        arb_bash_input().prop_map(ToolInput::Bash),
+        arb_bash_input().prop_map(ToolInput::from),
         arb_think_input().prop_map(ToolInput::Think),
     ]
 }
@@ -1097,7 +1097,7 @@ fn test_complete_tool_cycle() {
     // Step 2: LLM responds with tool call
     let tool = ToolCall::new(
         "tool-123",
-        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("ls")),
+        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run("ls")),
     );
     let result = transition(
         &state,
@@ -1218,19 +1218,19 @@ fn test_multi_tool_chain() {
 
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
             "echo 1",
         )),
     );
     let tool2 = ToolCall::new(
         "t2",
-        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
             "echo 2",
         )),
     );
     let tool3 = ToolCall::new(
         "t3",
-        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
             "echo 3",
         )),
     );
@@ -1402,20 +1402,20 @@ fn test_cancel_mid_tool_chain() {
     let state = ConvState::ToolExecuting {
         current_tool: ToolCall::new(
             "t2",
-            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                 "sleep 10",
             )),
         ),
         remaining_tools: vec![
             ToolCall::new(
                 "t3",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                     "echo 3",
                 )),
             ),
             ToolCall::new(
                 "t4",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                     "echo 4",
                 )),
             ),
@@ -1497,13 +1497,13 @@ fn test_cancel_mid_tool_chain() {
 fn test_tool_completion_advances_to_next_tool() {
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
             "echo 1",
         )),
     );
     let tool2 = ToolCall::new(
         "t2",
-        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
             "echo 2",
         )),
     );
@@ -1554,7 +1554,7 @@ fn test_tool_completion_advances_to_next_tool() {
 fn test_last_tool_completion_goes_to_llm_requesting() {
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
             "echo 1",
         )),
     );
@@ -1836,7 +1836,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
     let state = ConvState::ToolExecuting {
         current_tool: ToolCall::new(
             "t1",
-            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
+            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
         ),
         remaining_tools: vec![],
         completed_results: vec![],
@@ -1888,7 +1888,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
         ),
         remaining_tools: vec![ToolCall::new(
             "t2",
-            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
+            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
         )],
         completed_results: vec![],
         pending_sub_agents: vec![PendingSubAgent {

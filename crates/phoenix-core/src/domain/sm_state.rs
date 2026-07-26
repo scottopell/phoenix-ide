@@ -1,6 +1,6 @@
 //! Conversation state types
 
-use crate::domain::bash_types::BashToolInput;
+use crate::domain::bash_types::{BashInvocation, BashToolInput};
 use crate::domain::db_schema::{ConversationCreationPhase, ErrorKind, ToolResult, UsageData};
 use crate::domain::llm_types::ContentBlock;
 use crate::domain::patch_types::PatchInput;
@@ -180,7 +180,7 @@ pub struct QuestionMetadata {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "_tool", rename_all = "snake_case")]
 pub enum ToolInput {
-    Bash(BashToolInput),
+    Bash(BashInvocation),
     Think(ThinkInput),
     Patch(PatchInput),
     KeywordSearch(KeywordSearchInput),
@@ -284,17 +284,32 @@ impl<'de> Deserialize<'de> for ToolInput {
         }
 
         Ok(match tool_name.as_str() {
-            "bash" => match serde_json::from_value::<BashToolInput>(payload.clone()) {
-                Ok(input) => ToolInput::Bash(input),
-                Err(err) => payload
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .map(BashToolInput::run)
-                    .map_or_else(
-                        || malformed_known_input("bash", payload, err.to_string()),
+            "bash" => {
+                if let Ok(invocation) = serde_json::from_value::<BashInvocation>(payload.clone()) {
+                    ToolInput::Bash(invocation)
+                } else if let Ok(input) = serde_json::from_value::<BashToolInput>(payload.clone()) {
+                    BashInvocation::from_context(input).map_or_else(
+                        |error| malformed_known_input("bash", payload, error),
                         ToolInput::Bash,
-                    ),
-            },
+                    )
+                } else if let Some(command) = payload.get("command").and_then(Value::as_str) {
+                    BashInvocation::from_context(BashToolInput::run(command)).map_or_else(
+                        |error| malformed_known_input("bash", payload, error),
+                        ToolInput::Bash,
+                    )
+                } else {
+                    malformed_known_input(
+                        "bash",
+                        payload,
+                        "invalid persisted bash invocation".to_string(),
+                    )
+                }
+            }
+            "coordinator_bash" => BashInvocation::from_with_explicit_run_directory(payload.clone())
+                .map_or_else(
+                    |error| malformed_known_input("bash", payload, error),
+                    ToolInput::Bash,
+                ),
             "think" => parse_tool_input_or_malformed::<ThinkInput>("think", payload),
             "patch" => parse_tool_input_or_malformed::<PatchInput>("patch", payload),
             "keyword_search" => {
@@ -332,6 +347,20 @@ impl<'de> Deserialize<'de> for ToolInput {
 
 impl From<BashToolInput> for ToolInput {
     fn from(input: BashToolInput) -> Self {
+        let raw = serde_json::to_value(&input).unwrap_or(Value::Null);
+        BashInvocation::from_context(input).map_or_else(
+            |error| ToolInput::Malformed {
+                name: "bash".to_string(),
+                input: raw,
+                error,
+            },
+            ToolInput::Bash,
+        )
+    }
+}
+
+impl From<BashInvocation> for ToolInput {
+    fn from(input: BashInvocation) -> Self {
         ToolInput::Bash(input)
     }
 }
@@ -391,6 +420,12 @@ impl From<AskUserQuestionInput> for ToolInput {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ToolInputContract {
+    ContextWorkingDirectory,
+    ExplicitWorkingDirectory,
+}
+
 impl ToolInput {
     /// Get the tool name
     #[must_use]
@@ -423,7 +458,7 @@ impl ToolInput {
     #[must_use]
     pub fn to_value(&self) -> Value {
         match self {
-            ToolInput::Bash(input) => serde_json::to_value(input).unwrap_or(Value::Null),
+            ToolInput::Bash(input) => input.to_tool_value(),
             ToolInput::Think(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::Patch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::KeywordSearch(input) => serde_json::to_value(input).unwrap_or(Value::Null),
@@ -452,6 +487,27 @@ impl ToolInput {
     /// surface a malformed-known input separately from an unsupported tool.
     #[must_use]
     pub fn from_name_and_value(name: &str, value: Value) -> Self {
+        Self::from_name_and_value_with_contract(
+            name,
+            value,
+            ToolInputContract::ContextWorkingDirectory,
+        )
+    }
+
+    #[must_use]
+    pub fn from_name_and_value_with_explicit_working_directory(name: &str, value: Value) -> Self {
+        Self::from_name_and_value_with_contract(
+            name,
+            value,
+            ToolInputContract::ExplicitWorkingDirectory,
+        )
+    }
+
+    fn from_name_and_value_with_contract(
+        name: &str,
+        value: Value,
+        contract: ToolInputContract,
+    ) -> Self {
         fn parse<T>(name: &str, value: Value) -> ToolInput
         where
             T: serde::de::DeserializeOwned,
@@ -463,7 +519,19 @@ impl ToolInput {
             }
         }
         match name {
-            "bash" => parse::<BashToolInput>(name, value),
+            "bash" if matches!(contract, ToolInputContract::ExplicitWorkingDirectory) => {
+                BashInvocation::from_with_explicit_run_directory(value.clone()).map_or_else(
+                    |error| malformed_known_input(name, value, error),
+                    ToolInput::Bash,
+                )
+            }
+            "bash" => serde_json::from_value::<BashToolInput>(value.clone())
+                .map_err(|error| error.to_string())
+                .and_then(BashInvocation::from_context)
+                .map_or_else(
+                    |error| malformed_known_input(name, value, error),
+                    ToolInput::Bash,
+                ),
             "think" => parse::<ThinkInput>(name, value),
             "patch" => parse::<PatchInput>(name, value),
             "keyword_search" => parse::<KeywordSearchInput>(name, value),
@@ -499,8 +567,14 @@ mod tests {
         let ToolInput::Bash(input) = input else {
             panic!("expected bash input");
         };
-        assert_eq!(input.op, crate::domain::bash_types::BashOp::Run);
-        assert_eq!(input.cmd.as_deref(), Some("echo legacy"));
+        assert!(matches!(
+            input,
+            BashInvocation::Run {
+                cmd,
+                working_directory: crate::domain::bash_types::BashWorkingDirectory::Context,
+                ..
+            } if cmd == "echo legacy"
+        ));
     }
 
     #[test]
@@ -518,6 +592,73 @@ mod tests {
         assert_eq!(name, "bash");
         assert_eq!(input["op"], "run");
         assert_eq!(input["command"], "bad");
+    }
+
+    #[test]
+    fn explicit_directory_bash_is_typed_and_context_bash_rejects_cwd() {
+        let payload = serde_json::json!({
+            "op": "run",
+            "cmd": "pwd",
+            "cwd": "/tmp/work"
+        });
+        let typed =
+            ToolInput::from_name_and_value_with_explicit_working_directory("bash", payload.clone());
+        assert!(matches!(typed, ToolInput::Bash(_)));
+        assert_eq!(typed.tool_name(), "bash");
+        let redispatched = typed.to_value();
+        assert_eq!(redispatched["op"], "run");
+        assert_eq!(redispatched["cmd"], "pwd");
+        assert_eq!(redispatched["cwd"], "/tmp/work");
+
+        let durable = serde_json::to_value(&typed).unwrap();
+        let restored: ToolInput = serde_json::from_value(durable).unwrap();
+        assert_eq!(restored, typed);
+        assert!(matches!(
+            ToolInput::from_name_and_value("bash", payload),
+            ToolInput::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn short_lived_coordinator_bash_representation_migrates_to_bash_invocation() {
+        let durable = serde_json::json!({
+            "_tool": "coordinator_bash",
+            "op": "run",
+            "cmd": "pwd",
+            "cwd": "/tmp/work",
+            "label": null,
+            "wait_seconds": null,
+            "lines": null,
+            "since": null
+        });
+        let restored: ToolInput = serde_json::from_value(durable).unwrap();
+        let ToolInput::Bash(BashInvocation::Run {
+            working_directory:
+                crate::domain::bash_types::BashWorkingDirectory::Explicit(cwd),
+            ..
+        }) = restored
+        else {
+            panic!("expected explicit-directory bash invocation");
+        };
+        assert_eq!(cwd, "/tmp/work");
+    }
+
+    #[test]
+    fn legacy_malformed_coordinator_bash_retains_redispatch_payload() {
+        let durable = serde_json::json!({
+            "_tool": "malformed",
+            "name": "bash",
+            "input": {
+                "op": "run",
+                "cmd": "pwd",
+                "cwd": "/tmp/work"
+            },
+            "error": "unknown field `cwd`"
+        });
+        let restored: ToolInput = serde_json::from_value(durable).unwrap();
+        assert!(matches!(restored, ToolInput::Malformed { .. }));
+        assert_eq!(restored.tool_name(), "bash");
+        assert_eq!(restored.to_value()["cwd"], "/tmp/work");
     }
 
     /// A known tool name with a payload that fails to deserialize must produce

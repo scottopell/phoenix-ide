@@ -4574,20 +4574,20 @@ mod tests {
             &ConvState::ToolExecuting {
                 current_tool: ToolCall::new(
                     "tool-1",
-                    ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                         "echo 1",
                     )),
                 ),
                 remaining_tools: vec![
                     ToolCall::new(
                         "tool-2",
-                        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                             "echo 2",
                         )),
                     ),
                     ToolCall::new(
                         "tool-3",
-                        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                        ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                             "echo 3",
                         )),
                     ),
@@ -4839,7 +4839,7 @@ mod tests {
             &ConvState::ToolExecuting {
                 current_tool: ToolCall::new(
                     "sa-tool-1",
-                    ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                         "echo mutate",
                     )),
                 ),
@@ -5066,7 +5066,7 @@ mod tests {
 
         let tool_calls = vec![ToolCall::new(
             "tool-1",
-            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                 "echo test",
             )),
         )];
@@ -5677,7 +5677,7 @@ mod tests {
         let auq_tool = make_ask_user_question_tool_call("tool-auq-1");
         let bash_tool = ToolCall::new(
             "tool-bash-1",
-            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                 "echo test",
             )),
         );
@@ -5744,7 +5744,7 @@ mod tests {
         );
         let bash_tool = ToolCall::new(
             "tool-bash-1",
-            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                 "echo test",
             )),
         );
@@ -6149,7 +6149,7 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
+                ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],
@@ -6428,7 +6428,7 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
+                ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],
@@ -7329,7 +7329,7 @@ mod tests {
             );
             let bash_tool = ToolCall::new(
                 "tool-bash-1",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run(
                     "echo hi",
                 )),
             );

@@ -4415,6 +4415,22 @@ async fn refuse_if_chain_member(state: &AppState, id: &str, op: &str) -> Result<
     Err(AppError::Conflict(Box::new(response)))
 }
 
+async fn refuse_if_coordinator(state: &AppState, id: &str, op: &str) -> Result<(), AppError> {
+    if state
+        .runtime
+        .db()
+        .is_coordinator_conversation(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            format!("Cannot {op} the durable Coordinator conversation"),
+            "coordinator_lifecycle",
+        ))));
+    }
+    Ok(())
+}
+
 async fn archive_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -4434,6 +4450,7 @@ async fn archive_conversation(
 /// Resource cleanup failures (bash / tmux / worktree) log WARN and
 /// continue; only the final `archived = 1` write is fatal.
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    refuse_if_coordinator(state, id, "archive").await?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(id)
         .await
@@ -4761,6 +4778,7 @@ async fn delete_conversation(
 /// (see `Internal` variant) — bash / tmux / projects cleanup failures
 /// log WARN and continue per REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    refuse_if_coordinator(state, id, "delete").await?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(id)
         .await
@@ -10320,6 +10338,34 @@ pub(crate) mod hard_delete_cascade_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn coordinator_cannot_be_archived_or_hard_deleted() {
+        let state = make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("coordinator");
+
+        assert!(super::run_archive_cascade(&state, &coordinator.id)
+            .await
+            .is_err());
+        assert!(super::run_hard_delete_cascade(&state, &coordinator.id)
+            .await
+            .is_err());
+        let preserved = state
+            .db
+            .get_conversation(&coordinator.id)
+            .await
+            .expect("Coordinator history must remain durable");
+        assert!(!preserved.archived);
+        assert!(state
+            .db
+            .is_coordinator_conversation(&coordinator.id)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
