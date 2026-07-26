@@ -248,14 +248,19 @@ impl SendChatApplicationService {
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority(conversation.id.clone()),
                 client_key: client_key.clone(),
-                prepared: PreparedTurn::from_exact_payload(prepared_bytes),
+                prepared: PreparedTurn::from_exact_payload(
+                    &ConversationAuthority(conversation.id.clone()),
+                    prepared_bytes,
+                ),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: now_timestamp(),
             })
             .await
         {
             Ok(step) => step,
-            Err(crate::db::DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged)) => {
+            Err(crate::db::DbError::DirectTurnConflict(
+                TurnConflict::PreparedSemanticsChanged { .. },
+            )) => {
                 match repo
                     .lookup_scoped_direct_turn_replay(
                         &ConversationAuthority(conversation.id.clone()),
@@ -499,8 +504,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
 fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
         crate::db::DbError::DirectTurnConflict(
-            TurnConflict::PreparedSemanticsChanged
-            | TurnConflict::CanonicalMessageAlreadyBound { .. },
+            TurnConflict::PreparedSemanticsChanged { .. },
         ) => SendChatServiceError::IdempotencyConflict,
         crate::db::DbError::DirectTurnConflict(TurnConflict::ConversationAlreadyOwned {
             ..
@@ -778,8 +782,11 @@ mod tests {
         )
     }
 
-    fn prepared_turn(payload: &PreparedDirectTurnPayload) -> PreparedTurn {
-        PreparedTurn::from_exact_payload(payload.to_exact_bytes().unwrap())
+    fn prepared_turn(
+        conversation: &ConversationAuthority,
+        payload: &PreparedDirectTurnPayload,
+    ) -> PreparedTurn {
+        PreparedTurn::from_exact_payload(conversation, payload.to_exact_bytes().unwrap())
     }
 
     async fn db_with_conversation(conversation_id: &str) -> crate::db::Database {
@@ -871,13 +878,13 @@ mod tests {
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority(req.conversation_id.clone()),
                 client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
-                prepared: prepared_turn(&payload),
+                prepared: prepared_turn(&ConversationAuthority(req.conversation_id.clone()), &payload),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
             .await
             .unwrap();
-        let TurnOutcome::Created { turn_id } = turn.outcome else {
+        let TurnOutcome::Created { turn_id, .. } = turn.outcome else {
             panic!("expected created turn")
         };
         assert_eq!(
@@ -940,7 +947,7 @@ mod tests {
         repo.accept_authoritative_turn(&AcceptAuthoritativeTurn {
             conversation: ConversationAuthority(req.conversation_id.clone()),
             client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
-            prepared: prepared_turn(&payload),
+            prepared: prepared_turn(&ConversationAuthority(req.conversation_id.clone()), &payload),
             disposition: AcceptedDisposition::Runtime,
             accepted_at: Timestamp(1),
         })
@@ -992,7 +999,9 @@ mod tests {
         ));
         assert!(matches!(
             map_direct_turn_accept_error(crate::db::DbError::DirectTurnConflict(
-                TurnConflict::PreparedSemanticsChanged
+                TurnConflict::PreparedSemanticsChanged {
+                    authoritative_fingerprint: "fp".to_string()
+                }
             )),
             SendChatServiceError::IdempotencyConflict
         ));
@@ -1010,6 +1019,19 @@ mod tests {
             )),
             SendChatServiceError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn prepared_turn_fingerprint_is_scoped_to_conversation_authority() {
+        let req = request();
+        let payload = prepared_payload(&req, "first expansion");
+        let conv_a = ConversationAuthority("conv-a".to_string());
+        let conv_b = ConversationAuthority("conv-b".to_string());
+
+        let prepared_a = prepared_turn(&conv_a, &payload);
+        let prepared_b = prepared_turn(&conv_b, &payload);
+
+        assert_ne!(prepared_a.fingerprint(), prepared_b.fingerprint());
     }
 
     #[test]
