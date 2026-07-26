@@ -14,6 +14,71 @@ use super::registry::TmuxRegistry;
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 
+const WATCHDOG_PROGRAM: &str = r#"
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+root = Path(sys.argv[1])
+parent = int(sys.argv[2])
+(root / ".armed").touch()
+while not (root / ".cleanup-request").exists() and os.getppid() == parent:
+    time.sleep(0.05)
+(root / ".cleanup-ack").touch()
+quiet = 0
+for _ in range(50):
+    unconfirmed = False
+    for socket in root.glob("*.sock"):
+        if not socket.is_socket():
+            continue
+        try:
+            probe = subprocess.run(
+                ["tmux", "-S", str(socket), "list-sessions"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=0.5,
+            )
+            if probe.returncode == 0:
+                killed = subprocess.run(
+                    ["tmux", "-S", str(socket), "kill-server"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=0.5,
+                )
+                if killed.returncode == 0:
+                    socket.unlink(missing_ok=True)
+                else:
+                    unconfirmed = True
+            else:
+                unconfirmed = True
+        except (OSError, subprocess.TimeoutExpired):
+            unconfirmed = True
+    sockets = any(path.is_socket() for path in root.glob("*.sock"))
+    creators = False
+    for marker in root.glob(".creating-*"):
+        try:
+            pid = int(marker.read_text())
+            os.kill(pid, 0)
+            creators = True
+        except ProcessLookupError:
+            marker.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            creators = True
+    quiet = quiet + 1 if not unconfirmed and not sockets and not creators else 0
+    if quiet >= 5:
+        shutil.rmtree(root)
+        sys.exit(0)
+    time.sleep(0.1)
+sys.exit(1)
+"#;
+
 /// Owns real tmux servers created by tests, including after abrupt runner death.
 pub struct TestTmuxServerOwner {
     root: Option<TempDir>,
@@ -56,62 +121,10 @@ impl TestTmuxServerOwner {
             "tmux test root must be under a short system temporary directory"
         );
 
-        let script = r#"
-import os
-from pathlib import Path
-import shutil
-import subprocess
-import sys
-import time
-
-root = Path(sys.argv[1])
-parent = int(sys.argv[2])
-(root / ".armed").touch()
-while not (root / ".cleanup-request").exists() and os.getppid() == parent:
-    time.sleep(0.05)
-(root / ".cleanup-ack").touch()
-quiet = 0
-for _ in range(50):
-    unconfirmed = False
-    for socket in root.glob("*.sock"):
-        if not socket.is_socket():
-            continue
-        try:
-            probe = subprocess.run(
-                ["tmux", "-S", str(socket), "list-sessions"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            if probe.returncode == 0:
-                killed = subprocess.run(
-                    ["tmux", "-S", str(socket), "kill-server"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                if killed.returncode == 0:
-                    socket.unlink(missing_ok=True)
-                else:
-                    unconfirmed = True
-            else:
-                unconfirmed = True
-        except OSError:
-            unconfirmed = True
-    sockets = any(path.is_socket() for path in root.glob("*.sock"))
-    quiet = quiet + 1 if not unconfirmed and not sockets else 0
-    if quiet >= 5:
-        shutil.rmtree(root)
-        sys.exit(0)
-    time.sleep(0.1)
-sys.exit(1)
-"#;
         let parent_pid = std::process::id().to_string();
         let mut command = Command::new("python3");
         command
-            .args(["-c", script])
+            .args(["-c", WATCHDOG_PROGRAM])
             .arg(&canonical_root)
             .arg(parent_pid)
             .stdin(Stdio::null())
@@ -417,6 +430,46 @@ mod tests {
         let (root, socket) = rx.await.unwrap();
         task.abort();
         let _ = task.await;
+        assert_ne!(probe_sync(&socket), ProbeResult::Live);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn cleanup_waits_for_in_flight_late_server_creation() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let root = owner.path().to_path_buf();
+        let socket = root.join("late.sock");
+        let marker = root.join(".creating-late");
+        let script = r#"
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+marker = Path(sys.argv[1])
+marker.write_text(str(os.getpid()))
+time.sleep(0.25)
+try:
+    subprocess.run(
+        ["tmux", "-S", sys.argv[2], "new-session", "-d", "-s", "main", "sleep 300"],
+        check=True,
+    )
+finally:
+    marker.unlink(missing_ok=True)
+"#;
+        let mut creator = Command::new("python3")
+            .args(["-c", script])
+            .arg(&marker)
+            .arg(&socket)
+            .spawn()
+            .unwrap();
+        wait_until(|| marker.exists(), "in-flight creator marker");
+        owner.shutdown();
+        assert!(creator.wait().unwrap().success());
         assert_ne!(probe_sync(&socket), ProbeResult::Live);
         assert!(!root.exists());
     }

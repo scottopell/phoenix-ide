@@ -1130,6 +1130,36 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
 /// any in-app terminal that later attaches) in the Phoenix repo
 /// instead of the conversation's project directory.
 ///
+fn tmux_spawn_command(socket_path: &Path, tmux_args: &[String]) -> tokio::process::Command {
+    let Some(root) = socket_path
+        .parent()
+        .filter(|root| root.join(".armed").exists())
+    else {
+        let mut command = tokio::process::Command::new("tmux");
+        command.args(tmux_args);
+        return command;
+    };
+    let marker = root.join(format!(".creating-{}", uuid::Uuid::new_v4()));
+    let wrapper = r"
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+marker = Path(sys.argv[1])
+marker.write_text(str(os.getpid()))
+try:
+    completed = subprocess.run(sys.argv[2:], check=False)
+    sys.exit(completed.returncode)
+finally:
+    marker.unlink(missing_ok=True)
+";
+    let mut command = tokio::process::Command::new("python3");
+    command.arg("-c").arg(wrapper).arg(marker).arg("tmux");
+    command.args(tmux_args);
+    command
+}
+
 /// # Errors
 /// Returns a [`TmuxError`] when the `tmux new-session` process fails to
 /// spawn or exits non-zero.
@@ -1138,19 +1168,19 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    let mut cmd = tokio::process::Command::new("tmux");
-    cmd.args([
-        "-f",
-        &config_path.to_string_lossy(),
-        "-S",
-        &socket_path.to_string_lossy(),
-        "new-session",
-        "-d",
-        "-c",
-        &cwd.to_string_lossy(),
-        "-s",
-        TMUX_DEFAULT_SESSION,
-    ]);
+    let tmux_args = [
+        "-f".to_string(),
+        config_path.to_string_lossy().into_owned(),
+        "-S".to_string(),
+        socket_path.to_string_lossy().into_owned(),
+        "new-session".to_string(),
+        "-d".to_string(),
+        "-c".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "-s".to_string(),
+        TMUX_DEFAULT_SESSION.to_string(),
+    ];
+    let mut cmd = tmux_spawn_command(socket_path, &tmux_args);
     // A tmux pane shell inherits the tmux *server's* environment, captured here.
     // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
     // than inheriting Phoenix's env, which would leak server secrets into every
