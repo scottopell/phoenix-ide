@@ -151,6 +151,8 @@ entity DirectChatConsumerCursor {
 -- conflicting_fingerprint(existing_acceptance), runtime_slot_for(resolved_target), slot_is_available(slot)
 -- canonical_delivery_for(acceptance), runtime_acceptance_for(delivery), runtime_identity_matches_acceptance(acceptance, runtime_acceptance)
 -- committed_outcome_for(acceptance), replay_of(outcome), steering_target_matches_successor(acceptance)
+-- current_generation_for(acceptance), settlement_receipt_committed(acceptance), accepted_turn_ownership_released(acceptance)
+
 -- target_can_accept_runtime(resolved_target), queued_steering_ref(acceptance), runtime_accepted_ref(acceptance)
 -- consumer_cursor_for(acceptance, consumer_kind), cursor_progress_is_secondary_only(cursor)
 -- exact_acceptance_lookup(turn_key), transcript_window_lookup_is_non_authoritative(turn_key)
@@ -357,6 +359,27 @@ rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
     requires: acceptance.committed_outcome != null
 
     ensures: consumer_cursor_for(acceptance, consumer_kind)
+    ensures: acceptance.accepted_turn = acceptance.accepted_turn
+}
+
+rule LifecycleSettlementTargetsExactAcceptedTurnGeneration {
+    when: DirectTurnSettlementRequested(acceptance, generation)
+    requires: generation = current_generation_for(acceptance)
+    ensures: settlement_receipt_committed(acceptance)
+    ensures: accepted_turn_ownership_released(acceptance)
+
+    @guidance
+        -- Destructive lifecycle orchestration addresses direct-chat work by the
+        -- exact accepted-turn identity (`accepted_turn.workflow_id`, optional
+        -- `accepted_turn.canonical_delivery_id`) together with the current
+        -- generation fence. Settlement reuses the profile's existing typed
+        -- cancellation/recovery machinery rather than inventing a second close-
+        -- specific cancellation state machine.
+}
+
+rule StaleGenerationSettlementCannotMutateCurrentAcceptedTurn {
+    when: DirectTurnSettlementRequested(acceptance, generation)
+    requires: generation != current_generation_for(acceptance)
     ensures: acceptance.accepted_turn = acceptance.accepted_turn
 }
 

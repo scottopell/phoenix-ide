@@ -90,6 +90,14 @@ enum RecoveryKind { credential }
 enum RecoveryResumeTarget { conversation_turn | continuation_summary }
 enum TaskApprovalDecision { approved | rejected | feedback_provided }
 enum ModeKind { direct | managed | branch }
+enum ClosePhase {
+    awaiting_blocker_resolution
+    | awaiting_stop_work_confirmation
+    | settling_active_work
+    | awaiting_loss_confirmation
+    | retirement_requested
+    | needs_repair
+}
 
 ------------------------------------------------------------
 -- Entities
@@ -97,6 +105,32 @@ enum ModeKind { direct | managed | branch }
 
 -- Conversation uses a sum type to structurally separate parent and sub-agent
 -- conversations. The kind discriminator determines which states are reachable.
+entity ProductConversation {
+    lifecycle: open | history
+
+    -- Aggregate membership is singular by construction: each durable
+    -- transcript row belongs to exactly one product conversation, and the
+    -- aggregate alone owns lifecycle.
+    transcript_rows: Conversation with product_conversation = this
+}
+
+entity CloseObligation {
+    product_conversation: ProductConversation
+    phase: ClosePhase
+    loss_confirmation_generation: String? when phase in { awaiting_loss_confirmation, retirement_requested, needs_repair }
+
+    transitions phase {
+        awaiting_blocker_resolution -> awaiting_stop_work_confirmation
+        awaiting_blocker_resolution -> settling_active_work
+        awaiting_blocker_resolution -> awaiting_loss_confirmation
+        awaiting_stop_work_confirmation -> settling_active_work
+        settling_active_work -> awaiting_loss_confirmation
+        awaiting_loss_confirmation -> retirement_requested
+        retirement_requested -> needs_repair
+        terminal: retirement_requested, needs_repair
+    }
+}
+
 entity Conversation {
     kind: Parent | SubAgent
 
@@ -1188,6 +1222,126 @@ rule ConversationLifecycleBecomesHistory {
     requires: conversation.is_latest_row
     requires: conversation.lifecycle = open
     ensures: conversation.root_conversation.lifecycle = history
+}
+
+rule UserRequestsCloseConversation {
+    when: UserRequestsCloseConversation(conversation)
+    requires: conversation.product_lifecycle = open
+    requires: conversation.is_latest_row
+    requires: not CloseObligation.exists(product_conversation: conversation.product_conversation)
+    ensures: CloseObligation.created(
+        product_conversation: conversation.product_conversation,
+        phase: awaiting_blocker_resolution,
+        loss_confirmation_generation: null
+    )
+
+    @guidance
+        -- Close is a durable root-owned obligation separate from the row-local
+        -- lifecycle state. Creating the obligation precedes any destructive side
+        -- effects so restart/retry can resume one in-flight close rather than
+        -- inventing another.
+}
+
+rule CloseObligationWaitsForBlockingDecision {
+    when: CloseEvaluationRequested(product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_blocker_resolution
+    requires:
+        exists Parent{product_conversation: product_conversation, parent_status: awaiting_task_approval}
+        or exists Parent{product_conversation: product_conversation, core_status: awaiting_continuation}
+    ensures: CloseBlockedOnConversationDecision(product_conversation)
+}
+
+rule CloseObligationRequiresExplicitStopWorkConfirmation {
+    when: CloseEvaluationRequested(product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_blocker_resolution
+    requires: not exists Parent{product_conversation: product_conversation, parent_status: awaiting_task_approval}
+    requires: not exists Parent{product_conversation: product_conversation, core_status: awaiting_continuation}
+    requires: exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_stop_work_confirmation
+    ensures: StopWorkAndContinueClosingConfirmationRequired(product_conversation)
+}
+
+rule CloseObligationUserConfirmsStopWork {
+    when: UserConfirmsStopWorkAndContinueClosing(product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_stop_work_confirmation
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
+    ensures: CloseSettlementRequested(product_conversation)
+}
+
+rule CloseObligationCanBeCancelledBeforeRetirement {
+    when: UserCancelsClose(product_conversation)
+    requires: CloseObligation.exists(product_conversation: product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase in {
+        awaiting_blocker_resolution,
+        awaiting_stop_work_confirmation,
+        settling_active_work,
+        awaiting_loss_confirmation
+    }
+    ensures: CloseObligationCancelled(product_conversation)
+}
+
+rule CloseObligationBeginsSettlementWithoutBusyWork {
+    when: CloseEvaluationRequested(product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_blocker_resolution
+    requires: not exists Parent{product_conversation: product_conversation, parent_status: awaiting_task_approval}
+    requires: not exists Parent{product_conversation: product_conversation, core_status: awaiting_continuation}
+    requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
+    ensures: CloseSettlementRequested(product_conversation)
+}
+
+rule CloseObligationWaitsForSettlement {
+    when: CloseSettlementProgressed(product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
+    requires: exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
+    ensures: CloseSettlementStillOwed(product_conversation)
+}
+
+rule CloseObligationPersistsLossConfirmationBeforeRetirement {
+    when: CloseLossConfirmed(product_conversation, workspace_generation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
+    requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_loss_confirmation
+    ensures: CloseObligation{product_conversation: product_conversation}.loss_confirmation_generation = workspace_generation
+}
+
+rule CloseObligationRequestsRetirementBoundary {
+    when: CloseRetirementRequested(product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_loss_confirmation
+    requires: CloseObligation{product_conversation: product_conversation}.loss_confirmation_generation != null
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = retirement_requested
+    ensures: ResourceRetirementRequested(product_conversation)
+
+    @guidance
+        -- Crossing into retirement_requested commits Close past the user-cancellable
+        -- phase boundary. Downstream resource-retirement work consumes this typed
+        -- request and owns loss classification, teardown, and repair details.
+}
+
+rule CloseRetirementCompletionFinalizesAggregateHistory {
+    when: ResourceRetirementCompleted(product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = retirement_requested
+    requires: product_conversation.lifecycle = open
+    ensures: ProductConversationEnteredHistory(product_conversation)
+
+    @guidance
+        -- The lifecycle transition event name is intentionally completion-oriented:
+        -- it fires only after retirement completion, avoiding confusion with the
+        -- user action that merely requested Close.
+}
+
+rule ProductConversationEnteredHistory {
+    when: ProductConversationEnteredHistory(product_conversation)
+    requires: product_conversation.lifecycle = open
+    ensures: product_conversation.lifecycle = history
+}
+
+rule CloseRetirementFailureLeavesOpenNeedsRepair {
+    when: ResourceRetirementFailed(product_conversation)
+    requires: CloseObligation{product_conversation: product_conversation}.phase = retirement_requested
+    requires: product_conversation.lifecycle = open
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = needs_repair
+    ensures: CloseNeedsRepairVisible(product_conversation)
 }
 
 ------------------------------------------------------------

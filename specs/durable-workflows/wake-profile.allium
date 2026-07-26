@@ -396,6 +396,20 @@ rule PendingWakeBlocksDestructiveLifecycleWithoutBusyState {
         -- fabricate runtime-busy state for an otherwise idle conversation.
 }
 
+rule CloseSettlementCancelsPendingWakeBindings {
+    when: CloseSettlementRequested(manager, conversation)
+    requires: pending_wake_count(conversation) > 0
+    ensures:
+        for binding in pending_bindings(conversation):
+            WakeCancellationRequested(manager, binding)
+
+    @guidance
+        -- Close settles wake-owned obligations through the profile's existing
+        -- explicit cancellation authority. The resulting cancelled receipt still
+        -- follows the normal canonical-delivery path, but close orchestration does
+        -- not wait for a separate wake-specific lifecycle state machine.
+}
+
 rule ContinuationTransfersPendingWakeStateAtomically {
     when: ConversationContinued(manager, predecessor, successor)
     requires: transferable_bindings(predecessor) != {}

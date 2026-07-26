@@ -484,6 +484,20 @@ Correctness SHALL NOT depend on sleeps, polling cadence, timestamps that infer
 semantic ownership, manual sequence rewind discipline, provider-response-derived
 tool authority, or mutable runtime steering truth.
 
+### REQ-DWF-CHAT-015: Lifecycle Settlement Uses Exact Accepted-Turn Identity
+
+WHEN destructive lifecycle orchestration must settle durable direct-turn work before
+resource retirement
+THE direct-chat profile SHALL address that work by the exact accepted-turn identity
+already owned by the profile, including `accepted_turn.workflow_id` and the current
+workflow generation fence, and SHALL preserve any committed `canonical_delivery_id`
+identity when present.
+
+The settlement path SHALL reuse the profile's existing typed cancellation and recovery
+machinery. A stale-generation or stale-identity settlement attempt SHALL NOT mutate the
+current accepted turn, and successful settlement SHALL release runtime ownership without
+creating a duplicate transcript event or a second lifecycle-specific cancellation state.
+
 ### REQ-DWF-CHAT-011: Crash, Race, and Mutable-Input Verification
 
 WHEN the direct-chat profile is verified
@@ -619,6 +633,11 @@ Pending wake obligations SHALL derive lifecycle blocking without redefining an
 idle conversation as runtime-busy. Destructive lifecycle actions SHALL conflict
 until pending waits are explicitly resolved, with the guard serialized against
 new registration.
+
+Close-driven settlement SHALL invoke the wake profile's existing explicit
+cancellation authority for each pending binding and wait for the resulting typed
+terminal receipt/canonical-delivery settlement rather than inventing a separate
+wake-close state machine.
 
 ### REQ-DWF-WAKE-005: Continuation Transfer
 
