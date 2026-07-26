@@ -86,6 +86,12 @@ pub struct DiscoverableAcceptedTurn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverableAcceptedTurnPage {
+    pub candidates: Vec<DiscoverableAcceptedTurn>,
+    pub next_cursor: Option<DirectTurnDiscoveryCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmittedIdentityChanged {
     pub turn: DurableTurn,
     pub stored: SubmittedDirectTurnIdentity,
@@ -589,9 +595,12 @@ impl WorkflowRepository {
         &self,
         cursor: Option<DirectTurnDiscoveryCursor>,
         limit: usize,
-    ) -> DbResult<Vec<DiscoverableAcceptedTurn>> {
+    ) -> DbResult<DiscoverableAcceptedTurnPage> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(DiscoverableAcceptedTurnPage {
+                candidates: Vec::new(),
+                next_cursor: cursor,
+            });
         }
         let capped_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let (cursor_turn_id, cursor_workflow_id) = cursor.map_or((0_i64, 0_i64), |cursor| {
@@ -616,6 +625,15 @@ impl WorkflowRepository {
         .bind(capped_limit)
         .fetch_all(&self.pool)
         .await?;
+        let next_cursor = rows
+            .last()
+            .map(|row| {
+                Ok::<DirectTurnDiscoveryCursor, DbError>(DirectTurnDiscoveryCursor {
+                    turn_id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
+                    workflow_id: WorkflowId(to_u64(row.get("workflow_id"), "workflow_id")?),
+                })
+            })
+            .transpose()?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let turn_id = TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?);
@@ -632,7 +650,10 @@ impl WorkflowRepository {
                 }
             }
         }
-        Ok(out)
+        Ok(DiscoverableAcceptedTurnPage {
+            candidates: out,
+            next_cursor,
+        })
     }
 
     pub async fn preflight_direct_turn_materialization(
@@ -3046,6 +3067,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             first_page
+                .candidates
                 .iter()
                 .map(|row| (row.turn_id, row.workflow_id, row.conversation.0.as_str()))
                 .collect::<Vec<_>>(),
@@ -3063,6 +3085,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             second_page
+                .candidates
                 .iter()
                 .map(|row| (row.turn_id, row.workflow_id, row.conversation.0.as_str()))
                 .collect::<Vec<_>>(),
@@ -3072,6 +3095,7 @@ mod tests {
             .list_discoverable_accepted_runtime_direct_turns(None, 0)
             .await
             .unwrap()
+            .candidates
             .is_empty());
     }
 

@@ -6,9 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
 use phoenix_db::workflow::{
-    ClaimAuthoritativeTurnInput, DirectTurnDiscoveryCursor, DirectTurnMaterializationEligibility,
-    DiscoverableAcceptedTurn, PreflightDirectTurnMaterializationInput,
-    ReleaseAuthoritativeTurnInput, WorkflowRepository,
+    ClaimAuthoritativeTurnInput, DirectTurnMaterializationEligibility, DiscoverableAcceptedTurn,
+    PreflightDirectTurnMaterializationInput, ReleaseAuthoritativeTurnInput, WorkflowRepository,
 };
 use phoenix_db::LocalAttemptAuthority;
 use phoenix_workflow::{ClaimOutcome, LeaseExpiry, ProcessIncarnation, Timestamp};
@@ -113,20 +112,17 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
     pub(crate) async fn run_once(&self) -> Result<Duration, String> {
         let mut cursor = None;
         loop {
-            let candidates = self
+            let page = self
                 .repo
                 .list_discoverable_accepted_runtime_direct_turns(cursor, DISCOVERY_BATCH_LIMIT)
                 .await
                 .map_err(|error| error.to_string())?;
-            let page_len = candidates.len();
-            for candidate in candidates {
-                cursor = Some(DirectTurnDiscoveryCursor {
-                    turn_id: candidate.turn_id,
-                    workflow_id: candidate.workflow_id,
-                });
+            let exhausted = page.next_cursor.is_none() || page.next_cursor == cursor;
+            cursor = page.next_cursor;
+            for candidate in page.candidates {
                 self.dispatch_candidate(candidate, self.clock.now()).await?;
             }
-            if page_len < DISCOVERY_BATCH_LIMIT {
+            if exhausted {
                 break;
             }
         }
