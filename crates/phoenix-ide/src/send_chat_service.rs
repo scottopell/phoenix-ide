@@ -157,6 +157,17 @@ impl SendChatApplicationService {
             ) {
                 let validated_files = validate_files(&req).await?;
                 let expanded = expand_request(&self.db, &conversation, &req).await?;
+                match lookup_durable_replay(&self.db, &req, &submitted).await? {
+                    DurableReplayOutcome::Missing => {}
+                    DurableReplayOutcome::ExactMaterialized
+                    | DurableReplayOutcome::ExactUnmaterializedTerminal => {
+                        return Ok(SendChatOutcome::AlreadyPersisted);
+                    }
+                    DurableReplayOutcome::ExactUnmaterializedLive => {
+                        self.runtime.kick_direct_turn_worker();
+                        return Ok(SendChatOutcome::Delivered);
+                    }
+                }
                 let event = Event::SteerMessage {
                     text: expanded.display_text.clone(),
                     llm_text: expanded.llm_text,
