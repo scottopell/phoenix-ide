@@ -12890,12 +12890,6 @@ button.keyword-search-filepath:hover {
   min-height: 48px;
 }
 
-.mobile-list-density #conv-list > .conv-item,
-.mobile-list-density #conv-list > .conv-chain-block {
-  content-visibility: auto;
-  contain-intrinsic-block-size: auto 64px;
-}
-
 .mobile-list-density .conv-item-main {
   min-width: 0;
 }
@@ -13072,8 +13066,6 @@ button.keyword-search-filepath:hover {
   min-height: 44px;
   margin-left: 10px;
   border-left: 1px solid color-mix(in srgb, var(--border-color) 65%, transparent);
-  content-visibility: auto;
-  contain-intrinsic-block-size: auto 44px;
 }
 
 .mobile-list-density .conv-chain-history-target {
@@ -13141,8 +13133,15 @@ button.keyword-search-filepath:hover {
 }
 
 .mobile-list-density .conv-chain-history-menu .conv-item-actions {
+  position: absolute;
   top: 38px;
   right: 4px;
+  z-index: 10;
+  min-width: 120px;
+  padding: 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 18%);
 }
 
 /* stylelint-enable no-descending-specificity */
