@@ -337,7 +337,7 @@ function BrowserRow({
   onStopped,
   onError,
 }: {
-  state: 'live' | 'torn_down';
+  state: 'live' | 'teardown_failed' | 'torn_down';
   idleMs: number;
   scopeKey: string;
   conversationId: string;
@@ -350,9 +350,11 @@ function BrowserRow({
   const display =
     state === 'torn_down'
       ? { glyph: '○', cls: 'ws-glyph--muted', text: 'torn down' }
-      : idle
-        ? { glyph: '○', cls: 'ws-glyph--warn', text: `idle ${formatDuration(idleMs)}` }
-        : { glyph: '●', cls: 'ws-glyph--live', text: 'live' };
+      : state === 'teardown_failed'
+        ? { glyph: '✗', cls: 'ws-glyph--error', text: 'stop failed' }
+        : idle
+          ? { glyph: '○', cls: 'ws-glyph--warn', text: `idle ${formatDuration(idleMs)}` }
+          : { glyph: '●', cls: 'ws-glyph--live', text: 'live' };
   return (
     <div className={`ws-row${state === 'torn_down' ? ' ws-row--dead' : ''}`}>
       <div className="ws-row-main ws-row-main--static">
@@ -362,7 +364,7 @@ function BrowserRow({
         <span className="ws-row-label">browser</span>
         <span className="ws-row-meta">{display.text}</span>
         {state === 'live' && inspectable && <BrowserOpenButton />}
-        {state === 'live' && <BrowserStopButton scopeKey={scopeKey} conversationId={conversationId} onStopped={onStopped} onError={onError} />}
+        {state !== 'torn_down' && <BrowserStopButton scopeKey={scopeKey} conversationId={conversationId} onStopped={onStopped} onError={onError} />}
       </div>
     </div>
   );

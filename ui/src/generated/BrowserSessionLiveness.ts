@@ -6,4 +6,4 @@
  * Named distinctly from the SSE `BrowserSessionState` event (which signals
  * up/down edges) — this is the inventory's point-in-time liveness.
  */
-export type BrowserSessionLiveness = "live" | "torn_down";
+export type BrowserSessionLiveness = "live" | "teardown_failed" | "torn_down";

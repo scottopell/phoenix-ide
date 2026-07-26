@@ -19,7 +19,7 @@ use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceScopeKey};
 
 use crate::bash::handle::{Handle, HandleState};
 use crate::bash::registry::BashHandleRegistry;
-use crate::browser::session::BrowserSessionManager;
+use crate::browser::session::{BrowserInventoryState, BrowserSessionManager};
 use crate::tmux::registry::{ServerStatus, TmuxRegistry};
 
 /// Assemble the full inventory for `work_scope` from the live registries.
@@ -149,18 +149,19 @@ async fn assemble_browser(
     actor: Option<&EffectiveResourceAccess>,
     browser_sessions: &Arc<BrowserSessionManager>,
 ) -> Option<BrowserInventory> {
-    let idle = match actor {
+    let metadata = match actor {
         Some(access) => browser_sessions
-            .inventory_idle_for_actor(work_scope, access)
+            .inventory_metadata_for_actor(work_scope, access)
             .await
             .ok()??,
-        None => browser_sessions.inventory_idle(work_scope).await?,
+        None => browser_sessions.inventory_metadata(work_scope).await?,
     };
-    let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
-    Some(BrowserInventory {
-        state: BrowserSessionLiveness::Live,
-        idle_ms,
-    })
+    let state = match metadata.state {
+        BrowserInventoryState::Live => BrowserSessionLiveness::Live,
+        BrowserInventoryState::TeardownFailed => BrowserSessionLiveness::TeardownFailed,
+    };
+    let idle_ms = u64::try_from(metadata.idle.as_millis()).unwrap_or(u64::MAX);
+    Some(BrowserInventory { state, idle_ms })
 }
 
 #[cfg(test)]
