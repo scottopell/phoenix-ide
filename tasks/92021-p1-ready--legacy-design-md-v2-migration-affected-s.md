@@ -1,16 +1,51 @@
 Child of task 92010.
 
-Concern:
-- Migrate any affected legacy design.md content into spEARS v2 homes so lifecycle-related rationale, behavior, and status content live in the correct artifact types.
+# Migrate lifecycle-related legacy design.md content into spEARS v2 homes
 
-Settled terminology guardrails:
-- Preserve the settled lifecycle vocabulary while migrating text; do not copy legacy aliases forward unless they are explicitly marked as historical.
-- Requirements remain timeless; ADRs hold rationale/history; Allium holds precise behavior; executive docs hold status/current reality.
-- Use “legacy design.md” only to describe the source artifact, not the normative destination terminology.
-- Do not let migrated prose reintroduce conflicting authority terms.
+## Objective
+Apply the spEARS v2 migration rules to lifecycle-related legacy `design.md` material so rationale, behavior, requirements, and status each land in the right artifact type before new authoring drifts across file classes.
 
-Done evidence:
-- Every affected legacy design.md section is either migrated to the right v2 artifact or intentionally left with a documented reason.
-- No migrated timeless artifact contains task IDs, implementation-status language, or decision-log prose.
-- Cross-references among requirements, ADRs, Allium, and executive docs resolve cleanly after migration.
-- Validation notes identify which specs were migrated and where each content class landed.
+## Exact target artifact clusters
+Likely affected legacy source material to inspect first:
+- `specs/bedrock/design.md`
+- `specs/chains/design.md`
+- `specs/conversation-retrieval/design.md`
+- `specs/conversation-ui/design.md`
+- `specs/projects/design.md`
+- `specs/pr-association/design.md`
+- `specs/work-actions-bar/design.md`
+- `specs/work-lifecycle/design.md`
+- `specs/work-scope-ui/design.md`
+- any additional `design.md` file proven by grep to contain lifecycle/continuation/follow-up/WorkScope language
+
+Destination artifact classes:
+- `requirements.md` for timeless user need / REQ text
+- `.allium` for precise behavior
+- `specs/adrs/*.md` for rationale and decisions
+- `executive.md` for status/current reality
+
+## Settled facts this task MUST preserve during migration
+- Product conversation identified by durable root owns Open/History lifecycle.
+- Close conversation is the action; History is the resulting state; never migrate “Closed” as lifecycle truth.
+- Context continuation stays one product conversation and one attached `WorkScope` across `continued_in_conv_id` rows.
+- `WorkScope` owns resources; conversation lifecycle does not.
+- `Continue here`, `Start in new conversation`, and follow-up remain distinct behaviors with the side-effect boundaries already settled.
+- Use Git-backed vs chat-only; avoid migrating “project conversation” forward except as explicit legacy wording.
+
+## Required work contract
+- Follow spEARS v2 migration rules from repo guidance: requirements timeless, ADRs historical rationale, Allium precise behavior, executive current reality.
+- Do not copy task IDs, PR references, status bullets, or resolved-question logs into timeless artifacts.
+- For each migrated section, decide whether it should move, be rewritten, or stay temporarily as legacy source material with a documented reason.
+- Update cross-references after migration so touched specs point to current v2 homes instead of stale design.md prose.
+
+## Out of scope
+- No code changes.
+- Do not delete unrelated legacy `design.md` files wholesale.
+
+## Evidence required before marking done
+Append a completion note to this task body with these headings:
+- **Files changed** — exact legacy sources and destination artifact paths
+- **Decisions captured** — section-by-section migration calls and why
+- **Validation** — grep/spec-shape checks run
+- **Review corrections** — migration cleanup after review, or `None`
+- **Commit** — commit hash that landed the work
