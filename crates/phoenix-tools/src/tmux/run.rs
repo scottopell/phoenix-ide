@@ -789,25 +789,6 @@ fn prepare_tmux_wake_fingerprint(
     hex::encode(hasher.finalize())
 }
 
-fn now_timestamp() -> Timestamp {
-    Timestamp(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
-}
-
-trait TimestampExt {
-    fn saturating_add_duration(self, duration: Duration) -> Self;
-}
-
-impl TimestampExt for Timestamp {
-    fn saturating_add_duration(self, duration: Duration) -> Self {
-        Self(self.0.saturating_add(duration.as_secs()))
-    }
-}
-
 fn structured_response(
     status: &str,
     target: &TmuxRunTarget,
