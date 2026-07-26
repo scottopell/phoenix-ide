@@ -556,10 +556,34 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
     expect(getInv.mock.calls.length).toBe(callsAfterSettle);
   });
 
-  it('an SSE-backed collapsed surface does NOT poll (its push keeps the badge fresh)', async () => {
-    // WorkScopeSection is SSE-backed; collapsed (expanded=false) it must stay
-    // inert — no poll — relying on the push channel. Guards against the
-    // SSE-less fix leaking into the SSE-backed surface.
+  it('an SSE-backed collapsed surface polls pending browser teardown until terminal', async () => {
+    const pending = inv([], { browser: { state: 'teardown_pending', idle_ms: null } });
+    const failed = inv([], { browser: { state: 'teardown_failed', idle_ms: null } });
+    getInv.mockResolvedValueOnce(pending).mockResolvedValueOnce(failed);
+
+    await act(async () => {
+      render(sectionCollapsedTree({ scopeKey: 'ws-1', liveInventory: pending }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const callsAfterMount = getInv.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(getInv.mock.calls.length).toBeGreaterThan(callsAfterMount);
+
+    const callsAfterFailure = getInv.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(getInv.mock.calls.length).toBe(callsAfterFailure);
+  });
+
+  it('an SSE-backed collapsed surface does not poll an ordinary live resource', async () => {
+    // WorkScopeSection is SSE-backed; collapsed ordinary resources rely on the
+    // push channel. Only teardown_pending overrides this gate.
     getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
 
     await act(async () => {
@@ -575,7 +599,7 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
-    // No additional polls while collapsed + SSE-backed.
+    // No additional polls while collapsed + SSE-backed without pending teardown.
     expect(getInv.mock.calls.length).toBe(callsAfterMount);
   });
 });

@@ -402,12 +402,12 @@ function BrowserRow({
  * slower than the poll interval still completes and applies rather than being
  * perpetually superseded (and discarded) by the next interval's fetch.
  *
- * Two gates, deliberately separate. `pollActive` gates the inventory poll;
- * `visible` gates the per-second elapsed-time tick. They coincide for the
- * SSE-backed section (both = expanded), but the SSE-less chain dock keeps
- * `pollActive` true while collapsed (so the badge can settle with no push
- * channel) while leaving `visible` false — an off-screen dock polls but never
- * runs the elapsed timer.
+ * Two gates, deliberately separate. `pollActive` gates ordinary live-resource
+ * polling; `visible` gates the per-second elapsed-time tick. Pending browser
+ * teardown overrides `pollActive` so every collapsed surface observes its
+ * terminal state even if a lifecycle edge is delayed. The SSE-less chain dock
+ * also keeps `pollActive` true while collapsed so its badge can settle without
+ * a push channel, while leaving `visible` false.
  */
 function useWorkScopeInventory(
   scopeKey: string,
@@ -503,12 +503,12 @@ function useWorkScopeInventory(
   }, [visible]);
 
   // Live-resource poll: while the surface is active and the scope owns ANY
-  // live resource — a running bash handle, a tmux server entry, or a live
-  // browser session. Gated on `displayed` so it stops once everything is
-  // terminal and starts as soon as any resource appears. Covers values with
-  // no dedicated push edge (browser `idle_ms`) and is belt-and-suspenders for
-  // tmux, whose entry can be created off the conversation's own SSE channel.
-  const pollRunning = pollActive && hasLiveResource(displayed);
+  // live resource. Pending browser teardown remains poll-active even on a
+  // collapsed SSE-backed surface, until inventory reaches failed or absent.
+  // This closes the gap where a delayed terminal lifecycle edge would otherwise
+  // leave the collapsed summary stuck at "stopping".
+  const browserTeardownPending = displayed?.browser?.state === 'teardown_pending';
+  const pollRunning = (pollActive || browserTeardownPending) && hasLiveResource(displayed);
   useEffect(() => {
     if (!pollRunning) return;
     const id = setInterval(() => {
@@ -684,14 +684,12 @@ export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expa
  * live-count badge rail; expanded it shows the shared resource body.
  */
 export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collapsed, onToggle, width }: Props) {
-  // An SSE-less surface (no `liveInventory`) must keep polling even while
-  // collapsed so the count badge can settle: with no push channel, a resource
-  // live at collapse and then exited/reaped would otherwise read as running
-  // forever until expand. The poll self-limits — `pollRunning = pollActive &&
-  // hasLiveResource` — so it stops once nothing is live. An SSE-backed surface
-  // still pauses when collapsed (its push channel keeps the badge fresh).
-  // `visible` (the elapsed-tick gate) stays `!collapsed` regardless, so an
-  // off-screen dock never runs the 1s timer even while it polls.
+  // An SSE-less surface (no `liveInventory`) keeps ordinary resource polling
+  // active while collapsed so the count badge can settle without a push
+  // channel. An SSE-backed surface pauses ordinary polling while collapsed;
+  // `useWorkScopeInventory` still polls browser teardown_pending through a
+  // terminal state. `visible` stays `!collapsed`, so an off-screen dock never
+  // runs the 1s elapsed timer even while it polls.
   const pollActive = !collapsed || liveInventory == null;
   const { inventory, error, now, retry } = useWorkScopeInventory(
     scopeKey,
