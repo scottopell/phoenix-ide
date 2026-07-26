@@ -3338,7 +3338,6 @@ mod tests {
         let accepted_at = Timestamp(7);
         let created = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-                conversation: ConversationAuthority("conv-a".to_string()),
                 client_key: ClientTurnKey::new("gate-delivery").unwrap(),
                 prepared: PreparedTurn::from_exact_payload(
                     &ConversationAuthority("conv-a".to_string()),
@@ -3388,7 +3387,6 @@ mod tests {
         let accepted_at = Timestamp(7);
         let created = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-                conversation: ConversationAuthority("conv-a".to_string()),
                 client_key: ClientTurnKey::new("gate-head").unwrap(),
                 prepared: PreparedTurn::from_exact_payload(
                     &ConversationAuthority("conv-a".to_string()),

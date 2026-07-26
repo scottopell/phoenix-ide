@@ -398,7 +398,6 @@ mod tests {
     async fn accept(repo: &WorkflowRepository, key: &str) -> phoenix_workflow::TurnAuthorityId {
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
-                conversation: ConversationAuthority("conv-a".to_string()),
                 client_key: ClientTurnKey::new(key).unwrap(),
                 prepared: prepared_turn(&format!("message-{key}")),
                 disposition: AcceptedDisposition::Runtime,
@@ -657,7 +656,6 @@ mod tests {
         let (repo, dispatcher) = fixture().await;
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
-                conversation: ConversationAuthority("conv-a".to_string()),
                 client_key: ClientTurnKey::new("bad").unwrap(),
                 prepared: prepared_turn("bad"),
                 disposition: AcceptedDisposition::Runtime,

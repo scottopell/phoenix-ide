@@ -32,11 +32,17 @@ const DIRECT_TURN_EFFECT_ID: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptAuthoritativeTurn {
-    pub conversation: ConversationAuthority,
     pub client_key: ClientTurnKey,
     pub prepared: PreparedTurn,
     pub disposition: AcceptedDisposition,
     pub accepted_at: phoenix_workflow::Timestamp,
+}
+
+impl AcceptAuthoritativeTurn {
+    #[must_use]
+    pub fn conversation(&self) -> &ConversationAuthority {
+        self.prepared.target()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +185,7 @@ impl WorkflowRepository {
     ) -> DbResult<TurnStep> {
         let mut tx = self.begin_immediate_tx().await?;
         if let Some(existing) =
-            load_by_scoped_key(&mut tx.tx, &input.conversation, &input.client_key).await?
+            load_by_scoped_key(&mut tx.tx, input.conversation(), &input.client_key).await?
         {
             tx.rollback().await?;
             if existing.prepared != input.prepared
@@ -214,7 +220,7 @@ impl WorkflowRepository {
         .fetch_optional(&mut *tx.tx)
         .await?
         {
-            if existing_conversation != input.conversation.0 {
+            if existing_conversation != input.conversation().0 {
                 tx.rollback().await?;
                 return Err(prepared_semantics_changed(&input.prepared));
             }
@@ -223,7 +229,7 @@ impl WorkflowRepository {
             if let Some(owner) = sqlx::query_scalar::<_, i64>(
                 "SELECT turn_id FROM durable_turns WHERE conversation_id = ?1 AND owns_conversation = 1",
             )
-            .bind(&input.conversation.0)
+            .bind(&input.conversation().0)
             .fetch_optional(&mut *tx.tx)
             .await?
             {
@@ -231,6 +237,15 @@ impl WorkflowRepository {
                 return Err(conflict(TurnConflict::ConversationAlreadyOwned {
                     owner: TurnAuthorityId(to_u64(owner, "turn_id")?),
                 }));
+            }
+        } else if let Some(owner) =
+            load_active_runtime_turn_tx(&mut tx.tx, input.conversation()).await?
+        {
+            if owner.conversation != *input.conversation() {
+                tx.rollback().await?;
+                return Err(DbError::Serialization(
+                    "active runtime owner rehydrated under wrong conversation".to_string(),
+                ));
             }
         }
         let turn_id = next_direct_turn_id_tx(&mut tx).await?;
@@ -245,7 +260,7 @@ impl WorkflowRepository {
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, NULL, ?7, NULL, ?8)",
         )
         .bind(to_i64(turn_id.0, "turn_id")?)
-        .bind(&input.conversation.0)
+        .bind(&input.conversation().0)
         .bind(input.client_key.as_str())
         .bind(input.prepared.fingerprint())
         .bind(input.prepared.payload())
@@ -267,7 +282,7 @@ impl WorkflowRepository {
         model
             .apply(TurnCommand::Accept {
                 turn_id,
-                conversation: input.conversation.clone(),
+                conversation: input.conversation().clone(),
                 client_key: input.client_key.clone(),
                 prepared: input.prepared.clone(),
                 disposition: input.disposition,
@@ -523,18 +538,10 @@ impl WorkflowRepository {
         &self,
         conversation: &ConversationAuthority,
     ) -> DbResult<Option<DurableTurn>> {
-        sqlx::query(
-            "SELECT * FROM durable_turns
-             WHERE conversation_id = ?1
-               AND disposition = 'Runtime'
-               AND terminal_kind IS NULL
-               AND owns_conversation = 1",
-        )
-        .bind(&conversation.0)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(row_to_turn)
-        .transpose()
+        let mut tx = self.pool.begin().await?;
+        let turn = load_active_runtime_turn_tx(&mut tx, conversation).await?;
+        tx.rollback().await?;
+        Ok(turn)
     }
 
     pub async fn list_discoverable_accepted_turns(
@@ -715,7 +722,7 @@ impl WorkflowRepository {
             .await?
             .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
         verify_prepared_payload(&turn, &input.prepared)?;
-        let canonical_message_id = CanonicalMessageId(input.prepared.message_id().to_string());
+        let canonical_message_id = canonical_message_id_for_turn(&turn, &input.prepared);
         let mut model =
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model
@@ -907,7 +914,7 @@ impl WorkflowRepository {
                 &snapshot_codec,
                 &snapshot_payload,
                 phoenix_workflow::TransitionId(DIRECT_TURN_TERMINAL_TRANSITION_ID),
-                phoenix_workflow::Timestamp(next_generation),
+                terminal_commit_timestamp(),
             )
             .await?;
         if !committed {
@@ -969,7 +976,7 @@ async fn insert_direct_turn_workflow_tx(
     let snapshot = direct_turn_profile::DirectTurnSnapshot { turn_id: turn_id.0 };
     let intent = direct_turn_profile::RuntimeTurnIntent {
         turn_id: turn_id.0,
-        conversation_id: input.conversation.0.clone(),
+        conversation_id: input.conversation().0.clone(),
         client_turn_key: input.client_key.as_str().to_string(),
         prepared_fingerprint: input.prepared.fingerprint().to_string(),
     };
@@ -981,7 +988,7 @@ async fn insert_direct_turn_workflow_tx(
             .ok_or_else(|| DbError::Serialization("empty direct-turn scope".to_string()))?,
         idempotency_key: phoenix_workflow::NonEmptyExternalKey::new(format!(
             "turn:{}:{}",
-            input.conversation.0,
+            input.conversation().0,
             input.client_key.as_str()
         ))
         .ok_or_else(|| DbError::Serialization("empty direct-turn key".to_string()))?,
@@ -1057,6 +1064,39 @@ async fn insert_direct_turn_workflow_tx(
     }
 }
 
+fn canonical_message_id_for_turn(
+    turn: &DurableTurn,
+    prepared: &PreparedDirectTurnPayload,
+) -> CanonicalMessageId {
+    CanonicalMessageId(format!("{}:{}", turn.conversation.0, prepared.message_id()))
+}
+
+fn terminal_commit_timestamp() -> Timestamp {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Timestamp(seconds)
+}
+
+async fn load_active_runtime_turn_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation: &ConversationAuthority,
+) -> DbResult<Option<DurableTurn>> {
+    sqlx::query(
+        "SELECT * FROM durable_turns
+         WHERE conversation_id = ?1
+           AND disposition = 'Runtime'
+           AND terminal_kind IS NULL
+           AND owns_conversation = 1",
+    )
+    .bind(&conversation.0)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(row_to_turn)
+    .transpose()
+}
+
 async fn load_turn_for_workflow_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     turn_id: TurnAuthorityId,
@@ -1089,11 +1129,6 @@ fn verify_prepared_payload(
 ) -> DbResult<()> {
     let stored = PreparedDirectTurnPayload::from_exact_bytes(turn.prepared.payload())
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    if prepared.message_id() != stored.message_id() {
-        return Err(conflict(TurnConflict::MaterializationIdentityChanged {
-            canonical: CanonicalMessageId(stored.message_id().to_string()),
-        }));
-    }
     if prepared != &stored {
         return Err(prepared_semantics_changed(&turn.prepared));
     }
@@ -1136,11 +1171,6 @@ async fn insert_canonical_message_tx(
     created_at: Timestamp,
     prepared: &PreparedDirectTurnPayload,
 ) -> DbResult<Message> {
-    if prepared.message_id() != canonical_message_id.0 {
-        return Err(conflict(TurnConflict::MaterializationIdentityChanged {
-            canonical: CanonicalMessageId(prepared.message_id().to_string()),
-        }));
-    }
     let (content, display_data) = prepared.message_content_and_display_data();
     let created_at_dt = timestamp_to_datetime(created_at);
     let content_str = serde_json::to_string(&content.to_stored_json())
@@ -1812,7 +1842,6 @@ mod tests {
     ) -> AcceptAuthoritativeTurn {
         let conversation = ConversationAuthority(conversation.to_string());
         AcceptAuthoritativeTurn {
-            conversation: conversation.clone(),
             client_key: ClientTurnKey::new(key).unwrap(),
             prepared: prepared_turn(&conversation, &format!("message-{}-{key}", conversation.0)),
             disposition,
@@ -1894,6 +1923,10 @@ mod tests {
             target,
             prepared_payload(message_id).to_exact_bytes().unwrap(),
         )
+    }
+
+    fn canonical_message_id(conversation: &str, submitted_message_id: &str) -> String {
+        format!("{conversation}:{submitted_message_id}")
     }
 
     fn materialize_input(
@@ -1988,13 +2021,19 @@ mod tests {
         let receipt: direct_turn_profile::DirectTurnReceipt =
             serde_json::from_slice(&result.receipt.as_ref().unwrap().receipt_payload).unwrap();
         assert_eq!(receipt.turn_id, turn_id.0);
-        assert_eq!(receipt.canonical_message_id, "message-conv-a-typed-receipt");
+        assert_eq!(
+            receipt.canonical_message_id,
+            canonical_message_id("conv-a", "message-conv-a-typed-receipt")
+        );
         let event: direct_turn_profile::DirectTurnReceiptEvent =
             serde_json::from_slice(&result.delivery.as_ref().unwrap().payload_blob).unwrap();
         assert_eq!(
             event,
             direct_turn_profile::DirectTurnReceiptEvent::Materialized {
-                canonical_message_id: "message-conv-a-typed-receipt".to_string(),
+                canonical_message_id: canonical_message_id(
+                    "conv-a",
+                    "message-conv-a-typed-receipt"
+                ),
             }
         );
     }
@@ -2019,10 +2058,16 @@ mod tests {
             .await
             .unwrap();
         let authority = claim.authority.unwrap();
-        let message = CanonicalMessageId("message-conv-a-materialize-before".to_string());
         assert!(before_repo
             .materialize_authoritative_turn_at_cut(
-                &materialize_input(turn_id, authority.clone(), 1, 1, &message.0, 10),
+                &materialize_input(
+                    turn_id,
+                    authority.clone(),
+                    1,
+                    1,
+                    "message-conv-a-materialize-before",
+                    10,
+                ),
                 TransactionCut::BeforeCommit,
             )
             .await
@@ -2030,7 +2075,12 @@ mod tests {
         assert!(matches!(
             before_repo
                 .materialize_authoritative_turn(&materialize_input(
-                    turn_id, authority, 1, 1, &message.0, 10
+                    turn_id,
+                    authority,
+                    1,
+                    1,
+                    "message-conv-a-materialize-before",
+                    10,
                 ))
                 .await
                 .unwrap()
@@ -2056,10 +2106,16 @@ mod tests {
             .await
             .unwrap();
         let authority = claim.authority.unwrap();
-        let message = CanonicalMessageId("message-conv-a-materialize-after".to_string());
         assert!(after_repo
             .materialize_authoritative_turn_at_cut(
-                &materialize_input(turn_id, authority.clone(), 1, 1, &message.0, 11),
+                &materialize_input(
+                    turn_id,
+                    authority.clone(),
+                    1,
+                    1,
+                    "message-conv-a-materialize-after",
+                    11,
+                ),
                 TransactionCut::AfterCommit,
             )
             .await
@@ -2067,7 +2123,12 @@ mod tests {
         assert!(matches!(
             after_repo
                 .materialize_authoritative_turn(&materialize_input(
-                    turn_id, authority, 2, 2, &message.0, 11
+                    turn_id,
+                    authority,
+                    2,
+                    2,
+                    "message-conv-a-materialize-after",
+                    11,
                 ))
                 .await
                 .unwrap()
@@ -2470,35 +2531,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acceptance_rejects_message_identity_bound_to_another_conversation() {
+    async fn acceptance_allows_same_client_message_identity_in_other_conversation() {
         let repo = repo().await;
         sqlx::query(
             "INSERT INTO messages
              (message_id, conversation_id, sequence_id, message_type, content, created_at)
-             VALUES ('message-conv-a-cross-conversation', 'conv-b', 1, 'user', '[]', '2025-01-01T00:00:00Z')",
+             VALUES (?1, 'conv-b', 1, 'user', '[]', '2025-01-01T00:00:00Z')",
         )
+        .bind(canonical_message_id(
+            "conv-b",
+            "message-conv-a-cross-conversation",
+        ))
         .execute(&repo.pool)
         .await
         .unwrap();
 
-        assert!(matches!(
-            repo.accept_authoritative_turn(&input("conv-a", "cross-conversation", 11))
-                .await,
-            Err(DbError::DirectTurnConflict(
-                TurnConflict::PreparedSemanticsChanged {
-                    authoritative_fingerprint
-                }
-            )) if authoritative_fingerprint
-                == input("conv-a", "cross-conversation", 11)
-                    .prepared
-                    .fingerprint()
-        ));
+        let step = repo
+            .accept_authoritative_turn(&input("conv-a", "cross-conversation", 11))
+            .await
+            .unwrap();
+        assert!(matches!(step.outcome, TurnOutcome::Created { .. }));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM durable_turns")
                 .fetch_one(&repo.pool)
                 .await
                 .unwrap(),
-            0
+            1
         );
     }
 
@@ -2515,15 +2573,17 @@ mod tests {
         sqlx::query(
             "INSERT INTO messages
              (message_id, conversation_id, sequence_id, message_type, content, created_at)
-             VALUES ('foreign-message', 'conv-b', 1, 'user', '[]', '2025-01-01T00:00:00Z')",
+             VALUES (?1, 'conv-b', 1, 'user', '[]', '2025-01-01T00:00:00Z')",
         )
+        .bind(canonical_message_id("conv-b", "foreign-message"))
         .execute(&repo.pool)
         .await
         .unwrap();
         assert!(sqlx::query(
-            "UPDATE durable_turns SET canonical_message_id = 'foreign-message' WHERE turn_id = ?1",
+            "UPDATE durable_turns SET canonical_message_id = ?2 WHERE turn_id = ?1",
         )
         .bind(i64::try_from(turn_id.0).unwrap())
+        .bind(canonical_message_id("conv-b", "foreign-message"))
         .execute(&repo.pool)
         .await
         .is_err());
@@ -3073,6 +3133,114 @@ mod tests {
         assert!(terminal.is_err());
     }
     #[tokio::test]
+    async fn materialization_scopes_canonical_internal_message_id_by_conversation() {
+        let repo = repo().await;
+        let input_a = input("conv-a-scope", "same-key", 33);
+        let input_b = input("conv-b-scope", "same-key", 34);
+        let step_a = repo.accept_authoritative_turn(&input_a).await.unwrap();
+        let step_b = repo.accept_authoritative_turn(&input_b).await.unwrap();
+        let TurnOutcome::Created {
+            turn_id: turn_a, ..
+        } = step_a.outcome
+        else {
+            panic!("expected created turn a")
+        };
+        let TurnOutcome::Created {
+            turn_id: turn_b, ..
+        } = step_b.outcome
+        else {
+            panic!("expected created turn b")
+        };
+        let workflow_a = repo.workflow_id_for_turn(turn_a).await.unwrap().unwrap();
+        let workflow_b = repo.workflow_id_for_turn(turn_b).await.unwrap().unwrap();
+        let authority_a = repo
+            .claim_authoritative_turn(&claim_input(workflow_a, turn_a, 70))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        let authority_b = repo
+            .claim_authoritative_turn(&claim_input(workflow_b, turn_b, 71))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+
+        let message_a = repo
+            .materialize_authoritative_turn(&materialize_input(
+                turn_a,
+                authority_a,
+                70,
+                70,
+                "message-conv-a-scope-same-key",
+                70,
+            ))
+            .await
+            .unwrap()
+            .message
+            .unwrap();
+        let message_b = repo
+            .materialize_authoritative_turn(&materialize_input(
+                turn_b,
+                authority_b,
+                71,
+                71,
+                "message-conv-b-scope-same-key",
+                71,
+            ))
+            .await
+            .unwrap()
+            .message
+            .unwrap();
+
+        assert_eq!(
+            message_a.message_id,
+            canonical_message_id("conv-a-scope", "message-conv-a-scope-same-key")
+        );
+        assert_eq!(
+            message_b.message_id,
+            canonical_message_id("conv-b-scope", "message-conv-b-scope-same-key")
+        );
+        assert_ne!(message_a.message_id, message_b.message_id);
+    }
+
+    #[tokio::test]
+    async fn steering_accept_rehydrates_active_owner_before_commit() {
+        let repo = repo().await;
+        let runtime = input("conv-a", "runtime-owner", 80);
+        repo.accept_authoritative_turn(&runtime).await.unwrap();
+        sqlx::query(
+            "UPDATE durable_turns SET prepared_fingerprint = 'corrupt-owner' WHERE conversation_id = ?1 AND client_turn_key = ?2",
+        )
+        .bind("conv-a")
+        .bind("runtime-owner")
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+        let steering = input_with_disposition(
+            "conv-a",
+            "steering-corrupt-owner",
+            81,
+            AcceptedDisposition::Steering,
+        );
+        let err = repo.accept_authoritative_turn(&steering).await.unwrap_err();
+        assert!(matches!(
+            err,
+            DbError::DirectTurnConflict(TurnConflict::CorruptAggregate(_))
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM durable_turns WHERE client_turn_key = 'steering-corrupt-owner'"
+            )
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn scoped_replay_returns_exact_before_expansion_changes() {
         let repo = repo().await;
         let input = input("conv-replay", "client", 31);
@@ -3082,7 +3250,7 @@ mod tests {
         changed_delivery.delivery.llm_text = Some("changed expansion".to_string());
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
-                &input.conversation,
+                input.conversation(),
                 &input.client_key,
                 &changed_delivery.submitted,
             )
@@ -3102,7 +3270,7 @@ mod tests {
             .submitted;
         submitted.text.push_str(" changed");
         let err = repo
-            .lookup_scoped_direct_turn_replay(&input.conversation, &input.client_key, &submitted)
+            .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &submitted)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -3126,7 +3294,7 @@ mod tests {
             .submitted;
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
-                &input_a.conversation,
+                input_a.conversation(),
                 &input_a.client_key,
                 &submitted_a
             )
@@ -3136,7 +3304,7 @@ mod tests {
         ));
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
-                &input_b.conversation,
+                input_b.conversation(),
                 &input_b.client_key,
                 &submitted_b
             )
@@ -3146,7 +3314,7 @@ mod tests {
         ));
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
-                &input_a.conversation,
+                input_a.conversation(),
                 &input_a.client_key,
                 &submitted_b
             )
@@ -3162,7 +3330,7 @@ mod tests {
         let input = input("conv-replay", "corrupt", 35);
         repo.accept_authoritative_turn(&input).await.unwrap();
         sqlx::query("UPDATE durable_turns SET prepared_fingerprint = 'not-the-exact-fingerprint' WHERE conversation_id = ?1 AND client_turn_key = ?2")
-            .bind(&input.conversation.0)
+            .bind(&input.conversation().0)
             .bind(input.client_key.as_str())
             .execute(&repo.pool)
             .await
@@ -3171,7 +3339,7 @@ mod tests {
             .unwrap()
             .submitted;
         let err = repo
-            .lookup_scoped_direct_turn_replay(&input.conversation, &input.client_key, &submitted)
+            .lookup_scoped_direct_turn_replay(input.conversation(), &input.client_key, &submitted)
             .await
             .unwrap_err();
         assert!(matches!(

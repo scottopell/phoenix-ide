@@ -246,7 +246,6 @@ impl SendChatApplicationService {
             .ok_or(SendChatServiceError::IdempotencyConflict)?;
         let step = match repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-                conversation: ConversationAuthority(conversation.id.clone()),
                 client_key: client_key.clone(),
                 prepared: PreparedTurn::from_exact_payload(
                     &ConversationAuthority(conversation.id.clone()),
@@ -876,7 +875,6 @@ mod tests {
         let payload = prepared_payload(&req, "first expansion");
         let turn = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
-                conversation: ConversationAuthority(req.conversation_id.clone()),
                 client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
                 prepared: prepared_turn(
                     &ConversationAuthority(req.conversation_id.clone()),
@@ -948,7 +946,6 @@ mod tests {
         let repo = WorkflowRepository::new(db.pool().clone());
         let payload = prepared_payload(&req, "accepted before archive");
         repo.accept_authoritative_turn(&AcceptAuthoritativeTurn {
-            conversation: ConversationAuthority(req.conversation_id.clone()),
             client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
             prepared: prepared_turn(
                 &ConversationAuthority(req.conversation_id.clone()),
