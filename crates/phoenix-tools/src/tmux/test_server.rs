@@ -1,8 +1,5 @@
 use std::fs;
 use std::io;
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-use std::os::fd::AsRawFd;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -20,7 +17,6 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Owns real tmux servers created by tests, including after abrupt runner death.
 pub struct TestTmuxServerOwner {
     root: Option<TempDir>,
-    keepalive: Option<OwnedFd>,
     watchdog: Option<Child>,
 }
 
@@ -39,6 +35,10 @@ impl TestTmuxServerOwner {
     /// be created. Tests cannot safely continue without containment.
     #[must_use]
     pub fn new() -> Self {
+        Self::new_with_watchdog_path(None)
+    }
+
+    fn new_with_watchdog_path(watchdog_path: Option<&Path>) -> Self {
         let root = tempfile::Builder::new()
             .prefix("ptt-")
             .tempdir_in("/private/tmp")
@@ -56,48 +56,58 @@ impl TestTmuxServerOwner {
             "tmux test root must be under a short system temporary directory"
         );
 
-        let (read_fd, write_fd) = cloexec_pipe().expect("create tmux watchdog pipe");
         let script = r#"
 root=$1
-while IFS= read -r _; do :; done
-mode=abrupt
-[ -f "$root/.graceful-shutdown" ] && mode=graceful
-status=0
+parent=$2
+[ "$(ps -o ppid= -p $$ | tr -d ' ')" = "$parent" ] || exit 1
+command -v tmux >/dev/null 2>&1 || exit 1
+while [ ! -f "$root/.cleanup-request" ] && [ "$(ps -o ppid= -p $$ | tr -d ' ')" = "$parent" ]; do
+  sleep 0.05
+done
+: > "$root/.cleanup-ack"
 attempt=0
-while :; do
-  status=0
+quiet=0
+while [ "$attempt" -lt 50 ]; do
+  live=0
   for socket in "$root"/*.sock; do
     [ -S "$socket" ] || continue
     tmux -S "$socket" kill-server >/dev/null 2>&1 || true
     if tmux -S "$socket" list-sessions >/dev/null 2>&1; then
-      status=1
+      live=1
+    else
+      rm -f "$socket"
     fi
   done
-  [ "$mode" = graceful ] && break
+  sockets=0
+  for socket in "$root"/*.sock; do
+    [ -S "$socket" ] && sockets=1
+  done
+  if [ "$live" -eq 0 ] && [ "$sockets" -eq 0 ]; then
+    quiet=$((quiet + 1))
+  else
+    quiet=0
+  fi
+  if [ "$quiet" -ge 5 ]; then
+    rm -rf "$root"
+    exit 0
+  fi
   attempt=$((attempt + 1))
-  [ "$attempt" -ge 50 ] && break
   sleep 0.1
 done
-if [ "$status" -eq 0 ]; then
-  for socket in "$root"/*.sock; do
-    [ -S "$socket" ] || continue
-    if tmux -S "$socket" list-sessions >/dev/null 2>&1; then
-      status=1
-      break
-    fi
-  done
-fi
-[ "$status" -eq 0 ] && rm -rf "$root"
-exit "$status"
+exit 1
 "#;
-        let read_file = unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) };
+        let parent_pid = std::process::id().to_string();
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", script, "phoenix-tmux-test-watchdog"])
             .arg(&canonical_root)
-            .stdin(Stdio::from(read_file))
+            .arg(parent_pid)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(path) = watchdog_path {
+            command.env("PATH", path);
+        }
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -110,7 +120,6 @@ exit "$status"
 
         Self {
             root: Some(root),
-            keepalive: Some(write_fd),
             watchdog: Some(watchdog),
         }
     }
@@ -146,54 +155,33 @@ exit "$status"
     /// Panics when the watchdog cannot complete cleanup or any exact server
     /// remains live. The root is preserved for recovery in that case.
     pub fn shutdown(mut self) {
-        self.shutdown_inner()
-            .expect("tmux test cleanup must succeed");
+        self.finish(true).expect("tmux test cleanup must succeed");
     }
 
-    fn shutdown_inner(&mut self) -> io::Result<()> {
-        let result = self.try_shutdown();
-        if result.is_err() {
-            self.preserve_root();
-        }
-        result
-    }
-
-    fn try_shutdown(&mut self) -> io::Result<()> {
-        fs::write(self.socket_dir().join(".graceful-shutdown"), [])?;
-        self.keepalive.take();
+    fn finish(&mut self, graceful: bool) -> io::Result<()> {
+        let root = self.root.take().expect("owner root is live");
         let mut watchdog = self.watchdog.take().expect("watchdog is live");
-        let deadline = Instant::now() + CLEANUP_TIMEOUT;
-        let status = loop {
-            if let Some(status) = watchdog.try_wait()? {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = watchdog.kill();
-                let _ = watchdog.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "tmux test watchdog did not finish cleanup",
-                ));
-            }
-            // test-timing-allow: watchdog exit is the completion signal; the deadline only bounds failed cleanup
-            thread::sleep(Duration::from_millis(20));
-        };
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "tmux test watchdog reported cleanup failure: {status}"
-            )));
-        }
-        if self.socket_dir().exists() {
-            verify_no_live_servers(self.socket_dir())?;
-        }
-        self.root.take();
-        Ok(())
-    }
+        let root_path = root.path().to_path_buf();
+        let handoff_error = request_cleanup(&root_path, graceful).err();
 
-    fn preserve_root(&mut self) {
-        if let Some(root) = self.root.take() {
+        let result = wait_for_watchdog(&mut watchdog).and_then(|status| {
+            if !status.success() {
+                return Err(io::Error::other(format!(
+                    "tmux test watchdog reported cleanup failure: {status}"
+                )));
+            }
+            if root_path.exists() {
+                verify_no_live_servers(&root_path)?;
+            }
+            if let Some(error) = handoff_error {
+                return Err(error);
+            }
+            Ok(())
+        });
+        if result.is_err() {
             let _ = root.keep();
         }
+        result
     }
 }
 
@@ -202,7 +190,7 @@ impl Drop for TestTmuxServerOwner {
         if self.watchdog.is_none() {
             return;
         }
-        if let Err(error) = self.shutdown_inner() {
+        if let Err(error) = self.finish(false) {
             if thread::panicking() {
                 eprintln!("tmux test cleanup failed while unwinding: {error}");
             } else {
@@ -225,32 +213,50 @@ fn verify_no_live_servers(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    for fd in [&read_fd, &write_fd] {
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-        if flags < 0
-            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
-        {
-            return Err(io::Error::last_os_error());
+fn request_cleanup(root: &Path, graceful: bool) -> io::Result<()> {
+    let request = root.join(".cleanup-request");
+    let pending = root.join(".cleanup-request.pending");
+    let reason: &[u8] = if graceful { b"graceful" } else { b"drop" };
+    fs::write(&pending, reason)?;
+    fs::rename(pending, request)?;
+    let ack = root.join(".cleanup-ack");
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    while !ack.exists() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tmux test watchdog did not acknowledge cleanup request",
+            ));
         }
+        // test-timing-allow: the watchdog acknowledgment file is the completion signal; the deadline only bounds a failed handoff
+        thread::sleep(Duration::from_millis(20));
     }
-    Ok((read_fd, write_fd))
+    Ok(())
+}
+
+fn wait_for_watchdog(watchdog: &mut Child) -> io::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        if let Some(status) = watchdog.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = watchdog.kill();
+            let _ = watchdog.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tmux test watchdog did not finish cleanup",
+            ));
+        }
+        // test-timing-allow: watchdog exit is the completion signal; the deadline only bounds failed cleanup
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::ExitStatus;
 
@@ -299,6 +305,29 @@ mod tests {
         owner.shutdown();
         assert_ne!(probe_sync(&socket), ProbeResult::Live);
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_root_without_reentrant_drop() {
+        let fake_bin = TempDir::new().unwrap();
+        let fake_tmux = fake_bin.path().join("tmux");
+        fs::write(&fake_tmux, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_tmux, permissions).unwrap();
+
+        let owner = TestTmuxServerOwner::new_with_watchdog_path(Some(fake_bin.path()));
+        let root = owner.path().to_path_buf();
+        let socket = root.join("unconfirmed.sock");
+        std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let panic = std::panic::catch_unwind(|| owner.shutdown());
+        assert!(panic.is_err(), "cleanup failure must fail the test");
+        assert!(root.exists(), "failed cleanup must preserve its exact root");
+        assert!(
+            socket.exists(),
+            "unconfirmed socket must remain recoverable"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

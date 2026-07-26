@@ -102,3 +102,5 @@ after:  legacy_orphans=0 owner_servers=0 ptys=168
 ```
 
 Serial full-package attribution also completed all `phoenix_ide` tests and all 535 active `phoenix-tools` tests with zero persistent servers. Real tmux tests briefly daemonize during execution as expected; their owners returned the host to zero after each completed suite.
+
+After final Codex hardening, the owner no longer depends on inherited descriptors: the detached watchdog verifies its original parent relationship, observes an atomic cleanup-request marker or parent death, and requires five quiet exact-root probes before success. Cleanup command failure preserves the root and fails the test. The final full check again held `legacy_orphans=0`, `owner_servers=0`, and `ptys=168` before and after. The complete single/concurrent/five-repeat cross-crate matrix also remained exactly `ptys=168 test_servers=0 test_roots=0` after every phase.
