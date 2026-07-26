@@ -73,4 +73,4 @@ Append a completion note with these headings:
 - No speculative imports, cross-file contracts, persisted latest/current field, or Close-orchestration rules were added; edits stayed inside `specs/bedrock/bedrock.allium` and bedrock-owned lifecycle/topology behavior.
 
 **Commit**
-- Pending
+- `8c651be0f4c4de8258393713fc46c988426ac7c7`
