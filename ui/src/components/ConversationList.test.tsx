@@ -1158,7 +1158,79 @@ describe('Mobile conversation list redesign', () => {
 
     expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
     expect(container.querySelector('.conv-chain-latest-summary .conv-state-dot')).toHaveClass('awaiting-approval');
+    expect(container.querySelector('.conv-chain-latest-summary .conv-state-chip')).toHaveClass('awaiting-approval');
+    expect(container.querySelector('.conv-chain-latest-summary .conv-state-chip')?.textContent).toBe('Needs approval');
     expect(container.querySelector('[data-id="needs-leaf"].conv-item-chain-member')).toBeNull();
+  });
+
+  it('progressively reveals long mobile chains without mounting every member', () => {
+    const members = Array.from({ length: 45 }, (_, index) => makeConv(
+      `bounded-${index + 1}`,
+      `bounded-${index + 1}`,
+      {
+        continued_in_conv_id: index < 44 ? `bounded-${index + 2}` : null,
+        presentation_mode: 'done',
+        state: { type: 'terminal' },
+        updated_at: new Date(Date.UTC(2024, 0, index + 1)).toISOString(),
+      },
+    ));
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          listDensity="mobile"
+          conversations={[...members].reverse()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(container.querySelector('.conv-chain-caret')!);
+    expect(container.querySelectorAll('.conv-chain-members [data-id]')).toHaveLength(20);
+    expect(container.querySelector('.conv-chain-history-more')?.textContent).toBe('Show 20 earlier of 25');
+
+    fireEvent.click(container.querySelector('.conv-chain-history-more')!);
+    expect(container.querySelectorAll('.conv-chain-members [data-id]')).toHaveLength(40);
+    expect(container.querySelector('.conv-chain-history-more')?.textContent).toBe('Show 5 earlier of 5');
+
+    fireEvent.click(container.querySelector('.conv-chain-history-more')!);
+    expect(container.querySelectorAll('.conv-chain-members [data-id]')).toHaveLength(45);
+    expect(container.querySelector('.conv-chain-history-more')).toBeNull();
+  });
+
+  it('keeps a hidden active member visible without exceeding the progressive bound', () => {
+    const members = Array.from({ length: 45 }, (_, index) => makeConv(
+      `active-bounded-${index + 1}`,
+      `active-bounded-${index + 1}`,
+      {
+        continued_in_conv_id: index < 44 ? `active-bounded-${index + 2}` : null,
+        presentation_mode: 'done',
+        state: { type: 'terminal' },
+        updated_at: new Date(Date.UTC(2024, 0, index + 1)).toISOString(),
+      },
+    ));
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          listDensity="mobile"
+          activeSlug="active-bounded-6"
+          conversations={[...members].reverse()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(container.querySelector('.conv-chain-caret')!);
+    const visibleIds = Array.from(container.querySelectorAll('.conv-chain-members [data-id]'))
+      .map((element) => element.getAttribute('data-id'));
+    expect(visibleIds).toHaveLength(20);
+    expect(visibleIds[0]).toBe('active-bounded-6');
+    expect(visibleIds.slice(1)).toEqual(
+      Array.from({ length: 19 }, (_, index) => `active-bounded-${index + 27}`),
+    );
+    expect(container.querySelector('[data-id="active-bounded-6"]')).toHaveClass('active');
+    expect(container.querySelector('.conv-chain-history-more')?.textContent).toBe('Show 20 earlier of 25');
   });
 
   it('shows a visible context-full status label in mobile metadata', () => {
@@ -1495,8 +1567,10 @@ describe('ChainBlock — React.memo behaviour', () => {
       keyboardSelectedId: null,
       activeSlug: null,
       listDensity: 'full',
+      visibleMemberCount: 20,
       showArchived: false,
       onToggleCollapsed: vi.fn(),
+      onShowEarlierMembers: vi.fn(),
       onToggleChainMenu: vi.fn(),
       onCloseChainMenu: vi.fn(),
       onArchiveChain: vi.fn(),

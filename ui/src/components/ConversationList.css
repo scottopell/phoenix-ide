@@ -289,3 +289,106 @@
   border-radius: 8px;
   vertical-align: middle;
 }
+
+/* Mobile chain history links are owned by MobileChainHistoryLink. */
+.mobile-list-density .conv-chain-history-link {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 44px;
+  min-height: 44px;
+  margin-left: 10px;
+  border-left: 1px solid color-mix(in srgb, var(--border-color) 65%, transparent);
+}
+
+.mobile-list-density .conv-chain-history-target {
+  display: grid;
+  grid-template-columns: 8px max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 5px 4px 5px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mobile-list-density .conv-chain-history-target:hover,
+.mobile-list-density .conv-chain-history-link.keyboard-selected .conv-chain-history-target {
+  background: color-mix(in srgb, var(--bg-tertiary) 72%, transparent);
+  color: var(--text-primary);
+}
+
+.mobile-list-density .conv-chain-history-link.keyboard-selected .conv-chain-history-target {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: -2px;
+}
+
+.mobile-list-density .conv-chain-history-index {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.mobile-list-density .conv-chain-history-title {
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-list-density .conv-chain-history-menu {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.mobile-list-density .conv-chain-history-menu-btn {
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.mobile-list-density .conv-chain-history-menu-btn:hover {
+  color: var(--text-primary);
+}
+
+.mobile-list-density .conv-chain-history-menu .conv-item-actions {
+  position: absolute;
+  top: 38px;
+  right: 4px;
+  z-index: 10;
+  min-width: 120px;
+  padding: 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 18%);
+}
+
+.mobile-list-density .conv-chain-history-more {
+  width: calc(100% - 16px);
+  min-height: 44px;
+  margin: 0 6px 0 10px;
+  border: 0;
+  border-left: 1px solid color-mix(in srgb, var(--border-color) 65%, transparent);
+  background: transparent;
+  color: var(--accent-blue);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.mobile-list-density .conv-chain-history-more:hover {
+  background: var(--bg-tertiary);
+}

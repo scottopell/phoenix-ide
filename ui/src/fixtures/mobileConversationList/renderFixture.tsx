@@ -3,6 +3,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { ConversationList } from '../../components/ConversationList';
 import { StorageStatus } from '../../components/StorageStatus';
 import { SettingsDropdown } from '../../components/SettingsDropdown';
+import { useAppTouchContainment, useDocumentViewportOwnership } from '../../components/viewportRoutes';
 import '../../index.css';
 import { getMobileConversationListFixtureData } from './scenarios';
 import type { MobileConversationListScenario } from './types';
@@ -12,6 +13,8 @@ interface Props {
 }
 
 export function MobileConversationListFixtureBody({ scenario }: Props) {
+  useDocumentViewportOwnership(true);
+  useAppTouchContainment(true);
   const [showArchived, setShowArchived] = useState(scenario.kind === 'archived');
   const fixtureData = getMobileConversationListFixtureData(scenario);
   const totalConversations = fixtureData.conversations.length + fixtureData.archivedConversations.length;
@@ -31,7 +34,7 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
 
   return (
     <div id="app" className="list-page mobile-conversation-list-fixture">
-      <main id="main-area">
+      <main id="main-area" data-app-scroll-owner>
         <ConversationList
           conversations={fixtureData.conversations}
           archivedConversations={fixtureData.archivedConversations}

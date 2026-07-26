@@ -19,6 +19,8 @@ import {
 } from '../utils/conversationIdentity';
 import './ConversationList.css';
 
+const MOBILE_CHAIN_PAGE_SIZE = 20;
+
 
 interface ConversationListProps {
   conversations: readonly Conversation[];
@@ -466,6 +468,20 @@ const MobileChainHistoryLink = memo(function MobileChainHistoryLink({
   );
 });
 
+function visibleMobileChainMembers(
+  members: Conversation[],
+  visibleCount: number,
+  activeSlug: string | null | undefined,
+): Conversation[] {
+  if (members.length <= visibleCount) return members;
+
+  const start = members.length - visibleCount;
+  const active = members.slice(0, start).find((member) => matchesRouteSegment(member, activeSlug));
+  if (!active) return members.slice(start);
+
+  return [active, ...members.slice(start + 1)];
+}
+
 interface ChainBlockProps {
   item: Extract<SidebarItem, { kind: 'chain' }>;
   collapsed: boolean;
@@ -479,8 +495,10 @@ interface ChainBlockProps {
   keyboardSelectedId: string | null;
   activeSlug: string | null;
   listDensity: 'full' | 'mobile' | 'sidebar';
+  visibleMemberCount: number;
   showArchived: boolean;
   onToggleCollapsed: (rootId: string) => void;
+  onShowEarlierMembers: (rootId: string) => void;
   onToggleChainMenu: (e: React.MouseEvent, rootId: string) => void;
   onCloseChainMenu: () => void;
   onArchiveChain?: ((rootId: string) => void) | undefined;
@@ -503,8 +521,10 @@ export const ChainBlock = memo(function ChainBlock({
   keyboardSelectedId,
   activeSlug,
   listDensity,
+  visibleMemberCount,
   showArchived,
   onToggleCollapsed,
+  onShowEarlierMembers,
   onToggleChainMenu,
   onCloseChainMenu,
   onArchiveChain,
@@ -525,6 +545,10 @@ export const ChainBlock = memo(function ChainBlock({
   const latestContext = latestMember ? getConversationProjectLabel(latestMember) : null;
   const chainDisplayTitle = displayTitleFromChain(item);
   const latestDisplayTitle = latestMember ? displayTitleFromConversation(latestMember) : 'Latest conversation';
+  const visibleMembers = listDensity === 'mobile'
+    ? visibleMobileChainMembers(item.members, visibleMemberCount, activeSlug)
+    : item.members;
+  const hiddenMemberCount = item.members.length - visibleMembers.length;
   return (
     <li
       className={`conv-chain-block ${collapsed ? 'collapsed' : 'expanded'}`}
@@ -627,9 +651,10 @@ export const ChainBlock = memo(function ChainBlock({
           onClick={() => onRowClick(latestMember)}
           title={`Open latest conversation "${latestDisplayTitle}"`}
         >
-          <span className={`conv-state-dot ${latestDisplayState}`} title={stateLabel(latestMember, latestDisplayState)} />
+          <span className={`conv-state-dot ${latestDisplayState}`} aria-hidden="true" />
           <span className="conv-chain-summary-main">
             <span className="conv-chain-summary-title">Latest #{latestIndex + 1}: {latestDisplayTitle}</span>
+            <span className={`conv-state-chip ${latestDisplayState}`}>{stateLabel(latestMember, latestDisplayState)}</span>
             {latestMember.conv_mode_label && <span className="conv-mode-badge">{latestMember.conv_mode_label}</span>}
             <span className="conv-item-time">{formatRelativeTime(latestMember.updated_at)}</span>
           </span>
@@ -641,7 +666,19 @@ export const ChainBlock = memo(function ChainBlock({
       )}
       {!collapsed && (
         <ul className="conv-chain-members">
-          {item.members.map((m, idx) => {
+          {hiddenMemberCount > 0 && (
+            <li>
+              <button
+                type="button"
+                className="conv-chain-history-more"
+                onClick={() => onShowEarlierMembers(item.rootId)}
+              >
+                Show {Math.min(MOBILE_CHAIN_PAGE_SIZE, hiddenMemberCount)} earlier of {hiddenMemberCount}
+              </button>
+            </li>
+          )}
+          {visibleMembers.map((m) => {
+            const idx = item.members.findIndex((member) => member.id === m.id);
             const isActive = matchesRouteSegment(m, activeSlug);
             const isLatest = m.id === item.latestMemberId;
             const presentation = listDensity === 'mobile'
@@ -727,6 +764,7 @@ export function ConversationList({
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedChainId, setExpandedChainId] = useState<string | null>(null);
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
+  const [visibleMobileChainCounts, setVisibleMobileChainCounts] = useState<Record<string, number>>({});
   const menuRef = useRef<HTMLDivElement>(null);
   const chainMenuRef = useRef<HTMLDivElement>(null);
   const listRootRef = useRef<HTMLElement>(null);
@@ -782,12 +820,18 @@ export function ConversationList({
       } else if (effectiveListDensity === 'mobile' && isChainCollapsed(item)) {
         const latestMember = item.members.find((m) => m.id === item.latestMemberId);
         if (latestMember) out.push(latestMember);
+      } else if (effectiveListDensity === 'mobile') {
+        out.push(...visibleMobileChainMembers(
+          item.members,
+          visibleMobileChainCounts[item.rootId] ?? MOBILE_CHAIN_PAGE_SIZE,
+          activeSlug,
+        ));
       } else {
         out.push(...item.members);
       }
     }
     return out;
-  }, [effectiveListDensity, groupedItems, isChainCollapsed]);
+  }, [activeSlug, effectiveListDensity, groupedItems, isChainCollapsed, visibleMobileChainCounts]);
 
   const { selectedId } = useKeyboardNav({
     items: keyboardItems,
@@ -821,6 +865,13 @@ export function ConversationList({
       else next.add(rootId);
       return next;
     });
+  }, []);
+
+  const showEarlierMobileChainMembers = useCallback((rootId: string) => {
+    setVisibleMobileChainCounts((previous) => ({
+      ...previous,
+      [rootId]: (previous[rootId] ?? MOBILE_CHAIN_PAGE_SIZE) + MOBILE_CHAIN_PAGE_SIZE,
+    }));
   }, []);
 
   useLayoutEffect(() => {
@@ -996,8 +1047,10 @@ export function ConversationList({
                 keyboardSelectedId={chainKeyboardSelectedId}
                 activeSlug={chainActiveSlug}
                 listDensity={effectiveListDensity}
+                visibleMemberCount={visibleMobileChainCounts[item.rootId] ?? MOBILE_CHAIN_PAGE_SIZE}
                 showArchived={showArchived}
                 onToggleCollapsed={toggleChainCollapsed}
+                onShowEarlierMembers={showEarlierMobileChainMembers}
                 onToggleChainMenu={toggleChainActions}
                 onCloseChainMenu={closeChainMenu}
                 onArchiveChain={onArchiveChain}
