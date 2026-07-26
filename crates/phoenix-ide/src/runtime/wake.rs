@@ -26,6 +26,7 @@ use phoenix_workflow::{LeaseExpiry, ProcessIncarnation, Timestamp};
 use tokio::sync::watch;
 
 const OBSERVATION_BATCH_LIMIT: usize = 64;
+const CONVERSATION_DELIVERY_BATCH_LIMIT: usize = 16;
 const EXPIRY_BATCH_LIMIT: usize = 64;
 const LEASE_DURATION: Duration = Duration::from_secs(30);
 const LIVE_HANDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -542,6 +543,7 @@ async fn deliver_pending(
                 .list_pending(&current.conversation_id)
                 .await
                 .map_err(|error| error.to_string())?;
+            conversation_pending.truncate(CONVERSATION_DELIVERY_BATCH_LIMIT);
             sort_pending_for_materialization(&mut conversation_pending);
             let mut unmaterialized = Vec::new();
             for delivery in &conversation_pending {

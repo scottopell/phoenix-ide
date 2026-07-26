@@ -347,6 +347,7 @@ pub enum SseWireEvent {
         contract_id: String,
         resource_kind: String,
         handle_id: String,
+        condition: String,
         expires_at: u64,
     },
     SequenceBarrier {
@@ -575,6 +576,7 @@ impl From<SseEvent> for SseWireEvent {
                 contract_id,
                 resource_kind,
                 handle_id,
+                condition,
                 expires_at,
             } => SseWireEvent::WakeContractRegistered {
                 sequence_id,
@@ -582,6 +584,7 @@ impl From<SseEvent> for SseWireEvent {
                 contract_id,
                 resource_kind,
                 handle_id,
+                condition,
                 expires_at,
             },
             SseEvent::SequenceBarrier { sequence_id } => {

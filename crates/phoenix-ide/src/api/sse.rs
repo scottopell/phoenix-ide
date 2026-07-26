@@ -312,6 +312,7 @@ mod tests {
                 contract_id,
                 resource_kind,
                 handle_id,
+                condition,
                 expires_at,
             } => json!({
                 "type": "wake_contract_registered",
@@ -320,6 +321,7 @@ mod tests {
                 "contract_id": contract_id,
                 "resource_kind": resource_kind,
                 "handle_id": handle_id,
+                "condition": condition,
                 "expires_at": expires_at,
             }),
             SseEvent::SequenceBarrier { sequence_id } => json!({

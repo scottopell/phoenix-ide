@@ -735,7 +735,7 @@ fn cap_tool_output_text(text: String) -> String {
 /// is ever reached.
 fn tool_output_park_registration(
     out: &crate::tools::ToolOutput,
-) -> Option<(u64, String, String, String, u64)> {
+) -> Option<(u64, String, String, String, String, u64)> {
     if !out.is_success() {
         return None;
     }
@@ -746,12 +746,14 @@ fn tool_output_park_registration(
             contract_id,
             resource_kind,
             handle_id,
+            condition,
             expires_at,
         } => Some((
             workflow_id,
             contract_id,
             resource_kind,
             handle_id,
+            condition,
             expires_at,
         )),
     }
@@ -919,7 +921,7 @@ where
             outcome,
             duration_ms: Some(duration_ms),
         };
-        if let Some((workflow_id, contract_id, resource_kind, handle_id, expires_at)) =
+        if let Some((workflow_id, contract_id, resource_kind, handle_id, condition, expires_at)) =
             park_registration
         {
             ToolExecOutcome::CompletedAndPark {
@@ -929,6 +931,7 @@ where
                     contract_id,
                     resource_kind,
                     handle_id,
+                    condition,
                     expires_at,
                 },
             }
@@ -2592,6 +2595,7 @@ where
                 contract_id: registration.contract_id,
                 resource_kind: registration.resource_kind,
                 handle_id: registration.handle_id,
+                condition: registration.condition,
                 expires_at: registration.expires_at,
             });
     }
@@ -5542,7 +5546,7 @@ where
                 let (reserved_broadcast_range, reserved_seqs) = self
                     .broadcast_tx
                     .reserve_next_persisted_message_range(1 + tool_results.len());
-                let _reserved_broadcast_range = reserved_broadcast_range;
+                let reserved_broadcast_range = reserved_broadcast_range;
 
                 let agent_content = MessageContent::agent(assistant_message.content);
                 let agent_seq = reserved_seqs[0];
@@ -5587,10 +5591,6 @@ where
                 self.storage
                     .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                     .await?;
-                if let Some(registrar) = &self.wake_registrar {
-                    registrar.notify_activation_committed();
-                }
-
                 // Broadcast the now-durable rows so connected clients render
                 // the assistant message and each tool result. Tool-result
                 // durations are already baked into each row's display_data by
@@ -5602,6 +5602,10 @@ where
                 let _ = self.broadcast_tx.send_message(agent_msg);
                 for msg in tool_msgs {
                     let _ = self.broadcast_tx.send_message(msg);
+                }
+                drop(reserved_broadcast_range);
+                if let Some(registrar) = &self.wake_registrar {
+                    registrar.notify_activation_committed();
                 }
             }
         }
@@ -9406,6 +9410,7 @@ mod context_exhausted_preserves_worktree_tests {
             contract_id: "wake-11".to_string(),
             resource_kind: "BashHandle".to_string(),
             handle_id: "b-1".to_string(),
+            condition: "handle_terminal".to_string(),
             expires_at: 600,
         });
         assert!(runtime.registered_wake_workflows.is_empty());
@@ -9474,6 +9479,7 @@ mod context_exhausted_preserves_worktree_tests {
             contract_id: "wake-11".to_string(),
             resource_kind: "BashHandle".to_string(),
             handle_id: "b-1".to_string(),
+            condition: "handle_terminal".to_string(),
             expires_at: 600,
         });
 
@@ -9620,6 +9626,7 @@ mod context_exhausted_preserves_worktree_tests {
                     contract_id: "wake-21".to_string(),
                     resource_kind: "Bash".to_string(),
                     handle_id: "b-21".to_string(),
+                    condition: "handle_terminal".to_string(),
                     expires_at: 600,
                 },
             }))
@@ -13126,6 +13133,7 @@ mod tool_output_to_outcome_tests {
                 contract_id: "wake-7".to_string(),
                 resource_kind: "Bash".to_string(),
                 handle_id: "b-7".to_string(),
+                condition: "handle_terminal".to_string(),
                 expires_at: 600,
             },
         );
@@ -13216,6 +13224,7 @@ mod sender_drop_forwarder_tests {
                     contract_id: "wake-7".into(),
                     resource_kind: "Bash".into(),
                     handle_id: "b-7".into(),
+                    condition: "handle_terminal".to_string(),
                     expires_at: 600,
                 },
             })

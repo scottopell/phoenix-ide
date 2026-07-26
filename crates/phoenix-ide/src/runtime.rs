@@ -1174,6 +1174,7 @@ pub enum SseEvent {
         contract_id: String,
         resource_kind: String,
         handle_id: String,
+        condition: String,
         expires_at: u64,
     },
     SequenceBarrier {

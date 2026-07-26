@@ -335,6 +335,7 @@ export const SseWakeContractRegisteredDataSchema = v.looseObject({
   contract_id: v.string(),
   resource_kind: v.string(),
   handle_id: v.string(),
+  condition: v.string(),
   expires_at: v.number(),
 }) satisfies v.GenericSchema<unknown, WireWakeContractRegisteredData>;
 

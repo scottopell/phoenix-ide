@@ -112,6 +112,14 @@ impl Tool for WaitUntilTool {
                         "bash handle {id:?} was not found in this work scope"
                     ));
                 };
+                if !ctx
+                    .resource_access
+                    .can_control(&handle.creator_conversation_id, handle.authority)
+                {
+                    return ToolOutput::error(format!(
+                        "bash handle {id:?} was not found in this work scope"
+                    ));
+                }
                 drop(handle);
                 (
                     WakeResourceIdentity::Bash(BashResourceIdentity {
@@ -198,6 +206,7 @@ impl Tool for WaitUntilTool {
                         contract_id: contract_id.clone(),
                         resource_kind: "Bash".to_string(),
                         handle_id: handle_id.clone(),
+                        condition: CONDITION_HANDLE_TERMINAL.to_string(),
                         expires_at: expires_at.0,
                     })
             }

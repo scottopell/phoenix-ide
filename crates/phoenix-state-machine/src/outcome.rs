@@ -89,6 +89,7 @@ pub struct WakeRegistrationNotice {
     pub contract_id: String,
     pub resource_kind: String,
     pub handle_id: String,
+    pub condition: String,
     pub expires_at: u64,
 }
 

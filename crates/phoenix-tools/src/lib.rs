@@ -238,6 +238,7 @@ pub enum ToolOutputDisposition {
         contract_id: String,
         resource_kind: String,
         handle_id: String,
+        condition: String,
         expires_at: u64,
     },
 }
@@ -1315,6 +1316,7 @@ mod tests {
                     contract_id: "wake-1".into(),
                     resource_kind: "Bash".into(),
                     handle_id: "b-1".into(),
+                    condition: "handle_terminal".to_string(),
                     expires_at: 600,
                 })
                 .disposition(),
@@ -1323,6 +1325,7 @@ mod tests {
                 contract_id: "wake-1".into(),
                 resource_kind: "Bash".into(),
                 handle_id: "b-1".into(),
+                condition: "handle_terminal".to_string(),
                 expires_at: 600,
             }
         );

@@ -637,7 +637,7 @@ impl WakeRepository {
             resource: input.resource.clone(),
             expires_at: input.expires_at,
             registering_tool_use_id: input.registering_tool_use_id.clone(),
-            registering_tool_round_id: "round-test".to_string(),
+            registering_tool_round_id: input.registering_tool_round_id.clone(),
         };
         let plan = CommitTransitionPlanCas {
             workflow_id,
@@ -3542,7 +3542,7 @@ async fn retire_inactive_resource_bindings_tx(
                AND COALESCE(b.tmux_window_id, '') = ?6
                AND b.activated_at IS NULL
                AND b.registering_tool_round_id <> ?7
-               AND b.created_at < ?8
+               AND b.created_at <= ?8
          )",
     )
     .bind(i64::from(wake_profile::PROTOCOL_VERSION))

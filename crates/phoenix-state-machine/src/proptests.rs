@@ -2033,6 +2033,7 @@ fn arb_tool_outcome() -> impl Strategy<Value = ToolExecOutcome> {
                 contract_id: "wake-proptest".into(),
                 resource_kind: "Bash".into(),
                 handle_id: "b-proptest".into(),
+                condition: "handle_terminal".to_string(),
                 expires_at: 600,
             },
         }),
