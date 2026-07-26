@@ -252,8 +252,13 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
             "drive-turn tmux cleanup partially failed"
         );
     }
-    manager.browser_sessions().shutdown_all().await;
+    let browser_shutdown = manager
+        .browser_sessions()
+        .shutdown_all()
+        .await
+        .map_err(|error| DriveTurnError::Runtime(format!("browser shutdown failed: {error}")));
     crate::tools::bash::shutdown_kill_tree(manager.bash_handles()).await;
+    browser_shutdown?;
     result
 }
 

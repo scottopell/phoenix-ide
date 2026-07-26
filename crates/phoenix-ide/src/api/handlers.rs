@@ -4671,7 +4671,8 @@ pub(super) async fn run_resource_cleanup_cascade(
         ),
         inheritor_scope,
     )
-    .await;
+    .await
+    .map_err(|error| AppError::Internal(format!("browser cleanup failed: {error}")))?;
 
     Ok(())
 }

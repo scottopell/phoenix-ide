@@ -852,19 +852,23 @@ impl Drop for BrowserSessionGuard<'_> {
 /// kill path automatically.
 ///
 /// REQ-BROWSER-WS-003, REQ-BROWSER-WS-002.
+///
+/// # Errors
+/// Returns [`BrowserError`] when an authoritative browser teardown does not
+/// confirm process termination.
 pub async fn cascade_browser_on_delete(
     manager: &Arc<BrowserSessionManager>,
     work_scope: &ResourceScopeKey,
     actor: &EffectiveResourceAccess,
     inheritor_scope: Option<&ResourceScopeKey>,
-) {
+) -> Result<(), BrowserError> {
     if inheritor_scope == Some(work_scope) {
         if actor.authority() == ResourceAuthority::Restricted {
-            manager.kill_session_for_actor(work_scope, actor).await;
+            manager.kill_session_for_actor(work_scope, actor).await?;
         }
-        return;
+        return Ok(());
     }
-    manager.kill_session(work_scope).await;
+    manager.kill_session(work_scope).await
 }
 
 /// Lifecycle event published by [`BrowserSessionManager`] when a session is
@@ -926,7 +930,7 @@ struct ScopedSession {
 
 enum KillSessionOutcome {
     Absent,
-    Started(JoinHandle<()>),
+    Started(JoinHandle<Result<(), BrowserError>>),
     AlreadyRequested { key: String, done: Arc<Notify> },
 }
 
@@ -1052,7 +1056,11 @@ impl BrowserSessionManager {
         }
     }
 
-    async fn wait_for_kill_completion(&self, key: &str, done: Arc<Notify>) {
+    async fn wait_for_kill_completion(
+        &self,
+        key: &str,
+        done: Arc<Notify>,
+    ) -> Result<(), BrowserError> {
         loop {
             let notified = done.notified();
             tokio::pin!(notified);
@@ -1065,7 +1073,17 @@ impl BrowserSessionManager {
                 })
             };
             if !still_waiting_for_same_kill {
-                break;
+                let failed = self.sessions.read().await.get(key).is_some_and(|entry| {
+                    Arc::ptr_eq(&entry.kill_done, &done)
+                        && !entry.kill_requested.load(Ordering::SeqCst)
+                });
+                return if failed {
+                    Err(BrowserError::OperationFailed(
+                        "browser termination did not complete".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                };
             }
             notified.await;
         }
@@ -1119,7 +1137,7 @@ impl BrowserSessionManager {
                     if entry.kill_requested.load(Ordering::SeqCst) {
                         let kill_done = entry.kill_done.clone();
                         drop(sessions);
-                        self.wait_for_kill_completion(&key, kill_done).await;
+                        self.wait_for_kill_completion(&key, kill_done).await?;
                         continue;
                     }
                     if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
@@ -1134,7 +1152,7 @@ impl BrowserSessionManager {
                 if entry.kill_requested.load(Ordering::SeqCst) {
                     let kill_done = entry.kill_done.clone();
                     drop(sessions);
-                    self.wait_for_kill_completion(&key, kill_done).await;
+                    self.wait_for_kill_completion(&key, kill_done).await?;
                     continue;
                 }
                 if !actor.can_control(&entry.creator_conversation_id, entry.authority) {
@@ -1309,7 +1327,7 @@ impl BrowserSessionManager {
                 tracing::warn!(work_scope = %requested_scope, %error, "browser termination failed; retaining tracked session");
                 kill_requested.store(false, Ordering::SeqCst);
                 kill_done.notify_waiters();
-                return;
+                return Err(BrowserError::OperationFailed(error.to_string()));
             }
 
             let still_tracked = {
@@ -1321,8 +1339,8 @@ impl BrowserSessionManager {
             if !still_tracked {
                 tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was removed or replaced");
                 kill_done.notify_waiters();
-                return;
-            }
+                return Ok(());
+            };
 
             let user_data_dir = user_data_dir_for_key(&key);
             if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
@@ -1344,7 +1362,7 @@ impl BrowserSessionManager {
             let Some(entry) = removed else {
                 tracing::debug!(work_scope = %requested_scope, "browser kill cleaned profile after session was removed or replaced");
                 kill_done.notify_waiters();
-                return;
+                return Ok(());
             };
             let removed_scope = entry.scope.clone();
             let audience = match entry.authority {
@@ -1356,6 +1374,7 @@ impl BrowserSessionManager {
             drop(entry);
             manager.emit_lifecycle(&removed_scope, audience, false);
             kill_done.notify_waiters();
+            Ok(())
         }))
     }
 
@@ -1390,22 +1409,27 @@ impl BrowserSessionManager {
         }
     }
 
+    /// Kill the actor-specific session and wait for confirmed teardown.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] when the kill task fails or Chrome termination
+    /// cannot be confirmed.
     pub async fn kill_session_for_actor(
         self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
-    ) {
+    ) -> Result<(), BrowserError> {
         let key = session_key(work_scope, actor);
         match self
             .spawn_kill_session_by_key(key, work_scope.clone())
             .await
         {
-            KillSessionOutcome::Absent => {}
-            KillSessionOutcome::Started(handle) => {
-                let _ = handle.await;
-            }
+            KillSessionOutcome::Absent => Ok(()),
+            KillSessionOutcome::Started(handle) => handle.await.map_err(|error| {
+                BrowserError::OperationFailed(format!("browser kill task failed: {error}"))
+            })?,
             KillSessionOutcome::AlreadyRequested { key, done } => {
-                self.wait_for_kill_completion(&key, done).await;
+                self.wait_for_kill_completion(&key, done).await
             }
         }
     }
@@ -1416,7 +1440,13 @@ impl BrowserSessionManager {
     /// going away; user-facing Stop browser endpoints use
     /// [`Self::request_kill_session`] so they do not block behind an in-flight
     /// browser tool guard.
-    pub async fn kill_session(self: &Arc<Self>, work_scope: &ResourceScopeKey) {
+    /// # Errors
+    /// Returns [`BrowserError`] when any matching session's kill task fails or
+    /// Chrome termination cannot be confirmed.
+    pub async fn kill_session(
+        self: &Arc<Self>,
+        work_scope: &ResourceScopeKey,
+    ) -> Result<(), BrowserError> {
         let keys: Vec<String> = self
             .sessions
             .read()
@@ -1432,19 +1462,25 @@ impl BrowserSessionManager {
             {
                 KillSessionOutcome::Absent => {}
                 KillSessionOutcome::Started(handle) => {
-                    if let Err(err) = handle.await {
-                        tracing::warn!(work_scope = %work_scope, error = %err, "browser kill task failed");
-                    }
+                    handle.await.map_err(|error| {
+                        BrowserError::OperationFailed(format!(
+                            "browser kill task failed for {work_scope}: {error}"
+                        ))
+                    })??;
                 }
                 KillSessionOutcome::AlreadyRequested { key, done } => {
-                    self.wait_for_kill_completion(&key, done).await;
+                    self.wait_for_kill_completion(&key, done).await?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Kill all sessions and wait for their Chrome processes and profiles to be released.
-    pub async fn shutdown_all(self: &Arc<Self>) {
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] when any session cannot confirm authoritative teardown.
+    pub async fn shutdown_all(self: &Arc<Self>) -> Result<(), BrowserError> {
         let scopes: HashSet<ResourceScopeKey> = self
             .sessions
             .read()
@@ -1456,8 +1492,9 @@ impl BrowserSessionManager {
             tracing::info!(count = scopes.len(), "Shutting down all browser sessions");
         }
         for scope in scopes {
-            self.kill_session(&scope).await;
+            self.kill_session(&scope).await?;
         }
+        Ok(())
     }
 
     /// Of the idle `(key, scope)` candidates, return the keys that may be
@@ -1546,14 +1583,23 @@ impl BrowserSessionManager {
         }
 
         for result in futures::future::join_all(started).await {
-            if let Err(error) = result {
-                tracing::warn!(%error, "idle browser kill task failed");
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "idle browser termination failed"),
+                Err(error) => tracing::warn!(%error, "idle browser kill task failed"),
             }
         }
-        futures::future::join_all(already_requested.into_iter().map(|(key, done)| async move {
-            self.wait_for_kill_completion(&key, done).await;
-        }))
-        .await;
+        for result in futures::future::join_all(
+            already_requested
+                .into_iter()
+                .map(|(key, done)| async move { self.wait_for_kill_completion(&key, done).await }),
+        )
+        .await
+        {
+            if let Err(error) = result {
+                tracing::warn!(%error, "idle browser termination did not complete");
+            }
+        }
     }
 }
 
@@ -1621,7 +1667,10 @@ mod lifecycle_hook_tests {
     async fn kill_session_no_op_does_not_emit() {
         let (manager, mut rx) = install_sink();
         let scope = scope("conv-never-existed");
-        manager.kill_session(&scope).await;
+        manager
+            .kill_session(&scope)
+            .await
+            .expect("browser shutdown");
         assert!(
             rx.try_recv().is_err(),
             "kill_session on absent scope must not emit a lifecycle event"
@@ -1640,7 +1689,7 @@ mod lifecycle_hook_tests {
         let profile = super::user_data_dir_for_key(&scope.stable_key());
         let session = manager.get_session(&scope).await.expect("launch browser");
 
-        manager.shutdown_all().await;
+        manager.shutdown_all().await.expect("browser shutdown");
 
         assert!(!manager.is_active(&scope).await);
         assert!(!std::path::Path::new(&profile).exists());
