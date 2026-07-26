@@ -68,21 +68,24 @@ done
 attempt=0
 quiet=0
 while [ "$attempt" -lt 50 ]; do
-  live=0
+  unconfirmed=0
   for socket in "$root"/*.sock; do
     [ -S "$socket" ] || continue
-    tmux -S "$socket" kill-server >/dev/null 2>&1 || true
     if tmux -S "$socket" list-sessions >/dev/null 2>&1; then
-      live=1
+      if tmux -S "$socket" kill-server >/dev/null 2>&1; then
+        rm -f "$socket"
+      else
+        unconfirmed=1
+      fi
     else
-      rm -f "$socket"
+      unconfirmed=1
     fi
   done
   sockets=0
   for socket in "$root"/*.sock; do
     [ -S "$socket" ] && sockets=1
   done
-  if [ "$live" -eq 0 ] && [ "$sockets" -eq 0 ]; then
+  if [ "$unconfirmed" -eq 0 ] && [ "$sockets" -eq 0 ]; then
     quiet=$((quiet + 1))
   else
     quiet=0
@@ -106,7 +109,13 @@ exit 1
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Some(path) = watchdog_path {
-            command.env("PATH", path);
+            let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![path.to_path_buf()];
+            paths.extend(std::env::split_paths(&inherited_path));
+            command.env(
+                "PATH",
+                std::env::join_paths(paths).expect("join watchdog PATH"),
+            );
         }
         unsafe {
             command.pre_exec(|| {
