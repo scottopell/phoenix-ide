@@ -2152,10 +2152,8 @@ function ConversationPageContent({
     </div>
   ) : null;
 
-  // Split-pane viewer: rendered inside `#app` as a sibling of
-  // .conversation-column when wide-desktop and a viewer (file OR diff)
-  // is open. CSS in .app-split-pane (index.css) flexes children
-  // horizontally.
+  // Wide-desktop pane presentations render beside .conversation-column.
+  // Fullscreen message presentations use the takeover branch below.
   const splitPanePrs = openFileState;
   const showSplitPaneViewer =
     isDesktop
@@ -2165,7 +2163,7 @@ function ConversationPageContent({
       || paneDiffOpen
       || browserViewerOpen
       || inspectViewerOpen
-      || messageViewerOpen
+      || (messageViewerOpen && messageSlot?.presentation === 'pane')
       || commissionReviewViewerOpen
     );
 

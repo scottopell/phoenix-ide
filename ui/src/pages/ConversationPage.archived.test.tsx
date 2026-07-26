@@ -271,6 +271,31 @@ afterEach(() => {
   localStorage.clear();
 });
 
+describe('ConversationPage message viewer layout', () => {
+  it('keeps a direct fullscreen message open out of split-pane layout', async () => {
+    const { container } = renderPage(
+      makeConversation(),
+      slug,
+      '?viewer=message&presentation=fullscreen&message=1',
+    );
+
+    await screen.findByText('keep this history visible');
+    expect(container.querySelector('.app-split-pane')).not.toBeInTheDocument();
+  });
+
+  it('uses split-pane layout for a pane message on wide desktop', async () => {
+    const { container } = renderPage(
+      makeConversation(),
+      slug,
+      '?viewer=message&presentation=pane&message=1',
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('.app-split-pane')).toBeInTheDocument();
+    });
+  });
+});
+
 describe('ConversationPage message delivery reconciliation', () => {
   it('does not overwrite authoritative idle when SSE completes before the chat POST response', async () => {
     const response = deferred<{ queued: boolean; steering: boolean }>();
