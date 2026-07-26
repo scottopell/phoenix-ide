@@ -280,7 +280,6 @@ rule IdleSessionCleanedUp {
             work_scope: session.scope,
             active: false
         )
-        ensures: UserDataDirRemoved(user_data_dir_for_scope(session.scope))
 }
 
 -- REQ-BT-010: the skip path. An idle session whose scope is still live — a

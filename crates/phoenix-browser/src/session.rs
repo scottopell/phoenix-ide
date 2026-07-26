@@ -1505,6 +1505,8 @@ impl BrowserSessionManager {
         // timer re-checks it next interval. No hook means reap on age alone.
         let to_remove = self.filter_reapable(idle_candidates).await;
 
+        let mut started = Vec::new();
+        let mut already_requested = Vec::new();
         for key in to_remove {
             let scope = {
                 let sessions = self.sessions.read().await;
@@ -1514,17 +1516,23 @@ impl BrowserSessionManager {
                 tracing::info!(scope_key = %key, "Cleaning up idle browser session");
                 match self.spawn_kill_session_by_key(key, scope).await {
                     KillSessionOutcome::Absent => {}
-                    KillSessionOutcome::Started(handle) => {
-                        if let Err(error) = handle.await {
-                            tracing::warn!(%error, "idle browser kill task failed");
-                        }
-                    }
+                    KillSessionOutcome::Started(handle) => started.push(handle),
                     KillSessionOutcome::AlreadyRequested { key, done } => {
-                        self.wait_for_kill_completion(&key, done).await;
+                        already_requested.push((key, done));
                     }
                 }
             }
         }
+
+        for result in futures::future::join_all(started).await {
+            if let Err(error) = result {
+                tracing::warn!(%error, "idle browser kill task failed");
+            }
+        }
+        futures::future::join_all(already_requested.into_iter().map(|(key, done)| async move {
+            self.wait_for_kill_completion(&key, done).await;
+        }))
+        .await;
     }
 }
 

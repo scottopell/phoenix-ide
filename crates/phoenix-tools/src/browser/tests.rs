@@ -118,16 +118,19 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
         phoenix_terminal::ActiveTerminals::new(),
         Arc::new(crate::TmuxRegistry::new()),
         None,
-        phoenix_core::work_scope::WorkScopeId::new(),
+        phoenix_core::work_scope::WorkScopeId::parse(format!("browser-test-{conversation_id}"))
+            .expect("test conversation ID should form a valid browser scope"),
     );
     (ctx, manager)
 }
 
 #[test]
-fn test_contexts_have_isolated_browser_scopes() {
+fn test_contexts_have_isolated_and_rediscoverable_browser_scopes() {
     let (first, _) = test_context("first");
+    let (first_again, _) = test_context("first");
     let (second, _) = test_context("second");
 
+    assert_eq!(first.work_scope, first_again.work_scope);
     assert_ne!(first.work_scope, second.work_scope);
 }
 
@@ -950,7 +953,7 @@ async fn test_browser_navigate_remote() {
     require_chrome!();
     require_network!();
 
-    let (ctx, _manager) = test_context("test-navigate-remote");
+    let (ctx, manager) = test_context("test-navigate-remote");
 
     // Navigate to a real website
     let nav_tool = BrowserNavigateTool;
@@ -987,6 +990,8 @@ async fn test_browser_navigate_remote() {
         "Wrong h1: {}",
         result.output()
     );
+
+    manager.shutdown_all().await;
 }
 
 // ============================================================================
@@ -997,7 +1002,7 @@ async fn test_browser_navigate_remote() {
 async fn test_browser_eval_before_navigate() {
     require_chrome!();
 
-    let (ctx, _manager) = test_context("test-eval-no-nav");
+    let (ctx, manager) = test_context("test-eval-no-nav");
 
     // Try to eval without navigating first - should still work on about:blank
     let eval_tool = BrowserEvalTool;
@@ -1012,6 +1017,8 @@ async fn test_browser_eval_before_navigate() {
         "Wrong result: {}",
         result.output()
     );
+
+    manager.shutdown_all().await;
 }
 
 #[tokio::test]
