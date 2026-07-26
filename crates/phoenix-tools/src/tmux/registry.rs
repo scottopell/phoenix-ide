@@ -238,6 +238,7 @@ pub struct TmuxRegistry {
     /// so transitions flow into the work-scope push bridge; `None` for
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
+    contain_test_spawns: bool,
 }
 
 impl TmuxRegistry {
@@ -263,6 +264,7 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
+            contain_test_spawns: false,
         }
     }
 
@@ -312,6 +314,7 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
+            contain_test_spawns: false,
         }
     }
 
@@ -332,7 +335,24 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: sink,
+            contain_test_spawns: false,
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_test_spawn_containment(mut self) -> Self {
+        self.contain_test_spawns = true;
+        self
+    }
+
+    async fn spawn_owned_session(&self, socket_path: &Path, cwd: &Path) -> Result<(), TmuxError> {
+        spawn_session_owned(
+            socket_path,
+            &self.config_path(),
+            cwd,
+            self.contain_test_spawns,
+        )
+        .await
     }
 
     /// Cached `which("tmux")` result (REQ-TMUX-003). Discovered once at
@@ -531,7 +551,7 @@ impl TmuxRegistry {
                 reused_live = true;
             }
             ProbeResult::NoSocket => {
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                self.spawn_owned_session(&server.socket_path, cwd).await?;
                 server.server_token = read_server_token(&server.socket_path)
                     .await
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -546,7 +566,7 @@ impl TmuxRegistry {
                     "tmux: stale socket detected, unlinking and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                self.spawn_owned_session(&server.socket_path, cwd).await?;
                 server.server_token = read_server_token(&server.socket_path)
                     .await
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1130,16 +1150,18 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
 /// any in-app terminal that later attaches) in the Phoenix repo
 /// instead of the conversation's project directory.
 ///
-fn tmux_spawn_command(socket_path: &Path, tmux_args: &[String]) -> tokio::process::Command {
-    let Some(root) = socket_path
-        .parent()
-        .filter(|root| root.join(".armed").exists())
-    else {
+fn tmux_spawn_command(
+    socket_path: &Path,
+    tmux_args: &[String],
+    contain_test_spawn: bool,
+) -> tokio::process::Command {
+    let Some(root) = socket_path.parent().filter(|_| contain_test_spawn) else {
         let mut command = tokio::process::Command::new("tmux");
         command.args(tmux_args);
         return command;
     };
     let marker = root.join(format!(".creating-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&marker, []).expect("publish tmux test creation ownership");
     let wrapper = r"
 import os
 from pathlib import Path
@@ -1168,6 +1190,15 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
+    spawn_session_owned(socket_path, config_path, cwd, false).await
+}
+
+async fn spawn_session_owned(
+    socket_path: &Path,
+    config_path: &Path,
+    cwd: &Path,
+    contain_test_spawn: bool,
+) -> Result<(), TmuxError> {
     let tmux_args = [
         "-f".to_string(),
         config_path.to_string_lossy().into_owned(),
@@ -1180,7 +1211,7 @@ pub async fn spawn_session(
         "-s".to_string(),
         TMUX_DEFAULT_SESSION.to_string(),
     ];
-    let mut cmd = tmux_spawn_command(socket_path, &tmux_args);
+    let mut cmd = tmux_spawn_command(socket_path, &tmux_args, contain_test_spawn);
     // A tmux pane shell inherits the tmux *server's* environment, captured here.
     // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
     // than inheriting Phoenix's env, which would leak server secrets into every

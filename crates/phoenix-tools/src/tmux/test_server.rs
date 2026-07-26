@@ -4,6 +4,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,13 +27,25 @@ import time
 root = Path(sys.argv[1])
 parent = int(sys.argv[2])
 (root / ".armed").touch()
-while not (root / ".cleanup-request").exists() and os.getppid() == parent:
+heartbeat = root / ".parent-heartbeat"
+while not (root / ".cleanup-request").exists():
+    if parent == 1:
+        try:
+            if time.time() - heartbeat.stat().st_mtime > 0.5:
+                break
+        except FileNotFoundError:
+            break
+    elif os.getppid() != parent:
+        break
     time.sleep(0.05)
 (root / ".cleanup-ack").touch()
 quiet = 0
 for _ in range(50):
     unconfirmed = False
     for socket in root.glob("*.sock"):
+        if socket.is_symlink():
+            socket.unlink(missing_ok=True)
+            continue
         if not socket.is_socket():
             continue
         try:
@@ -83,6 +97,8 @@ sys.exit(1)
 pub struct TestTmuxServerOwner {
     root: Option<TempDir>,
     watchdog: Option<Child>,
+    heartbeat_stop: Arc<AtomicBool>,
+    heartbeat: Option<thread::JoinHandle<()>>,
 }
 
 impl Default for TestTmuxServerOwner {
@@ -96,8 +112,8 @@ impl TestTmuxServerOwner {
     ///
     /// # Panics
     ///
-    /// Panics when the temporary root, watchdog pipe, or watchdog process cannot
-    /// be created. Tests cannot safely continue without containment.
+    /// Panics when the temporary root or watchdog process cannot be created or
+    /// armed. Tests cannot safely continue without containment.
     #[must_use]
     pub fn new() -> Self {
         Self::new_with_watchdog_path(None)
@@ -150,10 +166,22 @@ impl TestTmuxServerOwner {
         let mut watchdog = command.spawn().expect("spawn tmux test watchdog");
         wait_for_watchdog_arm(&mut watchdog, &canonical_root)
             .expect("tmux test watchdog must arm before owner is exposed");
+        let heartbeat_stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&heartbeat_stop);
+        let heartbeat_path = canonical_root.join(".parent-heartbeat");
+        let heartbeat = thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                let _ = fs::write(&heartbeat_path, []);
+                // test-timing-allow: heartbeat cadence detects PID-1 runner death; cleanup uses explicit markers and watchdog exit
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
 
         Self {
             root: Some(root),
             watchdog: Some(watchdog),
+            heartbeat_stop,
+            heartbeat: Some(heartbeat),
         }
     }
 
@@ -170,7 +198,7 @@ impl TestTmuxServerOwner {
     /// Creates a registry whose servers are confined to this owner's root.
     #[must_use]
     pub fn registry(&self) -> TmuxRegistry {
-        TmuxRegistry::with_socket_dir(self.socket_dir().to_path_buf())
+        TmuxRegistry::with_socket_dir(self.socket_dir().to_path_buf()).with_test_spawn_containment()
     }
 
     #[cfg(test)]
@@ -179,6 +207,7 @@ impl TestTmuxServerOwner {
         sink: Option<super::registry::TmuxLifecycleSink>,
     ) -> TmuxRegistry {
         TmuxRegistry::with_socket_dir_binary_and_sink(self.socket_dir().to_path_buf(), true, sink)
+            .with_test_spawn_containment()
     }
 
     /// Kills and verifies all exact servers under the owned root.
@@ -195,6 +224,10 @@ impl TestTmuxServerOwner {
         let root = self.root.take().expect("owner root is live");
         let mut watchdog = self.watchdog.take().expect("watchdog is live");
         let root_path = root.path().to_path_buf();
+        self.heartbeat_stop.store(true, Ordering::Release);
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
         let handoff_error = request_cleanup(&root_path, graceful).err();
 
         let result = wait_for_watchdog(&mut watchdog).and_then(|status| {
@@ -277,14 +310,14 @@ fn request_cleanup(root: &Path, graceful: bool) -> io::Result<()> {
     fs::rename(pending, request)?;
     let ack = root.join(".cleanup-ack");
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
-    while !ack.exists() {
+    while !ack.exists() && root.exists() {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "tmux test watchdog did not acknowledge cleanup request",
             ));
         }
-        // test-timing-allow: the watchdog acknowledgment file is the completion signal; the deadline only bounds a failed handoff
+        // test-timing-allow: acknowledgment or completed root removal is the signal; the deadline only bounds a failed handoff
         thread::sleep(Duration::from_millis(20));
     }
     Ok(())
@@ -297,6 +330,11 @@ fn wait_for_watchdog(watchdog: &mut Child) -> io::Result<std::process::ExitStatu
             return Ok(status);
         }
         if Instant::now() >= deadline {
+            if let Ok(pid) = i32::try_from(watchdog.id()) {
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+            }
             let _ = watchdog.kill();
             let _ = watchdog.wait();
             return Err(io::Error::new(
@@ -385,7 +423,7 @@ mod tests {
         let root = owner.path().to_path_buf();
         let socket = root.join("unconfirmed.sock");
         std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let panic = std::panic::catch_unwind(|| owner.shutdown());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
         assert!(panic.is_err(), "cleanup failure must fail the test");
         assert!(root.exists(), "failed cleanup must preserve its exact root");
         assert!(

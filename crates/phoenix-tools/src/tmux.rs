@@ -695,6 +695,7 @@ mod tests {
                 let name = entry.file_name();
                 let s = name.to_string_lossy();
                 !(s == ".armed"
+                    || s == ".parent-heartbeat"
                     || s == "_phoenix.tmux.conf"
                     || s.starts_with(scope_socket_name.as_ref()))
             })
