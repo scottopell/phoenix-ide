@@ -3237,7 +3237,15 @@ async fn get_system_prompt(
         phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
     };
     let system_prompt = if is_coordinator {
-        crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
+        let coordinator_bash = if state.platform.has_sandbox() {
+            phoenix_core::domain::sm_state::ExploreBashCapability::Sandboxed
+        } else {
+            phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
+        };
+        crate::system_prompt::build_coordinator_system_prompt(
+            conversation.llm_language,
+            coordinator_bash,
+        )
     } else {
         let cwd = std::path::PathBuf::from(&conversation.cwd);
         let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
@@ -4394,7 +4402,7 @@ async fn scope_still_owned_after_delete(
     if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
         match state.runtime.db().get_conversation(cont_id).await {
             Ok(continuation) => {
-                let cont_scope = conversation_work_scope(&continuation)?;
+                let cont_scope = conversation_resource_scope(&continuation);
                 if &cont_scope == work_scope {
                     return Ok(true);
                 }
@@ -4415,14 +4423,13 @@ async fn scope_still_owned_after_delete(
     // skip every resource + worktree teardown while the row is still
     // archived/deleted, orphaning those resources with no retry. Failing the
     // request instead lets the caller retry once the DB is healthy.
+    let Some(work_scope_id) = work_scope.work_scope_id() else {
+        return Ok(false);
+    };
     let conversations = state
         .runtime
         .db()
-        .list_conversations_for_work_scope(work_scope.work_scope_id().ok_or_else(|| {
-            AppError::Internal(format!(
-                "cleanup cascade has no durable scope: {work_scope}"
-            ))
-        })?)
+        .list_conversations_for_work_scope(work_scope_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(conversations.into_iter().any(|candidate| {
@@ -4463,7 +4470,7 @@ pub(super) async fn run_resource_cleanup_cascade(
     conv: &crate::db::Conversation,
 ) -> Result<(), AppError> {
     let id = conv.id.as_str();
-    let work_scope = conversation_work_scope(conv)?;
+    let work_scope = conversation_resource_scope(conv);
 
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,

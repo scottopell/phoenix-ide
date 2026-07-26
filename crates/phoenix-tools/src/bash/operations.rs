@@ -423,12 +423,15 @@ fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
 pub enum BashSpawnMode {
     Direct,
     ExploreReadOnly,
+    CoordinatorReadOnly,
 }
 
 impl BashSpawnMode {
     fn authority(self) -> phoenix_core::work_scope::ResourceAuthority {
         match self {
-            Self::Direct => phoenix_core::work_scope::ResourceAuthority::Work,
+            Self::Direct | Self::CoordinatorReadOnly => {
+                phoenix_core::work_scope::ResourceAuthority::Work
+            }
             Self::ExploreReadOnly => phoenix_core::work_scope::ResourceAuthority::Restricted,
         }
     }
@@ -441,6 +444,10 @@ pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
 
 pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
     dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
+}
+
+pub async fn dispatch_coordinator_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::CoordinatorReadOnly).await
 }
 
 async fn dispatch_with_spawn_mode(
@@ -616,7 +623,7 @@ fn spawn_child(
             command.arg("-c").arg(cmd).current_dir(ctx.working_dir());
             command
         }
-        BashSpawnMode::ExploreReadOnly => {
+        BashSpawnMode::ExploreReadOnly | BashSpawnMode::CoordinatorReadOnly => {
             let sandbox_command = ExploreSandboxLauncher::command(cmd, ctx.working_dir())?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
@@ -2347,6 +2354,26 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(output.output()).expect("json");
         assert_eq!(value["status"], "exited");
         assert!(registrar.register_calls().is_empty());
+    }
+
+    #[test]
+    fn coordinator_read_only_handles_are_shared_with_coordinator_successors() {
+        assert_eq!(
+            BashSpawnMode::CoordinatorReadOnly.authority(),
+            phoenix_core::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(
+            BashSpawnMode::ExploreReadOnly.authority(),
+            phoenix_core::work_scope::ResourceAuthority::Restricted
+        );
+        let successor = phoenix_core::work_scope::EffectiveResourceAccess::new(
+            "coordinator-successor",
+            BashSpawnMode::CoordinatorReadOnly.authority(),
+        );
+        assert!(successor.can_control(
+            "coordinator-predecessor",
+            BashSpawnMode::CoordinatorReadOnly.authority()
+        ));
     }
 
     #[tokio::test]

@@ -186,14 +186,13 @@ SELECT c.id AS current_conversation_id,
        c.state_updated_at, c.updated_at, c.continued_in_conv_id,
        c.archived, c.user_initiated, c.parent_conversation_id,
        c.cm_task_id, c.cm_task_title,
-       environment.cwd,
-       environment.worktree_path,
+       CASE WHEN environment.lifecycle = 'active' THEN environment.cwd END AS cwd,
+       CASE WHEN environment.lifecycle = 'active' THEN environment.worktree_path END AS worktree_path,
        environment.branch_name AS cm_branch_name,
        environment.base_branch AS cm_base_branch
 FROM leaves JOIN conversations c ON c.id = leaves.current_id
 LEFT JOIN work_scopes environment
   ON environment.id = c.work_scope_id
- AND environment.lifecycle = 'active'
 WHERE leaves.root_id NOT IN (
   SELECT id FROM conversations WHERE coordinator_head = 1
 )
@@ -1195,7 +1194,9 @@ mod tests {
 
         sqlx::query(
             "UPDATE work_scopes
-             SET lifecycle = 'retired', retired_at = '2026-01-01T00:00:00Z'
+             SET lifecycle = 'retired', retired_at = '2026-01-01T00:00:00Z',
+                 environment_kind = 'allocated_worktree', worktree_path = ?1,
+                 branch_name = 'feature/history', base_branch = 'main'
              WHERE cwd = ?1",
         )
         .bind(canonical.to_str().unwrap())
@@ -1207,6 +1208,17 @@ mod tests {
             .await
             .unwrap_err()
             .contains("active persisted WorkScope"));
+        let snapshot = service.coordinator_snapshot().await.unwrap();
+        assert!(snapshot.contains("\"cwd\": null"), "{snapshot}");
+        assert!(snapshot.contains("\"worktree_path\": null"), "{snapshot}");
+        assert!(
+            snapshot.contains("\"cm_branch_name\": \"feature/history\""),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("\"cm_base_branch\": \"main\""),
+            "{snapshot}"
+        );
     }
 
     #[cfg(unix)]
