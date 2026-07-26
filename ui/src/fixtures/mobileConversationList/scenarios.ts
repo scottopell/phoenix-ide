@@ -256,6 +256,197 @@ const archivedConversations: Conversation[] = [
   }),
 ];
 
+const longStandaloneConversations: Conversation[] = Array.from({ length: 18 }, (_, index) => {
+  const n = index + 1;
+  const mode = n % 4 === 0 ? 'WORK' : n % 4 === 1 ? 'EXPLORE' : n % 4 === 2 ? 'BRANCH' : 'DIRECT';
+  const stateType: ConversationState['type'] = n % 6 === 0
+    ? 'awaiting_llm'
+    : n % 5 === 0
+      ? 'error'
+      : n % 4 === 0
+        ? 'awaiting_user_response'
+        : 'idle';
+  const presentationMode = stateType === 'awaiting_llm'
+    ? 'working'
+    : stateType === 'error'
+      ? 'error'
+      : stateType === 'awaiting_user_response'
+        ? 'needs_action'
+        : 'idle';
+
+  return conv(`long-standalone-${n}`, `long-standalone-${n.toString().padStart(2, '0')}`, {
+    conv_mode_label: mode,
+    updated_at: isoAgo(14 + n * 11),
+    created_at: isoAgo(1400 + n * 37),
+    message_count: 2 + n * 3,
+    state: state(stateType),
+    presentation_mode: presentationMode,
+    task_title: n % 3 === 0 ? `Standalone mobile fixture row ${n}` : null,
+    branch_name: n % 4 === 2 ? `scott/mobile-long-row-${n}` : null,
+    project_name: n % 5 === 0 ? null : 'phoenix-ide',
+    project_id: n % 5 === 0 ? null : 'phoenix',
+    cwd: n % 5 === 0 ? `/tmp/mobile-long-row-${n}` : `/Users/scottopell/dev/phoenix-ide/.phoenix/worktrees/long-standalone-${n.toString().padStart(2, '0')}`,
+    cached_pr: n % 6 === 1
+      ? pr(800 + n, 'open', `Long list open PR ${n}`)
+      : n % 6 === 3
+        ? pr(800 + n, 'draft', `Long list draft PR ${n}`)
+        : n % 6 === 5
+          ? pr(800 + n, 'closed', `Long list closed PR ${n}`)
+          : undefined,
+  });
+});
+
+const longContinuationChain: Conversation[] = [
+  conv('long-chain-current-12', 'long-chain-current-12', {
+    conv_mode_label: 'WORK',
+    chain_name: 'mobile long continuation chain',
+    cached_pr: pr(912, 'open', 'Current long chain PR'),
+    updated_at: isoAgo(2),
+    created_at: isoAgo(55),
+    message_count: 87,
+    state: state('awaiting_llm'),
+    presentation_mode: 'working',
+    task_title: 'Rework mobile conversation list scrolling',
+    branch_name: 'task-24704-rework-mobile-conversation-list',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-11', 'long-chain-link-11', {
+    continued_in_conv_id: 'long-chain-current-12',
+    conv_mode_label: 'WORK',
+    updated_at: isoAgo(18),
+    created_at: isoAgo(130),
+    message_count: 63,
+    state: state('awaiting_task_approval'),
+    presentation_mode: 'needs_action',
+    cached_pr: pr(911, 'draft', 'Approval step before current chain'),
+    task_title: 'Queue the follow-up continuation',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-10', 'long-chain-link-10', {
+    continued_in_conv_id: 'long-chain-link-11',
+    conv_mode_label: 'EXPLORE',
+    updated_at: isoAgo(36),
+    created_at: isoAgo(210),
+    message_count: 21,
+    state: state('awaiting_user_response'),
+    presentation_mode: 'needs_action',
+    task_title: 'Clarify mobile chain interactions',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-09', 'long-chain-link-09', {
+    continued_in_conv_id: 'long-chain-link-10',
+    conv_mode_label: 'WORK',
+    updated_at: isoAgo(58),
+    created_at: isoAgo(340),
+    message_count: 54,
+    state: state('terminal'),
+    presentation_mode: 'done',
+    cached_pr: pr(910, 'merged', 'Merged checkpoint for long chain'),
+    task_title: 'Land the compact chain summary experiment',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-08', 'long-chain-link-08', {
+    continued_in_conv_id: 'long-chain-link-09',
+    conv_mode_label: 'BRANCH',
+    updated_at: isoAgo(77),
+    created_at: isoAgo(470),
+    message_count: 33,
+    state: state('error'),
+    presentation_mode: 'error',
+    branch_name: 'scott/mobile-chain-hotfix',
+    task_title: 'Recover from chain layout regression',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-07', 'long-chain-link-07', {
+    continued_in_conv_id: 'long-chain-link-08',
+    conv_mode_label: 'WORK',
+    updated_at: isoAgo(96),
+    created_at: isoAgo(590),
+    message_count: 47,
+    state: state('context_exhausted'),
+    presentation_mode: 'needs_action',
+    task_title: 'Continue after context fill-up',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-06', 'long-chain-link-06', {
+    continued_in_conv_id: 'long-chain-link-07',
+    conv_mode_label: 'DIRECT',
+    updated_at: isoAgo(124),
+    created_at: isoAgo(730),
+    message_count: 12,
+    state: state('terminal'),
+    presentation_mode: 'done',
+    project_name: null,
+    project_id: null,
+    cwd: '/tmp/mobile-chain-direct-step',
+    task_title: 'Quick direct validation pass',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-05', 'long-chain-link-05', {
+    continued_in_conv_id: 'long-chain-link-06',
+    conv_mode_label: 'EXPLORE',
+    updated_at: isoAgo(150),
+    created_at: isoAgo(860),
+    message_count: 18,
+    state: state('terminal'),
+    presentation_mode: 'done',
+    task_title: 'Compare competing mobile row hierarchies',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-04', 'long-chain-link-04', {
+    continued_in_conv_id: 'long-chain-link-05',
+    conv_mode_label: 'WORK',
+    updated_at: isoAgo(182),
+    created_at: isoAgo(1020),
+    message_count: 72,
+    state: state('terminal'),
+    presentation_mode: 'done',
+    cached_pr: pr(904, 'closed', 'Closed chain exploration PR'),
+    task_title: 'Close the detour branch cleanly',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-03', 'long-chain-link-03', {
+    continued_in_conv_id: 'long-chain-link-04',
+    conv_mode_label: 'WORK',
+    updated_at: isoAgo(220),
+    created_at: isoAgo(1200),
+    message_count: 39,
+    state: state('terminal'),
+    presentation_mode: 'done',
+    task_title: 'Prototype the first continuation compression pass',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-link-02', 'long-chain-link-02', {
+    continued_in_conv_id: 'long-chain-link-03',
+    conv_mode_label: 'EXPLORE',
+    updated_at: isoAgo(270),
+    created_at: isoAgo(1420),
+    message_count: 9,
+    state: state('terminal'),
+    presentation_mode: 'done',
+    task_title: 'Inventory long mobile list edge cases',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+  conv('long-chain-root-01', 'long-chain-root-01', {
+    continued_in_conv_id: 'long-chain-link-02',
+    conv_mode_label: 'EXPLORE',
+    chain_name: 'mobile long continuation chain',
+    updated_at: isoAgo(360),
+    created_at: isoAgo(1680),
+    message_count: 4,
+    state: state('terminal'),
+    presentation_mode: 'done',
+    task_title: 'Original mobile conversation list bug hunt',
+    work_scope_key: 'worktree:/tmp/mobile-long-chain',
+  }),
+];
+
+const longListConversations: Conversation[] = [
+  ...longStandaloneConversations.slice(0, 9),
+  ...longContinuationChain,
+  ...longStandaloneConversations.slice(9),
+];
+
 const fixtureDataByDataset: Record<MobileConversationListScenario['dataset'], MobileConversationListFixtureData> = {
   overview: {
     conversations: overviewConversations,
@@ -271,6 +462,10 @@ const fixtureDataByDataset: Record<MobileConversationListScenario['dataset'], Mo
   },
   archived: {
     conversations: overviewConversations,
+    archivedConversations,
+  },
+  'long-list': {
+    conversations: longListConversations,
     archivedConversations,
   },
 };

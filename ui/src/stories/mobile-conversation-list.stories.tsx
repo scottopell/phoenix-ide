@@ -22,5 +22,8 @@ ChainsDark.storyName = 'chains-dark';
 export const NamingContextDark = storyFor('naming-context-dark');
 NamingContextDark.storyName = 'naming-context-dark';
 
+export const LongListDark = storyFor('long-list-dark');
+LongListDark.storyName = 'long-list-dark';
+
 export const ArchivedDark = storyFor('archived-dark');
 ArchivedDark.storyName = 'archived-dark';

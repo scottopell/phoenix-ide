@@ -44,6 +44,7 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
           onArchiveChain={() => {}}
           onDeleteChain={() => {}}
           onConversationClick={() => {}}
+          activeSlug={scenario.activeSlug}
           listDensity="mobile"
           authChip={<span className="mobile-conversation-list-fixture-auth">✓</span>}
           utilityActions={(
@@ -64,7 +65,7 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
 
 export function MobileConversationListFixture({ scenario }: Props) {
   return (
-    <MemoryRouter>
+    <MemoryRouter initialEntries={scenario.activeSlug ? [`/c/${scenario.activeSlug}`] : ['/']}>
       <MobileConversationListFixtureBody scenario={scenario} />
     </MemoryRouter>
   );
