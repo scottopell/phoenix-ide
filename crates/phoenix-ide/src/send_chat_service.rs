@@ -503,9 +503,9 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
 
 fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
-        crate::db::DbError::DirectTurnConflict(
-            TurnConflict::PreparedSemanticsChanged { .. },
-        ) => SendChatServiceError::IdempotencyConflict,
+        crate::db::DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged {
+            ..
+        }) => SendChatServiceError::IdempotencyConflict,
         crate::db::DbError::DirectTurnConflict(TurnConflict::ConversationAlreadyOwned {
             ..
         }) => SendChatServiceError::Busy,
@@ -878,7 +878,10 @@ mod tests {
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority(req.conversation_id.clone()),
                 client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
-                prepared: prepared_turn(&ConversationAuthority(req.conversation_id.clone()), &payload),
+                prepared: prepared_turn(
+                    &ConversationAuthority(req.conversation_id.clone()),
+                    &payload,
+                ),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
@@ -947,7 +950,10 @@ mod tests {
         repo.accept_authoritative_turn(&AcceptAuthoritativeTurn {
             conversation: ConversationAuthority(req.conversation_id.clone()),
             client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),
-            prepared: prepared_turn(&ConversationAuthority(req.conversation_id.clone()), &payload),
+            prepared: prepared_turn(
+                &ConversationAuthority(req.conversation_id.clone()),
+                &payload,
+            ),
             disposition: AcceptedDisposition::Runtime,
             accepted_at: Timestamp(1),
         })

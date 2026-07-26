@@ -3080,17 +3080,15 @@ mod tests {
         let mut changed_delivery =
             PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload()).unwrap();
         changed_delivery.delivery.llm_text = Some("changed expansion".to_string());
-        let err = repo
-            .lookup_scoped_direct_turn_replay(
+        assert!(matches!(
+            repo.lookup_scoped_direct_turn_replay(
                 &input.conversation,
                 &input.client_key,
                 &changed_delivery.submitted,
             )
             .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ScopedDirectTurnReplayError::Db(DbError::Serialization(_))
+            .unwrap(),
+            ScopedDirectTurnReplayLookup::Exact { .. }
         ));
     }
 
@@ -3109,7 +3107,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ScopedDirectTurnReplayError::Db(DbError::Serialization(_))
+            ScopedDirectTurnReplayError::SubmittedIdentityChanged { .. }
         ));
     }
 
@@ -3133,8 +3131,8 @@ mod tests {
                 &submitted_a
             )
             .await
-            .unwrap_err(),
-            ScopedDirectTurnReplayError::Db(DbError::Serialization(_))
+            .unwrap(),
+            ScopedDirectTurnReplayLookup::Exact { .. }
         ));
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
@@ -3143,8 +3141,8 @@ mod tests {
                 &submitted_b
             )
             .await
-            .unwrap_err(),
-            ScopedDirectTurnReplayError::Db(DbError::Serialization(_))
+            .unwrap(),
+            ScopedDirectTurnReplayLookup::Exact { .. }
         ));
         assert!(matches!(
             repo.lookup_scoped_direct_turn_replay(
@@ -3154,7 +3152,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            ScopedDirectTurnReplayError::Db(DbError::Serialization(_))
+            ScopedDirectTurnReplayError::SubmittedIdentityChanged { .. }
         ));
     }
 
