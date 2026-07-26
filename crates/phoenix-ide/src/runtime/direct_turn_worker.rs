@@ -161,14 +161,15 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.repo
-                    .terminate_authoritative_turn(phoenix_workflow::TurnCommand::Fail {
-                        turn_id: candidate.turn_id,
-                        expected_generation: authority.generation.0,
-                        reason: format!("prepared payload decode failed: {error}"),
-                    })
-                    .await
-                    .map_err(|terminal_error| terminal_error.to_string())?;
+                let terminal = phoenix_workflow::TurnCommand::Fail {
+                    turn_id: candidate.turn_id,
+                    expected_generation: authority.generation.0,
+                    reason: format!("prepared payload decode failed: {error}"),
+                };
+                if let Err(terminal_error) = self.repo.terminate_authoritative_turn(terminal).await
+                {
+                    tracing::error!(turn_id = candidate.turn_id.0, error = %terminal_error, "failed to quarantine corrupt direct-turn payload");
+                }
                 tracing::warn!(turn_id = candidate.turn_id.0, error = %error, "direct-turn payload decode failed; terminally quarantined turn");
                 return Ok(());
             }
@@ -613,7 +614,7 @@ mod tests {
         assert_eq!(
             turn.materialization,
             phoenix_workflow::Materialization::Materialized {
-                message_id: CanonicalMessageId("message-materialized".to_string())
+                message_id: CanonicalMessageId("conv-a:message-materialized".to_string())
             }
         );
     }
@@ -691,22 +692,16 @@ mod tests {
             .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
             .await
             .unwrap();
-        assert_eq!(
-            attempts[0].status,
-            phoenix_workflow::AttemptStatus::AuthorityLost
-        );
-        let turn = repo
-            .load_authoritative_turn(turn_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            turn.lifecycle,
-            phoenix_workflow::TurnLifecycle::Terminal {
-                terminal: phoenix_workflow::TurnTerminal::Failed { .. },
-                ..
-            }
-        ));
+        assert!(attempts
+            .iter()
+            .all(|attempt| attempt.status == phoenix_workflow::AttemptStatus::AuthorityLost));
+        let terminal_kind: String =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = ?1")
+                .bind(i64::try_from(turn_id.0).unwrap())
+                .fetch_one(repo.pool())
+                .await
+                .unwrap();
+        assert_eq!(terminal_kind, "Failed");
     }
 
     #[tokio::test]
