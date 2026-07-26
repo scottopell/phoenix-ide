@@ -1023,25 +1023,17 @@ impl<'a> WorkflowTx<'a> {
                     d.event_codec_family, d.event_codec_version, d.payload_kind, d.payload_blob,
                     d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
                     d.suppression_reason, d.accepted_by_transition_id
-             FROM workflow_receipts r
+             FROM workflow_receipt_adoptions adoption
+             JOIN workflow_receipts r
+               ON r.workflow_id = adoption.workflow_id
+              AND r.receipt_id = adoption.receipt_id
              JOIN workflow_deliveries d
-               ON d.workflow_id = r.workflow_id AND d.delivery_id = ?11
-             WHERE r.workflow_id = ?1 AND r.receipt_id = ?10 AND r.effect_id = ?2",
+               ON d.workflow_id = adoption.workflow_id
+              AND d.delivery_id = adoption.delivery_id
+             WHERE adoption.workflow_id = ?1 AND adoption.observation_id = ?2",
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(input.effect_id.0, "effect_id")?)
         .bind(to_i64(input.observation_id.0, "observation_id")?)
-        .bind(to_i64(
-            input.declared_workflow_version.0,
-            "declared_workflow_version",
-        )?)
-        .bind(to_i64(input.generation.0, "generation")?)
-        .bind(&input.receipt_codec.family)
-        .bind(i64::from(input.receipt_codec.version))
-        .bind(&input.receipt_event_codec.family)
-        .bind(i64::from(input.receipt_event_codec.version))
-        .bind(to_i64(input.receipt_id.0, "receipt_id")?)
-        .bind(to_i64(input.delivery_id.0, "delivery_id")?)
         .fetch_optional(&mut *self.tx)
         .await?
         {
@@ -1189,6 +1181,17 @@ impl<'a> WorkflowTx<'a> {
             .bind(if input.receipt_event_requires_runtime_acceptance { Some("Owed") } else { None })
             .execute(&mut *self.tx)
             .await?;
+        sqlx::query(
+            "INSERT INTO workflow_receipt_adoptions (
+                workflow_id, receipt_id, delivery_id, observation_id
+             ) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(to_i64(input.receipt_id.0, "receipt_id")?)
+        .bind(to_i64(input.delivery_id.0, "delivery_id")?)
+        .bind(to_i64(input.observation_id.0, "observation_id")?)
+        .execute(&mut *self.tx)
+        .await?;
         sqlx::query("UPDATE workflow_attempts SET status = 'ReceiptAccepted' WHERE workflow_id = ?1 AND attempt_id = ?2")
             .bind(to_i64(input.workflow_id.0, "workflow_id")?)
             .bind(to_i64(attempt_id.0, "attempt_id")?)
@@ -2031,6 +2034,16 @@ impl WorkflowRepository {
                     if is_sqlite_busy_retryable(error.as_ref()) =>
                 {
                     std::thread::yield_now();
+                }
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if is_sqlite_unique_constraint(error.as_ref())
+                        || is_sqlite_primary_key_constraint(error.as_ref()) =>
+                {
+                    return Ok(ReceiptAcceptanceResult {
+                        outcome: AuthorityOutcome::StaleAuthority,
+                        receipt: None,
+                        delivery: None,
+                    });
                 }
                 result => return result,
             }
