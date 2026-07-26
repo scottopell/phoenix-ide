@@ -85,28 +85,29 @@ conversation into a degenerate one-member chain.
 
 ---
 
-### REQ-CHN-003: Chain Page as a Navigable Place
+### REQ-CHN-003: Unified Conversation Surface as the Navigable Place
 
-WHEN the user activates a chain header in the sidebar (or otherwise
-navigates to a chain)
-THE SYSTEM SHALL navigate to a chain page that lists the member
-conversations in chain order and provides an entry point for asking
-the chain questions
+WHEN the user activates a continuation lineage in the sidebar (or
+otherwise navigates to it)
+THE SYSTEM SHALL navigate to the normal conversation surface for the
+root conversation
+AND that surface SHALL list the continuation-member transcripts in
+chain order and provide an entry point for asking lineage questions
 
 THE SYSTEM SHALL support standard browser navigation (back button,
-deep linking, refresh) to and from the chain page
+deep linking, refresh) to and from that unified conversation surface
 
-**Rationale:** A named chain that you can see but cannot navigate to
-is a label, not a place. Deep-linkable URLs and browser-native
-navigation are the foundational guarantees of a place; absent them the
-chain has no stable destination for revisiting Q&A history or
-sharing across browser tabs.
+**Rationale:** The user needs one stable place for a continuation
+lineage, but it need not be a dedicated continuation-only surface. Deep-linkable URLs
+and browser-native navigation still matter; they now belong to the
+normal conversation surface that projects one conversation across its
+continuation members.
 
 ---
 
 ### REQ-CHN-004: Ask the Chain, Get a Streamed Answer
 
-WHEN the user submits a question on a chain page
+WHEN the user submits a question on the unified conversation surface
 THE SYSTEM SHALL produce an answer derived from the chain's
 conversation content, streamed token-by-token to the user as it is
 generated
@@ -129,8 +130,8 @@ is good.
 ### REQ-CHN-005: Q&A History Persists Per Chain
 
 WHEN a user has previously asked questions on a chain
-THE SYSTEM SHALL display the prior questions and answers when the
-chain page is reopened
+THE SYSTEM SHALL display the prior questions and answers when that
+conversation surface is reopened
 
 THE SYSTEM SHALL render the Q&A panel as a vertical list of pair cards
 where each pair card displays an explicit `Q:` row and `A:` row. There
@@ -177,7 +178,7 @@ snapshot of conversation-graph state retained.
 
 ### REQ-CHN-006: Consistent Quality As Q&A Accumulates
 
-WHILE a user is asking questions on a chain page
+WHILE a user is asking questions on the unified conversation surface
 THE SYSTEM SHALL produce answers whose quality, latency, and content do
 not materially degrade as more questions and answers accumulate in
 that chain's Q&A history
@@ -204,7 +205,7 @@ WHEN a chain is first surfaced in the UI
 THE SYSTEM SHALL display a name for it derived from the chain's root
 conversation title
 
-WHEN the user invokes a name-edit action on the chain page header
+WHEN the user invokes a name-edit action on the conversation header for that lineage
 THE SYSTEM SHALL allow inline editing of the chain name and persist
 the new value when the user commits (Enter, blur, or explicit confirm)
 
@@ -213,8 +214,8 @@ typing it inline (above) or by invoking a regenerate action that derives
 a name from the chain's member content (REQ-CHN-010)
 
 THE SYSTEM SHALL display the user-set name (when present) consistently
-in every place the chain is identified — sidebar header, chain page
-header, and any other UI surface that names the chain
+in every place the lineage is identified — sidebar header, conversation
+header, and any other UI surface that names it
 
 **Rationale:** The chain is going to be a recognizable visual entity in
 the sidebar. Names are the hook users remember and search for. A
@@ -225,33 +226,34 @@ configurable object.
 
 ---
 
-### REQ-CHN-008: Chain Page Surfaces the Work Identity Alongside Runtime Resources
+### REQ-CHN-008: Unified Conversation Surface Shows Work Identity Alongside Runtime Resources
 
-The chain page already carries a **work-scope dock** showing the live
-runtime resources of the chain's scope — backgrounded bash, tmux, browser
-(`specs/work-scope-ui/` REQ-WSUI-009, keyed by the chain root's single
-`work_scope_key`). That dock answers "what is *running* on this work right
-now." It does not answer "what *unit of work* is this" — the worktree,
-branch, task, and pull request the chain is driving. REQ-CHN-008 adds
-that second, complementary facet to the chain page's work-scope surface.
-The two are different views of one `WorkScope`: runtime resources (the
-existing dock) and work identity + PR health (this requirement). The
-`WorkScope` owns resources; the durable root conversation owns Open/History lifecycle.
+The unified conversation surface already carries a **work-scope panel**
+showing the live runtime resources of the conversation's scope —
+backgrounded bash, tmux, browser (`specs/work-scope-ui/` REQ-WSUI-009,
+keyed by the latest live owner's `work_scope_key`). That panel answers
+"what is *running* on this work right now." It does not answer "what
+*unit of work* is this" — the worktree, current branch, task context,
+and pull request Phoenix is observing. REQ-CHN-008 adds that second,
+complementary facet to the same unified conversation surface. The two are
+different views of one `WorkScope`: runtime resources (the existing
+panel) and work identity + PR health (this requirement). The `WorkScope`
+owns resources; the durable root conversation owns Open/History lifecycle.
 
-WHEN the chain page is displayed
-THE SYSTEM SHALL surface, for the chain's work scope, its **work
-identity** — worktree path, branch, base branch, and the task (id and
-title) when the chain is doing Managed work — and its **pull-request
-health** when an associated PR exists: `display_state` (open / draft /
-merged / closed), checks, and feedback-freshness signal
+WHEN the unified conversation surface is displayed
+THE SYSTEM SHALL surface, for the live work scope, its **work
+identity** — worktree path, current branch, base/default branch context,
+and any associated task context — and its **pull-request health** when an
+associated PR exists: `display_state` (open / draft / merged / closed),
+checks, and feedback-freshness signal
 
 THE SYSTEM SHALL address this through the **same single `work_scope_key`**
-the runtime-resource dock uses (the chain root's scope; `specs/work-scope-ui/`
-REQ-WSUI-009), not by fanning out per member — a chain's members share one
-work scope, and at most one live conversation owns that scope at a time (`specs/bedrock/`
-REQ-BED-030; `specs/projects/` REQ-PROJ-WS-001), so one scope key is complete
+the runtime-resource panel uses, not by fanning out per continuation
+member — at most one live conversation row owns that scope at a time
+(`specs/bedrock/` REQ-BED-030; `specs/projects/` REQ-PROJ-WS-001), so one
+scope key is complete
 
-THE work identity SHALL be sourced from the members' `ConvMode` git
+THE work identity SHALL be sourced from the live conversation's Git-backed
 metadata, and the PR `display_state` / checks / feedback-freshness SHALL
 be sourced from the existing **PR-status / feedback pipeline** that drives
 the StateBar (work-lifecycle REQ-WL-003, pr-association REQ-PRA-001/REQ-PRA-002) — not from the PR
@@ -259,30 +261,24 @@ association record alone (which carries PR identity and state but not live
 checks or freshness). This facet SHALL NOT be folded into
 `WorkScopeInventory`, whose contract is a full-snapshot read-projection
 over the in-memory runtime registries (`specs/work-scope-ui/`
-REQ-WSUI-001); externally-polled PR state and durable git metadata do not
+REQ-WSUI-001); externally-polled PR state and durable Git metadata do not
 belong in that registry snapshot.
 
-WHEN the chain has no Git-backed work scope (e.g. a chat-only Direct
-conversation lineage with no worktree)
+WHEN the conversation has no Git-backed work scope
 THE SYSTEM SHALL indicate the absence of a Git-backed work scope rather than
 rendering empty worktree/branch/PR fields
 
-**Rationale:** The member list answers "what conversations happened"; the
-runtime-resource dock answers "what is running"; neither answers "what is
-this chain *for*." The worktree / branch / task / PR is the through-line
-that makes the chain a unit of work rather than a list of transcripts.
-Reusing the dock's single-scope-key model (rather than inventing a
-per-member aggregation) keeps the chain page's two work-scope facets
-addressed the same way and avoids the divergence a fan-out would invite.
-Keeping PR/git data out of `WorkScopeInventory` respects that
+**Rationale:** The transcript list answers "what work happened"; the
+runtime-resource panel answers "what is running"; neither answers "what
+is this conversation working through right now." The worktree / branch /
+task / PR context is the through-line that makes the unified surface feel
+like one live workstream rather than only a list of transcript segments.
+Reusing the panel's single-scope-key model keeps the two work-scope
+facets addressed the same way and avoids the divergence a fan-out would
+invite. Keeping PR/Git data out of `WorkScopeInventory` respects that
 projection's deliberate scope (in-memory registries, full-snapshot push
 on registry change) — PR state changes are not registry events, so they
-ride the PR-status pipeline that already models them. Keeping the chain
-concept while surfacing its work identity — rather than renaming the
-chain to a "work scope" — is deliberate: continuation lineage and
-resource ownership are distinct. The live conversation in a lineage may transfer
-ownership of the same `WorkScope` over time, so the correspondence is a
-strong default, not an invariant to hard-code.
+ride the PR-status pipeline that already models them.
 
 ---
 

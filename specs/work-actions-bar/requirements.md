@@ -69,13 +69,11 @@ THE SYSTEM SHALL organize available work actions into three logical zones:
   link rides alongside so an open PR offers both "address the feedback" and "go merge it"
   at once. This secondary is never a glowing primary (REQ-WAB-003).
 
-**FINISH zone** — terminal verbs:
-- `Clean up` — calls `mark-merged`. Its git effects (worktree deletion, mode-dependent branch
-  disposition) are owned by `work-lifecycle` REQ-WL-002.
-- `Abandon` — initiates the abandon flow: a diff snapshot and a confirmation dialog precede
-  the same mode-dependent git effects, per `work-lifecycle` REQ-WL-001.
-- One of the two terminal verbs may be suppressed in specific `WorkDisposition` cases
-  (REQ-WAB-004).
+**FINISH zone** — terminal guidance:
+- `Close conversation` — initiates the single Close flow for the conversation. Its
+  cancellation, loss-inspection, and resource-release behavior is owned by `work-lifecycle`.
+- The action bar may pair Close with explanatory notes about why it is or is not the right
+  next step in a specific `WorkDisposition` case (REQ-WAB-004).
 
 WHEN the conversation is presented in a narrow mobile viewport
 THE SYSTEM SHALL replace the persistent multi-zone action bar with one thin horizontally scrollable
@@ -114,11 +112,11 @@ surface — or, in the continuation case, no primary at all.
 
 WHEN `WorkDisposition` produces a RESOLVE verb (idle phase only), that verb is the primary.
 WHEN `WorkDisposition` suppresses RESOLVE (stuck phases) or there is no push-forward action
-(merged / closed / no-PR / gh-unavailable), the primary collapses to a FINISH verb
-(`Clean up` or `Abandon`).
+(merged / closed / no-PR / gh-unavailable), the primary may collapse to the single FINISH
+verb `Close conversation` when closing is honest for that state.
 WHEN dirty no-PR work has no honest PR-creation link, `View Diff` in the REVIEW zone is the
-primary so the user reviews the work before any terminal cleanup.
-WHEN `WorkDisposition` is `continued`, there is no primary verb and all terminal verbs are
+primary so the user reviews the work before any terminal close decision.
+WHEN `WorkDisposition` is `continued`, there is no primary verb and terminal actions are
 suppressed (REQ-WAB-009).
 
 A RESOLVE disposition may additionally carry a single **secondary** link-out (the
@@ -127,21 +125,21 @@ the primary and never glows; it exists only alongside an `address_feedback` prim
 not violate the single-primary rule: there is still exactly one glowing button.
 
 In the active-PR rail, the expanded region SHALL emphasize exactly one hero action. Supporting
-review, link-out, cleanup, and abandon controls SHALL remain visually secondary. Cleanup SHALL
+review, link-out, and Close conversation guidance SHALL remain visually secondary. Close SHALL
 never be inferred as the rail's hero action from repository structure alone; when legal, it remains
 available only among supporting context actions.
 
 **Design:** A single glowing button is the user's answer to "what do I do next?" The
-presentation carries the primary as a single slot selector (REVIEW / RESOLVE / Clean up /
-Abandon / none), so two glowing buttons are structurally unrepresentable rather than forbidden
-by a runtime check. The secondary link is a separate, non-primary slot — present-or-absent,
+presentation carries the primary as a single slot selector (REVIEW / RESOLVE / Close /
+none), so two glowing buttons are structurally unrepresentable rather than forbidden by a
+runtime check. The secondary link is a separate, non-primary slot — present-or-absent,
 never glowing — so it cannot collapse into a second primary.
 
 ---
 
 ### REQ-WAB-004: WorkDisposition Derivation
 
-THE SYSTEM SHALL derive a single `WorkDisposition` value from the conversation's phase, mode,
+THE SYSTEM SHALL derive a single `WorkDisposition` value from the conversation's phase,
 `continued_in_conv_id`, the explicit active PR selected by `pr-association`, `PrStatusView`
 (from `pr-association`, including its `check_state` and `feedback_freshness` fields), and
 `PrAutoFixAffordance` (from `pr-association`). The `WorkDisposition` selects the primary verb and
@@ -153,16 +151,16 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | # | Condition | WorkDisposition | Primary verb | Secondary / suppressed |
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
-| 2 | phase ∈ {`error`, `recoverable_continuation_failure`} | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
-| 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge on GitHub #N ↗` secondary when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
-| 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
-| 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
-| 6 | idle, PR merged | `clean_up_merged` | **Clean up** (FINISH) | — |
-| 7 | idle, PR closed unmerged | `pr_closed` | **Abandon** (FINISH) | Clean up suppressed; note |
-| 8a | idle, no PR found, refresh ≠ unavailable, work-change state = clean | `no_pr_clean` | **Clean up** (FINISH) | — |
-| 8b | idle, no PR found, refresh ≠ unavailable, work-change state = dirty and PR-ready | `no_pr_create_pr` | **Create PR on GitHub ↗** (RESOLVE, GitHub link) | Clean up suppressed; note |
-| 8c | idle, no PR found, refresh ≠ unavailable, work-change state dirty-needs-review / loading / unavailable | `no_pr_review` | **View Diff** (REVIEW) | Clean up suppressed; note |
-| 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Clean up** (FINISH) | warning note; single click |
+| 2 | phase ∈ {`error`, `recoverable_continuation_failure`} | `stuck` | **Close conversation** (FINISH) when close is legal | RESOLVE suppressed; review context may explain why recovery failed |
+| 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | Close suppressed; `Merge on GitHub #N ↗` secondary when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
+| 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | Close suppressed |
+| 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Close suppressed |
+| 6 | idle, PR merged | `ready_to_close_after_merge` | **Close conversation** (FINISH) | — |
+| 7 | idle, PR closed unmerged | `ready_to_close_closed_pr` | **Close conversation** (FINISH) | note explains PR closed without merge |
+| 8a | idle, no PR found, refresh ≠ unavailable, work-change state = clean | `no_pr_clean` | **Close conversation** (FINISH) | — |
+| 8b | idle, no PR found, refresh ≠ unavailable, work-change state = dirty and PR-ready | `no_pr_create_pr` | **Create PR on GitHub ↗** (RESOLVE, GitHub link) | Close suppressed; note |
+| 8c | idle, no PR found, refresh ≠ unavailable, work-change state dirty-needs-review / loading / unavailable | `no_pr_review` | **View Diff** (REVIEW) | Close suppressed; note |
+| 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Close conversation** (FINISH) | warning note; single click |
 
 The **Address feedback** affordance is enabled when Phoenix can post an auto-fix message to
 the conversation: the conversation has a live message channel and the PR is open
@@ -175,16 +173,16 @@ active PR supplied by `pr-association`. The bar SHALL NOT silently choose among 
 associated actionable PRs on its own, and SHALL NOT treat any compatibility singular primary-PR
 projection as authority over an explicit pinned or inferred active selection.
 
-The **FINISH sub-table** is a single shared selector (used by `stuck` and by the idle FINISH
-rows), total over PR state:
+The **FINISH guidance table** is a single shared selector (used by `stuck` and by the idle
+FINISH rows), total over PR state:
 
-| PR state | FINISH primary | Inline note (stuck path) |
+| PR state | FINISH primary | Inline note |
 |---|---|---|
-| merged | `Clean up` | — |
-| closed unmerged | `Abandon` | — |
-| open / draft | `Abandon` | "PR #N still open — merge on GitHub, or abandon." |
-| no PR found (refresh ok) | `Clean up` | — |
-| gh unavailable | `Clean up` | "gh unavailable — manual cleanup." |
+| merged | `Close conversation` | — |
+| closed unmerged | `Close conversation` | "PR #N closed without merge — close when you're done with this thread of work." |
+| open / draft | none | "PR #N still open — resolve on GitHub or review the diff before closing." |
+| no PR found (refresh ok) | `Close conversation` | — |
+| gh unavailable | `Close conversation` | "GitHub status unavailable — close only if you're satisfied from local review." |
 
 Rows 3–5 together cover **every** idle open-or-draft PR. Address feedback is the primary on
 every reachable open PR — not gated on failing checks, refresh availability, or a prior
@@ -201,7 +199,12 @@ labelled "Merge on GitHub"; a non-passing open PR (or any draft) is labelled "Op
 bar never promises a merge the checks do not support. Both labels carry the ↗ external-navigation
 glyph and open GitHub in a new tab — neither performs the merge in Phoenix (REQ-WAB-010).
 
-Rows 8a–8c split no-PR work by the typed work-change summary. Clean no-PR work is terminal and may clean up. Dirty no-PR work is not terminal: if the local committed work is pushed to a matching GitHub remote branch, the bar may offer an honest `Create PR on GitHub ↗` link; otherwise `View Diff` is the safe primary. Uncommitted changes, unpushed commits, remote divergence, unknown remote state, and non-GitHub remotes all route to `View Diff`. The bar never makes commit, push, merge, or terminal automation the hero.
+Rows 8a–8c split no-PR work by the typed work-change summary. Clean no-PR work may honestly
+close. Dirty no-PR work is not terminal: if the local committed work is pushed to a matching
+GitHub remote branch, the bar may offer an honest `Create PR on GitHub ↗` link; otherwise
+`View Diff` is the safe primary. Uncommitted changes, unpushed commits, remote divergence,
+unknown remote state, and non-GitHub remotes all route to `View Diff`. The bar never makes
+commit, push, merge, or terminal automation the hero.
 
 bar. The bar re-derives the disposition on every render. The `check_state` and
 `feedback_freshness` signals are read as typed fields on `PrStatusView`, never reconstructed
@@ -242,32 +245,22 @@ the appropriate REVIEW verb.
 
 ### REQ-WAB-007: Terminal Verb Tooltips
 
-EACH terminal verb (`Clean up`, `Abandon`) SHALL carry an info-icon (ⓘ) tooltip that conveys
-the verb's intent AND the key behavioral difference between the two verbs: Abandon captures a
-diff snapshot first and requires a confirmation dialog before any destructive git operation;
-Clean up does neither.
+The terminal action `Close conversation` SHALL carry an info-icon (ⓘ) tooltip that conveys
+its intent and its key safety behavior: Phoenix releases the conversation's owned worktree
+resources, preserves transcript history as read-only History, and does not mutate branches or
+pull requests.
 
-The tooltip copy SHALL be mode-sensitive, because branch disposition depends on mode (per
-`work-lifecycle` REQ-WL-002: Work mode deletes the managed task branch, Branch mode keeps the
-user's branch). Tooltip text:
+The tooltip copy SHALL explain that Close may require confirmation when active work must be
+stopped or when removing the worktree would discard local state. Tooltip text:
 
-**Clean up (Work mode):** "Mark as merged. Deletes the worktree and task branch. No
-confirmation — use Abandon if you want a diff snapshot before deletion."
+**Close conversation:** "End active work on this conversation. Phoenix may ask you to confirm
+stopping running work or discarding uncommitted workspace-only changes. Moves the conversation
+to History and leaves branches and pull requests untouched."
 
-**Clean up (Branch mode):** "Mark as merged. Deletes the worktree; your branch is kept. No
-confirmation — use Abandon if you want a diff snapshot before deletion."
-
-**Abandon (Work mode):** "Capture a diff snapshot, then delete the worktree and task branch.
-Requires confirmation."
-
-**Abandon (Branch mode):** "Capture a diff snapshot and delete the worktree; your branch is
-kept. Requires confirmation."
-
-**Design:** For a given mode, Clean up and Abandon produce the **same** git side effects —
-worktree deleted, task branch deleted (Work) or kept (Branch) — per `work-lifecycle`
-REQ-WL-001/002. The real differences are Abandon's diff snapshot and its confirmation dialog.
-The tooltips convey intent and that snapshot/confirm difference; they must not pretend the git
-effects differ between the two verbs.
+**Design:** The action bar no longer distinguishes separate terminal verbs. The meaningful
+behavioral split is between push-forward actions (REVIEW / RESOLVE) and the one Close flow,
+whose confirmations depend on runtime state and loss inspection rather than on separate
+verbs with different repository implications.
 
 ---
 
@@ -288,11 +281,12 @@ bar verb.
 
 A button that arms itself on the first click and executes only on the second violates the
 principle that each button has one fixed meaning. Confirmation for a destructive action is
-handled by a dialog (Abandon), not by mutating a button's behavior across clicks. The
-`gh_unavailable` disposition (REQ-WAB-004) makes this concrete: when gh cannot confirm a PR
-and there is no PR identity, `Clean up` is an enabled, single-click primary with a note
-explaining that cleanup proceeds without gh confirmation — not a disabled "waiting for PR
-merge" control, and not a two-step enable-then-confirm toggle.
+handled by a dialog (Close conversation when confirmation is required), not by mutating a
+button's behavior across clicks. The `gh_unavailable` disposition (REQ-WAB-004) makes this
+concrete: when GitHub cannot confirm a PR and there is no PR identity, `Close conversation`
+may still be an enabled primary with a note explaining that the decision proceeds without
+GitHub confirmation — not a disabled "waiting for PR merge" control, and not a two-step
+enable-then-confirm toggle.
 
 ---
 

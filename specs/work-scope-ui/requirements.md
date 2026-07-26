@@ -189,9 +189,10 @@ THE endpoint SHALL follow the existing `get_conversation` handler shape (path
 parameter, `State(AppState)`, `Json<…>` response).
 
 **Rationale:** The conversation page needs the inventory at first paint, before
-any push event has fired; the chain page needs it as its only data source
-(REQ-WSUI-009). A plain JSON GET keyed by `stable_key()` serves both and is
-also the natural surface for any future non-UI client (REQ-WSUI-011).
+any push event has fired; the unified conversation surface also needs a direct
+pull path before live updates arrive. A plain JSON GET keyed by `stable_key()`
+serves both and is also the natural surface for any future non-UI client
+(REQ-WSUI-011).
 
 ---
 
@@ -265,31 +266,23 @@ conversation→scope resolution the browser lifecycle bridge already performs
 
 ---
 
-### REQ-WSUI-009: Chain Page Active-Member Scope Query
+### REQ-WSUI-009: Unified Conversation Surface Resolves the Live Scope Once
 
-WHEN the chain page renders the work-scope panel
-THE SYSTEM SHALL query the one `scope_key` of the chain's leaf member — the
-last member in chain order — falling back to the root when the chain has a
-single member, and render a standalone right-adjacent dock that shares the
-per-resource row vocabulary of the conversation page's section (REQ-WSUI-010)
+WHEN the unified conversation surface renders the work-scope panel for a
+conversation that spans continuation members
+THE SYSTEM SHALL resolve the one live `scope_key` from the latest execution row
+that currently owns the `WorkScope`
+AND SHALL render one work-scope panel that shares the per-resource row
+vocabulary of the conversation page's section (REQ-WSUI-010)
 AND SHALL NOT aggregate per-member inventories.
 
-**Rationale:** A chain's members do not all share one scope. Worktree, Branch,
-and Work chains share a single worktree scope across every member, but Direct
-continuation chains resolve each member to a distinct
-`WorkScope::Conversation(<member id>)` — so the leaf's live resources live under
-its own scope, not the root's. The leaf is identified by chain order (the last
-member), not by the `latest` recency label: `latest` is the max-`updated_at`
-non-root member, which can be an intermediate, so it is not a reliable leaf
-pointer. Querying the leaf is correct for both kinds: for shared-worktree chains
-the leaf's scope *is* the shared worktree scope, and for Direct chains it is the
-leaf's own conversation scope where the running resources actually reside.
-Querying the root would show an empty inventory for a Direct chain whose work is
-on the leaf. A single query against the leaf's `WorkScope` key is complete; a
-hypothetical fan-out across every member and merge would add divergence risk
-for no gain. The chain page has no left file-explorer panel to host a section,
-so it uses a standalone collapsible dock; both surfaces render the same
-resource rows from shared code.
+**Rationale:** A unified conversation can contain multiple durable transcript
+rows, but only one latest execution row owns the live `WorkScope`. Querying
+that one owner is complete and avoids inventing a per-member merge layer. The
+older continuation members remain visible transcript history; they are not
+independent runtime-scope surfaces. Resolving the live owner once keeps the
+work-scope panel aligned with the single-surface conversation model and avoids
+showing an empty or stale inventory from an earlier member.
 
 ---
 

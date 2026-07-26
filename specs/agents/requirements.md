@@ -190,20 +190,21 @@ ordering is what makes the cache hold.
 
 ---
 
-### REQ-AG-009: Capability from Mode, Not Definition
+### REQ-AG-009: Capability from Spawn Authority, Not Definition
 
-THE SYSTEM SHALL derive a sub-agent's tool registry from its resolved mode
-(Explore or Work), independent of which agent definition produced it
+THE SYSTEM SHALL derive a sub-agent's tool registry from the spawn request's
+resolved execution authority (read-only or write-capable), independent of which
+agent definition produced it
 
 WHEN an agent definition declares a `tools` field
 THE SYSTEM SHALL preserve it during parsing without acting on it
 
-**Rationale:** Tool capability is governed solely by the Explore/Work mode
-registries (`for_subagent_explore` / `for_subagent_work`); a named agent
-changes persona and defaults, never which tools exist. Keeping capability
-single-sourced in mode means there is exactly one registry-construction path to
-reason about. The `tools` field is part of the on-disk format and is parsed and
-preserved so the format can carry a capability declaration, but it is not part
-of this contract: the resolved registry is a function of mode alone. (A
-capability-restriction pass that consults `tools` is tracked as follow-up work,
-not described here.)
+**Rationale:** Tool capability is governed by the parent's attached `WorkScope`
+and the spawn request's read-only versus write-capable authority, not by a
+named agent definition. A named agent changes persona and defaults, never which
+tools exist. Keeping capability single-sourced in spawn authority means there
+is exactly one registry-construction path to reason about. The `tools` field is
+part of the on-disk format and is parsed and preserved so the format can carry
+a capability declaration, but it is not part of this contract: the resolved
+registry is a function of spawn authority alone. (A capability-restriction pass
+that consults `tools` is follow-up work, not described here.)

@@ -118,3 +118,51 @@ Append a completion note to this task body with these headings:
 
 **Commit**
 - `e9f888c9851e659aa27c80187ccce7c71ec8cbc8`
+
+
+## Review correction round 3
+
+**Files changed**
+- `specs/agents/requirements.md`
+- `specs/ask-user-question/requirements.md`
+- `specs/bash/requirements.md`
+- `specs/bedrock/requirements.md`
+- `specs/chains/requirements.md`
+- `specs/patch/requirements.md`
+- `specs/subagents/requirements.md`
+- `specs/tasks-ui/requirements.md`
+- `specs/tmux-integration/requirements.md`
+- `specs/wake-contracts/requirements.md`
+- `specs/work-actions-bar/requirements.md`
+- `specs/work-scope-ui/requirements.md`
+- `specs/work-lifecycle/requirements.md`
+
+**Decisions captured**
+- Reclassified remaining repository-wide legacy-term hits into three buckets: rewritten contradictions, retained compatibility-only deprecations, and retained unrelated/internal terminology only when not part of the product taxonomy.
+- Rewrote chain requirements away from a dedicated chain page and onto the unified conversation surface while preserving lineage Q&A, naming, and work-scope value.
+- Reframed sub-agent, bash, patch, ask-user-question, and agent-capability requirements around execution authority / attached `WorkScope` / chat-only distinctions instead of product Work/Branch/Managed modes.
+- Rewrote the work-actions matrix around REVIEW / RESOLVE / Close guidance, preserving PR-driven user guidance while removing Clean up / Abandon / Mark merged product actions.
+- Removed normative task/conversation 1:1 ownership claims from tasks UI while keeping “current task” recognition and bidirectional navigation.
+- Rewrote destructive wake/tmux lifecycle language to reference Close conversation and permanent Delete instead of Archive / abandon / mark-merged.
+- Reworked bedrock approval, continuation, close, and execution-authority requirements to avoid product mode taxonomy and branch-lifecycle mutation, while preserving read-only planning, write-capable work-scope execution, and chat-only behavior.
+
+**Retained matches and rationale**
+- `specs/work-lifecycle/requirements.md:23` — retained intentionally as an explicit legacy compatibility statement for deprecated `Abandon` / `Mark as merged` inputs; it forbids them as current product actions rather than reintroducing them.
+
+**Validation**
+- Repository-wide sweep command reviewed and resolved:
+  - `rg -n 'chain page|Abandon|Mark as merged|Archive|auto-archive|Work mode|Branch mode|Managed mode|Clean up|project conversation' specs --glob requirements.md`
+  - Final result: only the intentional legacy compatibility note in `specs/work-lifecycle/requirements.md:23` remains.
+- Additional semantic zero-unexplained-hit spot checks:
+  - `rg -n 'chain page|Clean up|Abandon|Mark as merged|Archive|auto-archive|Work mode|Branch mode|Managed mode|project conversation' specs --glob requirements.md`
+  - `rg -n 'Close conversation|History|chat-only|WorkScope|read-only planning authority|write capability' specs/{bedrock,chains,work-actions-bar,work-scope-ui,patch,bash,subagents,agents,ask-user-question,tasks-ui,tmux-integration,wake-contracts,work-lifecycle}/requirements.md`
+- AUTHORING / required checks run successfully:
+  - `./dev.py check --lanes spec-shape`
+  - `./dev.py tasks validate`
+
+**Review corrections**
+- Independent review flagged that the reopened phase needed a repository-wide sweep beyond the earlier file-scoped corrections.
+- This pass extended the edits across every current grep hit, fixed the last chain-page and terminal-verb references, and documented the one retained compatibility hit explicitly.
+
+**Commit**
+- Pending final commit for this correction round.

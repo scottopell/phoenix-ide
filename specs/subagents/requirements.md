@@ -38,9 +38,9 @@ THE SYSTEM SHALL reject the call with an error
 
 **Rationale:** Users benefit from parallel task execution for code review,
 exploration, and divide-and-conquer problem solving. Spawning sub-agents
-keeps the parent's context clean for synthesis. Mode defaults to Explore
-(cheap, read-only) to minimize cost unless the LLM explicitly opts into
-Work mode.
+keeps the parent's context clean for synthesis. The default authority is
+read-only (cheap, safe) unless the LLM explicitly requests write capability
+against the parent's attached `WorkScope`.
 
 **Dependencies:** REQ-BED-008
 
@@ -139,9 +139,9 @@ sub-agent work completes or fails within a bounded time.
 (`fast`/`capable`) is replaced by mode-based defaults with optional
 explicit model override:
 
-- Explore mode defaults to the cheapest available model for the parent's
-  provider family.
-- Work mode inherits the parent's model.
+- Read-only sub-agent execution defaults to the cheapest available model for the
+  parent's provider family.
+- Write-capable sub-agent execution inherits the parent's model.
 - The `model` field on the task spec allows explicit override with any
   registry model id; unknown ids are rejected at spawn time.
 - The tool schema exposes the deployment's registered model ids from the same

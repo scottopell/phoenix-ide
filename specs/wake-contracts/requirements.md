@@ -190,10 +190,10 @@ expose the pending wake through wake-specific presentation detail, capability
 guards, and lifecycle conflict checks driven directly by the pending-wake
 lifecycle
 
-Archive, hard-delete, abandon, mark-merged, and any equivalent destructive
-lifecycle operation SHALL query pending wake contracts, unconsumed wake
-observations, and owed runtime acceptances directly and SHALL reject or serialize
-the lifecycle transition until those obligations are resolved
+Close conversation, permanent Delete, and any equivalent destructive lifecycle
+operation SHALL query pending wake contracts, unconsumed wake observations, and
+owed runtime acceptances directly and SHALL reject or serialize the lifecycle
+transition until those obligations are resolved
 
 **Rationale:** Wake waits are runtime-owned obligations, not proof that the LLM
 is actively executing. Fabricating `is_busy()` would create a duplicate semantic
