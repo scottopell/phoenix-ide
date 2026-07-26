@@ -493,10 +493,20 @@ already owned by the profile, including `accepted_turn.workflow_id` and the curr
 workflow generation fence, and SHALL preserve any committed `canonical_delivery_id`
 identity when present.
 
+The settlement path SHALL target only the latest-row accepted turn chosen by the owning
+conversation topology, while still permitting settlement authority to fan into existing
+typed child, shared-`WorkScope`, and wake-cancellation machinery already bound to that
+accepted turn.
+
 The settlement path SHALL reuse the profile's existing typed cancellation and recovery
 machinery. A stale-generation or stale-identity settlement attempt SHALL NOT mutate the
 current accepted turn, and successful settlement SHALL release runtime ownership without
 creating a duplicate transcript event or a second lifecycle-specific cancellation state.
+
+Once ownership release for that exact accepted turn has begun, a user-visible cancel of
+Close MAY stop further retirement progression but SHALL NOT require or invent a second
+settlement cancellation path; the original settlement completion remains the release
+boundary.
 
 ### REQ-DWF-CHAT-011: Crash, Race, and Mutable-Input Verification
 
@@ -635,9 +645,14 @@ until pending waits are explicitly resolved, with the guard serialized against
 new registration.
 
 Close-driven settlement SHALL invoke the wake profile's existing explicit
-cancellation authority for each pending binding and wait for the resulting typed
-terminal receipt/canonical-delivery settlement rather than inventing a separate
-wake-close state machine.
+cancellation authority for each pending binding associated with the exact latest-row
+execution target and SHALL wait for the resulting typed terminal receipt/canonical-
+delivery settlement rather than inventing a separate wake-close state machine.
+
+This wake settlement authority is additive to ordinary direct-turn settlement rather
+than a second close-owned source of truth: shared `WorkScope`, sub-agent, and wake work
+are settled through the already typed child or wake boundaries of that same latest-row
+execution target.
 
 ### REQ-DWF-WAKE-005: Continuation Transfer
 
