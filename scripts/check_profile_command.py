@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Measure one command's consumed CPU without changing its output streams.
+"""Dependency-free CPU window profiling helpers for Python check/test commands.
 
-This is intentionally dependency-free: `dev.py check --profile-work` inserts it
-between the check harness and each step.  `wait4` reports CPU charged to the
-exited command, including descendants that command waited for.
+Preserves the profiled command's normal stdout/stderr while writing versioned
+JSONL records when explicitly asked.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ import uuid
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+PROVENANCE = "windowed_process"
 
 
 def _write_atomic(path: Path, value: dict) -> None:
@@ -36,6 +36,66 @@ def _write_atomic(path: Path, value: dict) -> None:
             pass
 
 
+def _append_jsonl(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output:
+        json.dump(value, output, sort_keys=True)
+        output.write("\n")
+
+
+def _identity_suffix(identity: str) -> str:
+    safe = []
+    for char in identity:
+        safe.append(char if char.isalnum() or char in "._-" else "-")
+    suffix = "".join(safe).strip("-")
+    return suffix or "record"
+
+
+def _record(
+    *,
+    identity: str,
+    started_wall_ns: int,
+    started_monotonic_ns: int,
+    finished_monotonic_ns: int,
+    user_cpu_ms: float,
+    system_cpu_ms: float,
+    extra: dict | None = None,
+) -> dict:
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "provenance": PROVENANCE,
+        "identity": identity,
+        "started_unix_ns": started_wall_ns,
+        "wall_ms": (finished_monotonic_ns - started_monotonic_ns) / 1_000_000.0,
+        "user_cpu_ms": max(0.0, user_cpu_ms),
+        "system_cpu_ms": max(0.0, system_cpu_ms),
+    }
+    record["total_cpu_ms"] = record["user_cpu_ms"] + record["system_cpu_ms"]
+    if extra:
+        record.update(extra)
+    return record
+
+
+def _write_record(
+    *,
+    record: dict,
+    output: Path | None,
+    output_dir: Path | None,
+    output_jsonl: Path | None,
+) -> Path | None:
+    if output is not None:
+        _write_atomic(output, record)
+        return output
+    if output_dir is not None:
+        path = output_dir / f"process-{os.getpid()}-{uuid.uuid4().hex}-{_identity_suffix(record['identity'])}.json"
+        _write_atomic(path, record)
+        return path
+    if output_jsonl is not None:
+        _append_jsonl(output_jsonl, record)
+        return output_jsonl
+    return None
+
+
 def _forward_signal(child_pid: int, signum: int) -> None:
     try:
         os.kill(child_pid, signum)
@@ -43,7 +103,13 @@ def _forward_signal(child_pid: int, signum: int) -> None:
         pass
 
 
-def measure(command: list[str], output: Path | None = None, output_dir: Path | None = None) -> int:
+def measure(
+    command: list[str],
+    output: Path | None = None,
+    output_dir: Path | None = None,
+    output_jsonl: Path | None = None,
+    identity: str | None = None,
+) -> int:
     if not command:
         raise ValueError("missing command after --")
 
@@ -70,8 +136,6 @@ def measure(command: list[str], output: Path | None = None, output_dir: Path | N
             signal.signal(signum, handler)
 
     finished_monotonic_ns = time.monotonic_ns()
-    user_cpu_ms = usage.ru_utime * 1000.0
-    system_cpu_ms = usage.ru_stime * 1000.0
     if os.WIFEXITED(status):
         returncode = os.WEXITSTATUS(status)
     elif os.WIFSIGNALED(status):
@@ -79,25 +143,24 @@ def measure(command: list[str], output: Path | None = None, output_dir: Path | N
     else:
         returncode = 1
 
-    if output is None:
-        assert output_dir is not None
-        output = output_dir / f"process-{os.getpid()}-{uuid.uuid4().hex}.json"
-    _write_atomic(output, {
-        "schema_version": SCHEMA_VERSION,
-        "provenance": "exact_process_tree",
-        "command": command,
-        "pid": child_pid,
-        "started_unix_ns": started_wall_ns,
-        "duration_ms": (finished_monotonic_ns - started_monotonic_ns) / 1_000_000.0,
-        "user_cpu_ms": user_cpu_ms,
-        "system_cpu_ms": system_cpu_ms,
-        "cpu_ms": user_cpu_ms + system_cpu_ms,
-        # wait4 is exact for the command and descendants it reaped. A daemonized
-        # descendant is outside that accounting boundary and cannot be proven
-        # closed portably from this wrapper.
-        "tree_closure": "command_reaped_descendants_unverified",
-        "returncode": returncode,
-    })
+    record = _record(
+        identity=identity or f"command:{command[0]}",
+        started_wall_ns=started_wall_ns,
+        started_monotonic_ns=started_monotonic_ns,
+        finished_monotonic_ns=finished_monotonic_ns,
+        user_cpu_ms=usage.ru_utime * 1000.0,
+        system_cpu_ms=usage.ru_stime * 1000.0,
+        extra={
+            "command": command,
+            "pid": child_pid,
+            "returncode": returncode,
+            # wait4 is exact for the command and descendants it reaped. A daemonized
+            # descendant is outside that accounting boundary and cannot be proven
+            # closed portably from this wrapper.
+            "tree_closure": "command_reaped_descendants_unverified",
+        },
+    )
+    _write_record(record=record, output=output, output_dir=output_dir, output_jsonl=output_jsonl)
     return returncode if returncode >= 0 else 128 - returncode
 
 
@@ -106,6 +169,8 @@ def main(argv: list[str] | None = None) -> int:
     destination = parser.add_mutually_exclusive_group(required=True)
     destination.add_argument("--output", type=Path)
     destination.add_argument("--output-dir", type=Path)
+    destination.add_argument("--output-jsonl", type=Path)
+    parser.add_argument("--identity")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command
@@ -113,7 +178,13 @@ def main(argv: list[str] | None = None) -> int:
         command = command[1:]
     if not command:
         parser.error("missing command after --")
-    return measure(command, args.output, args.output_dir)
+    return measure(
+        command,
+        args.output,
+        args.output_dir,
+        args.output_jsonl,
+        args.identity,
+    )
 
 
 if __name__ == "__main__":

@@ -5003,7 +5003,15 @@ def cmd_check(
             with results_lock:
                 results.append(("spec shape", 0, elapsed, detail))
             reporter.step_done("spec-shape", "spec shape", 0, elapsed)
-            run_step("dev.py unit tests", [sys.executable, "-m", "unittest", "discover", "tests/devpy"])
+            unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
+            if profile_work and _CHECK_PROFILE is not None:
+                unittest_cmd = [
+                    sys.executable,
+                    str(ROOT / "scripts" / "python_unittest_profile.py"),
+                    "discover",
+                    "tests/devpy",
+                ]
+            run_step("dev.py unit tests", unittest_cmd)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
