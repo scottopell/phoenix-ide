@@ -6239,6 +6239,7 @@ mod tests {
         let mut retry = first_intent.clone();
         retry.contract_id = "contract-retry".to_string();
         retry.registering_tool_use_id = "tool-retry".to_string();
+        retry.registering_tool_round_id = "round-retry".to_string();
 
         assert!(matches!(
             repo.register_allocated(second, &retry, "fp-second", Timestamp(11))
