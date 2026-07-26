@@ -80,6 +80,12 @@ describe('derivePendingMessages', () => {
     expect(derivePendingMessages(queue, ['msg-1'])).toHaveLength(0);
   });
 
+  it('acceptance: target-scoped direct-turn echo removes the optimistic entry', () => {
+    const queue = [queued('msg-scoped', { conversationId: 'conv-a' })];
+    expect(derivePendingMessages(queue, ['conv-a:msg-scoped'])).toHaveLength(0);
+    expect(derivePendingMessages(queue, ['conv-b:msg-scoped'])).toHaveLength(1);
+  });
+
   // Acceptance criterion: "reload mid-send (message in queue, server has it)
   // → rendered once after rehydration".
   it('acceptance: rehydrated queue entry already echoed on server does not double-render', () => {

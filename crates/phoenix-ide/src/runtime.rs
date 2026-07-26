@@ -2787,7 +2787,7 @@ impl RuntimeManager {
 
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
-        let (mut initial_state, mut initial_state_updated_at, mut needs_auto_continue) =
+        let (initial_state, initial_state_updated_at, needs_auto_continue) =
             self.determine_resume_state(conversation_id).await?;
         let startup_creation_completion =
             if matches!(initial_state, ConvState::LlmRequesting { .. }) {
@@ -2819,22 +2819,6 @@ impl RuntimeManager {
         )
         .await?;
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
-            if loaded.materialized && matches!(initial_state, ConvState::Idle) {
-                let last_message_is_user = self
-                    .db
-                    .get_messages(conversation_id)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .last()
-                    .is_some_and(|message| {
-                        matches!(message.message_type, crate::db::MessageType::User)
-                    });
-                if last_message_is_user {
-                    initial_state = ConvState::LlmRequesting { attempt: 1 };
-                    initial_state_updated_at = Utc::now();
-                    needs_auto_continue = true;
-                }
-            }
             let recovered_terminal = if loaded.materialized {
                 match &initial_state {
                     ConvState::Idle | ConvState::HandedOff { .. } => {

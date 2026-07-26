@@ -2818,6 +2818,7 @@ where
     /// Updates state, drains sub-agent buffer if entering `AwaitingSubAgents`,
     /// dispatches effects. Returns any synchronously generated events
     /// (e.g., from `SpawnAgentsComplete`).
+    #[allow(clippy::too_many_lines)]
     async fn apply_transition_result(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
@@ -2831,6 +2832,7 @@ where
         // (specs/working-phase-visibility/ REQ-WPV-001). `persist_state_effect`
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
+        let old_state_updated_at = self.state_updated_at;
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
@@ -2981,6 +2983,15 @@ where
                     break;
                 }
             }
+        }
+
+        if self.direct_turn_materialization_aborted {
+            self.state = old_state;
+            self.state_updated_at = old_state_updated_at;
+            if let Some(tx) = &self.state_watcher {
+                let _ = tx.send(self.state.clone());
+            }
+            return Ok(Vec::new());
         }
 
         // Publish the final state to any live-state observer after all effects
@@ -8821,7 +8832,7 @@ mod authoritative_user_message_effect_tests {
             );
             assert_eq!(storage.get_current_state("conv-direct"), None);
             assert!(rt.llm_task_handle.is_none());
-            assert!(!matches!(rt.state, ConvState::Idle));
+            assert!(matches!(rt.state, ConvState::Idle));
             assert_no_broadcast(&mut rx);
         }
     }

@@ -19,7 +19,8 @@ use phoenix_workflow::{
 use sqlx::Row;
 
 use super::{
-    CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, LocalCodec, LocalEffectDecl,
+    CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, DeliveryResolutionDecision,
+    DeliveryResolutionPlan, LocalCodec, LocalEffectDecl,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +31,8 @@ enum TransactionCut {
 }
 
 const DIRECT_TURN_ACCEPTED_TRANSITION_ID: u64 = 1;
-const DIRECT_TURN_TERMINAL_TRANSITION_ID: u64 = 2;
+const DIRECT_TURN_MATERIALIZED_TRANSITION_ID: u64 = 2;
+const DIRECT_TURN_TERMINAL_TRANSITION_ID: u64 = 3;
 const DIRECT_TURN_EFFECT_ID: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -610,14 +612,18 @@ impl WorkflowRepository {
             )
         });
         let rows = sqlx::query(
-            "SELECT turn_id, workflow_id, conversation_id, prepared_fingerprint, prepared_payload
+            "SELECT durable_turns.turn_id, durable_turns.workflow_id,
+                    durable_turns.conversation_id, durable_turns.prepared_fingerprint,
+                    durable_turns.prepared_payload
              FROM durable_turns
+             JOIN conversations ON conversations.id = durable_turns.conversation_id
              WHERE disposition = 'Runtime'
+               AND conversations.archived = 0
                AND terminal_kind IS NULL
                AND canonical_message_id IS NULL
                AND workflow_id IS NOT NULL
-               AND (turn_id > ?1 OR (turn_id = ?1 AND workflow_id > ?2))
-             ORDER BY turn_id, workflow_id
+               AND (durable_turns.turn_id > ?1 OR (durable_turns.turn_id = ?1 AND durable_turns.workflow_id > ?2))
+             ORDER BY durable_turns.turn_id, durable_turns.workflow_id
              LIMIT ?3",
         )
         .bind(cursor_turn_id)
@@ -861,6 +867,45 @@ impl WorkflowRepository {
             )?;
             Some(existing)
         };
+        if matches!(step.outcome, TurnOutcome::Materialized { .. }) {
+            let snapshot = direct_turn_profile::DirectTurnSnapshot { turn_id: turn_id.0 };
+            let delivered = direct_turn_profile::DirectTurnReceiptEvent::Materialized {
+                canonical_message_id: canonical_message_id.0.clone(),
+            };
+            let event = direct_turn_profile::DirectTurnEvent::Delivered(delivered);
+            let event_codec = local_codec_owned(&direct_turn_profile::event_codec());
+            let snapshot_codec = local_codec_owned(&direct_turn_profile::snapshot_codec());
+            let event_payload = serde_json::to_vec(&event).map_err(|error| {
+                DbError::Serialization(format!("encode direct-turn delivered event: {error}"))
+            })?;
+            let snapshot_payload = serde_json::to_vec(&snapshot).map_err(|error| {
+                DbError::Serialization(format!("encode direct-turn snapshot: {error}"))
+            })?;
+            let outcome = tx
+                .resolve_deliveries_exact(DeliveryResolutionPlan {
+                    workflow_id: input.authority.workflow_id,
+                    expected_version: input.authority.declared_workflow_version,
+                    transition_id: phoenix_workflow::TransitionId(
+                        DIRECT_TURN_MATERIALIZED_TRANSITION_ID,
+                    ),
+                    generation: input.authority.generation,
+                    next_status: WorkflowStatus::Active,
+                    event_codec: &event_codec,
+                    event_payload: &event_payload,
+                    next_snapshot_codec: &snapshot_codec,
+                    next_snapshot_payload: &snapshot_payload,
+                    committed_at: input.now,
+                    exact_delivery_ids: &[delivery_id],
+                    decision: DeliveryResolutionDecision::Accept,
+                })
+                .await?;
+            if outcome != phoenix_workflow::CommitOutcome::Committed {
+                tx.rollback().await?;
+                return Err(DbError::Serialization(format!(
+                    "direct-turn runtime acceptance was rejected: {outcome:?}"
+                )));
+            }
+        }
         let canonical_turn =
             load_turn_for_workflow_tx(&self.pool, &mut tx.tx, turn_id, input.authority.workflow_id)
                 .await?
@@ -2421,6 +2466,24 @@ mod tests {
                     "message-conv-a-typed-receipt"
                 ),
             }
+        );
+        let delivery = sqlx::query(
+            "SELECT status, runtime_acceptance_status, accepted_by_transition_id
+             FROM workflow_deliveries WHERE workflow_id = ?1 AND delivery_id = ?2",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .bind(i64::try_from(result.delivery.as_ref().unwrap().delivery_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(delivery.get::<String, _>("status"), "Accepted");
+        assert_eq!(
+            delivery.get::<Option<String>, _>("runtime_acceptance_status"),
+            Some("Accepted".to_string())
+        );
+        assert_eq!(
+            delivery.get::<Option<i64>, _>("accepted_by_transition_id"),
+            Some(i64::try_from(DIRECT_TURN_MATERIALIZED_TRANSITION_ID).unwrap())
         );
     }
 

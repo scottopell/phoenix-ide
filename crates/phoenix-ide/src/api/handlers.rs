@@ -3787,6 +3787,26 @@ async fn cancel_conversation(
 
     if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
         let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
+        let effective_state = state.runtime.effective_conversation_state(&id).await;
+        if effective_state.is_some_and(|state| state.is_busy()) {
+            let handle = state.runtime.get_or_create(&id).await.map_err(|error| {
+                AppError::Internal(format!("failed to get conversation runtime: {error}"))
+            })?;
+            handle
+                .event_tx
+                .send(Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!("failed to send cancel event: {error}"))
+                })?;
+            return Ok(Json(CancelResponse {
+                ok: true,
+                no_op: false,
+            }));
+        }
         if !cancelled_direct_turn {
             tracing::debug!(
                 conv_id = %id,
@@ -4384,6 +4404,20 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot archive a busy conversation. Cancel the in-flight \
              operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+
+    cancel_active_direct_turn(state, id).await?;
+    let post_fence = state
+        .runtime
+        .db()
+        .get_conversation(id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    if post_fence.state.is_busy() {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot archive a busy conversation. Cancel the in-flight operation first, then retry.",
             "cancel_first",
         ))));
     }
@@ -11617,6 +11651,35 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("row preserved");
         assert!(conv.archived, "archived flag must be set after archive");
+    }
+
+    #[tokio::test]
+    async fn archive_fences_unmaterialized_direct_turn() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-archive-turn", "archive", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        accept_unmaterialized_direct_turn(&state, "c-archive-turn").await;
+
+        run_archive_cascade(&state, "c-archive-turn")
+            .await
+            .expect("archive conversation with pending turn");
+
+        assert!(
+            state
+                .db
+                .get_conversation("c-archive-turn")
+                .await
+                .expect("conversation")
+                .archived
+        );
+        let discoverable = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .expect("discover turns");
+        assert!(discoverable.candidates.is_empty());
     }
 
     /// Archive cascade preserves the conversation row + messages (done-but-

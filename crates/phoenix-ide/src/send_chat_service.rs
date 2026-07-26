@@ -95,9 +95,15 @@ impl SendChatApplicationService {
         let submitted = submitted_identity_from_request(&req);
         match lookup_durable_replay(&self.db, &req, &submitted).await? {
             DurableReplayOutcome::Missing => {}
-            DurableReplayOutcome::ExactMaterialized
-            | DurableReplayOutcome::ExactUnmaterializedTerminal => {
+            DurableReplayOutcome::ExactMaterialized => {
                 return Ok(SendChatOutcome::AlreadyPersisted);
+            }
+            DurableReplayOutcome::ExactUnmaterializedTerminal => {
+                return Ok(SendChatOutcome::Rejected {
+                    message: "The accepted message was cancelled or failed before delivery."
+                        .to_string(),
+                    code: "turn_terminal",
+                });
             }
             DurableReplayOutcome::ExactUnmaterializedLive => {
                 self.runtime.kick_direct_turn_worker();
@@ -159,9 +165,16 @@ impl SendChatApplicationService {
                 let expanded = expand_request(&self.db, &conversation, &req).await?;
                 match lookup_durable_replay(&self.db, &req, &submitted).await? {
                     DurableReplayOutcome::Missing => {}
-                    DurableReplayOutcome::ExactMaterialized
-                    | DurableReplayOutcome::ExactUnmaterializedTerminal => {
+                    DurableReplayOutcome::ExactMaterialized => {
                         return Ok(SendChatOutcome::AlreadyPersisted);
+                    }
+                    DurableReplayOutcome::ExactUnmaterializedTerminal => {
+                        return Ok(SendChatOutcome::Rejected {
+                            message:
+                                "The accepted message was cancelled or failed before delivery."
+                                    .to_string(),
+                            code: "turn_terminal",
+                        });
                     }
                     DurableReplayOutcome::ExactUnmaterializedLive => {
                         self.runtime.kick_direct_turn_worker();

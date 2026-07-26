@@ -6734,10 +6734,19 @@ impl Database {
              WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
                AND NOT (
                    json_extract(state, '$.type') = 'llm_requesting'
-                   AND EXISTS (
-                       SELECT 1 FROM conversation_creation_jobs j
-                       WHERE j.conversation_id = conversations.id
-                         AND j.status IN ('accepted', 'claimed', 'retry_scheduled')
+                   AND (
+                       EXISTS (
+                           SELECT 1 FROM conversation_creation_jobs j
+                           WHERE j.conversation_id = conversations.id
+                             AND j.status IN ('accepted', 'claimed', 'retry_scheduled')
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM durable_turns t
+                           WHERE t.conversation_id = conversations.id
+                             AND t.owns_conversation = 1
+                             AND t.canonical_message_id IS NOT NULL
+                             AND t.lifecycle = 'Live'
+                       )
                    )
                )",
         )

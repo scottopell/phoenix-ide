@@ -39,11 +39,9 @@ export interface QueuedMessage {
 /**
  * Derive the list of pending messages to render in the conversation:
  * queue entries with status `pending` whose `localId` has NOT yet appeared
- * as a `message_id` in `atom.messages`.
- *
- * The server uses the client's `localId` as the canonical `message_id`, so
- * the join is deterministic. Once the SSE `message` echo arrives, the entry
- * filters out on the next render — no imperative `markSent` needed.
+ * as an authoritative message identity. Direct turns use a target-scoped
+ * canonical ID (`conversation_id:localId`) while legacy/steering messages use
+ * `localId` directly, so both forms deterministically acknowledge the queue.
  */
 export function derivePendingMessages(
   queuedMessages: QueuedMessage[],
@@ -55,7 +53,8 @@ export function derivePendingMessages(
       q.status === 'pending'
       || q.status === 'accepted'
       || q.status === 'steering_queued'
-    ) && !serverIds.has(q.localId),
+    ) && !serverIds.has(q.localId)
+      && !serverIds.has(`${q.conversationId}:${q.localId}`),
   );
 }
 
