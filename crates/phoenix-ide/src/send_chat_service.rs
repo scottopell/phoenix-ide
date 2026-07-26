@@ -110,7 +110,11 @@ impl SendChatApplicationService {
                 return Ok(SendChatOutcome::Delivered);
             }
         }
-        if let Ok(message) = self.db.get_message_by_id(&req.message_id).await {
+        if let Ok(message) = self
+            .db
+            .get_message_by_id_in_conversation(&req.conversation_id, &req.message_id)
+            .await
+        {
             let persisted_matches = match &message.content {
                 phoenix_core::domain::db_schema::MessageContent::Skill(skill) => {
                     persisted_skill_matches(skill, &req)
@@ -142,7 +146,7 @@ impl SendChatApplicationService {
                 return replay_steering_receipt(receipt, &req, &request_fingerprint);
             }
             if let Some((queued_conversation_id, queued_entry)) =
-                find_queued_message(&self.db, &req.message_id).await?
+                find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
             {
                 if queued_conversation_id != req.conversation_id
                     || !queued_retry_matches(&queued_entry, &req)
@@ -198,7 +202,7 @@ impl SendChatApplicationService {
                         return replay_steering_receipt(receipt, &req, &request_fingerprint);
                     }
                     if let Some((queued_conversation_id, queued_entry)) =
-                        find_queued_message(&self.db, &req.message_id).await?
+                        find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
                     {
                         if queued_conversation_id != req.conversation_id
                             || !queued_retry_matches(&queued_entry, &req)
@@ -611,25 +615,16 @@ async fn insert_transient_steering_receipt(
 
 async fn find_queued_message(
     db: &crate::db::Database,
+    conversation_id: &str,
     message_id: &str,
 ) -> Result<Option<(String, phoenix_core::domain::sm_event::SteerEntry)>, SendChatServiceError> {
-    let Some(conversation_id) = db
-        .steering_conversation_id_for_message(message_id)
-        .await
-        .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
-    else {
-        return Ok(None);
-    };
     let entry = db
-        .get_steering_queue(&conversation_id)
+        .get_steering_queue(conversation_id)
         .await
         .map_err(|error| SendChatServiceError::Internal(error.to_string()))?
         .into_iter()
-        .find(|entry| entry.message_id == message_id)
-        .ok_or_else(|| {
-            SendChatServiceError::Internal("steering message disappeared during lookup".to_string())
-        })?;
-    Ok(Some((conversation_id, entry)))
+        .find(|entry| entry.message_id == message_id);
+    Ok(entry.map(|entry| (conversation_id.to_string(), entry)))
 }
 
 fn queued_retry_matches(

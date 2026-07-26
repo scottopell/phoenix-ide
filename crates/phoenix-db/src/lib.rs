@@ -7519,11 +7519,37 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_message_by_id(&self, message_id: &str) -> DbResult<Message> {
+        self.get_message_by_id_for_conversation(None, message_id)
+            .await
+    }
+
+    /// Returns a message only when both its conversation and message identities match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::MessageNotFound`] when the scoped identity is absent,
+    /// or a database/decoding error when retrieval fails.
+    pub async fn get_message_by_id_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> DbResult<Message> {
+        self.get_message_by_id_for_conversation(Some(conversation_id), message_id)
+            .await
+    }
+
+    async fn get_message_by_id_for_conversation(
+        &self,
+        conversation_id: Option<&str>,
+        message_id: &str,
+    ) -> DbResult<Message> {
         let mut message = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
-             FROM messages WHERE message_id = ?1",
+             FROM messages
+             WHERE message_id = ?1 AND (?2 IS NULL OR conversation_id = ?2)",
         )
         .bind(message_id)
+        .bind(conversation_id)
         .try_map(parse_message_row)
         .fetch_one(&self.pool)
         .await
