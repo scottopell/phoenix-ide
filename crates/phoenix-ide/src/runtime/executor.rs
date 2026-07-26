@@ -9312,7 +9312,14 @@ mod authoritative_user_message_effect_tests {
             .await
             .unwrap();
 
-            assert_no_broadcast(&mut rx);
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                crate::runtime::SseEvent::SequenceBarrier { sequence_id: 1 }
+            ));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
             assert_eq!(
                 storage
                     .recorded_materialize_authoritative_user_message_calls()
