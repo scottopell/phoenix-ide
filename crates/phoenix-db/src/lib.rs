@@ -6745,7 +6745,7 @@ impl Database {
                            WHERE t.conversation_id = conversations.id
                              AND t.owns_conversation = 1
                              AND t.canonical_message_id IS NOT NULL
-                             AND t.lifecycle = 'Live'
+                             AND t.terminal_kind IS NULL
                        )
                    )
                )",

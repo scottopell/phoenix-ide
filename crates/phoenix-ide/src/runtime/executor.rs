@@ -2994,6 +2994,8 @@ where
             return Ok(Vec::new());
         }
 
+        self.terminate_pending_direct_turn().await?;
+
         // Publish the final state to any live-state observer after all effects
         // (including any inline steering drain) have completed. Publishing here
         // rather than at the state-set site above prevents the intermediate
@@ -3036,7 +3038,6 @@ where
                 match &effect {
                     Effect::PersistState => {
                         self.persist_state_effect(false).await?;
-                        Box::pin(self.terminate_pending_direct_turn()).await?;
                         continue;
                     }
                     Effect::NotifyStateChange => {
@@ -4104,11 +4105,7 @@ where
                 Ok(None)
             }
 
-            Effect::PersistState => {
-                let outcome = self.persist_state_effect(true).await?;
-                Box::pin(self.terminate_pending_direct_turn()).await?;
-                Ok(outcome)
-            }
+            Effect::PersistState => self.persist_state_effect(true).await,
 
             Effect::RequestLlm => self.dispatch_llm_request().await,
 

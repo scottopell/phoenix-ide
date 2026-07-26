@@ -172,7 +172,7 @@ pub struct RuntimeManager {
     /// lock-free; eviction state therefore has exactly one consumer.
     runtime_creation_lock: AsyncMutex<()>,
     /// Serializes legacy steering admission until the normalized queue row is visible.
-    steering_acceptance_receipts: AsyncMutex<HashMap<String, SteeringAcceptanceReceipt>>,
+    steering_acceptance_receipts: AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -3095,7 +3095,7 @@ impl RuntimeManager {
 
     pub(crate) async fn lock_steering_acceptance(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<String, SteeringAcceptanceReceipt>> {
+    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), SteeringAcceptanceReceipt>> {
         self.steering_acceptance_receipts.lock().await
     }
 

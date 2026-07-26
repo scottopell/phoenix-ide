@@ -1285,9 +1285,15 @@ async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet
          UNION
          SELECT stored_path FROM steering_message_files
          UNION
-         SELECT stored_path FROM durable_turn_submitted_files
+         SELECT f.stored_path
+         FROM durable_turn_submitted_files f
+         JOIN durable_turns t ON t.turn_id = f.turn_id
+         WHERE t.terminal_kind IS NULL AND t.canonical_message_id IS NULL
          UNION
-         SELECT stored_path FROM durable_turn_delivery_files
+         SELECT f.stored_path
+         FROM durable_turn_delivery_files f
+         JOIN durable_turns t ON t.turn_id = f.turn_id
+         WHERE t.terminal_kind IS NULL AND t.canonical_message_id IS NULL
          UNION
          SELECT f.stored_path
          FROM conversation_creation_job_files f
@@ -3786,7 +3792,6 @@ async fn cancel_conversation(
     }
 
     if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
-        let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
         let effective_state = state.runtime.effective_conversation_state(&id).await;
         if effective_state.is_some_and(|state| state.is_busy()) {
             let handle = state.runtime.get_or_create(&id).await.map_err(|error| {
@@ -3807,6 +3812,7 @@ async fn cancel_conversation(
                 no_op: false,
             }));
         }
+        let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
         if !cancelled_direct_turn {
             tracing::debug!(
                 conv_id = %id,

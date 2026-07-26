@@ -395,6 +395,22 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             };
+            let active_direct_turn =
+                phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone())
+                    .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                        current.conversation_id.clone(),
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if active_direct_turn.is_some_and(|turn| {
+                matches!(
+                    turn.materialization,
+                    phoenix_workflow::Materialization::Unmaterialized
+                )
+            }) {
+                cursor = Some(next_cursor);
+                continue;
+            }
             let _steering_acceptance = manager.lock_steering_acceptance().await;
             let rendered = render_terminal_result(&current);
             let display_data = Some(serde_json::json!({
