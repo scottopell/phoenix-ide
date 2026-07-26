@@ -643,12 +643,14 @@ fn row_to_turn(row: sqlx::sqlite::SqliteRow) -> DbResult<DurableTurn> {
             "owns_conversation disagrees with turn lifecycle".to_string(),
         ));
     }
+    let conversation = ConversationAuthority(row.get("conversation_id"));
     Ok(DurableTurn {
         id: TurnAuthorityId(to_u64(row.get("turn_id"), "turn_id")?),
-        conversation: ConversationAuthority(row.get("conversation_id")),
+        conversation: conversation.clone(),
         client_key: ClientTurnKey::try_from(row.get::<String, _>("client_turn_key"))
             .map_err(|e| DbError::Serialization(e.to_string()))?,
         prepared: PreparedTurn::rehydrate(
+            &conversation,
             row.get("prepared_fingerprint"),
             row.get("prepared_payload"),
         )
@@ -856,7 +858,10 @@ mod tests {
         AcceptAuthoritativeTurn {
             conversation: ConversationAuthority(conversation.to_string()),
             client_key: ClientTurnKey::new(key).unwrap(),
-            prepared: PreparedTurn::from_exact_payload(vec![seed]),
+            prepared: PreparedTurn::from_exact_payload(
+                &ConversationAuthority("conv-a".to_string()),
+                vec![seed],
+            ),
             disposition: AcceptedDisposition::Runtime,
             accepted_at: phoenix_workflow::Timestamp(u64::from(seed)),
         }

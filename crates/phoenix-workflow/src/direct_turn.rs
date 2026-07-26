@@ -56,8 +56,8 @@ pub struct PreparedTurn {
 
 impl PreparedTurn {
     #[must_use]
-    pub fn from_exact_payload(payload: Vec<u8>) -> Self {
-        let fingerprint = sha256_hex(&payload);
+    pub fn from_exact_payload(target: &ConversationAuthority, payload: Vec<u8>) -> Self {
+        let fingerprint = prepared_fingerprint(target, &payload);
         Self {
             fingerprint,
             payload,
@@ -69,8 +69,12 @@ impl PreparedTurn {
     /// # Errors
     /// Returns [`TurnConflict::CorruptAggregate`] when the persisted fingerprint
     /// does not match the exact payload bytes.
-    pub fn rehydrate(fingerprint: String, payload: Vec<u8>) -> Result<Self, TurnConflict> {
-        if fingerprint != sha256_hex(&payload) {
+    pub fn rehydrate(
+        target: &ConversationAuthority,
+        fingerprint: String,
+        payload: Vec<u8>,
+    ) -> Result<Self, TurnConflict> {
+        if fingerprint != prepared_fingerprint(target, &payload) {
             return Err(TurnConflict::CorruptAggregate(
                 "prepared turn fingerprint does not match payload",
             ));
@@ -90,6 +94,14 @@ impl PreparedTurn {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
+}
+
+fn prepared_fingerprint(target: &ConversationAuthority, payload: &[u8]) -> String {
+    let mut exact = Vec::with_capacity(target.0.len() + 1 + payload.len());
+    exact.extend_from_slice(target.0.as_bytes());
+    exact.push(0);
+    exact.extend_from_slice(payload);
+    sha256_hex(&exact)
 }
 
 fn sha256_hex(payload: &[u8]) -> String {
@@ -599,7 +611,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn prepared(seed: u8) -> PreparedTurn {
-        PreparedTurn::from_exact_payload(vec![seed])
+        PreparedTurn::from_exact_payload(&ConversationAuthority("conv-a".to_string()), vec![seed])
     }
 
     #[test]
@@ -610,18 +622,33 @@ mod tests {
     }
 
     #[test]
-    fn prepared_turn_fingerprint_is_exact_payload_sha256() {
-        let prepared = PreparedTurn::from_exact_payload(b"abc".to_vec());
-        assert_eq!(
+    fn prepared_turn_fingerprint_binds_target_and_exact_payload() {
+        let prepared = PreparedTurn::from_exact_payload(
+            &ConversationAuthority("conv-a".to_string()),
+            b"abc".to_vec(),
+        );
+        assert_ne!(
             prepared.fingerprint(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            PreparedTurn::from_exact_payload(
+                &ConversationAuthority("conv-b".to_string()),
+                b"abc".to_vec(),
+            )
+            .fingerprint()
         );
         assert_eq!(prepared.payload(), b"abc");
-        assert!(
-            PreparedTurn::rehydrate(prepared.fingerprint().to_string(), b"abd".to_vec()).is_err()
-        );
+        assert!(PreparedTurn::rehydrate(
+            &ConversationAuthority("conv-a".into()),
+            prepared.fingerprint().to_string(),
+            b"abd".to_vec()
+        )
+        .is_err());
         assert_eq!(
-            PreparedTurn::rehydrate(prepared.fingerprint().to_string(), b"abc".to_vec()).unwrap(),
+            PreparedTurn::rehydrate(
+                &ConversationAuthority("conv-a".into()),
+                prepared.fingerprint().to_string(),
+                b"abc".to_vec()
+            )
+            .unwrap(),
             prepared
         );
     }

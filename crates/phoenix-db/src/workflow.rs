@@ -3276,7 +3276,10 @@ mod tests {
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority("conv-a".to_string()),
                 client_key: ClientTurnKey::new("gate-delivery").unwrap(),
-                prepared: PreparedTurn::from_exact_payload(vec![1]),
+                prepared: PreparedTurn::from_exact_payload(
+                    &ConversationAuthority("conv-a".to_string()),
+                    vec![1],
+                ),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at,
             })
@@ -3323,7 +3326,10 @@ mod tests {
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 conversation: ConversationAuthority("conv-a".to_string()),
                 client_key: ClientTurnKey::new("gate-head").unwrap(),
-                prepared: PreparedTurn::from_exact_payload(vec![2]),
+                prepared: PreparedTurn::from_exact_payload(
+                    &ConversationAuthority("conv-a".to_string()),
+                    vec![2],
+                ),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at,
             })
