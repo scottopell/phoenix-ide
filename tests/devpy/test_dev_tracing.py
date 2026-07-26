@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import subprocess
 import tempfile
 import unittest
@@ -26,13 +27,13 @@ class FakeTracing:
         self.started = []
         self.finished = []
 
-    def start_span(self, name, attributes=None, parent=None):
+    def start_span(self, name, attributes=None, parent=None, start_time=None):
         span = FakeSpan()
-        self.started.append((name, attributes, span, parent))
+        self.started.append((name, attributes, span, parent, start_time))
         return span
 
-    def finish_span(self, span, attributes, failed=False):
-        self.finished.append((span, attributes, failed))
+    def finish_span(self, span, attributes, failed=False, end_time=None):
+        self.finished.append((span, attributes, failed, end_time))
 
 
 class FakeProcess:
@@ -141,6 +142,7 @@ class DevTracingTests(unittest.TestCase):
         attributes = self.dev._profile_record_attributes({
             "provenance": "windowed_process",
             "test_name": "renders",
+            "started_unix_ns": 1_000_000_000,
             "cpu_user_us": 1250,
             "cpu_system_us": 750,
             "wall_time_ms": 4.5,
@@ -150,6 +152,25 @@ class DevTracingTests(unittest.TestCase):
         self.assertEqual(2.0, attributes["cpu.total_ms"])
         self.assertEqual("renders", attributes["check.test.identity"])
         self.assertEqual("pass", attributes["check.test.status"])
+
+    def test_imported_profile_span_preserves_recorded_interval(self):
+        tracing = FakeTracing()
+        self.dev._DEV_TRACING = tracing
+        parent = FakeSpan()
+        with tempfile.TemporaryDirectory(dir=self.dev.ROOT / "target") as directory:
+            root = Path(directory)
+            (root / "tests.jsonl").write_text(json.dumps({
+                "identity": "test:one", "provenance": "windowed_process",
+                "started_unix_ns": 1_000_000_000, "wall_ms": 2.5,
+                "user_cpu_ms": 1, "system_cpu_ms": 0, "status": "passed",
+            }) + "\n")
+            emitted = self.dev._emit_profile_record_spans(
+                root, parent, ("tests.jsonl",)
+            )
+
+        self.assertEqual(1, emitted)
+        self.assertEqual(1_000_000_000, tracing.started[0][4])
+        self.assertEqual(1_002_500_000, tracing.finished[0][3])
 
     def test_nextest_profile_config_wraps_only_run_phase(self):
         with tempfile.TemporaryDirectory(dir=self.dev.ROOT / "target") as directory:
@@ -204,7 +225,7 @@ class DevTracingTests(unittest.TestCase):
 
         self.assertEqual("dev.build", tracing.started[0][0])
         self.assertEqual({"build.profile": "release"}, tracing.started[0][1])
-        _, attributes, failed = tracing.finished[0]
+        _, attributes, failed, _ = tracing.finished[0]
         self.assertFalse(failed)
         self.assertEqual(6.0, attributes["build.elapsed_seconds"])
         self.assertEqual(2.0, attributes["cargo.lock_wait_seconds"])

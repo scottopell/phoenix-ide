@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROCESS_TREE_PROVENANCE = "exact_process_tree"
+PROCESS_TREE_PROVENANCE = "exact_waited_descendants"
 WINDOW_PROVENANCE = "windowed_process"
 
 
@@ -100,7 +100,7 @@ def _write_record(
 
 def _forward_signal(child_pid: int, signum: int) -> None:
     try:
-        os.kill(child_pid, signum)
+        os.killpg(child_pid, signum)
     except ProcessLookupError:
         pass
 
@@ -120,10 +120,16 @@ def measure(
     child_pid = os.fork()
     if child_pid == 0:
         try:
+            os.setpgid(0, 0)
             os.execvp(command[0], command)
         except OSError as error:
             print(f"check profile wrapper: cannot execute {command[0]}: {error}", file=sys.stderr)
             os._exit(127)
+
+    try:
+        os.setpgid(child_pid, child_pid)
+    except (PermissionError, ProcessLookupError):
+        pass
 
     previous_handlers: dict[int, object] = {}
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -176,7 +182,7 @@ def measure(
             # wait4 is exact for the command and descendants it reaped. A daemonized
             # descendant is outside that accounting boundary and cannot be proven
             # closed portably from this wrapper.
-            "tree_closure": "command_reaped_descendants_unverified",
+            "tree_closure": "waited_descendants_only_survivors_unverified",
         },
     )
     _write_record(record=record, output=output, output_dir=output_dir, output_jsonl=output_jsonl)

@@ -52,13 +52,39 @@ class _ProfilingTextTestResult(unittest.TextTestResult):
         self._started_wall_ns: int | None = None
         self._started_monotonic_ns: int | None = None
         self._started_cpu: tuple[float, float] | None = None
+        self._outcome = "unknown"
 
     def startTest(self, test):
         self._started_wall_ns = time.time_ns()
         self._started_monotonic_ns = time.monotonic_ns()
+        self._outcome = "running"
         cpu = os.times()
         self._started_cpu = (cpu.user + cpu.children_user, cpu.system + cpu.children_system)
         super().startTest(test)
+
+    def addSuccess(self, test):
+        self._outcome = "passed"
+        super().addSuccess(test)
+
+    def addFailure(self, test, err):
+        self._outcome = "failed"
+        super().addFailure(test, err)
+
+    def addError(self, test, err):
+        self._outcome = "error"
+        super().addError(test, err)
+
+    def addSkip(self, test, reason):
+        self._outcome = "skipped"
+        super().addSkip(test, reason)
+
+    def addExpectedFailure(self, test, err):
+        self._outcome = "expected_failure"
+        super().addExpectedFailure(test, err)
+
+    def addUnexpectedSuccess(self, test):
+        self._outcome = "unexpected_success"
+        super().addUnexpectedSuccess(test)
 
     def stopTest(self, test):
         try:
@@ -80,6 +106,7 @@ class _ProfilingTextTestResult(unittest.TextTestResult):
                         "schema_version": SCHEMA_VERSION,
                         "provenance": PROVENANCE,
                         "kind": "python_unittest_testcase",
+                        "status": self._outcome,
                     },
                 )
                 _append_jsonl(self._profile_jsonl, record)
@@ -87,6 +114,7 @@ class _ProfilingTextTestResult(unittest.TextTestResult):
             self._started_wall_ns = None
             self._started_monotonic_ns = None
             self._started_cpu = None
+            self._outcome = "unknown"
             super().stopTest(test)
 
 

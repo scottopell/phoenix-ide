@@ -53,7 +53,10 @@ import asyncio
 import contextlib
 import json
 import os
-import resource
+try:
+    import resource
+except ImportError:  # Windows: profiling unavailable; normal E2E remains usable.
+    resource = None
 import shutil
 import socket
 import subprocess
@@ -126,8 +129,11 @@ def _append_jsonl(path: Path, value: dict) -> None:
 
 def _process_cpu_times(pid: int) -> tuple[float, float] | None:
     if pid == os.getpid():
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        return usage.ru_utime, usage.ru_stime
+        if resource is not None:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            return usage.ru_utime, usage.ru_stime
+        process = os.times()
+        return process.user, process.system
     if sys.platform == "linux":
         try:
             with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as stat_file:
@@ -219,20 +225,6 @@ def _write_cpu_window(
             extra=extra,
         ),
     )
-
-
-def _build_binary() -> None:
-    print("[e2e] cargo build --bin phoenix-ide ...", flush=True)
-    t0 = time.monotonic()
-    # --quiet keeps the lane's stdout focused on test results; rustc errors
-    # still surface on stderr and via the non-zero exit code.
-    res = subprocess.run(
-        ["cargo", "build", "--bin", "phoenix_ide", "--quiet"],
-        cwd=ROOT,
-    )
-    if res.returncode != 0:
-        sys.exit(res.returncode)
-    print(f"[e2e] build done in {time.monotonic() - t0:.1f}s", flush=True)
 
 
 class _StartupFailure(RuntimeError):
@@ -1215,10 +1207,10 @@ def main() -> int:
             started_server_cpu = _process_cpu_times(server_pid)
             try:
                 fn(base_url)
-                dt = time.monotonic() - started_monotonic_ns
+                dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
                 print(f"  ✓ {name:<22s} {dt:6.2f}s", flush=True)
             except Exception as e:
-                dt = time.monotonic() - started_monotonic_ns
+                dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
                 detail = f"{type(e).__name__}: {e}"
                 print(f"  ✗ {name:<22s} {dt:6.2f}s  {detail}", flush=True)
                 failures.append((name, detail))

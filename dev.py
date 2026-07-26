@@ -84,17 +84,25 @@ class _DevTracing:
         self.command_span = None
         self.command_started_at = None
 
-    def start_span(self, name: str, attributes: dict | None = None, parent=None):
+    def start_span(
+        self, name: str, attributes: dict | None = None, parent=None,
+        start_time: int | None = None,
+    ):
         parent = parent or _DEV_CURRENT_SPAN.get() or self.command_span
         context = self.trace_api.set_span_in_context(parent) if parent is not None else None
-        return self.tracer.start_span(name, context=context, attributes=attributes)
+        return self.tracer.start_span(
+            name, context=context, attributes=attributes, start_time=start_time,
+        )
 
-    def finish_span(self, span, attributes: dict, failed: bool = False) -> None:
+    def finish_span(
+        self, span, attributes: dict, failed: bool = False,
+        end_time: int | None = None,
+    ) -> None:
         for name, value in attributes.items():
             span.set_attribute(name, value)
         code = self.status_api.StatusCode.ERROR if failed else self.status_api.StatusCode.OK
         span.set_status(self.status_api.Status(code))
-        span.end()
+        span.end(end_time=end_time)
 
     def shutdown(self) -> None:
         self.provider.shutdown()
@@ -167,10 +175,14 @@ def _profile_record_attributes(record: dict, source: Path) -> dict | None:
         system_ms = float(record.get("system_cpu_ms", record.get("cpu_system_us", 0.0) / 1000.0))
         identity = str(record.get("identity") or record.get("full_test_name") or record["test_name"])
         attributes = _cpu_attributes(user_ms, system_ms, str(record["provenance"]))
+        started_unix_ns = int(record["started_unix_ns"])
+        wall_ms = float(record.get("wall_ms", record.get("wall_time_ms", 0.0)))
         attributes.update({
             "check.test.identity": identity,
             "check.profile_record": str(source.relative_to(ROOT)),
-            "check.wall_ms": float(record.get("wall_ms", record.get("wall_time_ms", 0.0))),
+            "check.wall_ms": wall_ms,
+            "check.test.started_unix_ns": started_unix_ns,
+            "check.test.ended_unix_ns": started_unix_ns + int(wall_ms * 1_000_000),
         })
         for source_key, attribute in (
             ("kind", "check.test.kind"),
@@ -207,13 +219,18 @@ def _emit_profile_record_spans(profile_dir: Path, parent, patterns: tuple[str, .
                 attributes = _profile_record_attributes(record, path)
                 if attributes is None:
                     continue
+                started_unix_ns = attributes["check.test.started_unix_ns"]
+                ended_unix_ns = attributes["check.test.ended_unix_ns"]
                 span = _begin_dev_span("dev.check.test", {
                     "check.test.identity": attributes["check.test.identity"],
-                }, parent=parent)
+                }, parent=parent, start_time=started_unix_ns)
                 _finish_dev_span(
                     span, attributes,
-                    failed=record.get("status") in {"fail", "failed"}
+                    failed=record.get("status") in {
+                        "fail", "failed", "error", "unexpected_success",
+                    }
                     or int(record.get("returncode", 0)) != 0,
+                    end_time=ended_unix_ns,
                 )
                 emitted += 1
     return emitted
@@ -385,14 +402,19 @@ def _shutdown_dev_tracing(error: BaseException | None) -> None:
         print(f"  ⚠ dev trace export failed: {shutdown_error}", file=sys.stderr)
 
 
-def _begin_dev_span(name: str, attributes: dict | None = None, parent=None):
+def _begin_dev_span(
+    name: str, attributes: dict | None = None, parent=None,
+    start_time: int | None = None,
+):
     if _DEV_TRACING is None:
         return _NOOP_SPAN
     attributes = dict(attributes or {})
     if _CHECK_PROFILE is not None:
         attributes.setdefault("check.profile_run_id", _CHECK_PROFILE.run_id)
     parent = parent or _DEV_CURRENT_SPAN.get()
-    return _DEV_TRACING.start_span(name, attributes, parent=parent)
+    return _DEV_TRACING.start_span(
+        name, attributes, parent=parent, start_time=start_time,
+    )
 
 
 class _DevSpanScope:
@@ -409,11 +431,13 @@ class _DevSpanScope:
         _DEV_CURRENT_SPAN.reset(self.token)
 
 
-def _finish_dev_span(span, attributes: dict, failed: bool = False) -> None:
+def _finish_dev_span(
+    span, attributes: dict, failed: bool = False, end_time: int | None = None,
+) -> None:
     if span is _NOOP_SPAN or _DEV_TRACING is None:
         return
     try:
-        _DEV_TRACING.finish_span(span, attributes, failed)
+        _DEV_TRACING.finish_span(span, attributes, failed, end_time=end_time)
     except Exception as error:
         print(f"  ⚠ dev span recording failed: {error}", file=sys.stderr)
 
