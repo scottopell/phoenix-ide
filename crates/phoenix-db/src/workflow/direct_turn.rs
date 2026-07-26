@@ -1215,6 +1215,32 @@ fn prepared_semantics_changed(prepared: &PreparedTurn) -> DbError {
     })
 }
 
+fn decode_prepared_payload_with_normalized_attachments(
+    payload: &[u8],
+    submitted_images: Vec<ImageData>,
+    submitted_files: Vec<SubmittedDirectTurnFileAttachment>,
+    delivery_images: Vec<ImageData>,
+    delivery_files: Vec<FileAttachment>,
+) -> DbResult<PreparedDirectTurnPayload> {
+    let has_normalized_attachments = !submitted_images.is_empty()
+        || !submitted_files.is_empty()
+        || !delivery_images.is_empty()
+        || !delivery_files.is_empty();
+    if !has_normalized_attachments {
+        if let Ok(legacy) = PreparedDirectTurnPayload::from_exact_bytes(payload) {
+            return Ok(legacy);
+        }
+    }
+    PreparedDirectTurnPayload::rehydrate_from_normalized_bytes(
+        payload,
+        submitted_images,
+        submitted_files,
+        delivery_images,
+        delivery_files,
+    )
+    .map_err(|error| DbError::Serialization(error.to_string()))
+}
+
 async fn load_prepared_payload_pool(
     pool: &sqlx::SqlitePool,
     turn_id: TurnAuthorityId,
@@ -1228,14 +1254,13 @@ async fn load_prepared_payload_pool(
     let submitted_files = load_prepared_turn_submitted_files(pool, turn_id).await?;
     let delivery_images = load_prepared_turn_delivery_images(pool, turn_id).await?;
     let delivery_files = load_prepared_turn_delivery_files(pool, turn_id).await?;
-    PreparedDirectTurnPayload::rehydrate_from_normalized_bytes(
+    decode_prepared_payload_with_normalized_attachments(
         &payload,
         submitted_images,
         submitted_files,
         delivery_images,
         delivery_files,
     )
-    .map_err(|error| DbError::Serialization(error.to_string()))
 }
 
 async fn load_prepared_payload_tx(
@@ -1251,14 +1276,13 @@ async fn load_prepared_payload_tx(
     let submitted_files = load_prepared_turn_submitted_files(tx.as_mut(), turn_id).await?;
     let delivery_images = load_prepared_turn_delivery_images(tx.as_mut(), turn_id).await?;
     let delivery_files = load_prepared_turn_delivery_files(tx.as_mut(), turn_id).await?;
-    PreparedDirectTurnPayload::rehydrate_from_normalized_bytes(
+    decode_prepared_payload_with_normalized_attachments(
         &payload,
         submitted_images,
         submitted_files,
         delivery_images,
         delivery_files,
     )
-    .map_err(|error| DbError::Serialization(error.to_string()))
 }
 
 async fn load_prepared_turn_submitted_images<'c, E>(
@@ -3643,6 +3667,62 @@ mod tests {
             ),
             (1, 1, 1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_embedded_attachments_survive_normalized_schema_upgrade() {
+        let repo = repo().await;
+        let conversation = ConversationAuthority("conv-a".to_string());
+        let payload = prepared_payload_with_attachments("message-conv-a-legacy-attachments");
+        let prepared =
+            PreparedTurn::from_exact_payload(&conversation, payload.to_exact_bytes().unwrap());
+        let created = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("legacy-attachments").unwrap(),
+                prepared: prepared.clone(),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(78),
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+
+        let turn_id = i64::try_from(turn_id.0).unwrap();
+        sqlx::query("DELETE FROM durable_turn_submitted_images WHERE turn_id = ?1")
+            .bind(turn_id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM durable_turn_submitted_files WHERE turn_id = ?1")
+            .bind(turn_id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM durable_turn_delivery_images WHERE turn_id = ?1")
+            .bind(turn_id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM durable_turn_delivery_files WHERE turn_id = ?1")
+            .bind(turn_id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE durable_turns SET prepared_payload = ?1 WHERE turn_id = ?2")
+            .bind(payload.to_exact_bytes().unwrap())
+            .bind(turn_id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+
+        let loaded = repo
+            .load_authoritative_turn(TurnAuthorityId(u64::try_from(turn_id).unwrap()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.prepared, prepared);
     }
 
     #[tokio::test]

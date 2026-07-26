@@ -1285,6 +1285,10 @@ async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet
          UNION
          SELECT stored_path FROM steering_message_files
          UNION
+         SELECT stored_path FROM durable_turn_submitted_files
+         UNION
+         SELECT stored_path FROM durable_turn_delivery_files
+         UNION
          SELECT f.stored_path
          FROM conversation_creation_job_files f
          JOIN conversation_creation_jobs j ON j.id = f.job_id
@@ -3707,6 +3711,29 @@ async fn cancel_wake(
     Ok(axum::Json(SuccessResponse { success: true }))
 }
 
+async fn cancel_active_direct_turn(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<bool, AppError> {
+    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let Some(turn) = repo
+        .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+            conversation_id.to_string(),
+        ))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    repo.terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
+        turn_id: turn.id,
+        expected_generation: turn.generation,
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(true)
+}
+
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3759,14 +3786,17 @@ async fn cancel_conversation(
     }
 
     if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
-        tracing::debug!(
-            conv_id = %id,
-            state = conversation.state.variant_name(),
-            "cancel no-op: conversation has nothing in flight"
-        );
+        let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
+        if !cancelled_direct_turn {
+            tracing::debug!(
+                conv_id = %id,
+                state = conversation.state.variant_name(),
+                "cancel no-op: conversation has nothing in flight"
+            );
+        }
         return Ok(Json(CancelResponse {
             ok: true,
-            no_op: true,
+            no_op: !cancelled_direct_turn,
         }));
     }
 
@@ -4689,6 +4719,20 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // LIVE decoupled fork/refinement, which survives origin deletion and is NOT
     // touched. The proposal ROWS are removed by the fork_proposals.origin_conv_id
     // ON DELETE CASCADE on the row deletion below — not duplicated here.
+    cancel_active_direct_turn(state, id).await?;
+    let post_fence = state
+        .runtime
+        .db()
+        .get_conversation(id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    if post_fence.state.is_busy() {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot hard-delete a busy conversation. Cancel the in-flight operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+
     cleanup_pending_fork_orphans_on_delete(state, &conv).await;
 
     // Steps 2-5: bash handles, tmux server, project worktree, browser
@@ -10703,6 +10747,100 @@ pub(crate) mod hard_delete_cascade_tests {
         }
     }
 
+    async fn accept_unmaterialized_direct_turn(state: &AppState, conversation_id: &str) {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
+        };
+
+        let payload = PreparedDirectTurnPayload::from_parts(
+            SubmittedDirectTurnIdentity {
+                text: "pending".to_string(),
+                images: vec![],
+                files: vec![],
+                message_id: "pending-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            PreparedDirectTurnDelivery {
+                text: "pending".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        let target = ConversationAuthority(conversation_id.to_string());
+        let prepared = PreparedTurn::from_exact_payload(
+            &target,
+            payload.to_exact_bytes().expect("encode prepared payload"),
+        );
+        phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+            .accept_authoritative_turn(
+                &phoenix_db::workflow::direct_turn::AcceptAuthoritativeTurn {
+                    client_key: ClientTurnKey::new("pending-message").expect("client key"),
+                    prepared,
+                    disposition: AcceptedDisposition::Runtime,
+                    accepted_at: Timestamp(1),
+                },
+            )
+            .await
+            .expect("accept direct turn");
+    }
+
+    #[tokio::test]
+    async fn cancel_idle_conversation_terminalizes_unmaterialized_direct_turn() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-pending-turn", "pending", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        accept_unmaterialized_direct_turn(&state, "c-pending-turn").await;
+
+        let Json(response) =
+            cancel_conversation(State(state.clone()), Path("c-pending-turn".to_string()))
+                .await
+                .expect("cancel pending direct turn");
+
+        assert!(response.ok);
+        assert!(!response.no_op);
+        let active = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                "c-pending-turn".to_string(),
+            ))
+            .await
+            .expect("load active turn");
+        assert!(active.is_none());
+    }
+
+    #[tokio::test]
+    async fn hard_delete_fences_unmaterialized_direct_turn() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-delete-turn", "delete", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        accept_unmaterialized_direct_turn(&state, "c-delete-turn").await;
+
+        run_hard_delete_cascade(&state, "c-delete-turn")
+            .await
+            .expect("delete conversation with pending turn");
+
+        assert!(state.db.get_conversation("c-delete-turn").await.is_err());
+        let discoverable = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .expect("discover turns");
+        assert!(discoverable.candidates.is_empty());
+    }
+
     #[tokio::test]
     async fn cancel_rejects_awaiting_continuation_without_changing_state() {
         let state = make_test_state().await;
@@ -13407,6 +13545,83 @@ mod attachment_storage_tests {
             referenced.contains(&PathBuf::from(stored_path)),
             "creation job intent files must be protected from TTL cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn referenced_paths_include_unmaterialized_direct_turn_files() {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnFileAttachment,
+            SubmittedDirectTurnIdentity,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
+        };
+
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("open db");
+        db.create_conversation(
+            "conv-direct-turn-files",
+            "direct-turn-files",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("create conversation");
+        let submitted_path = "/tmp/phoenix-direct-turn-submitted.txt".to_string();
+        let delivery_path = "/tmp/phoenix-direct-turn-delivery.txt".to_string();
+        let file = |original_name: &str, stored_path: String| crate::db::FileAttachment {
+            original_name: original_name.to_string(),
+            media_type: "text/plain".to_string(),
+            size_bytes: 12,
+            stored_path,
+        };
+        let payload = PreparedDirectTurnPayload {
+            v: PreparedDirectTurnPayload::VERSION,
+            submitted: SubmittedDirectTurnIdentity {
+                message_id: "msg-direct-turn-files".to_string(),
+                text: "with attachments".to_string(),
+                images: vec![],
+                files: vec![SubmittedDirectTurnFileAttachment::from(file(
+                    "submitted.txt",
+                    submitted_path.clone(),
+                ))],
+                skill_invocation: None,
+                user_agent: None,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            delivery: PreparedDirectTurnDelivery {
+                text: "with attachments".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![file("delivery.txt", delivery_path.clone())],
+                user_agent: None,
+                skill_invocation: None,
+            },
+        };
+        let conversation = ConversationAuthority("conv-direct-turn-files".to_string());
+        let prepared = PreparedTurn::from_exact_payload(
+            &conversation,
+            payload.to_exact_bytes().expect("encode payload"),
+        );
+        phoenix_db::workflow::WorkflowRepository::new(db.pool().clone())
+            .accept_authoritative_turn(
+                &phoenix_db::workflow::direct_turn::AcceptAuthoritativeTurn {
+                    client_key: ClientTurnKey::new("msg-direct-turn-files").expect("client key"),
+                    prepared,
+                    disposition: AcceptedDisposition::Runtime,
+                    accepted_at: Timestamp(1),
+                },
+            )
+            .await
+            .expect("accept direct turn");
+
+        let referenced = referenced_attachment_paths(&db).await.expect("references");
+        assert!(referenced.contains(&PathBuf::from(submitted_path)));
+        assert!(referenced.contains(&PathBuf::from(delivery_path)));
     }
 
     #[test]
