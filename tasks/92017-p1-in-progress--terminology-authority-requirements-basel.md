@@ -40,3 +40,41 @@ Append a completion note to this task body with these headings:
 - **Validation** — grep commands and any spec-shape checks run
 - **Review corrections** — follow-up fixes made after self-review or peer review, or `None`
 - **Commit** — commit hash that landed the work
+
+## Completion evidence
+
+**Files changed**
+- `specs/bedrock/requirements.md`
+- `specs/projects/requirements.md`
+- `specs/work-lifecycle/requirements.md`
+- `specs/chains/requirements.md`
+- `specs/conversation-retrieval/requirements.md`
+- `specs/pr-association/requirements.md`
+- `specs/global-recall/requirements.md`
+- `specs/conversation-creation/requirements.md`
+
+**Decisions captured**
+- Re-grounded lifecycle language on Open → History, with close action terminology replacing terminal/closed wording where this task touched requirements.
+- Clarified that continuation topology (`continued_in_conv_id`) produces multiple execution rows for one product conversation, and that latest execution authority is derived from that topology rather than stored in a second owner field.
+- Clarified that `WorkScope` owns runtime resources only; product lifecycle remains attached to the durable root conversation.
+- Defined Continue here as an approval checkpoint with no extra lifecycle, environment, repository, or provenance side effects beyond the approved task commit.
+- Defined Start in new conversation as a separate Open conversation derived from the source, with a fresh `WorkScope`/worktree and only the exact approved task as starting context.
+- Re-grounded fork/follow-up language so follow-up work is separate and fresh rather than a continuation of the origin.
+- Replaced normative “non-git” wording with Git-backed vs chat-only where this requirement cluster needed that distinction.
+- Clarified that PR associations are observed WorkScope history, not lifecycle ownership, and that branches/PRs are observed targets rather than product-owned lifecycle units.
+- Explicitly excluded the Coordinator from ordinary conversation lifecycle/WorkScope semantics.
+
+**Validation**
+- Read-first artifacts reviewed: `AGENTS.md`, `specs/AUTHORING.md`, `tasks/92010-p1-in-progress--conversation-lifecycle-spec-schema.md`, `tasks/92017-p1-in-progress--terminology-authority-requirements-basel.md`, commit `7de83e234`, and the requested requirement files.
+- Grep audit run before edits:
+  - `rg -n "Archive|Clean up|Abandon|Mark merged|Work mode|Branch mode|project conversation" specs --glob 'requirements.md'`
+  - `rg -n "continued_in_conv_id|Close conversation|History state|project conversation|chat-only|Git-backed|Start in new conversation|Continue here|follow-up|Coordinator|Closed lifecycle|closed lifecycle|WorkScope" specs --glob 'requirements.md'`
+- Validation commands to run after edits:
+  - `./dev.py check --lanes spec-shape`
+  - applicable markdown timelessness/shape spot-checks from `specs/AUTHORING.md`
+
+**Review corrections**
+- Removed an accidental duplicated approval trigger line in `specs/projects/requirements.md` during self-review.
+
+**Commit**
+- PLACEHOLDER

@@ -4,7 +4,7 @@
 
 As a Phoenix user, I often have several unrelated streams of work active across projects, continuation chains, and standalone conversations. I want one durable Phoenix-wide conversation where I can survey that work, inspect relevant history, and send useful text guidance to existing conversations without opening and operating each one manually.
 
-The Coordinator is an open-ended cross-conversation console, not ambient memory for ordinary coding conversations and not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer.
+The Coordinator is an open-ended cross-conversation console, not ambient memory for ordinary coding conversations and not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. The Coordinator is excluded from the product conversation lifecycle and WorkScope model used for ordinary user and sub-agent execution conversations.
 
 ## Why the User Cares
 
@@ -37,14 +37,14 @@ THE SYSTEM SHALL provide bounded relational facts rather than application-inferr
 WHEN a user opens the Coordinator surface
 THE surface SHALL present only the normal Coordinator conversation
 
-THE facts SHALL distinguish continuation-root identity from current-conversation identity and SHALL include current state, state-update time, conversation-update time, available task metadata, WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
+THE facts SHALL distinguish durable root identity from latest execution-row identity and SHALL include current state, state-update time, conversation-update time, available task metadata, attached WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
 
 ---
 
 ### REQ-GR-002: Expose Continuation Identity Without Collapsing Evidence
 
 WHEN conversations form a continuation chain
-THE SYSTEM SHALL expose both the durable chain root and the current/latest conversation
+THE SYSTEM SHALL expose both the durable root conversation and the current/latest execution row
 
 WHEN the Coordinator requests current transcript evidence
 THE SYSTEM SHALL direct it to the current/latest conversation rather than silently reading only the historical root

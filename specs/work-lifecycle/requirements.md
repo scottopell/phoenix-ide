@@ -1,9 +1,9 @@
-# Work Lifecycle: Terminal Actions on Work and Branch Conversations
+# Work Lifecycle: Close Actions on Git-Backed Work Conversations
 
 ## User Story
 
-As a developer using PhoenixIDE, I need clear, safe terminal actions on my Work and Branch
-conversations so that I can close out completed or abandoned work without accidentally
+As a developer using PhoenixIDE, I need clear, safe close actions on my Work and Branch
+conversations so that I can move finished or abandoned Git-backed work into History without accidentally
 destroying git state I care about, and without being blocked by Phoenix when I already know
 the outcome of my PR.
 
@@ -13,6 +13,7 @@ This spec governs the **action semantics and git side effects** of:
 
 - **Abandon** — discarding a Work or Branch conversation.
 - **Mark as merged** — signalling that a Work or Branch conversation's work has shipped.
+- **Close conversation** as the product lifecycle action those outcomes trigger.
 - **PR merge state** as the advisory gate that guides (but never triggers) the cleanup path.
 
 It does **not** own:
@@ -38,7 +39,7 @@ Each terminal action's branch disposition depends only on the live conversation 
 
 ## Requirements
 
-### REQ-WL-001: Abandon a Conversation
+### REQ-WL-001: Abandon a Conversation and Close It to History
 
 WHEN the user initiates the Abandon action on a Work or Branch conversation
 THE SYSTEM SHALL present a confirmation dialog warning that the worktree will be deleted and
@@ -52,6 +53,7 @@ AND, when no other live conversation still owns that `WorkScope`, delete the wor
 AND, when no other live conversation still owns that `WorkScope`, apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
   keep the branch)
 AND resolve the conversation via bedrock's `TaskResolved` with outcome `abandoned`
+AND close the product conversation into History
 AND emit a synthetic system message describing the outcome
 
 WHEN the user cancels the confirmation dialog
@@ -70,13 +72,14 @@ Abandon may be initiated. This requirement governs what happens after the user c
 
 ---
 
-### REQ-WL-002: Mark as Merged
+### REQ-WL-002: Mark as Merged and Close to History
 
 WHEN the user initiates "Mark as merged" on a Work or Branch conversation
 THE SYSTEM SHALL, when no other live conversation still owns that `WorkScope`, delete the worktree
 AND, when no other live conversation still owns that `WorkScope`, apply the mode-dependent branch disposition (Managed: delete the task branch; Branch:
   keep the branch)
 AND resolve the conversation via bedrock's `TaskResolved` with outcome `merged`
+AND close the product conversation into History
 AND emit a synthetic system message describing the outcome
 
 THE SYSTEM SHALL NOT squash-merge to the base branch
@@ -106,7 +109,7 @@ AND `gh` can observe the pull request's state for the branch
 THE SYSTEM SHALL use the observed PR state to guide the cleanup action:
 WHEN a Work or Branch conversation has multiple associated pull requests
 THE SYSTEM SHALL summarize their mixed states honestly to the user-facing cleanup surface
-AND SHALL preserve cleanup as one task/worktree action rather than one lifecycle per PR
+AND SHALL preserve cleanup as one WorkScope-owner action rather than one lifecycle per PR
 
 WHEN one explicit active PR is selected by `pr-association`
 THE SYSTEM SHALL allow sibling cleanup surfaces to name that PR specifically where PR-specific

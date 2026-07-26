@@ -647,25 +647,31 @@ THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a displ
   re-propose" error rather than silently resetting to Idle.)
 
 THE HandedOff state SHALL carry `successor_conv_id` and reject further user messages;
-  it represents a read-only predecessor whose live work belongs to the successor
-  linked by `continued_in_conv_id`.
+  it represents a history row whose live execution target is the successor linked by
+  `continued_in_conv_id`.
 
 WHEN the user approves the task while in AwaitingTaskApproval with the
-`continue_in_current_conversation` handoff policy
+Continue here policy
 THE SYSTEM SHALL rename the worktree's temp branch in place to `task-{NNNN}-{slug}`
   (the worktree already exists — REQ-PROJ-028), promote the task file's status to
   `in-progress` if needed, commit it on that branch (never on main), and transition the
-  conversation to Idle in Work mode
+  same product conversation to Idle in Work mode
+AND SHALL treat the approval as a checkpoint only
+AND SHALL NOT create a fresh conversation row
+AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, repository state beyond the
+  approved task commit, or provenance records beyond the approval itself
 
 WHEN the user approves the task while in AwaitingTaskApproval with the
-`start_fresh_work_conversation` handoff policy
+Start in new conversation policy
 THE SYSTEM SHALL perform the same task approval git operations
-AND create a fresh Work conversation that becomes the live owner of the approved `WorkScope`, task branch, and worktree
+AND create a fresh Work conversation that becomes the live owner of a fresh `WorkScope`, task branch, and worktree
 AND link the Explore predecessor to that Work successor through `continued_in_conv_id`
 AND mark the Explore predecessor read-only as `HandedOff`
 AND dispatch the next LLM request only in the Work successor
 AND seed the Work successor's first LLM-visible context from the approved task brief
   and approval metadata, excluding the Explore transcript
+AND SHALL treat that Work successor as a separate Open conversation derived from the source conversation rather than as an in-place continuation of the predecessor's runtime environment
+AND SHALL carry only the exact approved task as the derived starting context
 
 WHEN the user provides annotation feedback while in AwaitingTaskApproval
 THE SYSTEM SHALL close the prose reader
@@ -700,53 +706,51 @@ happen on the task branch.
 
 ---
 
-### REQ-BED-029: Conversation Terminal State on Task Resolution
+### REQ-BED-029: Close Conversation After Work Resolution
 
 WHEN a Work or Branch conversation is marked as merged (work-lifecycle REQ-WL-002 — worktree
   removed; the task branch deleted for Managed mode, kept for Branch mode)
-THE SYSTEM SHALL transition the conversation to Terminal state
+THE SYSTEM SHALL transition the product conversation to History state
 AND the conversation SHALL NOT accept new user messages
 
 WHEN a Work or Branch conversation is abandoned (work-lifecycle REQ-WL-001)
-THE SYSTEM SHALL transition the conversation to Terminal state
+THE SYSTEM SHALL transition the product conversation to History state
 AND the conversation SHALL NOT accept new user messages
 
-WHEN a conversation enters Terminal state after task resolution
+WHEN a conversation enters History after work resolution
 THE SYSTEM SHALL inject a synthetic system message indicating the outcome
   ("Marked as merged…" / "Abandoned…", plus the captured diff snapshot on abandon)
 AND the conversation SHALL remain visible in the sidebar for reference
 AND the user SHALL be able to start a new conversation on the same project
 
 **Rationale:** Work and Branch conversations are single-purpose: one task or one branch,
-one worktree, one lifecycle. When the task concludes (merged or abandoned), the
-conversation is done — there is no in-Phoenix merge step, just a cleanup of the
-worktree (and, for Managed mode, the task branch). Returning to Explore mode would
-create confusion about what the conversation's context represents (the worktree is
-gone). Terminal state is clean and explicit; the user creates a new conversation to keep
-working on the project.
+one worktree, one conversation lifecycle. When the task concludes (merged or abandoned), the
+Open conversation moves to History — there is no in-Phoenix merge step, just cleanup of the
+worktree (and, for Managed mode, the task branch). Returning to Explore mode would create
+confusion about what the conversation's context represents once the worktree is gone.
 
 ---
 
 ### REQ-BED-030: Context Continuation Inherits Parent Environment
 
 WHEN user initiates continuation from a context-exhausted conversation
-THE SYSTEM SHALL create a new conversation that inherits:
+THE SYSTEM SHALL create a new transcript row within the same product conversation that inherits:
   - the parent's conversation mode (Work → Work, Branch → Branch, Explore → Explore, Direct → Direct)
   - the parent's working directory
   - the parent's worktree, if any (Work, Branch, and Explore modes all have worktrees — see REQ-PROJ-028 for Explore worktree creation on first message), via ownership transfer rather than destroy-and-recreate
   - any uncommitted changes in that worktree
   - for Work mode, the parent's task_id and associated task file
 
-WHEN the parent has a worktree
-THE SYSTEM SHALL transfer `WorkScope` ownership atomically in a single database transaction:
+WHEN the current execution row has a worktree
+THE SYSTEM SHALL transfer `WorkScope` ownership atomically in a single database transaction while keeping the durable root conversation identity unchanged:
   - the parent retains its `worktree_path` field as a read-only reference for history navigation
   - the continuation's `worktree_path` is set to the same value
   - the continuation inherits the same `work_scope_id`
   - the live owner of that `WorkScope` moves from parent to continuation
   - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
 
-WHEN a continuation successor is newly created
-THE SYSTEM SHALL submit the user-selected handoff text as the successor's first user message
+WHEN a continuation successor row is newly created
+THE SYSTEM SHALL submit the user-selected handoff text as that successor row's first user message
 AND SHALL use a client-generated message identifier for idempotent acceptance
 
 WHEN a parent conversation already has a continuation
@@ -761,7 +765,7 @@ ceremony or a separate auto-stash feature. Transferring ownership rather than
 destroying and recreating is the only shape that preserves uncommitted work
 structurally, without a separate auto-stash mechanism. Single-continuation
 policy keeps work ownership unambiguous: at any moment, exactly one
-live conversation in the parent→continuation chain owns the `WorkScope` and therefore the inherited worktree.
+live row in the product conversation's continuation topology owns the `WorkScope` and therefore the inherited worktree.
 
 **Dependencies:** REQ-BED-021, REQ-PROJ-025, work-lifecycle REQ-WL-001/REQ-WL-002, REQ-PROJ-028
 
@@ -775,15 +779,15 @@ AND preserve its worktree, if any, across server restarts
 AND preserve its branch in git
 
 WHEN a context-exhausted conversation has no continuation
-THE SYSTEM SHALL permit user-initiated terminal actions (abandon or mark-as-merged)
+THE SYSTEM SHALL permit user-initiated close actions (abandon or mark-as-merged)
 AND on abandon, apply the same worktree/branch disposition as abandon from a non-terminal state
   (worktree removed; branch removed for Work mode, preserved for Branch mode, per work-lifecycle REQ-WL-001)
 AND on mark-as-merged, apply the same worktree/branch disposition as mark-as-merged from a non-terminal state
   (worktree removed; branch removed for Work mode, preserved for Branch mode, per work-lifecycle REQ-WL-002)
 
 WHEN a context-exhausted conversation has an existing continuation
-THE SYSTEM SHALL NOT permit abandon or mark-as-merged on the parent
-(the continuation is the live conversation — any terminal decision belongs on the continuation)
+THE SYSTEM SHALL NOT permit abandon or mark-as-merged on the predecessor row
+(the continuation is the latest execution row — any close decision belongs on that latest row)
 
 WHEN the server restarts and encounters a context-exhausted conversation with a worktree
 THE SYSTEM SHALL preserve the worktree unchanged

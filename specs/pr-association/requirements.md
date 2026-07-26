@@ -105,13 +105,14 @@ WHEN active-PR inference is ambiguous
 THE SYSTEM SHALL leave PR-specific actions ambiguous or unavailable rather than silently choosing
   by recency alone
 
-**Design:** Phoenix owns one WorkScope lifecycle, not one-PR-only work. Durable settled-branch
+**Design:** Phoenix owns one WorkScope resource history, not one-PR-only work. Durable settled-branch
 observation gives Phoenix a cheap, local, structurally honest source of candidate PR heads without
 parsing commands, installing Git hooks, or exposing raw WorkScope construction to agents. The
 active PR is explicit because PR-specific surfaces need a target whose provenance is visible:
 user-pinned intent must outrank inference, and compatibility singular projections must not remain
-an invisible authority once multiple deliverable PRs exist. Continuations and fresh Work handoffs
-therefore keep the same WorkScope-owned PR history rather than minting a successor-local PR owner.
+an invisible authority once multiple deliverable PRs exist. Continuations therefore keep the same
+WorkScope-owned PR history, while Start in new conversation and follow-up forks create separate Open
+conversations with their own WorkScopes rather than inheriting PR ownership.
 
 ---
 

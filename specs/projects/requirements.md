@@ -177,7 +177,7 @@ AND transition the conversation to Explore mode (Idle)
 AND the agent MAY revise the plan and call `propose_task` again
   (which re-enters AwaitingTaskApproval and reopens the prose reader)
 
-WHEN user approves the task AND the file's name parses as a taskmd filename
+WHEN the user approves the task AND the file's name parses as a taskmd filename
 THE SYSTEM SHALL parse the task ID, priority, status, and slug from the on-disk task
   file's name (it allocates no ID; see REQ-PROJ-006)
 AND choose `task-{ID}-{slug}` as the desired execution branch (REQ-PROJ-028)
@@ -186,9 +186,10 @@ AND if that branch name already exists locally or at `origin`, choose a suffixed
 AND rename the worktree's temp branch in place to the chosen execution branch
 AND rename the task file to `...-in-progress--{slug}.md` if it isn't already
 AND commit the task file on that execution branch in the existing worktree
-AND transition the conversation from Explore to Work mode within the same worktree
-  (storing worktree_path, `work_scope_id`, the chosen branch_name, base_branch, task_id, task_title)
-AND resume agent execution with the chosen branch name
+AND, for Continue here, keep the same Open conversation and treat approval as a checkpoint with no additional lifecycle, environment, repository, or provenance side effect beyond the approved task commit
+AND, for Start in new conversation, create a separate Open conversation derived from the source conversation, with a fresh `WorkScope`, fresh worktree, and only the exact approved task as its starting context
+AND resume agent execution on the chosen branch in whichever Open conversation the approved handoff policy selects
+
 
 WHEN user approves the task AND the file is a plain-markdown brief (not a taskmd filename)
 THE SYSTEM SHALL choose `task-{sanitized-file-stem}-{conversation-id-prefix}` as the desired
@@ -199,9 +200,9 @@ AND if that branch name already exists locally or at `origin`, choose a suffixed
 AND rename the worktree's temp branch in place to the chosen execution branch
 AND NOT rename the file (a plain brief has no status segment) and NOT call `format_filename`
 AND commit the file at its own path on the execution branch
-AND transition the conversation to Work mode (the `task_id` recorded is the sanitized stem,
-  kept non-empty for the conversation record; there is no `task_title` parse so the display
-  title — the body's `# H1`, falling back to the stem — is used)
+AND, for Continue here, transition the same Open conversation to Work mode
+AND, for Start in new conversation, create a separate Open conversation derived from the source conversation, with a fresh `WorkScope`, fresh worktree, and only the exact approved task as its starting context
+AND record the `task_id` as the sanitized stem, kept non-empty for the conversation record; because there is no `task_title` parse, the display title — the body's `# H1`, falling back to the stem — is used
 
 WHEN user discards the task
 THE SYSTEM SHALL return the conversation to Explore mode
@@ -504,8 +505,9 @@ THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
 AND SHALL NOT demote the conversation's mode
   (the worktree is preserved pending explicit user action per REQ-BED-031)
 
-WHEN a conversation has transferred ownership through `continued_in_conv_id`
+WHEN a transcript row has transferred execution through `continued_in_conv_id`
 THE SYSTEM SHALL treat that row as a history reference rather than a live worktree owner
+AND SHALL derive the latest execution row from the continuation topology rather than storing a second latest-owner authority
 AND SHALL preserve the worktree only while a non-archived live conversation remains the owner of the same `WorkScope`
 
 WHEN a conversation undergoes a terminal-transition cascade (hard-delete,
@@ -632,9 +634,9 @@ name and the base branch.
 
 ---
 
-### REQ-PROJ-018: Direct Mode (Implemented)
+### REQ-PROJ-018: Direct Mode
 
-Direct mode is the default for all new conversations, git-backed and non-git alike.
+Direct mode is the default for all new conversations, Git-backed and chat-only alike.
 
 **Historical note — Standalone → Direct migration.** An earlier design
 split non-git directory conversations into a separate `Standalone` mode
@@ -1006,6 +1008,7 @@ THE SYSTEM SHALL create a fresh top-level conversation in Work mode, in its own 
 worktree (REQ-PROJ-005), on a new task branch **cut from the repository's default branch
 (the project's `main_ref` — REQ-PROJ-034a), not from the originating conversation's
 `base_branch` or HEAD** — uniformly for every origin mode (Work, Branch, Direct-in-git)
+AND SHALL treat the new conversation as a separate Open conversation derived from the source conversation rather than as a continuation row
 AND write the snapshot's bytes into the fork's worktree (a taskmd file under the tasks
 directory, a plain brief at its own path — classified as in REQ-PROJ-006); for a taskmd
 file, promote its status to `in-progress` before committing exactly as REQ-PROJ-006 does
@@ -1064,7 +1067,7 @@ lifecycle) and from `continued_in_conv_id` (chains — REQ-BED-030), and SHALL c
 lifecycle or notification semantics
 
 THE SYSTEM SHALL NOT establish any lifecycle relationship between the originating
-conversation and the fork:
+conversation and the fork beyond derived-from provenance:
 - the fork SHALL NOT be a sub-agent of the originator (no AwaitingSubAgentResult, no
   SubAgentResult — REQ-PROJ-008)
 - the fork SHALL NOT be a chain continuation of the originator (no `continued_in_conv_id`,
@@ -1116,7 +1119,8 @@ THE `propose_task` tool SHALL be available as follows:
 
 A Direct origin owns no worktree or task ceremony of its own, yet the fork it proposes is
 a managed Work conversation (own worktree, own task branch off the repository's default
-branch). The fork is managed even when its origin is not.
+branch). The fork is managed even when its origin is not. A follow-up fork is a separate,
+fresh Open conversation rather than a continuation of the origin.
 
 **Rationale:** Forking is meaningful from any mode that sits on a git history to branch
 from. Explore keeps its distinct, blocking gateway semantics because there the proposal

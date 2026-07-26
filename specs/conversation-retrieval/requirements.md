@@ -318,7 +318,7 @@ frozen list — e.g. "the members of chain root X," re-resolved at each
 tool call — so that membership changes during a run are reflected. What
 is fixed at construction is the *boundary the model cannot cross*, not
 necessarily a static set; liveness within that boundary is permitted and,
-for chain Q&A, required (see chains REQ-CHN-009). The chain scope is lineage-based, not ownership-based: retrieval follows the live member set of the chain even while `WorkScope` ownership transfers among those members.
+for chain Q&A, required (see chains REQ-CHN-009). The chain scope is continuation-topology-based, not `WorkScope`-ownership-based: retrieval follows the live member set of one product conversation even while `WorkScope` ownership transfers among its execution rows.
 
 WHEN a tool call names a conversation outside the bound scope (e.g. a
 read for a conversation not in the bound set)

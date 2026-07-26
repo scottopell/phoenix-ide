@@ -63,20 +63,18 @@ latest conversation in the chain would be misleading.
 
 ### REQ-CHN-002: Continuation Chains Surface as First-Class Entities
 
-WHEN two or more conversations share a linear handoff lineage through
-`continued_in_conv_id` (one was created via "continue in new conversation"
-from another, or a managed Explore task approval was handed off to a fresh
-Work conversation)
-THE SYSTEM SHALL present them as a grouped chain in conversation
-navigation surfaces, identifiable by the chain's root conversation as
+WHEN two or more transcript rows share a linear handoff lineage through
+`continued_in_conv_id` (one was created via context continuation from another,
+or a managed Explore task approval was handed off to Start in new conversation)
+THE SYSTEM SHALL present them as one grouped product conversation in conversation
+navigation surfaces, identifiable by the durable root conversation as
 its identity
 
 THE SYSTEM SHALL render chain members visually nested under a
 collapsible chain header in the sidebar, in chain order (root → latest)
 
-WHEN a conversation has not been continued and was not itself a
-continuation
-THE SYSTEM SHALL render it as a standalone (non-chain) navigation entry
+WHEN a conversation has no continuation lineage beyond its durable root row
+THE SYSTEM SHALL render it as a standalone navigation entry
 
 **Rationale:** Chain membership emerges automatically from how the
 user already structures work via continuations — no manual grouping
@@ -237,7 +235,8 @@ now." It does not answer "what *unit of work* is this" — the worktree,
 branch, task, and pull request the chain is driving. REQ-CHN-008 adds
 that second, complementary facet to the chain page's work-scope surface.
 The two are different views of one `WorkScope`: runtime resources (the
-existing dock) and work identity + PR health (this requirement).
+existing dock) and work identity + PR health (this requirement). The
+`WorkScope` owns resources; the durable root conversation owns Open/History lifecycle.
 
 WHEN the chain page is displayed
 THE SYSTEM SHALL surface, for the chain's work scope, its **work
@@ -263,9 +262,9 @@ over the in-memory runtime registries (`specs/work-scope-ui/`
 REQ-WSUI-001); externally-polled PR state and durable git metadata do not
 belong in that registry snapshot.
 
-WHEN the chain has no managed work scope (e.g. a chain of Direct
-conversations with no worktree)
-THE SYSTEM SHALL indicate the absence of a managed work scope rather than
+WHEN the chain has no Git-backed work scope (e.g. a chat-only Direct
+conversation lineage with no worktree)
+THE SYSTEM SHALL indicate the absence of a Git-backed work scope rather than
 rendering empty worktree/branch/PR fields
 
 **Rationale:** The member list answers "what conversations happened"; the
