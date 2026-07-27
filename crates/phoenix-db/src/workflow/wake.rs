@@ -2885,11 +2885,16 @@ impl WakeRepository {
     pub async fn adopt_materialized_pending_for_conversation(
         &self,
         conversation_id: &str,
+        exact_deliveries: &[(WorkflowId, DeliveryId)],
         timestamp: Timestamp,
     ) -> DbResult<WakeAdoptMaterializedPendingOutcome> {
         for _ in 0..20 {
             match self
-                .adopt_materialized_pending_for_conversation_once(conversation_id, timestamp)
+                .adopt_materialized_pending_for_conversation_once(
+                    conversation_id,
+                    exact_deliveries,
+                    timestamp,
+                )
                 .await
             {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
@@ -2900,8 +2905,12 @@ impl WakeRepository {
                 result => return result,
             }
         }
-        self.adopt_materialized_pending_for_conversation_once(conversation_id, timestamp)
-            .await
+        self.adopt_materialized_pending_for_conversation_once(
+            conversation_id,
+            exact_deliveries,
+            timestamp,
+        )
+        .await
     }
 
     pub async fn suppress_pending_for_archived_conversation(
@@ -3128,6 +3137,7 @@ impl WakeRepository {
     async fn adopt_materialized_pending_for_conversation_once(
         &self,
         conversation_id: &str,
+        exact_deliveries: &[(WorkflowId, DeliveryId)],
         timestamp: Timestamp,
     ) -> DbResult<WakeAdoptMaterializedPendingOutcome> {
         let mut tx = self.workflow_repo.begin_tx().await?;
@@ -3156,6 +3166,42 @@ impl WakeRepository {
             fetch_materialized_pending_batches_for_conversation_tx(&mut tx, conversation_id)
                 .await?;
         if batches.is_empty() {
+            tx.rollback().await?;
+            return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
+        }
+
+        let exact_deliveries: std::collections::BTreeSet<_> =
+            exact_deliveries.iter().copied().collect();
+        if exact_deliveries.is_empty() {
+            tx.rollback().await?;
+            return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
+        }
+        let batches: Vec<_> = batches
+            .into_iter()
+            .filter_map(|(workflow_id, pending_ids, materialized)| {
+                let pending_ids: Vec<_> = pending_ids
+                    .into_iter()
+                    .filter(|delivery_id| exact_deliveries.contains(&(workflow_id, *delivery_id)))
+                    .collect();
+                let materialized: Vec<_> = materialized
+                    .into_iter()
+                    .filter(|item| {
+                        exact_deliveries
+                            .contains(&(workflow_id, item.pending.canonical_delivery.delivery_id))
+                    })
+                    .collect();
+                (!pending_ids.is_empty()).then_some((workflow_id, pending_ids, materialized))
+            })
+            .collect();
+        let selected_deliveries: std::collections::BTreeSet<_> = batches
+            .iter()
+            .flat_map(|(workflow_id, pending_ids, _)| {
+                pending_ids
+                    .iter()
+                    .map(|delivery_id| (*workflow_id, *delivery_id))
+            })
+            .collect();
+        if selected_deliveries != exact_deliveries {
             tx.rollback().await?;
             return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
         }
@@ -5932,7 +5978,11 @@ mod tests {
         materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await;
 
         let outcome = repo
-            .adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+            .adopt_materialized_pending_for_conversation(
+                "conv-1",
+                &[(workflow_id, DeliveryId(1))],
+                Timestamp(51),
+            )
             .await
             .unwrap();
         let WakeAdoptMaterializedPendingOutcome::Adopted(adopted) = outcome else {
@@ -5961,6 +6011,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conversation_adoption_accepts_exact_materialized_prefix() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let first_workflow = WorkflowId(8121);
+        let second_workflow = WorkflowId(8122);
+        let first = create_pending_terminal_delivery(&repo, first_workflow).await;
+        let mut second_intent = intent();
+        let WakeResourceIdentity::Bash(second_resource) = &mut second_intent.resource else {
+            unreachable!("test intent is Bash")
+        };
+        second_resource.handle_id = "b-2".to_string();
+        assert!(matches!(
+            repo.register_allocated(second_workflow, &second_intent, "fp-2", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let second_claim = unwrap_started(
+            repo.claim_observation_if_eligible(
+                second_workflow,
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut second_evidence = bash_evidence(19);
+        if let WakeTerminalEvidence::Bash(evidence) = &mut second_evidence {
+            evidence.identity.handle_id = "b-2".to_string();
+        } else {
+            unreachable!("test evidence is Bash")
+        }
+        repo.record_terminal_evidence(
+            second_workflow,
+            second_claim.authority.as_ref().unwrap(),
+            1,
+            ReceiptId(1),
+            DeliveryId(1),
+            Timestamp(20),
+            &second_evidence,
+        )
+        .await
+        .unwrap();
+        materialize_pending(&repo, &first, "wake complete", None, true, Timestamp(50)).await;
+
+        let outcome = repo
+            .adopt_materialized_pending_for_conversation(
+                "conv-1",
+                &[(first_workflow, first.canonical_delivery.delivery_id)],
+                Timestamp(51),
+            )
+            .await
+            .unwrap();
+
+        let WakeAdoptMaterializedPendingOutcome::Adopted(adopted) = outcome else {
+            panic!("expected materialized prefix adoption");
+        };
+        assert_eq!(adopted.links.len(), 1);
+        let pending = repo.list_pending("conv-1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].workflow_id, second_workflow);
+    }
+
+    #[tokio::test]
     async fn conversation_adoption_leaves_busy_delivery_owed() {
         let (_dir, repo, _) = open_repo_pair().await;
         let workflow_id = WorkflowId(813);
@@ -5974,9 +6088,13 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            repo.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
-                .await
-                .unwrap(),
+            repo.adopt_materialized_pending_for_conversation(
+                "conv-1",
+                &[(workflow_id, DeliveryId(1))],
+                Timestamp(51)
+            )
+            .await
+            .unwrap(),
             WakeAdoptMaterializedPendingOutcome::Busy(_)
         ));
         assert_eq!(repo.list_pending("conv-1").await.unwrap().len(), 1);
@@ -6000,9 +6118,13 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            repo.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
-                .await
-                .unwrap(),
+            repo.adopt_materialized_pending_for_conversation(
+                "conv-1",
+                &[(workflow_id, DeliveryId(1))],
+                Timestamp(51)
+            )
+            .await
+            .unwrap(),
             WakeAdoptMaterializedPendingOutcome::NothingPending
         ));
         assert_eq!(repo.list_pending("conv-1").await.unwrap().len(), 1);
@@ -6059,7 +6181,11 @@ mod tests {
         .await;
 
         let WakeAdoptMaterializedPendingOutcome::Adopted(adopted) = repo
-            .adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+            .adopt_materialized_pending_for_conversation(
+                "conv-1",
+                &[(workflow_id, DeliveryId(1))],
+                Timestamp(51),
+            )
             .await
             .unwrap()
         else {
@@ -6093,9 +6219,18 @@ mod tests {
         let pending = create_pending_terminal_delivery(&first, workflow_id).await;
         materialize_pending(&first, &pending, "wake complete", None, true, Timestamp(50)).await;
 
+        let exact_deliveries = [(workflow_id, DeliveryId(1))];
         let (left, right) = tokio::join!(
-            first.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51)),
-            second.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+            first.adopt_materialized_pending_for_conversation(
+                "conv-1",
+                &exact_deliveries,
+                Timestamp(51)
+            ),
+            second.adopt_materialized_pending_for_conversation(
+                "conv-1",
+                &exact_deliveries,
+                Timestamp(51)
+            )
         );
         let outcomes = [left.unwrap(), right.unwrap()];
         assert_eq!(
@@ -8963,7 +9098,11 @@ mod tests {
         ));
 
         let outcome = repo
-            .adopt_materialized_pending_for_conversation("conv-1", Timestamp(21))
+            .adopt_materialized_pending_for_conversation(
+                "conv-1",
+                &[(workflow_id, DeliveryId(1))],
+                Timestamp(21),
+            )
             .await
             .unwrap();
         match outcome {

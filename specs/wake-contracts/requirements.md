@@ -120,7 +120,7 @@ THE `terminal_cause` and `forgotten_reason` columns SHALL be the queryable
 terminal discriminators used for metrics and operator views. `forgotten_reason`
 SHALL be populated whenever `terminal_cause = Forgotten` and SHALL be drawn from a
 finite set: `phoenix_restart`, `cascade_destroyed_handle`,
-`subagent_handle_missing`, or `tmux_handle_missing`. The `terminal_payload` column
+`bash_waiter_panicked`, `subagent_handle_missing`, or `tmux_handle_missing`. The `terminal_payload` column
 SHALL hold only the cause-specific body and SHALL NOT repeat those discriminator
 values or the watched `handle_kind`; replay derives the fired payload variant
 from the contract row.

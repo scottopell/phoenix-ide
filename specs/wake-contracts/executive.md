@@ -132,8 +132,8 @@ remain explicit runtime errors until their end-to-end lifecycle is implemented.
 | REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
 
 Requirements remain Partial because the end-to-end surface currently covers only
-Bash handles. Tmux and sub-agent registration, user status/cancellation, and the
-remaining observability surfaces are not implemented.
+Bash handles. Tmux and sub-agent registration and the remaining observability
+surfaces are not implemented.
 
 ## Dependencies
 

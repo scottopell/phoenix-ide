@@ -93,12 +93,12 @@ impl WakeRegistrar for ProductionWakeRegistrar {
         let prepared_fingerprint = input.prepared_fingerprint.clone();
         let conversation_id = input.conversation_id.clone();
         let intent = input.into_intent(now);
+        let _acceptance_guard = self.acceptance_lock.lock().await;
         let _conversation_guard = crate::runtime::acquire_conversation_acceptance_lock(
             &self.conversation_acceptance_locks,
             &conversation_id,
         )
         .await;
-        let _acceptance_guard = self.acceptance_lock.lock().await;
         let outcome = self
             .repo
             .register(&intent, &prepared_fingerprint, now)
@@ -203,8 +203,10 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .reconcile_continuation_transfers(self.clock.now())
             .await
             .map_err(|error| error.to_string())?;
+        let acceptance_guard = manager.lock_steering_acceptance().await;
         self.run_once().await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
+        drop(acceptance_guard);
         let _ = ready_tx.send(());
         self.run_loop_inner(&mut kick_rx, Some(manager)).await
     }
@@ -216,6 +218,11 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
     ) -> Result<(), String> {
         let mut error_backoff = ERROR_RETRY_BASE_INTERVAL;
         loop {
+            let acceptance_guard = if let Some(manager) = manager.as_ref() {
+                Some(manager.lock_steering_acceptance().await)
+            } else {
+                None
+            };
             let wait = match self.run_once().await {
                 Ok(wait) => {
                     if let Some(manager) = manager.as_ref() {
@@ -243,6 +250,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                     wait
                 }
             };
+            drop(acceptance_guard);
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
             tokio::select! {
@@ -457,6 +465,7 @@ async fn adopt_materialized_delivery(
     handle: &crate::runtime::ConversationHandle,
     repo: &WakeRepository,
     conversation_id: &str,
+    deliveries: &[(phoenix_workflow::WorkflowId, phoenix_workflow::DeliveryId)],
     now: Timestamp,
 ) -> Result<(), String> {
     let runtimes = manager.runtimes.read().await;
@@ -472,7 +481,7 @@ async fn adopt_materialized_delivery(
         .await
         .map_err(|error| error.to_string())?;
     let outcome = repo
-        .adopt_materialized_pending_for_conversation(conversation_id, now)
+        .adopt_materialized_pending_for_conversation(conversation_id, deliveries, now)
         .await
         .map_err(|error| error.to_string())?;
     if let phoenix_db::workflow::wake::WakeAdoptMaterializedPendingOutcome::Adopted(adopted) =
@@ -533,7 +542,6 @@ async fn deliver_pending(
             let _conversation_acceptance = manager
                 .lock_conversation_acceptance(&current.conversation_id)
                 .await;
-            let _steering_acceptance = manager.lock_steering_acceptance().await;
             let active_direct_turn =
                 phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone())
                     .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
@@ -646,9 +654,25 @@ async fn deliver_pending(
                     }
                 }
             }
+            let deliveries: Vec<_> = conversation_pending
+                .iter()
+                .map(|delivery| {
+                    (
+                        delivery.workflow_id,
+                        delivery.canonical_delivery.delivery_id,
+                    )
+                })
+                .collect();
             drop(reserved);
-            adopt_materialized_delivery(manager, &handle, repo, &current.conversation_id, now)
-                .await?;
+            adopt_materialized_delivery(
+                manager,
+                &handle,
+                repo,
+                &current.conversation_id,
+                &deliveries,
+                now,
+            )
+            .await?;
             cursor = Some(next_cursor);
         }
         if page_len < OBSERVATION_BATCH_LIMIT {
@@ -2426,7 +2450,7 @@ mod tests {
             identity: Arc::new(()),
             ..handle.clone()
         };
-        adopt_materialized_delivery(&manager, &stale, &repo, "conv", Timestamp(1))
+        adopt_materialized_delivery(&manager, &stale, &repo, "conv", &[], Timestamp(1))
             .await
             .unwrap();
     }
@@ -2534,9 +2558,24 @@ mod tests {
         ));
         let handle = manager.get_or_create("conv").await.unwrap();
         let mut state_rx = handle.state_rx.clone();
-        adopt_materialized_delivery(&manager, &handle, &repo, "conv", Timestamp(21))
-            .await
-            .unwrap();
+        adopt_materialized_delivery(
+            &manager,
+            &handle,
+            &repo,
+            "conv",
+            &pending
+                .iter()
+                .map(|delivery| {
+                    (
+                        delivery.workflow_id,
+                        delivery.canonical_delivery.delivery_id,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Timestamp(21),
+        )
+        .await
+        .unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {

@@ -150,6 +150,7 @@ enum TerminalCause {
 enum ForgottenReason {
     phoenix_restart
     | cascade_destroyed_handle
+    | bash_waiter_panicked
     | subagent_handle_missing
     | tmux_handle_missing
 }
