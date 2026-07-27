@@ -272,18 +272,18 @@ pub enum BashLifecyclePhase {
     Terminal,
 }
 
-impl BashLifecyclePhase {
-    #[must_use]
-    pub fn schedules_reconciliation(self) -> bool {
-        matches!(self, Self::Terminal)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashTerminalEffect {
+    InventoryOnly,
+    InventoryAndBranchReconcile,
 }
 
 #[derive(Debug, Clone)]
 pub struct BashLifecycleEvent {
-    pub lifecycle_scope: ResourceScopeKey,
-    pub control_scope: ResourceScopeKey,
+    pub owner: ResourceScopeKey,
+    pub handle_id: Option<HandleId>,
     pub phase: BashLifecyclePhase,
+    pub terminal_effect: Option<BashTerminalEffect>,
 }
 
 /// Sink the registry publishes [`BashLifecycleEvent`]s into. A bounded `mpsc`
@@ -362,22 +362,27 @@ impl BashHandleRegistry {
     /// Mirrors `BrowserSessionManager::emit_lifecycle`.
     pub fn emit_lifecycle(
         &self,
-        lifecycle_scope: &ResourceScopeKey,
-        control_scope: &ResourceScopeKey,
+        owner: &ResourceScopeKey,
+        handle_id: Option<HandleId>,
         phase: BashLifecyclePhase,
+        terminal_effect: Option<BashTerminalEffect>,
     ) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
         };
+        let handle_id_for_log = handle_id.as_ref().map(|id| id.as_str().to_string());
         let event = BashLifecycleEvent {
-            lifecycle_scope: lifecycle_scope.clone(),
-            control_scope: control_scope.clone(),
+            owner: owner.clone(),
+            handle_id,
             phase,
+            terminal_effect,
         };
         if let Err(e) = sink.send(event) {
             tracing::debug!(
-                lifecycle_scope = %lifecycle_scope,
-                control_scope = %control_scope,
+                owner = %owner,
+                phase = ?phase,
+                handle_id = handle_id_for_log.as_deref(),
+                terminal_effect = ?terminal_effect,
                 error = %e,
                 "dropping bash lifecycle event — sink closed"
             );
@@ -743,7 +748,12 @@ pub async fn cascade_bash_on_delete(
     // the bridge would leave the collapsed work-scope badge showing the
     // killed handles (REQ-WSUI-007). NOT emitted on the preserved early
     // return above, where nothing changed.
-    registry.emit_lifecycle(work_scope, work_scope, BashLifecyclePhase::Terminal);
+    registry.emit_lifecycle(
+        work_scope,
+        None,
+        BashLifecyclePhase::Terminal,
+        Some(BashTerminalEffect::InventoryAndBranchReconcile),
+    );
 
     report
 }
@@ -777,7 +787,12 @@ async fn kill_selected_handles(
             }
         }
     }
-    registry.emit_lifecycle(work_scope, work_scope, BashLifecyclePhase::Terminal);
+    registry.emit_lifecycle(
+        work_scope,
+        None,
+        BashLifecyclePhase::Terminal,
+        Some(BashTerminalEffect::InventoryAndBranchReconcile),
+    );
     report
 }
 
@@ -838,17 +853,32 @@ mod tests {
         let registry = BashHandleRegistry::with_lifecycle_sink(Some(tx));
         let a = scope("conv-A");
         let b = scope("conv-B");
-        registry.emit_lifecycle(&a, &a, BashLifecyclePhase::Spawned);
-        registry.emit_lifecycle(&b, &b, BashLifecyclePhase::Terminal);
+        registry.emit_lifecycle(
+            &a,
+            Some(HandleId::new("b-a")),
+            BashLifecyclePhase::Spawned,
+            None,
+        );
+        registry.emit_lifecycle(
+            &b,
+            None,
+            BashLifecyclePhase::Terminal,
+            Some(BashTerminalEffect::InventoryAndBranchReconcile),
+        );
 
         let e1 = rx.try_recv().expect("first event missing");
-        assert_eq!(e1.lifecycle_scope, a);
-        assert_eq!(e1.control_scope, a);
+        assert_eq!(e1.owner, a);
+        assert_eq!(e1.handle_id, Some(HandleId::new("b-a")));
         assert_eq!(e1.phase, BashLifecyclePhase::Spawned);
+        assert_eq!(e1.terminal_effect, None);
         let e2 = rx.try_recv().expect("second event missing");
-        assert_eq!(e2.lifecycle_scope, b);
-        assert_eq!(e2.control_scope, b);
+        assert_eq!(e2.owner, b);
+        assert_eq!(e2.handle_id, None);
         assert_eq!(e2.phase, BashLifecyclePhase::Terminal);
+        assert_eq!(
+            e2.terminal_effect,
+            Some(BashTerminalEffect::InventoryAndBranchReconcile)
+        );
         assert!(rx.try_recv().is_err(), "no more events expected");
     }
 
@@ -856,7 +886,12 @@ mod tests {
     async fn emit_lifecycle_without_sink_is_no_op() {
         let registry = BashHandleRegistry::new();
         let scope = scope("conv-X");
-        registry.emit_lifecycle(&scope, &scope, BashLifecyclePhase::Spawned);
+        registry.emit_lifecycle(
+            &scope,
+            Some(HandleId::new("b-x")),
+            BashLifecyclePhase::Spawned,
+            None,
+        );
         assert!(registry.lifecycle_sink().is_none());
     }
 
@@ -1287,8 +1322,12 @@ mod tests {
         let _ = cascade_bash_on_delete(&registry, &s, &work_actor("owner"), None).await;
 
         let evt = rx.try_recv().expect("teardown must emit a lifecycle edge");
-        assert_eq!(evt.lifecycle_scope, s);
-        assert_eq!(evt.control_scope, s);
+        assert_eq!(evt.owner, s);
+        assert_eq!(evt.handle_id, None);
+        assert_eq!(
+            evt.terminal_effect,
+            Some(BashTerminalEffect::InventoryAndBranchReconcile)
+        );
         assert!(rx.try_recv().is_err(), "exactly one edge per teardown");
     }
 

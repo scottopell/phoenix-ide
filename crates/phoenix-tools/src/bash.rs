@@ -25,10 +25,11 @@ pub mod registry;
 pub mod ring;
 pub mod sandbox;
 
+pub use handle::HandleId;
 pub use reaper::{install_reaper, shutdown_kill_tree};
 pub use registry::{
-    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
-    ResourceScopeKeyHandles,
+    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase,
+    BashLifecycleSink, BashTerminalEffect, ResourceScopeKeyHandles,
 };
 // `types` (BashOp, BashToolInput) moved to phoenix-core. Alias the module back
 // as `types` and re-export the items so existing paths resolve unchanged.

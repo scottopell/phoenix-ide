@@ -33,7 +33,8 @@ use crate::tools::browser::session::{
     BrowserSessionAudience, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
 };
 use crate::tools::{
-    BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, ExploreToolPolicy,
+    BashHandleRegistry, BashLifecycleEvent, BashTerminalEffect, BrowserSessionManager,
+    ExploreToolPolicy,
     TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
 };
 use phoenix_core::work_scope::ResourceScopeKey;
@@ -1631,16 +1632,13 @@ impl RuntimeManager {
     /// one non-terminal conversation per scope, so this lands on the one live
     /// member.
     fn bash_lifecycle_bridge_action(event: &BashLifecycleEvent) -> BashLifecycleBridgeAction {
-        match (
-            &event.lifecycle_scope,
-            &event.control_scope,
-            event.phase.schedules_reconciliation(),
-        ) {
-            (ResourceScopeKey::Work(_), ResourceScopeKey::Work(_), true) => {
-                BashLifecycleBridgeAction::Reconcile
-            }
-            (ResourceScopeKey::Work(_), _, _) => BashLifecycleBridgeAction::Broadcast,
-            (ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal, _, _) => {
+        match (&event.owner, event.terminal_effect) {
+            (
+                ResourceScopeKey::Work(_),
+                Some(BashTerminalEffect::InventoryAndBranchReconcile),
+            ) => BashLifecycleBridgeAction::Reconcile,
+            (ResourceScopeKey::Work(_), _) => BashLifecycleBridgeAction::Broadcast,
+            (ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal, _) => {
                 BashLifecycleBridgeAction::Ignore
             }
         }
@@ -1674,22 +1672,23 @@ impl RuntimeManager {
                     BridgeEvent::Bash(event) => match Self::bash_lifecycle_bridge_action(&event) {
                         BashLifecycleBridgeAction::Ignore => {
                             tracing::debug!(
-                                lifecycle_scope = %event.lifecycle_scope,
-                                control_scope = %event.control_scope,
+                                owner = %event.owner,
                                 phase = ?event.phase,
+                                handle_id = event.handle_id.as_ref().map(|id| id.as_str()),
+                                terminal_effect = ?event.terminal_effect,
                                 "skipping work-scope reconciliation for non-Work bash lifecycle"
                             );
                         }
                         BashLifecycleBridgeAction::Broadcast => {
                             manager
-                                .broadcast_work_scope_update(&event.lifecycle_scope)
+                                .broadcast_work_scope_update(&event.owner)
                                 .await;
                         }
                         BashLifecycleBridgeAction::Reconcile => {
                             manager
-                                .broadcast_work_scope_update(&event.lifecycle_scope)
+                                .broadcast_work_scope_update(&event.owner)
                                 .await;
-                            let ResourceScopeKey::Work(work_scope_id) = &event.lifecycle_scope
+                            let ResourceScopeKey::Work(work_scope_id) = &event.owner
                             else {
                                 unreachable!("bridge action requires Work scope");
                             };
@@ -1703,7 +1702,7 @@ impl RuntimeManager {
                             manager
                                 .reconcile_work_scope_after_bash_terminal(
                                     WorkScopeReconciliationRequest {
-                                        work_scope: event.lifecycle_scope,
+                                        work_scope: event.owner,
                                         terminal_generation: generation,
                                     },
                                 )
@@ -3582,7 +3581,8 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
 #[cfg(test)]
 mod bash_lifecycle_bridge_tests {
     use super::{BashLifecycleBridgeAction, RuntimeManager};
-    use crate::tools::{BashLifecycleEvent, BashLifecyclePhase};
+    use crate::tools::{BashLifecycleEvent, BashLifecyclePhase, BashTerminalEffect};
+    use phoenix_tools::bash::HandleId;
     use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 
     #[test]
@@ -3594,9 +3594,10 @@ mod bash_lifecycle_bridge_tests {
         ] {
             assert_eq!(
                 RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
-                    lifecycle_scope: ResourceScopeKey::Coordinator,
-                    control_scope: ResourceScopeKey::Coordinator,
+                    owner: ResourceScopeKey::Coordinator,
+                    handle_id: None,
                     phase,
+                    terminal_effect: None,
                 }),
                 BashLifecycleBridgeAction::Ignore
             );
@@ -3608,25 +3609,28 @@ mod bash_lifecycle_bridge_tests {
         let scope = ResourceScopeKey::Work(WorkScopeId::parse("scope").unwrap());
         assert_eq!(
             RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
-                lifecycle_scope: scope.clone(),
-                control_scope: scope.clone(),
+                owner: scope.clone(),
+                handle_id: Some(HandleId::new("b-1")),
                 phase: BashLifecyclePhase::Spawned,
+                terminal_effect: None,
             }),
             BashLifecycleBridgeAction::Broadcast
         );
         assert_eq!(
             RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
-                lifecycle_scope: scope.clone(),
-                control_scope: scope.clone(),
+                owner: scope.clone(),
+                handle_id: Some(HandleId::new("b-1")),
                 phase: BashLifecyclePhase::Terminal,
+                terminal_effect: Some(BashTerminalEffect::InventoryAndBranchReconcile),
             }),
             BashLifecycleBridgeAction::Reconcile
         );
         assert_eq!(
             RuntimeManager::bash_lifecycle_bridge_action(&BashLifecycleEvent {
-                lifecycle_scope: scope,
-                control_scope: ResourceScopeKey::Coordinator,
+                owner: scope.clone(),
+                handle_id: Some(HandleId::new("b-1")),
                 phase: BashLifecyclePhase::Terminal,
+                terminal_effect: Some(BashTerminalEffect::InventoryOnly),
             }),
             BashLifecycleBridgeAction::Broadcast
         );

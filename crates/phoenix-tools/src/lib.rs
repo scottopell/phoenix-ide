@@ -25,7 +25,8 @@ pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
-    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
+    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase,
+    BashLifecycleSink, BashTerminalEffect,
     BashOp, BashTool, BashToolInput, ResourceScopeKeyHandles as BashResourceScopeKeyHandles,
     SandboxedBashTool, SharedSandboxedBashRequest, ValidatedBashSpawnTarget,
 };

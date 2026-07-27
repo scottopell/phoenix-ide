@@ -27,7 +27,7 @@ use super::handle::{
     ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState, KillSignal,
     TOMBSTONE_TAIL_LINES,
 };
-use super::registry::{BashHandleError, LiveHandleSummary};
+use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
@@ -435,6 +435,7 @@ pub enum BashSpawnMode {
 struct SpawnContext {
     working_dir: std::path::PathBuf,
     lifecycle_scope: ResourceScopeKey,
+    terminal_effect: BashTerminalEffect,
 }
 
 impl BashSpawnMode {
@@ -494,15 +495,18 @@ async fn dispatch_with_spawn_mode(
                 BashSpawnMode::Direct | BashSpawnMode::ExploreReadOnly => SpawnContext {
                     working_dir: ctx.working_dir().to_path_buf(),
                     lifecycle_scope: ctx.work_scope.clone(),
+                    terminal_effect: BashTerminalEffect::InventoryAndBranchReconcile,
                 },
                 BashSpawnMode::SharedReadOnly => match spawn_target {
                     Some(target) => SpawnContext {
                         working_dir: target.working_dir,
                         lifecycle_scope: ResourceScopeKey::Work(target.lifecycle_scope),
+                        terminal_effect: BashTerminalEffect::InventoryOnly,
                     },
                     None => SpawnContext {
                         working_dir: ctx.working_dir().to_path_buf(),
                         lifecycle_scope: ctx.work_scope.clone(),
+                        terminal_effect: BashTerminalEffect::InventoryOnly,
                     },
                 },
             };
@@ -612,8 +616,9 @@ async fn run_run(
             // emit the terminal edge off-thread.
             registry.emit_lifecycle(
                 &spawn_context.lifecycle_scope,
-                &handle.controller_scope,
+                Some(handle.handle_id.clone()),
                 crate::bash::registry::BashLifecyclePhase::Spawned,
+                None,
             );
             let progress_reporter = ctx
                 .bash_progress_sink()
@@ -626,6 +631,7 @@ async fn run_run(
                 spawn_context.lifecycle_scope.clone(),
                 child,
                 registry.lifecycle_sink(),
+                spawn_context.terminal_effect,
                 sandbox_scratch_dir,
                 progress_reporter.clone(),
             );
@@ -745,6 +751,7 @@ fn start_io_tasks(
     owner_scope: ResourceScopeKey,
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    terminal_effect: BashTerminalEffect,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
     progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
@@ -794,6 +801,7 @@ fn start_io_tasks(
                 stdout_join,
                 stderr_join,
                 lifecycle_sink,
+                terminal_effect,
                 sandbox_scratch_dir,
                 progress_reporter,
             )
@@ -1050,6 +1058,7 @@ async fn run_waiter(
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    terminal_effect: BashTerminalEffect,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
     progress_reporter: Option<Arc<LiveBashProgressReporter>>,
 ) {
@@ -1098,13 +1107,15 @@ async fn run_waiter(
         // not double-emit. Best-effort: a closed sink is logged by the bridge.
         if let Some(sink) = &lifecycle_sink {
             if let Err(e) = sink.send(crate::bash::registry::BashLifecycleEvent {
-                lifecycle_scope: owner_scope.clone(),
-                control_scope: handle.controller_scope.clone(),
+                owner: owner_scope.clone(),
+                handle_id: Some(handle.handle_id.clone()),
                 phase: crate::bash::registry::BashLifecyclePhase::Terminal,
+                terminal_effect: Some(terminal_effect),
             }) {
                 tracing::debug!(
-                    lifecycle_scope = %owner_scope,
-                    control_scope = %handle.controller_scope,
+                    owner = %owner_scope,
+                    handle_id = %handle.handle_id,
+                    terminal_effect = ?terminal_effect,
                     error = %e,
                     "dropping bash terminal lifecycle event — sink closed"
                 );
@@ -1334,10 +1345,17 @@ async fn run_kill(
             // state the inventory reflects (REQ-WSUI-007). Emit a non-
             // reconciling lifecycle phase now; the later true terminal
             // transition still emits from the waiter after final I/O drains.
+            let owner = ctx
+                .bash_handle_registry()
+                .get_by_id(&handle.handle_id)
+                .await
+                .map(|registered| registered.owner)
+                .unwrap_or_else(|| ctx.work_scope.clone());
             ctx.bash_handle_registry().emit_lifecycle(
-                &ctx.work_scope,
-                &handle.controller_scope,
+                &owner,
+                Some(handle.handle_id.clone()),
                 crate::bash::registry::BashLifecyclePhase::KillPendingKernel,
+                None,
             );
             shape_handle_response(
                 &handle,
@@ -2019,6 +2037,7 @@ mod tests {
         SpawnContext {
             working_dir: ctx.working_dir().to_path_buf(),
             lifecycle_scope: ctx.work_scope.clone(),
+            terminal_effect: BashTerminalEffect::InventoryAndBranchReconcile,
         }
     }
 
@@ -2468,6 +2487,7 @@ mod tests {
                 lifecycle_scope: ResourceScopeKey::Work(
                     phoenix_core::work_scope::WorkScopeId::parse("coordinator-target").unwrap(),
                 ),
+                terminal_effect: BashTerminalEffect::InventoryOnly,
             },
             BashSpawnMode::Direct,
         )
@@ -2608,8 +2628,9 @@ mod tests {
 
         let spawned = rx.recv().await.expect("spawned event");
         assert_eq!(spawned.phase, BashLifecyclePhase::Spawned);
-        assert_eq!(spawned.lifecycle_scope, ctx.work_scope);
-        assert_eq!(spawned.control_scope, ctx.work_scope);
+        assert_eq!(spawned.owner, ctx.work_scope);
+        assert_eq!(spawned.handle_id.as_ref().map(|id| id.as_str()), Some(handle_id.as_str()));
+        assert_eq!(spawned.terminal_effect, None);
 
         // Wait for the trap-installed marker to appear in the ring. Deterministic
         // proof the trap is in place; no wall-clock assumption about bash startup.
@@ -2658,12 +2679,12 @@ mod tests {
 
         let kill_pending = rx.recv().await.expect("kill-pending event");
         assert_eq!(kill_pending.phase, BashLifecyclePhase::KillPendingKernel);
-        assert_eq!(kill_pending.lifecycle_scope, ctx.work_scope);
-        assert_eq!(kill_pending.control_scope, ctx.work_scope);
-        assert!(
-            !kill_pending.phase.schedules_reconciliation(),
-            "kill_pending must not trigger terminal reconciliation"
+        assert_eq!(kill_pending.owner, ctx.work_scope);
+        assert_eq!(
+            kill_pending.handle_id.as_ref().map(|id| id.as_str()),
+            Some(handle_id.as_str())
         );
+        assert_eq!(kill_pending.terminal_effect, None);
 
         let kill_output = kill_task.await.expect("kill task");
         let kill_value: serde_json::Value =
@@ -2688,6 +2709,14 @@ mod tests {
         .await;
         let terminal = rx.recv().await.expect("terminal event");
         assert_eq!(terminal.phase, BashLifecyclePhase::Terminal);
-        assert!(terminal.phase.schedules_reconciliation());
+        assert_eq!(terminal.owner, ctx.work_scope);
+        assert_eq!(
+            terminal.handle_id.as_ref().map(|id| id.as_str()),
+            Some(handle_id.as_str())
+        );
+        assert_eq!(
+            terminal.terminal_effect,
+            Some(BashTerminalEffect::InventoryAndBranchReconcile)
+        );
     }
 }
