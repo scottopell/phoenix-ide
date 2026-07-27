@@ -37,6 +37,7 @@ describe('testCpuProfile', () => {
         full_test_name: 'suite > records cpu',
         status: 'pass',
         concurrent: false,
+        started_unix_ns: 1_000_000_000,
         wall_time_ms: 12.5,
         cpu_user_us: 10,
         cpu_system_us: 3,
@@ -103,5 +104,6 @@ describe('testCpuProfile', () => {
       cpu_system_us: 500,
     })
     expect(record.wall_time_ms).toBeGreaterThanOrEqual(0)
+    expect(record.started_unix_ns).toBeGreaterThan(1_000_000_000_000_000_000)
   })
 })

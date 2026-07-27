@@ -171,15 +171,28 @@ def _read_cpu_measurement(path: Path) -> dict | None:
 
 def _profile_record_attributes(record: dict, source: Path) -> dict | None:
     try:
-        user_ms = float(record.get("user_cpu_ms", record.get("cpu_user_us", 0.0) / 1000.0))
-        system_ms = float(record.get("system_cpu_ms", record.get("cpu_system_us", 0.0) / 1000.0))
+        provenance = str(record["provenance"])
+        user_value = record.get("user_cpu_ms")
+        system_value = record.get("system_cpu_ms")
+        if user_value is None and "cpu_user_us" in record:
+            user_value = record["cpu_user_us"] / 1000.0
+        if system_value is None and "cpu_system_us" in record:
+            system_value = record["cpu_system_us"] / 1000.0
         identity = str(record.get("identity") or record.get("full_test_name") or record["test_name"])
-        attributes = _cpu_attributes(user_ms, system_ms, str(record["provenance"]))
+        attributes = (
+            _cpu_attributes(float(user_value), float(system_value), provenance)
+            if user_value is not None and system_value is not None
+            else {"cpu.provenance": "unavailable"}
+        )
         started_unix_ns = int(record["started_unix_ns"])
         wall_ms = float(record.get("wall_ms", record.get("wall_time_ms", 0.0)))
+        try:
+            source_label = str(source.relative_to(ROOT))
+        except ValueError:
+            source_label = str(source)
         attributes.update({
             "check.test.identity": identity,
-            "check.profile_record": str(source.relative_to(ROOT)),
+            "check.profile_record": source_label,
             "check.wall_ms": wall_ms,
             "check.test.started_unix_ns": started_unix_ns,
             "check.test.ended_unix_ns": started_unix_ns + int(wall_ms * 1_000_000),
@@ -3664,6 +3677,12 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("SPECS")
         if p == "scripts/check_rust_test_timing.py":
             cats.update({"ASTGREP", "SPECS"})
+        if p in {
+            "scripts/check_profile_command.py",
+            "scripts/check_profile_report.py",
+            "scripts/python_unittest_profile.py",
+        }:
+            cats.add("SPECS")
         if p.startswith("ast-grep-rules/"):
             cats.add("ASTGREP")
         if p.startswith("tests/e2e/") or p == "phoenix-client.py":
@@ -4464,7 +4483,15 @@ def cmd_check(
     gate=False. `pretty` renders a live lane table instead of line-per-event
     output.
     """
-    results = []  # (name, returncode, elapsed, output)
+    failed_lanes: set[str] = set()
+
+    class _CheckResults(list):
+        def append(self, result):
+            super().append(result)
+            if result[1] != 0:
+                failed_lanes.add(threading.current_thread().name)
+
+    results = _CheckResults()  # (name, returncode, elapsed, output)
     results_lock = threading.Lock()
     t_start = time.monotonic()
 
@@ -5185,7 +5212,13 @@ def cmd_check(
             ).returncode == 0
         except (subprocess.TimeoutExpired, OSError):
             has_nextest = False
-            reporter.info("cargo nextest probe stalled/failed — using plain `cargo test`")
+        if not has_nextest:
+            reporter.info("cargo nextest unavailable — using plain `cargo test`")
+            if profile_work:
+                reporter.info(
+                    "Rust per-test CPU attribution unavailable without cargo-nextest; "
+                    "the Rust step remains measured as a whole"
+                )
         # nextest defaults to available_parallelism (= num_cpus). On low-RAM
         # boxes, num_cpus parallel test threads can swap and stall sensitive
         # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
@@ -5332,13 +5365,15 @@ def cmd_check(
                 failed = True
                 raise
             finally:
+                with results_lock:
+                    failed = failed or lane in failed_lanes
                 attributes = {}
                 if profile_work:
                     thread_cpu_ms = (time.thread_time_ns() - started_thread_ns) / 1_000_000.0
-                    attributes = _cpu_attributes(
-                        thread_cpu_ms, 0.0, "exact_thread",
-                        **{"cpu.scope": "dev.py_lane_orchestration_only"},
-                    )
+                    attributes = {
+                        "orchestration.cpu.total_ms": thread_cpu_ms,
+                        "orchestration.cpu.provenance": "exact_thread",
+                    }
                 _finish_dev_span(span, attributes, failed=failed)
                 reporter.lane_done(lane)
         return wrapped
@@ -5399,8 +5434,9 @@ def cmd_check(
             ))
             print(f"  ✗ {label:<18s} ({LANE_JOIN_TIMEOUT}s)")
 
+    profile_messages = []
     if profile_work and _CHECK_PROFILE is not None and sys.platform == "darwin":
-        reporter.info(
+        profile_messages.append(
             "sampled stacks: run `xctrace record --template 'Time Profiler' "
             f"--output {_CHECK_PROFILE.artifact_dir / 'full-check.trace'} --no-prompt "
             f"--launch -- {ROOT / 'dev.py'} check --all --profile-work`"
@@ -5413,11 +5449,13 @@ def cmd_check(
             capture_output=True, text=True, check=False,
         )
         if report.returncode == 0:
-            reporter.info(
+            profile_messages.append(
                 f"CPU work profile: {_CHECK_PROFILE.artifact_dir.relative_to(ROOT)}/summary.md"
             )
         else:
-            reporter.info(f"CPU work report failed: {report.stderr.strip()}")
+            profile_messages.append(f"CPU work report failed: {report.stderr.strip()}")
+    for message in profile_messages:
+        print(f"  i  {message}")
 
     total_elapsed = time.monotonic() - t_start
     failures = [(n, out) for n, rc, _, out in results if rc != 0]

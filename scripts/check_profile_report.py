@@ -34,12 +34,12 @@ def _records(root: Path):
 
 def _normalize(path: Path, value: dict) -> dict:
     cpu_ms = value.get("total_cpu_ms", value.get("cpu_ms"))
-    if cpu_ms is None:
-        cpu_ms = (value.get("cpu_user_us", 0) + value.get("cpu_system_us", 0)) / 1000.0
+    if cpu_ms is None and "cpu_user_us" in value and "cpu_system_us" in value:
+        cpu_ms = (value["cpu_user_us"] + value["cpu_system_us"]) / 1000.0
     identity = value.get("identity") or value.get("full_test_name") or value.get("test_name") or path.stem
     return {
         "identity": str(identity),
-        "cpu_ms": float(cpu_ms),
+        "cpu_ms": float(cpu_ms) if cpu_ms is not None else None,
         "wall_ms": float(value.get("wall_ms", value.get("wall_time_ms", value.get("duration_ms", 0)))),
         "provenance": value.get("provenance", "unavailable"),
         "kind": value.get("kind", "step" if path.parent.name == "processes" else "test"),
@@ -48,15 +48,21 @@ def _normalize(path: Path, value: dict) -> dict:
 
 
 def render(profile_dir: Path, limit: int) -> dict:
-    rows = sorted(
-        (_normalize(path.relative_to(profile_dir), value) for path, value in _records(profile_dir)),
+    rows = [
+        _normalize(path.relative_to(profile_dir), value)
+        for path, value in _records(profile_dir)
+    ]
+    ranked_rows = sorted(
+        (row for row in rows if row["cpu_ms"] is not None),
         key=lambda row: row["cpu_ms"], reverse=True,
     )
+    unavailable_rows = [row for row in rows if row["cpu_ms"] is None]
     summary = {
         "schema_version": 1,
         "profile_dir": str(profile_dir),
         "record_count": len(rows),
-        "top_cpu_records": rows[:limit],
+        "top_cpu_records": ranked_rows[:limit],
+        "unavailable_cpu_records": unavailable_rows,
         "traceql": {
             "command": '{ name = "dev.command" && span.check.profile_work = true }',
             "steps": '{ name = "dev.check.step" && span.check.profile_run_id != nil }',
@@ -76,9 +82,12 @@ def render(profile_dir: Path, limit: int) -> dict:
         "| CPU ms | Wall ms | Provenance | Kind | Identity |",
         "| ---: | ---: | --- | --- | --- |",
     ]
-    for row in rows[:limit]:
+    for row in ranked_rows[:limit]:
         identity = row["identity"].replace("|", "\\|")
         lines.append(f'| {row["cpu_ms"]:.1f} | {row["wall_ms"]:.1f} | {row["provenance"]} | {row["kind"]} | `{identity}` |')
+    if unavailable_rows:
+        lines += ["", "## Unavailable CPU measurements", ""]
+        lines += [f'- `{row["identity"]}` ({row["provenance"]})' for row in unavailable_rows]
     lines += ["", "## Interpretation", "", *[f"- {item}" for item in summary["methodology"]]]
     (profile_dir / "summary.md").write_text("\n".join(lines) + "\n")
     return summary

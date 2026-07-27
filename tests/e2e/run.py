@@ -347,7 +347,9 @@ def _server():
     profile_dir = _profile_dir_from_env()
     startup_started_wall_ns = time.time_ns()
     startup_started_monotonic_ns = time.monotonic_ns()
-    startup_started_cpu = _process_cpu_times(os.getpid())
+    startup_started_cpu = (
+        _process_cpu_times(os.getpid()) if profile_dir is not None else None
+    )
 
     try:
         proc, base_url, log_path, log_file = _start_server_with_retries(env, tmpdir)
@@ -356,7 +358,9 @@ def _server():
         raise
 
     startup_finished_monotonic_ns = time.monotonic_ns()
-    startup_finished_cpu = _process_cpu_times(os.getpid())
+    startup_finished_cpu = (
+        _process_cpu_times(os.getpid()) if profile_dir is not None else None
+    )
     _write_cpu_window(
         profile_dir,
         identity="e2e:startup:harness",
@@ -1203,10 +1207,16 @@ def main() -> int:
         for name, fn in SCENARIOS:
             started_wall_ns = time.time_ns()
             started_monotonic_ns = time.monotonic_ns()
-            started_harness_cpu = _process_cpu_times(os.getpid())
-            started_server_cpu = _process_cpu_times(server_pid)
+            started_harness_cpu = (
+                _process_cpu_times(os.getpid()) if profile_dir is not None else None
+            )
+            started_server_cpu = (
+                _process_cpu_times(server_pid) if profile_dir is not None else None
+            )
+            scenario_status = "failed"
             try:
                 fn(base_url)
+                scenario_status = "passed"
                 dt = (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000.0
                 print(f"  ✓ {name:<22s} {dt:6.2f}s", flush=True)
             except Exception as e:
@@ -1218,8 +1228,12 @@ def main() -> int:
                 break
             finally:
                 finished_monotonic_ns = time.monotonic_ns()
-                finished_harness_cpu = _process_cpu_times(os.getpid())
-                finished_server_cpu = _process_cpu_times(server_pid)
+                finished_harness_cpu = (
+                    _process_cpu_times(os.getpid()) if profile_dir is not None else None
+                )
+                finished_server_cpu = (
+                    _process_cpu_times(server_pid) if profile_dir is not None else None
+                )
                 _write_cpu_window(
                     profile_dir,
                     identity=f"e2e:scenario:{name}:harness",
@@ -1228,7 +1242,7 @@ def main() -> int:
                     finished_monotonic_ns=finished_monotonic_ns,
                     start_cpu=started_harness_cpu,
                     finish_cpu=finished_harness_cpu,
-                    extra={"kind": "e2e_scenario", "process_role": "harness", "scenario": name},
+                    extra={"kind": "e2e_scenario", "process_role": "harness", "scenario": name, "status": scenario_status},
                 )
                 _write_cpu_window(
                     profile_dir,
@@ -1238,7 +1252,7 @@ def main() -> int:
                     finished_monotonic_ns=finished_monotonic_ns,
                     start_cpu=started_server_cpu,
                     finish_cpu=finished_server_cpu,
-                    extra={"kind": "e2e_scenario", "process_role": "server", "scenario": name},
+                    extra={"kind": "e2e_scenario", "process_role": "server", "scenario": name, "status": scenario_status},
                 )
             
         # Read log inside the context — the tempdir may be cleaned up after.

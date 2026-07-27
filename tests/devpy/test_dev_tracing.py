@@ -157,7 +157,7 @@ class DevTracingTests(unittest.TestCase):
         tracing = FakeTracing()
         self.dev._DEV_TRACING = tracing
         parent = FakeSpan()
-        with tempfile.TemporaryDirectory(dir=self.dev.ROOT / "target") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "tests.jsonl").write_text(json.dumps({
                 "identity": "test:one", "provenance": "windowed_process",
@@ -172,8 +172,19 @@ class DevTracingTests(unittest.TestCase):
         self.assertEqual(1_000_000_000, tracing.started[0][4])
         self.assertEqual(1_002_500_000, tracing.finished[0][3])
 
+    def test_unavailable_profile_record_is_preserved_without_cpu_totals(self):
+        source = self.dev.ROOT / "target" / "record.jsonl"
+        attributes = self.dev._profile_record_attributes({
+            "identity": "e2e:server", "provenance": "unavailable",
+            "started_unix_ns": 1_000_000_000, "wall_ms": 2.0,
+            "user_cpu_ms": None, "system_cpu_ms": None,
+        }, source)
+
+        self.assertEqual("unavailable", attributes["cpu.provenance"])
+        self.assertNotIn("cpu.total_ms", attributes)
+
     def test_nextest_profile_config_wraps_only_run_phase(self):
-        with tempfile.TemporaryDirectory(dir=self.dev.ROOT / "target") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             profile = self.dev.CheckWorkProfile(
                 run_id="run", artifact_dir=Path(directory),
                 started_self=mock.Mock(), started_children=mock.Mock(),

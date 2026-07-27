@@ -129,6 +129,21 @@ class CheckPlanTests(unittest.TestCase):
         self.assertIn("ast-grep", active)
         self.assertIn("spec-shape", active)
 
+    def test_check_profile_scripts_run_their_devpy_unit_tests(self):
+        for path in (
+            "scripts/check_profile_command.py",
+            "scripts/check_profile_report.py",
+            "scripts/python_unittest_profile.py",
+        ):
+            with self.subTest(path=path):
+                cats = self.dev._categorize_changed_paths({path})
+                self.assertIn("SPECS", cats)
+                with mock.patch.object(
+                    self.dev, "_changed_paths_vs_base", return_value={path},
+                ):
+                    active, _ = self.dev._gate_lanes()
+                self.assertIn("spec-shape", active)
+
     def test_pr_433_task_only_rename_activates_only_task_group(self):
         paths = {"tasks/45002-p1-done--deterministic-message-scroll-state-machine.md"}
         with mock.patch.dict(os.environ, GATED_CI_ENV, clear=False), \

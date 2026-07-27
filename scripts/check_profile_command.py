@@ -100,7 +100,7 @@ def _write_record(
 
 def _forward_signal(child_pid: int, signum: int) -> None:
     try:
-        os.killpg(child_pid, signum)
+        os.kill(child_pid, signum)
     except ProcessLookupError:
         pass
 
@@ -120,16 +120,12 @@ def measure(
     child_pid = os.fork()
     if child_pid == 0:
         try:
-            os.setpgid(0, 0)
+            # Remain in the wrapper's process group. The owning check step can
+            # then terminate the complete wrapped tree with one group signal.
             os.execvp(command[0], command)
         except OSError as error:
             print(f"check profile wrapper: cannot execute {command[0]}: {error}", file=sys.stderr)
             os._exit(127)
-
-    try:
-        os.setpgid(child_pid, child_pid)
-    except (PermissionError, ProcessLookupError):
-        pass
 
     previous_handlers: dict[int, object] = {}
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):

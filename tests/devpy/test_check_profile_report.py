@@ -41,6 +41,23 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertIn("inclusive", markdown)
         self.assertIn("dev.check.test", summary["traceql"]["tests"])
 
+    def test_unavailable_cpu_is_not_ranked_as_zero(self):
+        report = load_report()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "e2e-scenario-cpu.jsonl").write_text(json.dumps({
+                "identity": "e2e:server", "provenance": "unavailable",
+                "total_cpu_ms": None, "wall_ms": 5,
+            }) + "\n")
+
+            summary = report.render(root, 20)
+            markdown = (root / "summary.md").read_text()
+
+        self.assertEqual([], summary["top_cpu_records"])
+        self.assertEqual("e2e:server", summary["unavailable_cpu_records"][0]["identity"])
+        self.assertIn("Unavailable CPU measurements", markdown)
+
+
 
 if __name__ == "__main__":
     unittest.main()

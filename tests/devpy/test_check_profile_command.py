@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,18 @@ class CheckProfileCommandTests(unittest.TestCase):
         )
         self.assertIn("identity", measurement)
         self.assertIn("wall_ms", measurement)
+
+    @unittest.skipUnless(hasattr(os, "getpgid"), "requires POSIX process groups")
+    def test_wrapped_command_remains_in_wrapper_process_group(self):
+        result, measurement = self.run_wrapper([
+            sys.executable,
+            "-c",
+            "import os; print(os.getpgrp())",
+        ])
+
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(os.getpgrp(), int(result.stdout.strip()))
+        self.assertGreater(measurement["pid"], 0)
 
     def test_includes_short_lived_waited_grandchild(self):
         baseline_result, baseline = self.run_wrapper([sys.executable, "-c", "pass"])

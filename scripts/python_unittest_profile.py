@@ -82,6 +82,12 @@ class _ProfilingTextTestResult(unittest.TextTestResult):
         self._outcome = "expected_failure"
         super().addExpectedFailure(test, err)
 
+    def addSubTest(self, test, subtest, err):
+        if err is not None:
+            failure_exception = getattr(test, "failureException", AssertionError)
+            self._outcome = "failed" if issubclass(err[0], failure_exception) else "error"
+        super().addSubTest(test, subtest, err)
+
     def addUnexpectedSuccess(self, test):
         self._outcome = "unexpected_success"
         super().addUnexpectedSuccess(test)

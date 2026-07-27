@@ -50,6 +50,33 @@ class PythonUnittestProfileTests(unittest.TestCase):
         self.assertIn("wall_ms", record)
         self.assertIn("total_cpu_ms", record)
 
+    def test_failing_subtest_marks_parent_record_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test_sample.py").write_text(textwrap.dedent("""
+                import unittest
+
+                class Sample(unittest.TestCase):
+                    def test_subtests(self):
+                        for value in (1, 2):
+                            with self.subTest(value=value):
+                                self.assertEqual(value, 1)
+            """))
+            profile_dir = root / "profile"
+            env = dict(os.environ)
+            env["PHOENIX_CHECK_PROFILE_DIR"] = str(profile_dir)
+            result = subprocess.run(
+                [sys.executable, str(RUNNER), "discover", "-s", str(root), "-t", str(root)],
+                cwd=root, capture_output=True, text=True, env=env,
+            )
+            record = json.loads(
+                (profile_dir / "python-test-cpu.jsonl").read_text().splitlines()[0]
+            )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("failed", record["status"])
+
+
 
 if __name__ == "__main__":
     unittest.main()
