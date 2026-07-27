@@ -99,3 +99,25 @@ Append a completion note to this task body with these headings:
 
 **Commit**
 - Pending local commit
+
+
+## Reopen correction evidence
+
+**Why the prior acceptance was invalid**
+- The earlier review explicitly accepted `specs/chains/requirements.md` as an intentional legacy divergence instead of reconciling it to the settled unified ProductConversation target.
+- That acceptance was wrong for this task's closure bar because the chains requirements artifact is normative. Leaving dedicated chain surface, naming, and lifecycle language in a normative requirements file contradicted the settled facts this review was supposed to enforce.
+
+**Correction made**
+- Rewrote `specs/chains/requirements.md` end-to-end while preserving `REQ-CHN-*` identifiers.
+- The rewritten current truth now makes `chain` a legacy/topology term only, with one root-keyed ProductConversation in navigation, no nested member/sidebar header product surface, no dedicated chain route/page/header, no separate chain rename/regenerate/archive/delete lifecycle, and lineage Q&A/work identity hosted on the normal conversation page.
+
+**Validation for reopen**
+- `rg -n 'nested|collapsible chain header|chain page|chain route|sidebar header|conversation header|regenerate-name action|archive|unarchive|delete actions|first-class entities|chain-specific' specs/chains/requirements.md`
+- `rg -n 'ProductConversation|root conversation|normal conversation surface|NOT require a dedicated chain route|NOT introduce separate chain-specific' specs/chains/requirements.md`
+- `./dev.py tasks validate`
+
+**Review corrections**
+- Fixed in place: `specs/chains/requirements.md`
+
+**Commit**
+- Pending local commit
