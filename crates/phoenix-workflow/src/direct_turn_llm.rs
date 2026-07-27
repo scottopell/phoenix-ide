@@ -126,6 +126,7 @@ impl<'de> Deserialize<'de> for PreparedLlmRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmEffectIntent {
     #[serde(
         serialize_with = "serialize_turn_id",
@@ -289,6 +290,22 @@ mod tests {
         let json = br#"{"fingerprint":"wrong","canonical_payload":[1,2,3]}"#;
         let error = serde_json::from_slice::<PreparedLlmRequest>(json).unwrap_err();
         assert!(error.to_string().contains("fingerprint mismatch"));
+    }
+
+    #[test]
+    fn intent_decoder_rejects_unknown_fields() {
+        let request = PreparedLlmRequest::new(vec![1]);
+        let intent = LlmEffectIntent {
+            turn_id: crate::direct_turn::TurnAuthorityId(7),
+            request,
+        };
+        let mut value = serde_json::to_value(intent).unwrap();
+        value["future"] = serde_json::json!(1);
+
+        assert!(serde_json::from_value::<LlmEffectIntent>(value)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
     }
 
     #[test]
