@@ -253,10 +253,10 @@ THE SYSTEM SHALL configure those sub-agents with read-only authority
 
 ### REQ-PROJ-009: Complete a Task (Squash Merge)
 
-**DEPRECATED:** Superseded by work-lifecycle REQ-WL-002 (push branch, user merges via PR).
-Squash-merge bypasses code review and branch protection rules. The push-branch
-model aligns with how teams actually ship code. Retained for historical context;
-the no-squash-merge constraint lives in work-lifecycle REQ-WL-002.
+**DEPRECATED:** Superseded by `specs/work-lifecycle/requirements.md` REQ-WL-001 through REQ-WL-003.
+Squash-merge bypasses code review and branch protection rules. The current model
+uses one explicit Close flow that leaves branches and pull requests untouched.
+Retained for historical context only.
 
 ---
 

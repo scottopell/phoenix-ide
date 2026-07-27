@@ -2,57 +2,91 @@
 
 ## What This Spec Covers
 
-The work lifecycle defines the user-facing **terminal actions** on Work and Branch
-conversations and the **git side effects** they produce. A Work or Branch conversation
-enters the lifecycle when the user declares the work shipped (mark as merged) or discards it
-(abandon). This spec owns:
+The work lifecycle defines the user-facing **Close conversation** flow for Git-backed
+conversations and the **retirement inspection / resource retirement** contract it drives.
+This spec owns:
 
-- **Action semantics** — what each terminal action means, what git state it leaves behind,
-  and the disposition of the worktree and branch per conversation mode.
-- **Git side effects** — worktree removal, branch deletion (Managed/Work mode) or
-  preservation (Branch mode), the diff-snapshot captured on abandon, and the confirmation
-  that gates the irreversible abandon deletion.
-- **PR-state-as-cleanup-gate** — `gh`-observed PR merge state labels and guides which
-  cleanup affordance is presented, without ever creating an automatic lifecycle transition.
+- **Close semantics** — one user-facing lifecycle action that moves the product conversation
+  to History without treating branches, tasks, or pull requests as lifecycle owners.
+- **Retirement inspection** — exact worktree-loss classification, inspection generation, and
+  discard confirmation for destructive teardown.
+- **Resource retirement** — idempotent teardown of the attached Git-backed `WorkScope`
+  resources and worktree, without creating automatic recovery artifacts or mutating refs / PRs.
+- **Advisory PR guidance** — observed PR state can guide whether Close looks timely, but never
+  triggers lifecycle change on its own.
 
 It does **not** own:
 
-- **Transition legality** — when a terminal action is permitted based on conversation state
-  (`core_status`, `parent_status`, `mode`, continuation pointer). That is bedrock's
-  `TaskResolved` rule and its `TerminalActionRequiresNoContinuation` invariant (REQ-BED-029,
-  REQ-BED-031). This spec's handlers validate against that same gate but do not define it.
+- **Conversation-state legality, close-obligation sequencing, or ProductConversation lifecycle** —
+  bedrock owns those authorities.
 - **PR feedback freshness, explicit active-PR targeting, auto-fix, or remediation context** —
   the `pr-association` spec.
-- **UI surface composition** — button labels, action zones, disposition derivation, tooltips.
-  The `work-actions-bar` spec owns these.
+- **UI placement, wording variants, or action-surface composition** — sibling UI specs such as
+  `work-actions-bar` own those surfaces.
 
 ## User Need
 
-A developer using PhoenixIDE needs a clear, safe way to close out Work and Branch
-conversations. *Clear* means the user always knows what cleanup will happen before they
-commit to it. *Safe* means no irreversible git operation runs without confirmation, a
-worktree still in use by another live conversation is never destroyed, and the branch
-disposition matches the mode: Phoenix-created task branches are removed, user-owned PR
-branches are kept.
+A developer using PhoenixIDE needs one clear, safe way to retire a Git-backed conversation.
+*Clear* means Phoenix explains whether closing will discard workspace-only state and what exact
+loss categories were detected. *Safe* means Close never silently mutates branches or pull requests,
+never treats repository facts as lifecycle authority, and can retry teardown without losing track
+of partially retired resources.
 
 ## Requirements Summary
 
 | ID | Summary |
 |----|---------|
-| REQ-WL-001 | Abandon a conversation — confirmation, diff snapshot, mode-dependent branch disposition |
-| REQ-WL-002 | Mark as merged — worktree cleanup, mode-dependent branch disposition, no squash, no push |
-| REQ-WL-003 | PR merge state is the cleanup gate — advisory only, never a lifecycle trigger |
+| REQ-WL-001 | Close conversation is the only user-facing terminal lifecycle action for Git-backed conversations |
+| REQ-WL-002 | Retirement inspection classifies exact worktree-loss risk before destructive teardown |
+| REQ-WL-002a | Discard confirmation binds to one exact inspected workspace generation |
+| REQ-WL-002b | Retirement retires owned resources stepwise, idempotently, and without automatic recovery artifacts |
+| REQ-WL-003 | Pull-request state guides Close but never triggers it |
 
-Increment 1 clarifies that plural PR association does not create plural cleanup ownership.
-Cleanup remains one task/worktree action even when multiple associated PRs exist. Mixed PR states
-may be summarized by sibling UI surfaces, and an explicit active PR may be named for clarity, but
-cleanup does not merge, close, or retarget PRs and does not treat feedback freshness as a cleanup
-gate.
+ADR-025 is the governing rationale: product lifecycle belongs to the ProductConversation,
+`continued_in_conv_id` remains transcript topology, and the attached `WorkScope` owns disposable
+resources without becoming the lifecycle root.
 
-Both terminal actions (REQ-WL-001, REQ-WL-002) are organized by **action**, with conversation
-mode appearing as a row in each action's disposition table rather than as a separate
-requirement. The disposition is identical in shape across the two actions: the worktree is
-always deleted; the branch is deleted for Managed (Work) mode and kept for Branch mode.
+## Normative Authority
+
+Load-bearing behavior previously described in the legacy `design.md` now lives in:
+
+- `requirements.md` for the timeless Close / inspection / retirement / PR-guidance contract;
+- `specs/bedrock/bedrock.allium` for ProductConversation lifecycle and close-obligation sequencing;
+- `specs/adrs/025_workscope-owned-lifecycle-unifies-conversation-handoffs.md` for the ownership split
+  between lifecycle, transcript topology, and WorkScope resources.
+
+The legacy `design.md` has been removed.
+
+## Implementation Status
+
+| Requirement | Status | Surface |
+|-------------|--------|---------|
+| REQ-WL-001 | Specified | Bedrock close-obligation flow owns lifecycle sequencing; user-facing Close migration still in progress |
+| REQ-WL-002 | Specified | Retirement inspection contract is specified; implementation coverage is tracked separately |
+| REQ-WL-002a | Specified | Inspection-generation/fingerprint binding is specified |
+| REQ-WL-002b | Specified | Resource-retirement and no-automatic-recovery-artifact contract is specified |
+| REQ-WL-003 | Specified | PR guidance contract is specified; no automatic close authority |
+
+## Provenance
+
+This spec supersedes the older abandon / mark-merged split. Legacy clients or persisted intents may
+still arrive with deprecated `abandon` / `mark_merged` values, but `requirements.md` now defines
+those only as compatibility inputs to the single Close flow rather than as current user-facing
+lifecycle verbs.
+
+Completed historical task references remain useful context, but current authority is the REQ /
+Allium / ADR package above.
+
+## Validation
+
+All active guidance should now cite `requirements.md`, `bedrock.allium`, or ADR-025 rather than the
+removed legacy `design.md`.
+
+Search check used during migration:
+
+- `rg -n 'work-lifecycle/design\.md' specs tasks`
+
+Only historical task references should remain after migration.
 
 ## Implementation Status
 

@@ -48,6 +48,8 @@ thing when clicked, present only when that thing is safe to do. No button is dis
 a status display; no button requires a second click to arm.
 
 ## Requirements Summary
+Current authority for work-action behavior is `requirements.md` plus the active-PR and close-lifecycle contracts it cites. The legacy `design.md` has been removed; rationale now lives either inline in the requirements or, for lifecycle/workscope ownership, in ADR-025.
+
 
 | ID | Summary |
 |----|---------|

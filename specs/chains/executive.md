@@ -63,7 +63,7 @@ Q&A agent as scope-bound tools; REQ-CHN-008 (work-identity facet) reuses the
 chain dock + `work_scope_key` from `specs/work-scope-ui/` and the
 per-conversation PR-status pipeline from `specs/projects/` for PR health.
 
-The "out of scope" list below remains accurate — the deferred Allium spec for the Q&A lifecycle is recommended now that the actual transitions are observable in production.
+The removed legacy `design.md` is no longer authoritative. Current chain behavior lives in `requirements.md`; work-identity ownership is grounded in ADR-025; implementation status remains here in `executive.md`.
 
 ## v1 (MVP) Scope
 
