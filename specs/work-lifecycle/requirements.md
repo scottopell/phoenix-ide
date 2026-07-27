@@ -82,8 +82,9 @@ WHEN the workspace changes after inspection and before destructive retirement be
 THE SYSTEM SHALL invalidate the outstanding confirmation
 AND SHALL require reinspection before retirement may proceed
 
-WHEN a conversation has no attached Git-backed `WorkScope`
+WHEN a product conversation has no attached Git-backed `WorkScope`
 THE SYSTEM SHALL skip worktree-loss inspection
+AND SHALL emit the no-confirmation inspection outcome for that exact Close attempt
 AND SHALL NOT require a discard confirmation that implies worktree-owned loss
 
 **Rationale:** The confirmation is only trustworthy for the exact inspected workspace. A changed workspace must not inherit stale approval to discard different state.
@@ -95,11 +96,14 @@ AND SHALL NOT require a discard confirmation that implies worktree-owned loss
 WHEN bedrock requests resource retirement for an attached Git-backed `WorkScope`
 THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources, including bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that same WorkScope
 
-THE SYSTEM SHALL treat continuation members that still resolve to the same live `WorkScope` as shared owners
-AND SHALL NOT retire the worktree while another non-History live conversation still resolves to that same `WorkScope`
+THE SYSTEM SHALL treat the attached `WorkScope` as the owner of the retireable resources
+AND SHALL derive cleanup authority only from the root product conversation's committed Close retirement operation targeting that attached `WorkScope`
 
-THE SYSTEM SHALL treat sub-agents attached to a parent's `WorkScope` as non-owning participants
-AND SHALL NOT grant a sub-agent independent cleanup authority over the shared WorkScope
+THE SYSTEM SHALL treat transcript rows and subordinate execution conversations within the same open product conversation as participants in that one aggregate rather than as independent WorkScope owners
+AND SHALL NOT let those subordinate participants independently own, veto, or delay destructive retirement of the product conversation's attached `WorkScope`
+
+THE SYSTEM SHALL distinguish those same-aggregate participants from a genuinely separate open product conversation that also resolves to the same `WorkScope`, or from unresolved conversation-identity evidence that prevents Phoenix from proving whether another open product aggregate exists
+AND SHALL block destructive teardown only for that distinct-open-aggregate or unresolved-identity-conflict case
 
 THE SYSTEM SHALL perform retirement as a stepwise idempotent operation that records enough completion or residual-error evidence to retry safely
 
@@ -110,7 +114,11 @@ WHEN retirement cannot retire every owned resource
 THE SYSTEM SHALL report typed residual cleanup state and repair information rather than silently succeeding
 
 WHEN the worktree is already absent
-THE SYSTEM SHALL accept that absence only when retained identity and evidence show that the same requested retirement already removed it or is adopting that exact absence
+THE SYSTEM SHALL bind that absence evidence to the exact retirement attempt and attached `WorkScope`
+AND SHALL accept the absence only when retained identity and evidence show that the same requested retirement already removed it or is adopting that exact absence
+
+WHEN cleanup cannot retire every owned resource
+THE SYSTEM SHALL bind every residual cleanup item to the exact retirement attempt and attached `WorkScope`
 
 CONFIRMED retirement SHALL NOT create a branch, tag, commit, stash, patch, diff snapshot, or other automatic recovery artifact
 
@@ -135,7 +143,7 @@ THE SYSTEM SHALL surface that truthfully without blocking Close solely on PR sta
 
 WHEN multiple associated pull requests exist
 THE SYSTEM SHALL summarize their mixed states honestly
-AND SHALL preserve Close as one WorkScope-owner action rather than one lifecycle per PR
+AND SHALL preserve Close as one product-conversation action rather than one lifecycle per PR
 
 THE SYSTEM SHALL NOT automatically close a conversation because a PR appears merged, closed, missing, or stale
 AND SHALL NOT treat PR state as ownership of the conversation lifecycle

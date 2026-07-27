@@ -3,10 +3,10 @@
 --
 -- Phoenix WorkScope-owned PR Association: Behavioural Specification
 --
--- Scope: durable association between a WorkScope and observed task branches and
+-- Scope: durable association between a WorkScope and observed settled local branches and
 --        GitHub pull requests; explicit active-PR selection; freshness-aware PR
 --        status; the Address-CI auto-fix affordance target selection; and
---        abandon-time best-effort refresh.
+--        Close-triggered best-effort refresh.
 --
 -- Includes:
 --   - WorkScope-keyed observed-branch history and PR observation history.
@@ -18,7 +18,7 @@
 --     auto-fix target rendered by the work actions bar: the StateBar shows the
 --     PR identity, the work actions bar shows the Address-CI auto-fix
 --     affordance, and they must target the same explicit active PR.
---   - Bounded, non-fatal abandon refresh before worktree cleanup.
+--   - Bounded, non-fatal PR refresh at Close-triggered retirement boundaries.
 --
 -- Excludes:
 --   - GitHub CLI internals and GraphQL/REST wire formats.
@@ -333,7 +333,7 @@ entity PrAutoFixAffordanceResult {
 ------------------------------------------------------------
 
 config {
-    abandon_refresh_deadline_ms: Integer = 10000
+    close_refresh_deadline_ms: Integer = 10000
 }
 
 ------------------------------------------------------------
@@ -668,20 +668,21 @@ rule WorkActionsDisablesAutoFixForNonOpenActivePr {
     )
 }
 
-rule AbandonBestEffortRefreshIsBoundedAndNonFatal {
-    when: ConversationAbandoned(conversation)
+rule CloseTriggeredBestEffortRefreshIsBoundedAndNonFatal {
+    when: CloseTriggeredRetirementBoundaryReached(conversation)
 
     let scope = resolve_work_scope(conversation)
 
     requires: conversation.mode in { work, branch }
 
-    ensures: BestEffortPrRefreshAttempted(scope, config.abandon_refresh_deadline_ms)
+    ensures: BestEffortPrRefreshAttempted(scope, config.close_refresh_deadline_ms)
     ensures: CleanupContinues(conversation)
 
     @guidance
-        -- The refresh happens while the worktree still exists. Any failure,
-        -- unavailable provider, not_found result, or deadline expiry is logged
-        -- and cannot prevent worktree/branch cleanup from completing.
+        -- The refresh happens while the Git-backed WorkScope still exists. Any
+        -- failure, unavailable provider, not_found result, or deadline expiry is
+        -- logged and cannot prevent Close, retirement inspection, or resource
+        -- retirement from continuing.
 }
 
 ------------------------------------------------------------
@@ -769,18 +770,19 @@ surface WorkActionsPrAffordance {
         fulfils WorkActionsPrAffordanceContract
 }
 
-surface AbandonCleanup {
+surface CloseRetirementBoundary {
     facing user: ConversationUser
 
     context conversation: bedrock/Conversation
 
     provides:
-        ConversationAbandoned(conversation)
+        CloseTriggeredRetirementBoundaryReached(conversation)
             when conversation.mode in { work, branch }
 
     @guarantee PrRefreshNeverBlocksCleanup
-        -- Abandon may attempt to enrich PR association history before cleanup,
-        -- but cleanup completion does not depend on PR provider success.
+        -- Close-triggered retirement may attempt to enrich PR association history
+        -- before resource teardown, but Close and cleanup completion do not depend
+        -- on PR provider success.
 }
 
 deferred WorkScopeObservedBranchHistory
@@ -813,7 +815,7 @@ deferred ExplicitActivePrSelection
 ------------------------------------------------------------
 --
 -- The rules above model the singular current-reality PR identity, freshness-
--- aware PR status, the Address-CI auto-fix affordance, and abandon refresh.
+-- aware PR status, the Address-CI auto-fix affordance, and Close-triggered refresh.
 -- The plural branch-observation and explicit-active-selection model introduced
 -- by REQ-PRA-000..000c is deferred immediately above so the normative direction
 -- is explicit even before implementation lands. The agent-facing PR feedback
@@ -824,12 +826,13 @@ deferred ExplicitActivePrSelection
 
 deferred PrFeedbackFreshnessAdvisory
     -- Location: `ui/src/components/WorkActions.tsx` (`PrRemediationActions`)
-    -- REQ-PRA-001. WHEN a Work or Branch conversation has an open associated PR
+    -- REQ-PRA-001. WHEN a Git-backed conversation with an attached WorkScope has
+    -- an open associated PR
     -- AND PR feedback changed since Phoenix last captured agent-facing PR
     -- remediation context, a compact advisory count marker (`{N} new` or
     -- `{N} edited`) is shown near the Address-CI Work Action. PR feedback freshness
-    -- is NOT the StateBar branch-health signal (that is PR merge state, owned by
-    -- the work-lifecycle spec) and it never blocks cleanup, abandon, or ordinary
+    -- is NOT the StateBar branch-health signal and it never blocks Close,
+    -- retirement inspection, retirement, or ordinary
     -- conversation use. The advisory composes the PrStatusResult freshness
     -- metadata modelled above with a feedback-identity comparison against the
     -- baseline captured by PrRemediationContextBaseline below.

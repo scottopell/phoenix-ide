@@ -17,8 +17,8 @@ remain.
 
 This spec **owns**:
 
-- **Observed-branch history** — durable, WorkScope-keyed history of the settled task-branch
-  heads Phoenix observed for a conversation's worktree scope, used as candidate PR heads.
+- **Observed-branch history** — durable, WorkScope-keyed history of the settled local branch
+  heads Phoenix observed for a conversation's Git-backed scope, used as candidate PR heads.
 - **PR ↔ work-scope association** — durable, WorkScope-keyed history of the pull requests
   Phoenix has observed for those candidate branches.
 - **Active-PR selection** — explicit selection of the one PR PR-specific status/action surfaces
@@ -37,14 +37,12 @@ This spec **owns**:
 
 This spec does **not** own:
 
-- **Terminal-action git side effects and PR-merge-state-as-cleanup-gate** — abandon and mark-
-  as-merged worktree/branch disposition, and using PR merge state to label the cleanup path.
-  The `work-lifecycle` spec owns these. `work-lifecycle`'s REQ-WL-003 consumes the PR status
-  this spec produces as its cleanup gate; this spec provides the status, work-lifecycle
-  decides cleanup. **PR feedback freshness is never the branch-health signal** — PR merge
-  state is, and it belongs to `work-lifecycle`.
-- **Transition legality** — when a terminal action is permitted based on conversation state.
-  That is bedrock's `TaskResolved` rule and `TerminalActionRequiresNoContinuation` invariant.
+- **Conversation-close orchestration and WorkScope retirement** — whether the product conversation
+  may Close, how retirement inspection/confirmation proceeds, and how resource teardown uses the
+  observed PR state this spec provides. The `work-lifecycle` and `bedrock` specs own those
+  authorities. This spec provides observed PR facts only; it does not gate Close or cleanup.
+- **Transition legality** — when a Close attempt is permitted based on conversation state.
+  That is bedrock's close-obligation authority, not this PR-observation spec.
 - **The work-actions-bar UI surface composition** — button labels, action zones, tooltips,
   disposition derivation. The `work-actions-bar` spec consumes this spec's auto-fix affordance
   result and renders it.
@@ -83,7 +81,7 @@ reconciliation boundary
 THE SYSTEM SHALL record that observation as durable branch history keyed by WorkScope and
   repository identity
 
-THE SYSTEM SHALL treat observed task-branch history as the candidate set for pull-request
+THE SYSTEM SHALL treat observed settled local-branch history as the candidate set for pull-request
   discovery
 AND SHALL NOT require the currently checked-out branch, `ConvMode.branch_name`, or one hidden
   singular primary PR to be the sole authority for discovery
@@ -143,7 +141,7 @@ actionable PRs remain plausible, silence is safer than a wrong silent retarget.
 
 ### REQ-PRA-000b: PR-Specific Surfaces Share One Explicit Target
 
-WHEN Phoenix renders or executes a PR-specific surface for a Work or Branch conversation
+WHEN Phoenix renders or executes a PR-specific surface for a Git-backed conversation with an attached `WorkScope`
 THE SYSTEM SHALL target the same explicit active PR across:
 - the StateBar PR identity and status
 - PR-specific status and check-state reads
@@ -179,7 +177,7 @@ projection, not ownership.
 
 ### REQ-PRA-001: PR Feedback Freshness Indicator
 
-WHEN a Work or Branch conversation has an open associated pull request
+WHEN a Git-backed conversation with an attached `WorkScope` has an open associated pull request
 AND PR feedback changed since Phoenix last captured agent-facing PR remediation context
 THE SYSTEM SHALL show a compact advisory marker near the `Address CI & comments` Work Action
   carrying a count, SUCH AS `{N} new` (net-new feedback items) or `{N} edited` (baseline items

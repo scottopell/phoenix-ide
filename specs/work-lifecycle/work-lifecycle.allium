@@ -104,7 +104,17 @@ external entity AttachedWorkScope {
     product_conversation: bedrock/ProductConversation
     scope: WorkScope
     owns_git_worktree: Boolean
-    has_cleanup_authority: Boolean
+}
+
+external entity CloseRetirementAuthority {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+}
+
+external entity RetirementAttempt {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    inspection: RetirementInspection?
 }
 
 external entity Worktree {
@@ -113,7 +123,8 @@ external entity Worktree {
     identity: WorktreeIdentity
 }
 
-external entity RetirementLossItem {
+external entity RetirementLossCategoryRow {
+    attempt: RetirementAttempt
     inspection: RetirementInspection
     category: LossCategory
     item_identity: String
@@ -126,9 +137,16 @@ external entity RetiredResource {
 }
 
 external entity RetirementResidualResource {
+    attempt: RetirementAttempt
     product_conversation: bedrock/ProductConversation
     scope: WorkScope
     residual: RetirementResidual
+}
+
+external entity RetirementAbsenceEvidence {
+    attempt: RetirementAttempt
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
 }
 
 ------------------------------------------------------------
@@ -137,7 +155,9 @@ external entity RetirementResidualResource {
 
 rule ChatOnlyCloseSkipsWorktreeInspection {
     when: RetirementInspectionRequested(product_conversation)
-    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: false}
+    requires:
+        not exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
+        or exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: false}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         inspection_generation: "no-worktree",
@@ -151,12 +171,13 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
 
 rule GitBackedInspectionWithoutLossRequestsRetirement {
     when: RetirementInspectionRequested(product_conversation)
-    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true, has_cleanup_authority: true}
-    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: staged_tracked_paths}
-    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: unstaged_tracked_paths}
-    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: untracked_non_ignored_paths}
-    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: initialized_submodule_state}
-    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: detached_unreachable_commits}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
+    requires: exists RetirementAttempt{product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: staged_tracked_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: unstaged_tracked_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: untracked_non_ignored_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: initialized_submodule_state}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         inspection_generation: RetirementInspection.generation,
@@ -176,13 +197,14 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
 
 rule GitBackedInspectionWithLossRequiresConfirmation {
     when: RetirementInspectionRequested(product_conversation)
-    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true, has_cleanup_authority: true}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
+    requires: exists RetirementAttempt{product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
     requires:
-        exists RetirementLossItem{inspection: RetirementInspection, category: staged_tracked_paths}
-        or exists RetirementLossItem{inspection: RetirementInspection, category: unstaged_tracked_paths}
-        or exists RetirementLossItem{inspection: RetirementInspection, category: untracked_non_ignored_paths}
-        or exists RetirementLossItem{inspection: RetirementInspection, category: initialized_submodule_state}
-        or exists RetirementLossItem{inspection: RetirementInspection, category: detached_unreachable_commits}
+        exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: staged_tracked_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: unstaged_tracked_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: untracked_non_ignored_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: initialized_submodule_state}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionRequiresConfirmation(
         product_conversation,
         inspection_generation: RetirementInspection.generation,
@@ -190,7 +212,9 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
     )
 
     @guidance
-        -- Each RetirementLossItem is one categorized row in the exact inventory.
+        -- Each RetirementLossCategoryRow is one categorized row in the exact inventory,
+        -- bound both to one exact RetirementInspection and to the RetirementAttempt
+        -- for the product conversation plus attached WorkScope being retired.
         -- Categories coexist independently. Paths and detached-commit identities
         -- are surfaced without synthesizing a branch, tag, stash, patch, or diff
         -- snapshot as a recovery artifact.
@@ -204,8 +228,9 @@ rule ChangedWorkspaceInvalidatesOutstandingConfirmation {
 
 rule RetirementRequestedRetiresOwnedResources {
     when: ResourceRetirementRequested(product_conversation)
-    requires: exists AttachedWorkScope{product_conversation: product_conversation, has_cleanup_authority: true}
-    requires: not live_conversation_shares_scope(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: not blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
     requires: all_owned_resources_retired(product_conversation)
     ensures: ResourceRetirementCompleted(product_conversation)
 
@@ -216,21 +241,24 @@ rule RetirementRequestedRetiresOwnedResources {
         -- resource has been retired.
 }
 
-rule SharedContinuationPreventsDestructiveRetirement {
+rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
     when: ResourceRetirementRequested(product_conversation)
-    requires: exists AttachedWorkScope{product_conversation: product_conversation, has_cleanup_authority: true}
-    requires: live_conversation_shares_scope(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
     ensures: ResourceRetirementFailed(product_conversation)
 
     @guidance
-        -- Continuations share one live WorkScope. Retirement cannot remove the
-        -- shared worktree while another non-History live conversation still
-        -- resolves to that same scope.
+        -- Continuation rows and subordinate execution conversations inside the same
+        -- ProductConversation do not block retirement of that aggregate's attached
+        -- WorkScope. Destructive teardown stops only when Phoenix sees a genuinely
+        -- distinct open ProductConversation sharing the scope, or cannot resolve
+        -- whether such a distinct aggregate exists because identity evidence conflicts.
 }
 
 rule ResourceRetirementFailureProducesResidualRepairState {
     when: ResourceRetirementRequested(product_conversation)
-    requires: exists RetirementResidualResource{product_conversation: product_conversation}
+    requires: exists RetirementResidualResource{attempt: RetirementAttempt, product_conversation: product_conversation}
     ensures: ResourceRetirementFailed(product_conversation)
 
     @guidance
@@ -240,9 +268,10 @@ rule ResourceRetirementFailureProducesResidualRepairState {
 
 rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     when: ResourceRetirementRequested(product_conversation)
-    requires: exists AttachedWorkScope{product_conversation: product_conversation, has_cleanup_authority: true}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     requires: worktree_already_absent(product_conversation)
-    requires: not absence_identity_proven(product_conversation)
+    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt, product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     ensures: ResourceRetirementFailed(product_conversation)
 
     @guidance
@@ -265,13 +294,14 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 -- Invariants
 ------------------------------------------------------------
 
-invariant SubAgentsDoNotOwnCleanupAuthority {
+invariant CleanupAuthorityComesFromCommittedCloseOperation {
     for a in AttachedWorkScope:
-        a.has_cleanup_authority implies a.owns_git_worktree or a.scope.kind = conversation
+        exists CloseRetirementAuthority{product_conversation: a.product_conversation, scope: a.scope}
+        implies a.owns_git_worktree or a.scope.kind = conversation
 }
 
 invariant NoAutomaticRecoveryArtifactFromRetirement {
     for a in AttachedWorkScope:
-        a.has_cleanup_authority implies
-            not AutomaticRetirementSnapshotCreated(a.product_conversation)
+        exists CloseRetirementAuthority{product_conversation: a.product_conversation, scope: a.scope}
+        implies not AutomaticRetirementSnapshotCreated(a.product_conversation)
 }
