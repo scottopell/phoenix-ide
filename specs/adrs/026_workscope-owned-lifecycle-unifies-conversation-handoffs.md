@@ -19,6 +19,7 @@ The affected requirements now distinguish those dimensions explicitly:
 The point-in-time decision needed here is not whether Phoenix should invent another aggregate or cache table. It is which persisted identity owns which kind of truth, so later requirements and Allium rules do not drift back into mixed authority.
 
 This decision also leaves a naming artifact in the spec set: the requirements covering continuation-linked conversation history remain in `specs/chains/` and keep `REQ-CHN-*` identifiers even though the accepted model treats that topology as implementation structure inside one ProductConversation rather than as a separate user-facing chain entity. Those identifiers remain stable anchors for cross-spec references; the user-facing model does not inherit a separate "chain" object from them.
+That naming artifact is historical documentation, not a standing behavioral requirement: the accepted product model is simply that continuation-linked rows are implementation topology inside one ProductConversation. The filename and requirement IDs stay as stable cross-reference anchors, but future requirements should not restate that migration history as a user-facing contract.
 
 ## Options considered
 

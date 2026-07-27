@@ -297,10 +297,3 @@ scope for that work.
 - **Cross-conversation comparison outside one root-keyed product
   conversation.** This spec scopes recall to one product conversation's
   continuation lineage.
-
-## Compatibility Note
-
-The term **chain** remains in this spec's filename, requirement IDs, and
-some implementation topology because it is the historical name for
-continuation-linked lineage. That term does not imply a separate
-user-facing product entity.
