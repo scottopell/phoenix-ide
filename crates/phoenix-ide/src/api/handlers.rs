@@ -12345,8 +12345,20 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("delete");
 
         assert!(
-            state.runtime.bash_handles().remove(&scope).await.is_none(),
-            "scope must be torn down when its last live conversation is deleted"
+            state
+                .runtime
+                .bash_handles()
+                .owner_handles(&scope)
+                .await
+                .is_empty(),
+            "last-owner delete must drain the scope's bash handles"
+        );
+        assert!(
+            matches!(
+                state.runtime.bash_handles().reserve_spawn(&scope).await,
+                Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+            ),
+            "last-owner delete must preserve the scope's teardown fence"
         );
     }
 
