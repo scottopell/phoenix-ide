@@ -538,7 +538,7 @@ impl ToolContext {
         self
     }
 
-    fn bash_lifecycle_scope(&self) -> ResourceScopeKey {
+    pub(crate) fn bash_lifecycle_scope(&self) -> ResourceScopeKey {
         match &self.bash_lifecycle_owner {
             BashLifecycleOwner::ControlScope => self.work_scope.clone(),
             BashLifecycleOwner::Work(work_scope_id) => {

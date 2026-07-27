@@ -19,7 +19,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tokio::sync::RwLock;
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -28,7 +27,7 @@ use super::handle::{
     ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState, KillSignal,
     TOMBSTONE_TAIL_LINES,
 };
-use super::registry::{BashHandleError, LiveHandleSummary, ResourceScopeKeyHandles};
+use super::registry::{BashHandleError, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
@@ -189,6 +188,11 @@ impl BashError {
                     cap,
                     live_handles: live,
                     hint: CAP_HINT.to_string(),
+                }
+            }
+            BashError::HandleCapReached(BashHandleError::SpawnFenced) => {
+                BashErrorResponse::SpawnFailed {
+                    error_message: BashHandleError::SpawnFenced.to_string(),
                 }
             }
             BashError::WaitSecondsOutOfRange { provided, max } => {
@@ -510,73 +514,72 @@ async fn run_run(
     // check at the tool boundary keeps enforcement single-homed.
 
     let registry = ctx.bash_handle_registry().clone();
-    let handles_arc = match ctx.bash_handles().await {
-        Ok(h) => h,
-        Err(e) => {
+    let mut reservation = match registry.reserve_spawn(&ctx.bash_lifecycle_scope()).await {
+        Ok(reservation) => reservation,
+        Err(BashHandleError::HandleCapReached { cap, live_handles }) => {
+            return BashError::HandleCapReached(BashHandleError::HandleCapReached {
+                cap,
+                live_handles,
+            })
+            .into_tool_output();
+        }
+        Err(BashHandleError::SpawnFenced) => {
             return BashError::SpawnFailed {
-                error_message: format!("could not access bash handle registry: {e}"),
+                error_message: BashHandleError::SpawnFenced.to_string(),
             }
             .into_tool_output();
         }
     };
 
-    // REQ-BASH-005: cap check + handle id allocation under the same write
-    // lock so two concurrent runs can't both race past the cap.
-    let cap = registry.live_handle_cap();
     let ring_bytes_cap = registry.ring_bytes_cap();
-    let handle_id;
-    {
-        let mut handles = handles_arc.write().await;
-        if let Err(e) = handles.check_cap(cap).await {
-            return BashError::HandleCapReached(e).into_tool_output();
+    match spawn_child(
+        cmd,
+        label,
+        ctx,
+        reservation.handle_id().clone(),
+        ring_bytes_cap,
+        spawn_mode,
+    ) {
+        Ok((handle, child, sandbox_scratch_dir)) => {
+            let inserted = match registry
+                .commit_spawn(&mut reservation, handle.clone())
+                .await
+            {
+                Ok(inserted) => inserted,
+                Err(error) => {
+                    return BashError::SpawnFailed {
+                        error_message: error.to_string(),
+                    }
+                    .into_tool_output();
+                }
+            };
+            // Spawn edge: a new bash handle exists for this scope. Emit a
+            // work-scope state-transition signal (REQ-WSUI-007). The
+            // detached waiter started below carries the sink so it can
+            // emit the terminal edge off-thread.
+            registry.emit_lifecycle(
+                &handle.lifecycle_scope,
+                &handle.work_scope,
+                crate::bash::registry::BashLifecyclePhase::Spawned,
+            );
+            let progress_reporter = ctx
+                .bash_progress_sink()
+                .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
+            let _progress_lease = progress_reporter
+                .as_ref()
+                .map(|reporter| LiveBashProgressLease(reporter.clone()));
+            start_io_tasks(
+                &inserted,
+                child,
+                registry.lifecycle_sink(),
+                sandbox_scratch_dir,
+                progress_reporter.clone(),
+            );
+            race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
         }
-        handle_id = handles.allocate_handle_id();
-        // We deliberately do not insert the Handle yet — we need the pgid
-        // from the spawned child. We hold the write lock across the spawn
-        // so no other run can race the cap check, then insert below.
-        // Spawn is fast (a fork+exec) so this lock-hold is bounded.
-        match spawn_child(
-            cmd,
-            label,
-            ctx,
-            handle_id.clone(),
-            ring_bytes_cap,
-            spawn_mode,
-        ) {
-            Ok((handle, child, sandbox_scratch_dir)) => {
-                let inserted = handles.insert(handle.clone());
-                drop(handles);
-                // Spawn edge: a new bash handle exists for this scope. Emit a
-                // work-scope state-transition signal (REQ-WSUI-007). The
-                // detached waiter started below carries the sink so it can
-                // emit the terminal edge off-thread.
-                registry.emit_lifecycle(
-                    &handle.lifecycle_scope,
-                    &handle.work_scope,
-                    crate::bash::registry::BashLifecyclePhase::Spawned,
-                );
-                let progress_reporter = ctx
-                    .bash_progress_sink()
-                    .map(|sink| Arc::new(LiveBashProgressReporter::new(sink)));
-                let _progress_lease = progress_reporter
-                    .as_ref()
-                    .map(|reporter| LiveBashProgressLease(reporter.clone()));
-                start_io_tasks(
-                    &inserted,
-                    child,
-                    registry.lifecycle_sink(),
-                    sandbox_scratch_dir,
-                    progress_reporter.clone(),
-                );
-                race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
-            }
-            Err(e) => {
-                // Drop the allocated handle id by NOT inserting — next
-                // allocation will simply skip past it; that's harmless
-                // (handle ids are sequential and don't need to be dense).
-                drop(handles);
-                BashError::SpawnFailed { error_message: e }.into_tool_output()
-            }
+        Err(e) => {
+            registry.abort_spawn(reservation).await;
+            BashError::SpawnFailed { error_message: e }.into_tool_output()
         }
     }
 }
@@ -1307,18 +1310,10 @@ fn send_signal_to_group(_pgid: i32, _signal: KillSignal) {
 // ---------------------------------------------------------------------------
 
 async fn lookup_handle(ctx: &ToolContext, handle_id: &str) -> Result<Arc<Handle>, BashError> {
-    let handles_arc: Arc<RwLock<ResourceScopeKeyHandles>> =
-        ctx.bash_handles().await.map_err(|e| {
-            // The accessor is currently infallible (returns Ok), but if it
-            // ever fails we surface as handle_not_found-shaped. Use the
-            // BashHandleError debug for the message.
-            BashError::HandleNotFound {
-                handle_id: format!("{handle_id} (registry error: {e:?})"),
-            }
-        })?;
-    let handles = handles_arc.read().await;
-    let handle = handles
-        .get(&HandleId::new(handle_id.to_string()))
+    let handle = ctx
+        .bash_handle_registry()
+        .lookup_handle(&HandleId::new(handle_id.to_string()))
+        .await
         .ok_or_else(|| BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
         })?;

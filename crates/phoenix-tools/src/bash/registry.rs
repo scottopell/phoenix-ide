@@ -24,7 +24,7 @@ use std::time::SystemTime;
 
 use phoenix_core::work_scope::ResourceScopeKey;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use super::handle::{Handle, HandleId};
 use super::ring::RING_BUFFER_BYTES;
@@ -44,6 +44,8 @@ pub enum BashHandleError {
         cap: usize,
         live_handles: Vec<LiveHandleSummary>,
     },
+    #[error("this work scope is being torn down and no longer accepts bash spawns")]
+    SpawnFenced,
 }
 
 /// Summary of a live handle for the cap-rejection response (REQ-BASH-005).
@@ -65,35 +67,45 @@ pub struct LiveHandleProcessGroup {
     pub pgid: i32,
 }
 
-/// Per-`ResourceScopeKey` handle table. Tracks live handles (for cap enforcement
-/// and lookup) and tombstones (so peek/wait/kill on an exited handle still
-/// resolves until the scope is hard-deleted with no inheritor or Phoenix
-/// restarts).
+#[derive(Debug)]
+pub struct SpawnReservation {
+    owner: ResourceScopeKey,
+    handle_id: HandleId,
+    committed: bool,
+}
+
+impl SpawnReservation {
+    #[must_use]
+    pub fn handle_id(&self) -> &HandleId {
+        &self.handle_id
+    }
+}
+
+/// Per-owner handle table. Tracks live handles (for cap enforcement and owner-local
+/// inventory) and tombstones (so peek/wait/kill on an exited handle still resolves
+/// until the owner is hard-deleted with no inheritor or Phoenix restarts).
 ///
-/// The unified `handles` map covers both live and tombstoned entries;
-/// the discrimination is made by inspecting the handle's `HandleState`.
-/// This keeps the lookup path single-source — a handle that transitions
-/// from `Live` to `Tombstoned` is the SAME `Arc<Handle>` (its `state`
-/// field swaps), and lookup never has to "follow" between two maps.
+/// The unified `handles` map covers both live and tombstoned entries; the
+/// discrimination is made by inspecting the handle's `HandleState`. This keeps the
+/// lookup path single-source — a handle that transitions from `Live` to
+/// `Tombstoned` is the SAME `Arc<Handle>` (its `state` field swaps), and lookup
+/// never has to "follow" between two maps.
 #[derive(Debug, Default)]
 pub struct ResourceScopeKeyHandles {
-    /// Next sequential handle index for this work scope (`b-1`, `b-2`, ...).
-    next_id: u64,
-    /// All handles, by id. Live and tombstoned alike.
+    /// All handles owned by this work scope, by id. Live and tombstoned alike.
     handles: HashMap<HandleId, Arc<Handle>>,
+    /// Once teardown begins, no new spawn reservation may commit for this owner.
+    teardown_started: bool,
+    /// Spawn slots admitted before teardown fenced this owner but not yet committed.
+    pending_spawns: usize,
+    /// Wakes teardown after the final admitted spawn commits or aborts.
+    spawn_settled: Arc<Notify>,
 }
 
 impl ResourceScopeKeyHandles {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Allocate the next handle id and increment the counter. Format:
-    /// `b-N` where N starts at 1.
-    pub fn allocate_handle_id(&mut self) -> HandleId {
-        self.next_id += 1;
-        HandleId::new(format!("b-{}", self.next_id))
     }
 
     /// Look up a handle by id (live or tombstoned).
@@ -222,21 +234,6 @@ impl ResourceScopeKeyHandles {
             .collect()
     }
 
-    fn remove_lifecycle_owned_by(
-        &mut self,
-        lifecycle_scope: &ResourceScopeKey,
-    ) -> Vec<Arc<Handle>> {
-        let ids: Vec<_> = self
-            .handles
-            .iter()
-            .filter(|(_, handle)| &handle.lifecycle_scope == lifecycle_scope)
-            .map(|(id, _)| id.clone())
-            .collect();
-        ids.into_iter()
-            .filter_map(|id| self.handles.remove(&id))
-            .collect()
-    }
-
     /// REQ-BASH-005: enforce the cap before allocating a new handle id /
     /// spawning a process.
     ///
@@ -298,6 +295,7 @@ pub type BashLifecycleSink = tokio::sync::mpsc::UnboundedSender<BashLifecycleEve
 #[derive(Debug, Default)]
 pub struct BashHandleRegistry {
     inner: RwLock<HashMap<ResourceScopeKey, Arc<RwLock<ResourceScopeKeyHandles>>>>,
+    handles_by_id: RwLock<HashMap<HandleId, Arc<Handle>>>,
     /// Per-handle ring byte cap. Defaults to [`RING_BUFFER_BYTES`]; tests
     /// override to small values to exercise eviction.
     ring_bytes_cap: usize,
@@ -317,6 +315,7 @@ impl BashHandleRegistry {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            handles_by_id: RwLock::new(HashMap::new()),
             ring_bytes_cap: RING_BUFFER_BYTES,
             live_handle_cap: LIVE_HANDLE_CAP,
             lifecycle_sink: None,
@@ -331,6 +330,7 @@ impl BashHandleRegistry {
     pub fn with_lifecycle_sink(sink: Option<BashLifecycleSink>) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            handles_by_id: RwLock::new(HashMap::new()),
             ring_bytes_cap: RING_BUFFER_BYTES,
             live_handle_cap: LIVE_HANDLE_CAP,
             lifecycle_sink: sink,
@@ -343,6 +343,7 @@ impl BashHandleRegistry {
     pub fn with_caps(ring_bytes_cap: usize, live_handle_cap: usize) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            handles_by_id: RwLock::new(HashMap::new()),
             ring_bytes_cap,
             live_handle_cap,
             lifecycle_sink: None,
@@ -395,6 +396,10 @@ impl BashHandleRegistry {
         self.live_handle_cap
     }
 
+    fn allocate_handle_id(&self) -> HandleId {
+        HandleId::new(format!("b-{}", uuid::Uuid::new_v4()))
+    }
+
     /// Get-or-create the per-`ResourceScopeKey` handle table. Matches the
     /// `BrowserSessionManager::get_session` pattern — returns the same
     /// `Arc<RwLock<ResourceScopeKeyHandles>>` for repeated calls with the
@@ -432,6 +437,63 @@ impl BashHandleRegistry {
         work_scope: &ResourceScopeKey,
     ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
         self.inner.read().await.get(work_scope).cloned()
+    }
+
+    pub async fn reserve_spawn(
+        &self,
+        owner: &ResourceScopeKey,
+    ) -> Result<SpawnReservation, BashHandleError> {
+        let entry = self.get_or_create(owner).await;
+        let mut handles = entry.write().await;
+        if handles.teardown_started {
+            return Err(BashHandleError::SpawnFenced);
+        }
+        if handles.live_count().await + handles.pending_spawns >= self.live_handle_cap {
+            return Err(BashHandleError::HandleCapReached {
+                cap: self.live_handle_cap,
+                live_handles: handles.live_summary().await,
+            });
+        }
+        handles.pending_spawns += 1;
+        Ok(SpawnReservation {
+            owner: owner.clone(),
+            handle_id: self.allocate_handle_id(),
+            committed: false,
+        })
+    }
+
+    pub async fn commit_spawn(
+        &self,
+        reservation: &mut SpawnReservation,
+        handle: Arc<Handle>,
+    ) -> Result<Arc<Handle>, BashHandleError> {
+        let entry = self
+            .get_existing(&reservation.owner)
+            .await
+            .ok_or(BashHandleError::SpawnFenced)?;
+        let mut table = entry.write().await;
+        let inserted = table.insert(handle.clone());
+        table.pending_spawns = table.pending_spawns.saturating_sub(1);
+        table.spawn_settled.notify_waiters();
+        self.handles_by_id
+            .write()
+            .await
+            .insert(inserted.handle_id.clone(), inserted.clone());
+        reservation.committed = true;
+        Ok(inserted)
+    }
+
+    pub async fn abort_spawn(&self, reservation: SpawnReservation) {
+        let Some(entry) = self.get_existing(&reservation.owner).await else {
+            return;
+        };
+        let mut table = entry.write().await;
+        table.pending_spawns = table.pending_spawns.saturating_sub(1);
+        table.spawn_settled.notify_waiters();
+    }
+
+    pub async fn lookup_handle(&self, handle_id: &HandleId) -> Option<Arc<Handle>> {
+        self.handles_by_id.read().await.get(handle_id).cloned()
     }
 
     /// Snapshot live process-group ids across ALL work scopes, for the
@@ -474,60 +536,54 @@ impl BashHandleRegistry {
         out
     }
 
-    pub async fn lifecycle_owned_handles(
-        &self,
-        lifecycle_scope: &ResourceScopeKey,
-    ) -> Vec<Arc<Handle>> {
-        let entries: Vec<_> = self.inner.read().await.values().cloned().collect();
-        let mut handles = Vec::new();
-        for entry in entries {
-            handles.extend(
-                entry
-                    .read()
-                    .await
-                    .all()
-                    .filter(|handle| &handle.lifecycle_scope == lifecycle_scope)
-                    .cloned(),
-            );
-        }
+    pub async fn owner_handles(&self, owner: &ResourceScopeKey) -> Vec<Arc<Handle>> {
+        let Some(entry) = self.get_existing(owner).await else {
+            return Vec::new();
+        };
+        let handles = entry.read().await.all().cloned().collect();
         handles
-    }
-
-    async fn remove_lifecycle_owned(&self, lifecycle_scope: &ResourceScopeKey) -> Vec<Arc<Handle>> {
-        let entries: Vec<_> = self
-            .inner
-            .read()
-            .await
-            .iter()
-            .map(|(scope, entry)| (scope.clone(), entry.clone()))
-            .collect();
-        let mut removed = Vec::new();
-        let mut empty_scopes = Vec::new();
-        for (scope, entry) in entries {
-            let mut table = entry.write().await;
-            removed.extend(table.remove_lifecycle_owned_by(lifecycle_scope));
-            if table.all().next().is_none() {
-                empty_scopes.push(scope);
-            }
-        }
-        if !empty_scopes.is_empty() {
-            let mut registry = self.inner.write().await;
-            for scope in empty_scopes {
-                registry.remove(&scope);
-            }
-        }
-        removed
     }
 
     /// Remove a `ResourceScopeKey`'s handle table outright. Used by the
     /// hard-delete cascade (REQ-BASH-006). Returns the removed entry so
     /// the caller can SIGKILL its live process groups synchronously.
+    pub async fn begin_teardown(
+        &self,
+        work_scope: &ResourceScopeKey,
+    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
+        let entry = self.get_existing(work_scope).await?;
+        loop {
+            let notified = {
+                let mut table = entry.write().await;
+                table.teardown_started = true;
+                if table.pending_spawns == 0 {
+                    return Some(entry.clone());
+                }
+                table.spawn_settled.clone().notified_owned()
+            };
+            notified.await;
+        }
+    }
+
     pub async fn remove(
         &self,
         work_scope: &ResourceScopeKey,
     ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
-        let mut map = self.inner.write().await;
-        map.remove(work_scope)
+        let removed = {
+            let mut map = self.inner.write().await;
+            map.remove(work_scope)
+        }?;
+        let ids: Vec<_> = removed
+            .read()
+            .await
+            .all()
+            .map(|handle| handle.handle_id.clone())
+            .collect();
+        let mut by_id = self.handles_by_id.write().await;
+        for id in ids {
+            by_id.remove(&id);
+        }
+        Some(removed)
     }
 
     /// Number of work scopes currently tracked. Test/diagnostic only.
@@ -606,7 +662,11 @@ pub async fn cascade_bash_on_delete(
         return kill_selected_handles(registry, work_scope, handles).await;
     }
     let mut report = CascadeBashReport::default();
-    let handles = registry.remove_lifecycle_owned(work_scope).await;
+    let Some(entry) = registry.begin_teardown(work_scope).await else {
+        return report;
+    };
+    let handles: Vec<_> = entry.read().await.all().cloned().collect();
+    let _ = registry.remove(work_scope).await;
     if handles.is_empty() {
         return report;
     }
@@ -761,21 +821,130 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocate_handle_id_is_sequential_per_scope() {
-        let mut handles = ResourceScopeKeyHandles::new();
-        assert_eq!(handles.allocate_handle_id().as_str(), "b-1");
-        assert_eq!(handles.allocate_handle_id().as_str(), "b-2");
-        assert_eq!(handles.allocate_handle_id().as_str(), "b-3");
+    async fn handle_ids_are_globally_unique_across_owners() {
+        let registry = BashHandleRegistry::new();
+        let a = registry
+            .reserve_spawn(&scope("conv-a"))
+            .await
+            .expect("reserve a");
+        let b = registry
+            .reserve_spawn(&scope("conv-b"))
+            .await
+            .expect("reserve b");
+        let c = registry
+            .reserve_spawn(&scope("conv-a"))
+            .await
+            .expect("reserve c");
+        assert!(a.handle_id().as_str().starts_with("b-"));
+        assert_ne!(a.handle_id(), b.handle_id());
+        assert_ne!(a.handle_id(), c.handle_id());
+        assert_ne!(b.handle_id(), c.handle_id());
     }
 
     #[tokio::test]
-    async fn allocate_handle_id_independent_across_scopes() {
+    async fn owner_local_inventory_and_removal_leave_other_owner_intact() {
         let registry = BashHandleRegistry::new();
-        let scope_a = registry.get_or_create(&scope("conv-a")).await;
-        let scope_b = registry.get_or_create(&scope("conv-b")).await;
-        assert_eq!(scope_a.write().await.allocate_handle_id().as_str(), "b-1");
-        assert_eq!(scope_b.write().await.allocate_handle_id().as_str(), "b-1");
-        assert_eq!(scope_a.write().await.allocate_handle_id().as_str(), "b-2");
+        let owner_a = scope("conv-a");
+        let owner_b = scope("conv-b");
+        let table_a = registry.get_or_create(&owner_a).await;
+        let table_b = registry.get_or_create(&owner_b).await;
+        table_a
+            .write()
+            .await
+            .insert(make_handle("conv-a", "b-1", RING_BUFFER_BYTES));
+        table_b
+            .write()
+            .await
+            .insert(make_handle("conv-b", "b-2", RING_BUFFER_BYTES));
+
+        assert_eq!(registry.owner_handles(&owner_a).await.len(), 1);
+        assert_eq!(registry.owner_handles(&owner_b).await.len(), 1);
+        let _ = registry.remove(&owner_a).await;
+        assert!(registry.owner_handles(&owner_a).await.is_empty());
+        assert_eq!(registry.owner_handles(&owner_b).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reservation_abort_and_commit_behave_as_expected() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-a");
+
+        let reservation = registry.reserve_spawn(&owner).await.expect("reserve abort");
+        let aborted_id = reservation.handle_id().clone();
+        registry.abort_spawn(reservation).await;
+        assert!(registry.lookup_handle(&aborted_id).await.is_none());
+
+        let mut reservation = registry
+            .reserve_spawn(&owner)
+            .await
+            .expect("reserve commit");
+        let committed_id = reservation.handle_id().clone();
+        let inserted = registry
+            .commit_spawn(
+                &mut reservation,
+                Handle::new_live(
+                    owner.clone(),
+                    committed_id.clone(),
+                    "pwd".into(),
+                    None,
+                    12345,
+                    12345,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await
+            .expect("commit spawn");
+        assert_eq!(inserted.handle_id, committed_id);
+        assert!(registry.lookup_handle(&committed_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn teardown_fences_new_spawn_admission() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-a");
+        registry.get_or_create(&owner).await;
+        let _ = registry
+            .begin_teardown(&owner)
+            .await
+            .expect("begin teardown");
+        assert!(registry.reserve_spawn(&owner).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_reservation_counts_against_cap() {
+        let registry = BashHandleRegistry::with_caps(RING_BUFFER_BYTES, 1);
+        let owner = scope("conv-a");
+        let _reservation = registry.reserve_spawn(&owner).await.expect("first slot");
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::HandleCapReached { cap: 1, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn teardown_waits_for_admitted_spawn_to_settle() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("conv-a");
+        let reservation = registry.reserve_spawn(&owner).await.expect("reservation");
+        let teardown = {
+            let registry = registry.clone();
+            let owner = owner.clone();
+            tokio::spawn(async move { registry.begin_teardown(&owner).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!teardown.is_finished());
+        registry.abort_spawn(reservation).await;
+        assert!(teardown.await.expect("join").is_some());
+    }
+
+    #[tokio::test]
+    async fn preserved_owner_still_accepts_spawns() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("conv-a");
+        let actor = work_actor("owner");
+        let _ = registry.get_or_create(&owner).await;
+        let _ = cascade_bash_on_delete(&registry, &owner, &actor, Some(&owner)).await;
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
     }
 
     #[tokio::test]
@@ -798,6 +967,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert!(ids.contains(&"b-1") && ids.contains(&"b-2"));
             }
+            BashHandleError::SpawnFenced => panic!("expected cap rejection"),
         }
     }
 
@@ -808,7 +978,9 @@ mod tests {
         let mut guard = handles_arc.write().await;
         guard.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES));
         let err = guard.check_cap(1).await.unwrap_err();
-        let BashHandleError::HandleCapReached { live_handles, .. } = err;
+        let BashHandleError::HandleCapReached { live_handles, .. } = err else {
+            panic!("expected cap rejection");
+        };
         assert_eq!(live_handles[0].cmd, "cmd for b-1");
         // age is recent; just assert it's a u64 (>= 0).
         let _ = live_handles[0].age_seconds;
@@ -939,7 +1111,7 @@ mod tests {
     async fn work_scope_teardown_removes_coordinator_controlled_handle() {
         let registry = Arc::new(BashHandleRegistry::new());
         let lifecycle_scope = scope("inspected-work");
-        let coordinator_table = registry.get_or_create(&ResourceScopeKey::Coordinator).await;
+        let coordinator_table = registry.get_or_create(&lifecycle_scope).await;
         let handle = Handle::new_live_for_actor_with_lifecycle(
             ResourceScopeKey::Coordinator,
             lifecycle_scope.clone(),
@@ -962,17 +1134,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(
-            registry
-                .lifecycle_owned_handles(&lifecycle_scope)
-                .await
-                .len(),
-            1
-        );
+        assert_eq!(registry.owner_handles(&lifecycle_scope).await.len(), 1);
         let report =
             cascade_bash_on_delete(&registry, &lifecycle_scope, &work_actor("owner"), None).await;
         assert!(report.kill_failures.is_empty());
-        assert!(coordinator_table.read().await.all().next().is_none());
+        assert!(registry.get_existing(&lifecycle_scope).await.is_none());
     }
 
     #[tokio::test]

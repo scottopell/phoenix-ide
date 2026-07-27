@@ -57,7 +57,7 @@ async fn assemble_bash(
     actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Vec<BashHandleInventory> {
-    let handles = bash_handles.lifecycle_owned_handles(work_scope).await;
+    let handles = bash_handles.owner_handles(work_scope).await;
     let mut out = Vec::new();
     for handle in &handles {
         if actor.is_none_or(|access| {
@@ -231,7 +231,7 @@ mod tests {
         use phoenix_core::work_scope::ResourceAuthority;
 
         let bash = Arc::new(BashHandleRegistry::new());
-        let coordinator = bash.get_or_create(&ResourceScopeKey::Coordinator).await;
+        let coordinator = bash.get_or_create(&scope()).await;
         coordinator
             .write()
             .await

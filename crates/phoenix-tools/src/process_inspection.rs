@@ -50,17 +50,15 @@ pub struct InspectionAssembly {
 /// table or the handle id is absent — a not-found condition (REQ-PINSP-001).
 pub async fn assemble_inspection(
     lifecycle_scope: &ResourceScopeKey,
-    control_scope: &ResourceScopeKey,
+    _control_scope: &ResourceScopeKey,
     handle_id: &str,
     since: Option<u64>,
     actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Option<InspectionAssembly> {
-    let table = bash_handles.get_existing(control_scope).await?;
-    let handle = table
-        .read()
-        .await
-        .get(&HandleId::new(handle_id.to_string()))?;
+    let handle = bash_handles
+        .lookup_handle(&HandleId::new(handle_id.to_string()))
+        .await?;
     if &handle.lifecycle_scope != lifecycle_scope {
         return None;
     }
@@ -177,8 +175,7 @@ mod tests {
         use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority};
 
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
-        table.write().await.insert(Handle::new_live_for_actor(
+        let handle = Handle::new_live_for_actor(
             scope(),
             HandleId::new("b-private"),
             "sibling-b".into(),
@@ -188,7 +185,11 @@ mod tests {
             1,
             1,
             RING_BUFFER_BYTES,
-        ));
+        );
+        let mut reservation = bash.reserve_spawn(&scope()).await.expect("reserve");
+        bash.commit_spawn(&mut reservation, handle)
+            .await
+            .expect("commit");
         let actor = EffectiveResourceAccess::new("sibling-a", ResourceAuthority::Restricted);
 
         assert!(
@@ -201,7 +202,6 @@ mod tests {
     #[tokio::test]
     async fn live_handle_reports_identity_state_and_live_pgid() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -211,7 +211,10 @@ mod tests {
             1234,
             RING_BUFFER_BYTES,
         );
-        table.write().await.insert(handle);
+        let mut reservation = bash.reserve_spawn(&scope()).await.expect("reserve");
+        bash.commit_spawn(&mut reservation, handle)
+            .await
+            .expect("commit");
 
         let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
             .await
@@ -236,7 +239,6 @@ mod tests {
         let bash = Arc::new(BashHandleRegistry::new());
         let control_scope = ResourceScopeKey::Coordinator;
         let lifecycle_scope = scope();
-        let table = bash.get_or_create(&control_scope).await;
         let handle = Handle::new_live_for_actor_with_lifecycle(
             control_scope.clone(),
             lifecycle_scope.clone(),
@@ -249,7 +251,10 @@ mod tests {
             1234,
             RING_BUFFER_BYTES,
         );
-        table.write().await.insert(handle);
+        let mut reservation = bash.reserve_spawn(&scope()).await.expect("reserve");
+        bash.commit_spawn(&mut reservation, handle)
+            .await
+            .expect("commit");
 
         assert!(
             assemble_inspection(&lifecycle_scope, &control_scope, "b-1", None, None, &bash,)
@@ -266,7 +271,6 @@ mod tests {
     #[tokio::test]
     async fn kill_pending_handle_projects_kill_pending_kernel_and_live_pgid() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -279,7 +283,10 @@ mod tests {
         handle
             .mark_kill_pending_kernel(KillSignal::Term, SystemTime::now())
             .await;
-        table.write().await.insert(handle);
+        let mut reservation = bash.reserve_spawn(&scope()).await.expect("reserve");
+        bash.commit_spawn(&mut reservation, handle)
+            .await
+            .expect("commit");
 
         let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
             .await
@@ -294,7 +301,6 @@ mod tests {
     #[tokio::test]
     async fn tombstoned_handle_serves_terminal_fields_and_no_live_pgid() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -315,7 +321,10 @@ mod tests {
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
-        table.write().await.insert(handle);
+        let mut reservation = bash.reserve_spawn(&scope()).await.expect("reserve");
+        bash.commit_spawn(&mut reservation, handle)
+            .await
+            .expect("commit");
 
         let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
             .await
