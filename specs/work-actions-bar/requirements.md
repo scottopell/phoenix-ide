@@ -71,7 +71,8 @@ THE SYSTEM SHALL organize available work actions into three logical zones:
 
 **FINISH zone** — terminal guidance:
 - `Close conversation` — initiates the single Close flow for the conversation. Its
-  cancellation, loss-inspection, and resource-release behavior is owned by `work-lifecycle`.
+  cancellation, loss-inspection, and resource-release behavior is owned by the Close lifecycle
+  specs.
 - The action bar may pair Close with explanatory notes about why it is or is not the right
   next step in a specific `WorkDisposition` case (REQ-WAB-004).
 
@@ -296,9 +297,12 @@ WHEN the conversation's `continued_in_conv_id` is set
 THE SYSTEM SHALL render the bar with no RESOLVE or FINISH verbs and no primary
 AND SHALL show a muted inline note: "Continued — actions belong on the continuation."
 
-The continuation is the live conversation and therefore the current `WorkScope` owner; any terminal decision belongs there. bedrock
-REQ-BED-031 also forbids terminal actions on a context-exhausted parent that has a
-continuation, so the suppressed bar matches the server-side legality gate.
+The continuation is the live execution target, but the same `ProductConversation` retains the
+attached `WorkScope`; Phoenix does not transfer WorkScope ownership to a successor row just because
+execution continued there. Any terminal decision therefore belongs on the live continuation row,
+which is the aggregate's latest executable surface. bedrock REQ-BED-031 also forbids terminal
+actions on a context-exhausted parent that has a continuation, so the suppressed bar matches the
+server-side legality gate.
 
 ---
 

@@ -803,8 +803,9 @@ rule AggregateLifecycleProjectionBroadcast {
         --
         -- This aggregate lifecycle projection is the authoritative replacement for any
         -- row-local terminal event on the root conversation stream. The event list/ring
-        -- treat the lifecycle projection consistently; no separate
-        -- `conversation_became_terminal` carrier is required for reconnect correctness.
+        -- treat the lifecycle projection consistently, and reconnect correctness comes
+        -- from replaying that authoritative projection rather than from any legacy
+        -- row-local terminal carrier.
 }
 
 rule ConversationUpdateBroadcast {

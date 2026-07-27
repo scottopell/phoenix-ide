@@ -144,7 +144,6 @@ entity CloseObligation {
         awaiting_stop_work_confirmation -> settling_active_work
         settling_active_work -> cancel_requested_during_settlement
         settling_active_work -> awaiting_retirement_inspection
-        cancel_requested_during_settlement -> awaiting_retirement_inspection
         cancel_requested_during_settlement -> completed
         awaiting_retirement_inspection -> awaiting_loss_confirmation
         awaiting_retirement_inspection -> retirement_requested
@@ -1396,18 +1395,21 @@ rule CloseObligationRequestsRetirementInspectionAfterSettlement {
     ensures: RetirementInspectionRequested(product_conversation)
 }
 
-rule CloseSettlementCancellationReturnsToRetirementInspection {
+rule CloseSettlementCancellationCompletesAfterBusyOwnershipReleased {
     when: CloseSettlementProgressed(product_conversation)
     requires: CloseObligation{product_conversation: product_conversation}.phase = cancel_requested_during_settlement
     requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_retirement_inspection
-    ensures: RetirementInspectionRequested(product_conversation)
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
+    ensures: CloseObligationCancelled(product_conversation)
 
     @guidance
-        -- A cancellation request during settlement only cancels the active-work stop.
-        -- Once busy execution has settled, Close still resolves structurally through
-        -- the same retirement-inspection path used by non-cancelled Close rather than
-        -- completing early while resources may remain owned.
+        -- A cancellation request during settlement does not interrupt the same
+        -- settlement pass that releases latest-row busy ownership. Phoenix first
+        -- waits for that busy ownership to clear through settlement, then marks the
+        -- Close obligation completed and emits CloseObligationCancelled. It does not
+        -- request retirement inspection, enter retirement_requested, or continue into
+        -- destructive Close after the user has cancelled. The user may later start a
+        -- fresh Close from the still-open ProductConversation.
 }
 
 rule RetirementInspectionShowsNoConfirmationRequired {
