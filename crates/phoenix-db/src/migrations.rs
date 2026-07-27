@@ -309,6 +309,27 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 const MIGRATION_058: &str = r"
+INSERT OR IGNORE INTO workflow_supported_codecs (
+    workflow_id, codec_family, codec_version
+)
+SELECT workflow_id, 'direct_turn.llm_intent', 1
+FROM workflows WHERE profile_kind = 'direct_turn';
+INSERT OR IGNORE INTO workflow_supported_codecs (
+    workflow_id, codec_family, codec_version
+)
+SELECT workflow_id, 'direct_turn.llm_observation', 1
+FROM workflows WHERE profile_kind = 'direct_turn';
+INSERT OR IGNORE INTO workflow_supported_codecs (
+    workflow_id, codec_family, codec_version
+)
+SELECT workflow_id, 'direct_turn.llm_receipt', 1
+FROM workflows WHERE profile_kind = 'direct_turn';
+INSERT OR IGNORE INTO workflow_supported_codecs (
+    workflow_id, codec_family, codec_version
+)
+SELECT workflow_id, 'direct_turn.llm_receipt_event', 1
+FROM workflows WHERE profile_kind = 'direct_turn';
+
 CREATE TABLE workflow_receipt_adoptions (
     workflow_id INTEGER NOT NULL,
     receipt_id INTEGER NOT NULL,

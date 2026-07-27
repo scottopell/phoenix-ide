@@ -112,6 +112,10 @@ fn supported_codecs() -> SupportedCodecRegistry {
         prepared_payload_codec(),
         receipt_codec(),
         receipt_event_codec(),
+        crate::direct_turn_llm::intent_codec(),
+        crate::direct_turn_llm::observation_codec(),
+        crate::direct_turn_llm::receipt_codec(),
+        crate::direct_turn_llm::receipt_event_codec(),
     ])
     .unwrap_or_else(|| unreachable!("static direct-turn codec registry is non-empty and valid"))
 }

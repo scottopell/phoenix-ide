@@ -969,6 +969,13 @@ impl<'a> WorkflowTx<'a> {
              WHERE e.workflow_id = ?1 AND e.effect_id = ?2
                AND a.status IN (
                    'Begun', 'ObservationRecorded', 'AuthorityLost', 'ReceiptAccepted'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM workflow_attempts competing
+                   WHERE competing.workflow_id = e.workflow_id
+                     AND competing.effect_id = e.effect_id
+                     AND competing.attempt_id <> a.attempt_id
+                     AND competing.status IN ('Begun', 'ObservationRecorded')
                )",
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
@@ -1114,14 +1121,7 @@ impl<'a> WorkflowTx<'a> {
                 && delivery.payload_kind == LocalDeliveryPayloadKind::Receipt
                 && delivery.payload_blob == input.receipt_event_payload
                 && delivery.requires_runtime_acceptance
-                    == input.receipt_event_requires_runtime_acceptance
-                && delivery.status == DeliveryStatus::Pending
-                && delivery.runtime_acceptance_status
-                    == input
-                        .receipt_event_requires_runtime_acceptance
-                        .then_some(RuntimeAcceptanceStatus::Owed)
-                && delivery.suppression_reason.is_none()
-                && delivery.accepted_by_transition_id.is_none();
+                    == input.receipt_event_requires_runtime_acceptance;
             return Ok(ReceiptAcceptanceResult {
                 outcome: if exact {
                     AuthorityOutcome::Authorized
@@ -2028,31 +2028,19 @@ impl WorkflowRepository {
         &self,
         input: &AdoptReceiptInput,
     ) -> DbResult<ReceiptAcceptanceResult> {
-        for _ in 0..5 {
-            match self.adopt_receipt_once(input).await {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if is_sqlite_busy_retryable(error.as_ref()) =>
-                {
-                    std::thread::yield_now();
-                }
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if is_sqlite_unique_constraint(error.as_ref())
-                        || is_sqlite_primary_key_constraint(error.as_ref()) =>
-                {
-                    return Ok(ReceiptAcceptanceResult {
-                        outcome: AuthorityOutcome::StaleAuthority,
-                        receipt: None,
-                        delivery: None,
-                    });
-                }
-                result => return result,
+        match self.adopt_receipt_once(input).await {
+            Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                if is_sqlite_unique_constraint(error.as_ref())
+                    || is_sqlite_primary_key_constraint(error.as_ref()) =>
+            {
+                Ok(ReceiptAcceptanceResult {
+                    outcome: AuthorityOutcome::StaleAuthority,
+                    receipt: None,
+                    delivery: None,
+                })
             }
+            result => result,
         }
-        Ok(ReceiptAcceptanceResult {
-            outcome: AuthorityOutcome::StaleAuthority,
-            receipt: None,
-            delivery: None,
-        })
     }
 
     async fn adopt_receipt_once(
@@ -3422,6 +3410,48 @@ mod tests {
             .unwrap();
         assert_eq!(expired, AuthorityOutcome::Authorized);
 
+        let replacement = repo
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(324),
+                effect_id: EffectId(1),
+                attempt_id: AttemptId(2),
+                process_incarnation: ProcessIncarnation(10),
+                now: Timestamp(10),
+                lease_until: Some(LeaseExpiry(20)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(replacement.outcome, ClaimOutcome::Started);
+        let blocked = repo
+            .adopt_receipt(&AdoptReceiptInput {
+                workflow_id: WorkflowId(324),
+                effect_id: EffectId(1),
+                observation_id: ObservationId(1),
+                declared_workflow_version: authority.declared_workflow_version,
+                generation: authority.generation,
+                receipt_id: ReceiptId(1),
+                delivery_id: DeliveryId(1),
+                receipt_codec: local_codec_owned("receipt"),
+                receipt_payload: vec![8],
+                receipt_event_codec: local_codec_owned("event"),
+                receipt_event_payload: vec![9],
+                receipt_event_requires_runtime_acceptance: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(blocked.outcome, AuthorityOutcome::StaleAuthority);
+        assert_eq!(
+            repo.expire_lease_exact(&ExpireLeaseInput {
+                workflow_id: WorkflowId(324),
+                effect_id: EffectId(1),
+                attempt_id: AttemptId(2),
+                now: Timestamp(20),
+            })
+            .await
+            .unwrap(),
+            AuthorityOutcome::Authorized
+        );
+
         let adopted = repo
             .adopt_receipt(&AdoptReceiptInput {
                 workflow_id: WorkflowId(324),
@@ -3446,6 +3476,23 @@ mod tests {
         );
         assert_eq!(adopted.receipt.as_ref().unwrap().attempt_id, None);
 
+        sqlx::query(
+            "UPDATE workflow_deliveries
+             SET status = 'Suppressed', suppression_reason = 'LifecycleTerminal'
+             WHERE workflow_id = ?1 AND delivery_id = ?2",
+        )
+        .bind(324_i64)
+        .bind(1_i64)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        let canonical_delivery = repo
+            .list_deliveries(WorkflowId(324))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
         let replay = repo
             .adopt_receipt(&AdoptReceiptInput {
                 workflow_id: WorkflowId(324),
@@ -3463,22 +3510,26 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(replay, adopted);
+        assert_eq!(replay.outcome, AuthorityOutcome::Authorized);
+        assert_eq!(replay.receipt, adopted.receipt);
+        assert_eq!(replay.delivery, Some(canonical_delivery));
 
         let attempts = repo
             .list_attempts(WorkflowId(324), EffectId(1))
             .await
             .unwrap();
-        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].status, AttemptStatus::ReceiptAccepted);
         assert!(attempts[0].lease.is_none());
+        assert_eq!(attempts[1].status, AttemptStatus::AuthorityLost);
+        assert!(attempts[1].lease.is_none());
 
         let claimed_again = second
             .begin_attempt(&BeginAttemptInput {
                 workflow_id: WorkflowId(324),
                 effect_id: EffectId(1),
-                attempt_id: AttemptId(2),
-                process_incarnation: ProcessIncarnation(10),
+                attempt_id: AttemptId(3),
+                process_incarnation: ProcessIncarnation(11),
                 now: Timestamp(11),
                 lease_until: Some(LeaseExpiry(20)),
             })

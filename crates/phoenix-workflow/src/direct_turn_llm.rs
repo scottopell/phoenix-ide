@@ -10,6 +10,38 @@ pub const RECEIPT_CODEC_FAMILY: &str = "direct_turn.llm_receipt";
 pub const RECEIPT_EVENT_CODEC_FAMILY: &str = "direct_turn.llm_receipt_event";
 pub const CODEC_VERSION: u32 = 1;
 
+#[must_use]
+pub fn intent_codec() -> crate::CodecRef {
+    crate::CodecRef {
+        family: INTENT_CODEC_FAMILY,
+        version: CODEC_VERSION,
+    }
+}
+
+#[must_use]
+pub fn observation_codec() -> crate::CodecRef {
+    crate::CodecRef {
+        family: OBSERVATION_CODEC_FAMILY,
+        version: CODEC_VERSION,
+    }
+}
+
+#[must_use]
+pub fn receipt_codec() -> crate::CodecRef {
+    crate::CodecRef {
+        family: RECEIPT_CODEC_FAMILY,
+        version: CODEC_VERSION,
+    }
+}
+
+#[must_use]
+pub fn receipt_event_codec() -> crate::CodecRef {
+    crate::CodecRef {
+        family: RECEIPT_EVENT_CODEC_FAMILY,
+        version: CODEC_VERSION,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LlmPayloadError {
     #[error("payload fingerprint mismatch: expected {expected}, got {actual}")]
@@ -136,7 +168,7 @@ impl LlmResultObservation {
     fn new(request: &PreparedLlmRequest, kind: LlmResultKind, canonical_payload: Vec<u8>) -> Self {
         Self {
             request_fingerprint: request.fingerprint().to_string(),
-            result_fingerprint: fingerprint(&canonical_payload),
+            result_fingerprint: result_fingerprint(&kind, &canonical_payload),
             kind,
             canonical_payload,
         }
@@ -154,7 +186,7 @@ impl LlmResultObservation {
         kind: LlmResultKind,
         canonical_payload: Vec<u8>,
     ) -> Result<Self, LlmPayloadError> {
-        let expected = fingerprint(&canonical_payload);
+        let expected = self::result_fingerprint(&kind, &canonical_payload);
         if result_fingerprint != expected {
             return Err(LlmPayloadError::FingerprintMismatch {
                 expected,
@@ -232,13 +264,33 @@ impl<'de> Deserialize<'de> for LlmResultObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmResultReceipt {
-    pub observation_id: ObservationId,
-    pub result_fingerprint: String,
+    observation_id: ObservationId,
+}
+
+impl LlmResultReceipt {
+    #[must_use]
+    pub fn from_observation(observation_id: ObservationId) -> Self {
+        Self { observation_id }
+    }
+
+    #[must_use]
+    pub fn observation_id(&self) -> ObservationId {
+        self.observation_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LlmResultReducerEvent {
     ResultObserved(LlmResultReceipt),
+}
+
+fn result_fingerprint(kind: &LlmResultKind, payload: &[u8]) -> String {
+    let kind = serde_json::to_vec(kind).expect("LLM result kind serialization is infallible");
+    let mut semantic_payload = Vec::with_capacity(kind.len() + payload.len() + 8);
+    semantic_payload.extend_from_slice(&(kind.len() as u64).to_be_bytes());
+    semantic_payload.extend_from_slice(&kind);
+    semantic_payload.extend_from_slice(payload);
+    fingerprint(&semantic_payload)
 }
 
 fn fingerprint(payload: &[u8]) -> String {
@@ -281,13 +333,21 @@ mod tests {
     }
 
     #[test]
+    fn result_fingerprint_covers_terminal_kind() {
+        let request = PreparedLlmRequest::new(br#"{\"prompt\":\"one\"}"#.to_vec());
+        let payload = br#"{\"message\":\"same bytes\"}"#.to_vec();
+        let success = LlmResultObservation::success(&request, payload.clone());
+        let failure =
+            LlmResultObservation::failure(&request, ProviderFailureKind::RateLimited, payload);
+        assert_ne!(success.result_fingerprint(), failure.result_fingerprint());
+    }
+
+    #[test]
     fn receipt_references_observation_without_copying_result_payload() {
-        let receipt = LlmResultReceipt {
-            observation_id: ObservationId(9),
-            result_fingerprint: "result-fingerprint".to_string(),
-        };
+        let receipt = LlmResultReceipt::from_observation(ObservationId(9));
         let encoded = serde_json::to_value(&receipt).unwrap();
-        assert_eq!(encoded.as_object().unwrap().len(), 2);
+        assert_eq!(encoded.as_object().unwrap().len(), 1);
+        assert_eq!(receipt.observation_id(), ObservationId(9));
         assert!(encoded.get("canonical_payload").is_none());
     }
 }
