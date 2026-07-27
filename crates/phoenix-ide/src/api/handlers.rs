@@ -3192,9 +3192,11 @@ async fn inspect_bash_handle(
     } else {
         crate::work_scope::EffectiveResourceAccess::new(conversation.id.clone(), authority)
     };
+    let actor_scope = conversation_resource_scope(&conversation);
 
     let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
         &handle_id,
+        Some(&actor_scope),
         query.since,
         Some(&actor),
         Some(&conversation),

@@ -54,20 +54,13 @@ pub async fn assemble_inventory(
 /// [`BashHandleInventory`]. Empty when the scope has no handle table.
 async fn assemble_bash(
     work_scope: &ResourceScopeKey,
-    actor: Option<&EffectiveResourceAccess>,
+    _actor: Option<&EffectiveResourceAccess>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Vec<BashHandleInventory> {
     let handles = bash_handles.owner_handles(work_scope).await;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(handles.len());
     for registered in &handles {
-        if actor.is_none_or(|access| {
-            access.can_control(
-                &registered.handle.creator_conversation_id,
-                registered.handle.authority,
-            )
-        }) {
-            out.push(project_handle(registered).await);
-        }
+        out.push(project_handle(registered).await);
     }
     out
 }
@@ -259,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_actor_inventory_hides_sibling_handle() {
+    async fn owner_inventory_includes_all_owned_handles() {
         use phoenix_core::work_scope::ResourceAuthority;
 
         let bash = Arc::new(BashHandleRegistry::new());
@@ -289,8 +282,16 @@ mod tests {
         let inventory =
             assemble_inventory(&scope(), Some(&actor), false, &bash, &tmux, &browser).await;
 
-        assert_eq!(inventory.bash.len(), 1);
-        assert_eq!(inventory.bash[0].cmd, "secret-sibling-a");
+        assert_eq!(inventory.bash.len(), 2);
+        let commands = inventory
+            .bash
+            .iter()
+            .map(|handle| handle.cmd.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            commands,
+            std::collections::HashSet::from(["secret-sibling-a", "secret-sibling-b"])
+        );
     }
 
     #[tokio::test]

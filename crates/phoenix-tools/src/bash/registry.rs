@@ -240,6 +240,10 @@ impl ResourceScopeKeyHandles {
             .collect()
     }
 
+    fn take_all(&mut self) -> Vec<Arc<Handle>> {
+        self.handles.drain().map(|(_, handle)| handle).collect()
+    }
+
     /// REQ-BASH-005: enforce the cap before allocating a new handle id /
     /// spawning a process.
     ///
@@ -618,21 +622,25 @@ impl BashHandleRegistry {
         &self,
         work_scope: &ResourceScopeKey,
     ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
-        let removed = {
-            let mut map = self.inner.write().await;
-            map.remove(work_scope)
-        }?;
-        let ids: Vec<_> = removed
-            .read()
-            .await
-            .all()
-            .map(|handle| handle.handle_id.clone())
-            .collect();
-        let mut by_id = self.handles_by_id.write().await;
-        for id in ids {
-            by_id.remove(&id);
+        let entry = self.begin_teardown(work_scope).await?;
+        let removed_handles = entry.write().await.take_all();
+        self.remove_from_global_index(&removed_handles).await;
+
+        let removed = Arc::new(RwLock::new(ResourceScopeKeyHandles::new()));
+        {
+            let mut table = removed.write().await;
+            for handle in removed_handles {
+                table.insert(handle);
+            }
         }
         Some(removed)
+    }
+
+    async fn remove_from_global_index(&self, handles: &[Arc<Handle>]) {
+        let mut by_id = self.handles_by_id.write().await;
+        for handle in handles {
+            by_id.remove(&handle.handle_id);
+        }
     }
 
     /// Number of work scopes currently tracked. Test/diagnostic only.
@@ -708,6 +716,7 @@ pub async fn cascade_bash_on_delete(
             .write()
             .await
             .remove_restricted_created_by(actor.conversation_id());
+        registry.remove_from_global_index(&handles).await;
         return kill_selected_handles(registry, work_scope, handles).await;
     }
     let mut report = CascadeBashReport::default();
@@ -1182,13 +1191,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_returns_entry() {
+    async fn remove_drains_but_preserves_teardown_fence() {
         let registry = BashHandleRegistry::new();
-        let _ = registry.get_or_create(&scope("conv-1")).await;
+        let owner = scope("conv-1");
+        let _ = registry.get_or_create(&owner).await;
+        assert!(registry.begin_teardown(&owner).await.is_some());
+        assert!(registry.remove(&owner).await.is_some());
         assert_eq!(registry.scope_count().await, 1);
-        assert!(registry.remove(&scope("conv-1")).await.is_some());
-        assert_eq!(registry.scope_count().await, 0);
-        assert!(registry.remove(&scope("conv-1")).await.is_none());
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
     }
 
     #[tokio::test]
@@ -1222,7 +1235,7 @@ mod tests {
         let report =
             cascade_bash_on_delete(&registry, &lifecycle_scope, &work_actor("owner"), None).await;
         assert!(report.kill_failures.is_empty());
-        assert!(registry.get_existing(&lifecycle_scope).await.is_none());
+        assert!(registry.owner_handles(&lifecycle_scope).await.is_empty());
     }
 
     #[tokio::test]
@@ -1263,7 +1276,7 @@ mod tests {
         assert!(report.kill_failures.is_empty());
         assert!(report.live_handle_pgids.is_empty());
         // Registry entry is gone after cascade.
-        assert_eq!(registry.scope_count().await, 0);
+        assert_eq!(registry.scope_count().await, 1);
     }
 
     /// REQ-BASH-WS-002: when the continuation inherits the SAME `ResourceScopeKey`,
@@ -1309,7 +1322,7 @@ mod tests {
         let report =
             cascade_bash_on_delete(&registry, &wt, &work_actor("owner"), Some(&other)).await;
         assert!(report.kill_failures.is_empty());
-        assert_eq!(registry.scope_count().await, 0);
+        assert_eq!(registry.scope_count().await, 1);
     }
 
     /// REQ-WSUI-007: the cascade teardown path (handle table actually
@@ -1399,7 +1412,7 @@ mod tests {
         assert_eq!(report.live_handle_pgids.len(), 2);
         assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
         assert!(report.kill_failures.is_empty(), "ESRCH must be swallowed");
-        assert_eq!(registry.scope_count().await, 0);
+        assert_eq!(registry.scope_count().await, 1);
     }
 
     #[cfg(unix)]
@@ -1467,7 +1480,7 @@ mod tests {
             cascade_bash_on_delete(&registry, &real_scope, &work_actor("owner"), None).await;
         assert!(report.live_handle_pgids.contains(&pgid));
         assert!(report.kill_failures.is_empty());
-        assert_eq!(registry.scope_count().await, 0);
+        assert_eq!(registry.scope_count().await, 1);
 
         // Wait briefly for the kernel to deliver SIGKILL, then reap the
         // child. The exit status's `signal()` should be `Some(SIGKILL)`.

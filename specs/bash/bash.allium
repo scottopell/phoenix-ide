@@ -726,9 +726,9 @@ rule PartialLineIdleFlushed {
 rule HandlePeekedLive {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: exists Handle{owner_scope: owner_scope, handle_id: handle_id}
-    let h = Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: exists Handle{handle_id: handle_id}
+    let h = Handle{handle_id: handle_id}
+    requires: can_control(conversation, h.controller_scope)
     requires: h.status = running
     requires: not (args.lines != null and args.since != null)
 
@@ -749,9 +749,9 @@ rule HandlePeekedLive {
 rule HandlePeekedTombstoned {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: exists Handle{owner_scope: owner_scope, handle_id: handle_id}
-    let h = Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: exists Handle{handle_id: handle_id}
+    let h = Handle{handle_id: handle_id}
+    requires: can_control(conversation, h.controller_scope)
     requires: h.status in { exited, killed }
     requires: not (args.lines != null and args.since != null)
 
@@ -773,9 +773,9 @@ rule HandlePeekedTombstoned {
 rule HandlePeekedPendingKernel {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: exists Handle{owner_scope: owner_scope, handle_id: handle_id}
-    let h = Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: exists Handle{handle_id: handle_id}
+    let h = Handle{handle_id: handle_id}
+    requires: can_control(conversation, h.controller_scope)
     requires: h.status = kill_pending_kernel
     requires: not (args.lines != null and args.since != null)
 
@@ -862,9 +862,9 @@ rule HandleWaitedTimedOut {
 rule HandleWaitedAlreadyTerminal {
     when: AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: exists Handle{owner_scope: owner_scope, handle_id: handle_id}
-    let h = Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: exists Handle{handle_id: handle_id}
+    let h = Handle{handle_id: handle_id}
+    requires: can_control(conversation, h.controller_scope)
     requires: h.status in { exited, killed }
     requires: not (args.lines != null and args.since != null)
 
@@ -904,9 +904,9 @@ rule HandleWaitNotFound {
 rule HandleKilledByAgent {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: exists Handle{owner_scope: owner_scope, handle_id: handle_id}
-    let h = Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: exists Handle{handle_id: handle_id}
+    let h = Handle{handle_id: handle_id}
+    requires: can_control(conversation, h.controller_scope)
     requires: h.status = running
 
     ensures: SignalSentToGroup(h, signal)
@@ -1005,9 +1005,9 @@ rule HandleKillPendingKernel {
 rule HandleKillOnAlreadyTerminal {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: exists Handle{owner_scope: owner_scope, handle_id: handle_id}
-    let h = Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: exists Handle{handle_id: handle_id}
+    let h = Handle{handle_id: handle_id}
+    requires: can_control(conversation, h.controller_scope)
     requires: h.status in { exited, killed }
 
     ensures: AgentReceivesKillResponse(
@@ -1028,9 +1028,9 @@ rule HandleKillOnAlreadyTerminal {
 rule HandleKilledOnKillPendingKernel {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: exists Handle{owner_scope: owner_scope, handle_id: handle_id}
-    let h = Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: exists Handle{handle_id: handle_id}
+    let h = Handle{handle_id: handle_id}
+    requires: can_control(conversation, h.controller_scope)
     requires: h.status = kill_pending_kernel
 
     ensures: SignalSentToGroup(h, signal)

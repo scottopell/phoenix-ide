@@ -52,6 +52,7 @@ pub struct InspectionAssembly {
 /// table or the handle id is absent — a not-found condition (REQ-PINSP-001).
 pub async fn assemble_inspection(
     handle_id: &str,
+    actor_scope: Option<&ResourceScopeKey>,
     since: Option<u64>,
     actor: Option<&EffectiveResourceAccess>,
     conversation: Option<&Conversation>,
@@ -61,8 +62,12 @@ pub async fn assemble_inspection(
         .get_by_id(&HandleId::new(handle_id.to_string()))
         .await?;
     let handle = &registered.handle;
-    let controller_visible = actor.is_some_and(|access| {
-        access.can_control(&handle.creator_conversation_id, handle.authority)
+    let controller_visible = actor_scope.is_some_and(|scope| {
+        scope == &handle.controller_scope
+            && (matches!(scope, ResourceScopeKey::Coordinator)
+                || actor.is_some_and(|access| {
+                    access.can_control(&handle.creator_conversation_id, handle.authority)
+                }))
     });
     let owner_visible = conversation.is_some_and(|conversation| {
         registered
@@ -205,12 +210,12 @@ mod tests {
     async fn unknown_scope_or_handle_is_none() {
         let bash = Arc::new(BashHandleRegistry::new());
         // No table at all.
-        assert!(assemble_inspection("b-1", None, None, None, &bash)
+        assert!(assemble_inspection("b-1", None, None, None, None, &bash)
             .await
             .is_none());
         // Table exists but handle absent.
         let _ = bash.get_or_create(&scope()).await;
-        assert!(assemble_inspection("b-999", None, None, None, &bash)
+        assert!(assemble_inspection("b-999", None, None, None, None, &bash)
             .await
             .is_none());
     }
@@ -238,7 +243,7 @@ mod tests {
         let actor = EffectiveResourceAccess::new("sibling-a", ResourceAuthority::Restricted);
 
         assert!(
-            assemble_inspection("b-private", None, Some(&actor), None, &bash)
+            assemble_inspection("b-private", None, None, Some(&actor), None, &bash)
                 .await
                 .is_none()
         );
@@ -261,7 +266,7 @@ mod tests {
             .await
             .expect("commit");
 
-        let assembly = assemble_inspection("b-1", None, None, None, &bash)
+        let assembly = assemble_inspection("b-1", None, None, None, None, &bash)
             .await
             .expect("inspection");
         let inv = &assembly.inspection;
@@ -302,9 +307,11 @@ mod tests {
 
         let owner =
             owner_conversation(lifecycle_scope.work_scope_id().expect("work scope").clone());
-        assert!(assemble_inspection("b-1", None, None, Some(&owner), &bash)
-            .await
-            .is_some());
+        assert!(
+            assemble_inspection("b-1", None, None, None, Some(&owner), &bash)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -332,7 +339,7 @@ mod tests {
         let unrelated =
             owner_conversation(unrelated_scope.work_scope_id().expect("work scope").clone());
         assert!(
-            assemble_inspection("b-1", None, None, Some(&unrelated), &bash)
+            assemble_inspection("b-1", None, None, None, Some(&unrelated), &bash)
                 .await
                 .is_none()
         );
@@ -358,7 +365,7 @@ mod tests {
             .await
             .expect("commit");
 
-        let assembly = assemble_inspection("b-1", None, None, None, &bash)
+        let assembly = assemble_inspection("b-1", None, None, None, None, &bash)
             .await
             .expect("inspection");
         assert_eq!(
@@ -396,7 +403,7 @@ mod tests {
             .await
             .expect("commit");
 
-        let assembly = assemble_inspection("b-1", None, None, None, &bash)
+        let assembly = assemble_inspection("b-1", None, None, None, None, &bash)
             .await
             .expect("inspection");
         let inv = &assembly.inspection;
