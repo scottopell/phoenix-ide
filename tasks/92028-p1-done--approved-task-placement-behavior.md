@@ -73,7 +73,7 @@ Append a completion note with these headings:
 - No provisioning internals, continuation boundary invention, or extra review state machine beyond the requested blocking review / two placement outcomes was added.
 
 **Commit**
-- Pending
+- `6c6351cb7`
 
 
 ## Reopen review evidence
@@ -112,7 +112,7 @@ Append a completion note with these headings:
 - No unrelated branch-picker, restart reconciliation, terminal cleanup, or downstream provisioning mechanics were rewritten beyond adding disjointness / removing proposal-flow coupling.
 
 **Commit**
-- Pending
+- `6c6351cb7`
 
 
 ## Final correction evidence
@@ -149,4 +149,42 @@ Append a completion note with these headings:
 - No typed provisioning internals were invented beyond changing the start-fresh semantic target to canonical default identity.
 
 **Commit**
-- Pending
+- `6c6351cb7`
+
+
+## 92028 duplicate-environment-kind correction evidence
+
+**Files changed**
+- `specs/bedrock/bedrock.allium`
+- `tasks/92028-p1-in-progress--approved-task-placement-behavior.md`
+
+**Settled facts encoded**
+- `Conversation` now declares `environment_kind` exactly once in `specs/bedrock/bedrock.allium`; the duplicate field declaration was removed.
+- `task_proposal_eligible` is now exactly `environment_kind = git_backed and is_git_repository(working_dir)`.
+- Attached `WorkScope` no longer participates in proposal eligibility, so it cannot make `chat_only` conversations eligible.
+- The spec text still leaves the broader "chat-only conversation may still carry a WorkScope" question open.
+- The start-fresh boundary remains `FreshGitWorktreeProvisioningRequested(target, conversation.project.repo)`; no approval-time branch/base/current-branch arguments were reintroduced.
+
+**Validation**
+- Command: `allium check specs/bedrock/bedrock.allium specs/projects/projects.allium`
+- Result: exit `0`; diagnostics were existing `info` / `warning` only, with no `severity: "error"` output.
+- Command: `rg -n -C 2 'task_proposal_eligible' specs/bedrock/bedrock.allium`
+- Result: showed the declaration/comment block and derived expression only; the derived expression is exactly:
+  - `task_proposal_eligible = environment_kind = git_backed`
+  - `    and is_git_repository(working_dir)`
+- Command: `rg -n 'mode in \{ explore, work, branch \}|has_attached_work_scope|current_branch|base_branch|main_ref' specs/bedrock/bedrock.allium specs/projects/projects.allium`
+- Result: proposal-eligibility block had no legacy mode gate and no `has_attached_work_scope` match; remaining `current_branch`, `base_branch`, and `main_ref` matches were elsewhere in project/worktree rules, not in the proposal-eligibility block.
+- Command: `rg -n -C 3 'FreshGitWorktreeProvisioningRequested\(target, conversation\.project\.repo\)' specs/projects/projects.allium`
+- Result: the start-fresh approval rule still emits exactly `FreshGitWorktreeProvisioningRequested(target, conversation.project.repo)` and the surrounding rule text contains no approval-time `main_ref`, `base_branch`, or `current_branch` arguments.
+
+**Review / evidence ledger**
+- Self-review: confirmed the duplicate `environment_kind` field was removed rather than renamed/moved, leaving a single source of truth on `Conversation`.
+- Self-review: confirmed the only semantic change was proposal eligibility simplification; `projects.allium` start-fresh provisioning boundary remained unchanged.
+- Self-review: confirmed this correction stayed within the allowed scope (`bedrock.allium`, `projects.allium`, task file).
+
+**Speculation avoided**
+- Left the broader chat-only-plus-WorkScope question explicitly open.
+- Did not alter branch-picker, provisioning internals, or unrelated project/worktree rules.
+
+**Commit**
+- `6c6351cb7`

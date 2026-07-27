@@ -96,6 +96,7 @@ enum TaskApprovalDecision {
     | rejected
 }
 enum ModeKind { direct | managed | branch }
+enum EnvironmentKind { git_backed | chat_only }
 enum ClosePhase {
     awaiting_blocker_resolution
     | awaiting_stop_work_confirmation
@@ -164,6 +165,7 @@ entity Conversation {
     -- Mode (orthogonal to status)
     mode: explore | direct | work | branch
     mode_kind: ModeKind
+    environment_kind: EnvironmentKind
     desired_base_branch: String?
 
     -- Context tracking (REQ-BED-012)
@@ -254,10 +256,11 @@ entity Conversation {
     -- connected, polling is suppressed (REQ-PROJ-023).
     has_connected_clients: Boolean
 
-    -- Declared proposal eligibility boundary for `propose_task`. Chat-only parents
-    -- are excluded structurally: the conversation must be attached to a Git-backed
-    -- work environment, either by already owning a worktree-capable mode or by
-    -- carrying a reusable attached work scope that can land approved work.
+    -- Declared proposal eligibility boundary for `propose_task`. Eligibility is
+    -- structural: the conversation must target a Git-backed product environment
+    -- and the working directory must resolve to a repository. Whether a
+    -- chat-only conversation may still carry a WorkScope is intentionally left
+    -- unspecified here; attached WorkScope does not make chat-only eligible.
     task_proposal_eligible: Boolean
 
     -- Relationships
@@ -268,9 +271,8 @@ entity Conversation {
     is_busy: core_status in { llm_requesting, executing_tools,
                               awaiting_sub_agents, cancelling_tool,
                               cancelling_sub_agents }
-    has_git_work_intent: mode in { explore, work, branch }
-    task_proposal_eligible = is_git_repository(working_dir)
-        and (has_git_work_intent or has_attached_work_scope(this))
+    task_proposal_eligible = environment_kind = git_backed
+        and is_git_repository(working_dir)
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
 

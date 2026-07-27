@@ -554,7 +554,7 @@ rule TaskApprovalNewConversationExecuted {
     ensures: ApprovedTaskDerivedFromRecorded(conversation.product_conversation, target, approved_source)
     ensures: target.lifecycle = open
     ensures: CreatedFromApprovedTask(target, approved_source)
-    ensures: FreshGitWorktreeProvisioningRequested(target, canonical_default_identity(conversation.project.repo, conversation.project.main_ref))
+    ensures: FreshGitWorktreeProvisioningRequested(target, conversation.project.repo)
 
     @guidance
         -- Start in new conversation writes the approved-task placement once onto a
@@ -563,9 +563,10 @@ rule TaskApprovalNewConversationExecuted {
         -- a second winner.
         --
         -- Task approval itself does not materialize a branch, base_branch, or worktree
-        -- record. It emits only the typed fresh-provisioning boundary at the repository's
-        -- canonical default identity (not an arbitrary currently checked-out branch) and
-        -- the root approved_task source link used for the visible "Derived from" breadcrumb.
+        -- record. It emits only the typed fresh-provisioning boundary with the target and
+        -- repository identity; the provisioning authority resolves the canonical default
+        -- branch itself with bounded fetch/fallback. The root approved_task source link is
+        -- used for the visible "Derived from" breadcrumb.
 }
 
 -- REQ-PROJ-004 request-changes/reject loop: no git operations. Until approval
