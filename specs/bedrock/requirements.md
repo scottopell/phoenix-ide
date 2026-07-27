@@ -790,6 +790,7 @@ AND preserve its branch in git
 WHEN a context-exhausted conversation has no continuation
 THE SYSTEM SHALL permit user-initiated Close conversation on that latest row
 AND SHALL apply the same close contract and worktree/resource disposition as Close from a non-terminal state
+AND SHALL route any direct-turn-owned runtime work, wake deliveries, tool execution, sub-agent execution, and other child work through the durable workflow profile's typed effects and reconciliation machinery rather than through parent-row callbacks that mutate conversation state directly
 
 WHEN a context-exhausted conversation has an existing continuation
 THE SYSTEM SHALL NOT permit Close conversation on the predecessor row
@@ -808,7 +809,12 @@ continuing — without it, the only cleanup path is to create an unwanted
 continuation and then abandon that, which is clunky and produces a
 stranded continuation record. When a continuation exists, the live
 conversation is the continuation; operating on the parent would be
-ambiguous about which conversation the action affects.
+ambiguous about which conversation the action affects. The landed durable
+architecture also means parent lifecycle settlement cannot rely on ad hoc
+callbacks mutating the parent row directly after child completion; wake,
+child, tool, sub-agent, and other direct-turn-owned effects must reconcile
+through their typed durable profile boundaries so restart/replay and close
+settlement share one authority.
 
 **Dependencies:** REQ-BED-021, REQ-BED-030, REQ-PROJ-015, work-lifecycle REQ-WL-001/REQ-WL-002
 
@@ -820,6 +826,7 @@ WHEN the user starts a follow-up from a History conversation
 THE SYSTEM SHALL create a separate Open conversation rather than reopening or continuing the historical one
 AND SHALL attach a fresh `WorkScope`
 AND SHALL provision a fresh detached-default-branch disposable worktree when the follow-up is Git-backed
+AND SHALL treat that follow-up as an independent ProductConversation rather than as a sub-agent or continuation attachment to the source `WorkScope`
 AND SHALL set the new conversation's user objective from the follow-up request rather than from the historical transcript
 AND SHALL NOT inject, copy, or summarize the source transcript into the new conversation's starting transcript
 AND SHALL record exactly one visible source relation of kind `follow_up` on the new conversation that points to the source conversation

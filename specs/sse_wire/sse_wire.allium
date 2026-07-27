@@ -185,6 +185,11 @@ entity ProjectedContinuationBoundary {
     root_sequence_id: Integer
 }
 
+entity RootStreamLedger {
+    root_conversation_id: String
+    last_allocated_root_sequence_id: Integer
+}
+
 -- Join entity: records that a message-type SSE event was delivered
 -- on a specific stream. One StreamMessage is created per open stream
 -- when MessageBroadcast fires. Used by PersistBeforeBroadcast to
@@ -444,12 +449,17 @@ rule MessageCommittedToDb {
 rule PersistedTranscriptMessageProjectsIntoRootStream {
     when: msg: PersistedMessage.created
 
+    let root_id = DurableRootOf(msg.conversation_id)
+    let ledger = RootStreamLedger{root_conversation_id: root_id}
+    let allocated_root_seq = NextRootSequenceForPersistedMessage(msg)
+
     ensures: ProjectedTranscriptRow.created(
-        root_conversation_id: DurableRootOf(msg.conversation_id),
+        root_conversation_id: root_id,
         member_conversation_id: msg.conversation_id,
         member_sequence_id: msg.sequence_id,
-        root_sequence_id: RootAggregateSequenceForPersistedMessage(msg)
+        root_sequence_id: allocated_root_seq
     )
+    ensures: ledger.last_allocated_root_sequence_id = allocated_root_seq
 
     @guidance
         -- Persisted messages remain the only transcript content authority. The wire
@@ -459,9 +469,12 @@ rule PersistedTranscriptMessageProjectsIntoRootStream {
         --
         -- Member `message.sequence_id` remains row-local identity. It is NOT the
         -- root stream watermark once multiple member rows share one ProductConversation.
-        -- The root stream allocates its own monotonic envelope sequence at the
-        -- ProductConversation boundary; replay and `applyIfNewer` advance on that
-        -- root sequence while still carrying member row/message identity.
+        -- One concrete authority owns root sequencing: the ProductConversation-boundary
+        -- RootStreamLedger. Every live emit, replay envelope, and init snapshot that
+        -- advances the root stream uses a root_sequence_id allocated from that ledger,
+        -- and the ledger advances monotonically without unnamed intermediate allocators.
+        -- Replay and `applyIfNewer` advance on that root sequence while still carrying
+        -- member row/message identity.
 }
 
 rule MessageBroadcast {
@@ -751,6 +764,29 @@ rule StateChangeBroadcast {
 
 -- Partial conversation metadata changes are broadcast as conversation_update.
 -- The client merges the payload shallowly onto its local Conversation copy.
+rule RootStreamLedgerAllocatesMonotonicSequenceForEveryProjectedEvent {
+    when: RootProjectedEventRequested(root_conversation_id, projected_kind, payload_identity)
+
+    let ledger = RootStreamLedger{root_conversation_id: root_conversation_id}
+    let next_seq = NextRootSequence(root_conversation_id)
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: root_conversation_id,
+        projected_kind: projected_kind,
+        payload_identity: payload_identity,
+        root_sequence_id: next_seq
+    )
+    ensures: ledger.last_allocated_root_sequence_id = next_seq
+
+    @guidance
+        -- ProductConversation is the only root-stream sequencing boundary. Any live
+        -- root event carrier, replayable projection, or init-visible projected fact
+        -- must first claim one root_sequence_id from RootStreamLedger. The same
+        -- sequence then rides the live SSE envelope, the replay ring entry if
+        -- replayable, and the init snapshot watermark so all three views share one
+        -- monotonic ledger.
+}
+
 rule ContinuationBoundaryBroadcast {
     when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, summary, seq)
 
@@ -782,8 +818,9 @@ rule ContinuationBoundaryBroadcast {
         --
         -- The same durable boundary appears exactly once in the init snapshot's
         -- aggregate projection. Live persistence emits the typed carrier and advances
-        -- the root stream watermark only after the payload is parseable, so replay and
-        -- fresh snapshot agree on a single boundary fact with no duplicate synthesis.
+        -- the ProductConversation-boundary RootStreamLedger only after the payload is
+        -- parseable, so replay and fresh snapshot agree on a single boundary fact with
+        -- no duplicate synthesis.
 }
 
 rule AggregateLifecycleProjectionBroadcast {
@@ -989,6 +1026,25 @@ invariant ContinuationBoundaryProjectionIsUniquePerJoin {
 invariant ContinuationBoundaryProjectionCarriesDurableSummary {
     for boundary in ProjectedContinuationBoundaries:
         boundary.summary = PersistedContinuationBoundarySummary(boundary.predecessor_conversation_id, boundary.successor_conversation_id)
+}
+
+invariant RootStreamLedgerIsMonotonicAndAuthoritative {
+    for ledger in RootStreamLedgers:
+        ledger.last_allocated_root_sequence_id >= 0
+
+    for row in ProjectedTranscriptRows:
+        exists RootStreamLedger{root_conversation_id: row.root_conversation_id}
+        row.root_sequence_id <= RootStreamLedger{root_conversation_id: row.root_conversation_id}.last_allocated_root_sequence_id
+
+    for boundary in ProjectedContinuationBoundaries:
+        exists RootStreamLedger{root_conversation_id: boundary.root_conversation_id}
+        boundary.root_sequence_id <= RootStreamLedger{root_conversation_id: boundary.root_conversation_id}.last_allocated_root_sequence_id
+
+    @guidance
+        -- There is one root-sequence ledger per ProductConversation root. Every init
+        -- watermark, replayable projection, and live root-stream envelope derives from
+        -- that ledger, so no parallel unnamed allocator can produce a competing root
+        -- ordering.
 }
 
 -- Ring entries are in strictly increasing sequence_id order. Not

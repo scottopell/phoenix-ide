@@ -26,6 +26,9 @@
 --   - Single primary across the whole bar, encoded structurally.
 --   - View Browser exclusion from this bar.
 --   - Tooltip semantics for terminal verbs.
+--   - Close emits the bedrock-owned typed UserRequestsCloseConversation command;
+--     any local user_close_started-style state is only a projection/acknowledgement,
+--     never an independent lifecycle mutation path.
 --
 -- Excludes:
 --   - PR status derivation, primary PR selection, the check-state and
@@ -47,6 +50,7 @@
 
 use "../bedrock/bedrock.allium" as bedrock
 use "../pr-association/pr-association.allium" as pra
+
 
 ------------------------------------------------------------
 -- Value Types

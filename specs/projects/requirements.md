@@ -142,6 +142,7 @@ WHEN the user approves the task and chooses **Start in new conversation**
 THE SYSTEM SHALL create a separate Open conversation derived from the source conversation
 AND SHALL approve only the same reviewed snapshot identity rather than whatever file currently exists at approval time
 AND provision a fresh detached-default-branch disposable worktree for the spawned conversation
+AND SHALL treat that spawned conversation as an independent ProductConversation with its own fresh `WorkScope`, not as a sub-agent attachment to the source conversation's worktree
 AND seed only the exact approved task as the spawned conversation's starting context
 AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
 AND record exactly one source relation of kind `approved_task` on the spawned conversation that points to the source conversation
@@ -245,11 +246,15 @@ THE SYSTEM SHALL configure the sub-agent's working directory as the parent's wor
 AND grant write access to that same worktree
 AND allow only one write-authority sub-agent per parent conversation at a time
 AND place the parent conversation in AwaitingSubAgentResult state for the duration
+AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
+AND SHALL attach the sub-agent to the parent's existing `WorkScope` and filesystem worktree instead
 
 WHEN a Git-backed parent conversation spawns a sub-agent with read-only authority requested
 THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
 AND grant read-only authority there
 AND allow multiple read-only sub-agents in parallel
+AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
+AND SHALL attach the sub-agent to the parent's existing `WorkScope` and filesystem worktree instead
 
 WHEN a planning/read-only conversation spawns sub-agents
 THE SYSTEM SHALL configure those sub-agents with read-only authority

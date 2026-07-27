@@ -74,11 +74,14 @@ THE SYSTEM SHALL organize available work actions into three logical zones:
   at once. This secondary is never a glowing primary (REQ-WAB-003).
 
 **FINISH zone** — terminal guidance:
-- `Close conversation` — initiates the single Close flow for the conversation. Its
-  cancellation, loss-inspection, and resource-release behavior is owned by the Close lifecycle
-  specs.
+- `Close conversation` — emits the same typed `UserRequestsCloseConversation` command/event that bedrock consumes for every other Close surface. Its cancellation, loss-inspection, and resource-release behavior is owned by the Close lifecycle specs; this bar does not mutate lifecycle state locally.
 - The action bar may pair Close with explanatory notes about why it is or is not the right
   next step in a specific `WorkDisposition` case (REQ-WAB-004).
+
+WHEN the user activates `Close conversation` from this bar
+THE SYSTEM SHALL dispatch the typed `UserRequestsCloseConversation` command against the same target conversation identity that the bedrock lifecycle surface would use
+AND SHALL treat any local `user_close_started`-style UI state only as a projection or acknowledgement of that dispatched command
+AND SHALL NOT treat the bar as an independent close authority or as a lifecycle-mutating state machine.
 
 WHEN the conversation is presented in a narrow mobile viewport
 THE SYSTEM SHALL replace the persistent multi-zone action bar with one thin horizontally scrollable
