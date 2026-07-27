@@ -113,3 +113,40 @@ Append a completion note with these headings:
 
 **Commit**
 - Pending
+
+
+## Final correction evidence
+
+**Files changed**
+- `specs/bedrock/bedrock.allium`
+- `specs/projects/projects.allium`
+- `tasks/92028-p1-in-progress--approved-task-placement-behavior.md`
+
+**Settled facts encoded**
+- Bedrock `propose_task` eligibility now flows through the declared `conversation.task_proposal_eligible` predicate rather than repeating a hidden `mode in { explore, work, branch }` gate at each proposal rule.
+- That predicate is Git-backed by construction: `is_git_repository(working_dir)` and `(has_git_work_intent or has_attached_work_scope(this))`, so chat-only/direct conversations are excluded unless they carry attached work scope.
+- Projects no longer contains `TaskApprovalStarted(...)` or any approval-time branch-materialization rule; approval never fast-forwards, creates, or materializes a branch.
+- `TaskFile` comments now describe the exact reviewed file as already present in the current worktree before approval, with start-fresh persistence owned independently by `ApprovedTaskSource`.
+- Proposal-neighborhood comments no longer claim approved/rejected tasks live on a task branch or temp branch during approval review.
+- Start-fresh approval now requests provisioning from `canonical_default_identity(conversation.project.repo, conversation.project.main_ref)`, making the semantic target the repository canonical default identity rather than a legacy current-branch fallback path.
+- Branch-picker rules were left intact, and the `BranchPicker` surface guarantee now states proposal / approved-task placement has no path to that surface.
+
+**Validation**
+- Command: `allium check specs/bedrock/bedrock.allium specs/projects/projects.allium`
+- Result: exit `1`; diagnostics remained `info` only (no `severity: "error"` output).
+
+**Review / evidence ledger**
+- Exact semantic grep command:
+  - `rg -n "TaskApprovalStarted|fork_branch_name|ForkProposal|propose_task.*mode in|mode in \{ explore, work, branch \}.*propose_task|task branch|temp branch|BranchDeleted\(" specs/bedrock/bedrock.allium specs/projects/projects.allium`
+- Exact output:
+  - `specs/projects/projects.allium:615:            BranchDeleted(worktree.branch_name)`
+  - `specs/projects/projects.allium:666:    ensures: BranchDeleted(worktree.branch_name)`
+- Retained matches rationale:
+  - `BranchDeleted(worktree.branch_name)` at lines 615 and 666 is unrelated to approval/rejection flow; both are terminal cleanup rules (`WorktreeRemovedByConversationDelete`, `ExploreWorktreeCleanupOnTerminal`) outside task approval / rejection semantics.
+
+**Speculation avoided**
+- No unrelated `UserSelectsBranch` rules were altered.
+- No typed provisioning internals were invented beyond changing the start-fresh semantic target to canonical default identity.
+
+**Commit**
+- Pending

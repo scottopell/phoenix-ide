@@ -254,6 +254,12 @@ entity Conversation {
     -- connected, polling is suppressed (REQ-PROJ-023).
     has_connected_clients: Boolean
 
+    -- Declared proposal eligibility boundary for `propose_task`. Chat-only parents
+    -- are excluded structurally: the conversation must be attached to a Git-backed
+    -- work environment, either by already owning a worktree-capable mode or by
+    -- carrying a reusable attached work scope that can land approved work.
+    task_proposal_eligible: Boolean
+
     -- Relationships
     sub_agents: Conversation with parent = this
     work_sub_agents: sub_agents where mode in { work, branch }
@@ -262,6 +268,9 @@ entity Conversation {
     is_busy: core_status in { llm_requesting, executing_tools,
                               awaiting_sub_agents, cancelling_tool,
                               cancelling_sub_agents }
+    has_git_work_intent: mode in { explore, work, branch }
+    task_proposal_eligible = is_git_repository(working_dir)
+        and (has_git_work_intent or has_attached_work_scope(this))
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
 
@@ -743,18 +752,16 @@ rule ParentLlmRespondsTextOnly {
 }
 
 -- REQ-BED-028, REQ-PROJ-003/012: propose_task interception for every Git-backed
--- parent conversation that either already has a worktree-capable environment or an
--- attached WorkScope. Review is always blocking: proposal authority does not split by
--- mode, and writing-capable parents do not get a parallel non-blocking path.
+-- parent conversation whose declared proposal-eligibility boundary says approved work
+-- can land into a Git-backed target. Review is always blocking: proposal authority does
+-- not split by mode, and writing-capable parents do not get a parallel non-blocking path.
 rule ProposeTaskIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
-    requires: is_git_repository(conversation.working_dir)
-    requires: conversation.mode in { explore, work, branch }
-           or has_attached_work_scope(conversation)
+    requires: conversation.task_proposal_eligible
     let proposal = parse_task_proposal(tool_calls.first)
     ensures: conversation.parent_status = awaiting_task_approval
     ensures: conversation.proposal = proposal
@@ -771,16 +778,15 @@ rule ProposeTaskIntercepted {
 
 -- REQ-PROJ-003/012: an invalid propose_task is rejected before the blocking review
 -- state is entered. The same validation boundary applies to every eligible Git-backed
--- parent, so there is no competing validity authority in work / branch / explore.
+-- parent, so there is no competing validity authority parallel to the declared
+-- proposal-eligibility predicate.
 rule ProposeTaskInvalid {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
-    requires: is_git_repository(conversation.working_dir)
-    requires: conversation.mode in { explore, work, branch }
-           or has_attached_work_scope(conversation)
+    requires: conversation.task_proposal_eligible
     let proposal = parse_task_proposal(tool_calls.first)
     requires: not task_proposal_valid(proposal)
     ensures: conversation.core_status = llm_requesting

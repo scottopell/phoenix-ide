@@ -115,7 +115,12 @@ entity Project {
     work_conversations: conversations where mode in { work, branch }
 }
 
--- A task file, committed on the task branch.
+-- A task file snapshot tracked for an approved managed-work objective.
+--
+-- The exact file already exists in the current worktree before approval; this entity
+-- records the typed taskmd metadata that the approved worktree continues to carry after
+-- the blocking review resolves. Start-in-new placement persists the reviewed artifact
+-- independently through ApprovedTaskSource rather than through task-branch ownership.
 --
 -- This entity models the *taskmd* form (the default): a filename
 -- `{task_id}-{priority}-{status}--{slug}.md`, *required* to be under the
@@ -128,8 +133,7 @@ entity Project {
 -- other `.md` file inside the worktree — e.g. `docs/plan.md`, `README.md`).
 -- A plain brief carries no structured metadata: the display title is the
 -- body's `# H1` (falling back to the file stem), priority defaults to `p2`,
--- there is no status segment and therefore no on-approve status rename, and
--- the task branch is `task-{sanitized-stem}-{conversation-id-prefix}`. The
+-- there is no status segment and therefore no on-approve status rename. The
 -- `TaskSource` seam (`crate::task_source`) picks taskmd when the filename
 -- parses, plain-markdown otherwise; a future explicit backend (beads, …)
 -- would slot in behind the same seam. (Plain briefs are not modelled as a
@@ -216,7 +220,7 @@ config {
 -- System signals: several rules listen for triggers that are not declared
 -- in any local surface's `provides` clause. These are intentionally implicit:
 --   - ConversationCreated, ServerRestarted, SubAgentSpawned, WriteAttempted,
---     TaskApprovalStarted, UserSelectsManaged, UserSelectsBranch,
+--     UserSelectsManaged, UserSelectsBranch,
 --     UserSendsFirstMessage, UserApprovesTask — system-level events wired by
 --     the implementation, not user actions on a surface. Mode selection
 --     (Managed/Branch) happens before conversation creation; the first-message
@@ -478,53 +482,17 @@ rule SearchRemoteBranches {
         -- Filtering is substring, not glob, for typeahead UX.
 }
 
--- REQ-PROJ-022: Branch materialization (single-branch fetch at worktree creation)
-rule MaterializeBranch {
-    when: TaskApprovalStarted(conversation, base_branch_name)
-
-    let repo = conversation.project.repo
-
-    -- Always attempt a single-branch fetch, regardless of local/remote status.
-    -- This is the moment where staleness is resolved.
-    ensures: BestEffortFetch(repo, base_branch_name)
-
-    ensures:
-        if exists git_ref(repo, "refs/heads/" + base_branch_name):
-            -- Local branch exists. If fetch succeeded, fast-forward to remote tip.
-            FastForwardIfPossible(repo, base_branch_name)
-        else if exists git_ref(repo, "refs/remotes/origin/" + base_branch_name):
-            -- Remote-only. Create local tracking branch.
-            CreateTrackingBranch(repo, base_branch_name, "origin/" + base_branch_name)
-        else:
-            -- Neither local nor remote. Fail.
-            error("Branch '" + base_branch_name + "' not found locally or at origin")
-
-    @guidance
-        -- `git fetch origin <branch>` downloads objects for one branch only.
-        -- Sub-second even on large repos.
-        --
-        -- Best-effort: if fetch fails (offline, auth, etc.), fall back to
-        -- local ref. If no local ref exists and fetch failed, error out.
-        --
-        -- Fast-forward: `git fetch origin <branch>:<branch>` updates the
-        -- local ref atomically if it's a fast-forward. If not (diverged),
-        -- leave the local ref as-is and log a warning. The user chose this
-        -- branch; forcing a reset would lose local commits.
-        --
-        -- Tracking branch: `git branch --track <name> origin/<name>`.
-        -- Ensures merge-back and behind/ahead polling work on local refs.
-}
-
 -- ===========================================================
 -- 3. TASK APPROVAL -- GIT OPERATIONS (REQ-PROJ-003, 004, 006, 012)
 -- ===========================================================
 
 -- REQ-PROJ-003/012: propose_task tool intercepted by bedrock. The agent
--- has already written the task file under tasks/ with `patch`; the tool
--- call carries only the file path. No git operations during the
--- propose/feedback loop — the file just sits on the temp branch,
--- uncommitted. Tool availability (Explore only, no sub-agents) enforced
--- by bedrock.
+-- has already written the markdown file inside the current worktree with `patch`;
+-- the tool call carries only the file path. No git operations happen during the
+-- propose/feedback loop, and task approval is the first point that snapshots and
+-- revalidates the exact reviewed artifact. Tool availability is enforced by
+-- bedrock's Git-backed proposal-eligibility boundary rather than by a parallel
+-- projects-local mode split.
 
 -- REQ-PROJ-004/006/028: User approves task into the current conversation.
 -- The shared approval mutex snapshots and revalidates the exact reviewed markdown,
@@ -586,7 +554,7 @@ rule TaskApprovalNewConversationExecuted {
     ensures: ApprovedTaskDerivedFromRecorded(conversation.product_conversation, target, approved_source)
     ensures: target.lifecycle = open
     ensures: CreatedFromApprovedTask(target, approved_source)
-    ensures: FreshGitWorktreeProvisioningRequested(target, conversation.project.main_ref)
+    ensures: FreshGitWorktreeProvisioningRequested(target, canonical_default_identity(conversation.project.repo, conversation.project.main_ref))
 
     @guidance
         -- Start in new conversation writes the approved-task placement once onto a
@@ -595,9 +563,9 @@ rule TaskApprovalNewConversationExecuted {
         -- a second winner.
         --
         -- Task approval itself does not materialize a branch, base_branch, or worktree
-        -- record. It emits only the typed fresh-provisioning boundary at the canonical
-        -- detached default commit (Project.main_ref) and the root approved_task source
-        -- link used for the visible "Derived from" breadcrumb.
+        -- record. It emits only the typed fresh-provisioning boundary at the repository's
+        -- canonical default identity (not an arbitrary currently checked-out branch) and
+        -- the root approved_task source link used for the visible "Derived from" breadcrumb.
 }
 
 -- REQ-PROJ-004 request-changes/reject loop: no git operations. Until approval
@@ -646,9 +614,8 @@ rule WorktreeRemovedByConversationDelete {
             -- Managed (Work mode): Phoenix created the branch; delete it.
             BranchDeleted(worktree.branch_name)
         -- Branch mode: keep the branch (it's the user's PR branch).
-        -- Explore mode: branch is the temp pending-task branch; delete.
-        -- (TaskApprovalExecuted promotes Explore's temp branch to a
-        -- task branch; pre-approval the branch is disposable.)
+        -- Explore mode: branch is the pre-approval pending branch; delete.
+        -- Once approval resolves into Work mode, this cleanup rule no longer applies.
 
     @guidance
         -- Sequence (matches ConfirmAbandon's worktree-removal flow):
@@ -675,7 +642,7 @@ rule WorktreeRemovedByConversationDelete {
 -- ===========================================================
 
 -- REQ-PROJ-028: Managed Explore conversation reaches terminal without
--- entering Work mode. Clean up the worktree and temp branch.
+-- entering Work mode. Clean up the worktree and pre-approval pending branch.
 -- Subscribes to bedrock's ConversationBecameTerminal lifecycle event
 -- (see bedrock.allium).
 rule ExploreWorktreeCleanupOnTerminal {
@@ -701,7 +668,7 @@ rule ExploreWorktreeCleanupOnTerminal {
     @guidance
         -- Fires when an Explore conversation with a worktree reaches
         -- terminal state (user abandoned without ever approving a task).
-        -- The temp branch (task-pending-*) and worktree are cleaned up.
+        -- The pre-approval pending branch (`task-pending-*`) and worktree are cleaned up.
         -- Complements ServerRestartWorktreeReconciliation, which catches
         -- the crash case. This rule handles the normal-operation case.
         -- Skips context-exhausted conversations and conversations with
@@ -736,7 +703,7 @@ rule WorktreeTransferredOnContinuation {
 
     requires: parent.parent_status = context_exhausted
     -- Explore is included: REQ-PROJ-028 / ManagedWorktreeOnFirstMessage
-    -- creates a worktree (on a temp branch) for every Explore conversation
+    -- creates a worktree (on a pre-approval pending branch) for every Explore conversation
     -- on first message, before any task approval. A context-exhausted
     -- Explore conversation therefore has a worktree to transfer.
     requires: parent.mode in { work, branch, explore }
@@ -768,7 +735,7 @@ rule WorktreeTransferredOnContinuation {
         -- Explore rows):
         --   Work    -> Work:    worktree transferred, branch_name + task_id inherited
         --   Branch  -> Branch:  worktree transferred, branch_name inherited
-        --   Explore -> Explore: worktree transferred, temp branch_name inherited
+        --   Explore -> Explore: worktree transferred, pending branch_name inherited
         --   Direct  -> Direct:  no worktree to transfer (covered by
         --     DirectContinuationInheritsCwd below; filesystem
         --     unchanged, only cwd and mode are inherited).
@@ -1284,8 +1251,9 @@ surface BranchPicker {
         -- Rapid successive keystrokes filter the cache, not the network.
 
     @guarantee MaterializationIsTargeted
-        -- When a branch is selected and the task is approved, only that
-        -- branch is fetched. No blanket `git fetch` or `git fetch --prune`.
+        -- When a branch is selected, only that branch is fetched for branch-mode
+        -- materialization. No blanket `git fetch` or `git fetch --prune`, and the
+        -- proposal / approved-task placement flow has no path to this branch-picker surface.
 }
 
 -- No open questions. All requirements are either modeled or explicitly
