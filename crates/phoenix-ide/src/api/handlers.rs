@@ -11611,8 +11611,20 @@ pub(crate) mod hard_delete_cascade_tests {
 
         for (id, scope) in ids.into_iter().zip(scopes) {
             assert!(
-                state.runtime.bash_handles().remove(&scope).await.is_none(),
-                "bash registry leaked entry for {id}"
+                state
+                    .runtime
+                    .bash_handles()
+                    .owner_handles(&scope)
+                    .await
+                    .is_empty(),
+                "bash registry retained handles for {id}"
+            );
+            assert!(
+                matches!(
+                    state.runtime.bash_handles().reserve_spawn(&scope).await,
+                    Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+                ),
+                "bash registry lost teardown fence for {id}"
             );
             assert!(state.db.get_conversation(id).await.is_err());
         }
@@ -12311,9 +12323,22 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("delete sub-agent");
 
         assert!(
-            state.runtime.bash_handles().remove(&scope).await.is_some(),
-            "parent's bash handle table must survive the sub-agent's deletion \
-             (scope still owned by the live parent)"
+            !state
+                .runtime
+                .bash_handles()
+                .owner_handles(&scope)
+                .await
+                .is_empty(),
+            "parent's bash handles must survive the sub-agent's deletion"
+        );
+        assert!(
+            state
+                .runtime
+                .bash_handles()
+                .reserve_spawn(&scope)
+                .await
+                .is_ok(),
+            "live parent must keep the shared scope open for new bash spawns"
         );
         assert!(
             state.db.get_conversation("sa-child").await.is_err(),
