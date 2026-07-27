@@ -203,10 +203,8 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .reconcile_continuation_transfers(self.clock.now())
             .await
             .map_err(|error| error.to_string())?;
-        let acceptance_guard = manager.lock_steering_acceptance().await;
-        self.run_once().await?;
-        deliver_pending(&manager, &self.repo, self.clock.now()).await?;
-        drop(acceptance_guard);
+        self.run_once_with_manager(Some(&manager)).await?;
+        deliver_pending(&manager, &self.repo, self.clock.now(), None).await?;
         let _ = ready_tx.send(());
         self.run_loop_inner(&mut kick_rx, Some(manager)).await
     }
@@ -218,16 +216,11 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
     ) -> Result<(), String> {
         let mut error_backoff = ERROR_RETRY_BASE_INTERVAL;
         loop {
-            let acceptance_guard = if let Some(manager) = manager.as_ref() {
-                Some(manager.lock_steering_acceptance().await)
-            } else {
-                None
-            };
-            let wait = match self.run_once().await {
+            let wait = match self.run_once_with_manager(manager.as_ref()).await {
                 Ok(wait) => {
                     if let Some(manager) = manager.as_ref() {
                         if let Err(error) =
-                            deliver_pending(manager, &self.repo, self.clock.now()).await
+                            deliver_pending(manager, &self.repo, self.clock.now(), None).await
                         {
                             tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker delivery failed; retrying");
                             let wait = error_backoff;
@@ -250,7 +243,6 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                     wait
                 }
             };
-            drop(acceptance_guard);
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
             tokio::select! {
@@ -269,28 +261,63 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         self.run_loop_inner(&mut kick_rx, None).await
     }
 
+    #[cfg(test)]
     async fn run_once(&self) -> Result<Duration, String> {
+        self.run_once_with_manager(None).await
+    }
+
+    async fn run_once_with_manager(
+        &self,
+        manager: Option<&Arc<RuntimeManager>>,
+    ) -> Result<Duration, String> {
         let now = self.clock.now();
-        let next_wait = self.observe_candidates(now).await?;
-        self.expire_due(now).await?;
+        let next_wait = self.observe_candidates(now, manager).await?;
+        self.expire_due(now, manager).await?;
         Ok(next_wait)
     }
 
-    async fn expire_due(&self, now: Timestamp) -> Result<(), String> {
+    async fn expire_due(
+        &self,
+        now: Timestamp,
+        manager: Option<&Arc<RuntimeManager>>,
+    ) -> Result<(), String> {
         let expired = self
             .repo
             .list_expired_unresolved(now, EXPIRY_BATCH_LIMIT)
             .await
             .map_err(|e| e.to_string())?;
         for row in expired {
+            let conversation_guard = if let Some(manager) = manager {
+                Some(
+                    manager
+                        .lock_conversation_acceptance(&row.conversation_id)
+                        .await,
+                )
+            } else {
+                None
+            };
             if let Err(error) = self.repo.expire_if_unresolved(row.workflow_id, now).await {
                 tracing::warn!(workflow_id = row.workflow_id.0, error = %error, "wake expiry failed for one contract; continuing");
             }
+            if let Some(manager) = manager {
+                deliver_pending(
+                    manager,
+                    &self.repo,
+                    self.clock.now(),
+                    Some(&row.conversation_id),
+                )
+                .await?;
+            }
+            drop(conversation_guard);
         }
         Ok(())
     }
 
-    async fn observe_candidates(&self, now: Timestamp) -> Result<Duration, String> {
+    async fn observe_candidates(
+        &self,
+        now: Timestamp,
+        manager: Option<&Arc<RuntimeManager>>,
+    ) -> Result<Duration, String> {
         let mut next_wait = EMPTY_RESCAN_INTERVAL;
         let mut saw_candidate = false;
         let mut cursor = None;
@@ -331,7 +358,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                             continue;
                         };
                         match self
-                            .inspect_candidate(candidate, authority, now, claim_until)
+                            .inspect_candidate(candidate, authority, now, claim_until, manager)
                             .await
                         {
                             Ok(wait) => {
@@ -359,12 +386,14 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn inspect_candidate(
         &self,
         candidate: WakeObservationCandidateRow,
         authority: LocalAttemptAuthority,
         now: Timestamp,
         _lease_until: LeaseExpiry,
+        manager: Option<&Arc<RuntimeManager>>,
     ) -> Result<Duration, String> {
         let Some(binding) = self
             .repo
@@ -408,6 +437,15 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                         .map_err(|e| e.to_string())?;
                     return Ok(Duration::ZERO);
                 }
+                let conversation_guard = if let Some(manager) = manager {
+                    Some(
+                        manager
+                            .lock_conversation_acceptance(&binding.conversation_id)
+                            .await,
+                    )
+                } else {
+                    None
+                };
                 let observation_time = self.clock.now();
                 let outcome = match self
                     .repo
@@ -433,6 +471,16 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                         return Err(error.to_string());
                     }
                 };
+                if let Some(manager) = manager {
+                    deliver_pending(
+                        manager,
+                        &self.repo,
+                        self.clock.now(),
+                        Some(&binding.conversation_id),
+                    )
+                    .await?;
+                }
+                drop(conversation_guard);
                 if matches!(
                     outcome,
                     WakeTerminalEvidenceOutcome::Recorded { .. }
@@ -510,6 +558,7 @@ async fn deliver_pending(
     manager: &Arc<RuntimeManager>,
     repo: &WakeRepository,
     now: Timestamp,
+    already_locked_conversation: Option<&str>,
 ) -> Result<(), String> {
     let mut cursor = None;
     loop {
@@ -527,6 +576,12 @@ async fn deliver_pending(
                 workflow_id: row.workflow_id,
                 delivery_id: row.delivery_id,
             };
+            if already_locked_conversation
+                .is_some_and(|conversation_id| row.conversation_id != conversation_id)
+            {
+                cursor = Some(next_cursor);
+                continue;
+            }
             if !processed_conversations.insert(row.conversation_id.clone()) {
                 cursor = Some(next_cursor);
                 continue;
@@ -539,9 +594,16 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             };
-            let _conversation_acceptance = manager
-                .lock_conversation_acceptance(&current.conversation_id)
-                .await;
+            let _conversation_acceptance =
+                if already_locked_conversation == Some(current.conversation_id.as_str()) {
+                    None
+                } else {
+                    Some(
+                        manager
+                            .lock_conversation_acceptance(&current.conversation_id)
+                            .await,
+                    )
+                };
             let active_direct_turn =
                 phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone())
                     .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
@@ -1167,6 +1229,26 @@ mod tests {
         }
     }
 
+    struct BlockingInspector {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl TerminalInspector for BlockingInspector {
+        fn inspect<'a>(
+            &'a self,
+            _binding: &'a phoenix_db::workflow::wake::WakeBindingRecord,
+            _authority: &'a LocalAttemptAuthority,
+            _observation_time: Timestamp,
+        ) -> Pin<Box<dyn Future<Output = Result<InspectionOutcome, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(InspectionOutcome::LiveRetry)
+            })
+        }
+    }
+
     struct MockInspector {
         outcomes: Mutex<HashMap<u64, VecDeque<InspectionOutcome>>>,
         cleanup_calls: AtomicUsize,
@@ -1709,6 +1791,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_terminal_inspection_does_not_hold_process_wide_acceptance_lock() {
+        let (db, repo, scope) = open_repo().await;
+        register_bash(&repo, &scope, "b-1", 50).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker = WakeWorker::new(
+            repo,
+            Arc::new(BlockingInspector {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db,
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let task = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { worker.run_once_with_manager(Some(&manager)).await }
+        });
+        started.notified().await;
+
+        let unrelated_guard = manager.lock_steering_acceptance().await;
+        drop(unrelated_guard);
+        release.notify_one();
+
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn startup_restart_discovery_marks_missing_bash_forgotten() {
         let (_db, repo, scope) = open_repo().await;
         register_bash(&repo, &scope, "missing", 50).await;
@@ -1769,7 +1888,7 @@ mod tests {
         ));
         let handle = manager.get_or_create("conv").await.unwrap();
 
-        deliver_pending(&manager, &repo, Timestamp(20))
+        deliver_pending(&manager, &repo, Timestamp(20), None)
             .await
             .unwrap();
         let messages_after_first_delivery = db.get_messages("conv").await.unwrap();
@@ -1786,7 +1905,7 @@ mod tests {
         assert!(!handle_is_idle(&handle));
 
         worker.run_once().await.unwrap();
-        deliver_pending(&manager, &repo, Timestamp(21))
+        deliver_pending(&manager, &repo, Timestamp(21), None)
             .await
             .unwrap();
         assert_eq!(
@@ -2290,7 +2409,7 @@ mod tests {
             None,
         ));
 
-        deliver_pending(&manager, &repo, Timestamp(20))
+        deliver_pending(&manager, &repo, Timestamp(20), None)
             .await
             .unwrap();
 
@@ -2355,7 +2474,7 @@ mod tests {
         let _ = handle.broadcast_tx.next_seq();
         let _ = handle.broadcast_tx.next_seq();
 
-        deliver_pending(&manager, &repo, Timestamp(20))
+        deliver_pending(&manager, &repo, Timestamp(20), None)
             .await
             .unwrap();
 
@@ -2674,7 +2793,7 @@ mod tests {
         assert_eq!(before.3.len(), 1);
 
         let sequence_before = handle.broadcast_tx.current_seq();
-        deliver_pending(&manager, &repo, Timestamp(21))
+        deliver_pending(&manager, &repo, Timestamp(21), None)
             .await
             .unwrap();
 
