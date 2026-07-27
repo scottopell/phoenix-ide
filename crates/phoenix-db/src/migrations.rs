@@ -301,37 +301,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "normalize_direct_turn_attachments",
         sql: MIGRATION_057,
     },
-    Migration {
-        version: 58,
-        name: "register_direct_turn_llm_codecs",
-        sql: MIGRATION_058,
-    },
 ];
-
-const MIGRATION_058: &str = r"
-INSERT OR IGNORE INTO workflow_supported_codecs (
-    workflow_id, codec_family, codec_version
-)
-SELECT workflow_id, 'direct_turn.llm_intent', 1
-FROM workflows WHERE profile_kind = 'direct_turn';
-INSERT OR IGNORE INTO workflow_supported_codecs (
-    workflow_id, codec_family, codec_version
-)
-SELECT workflow_id, 'direct_turn.llm_observation', 1
-FROM workflows WHERE profile_kind = 'direct_turn';
-INSERT OR IGNORE INTO workflow_supported_codecs (
-    workflow_id, codec_family, codec_version
-)
-SELECT workflow_id, 'direct_turn.llm_receipt', 1
-FROM workflows WHERE profile_kind = 'direct_turn';
-INSERT OR IGNORE INTO workflow_supported_codecs (
-    workflow_id, codec_family, codec_version
-)
-SELECT workflow_id, 'direct_turn.llm_receipt_event', 1
-FROM workflows WHERE profile_kind = 'direct_turn';
-
-
-";
 
 const MIGRATION_057: &str = r"
 CREATE TABLE IF NOT EXISTS durable_turn_submitted_images (

@@ -50,6 +50,14 @@ pub enum LlmPayloadError {
     RequestMismatch { expected: String, actual: String },
 }
 
+#[derive(Debug, Error)]
+pub enum LlmObservationDecodeError {
+    #[error(transparent)]
+    Serialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    Payload(#[from] LlmPayloadError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreparedLlmRequest {
     fingerprint: String,
@@ -100,6 +108,7 @@ impl PreparedLlmRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedPreparedLlmRequest {
     fingerprint: String,
     canonical_payload: Vec<u8>,
@@ -118,58 +127,27 @@ impl<'de> Deserialize<'de> for PreparedLlmRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmEffectIntent {
-    pub turn_id: u64,
+    #[serde(
+        serialize_with = "serialize_turn_id",
+        deserialize_with = "deserialize_turn_id"
+    )]
+    pub turn_id: crate::direct_turn::TurnAuthorityId,
     pub request: PreparedLlmRequest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderFailureKind {
-    RateLimited,
-    UsageLimitReached,
-    Server,
-    InvalidResponse,
-    Overloaded,
-    Network,
-    TokenBudgetExceeded,
-    Authentication,
-    Rejected,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LlmResultKind {
-    Success,
-    Failure(ProviderFailureKind),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LlmResultObservation {
     request_fingerprint: String,
     result_fingerprint: String,
-    kind: LlmResultKind,
     canonical_payload: Vec<u8>,
 }
 
 impl LlmResultObservation {
     #[must_use]
-    pub fn success(request: &PreparedLlmRequest, canonical_payload: Vec<u8>) -> Self {
-        Self::new(request, LlmResultKind::Success, canonical_payload)
-    }
-
-    #[must_use]
-    pub fn failure(
-        request: &PreparedLlmRequest,
-        kind: ProviderFailureKind,
-        canonical_payload: Vec<u8>,
-    ) -> Self {
-        Self::new(request, LlmResultKind::Failure(kind), canonical_payload)
-    }
-
-    fn new(request: &PreparedLlmRequest, kind: LlmResultKind, canonical_payload: Vec<u8>) -> Self {
+    pub fn new(request: &PreparedLlmRequest, canonical_payload: Vec<u8>) -> Self {
         Self {
             request_fingerprint: request.fingerprint().to_string(),
-            result_fingerprint: result_fingerprint(&kind, &canonical_payload),
-            kind,
+            result_fingerprint: fingerprint(&canonical_payload),
             canonical_payload,
         }
     }
@@ -181,12 +159,18 @@ impl LlmResultObservation {
     /// Returns [`LlmPayloadError::FingerprintMismatch`] when the persisted
     /// result fingerprint does not match the canonical result payload.
     pub fn rehydrate(
+        request: &PreparedLlmRequest,
         request_fingerprint: String,
         result_fingerprint: String,
-        kind: LlmResultKind,
         canonical_payload: Vec<u8>,
     ) -> Result<Self, LlmPayloadError> {
-        let expected = self::result_fingerprint(&kind, &canonical_payload);
+        if request_fingerprint != request.fingerprint() {
+            return Err(LlmPayloadError::RequestMismatch {
+                expected: request.fingerprint().to_string(),
+                actual: request_fingerprint,
+            });
+        }
+        let expected = fingerprint(&canonical_payload);
         if result_fingerprint != expected {
             return Err(LlmPayloadError::FingerprintMismatch {
                 expected,
@@ -194,27 +178,30 @@ impl LlmResultObservation {
             });
         }
         Ok(Self {
-            request_fingerprint,
+            request_fingerprint: request.fingerprint().to_string(),
             result_fingerprint,
-            kind,
             canonical_payload,
         })
     }
 
-    /// Checks that this result was observed for the supplied prepared request.
+    /// Decodes and binds persisted observation bytes to an expected request.
     ///
     /// # Errors
     ///
-    /// Returns [`LlmPayloadError::RequestMismatch`] when the observation names
-    /// a different prepared request fingerprint.
-    pub fn validate_request(&self, request: &PreparedLlmRequest) -> Result<(), LlmPayloadError> {
-        if self.request_fingerprint != request.fingerprint() {
-            return Err(LlmPayloadError::RequestMismatch {
-                expected: request.fingerprint().to_string(),
-                actual: self.request_fingerprint.clone(),
-            });
-        }
-        Ok(())
+    /// Returns a serialization error for an incompatible payload and a typed
+    /// payload error when either fingerprint does not match.
+    pub fn decode_exact(
+        request: &PreparedLlmRequest,
+        encoded: &[u8],
+    ) -> Result<Self, LlmObservationDecodeError> {
+        let persisted: PersistedLlmResultObservation = serde_json::from_slice(encoded)?;
+        Self::rehydrate(
+            request,
+            persisted.request_fingerprint,
+            persisted.result_fingerprint,
+            persisted.canonical_payload,
+        )
+        .map_err(Into::into)
     }
 
     #[must_use]
@@ -228,41 +215,21 @@ impl LlmResultObservation {
     }
 
     #[must_use]
-    pub fn kind(&self) -> &LlmResultKind {
-        &self.kind
-    }
-
-    #[must_use]
     pub fn canonical_payload(&self) -> &[u8] {
         &self.canonical_payload
     }
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedLlmResultObservation {
     request_fingerprint: String,
     result_fingerprint: String,
-    kind: LlmResultKind,
     canonical_payload: Vec<u8>,
 }
 
-impl<'de> Deserialize<'de> for LlmResultObservation {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let persisted = PersistedLlmResultObservation::deserialize(deserializer)?;
-        Self::rehydrate(
-            persisted.request_fingerprint,
-            persisted.result_fingerprint,
-            persisted.kind,
-            persisted.canonical_payload,
-        )
-        .map_err(D::Error::custom)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmResultReceipt {
     observation_id: ObservationId,
 }
@@ -284,13 +251,24 @@ pub enum LlmResultReducerEvent {
     ResultObserved(LlmResultReceipt),
 }
 
-fn result_fingerprint(kind: &LlmResultKind, payload: &[u8]) -> String {
-    let kind = serde_json::to_vec(kind).expect("LLM result kind serialization is infallible");
-    let mut semantic_payload = Vec::with_capacity(kind.len() + payload.len() + 8);
-    semantic_payload.extend_from_slice(&(kind.len() as u64).to_be_bytes());
-    semantic_payload.extend_from_slice(&kind);
-    semantic_payload.extend_from_slice(payload);
-    fingerprint(&semantic_payload)
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_turn_id<S>(
+    id: &crate::direct_turn::TurnAuthorityId,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u64(id.0)
+}
+
+fn deserialize_turn_id<'de, D>(
+    deserializer: D,
+) -> Result<crate::direct_turn::TurnAuthorityId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    u64::deserialize(deserializer).map(crate::direct_turn::TurnAuthorityId)
 }
 
 fn fingerprint(payload: &[u8]) -> String {
@@ -317,29 +295,39 @@ mod tests {
     fn observation_is_bound_to_one_request_and_validates_on_decode() {
         let request = PreparedLlmRequest::new(br#"{"prompt":"one"}"#.to_vec());
         let other = PreparedLlmRequest::new(br#"{"prompt":"two"}"#.to_vec());
-        let observation = LlmResultObservation::success(&request, br#"{"answer":"ok"}"#.to_vec());
-
-        assert_eq!(observation.validate_request(&request), Ok(()));
-        assert!(matches!(
-            observation.validate_request(&other),
-            Err(LlmPayloadError::RequestMismatch { .. })
-        ));
-
+        let observation = LlmResultObservation::new(&request, br#"{"answer":"ok"}"#.to_vec());
         let encoded = serde_json::to_vec(&observation).unwrap();
+
         assert_eq!(
-            serde_json::from_slice::<LlmResultObservation>(&encoded).unwrap(),
+            LlmResultObservation::decode_exact(&request, &encoded).unwrap(),
             observation
         );
+        assert!(matches!(
+            LlmResultObservation::decode_exact(&other, &encoded),
+            Err(LlmObservationDecodeError::Payload(
+                LlmPayloadError::RequestMismatch { .. }
+            ))
+        ));
     }
 
     #[test]
-    fn result_fingerprint_covers_terminal_kind() {
-        let request = PreparedLlmRequest::new(br#"{\"prompt\":\"one\"}"#.to_vec());
-        let payload = br#"{\"message\":\"same bytes\"}"#.to_vec();
-        let success = LlmResultObservation::success(&request, payload.clone());
-        let failure =
-            LlmResultObservation::failure(&request, ProviderFailureKind::RateLimited, payload);
-        assert_ne!(success.result_fingerprint(), failure.result_fingerprint());
+    fn durable_decoders_reject_unknown_fields() {
+        let request_json = br#"{"fingerprint":"wrong","canonical_payload":[],"future":1}"#;
+        assert!(serde_json::from_slice::<PreparedLlmRequest>(request_json)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+
+        let request = PreparedLlmRequest::new(vec![1]);
+        let observation = LlmResultObservation::new(&request, vec![2]);
+        let mut value = serde_json::to_value(observation).unwrap();
+        value["future"] = serde_json::json!(1);
+        assert!(
+            LlmResultObservation::decode_exact(&request, &serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
     }
 
     #[test]
