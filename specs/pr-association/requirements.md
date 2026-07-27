@@ -187,14 +187,14 @@ THE SYSTEM SHALL show a compact advisory marker near the `Address CI & comments`
 
 THE SYSTEM SHALL NOT use PR feedback freshness as the StateBar branch-health signal
 
-THE SYSTEM SHALL NOT block cleanup, abandon, or ordinary conversation use based on PR feedback
+THE SYSTEM SHALL NOT block Close, retirement inspection, retirement, or ordinary conversation use based on PR feedback
   freshness
 
 **Design:** Fresh review activity is useful exactly where the user asks the agent to address
 feedback — beside the Address-CI action on the work actions bar. It is not branch health, not PR
 identity, and not PR status. PR merge/state signals stay on the StateBar and sibling cleanup
 surfaces, while freshness stays an actionability cue for whether Phoenix may need fresh review
-context. It carries no lifecycle authority: it never gates cleanup, abandon, or ordinary use.
+context. It carries no lifecycle authority: it never gates Close, retirement inspection, retirement, or ordinary use.
 
 ---
 
@@ -256,7 +256,7 @@ THE SYSTEM SHALL distinguish a user-actionable auth gap (`auth_required` — the
 
 THE SYSTEM SHALL treat any freshness count shown alongside a coverage gap as a lower bound
 
-THE SYSTEM SHALL NOT block cleanup, abandon, or ordinary conversation use based on coverage
+THE SYSTEM SHALL NOT block Close, retirement inspection, retirement, or ordinary conversation use based on coverage
   health
 
 **Design:** Coverage health is orthogonal to freshness: freshness answers "did feedback

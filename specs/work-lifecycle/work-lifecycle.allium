@@ -1,307 +1,277 @@
 -- allium: 3
 -- work-lifecycle.allium
 --
--- Phoenix Work Lifecycle: Behavioural Specification
+-- Phoenix WorkScope Retirement: Behavioural Specification
 --
--- Scope: Terminal actions on Work and Branch conversations and their git
---        side effects.
--- Includes: Abandon (confirmation gate, diff snapshot, worktree + branch
---             cleanup with mode-dependent disposition),
---           Mark as merged (worktree + branch cleanup, mode-dependent
---             disposition, no squash, no push),
---           PR merge state as the advisory cleanup-affordance gate for one
---             task/worktree lifecycle even when multiple associated PRs exist.
--- Excludes: the canonical scope boundary is stated in requirements.md and
---           executive.md (transition legality is bedrock's TaskResolved rule
---           and TerminalActionRequiresNoContinuation invariant; PR freshness/
---           auto-fix is the pr-association spec; UI surface composition is the
---           work-actions-bar spec). Not re-duplicated here.
+-- Scope: Git-backed Close retirement inspection, exact loss classification,
+--        WorkScope-owned resource retirement, and PR-state advisory guidance.
+--
+-- Includes:
+--   - classification of exact worktree-loss categories for an attached
+--     Git-backed WorkScope;
+--   - generation/fingerprint-bound discard confirmation;
+--   - stepwise idempotent retirement of owned worktree and WorkScope resources;
+--   - PR-state guidance that may encourage Close but never blocks it.
+--
+-- Excludes:
+--   - root lifecycle legality, close-obligation orchestration, and ProductConversation
+--     Open/History transitions (bedrock owns those authorities);
+--   - PR identity selection, feedback freshness, and remediation context
+--     (pr-association owns those authorities);
+--   - UI layout and copy.
 --
 -- Requirement traceability: REQ-WL-001 through REQ-WL-003
--- Increment-1 clarification: plural PR association belongs to
--- pr-association; this spec remains singular in ownership of cleanup. Multiple
--- associated PRs may be summarized by sibling surfaces, and one explicit active
--- PR may be named for clarity, but cleanup is still one user-initiated
--- WorkScope-owner action and never mutates PRs.
 
 use "../bedrock/bedrock.allium" as bedrock
 
 ------------------------------------------------------------
--- External Entities
+-- Value Types
 ------------------------------------------------------------
 
--- The git worktree managed by Phoenix for a Work or Branch conversation.
--- One live WorkScope owner at a time may remove it; predecessors in the
--- chain can retain the path as history references after handoff.
--- A worktree exists only for mode in { work, branch } (Direct and Explore
--- conversations are not subjects of the terminal actions here).
-external entity Worktree {
-    conversation: bedrock/Conversation
+value WorkScope {
+    kind: WorkScopeKind
+    inner: String
+}
+
+value WorktreeIdentity {
     path: String
-    branch_name: String            -- task-{ID}-{slug} (managed) or existing branch (branch mode)
+}
+
+value RetirementInspection {
+    generation: String
+    fingerprint: String
+}
+
+value RetirementResidual {
+    resource_kind: RetiredResourceKind
+    reason: RetirementFailureReason
+    detail: String?
 }
 
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
 
--- bedrock's TaskResolved(conversation, outcome) carries an untyped outcome
--- identifier. The two user-initiated terminal actions in this spec resolve a
--- Work/Branch conversation with one of exactly two outcomes: `merged` (Mark
--- as merged) or `abandoned` (Abandon), passed as bare identifiers below.
-
-enum PrDisplayState  { open | draft | merged | closed }
-enum PrCheckState    { passing | pending | failing | unknown }
-
-------------------------------------------------------------
--- Helpers
-------------------------------------------------------------
---
--- Allium has no formal helper-function declaration; the rules below call
--- these by bare identifier. This block is the single source of truth for
--- their signatures and semantics.
---
---   is_managed_mode(conversation: Conversation) -> Boolean
---       True when conversation.mode = work (Managed mode). Phoenix created
---       the task branch (task-{ID}-{slug}), so Phoenix must also delete it.
---       False for branch mode (user-owned PR branch; kept on cleanup).
---
---   has_live_worktree_co_owner(conversation: Conversation) -> Boolean
---       True when at least one live conversation (non-terminal AND not
---       archived), other than this one, still owns the same work scope:
---       a context continuation that inherited the worktree (REQ-BED-030),
---       or a Work-mode sub-agent sharing the parent's worktree_path
---       (REQ-PROJ-008). Liveness is derived from persisted conversation
---       rows, not runtime handle presence. Prevents destroying a worktree
---       still in use by another live conversation. This is the same
---       any-live-owner signal that gates the bedrock terminal cascade
---       (cascade_projects_on_delete, REQ-BED-032).
-
-------------------------------------------------------------
--- Value Types
-------------------------------------------------------------
-
--- Best-effort capture of "what this branch has done relative to its base",
--- taken before worktree removal so the abandoned work survives in the
--- conversation record after the worktree is gone. Captured relative to the
--- effective base ref (origin/{base} when it resolves, else the bare base).
--- Each diff section is bounded by a per-section byte cap; `truncated` is
--- set when any section saturated that cap.
-value DiffSnapshot {
-    commit_log: String       -- subjects of commits on the branch not in base
-    committed_diff: String   -- base...HEAD, bounded per-section
-    uncommitted_diff: String -- working-tree changes (incl. untracked), bounded per-section
-    truncated: Boolean       -- a section hit its byte cap; content was dropped
+enum WorkScopeKind {
+    worktree
+    | conversation
 }
 
-value PrStatusResult {
-    found: Boolean
-    display_state: PrDisplayState?  -- present when found
-    check_state: PrCheckState?      -- present when found
-    number: Integer?                -- present when found
-    unavailable_reason: String?     -- present when not found
+enum LossCategory {
+    staged_tracked_paths
+    | unstaged_tracked_paths
+    | untracked_non_ignored_paths
+    | initialized_submodule_state
+    | detached_unreachable_commits
+}
+
+enum RetiredResourceKind {
+    worktree
+    | bash_process_group
+    | tmux_server
+    | pty_session
+    | browser_session
+    | equivalent_live_resource
+}
+
+enum RetirementFailureReason {
+    removal_failed
+    | still_shared_by_live_owner
+    | residual_process_alive
+    | identity_not_proven
+    | manual_repair_required
+}
+
+enum PrDisplayState {
+    open
+    | draft
+    | merged
+    | closed
+}
+
+enum PrCheckState {
+    passing
+    | pending
+    | failing
+    | unknown
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity AttachedWorkScope {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    owns_git_worktree: Boolean
+    has_cleanup_authority: Boolean
+}
+
+external entity Worktree {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    identity: WorktreeIdentity
+}
+
+external entity RetirementLossItem {
+    inspection: RetirementInspection
+    category: LossCategory
+    item_identity: String
+}
+
+external entity RetiredResource {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    kind: RetiredResourceKind
+}
+
+external entity RetirementResidualResource {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    residual: RetirementResidual
 }
 
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
 
--- ===========================================================
--- 1. ABANDON (REQ-WL-001)
--- ===========================================================
---
--- Abandon is a two-step user action: initiate (shows a confirmation
--- dialog), then confirm (captures the diff snapshot and runs the git
--- sequence) or cancel (no-op). Legality preconditions (mode, core_status,
--- parent_status, continued_in_conv_id) are enforced by bedrock's
--- TaskResolved rule and the TerminalActionRequiresNoContinuation invariant
--- in projects; this spec models the confirmation gate and git side effects.
-
-rule InitiateAbandon {
-    when: UserInitiatesAbandon(conversation)
-    requires: exists Worktree{conversation: conversation}
-    ensures: AbandonConfirmationPending(conversation)
-
-    @guidance
-        -- Show a confirmation dialog warning that the worktree will be
-        -- deleted and uncommitted work lost (a diff snapshot is saved to
-        -- conversation history first). The dialog offers Confirm and Cancel.
-}
-
-rule ConfirmAbandon {
-    when: UserConfirmsAbandon(conversation)
-
-    let worktree = Worktree{conversation: conversation}
-
-    requires: AbandonConfirmationPending(conversation)
-    requires: exists worktree
-
-    ensures: not AbandonConfirmationPending(conversation)
-
-    -- Worktree/branch removal is conditional, not gated: a live co-owner (a
-    -- context continuation or a Work sub-agent sharing this worktree) preserves
-    -- the worktree and branch. The conversation resolves either way — the
-    -- co-owner guard is an outcome on cleanup, not a precondition on the action.
-    ensures:
-        if not has_live_worktree_co_owner(conversation):
-            not exists worktree
-
-    ensures:
-        if is_managed_mode(conversation) and not has_live_worktree_co_owner(conversation):
-            BranchDeleted(worktree.branch_name)
-        -- Branch mode: branch kept (user's PR branch, not ours to delete)
-
-    -- The diff snapshot is best-effort, not a guaranteed postcondition: capture
-    -- can fail or find no diff, and abandon still succeeds. The capture-before-
-    -- delete ordering and bounds are in @guidance, not a hard `ensures`.
-
-    ensures: bedrock/TaskResolved(conversation, abandoned)
-    ensures: SystemMessageEmitted(
-        conversation,
-        if is_managed_mode(conversation):
-            "Task abandoned. Worktree and branch deleted."
-        else:
-            "Conversation abandoned. Worktree deleted, branch kept."
+rule ChatOnlyCloseSkipsWorktreeInspection {
+    when: RetirementInspectionRequested(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: false}
+    ensures: RetirementInspectionCompletedWithoutConfirmation(
+        product_conversation,
+        inspection_generation: "no-worktree",
+        inspection_fingerprint: "no-worktree"
     )
 
     @guidance
-        -- Sequence:
-        --   1. Validate legality (same gate as MarkAsMerged) — HTTP 409
-        --      on failure.
-        --   2. Capture the DiffSnapshot from the worktree (committed +
-        --      uncommitted, relative to the effective base ref) and persist
-        --      it to conversation history. Best-effort: a failure here is
-        --      logged at debug and does not block step 3. Each section is
-        --      bounded by a per-section byte cap; saturation sets `truncated`.
-        --   3. Check has_live_worktree_co_owner — skip worktree/branch
-        --      removal if a live co-owner exists.
-        --   4. `git worktree remove {path} --force`
-        --      On failure: remove the directory directly + `git worktree prune`.
-        --   5. If managed: `git branch -D {branch_name}` (non-fatal; log at
-        --      debug and continue). If branch mode: skip branch deletion.
-        --   6. Send TaskResolved(conversation, abandoned) (bedrock transitions
-        --      parent_status -> terminal) and emit the system message.
-        --
-        -- All uncommitted work is permanently lost after step 4. The diff
-        -- snapshot from step 2 is the recovery artifact.
+        -- Chat-only and other non-Git-backed scopes own no disposable worktree,
+        -- so there is no worktree-loss inventory and no discard confirmation.
 }
 
-rule CancelAbandon {
-    when: UserCancelsAbandon(conversation)
-    requires: AbandonConfirmationPending(conversation)
-    ensures: not AbandonConfirmationPending(conversation)
-    -- No git operations. The conversation remains in its current state.
-}
-
--- ===========================================================
--- 2. MARK AS MERGED (REQ-WL-002)
--- ===========================================================
---
--- User initiates "Mark as merged" on a Work or Branch conversation: a
--- single-step assertion that the work shipped via the user's own PR
--- workflow. Phoenix performs worktree cleanup only — it never squash-merges
--- and never pushes. Same legality gate as abandon (bedrock's TaskResolved).
-
-rule MarkAsMerged {
-    when: UserMarksAsMerged(conversation)
-
-    let worktree = Worktree{conversation: conversation}
-
-    -- Existence implies mode in { work, branch } — Direct and Explore
-    -- conversations have no worktree.
-    requires: exists worktree
-
-    -- Worktree/branch removal is conditional, not gated: a live co-owner (a
-    -- context continuation or a Work sub-agent sharing this worktree) preserves
-    -- the worktree and branch. The conversation resolves either way — the
-    -- co-owner guard is an outcome on cleanup, not a precondition on the action.
-    ensures:
-        if not has_live_worktree_co_owner(conversation):
-            not exists worktree
-
-    ensures:
-        if is_managed_mode(conversation) and not has_live_worktree_co_owner(conversation):
-            BranchDeleted(worktree.branch_name)
-        -- Branch mode: branch kept (user's PR branch, not ours to delete)
-
-    ensures: bedrock/TaskResolved(conversation, merged)
-    ensures: SystemMessageEmitted(conversation, "Marked as merged. Worktree deleted.")
+rule GitBackedInspectionWithoutLossRequestsRetirement {
+    when: RetirementInspectionRequested(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true, has_cleanup_authority: true}
+    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: staged_tracked_paths}
+    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: unstaged_tracked_paths}
+    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: untracked_non_ignored_paths}
+    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: initialized_submodule_state}
+    requires: not exists RetirementLossItem{inspection: RetirementInspection, category: detached_unreachable_commits}
+    ensures: RetirementInspectionCompletedWithoutConfirmation(
+        product_conversation,
+        inspection_generation: RetirementInspection.generation,
+        inspection_fingerprint: RetirementInspection.fingerprint
+    )
 
     @guidance
-        -- Sequence:
-        --   1. Validate legality (mode, core_status, parent_status,
-        --      continued_in_conv_id) — HTTP 409 on failure.
-        --   2. Check has_live_worktree_co_owner — skip worktree/branch
-        --      removal if a live co-owner exists.
-        --   3. `git worktree remove {path} --force`
-        --      On failure: remove the directory directly + `git worktree prune`.
-        --   4. If managed: `git branch -D {branch_name}` (non-fatal; log at
-        --      debug and continue). If branch mode: skip branch deletion.
-        --   5. Send TaskResolved(conversation, merged) (bedrock transitions
-        --      parent_status -> terminal) and emit the system message.
-        --
-        -- Never squash-merge to base; never push to origin. Push is the
-        -- agent's responsibility via the bash tool when the user requests it.
+        -- The inspection must classify exactly five independent loss categories:
+        -- staged tracked paths; unstaged tracked/conflicted/unmerged paths;
+        -- untracked non-ignored paths; dirty or untracked state inside
+        -- initialized submodules; and detached commits unreachable from
+        -- refs/heads/*, refs/remotes/*, refs/tags/*, or refs/stash.
+        -- Ignored paths are excluded. LFS-tracked edits are ordinary tracked
+        -- changes. Local branches, tags, remotes, and stash are durable refs.
+        -- Reflog-only detached commits are at-risk detached commits.
 }
 
--- ===========================================================
--- 3. PR MERGE STATE AS CLEANUP GATE (REQ-WL-003)
--- ===========================================================
---
--- Phoenix queries `gh` for the branch's PR state. The result is advisory:
--- it labels the cleanup affordance but does not by itself trigger a
--- lifecycle transition. Cleanup occurs only when the user initiates
--- UserMarksAsMerged or UserInitiatesAbandon.
-
-rule PrStatusObserved {
-    when: PrStatusQueried(conversation)
-
-    let worktree = Worktree{conversation: conversation}
-
-    requires: exists worktree
-    ensures: PrStatusResultDelivered(conversation, result: PrStatusResult)
+rule GitBackedInspectionWithLossRequiresConfirmation {
+    when: RetirementInspectionRequested(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true, has_cleanup_authority: true}
+    requires:
+        exists RetirementLossItem{inspection: RetirementInspection, category: staged_tracked_paths}
+        or exists RetirementLossItem{inspection: RetirementInspection, category: unstaged_tracked_paths}
+        or exists RetirementLossItem{inspection: RetirementInspection, category: untracked_non_ignored_paths}
+        or exists RetirementLossItem{inspection: RetirementInspection, category: initialized_submodule_state}
+        or exists RetirementLossItem{inspection: RetirementInspection, category: detached_unreachable_commits}
+    ensures: RetirementInspectionRequiresConfirmation(
+        product_conversation,
+        inspection_generation: RetirementInspection.generation,
+        inspection_fingerprint: RetirementInspection.fingerprint
+    )
 
     @guidance
-        -- Implementation: query `gh` for the PR on the worktree's branch,
-        -- off the request thread, from the conversation's worktree. gh
-        -- failures (unavailable, unauthenticated, non-git directory,
-        -- command failure) yield found: false with an unavailable_reason,
-        -- are logged at debug, and surface as compact non-blocking UI hints;
-        -- the conversation page stays fully usable.
-        --
-        -- The work-actions-bar spec maps PrStatusResult to UI:
-        --   display_state = merged  -> cleanup is the happy path
-        --   display_state in { open, draft, closed }, or
-        --     check_state in { pending, failing }
-        --                          -> cleanup discouraged + note
-        --   found = false           -> cleanup without PR confirmation remains available
-        --
-        -- No auto-transition: observing a merged PR does NOT call
-        -- UserMarksAsMerged automatically. The user initiates.
+        -- Each RetirementLossItem is one categorized row in the exact inventory.
+        -- Categories coexist independently. Paths and detached-commit identities
+        -- are surfaced without synthesizing a branch, tag, stash, patch, or diff
+        -- snapshot as a recovery artifact.
+}
+
+rule ChangedWorkspaceInvalidatesOutstandingConfirmation {
+    when: WorkspaceFingerprintChanged(product_conversation)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation}.phase = awaiting_loss_confirmation
+    ensures: RetirementInspectionChanged(product_conversation)
+}
+
+rule RetirementRequestedRetiresOwnedResources {
+    when: ResourceRetirementRequested(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, has_cleanup_authority: true}
+    requires: not live_conversation_shares_scope(product_conversation)
+    requires: all_owned_resources_retired(product_conversation)
+    ensures: ResourceRetirementCompleted(product_conversation)
+
+    @guidance
+        -- Retirement is stepwise and idempotent. It retires the worktree and
+        -- WorkScope-owned bash/process-group, tmux, PTY/terminal, browser, and
+        -- equivalent live resources. Success is emitted only after every owned
+        -- resource has been retired.
+}
+
+rule SharedContinuationPreventsDestructiveRetirement {
+    when: ResourceRetirementRequested(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, has_cleanup_authority: true}
+    requires: live_conversation_shares_scope(product_conversation)
+    ensures: ResourceRetirementFailed(product_conversation)
+
+    @guidance
+        -- Continuations share one live WorkScope. Retirement cannot remove the
+        -- shared worktree while another non-History live conversation still
+        -- resolves to that same scope.
+}
+
+rule ResourceRetirementFailureProducesResidualRepairState {
+    when: ResourceRetirementRequested(product_conversation)
+    requires: exists RetirementResidualResource{product_conversation: product_conversation}
+    ensures: ResourceRetirementFailed(product_conversation)
+
+    @guidance
+        -- Failure is typed and residual: report the exact remaining resource and
+        -- repair information rather than silently succeeding.
+}
+
+rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
+    when: ResourceRetirementRequested(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, has_cleanup_authority: true}
+    requires: worktree_already_absent(product_conversation)
+    requires: not absence_identity_proven(product_conversation)
+    ensures: ResourceRetirementFailed(product_conversation)
+
+    @guidance
+        -- An already-absent worktree is accepted only when retained identity and
+        -- evidence show this retirement is adopting that exact absence rather than
+        -- guessing over a missing path.
+}
+
+rule PrStatusObservedAsAdvisoryCloseGuidance {
+    when: PrStatusQueried(product_conversation)
+    ensures: PrStatusResultDelivered(product_conversation, found: Boolean, display_state: PrDisplayState?, check_state: PrCheckState?, number: Integer?, unavailable_reason: String?)
+
+    @guidance
+        -- PR observation may guide the user toward Close, especially when a PR is
+        -- merged, but it never blocks Close, retirement inspection, or retirement,
+        -- and never closes, mutates, or retargets a PR.
 }
 
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
 
--- A terminal Work/Branch conversation with no surviving live co-owner has
--- no worktree on disk: the terminal cascade removes the worktree before the
--- conversation settles into terminal state, unless a live co-owner (a
--- continuation that inherited the worktree, or a sub-agent sharing it) still
--- needs it. When a co-owner exists the worktree may persist on disk.
-invariant TerminalConversationHasNoWorktree {
-    for w in Worktree:
-        w.conversation.parent_status = terminal
-        and not has_live_worktree_co_owner(w.conversation) implies
-            not exists Worktree{conversation: w.conversation}
+invariant SubAgentsDoNotOwnCleanupAuthority {
+    for a in AttachedWorkScope:
+        a.has_cleanup_authority implies a.owns_git_worktree or a.scope.kind = conversation
 }
 
--- A terminal Managed (Work) conversation with no live co-owner has no task
--- branch: Phoenix created the branch, so cleanup deletes it.
-invariant TerminalManagedConversationHasNoBranch {
-    for w in Worktree:
-        w.conversation.parent_status = terminal
-        and is_managed_mode(w.conversation)
-        and not has_live_worktree_co_owner(w.conversation) implies
-            BranchDeleted(w.branch_name)
+invariant NoAutomaticRecoveryArtifactFromRetirement {
+    for a in AttachedWorkScope:
+        a.has_cleanup_authority implies
+            not AutomaticRetirementSnapshotCreated(a.product_conversation)
 }

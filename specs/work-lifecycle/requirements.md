@@ -6,17 +6,18 @@ As a developer using PhoenixIDE, I need one explicit way to close a Git-backed c
 
 ## Scope
 
-This spec governs the product-facing **Close conversation** action for Git-backed conversations and the advisory repository facts that help the user decide when to use it.
+This spec governs the product-facing **Close conversation** action for Git-backed conversations and the WorkScope retirement contract consumed by that Close flow.
 
 It owns:
 
-- the confirmation and loss-warning contract for Close on a Git-backed conversation;
-- the requirement that Close release Phoenix-owned worktree resources while leaving repository refs and PRs untouched;
+- the exact retirement-inspection and loss-warning contract for Close on a Git-backed conversation;
+- the exact loss categories that require confirmation before destructive retirement;
+- the requirement that Close retire Phoenix-owned WorkScope resources and the worktree without creating automatic recovery artifacts and without mutating repository refs or PRs;
 - the advisory use of PR state to guide the user toward closing when work appears shipped.
 
 It does **not** own:
 
-- conversation-state legality and durable cancellation sequencing — bedrock and the unified lifecycle specs own those authorities;
+- conversation-state legality, root lifecycle topology, or durable cancellation sequencing — bedrock and the unified lifecycle specs own those authorities;
 - PR feedback freshness, explicit active-PR targeting, auto-fix, and remediation context — the `pr-association` spec;
 - UI placement, wording variants, or action-bar composition — the `work-actions-bar` spec owns those concerns.
 
@@ -41,20 +42,82 @@ AND SHALL NOT expose those deprecated verbs as current writable lifecycle choice
 
 ---
 
-### REQ-WL-002: Close Releases Phoenix-Owned Resources but Never Mutates Branches or PRs
+### REQ-WL-002: Retirement Inspection Classifies Exact Worktree-Loss Risk Before Destructive Teardown
 
-WHEN a Git-backed conversation successfully closes
-THE SYSTEM SHALL release the conversation's Phoenix-owned worktree resources
-AND SHALL remove the worktree only when no other live conversation still resolves to the same `WorkScope`
-AND SHALL leave every branch, tag, stash, remote-tracking ref, and pull request untouched
+WHEN bedrock requests retirement inspection for an attached Git-backed `WorkScope`
+THE SYSTEM SHALL inspect only state whose durability depends on the attached worktree and its owned resources
+AND SHALL classify loss risk into these independent categories:
+- staged tracked paths
+- unstaged tracked paths, including conflicted or otherwise unmerged paths
+- untracked non-ignored paths
+- dirty or untracked state inside initialized submodule checkouts
+- detached commits not reachable from any ref under `refs/heads/*`, `refs/remotes/*`, `refs/tags/*`, or `refs/stash`
 
-THE SYSTEM SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or retarget any branch or pull request as a side effect of Close
+THE SYSTEM SHALL exclude ignored paths from the loss inventory
+AND SHALL treat LFS-tracked edits as ordinary tracked changes within the tracked-path categories
+AND SHALL treat local branches, remote-tracking branches, tags, and stash entries as durable refs rather than as loss
+AND SHALL treat reflog-only detached commits as at-risk detached commits
+AND SHALL scope nested-repository inspection only to declared submodules rather than recursively inventing preservation rules for arbitrary nested repositories
 
-WHEN the worktree contains local state whose loss depends on worktree removal
-THE SYSTEM SHALL present Close's exact loss-warning contract before destructive teardown
-AND SHALL require explicit user confirmation before discarding that state
+WHEN any one or more of those categories are present
+THE SYSTEM SHALL return an exact categorized inventory with the relevant path rows and detached-commit identities
+AND SHALL require explicit discard confirmation before destructive retirement begins
 
-**Rationale:** Phoenix owns the disposable environment, not repository history. Closing a conversation should reclaim Phoenix-owned resources while treating Git refs and PRs as user-owned facts Phoenix observes rather than lifecycle-owned artifacts Phoenix mutates.
+WHEN no category is present
+THE SYSTEM SHALL allow retirement to proceed without a discard confirmation
+
+**Rationale:** Phoenix owns the disposable environment, not repository history. Loss inspection must warn exactly about worktree-only risk without conflating it with durable refs the user still owns.
+
+---
+
+### REQ-WL-002a: Retirement Inspection Binds Confirmation to One Exact Workspace Generation
+
+WHEN retirement inspection completes for an attached Git-backed `WorkScope`
+THE SYSTEM SHALL produce an inspection generation and workspace fingerprint together with the categorized results
+
+WHEN the user confirms discard after a warning-producing inspection
+THE SYSTEM SHALL bind that confirmation to the exact inspection generation and workspace fingerprint that justified the warning
+
+WHEN the workspace changes after inspection and before destructive retirement begins
+THE SYSTEM SHALL invalidate the outstanding confirmation
+AND SHALL require reinspection before retirement may proceed
+
+WHEN a conversation has no attached Git-backed `WorkScope`
+THE SYSTEM SHALL skip worktree-loss inspection
+AND SHALL NOT require a discard confirmation that implies worktree-owned loss
+
+**Rationale:** The confirmation is only trustworthy for the exact inspected workspace. A changed workspace must not inherit stale approval to discard different state.
+
+---
+
+### REQ-WL-002b: Retirement Retires Owned Resources Stepwise, Idempotently, and Without Automatic Recovery Artifacts
+
+WHEN bedrock requests resource retirement for an attached Git-backed `WorkScope`
+THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources, including bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that same WorkScope
+
+THE SYSTEM SHALL treat continuation members that still resolve to the same live `WorkScope` as shared owners
+AND SHALL NOT retire the worktree while another non-History live conversation still resolves to that same `WorkScope`
+
+THE SYSTEM SHALL treat sub-agents attached to a parent's `WorkScope` as non-owning participants
+AND SHALL NOT grant a sub-agent independent cleanup authority over the shared WorkScope
+
+THE SYSTEM SHALL perform retirement as a stepwise idempotent operation that records enough completion or residual-error evidence to retry safely
+
+WHEN retirement succeeds
+THE SYSTEM SHALL emit success only after every owned resource has been retired
+
+WHEN retirement cannot retire every owned resource
+THE SYSTEM SHALL report typed residual cleanup state and repair information rather than silently succeeding
+
+WHEN the worktree is already absent
+THE SYSTEM SHALL accept that absence only when retained identity and evidence show that the same requested retirement already removed it or is adopting that exact absence
+
+CONFIRMED retirement SHALL NOT create a branch, tag, commit, stash, patch, diff snapshot, or other automatic recovery artifact
+
+THE SYSTEM SHALL leave every branch, tag, stash, remote-tracking ref, and pull request untouched
+AND SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or retarget any branch or pull request as a side effect of Close or retirement
+
+**Rationale:** Retirement must reclaim exactly the resources Phoenix owns, converge safely across retries and restarts, and never disguise destructive teardown as repository management or automatic backup creation.
 
 ---
 
