@@ -147,7 +147,7 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
 
 async fn shutdown_browser_sessions(manager: &Arc<RuntimeManager>) -> Result<(), DriveTurnError> {
     tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(95),
         manager.browser_sessions().shutdown_all(),
     )
     .await

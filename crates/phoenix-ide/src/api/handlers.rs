@@ -3123,8 +3123,10 @@ async fn stop_conversation_browser_session(
             .map_err(|error| AppError::Internal(error.to_string()))?,
     );
     if conversation_scope != work_scope {
-        let pre_rekey_actor =
-            crate::work_scope::EffectiveResourceAccess::shared_restricted(conversation.id);
+        let pre_rekey_actor = crate::work_scope::EffectiveResourceAccess::new(
+            conversation.id,
+            crate::work_scope::ResourceAuthority::Restricted,
+        );
         browser_sessions
             .request_kill_session_for_actor(&conversation_scope, &pre_rekey_actor)
             .await;
@@ -4565,7 +4567,14 @@ async fn cleanup_browser_with_retry(
     };
     if let Err(first_error) = cleanup().await {
         if let Err(retry_error) = cleanup().await {
-            tracing::warn!(conv_id = %conv.id, %first_error, %retry_error, "browser cleanup failed after bounded retry; lifecycle transition will continue");
+            let retained_browser_cleanup = browser_manager.cleanup_identifiers(work_scope).await;
+            tracing::warn!(
+                conv_id = %conv.id,
+                ?retained_browser_cleanup,
+                %first_error,
+                %retry_error,
+                "browser cleanup failed after bounded retry; lifecycle transition will continue"
+            );
         }
     }
 }

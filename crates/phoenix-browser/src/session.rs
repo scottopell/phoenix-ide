@@ -241,6 +241,7 @@ pub struct ProfilingState {
 pub struct BrowserSession {
     #[allow(dead_code)] // Browser must stay alive
     browser: Browser,
+    chrome_pid: Option<u32>,
     #[allow(dead_code)] // Task must stay alive
     handler_task: JoinHandle<()>,
     #[allow(dead_code)] // Task must stay alive
@@ -449,6 +450,9 @@ impl BrowserSession {
                 Ok(Err(e)) => return Err(BrowserError::LaunchFailed(e.to_string())),
                 Err(_) => return Err(BrowserError::InitTimeout(SESSION_INIT_TIMEOUT)),
             };
+        let chrome_pid = browser
+            .get_mut_child()
+            .and_then(|child| child.as_mut_inner().id());
 
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
@@ -494,6 +498,7 @@ impl BrowserSession {
 
         Ok(Self {
             browser,
+            chrome_pid,
             handler_task,
             console_task: None,
             profiling_tasks: Vec::new(),
@@ -938,6 +943,12 @@ pub struct BrowserInventoryMetadata {
     pub idle: Option<Duration>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserCleanupIdentifiers {
+    pub chrome_pid: Option<u32>,
+    pub profile_path: String,
+}
+
 /// Predicate answering "does this `ResourceScopeKey` still own a live (non-terminal)
 /// conversation?". Injected by the runtime after construction (the manager is
 /// built inside `RuntimeManager::new`, before the runtime `Arc` exists, so the
@@ -1356,6 +1367,28 @@ impl BrowserSessionManager {
         Ok(session_arc)
     }
 
+    pub async fn cleanup_identifiers(
+        &self,
+        work_scope: &ResourceScopeKey,
+    ) -> Vec<BrowserCleanupIdentifiers> {
+        let sessions: Vec<_> = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .filter(|entry| entry.scope == *work_scope)
+            .map(|entry| (entry.session.clone(), entry.user_data_key.clone()))
+            .collect();
+        let mut identifiers = Vec::with_capacity(sessions.len());
+        for (session, user_data_key) in sessions {
+            identifiers.push(BrowserCleanupIdentifiers {
+                chrome_pid: session.read().await.chrome_pid,
+                profile_path: user_data_dir_for_key(&user_data_key),
+            });
+        }
+        identifiers
+    }
+
     /// Return control-plane idle metadata without exposing the session for reuse.
     #[must_use]
     pub async fn inventory_metadata(
@@ -1491,6 +1524,28 @@ impl BrowserSessionManager {
         hit
     }
 
+    async fn remove_profile_for_attempt(
+        &self,
+        key: &str,
+        attempt: &Arc<KillAttempt>,
+        user_data_dir: &str,
+    ) -> Result<(), BrowserError> {
+        let failure = match tokio::time::timeout(
+            SESSION_INIT_TIMEOUT,
+            tokio::fs::remove_dir_all(user_data_dir),
+        )
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(Err(error)) => format!("failed to remove browser profile {user_data_dir}: {error}"),
+            Err(_) => format!("timed out removing browser profile {user_data_dir}"),
+        };
+        self.complete_kill_failure(key, attempt, failure.clone())
+            .await;
+        Err(BrowserError::OperationFailed(failure))
+    }
+
     async fn remove_session_if_current(
         &self,
         key: &str,
@@ -1593,16 +1648,9 @@ impl BrowserSessionManager {
                 };
 
                 let user_data_dir = user_data_dir_for_key(&user_data_key);
-                if let Err(error) = tokio::fs::remove_dir_all(&user_data_dir).await {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        let message =
-                            format!("failed to remove browser profile {user_data_dir}: {error}");
-                        manager
-                            .complete_kill_failure(&key, &task_attempt, message.clone())
-                            .await;
-                        return Err(BrowserError::OperationFailed(message));
-                    }
-                }
+                manager
+                    .remove_profile_for_attempt(&key, &task_attempt, &user_data_dir)
+                    .await?;
 
                 let removed = manager.remove_session_if_current(&key, &session).await;
                 let Some(entry) = removed else {
@@ -2203,20 +2251,26 @@ mod lifecycle_hook_tests {
     }
 
     #[test]
-    fn shared_explore_stop_does_not_target_private_sub_agent_key() {
+    fn pre_rekey_explore_stop_targets_only_its_private_actor_key() {
         let shared = scope("pre-rekey-conversation-scope");
-        let user_explore = EffectiveResourceAccess::shared_restricted("user-explore");
+        let user_explore =
+            EffectiveResourceAccess::new("user-explore", ResourceAuthority::Restricted);
+        let same_user = EffectiveResourceAccess::new("user-explore", ResourceAuthority::Restricted);
         let private_sub_agent =
             EffectiveResourceAccess::new("explore-child", ResourceAuthority::Restricted);
         let work_actor = EffectiveResourceAccess::new("work-parent", ResourceAuthority::Work);
 
         assert_eq!(
             super::session_key(&shared, &user_explore),
-            super::session_key(&shared, &work_actor)
+            super::session_key(&shared, &same_user)
         );
         assert_ne!(
             super::session_key(&shared, &user_explore),
             super::session_key(&shared, &private_sub_agent)
+        );
+        assert_ne!(
+            super::session_key(&shared, &user_explore),
+            super::session_key(&shared, &work_actor)
         );
     }
 
