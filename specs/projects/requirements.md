@@ -103,7 +103,11 @@ THE SYSTEM SHALL reject the call
 WHEN the task file's name parses as taskmd but its status is not `ready` / `in-progress` / `brainstorming`
 THE SYSTEM SHALL reject the call
 
-THE AwaitingTaskApproval state SHALL carry the `task_file` path plus a display copy of the title, priority, and body; on approval the executor SHALL re-read the file from disk as the source of truth
+THE AwaitingTaskApproval state SHALL carry the `task_file` path plus a display copy of the title, priority, and body
+AND SHALL persist one reviewed proposal snapshot identity containing the intended repo-relative path, task kind, and content digest bound to that reviewed body
+AND, on approval, the executor SHALL re-read the file from disk only for that same reviewed path and task kind
+AND SHALL compare the re-read body, path, and task kind against the reviewed snapshot identity before approving
+AND SHALL require the user to request changes and capture a new reviewed snapshot before a changed path, changed task kind, or changed body can be approved
 
 WHEN `propose_task` is called in a non-Git Direct conversation
 THE SYSTEM SHALL NOT provide the tool at all
@@ -129,12 +133,14 @@ AND the agent MAY revise the plan and call `propose_task` again
 
 WHEN the user approves the task and chooses **Continue here**
 THE SYSTEM SHALL commit the approved task artifact according to REQ-PROJ-006
+AND SHALL approve only the same reviewed snapshot identity rather than whatever file currently exists at approval time
 AND keep the same Open conversation and the same `WorkScope`
 AND resume execution in that conversation
 AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
 
 WHEN the user approves the task and chooses **Start in new conversation**
 THE SYSTEM SHALL create a separate Open conversation derived from the source conversation
+AND SHALL approve only the same reviewed snapshot identity rather than whatever file currently exists at approval time
 AND provision a fresh detached-default-branch disposable worktree for the spawned conversation
 AND seed only the exact approved task as the spawned conversation's starting context
 AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
@@ -204,6 +210,7 @@ WHEN the user approves a taskmd task
 THE SYSTEM SHALL parse the task ID, priority, status, and slug from the filename
 AND rename the file to `...-in-progress--{slug}.md` if its status is not already `in-progress`
 AND persist the approved content so the chosen conversation placement can continue to use the exact approved task
+AND SHALL persist the exact approved body together with the reviewed snapshot identity that justified that approval
 
 WHEN the agent later updates the task file during active work
 THE SYSTEM SHALL allow edits to it like any other workspace file

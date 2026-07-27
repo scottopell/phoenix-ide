@@ -832,7 +832,8 @@ AND SHALL render that Follow-up relationship visibly from the source conversatio
 ### REQ-BED-031B: Permanent Delete Removes Only the Conversation Aggregate and Is Idempotent
 
 WHEN the user permanently deletes a History conversation
-THE SYSTEM SHALL remove the complete ProductConversation aggregate that is solely owned by that History conversation, including every transcript row in that aggregate plus solely-owned messages, approval records, attachments, and retrieval/index projections
+THE SYSTEM SHALL remove the complete ProductConversation aggregate that is solely owned by that History conversation, including every transcript row in that aggregate plus every solely-owned normalized child row required by that aggregate
+AND SHALL explicitly delete solely-owned message rows, tool-call rows, approval rows, attachment rows, retrieval chunk rows, retrieval locator rows, and FTS rows for that aggregate rather than relying on an unspecified catch-all such as "messages deleted"
 AND SHALL preserve typed tombstone-grade source identity needed by surviving provenance consumers
 AND SHALL NOT cascade the deletion into related but separately-owned conversations, branches, or pull requests
 
@@ -871,8 +872,8 @@ following sequence of direct calls in order:
 5. `cascade_browser_on_delete(work_scope, inheritor_scope)` — drops the
    Chrome session for the scope unless another still-live owner retains the
    same `WorkScope` (REQ-BROWSER-WS-003)
-6. `db.delete_product_conversation(product_conversation_id)` — permanent Delete removes the complete History ProductConversation aggregate, including every transcript row plus solely-owned messages,
-   tool calls, approval records, attachments, and index/FTS projections, while retaining typed tombstones for surviving provenance links and leaving related but
+6. `db.delete_product_conversation(product_conversation_id)` — permanent Delete removes the complete History ProductConversation aggregate, including every transcript row plus solely-owned message rows,
+   tool-call rows, approval rows, attachment rows, retrieval chunk rows, retrieval locator rows, and FTS rows, while retaining typed tombstones for surviving provenance links and leaving related but
    separately-owned conversations, branches, and pull requests untouched
 7. Broadcast `ConversationHardDeleted` for UI consumers
 

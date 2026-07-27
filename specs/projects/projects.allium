@@ -62,12 +62,19 @@ value ApprovedTaskIdentity {
     plain_title: String?
 }
 
+value ReviewedProposalSnapshotIdentity {
+    repo_relative_path: String
+    task_kind: taskmd | plain_markdown
+    content_digest: String
+}
+
 value ApprovedTaskSource {
     task_path: String
     title: String
     priority: String
     body: String
     identity: ApprovedTaskIdentity
+    reviewed_snapshot: ReviewedProposalSnapshotIdentity
     kind: taskmd | plain_markdown
 }
 
@@ -321,17 +328,29 @@ rule TaskApprovalExecuted {
 
     let worktree = Worktree{product_conversation: conversation.product_conversation}
     let approved_source = ApprovedTaskSource {
-        task_path: conversation.proposal.task_file,
-        title: conversation.proposal.title,
-        priority: conversation.proposal.priority,
-        body: reread_task_body(conversation.proposal.task_file),
-        identity: approved_task_identity(conversation.proposal.task_file),
-        kind: approved_task_kind(conversation.proposal.task_file)
+        task_path: conversation.proposal_snapshot.task_file,
+        title: conversation.proposal_snapshot.title,
+        priority: conversation.proposal_snapshot.priority,
+        body: reread_task_body(conversation.proposal_snapshot.task_file),
+        identity: approved_task_identity(conversation.proposal_snapshot.task_file),
+        reviewed_snapshot: ReviewedProposalSnapshotIdentity {
+            repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+            task_kind: conversation.proposal_snapshot.task_kind,
+            content_digest: conversation.proposal_snapshot.content_digest
+        },
+        kind: approved_task_kind(conversation.proposal_snapshot.task_file)
     }
 
     ensures: WriteAuthorityPersistedBeforeResume(conversation)
     ensures: ApprovedTaskSnapshotted(conversation, approved_source)
     ensures: ApprovedTaskRevalidated(conversation, approved_source)
+    ensures: ApprovedTaskRereadBoundToReviewedSnapshot(
+        conversation,
+        approved_source.reviewed_snapshot,
+        approved_path: approved_source.task_path,
+        approved_kind: approved_source.kind,
+        approved_body: approved_source.body
+    )
     ensures: worktree.approved_task = approved_source
     ensures:
         if approved_source.kind = taskmd:
@@ -355,17 +374,29 @@ rule TaskApprovalNewConversationExecuted {
     requires: decision = approved_start_fresh
 
     let approved_source = ApprovedTaskSource {
-        task_path: conversation.proposal.task_file,
-        title: conversation.proposal.title,
-        priority: conversation.proposal.priority,
-        body: reread_task_body(conversation.proposal.task_file),
-        identity: approved_task_identity(conversation.proposal.task_file),
-        kind: approved_task_kind(conversation.proposal.task_file)
+        task_path: conversation.proposal_snapshot.task_file,
+        title: conversation.proposal_snapshot.title,
+        priority: conversation.proposal_snapshot.priority,
+        body: reread_task_body(conversation.proposal_snapshot.task_file),
+        identity: approved_task_identity(conversation.proposal_snapshot.task_file),
+        reviewed_snapshot: ReviewedProposalSnapshotIdentity {
+            repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+            task_kind: conversation.proposal_snapshot.task_kind,
+            content_digest: conversation.proposal_snapshot.content_digest
+        },
+        kind: approved_task_kind(conversation.proposal_snapshot.task_file)
     }
     let target = bedrock/ProductConversation{id: approved_task_child_id(conversation)}
 
     ensures: ApprovedTaskSnapshotted(conversation, approved_source)
     ensures: ApprovedTaskRevalidated(conversation, approved_source)
+    ensures: ApprovedTaskRereadBoundToReviewedSnapshot(
+        conversation,
+        approved_source.reviewed_snapshot,
+        approved_path: approved_source.task_path,
+        approved_kind: approved_source.kind,
+        approved_body: approved_source.body
+    )
     ensures: ApprovedTaskSourceRecorded(target, approved_source)
     ensures: ApprovedTaskDerivedFromRecorded(conversation.product_conversation, target, approved_source)
     ensures: CreatedFromApprovedTask(target, approved_source)

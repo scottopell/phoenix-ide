@@ -73,11 +73,14 @@ value UserQuestion {
     question: String
 }
 
-value TaskProposal {
+value TaskProposalSnapshot {
     task_file: String
     title: String
     priority: String
     plan: String
+    task_kind: taskmd | plain_markdown
+    repo_relative_path: String
+    content_digest: String
 }
 
 ------------------------------------------------------------
@@ -306,7 +309,7 @@ variant Parent : Conversation {
     -- ownership, continuation routing, delete cascades, or sub-agent topology.
     spawned_from_conversation_id: String?
 
-    proposal: TaskProposal when parent_status = awaiting_task_approval
+    proposal_snapshot: TaskProposalSnapshot when parent_status = awaiting_task_approval
     pending_questions: List<UserQuestion> when parent_status = awaiting_user_response
     recovery_kind: RecoveryKind when parent_status = awaiting_recovery
     recovery_resume_target: RecoveryResumeTarget when parent_status = awaiting_recovery
@@ -795,10 +798,10 @@ rule ProposeTaskIntercepted {
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
     requires: conversation.task_proposal_eligible
-    let proposal = parse_task_proposal(tool_calls.first)
+    let proposal_snapshot = snapshot_task_proposal(tool_calls.first)
     ensures: conversation.parent_status = awaiting_task_approval
-    ensures: conversation.proposal = proposal
-    ensures: TaskApprovalRequested(conversation, proposal)
+    ensures: conversation.proposal_snapshot = proposal_snapshot
+    ensures: TaskApprovalRequested(conversation, proposal_snapshot)
 
     @guidance
         -- There is exactly one blocking proposal-review authority: a sole propose_task
@@ -807,6 +810,22 @@ rule ProposeTaskIntercepted {
         -- At the continuation threshold ContextThresholdReachedParent still wins first,
         -- parking into awaiting_continuation with the propose_task call in
         -- rejected_tool_calls for replay after continuation.
+}
+
+rule ApprovalSnapshotMismatchRequiresRequestChanges {
+    when: TaskApprovalDecided(conversation, decision)
+    requires: conversation.parent_status = awaiting_task_approval
+    requires: decision in { approved_continue_current, approved_start_fresh }
+    requires: reread_task_repo_relative_path(conversation.proposal_snapshot.task_file) != conversation.proposal_snapshot.repo_relative_path
+        or reread_task_kind(conversation.proposal_snapshot.task_file) != conversation.proposal_snapshot.task_kind
+        or reread_task_digest(conversation.proposal_snapshot.task_file) != conversation.proposal_snapshot.content_digest
+    ensures: ApprovalRejectedUntilRequestChanges(conversation)
+
+    @guidance
+        -- Approval is bound to the reviewed proposal snapshot identity. If the task
+        -- file was swapped, moved, retyped, or edited after review, the user must
+        -- request changes so the agent can present and the user can review a fresh
+        -- snapshot before any approval path may proceed.
 }
 
 -- REQ-PROJ-003/012: an invalid propose_task is rejected before the blocking review
@@ -820,8 +839,8 @@ rule ProposeTaskInvalid {
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
     requires: conversation.task_proposal_eligible
-    let proposal = parse_task_proposal(tool_calls.first)
-    requires: not task_proposal_valid(proposal)
+    let proposal_snapshot = snapshot_task_proposal(tool_calls.first)
+    requires: not task_proposal_valid(proposal_snapshot)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
@@ -1013,6 +1032,28 @@ rule UserApprovesTaskCurrentConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_continue_current
+    ensures: ApprovalRereadSnapshot(
+        conversation,
+        original_task_file: conversation.proposal_snapshot.task_file,
+        original_repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+        original_task_kind: conversation.proposal_snapshot.task_kind,
+        original_content_digest: conversation.proposal_snapshot.content_digest
+    )
+    ensures: ApprovalMatchesReviewedSnapshot(
+        conversation,
+        original_task_file: conversation.proposal_snapshot.task_file,
+        original_repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+        original_task_kind: conversation.proposal_snapshot.task_kind,
+        original_content_digest: conversation.proposal_snapshot.content_digest,
+        approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
+    )
+    ensures: ExactApprovedBodyPersisted(
+        conversation,
+        repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+        task_kind: conversation.proposal_snapshot.task_kind,
+        content_digest: conversation.proposal_snapshot.content_digest,
+        approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
+    )
     ensures: WriteAuthorityPersistedBeforeResume(conversation)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
@@ -1025,12 +1066,40 @@ rule UserApprovesTaskCurrentConversation {
         -- product lifecycle, product mode, work-scope attachment, continuation
         -- topology, provenance, or branch/worktree state beyond the approval
         -- checkpoint itself.
+        --
+        -- ApprovalRereadSnapshot / ApprovalMatchesReviewedSnapshot bind approval to
+        -- the reviewed repo-relative path, task kind, and content digest. The
+        -- reread body may only be approved when all three still match the reviewed
+        -- snapshot identity; otherwise ApprovalSnapshotMismatchRequiresRequestChanges
+        -- wins and approval is blocked until a fresh review snapshot is captured.
 }
 
 rule UserApprovesTaskNewConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_start_fresh
+    ensures: ApprovalRereadSnapshot(
+        conversation,
+        original_task_file: conversation.proposal_snapshot.task_file,
+        original_repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+        original_task_kind: conversation.proposal_snapshot.task_kind,
+        original_content_digest: conversation.proposal_snapshot.content_digest
+    )
+    ensures: ApprovalMatchesReviewedSnapshot(
+        conversation,
+        original_task_file: conversation.proposal_snapshot.task_file,
+        original_repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+        original_task_kind: conversation.proposal_snapshot.task_kind,
+        original_content_digest: conversation.proposal_snapshot.content_digest,
+        approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
+    )
+    ensures: ExactApprovedBodyPersisted(
+        conversation,
+        repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+        task_kind: conversation.proposal_snapshot.task_kind,
+        content_digest: conversation.proposal_snapshot.content_digest,
+        approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
+    )
     let fresh_work_conversation = created_fresh_work_conversation(conversation)
     ensures: FreshWorkConversationCreated(conversation, fresh_work_conversation)
     ensures: fresh_work_conversation.product_conversation != conversation.product_conversation
@@ -1045,6 +1114,10 @@ rule UserApprovesTaskNewConversation {
         -- The initial handoff is only a typed provisioning boundary at the canonical
         -- detached default-commit base; detailed worktree/branch provisioning is owned
         -- downstream rather than by task approval itself.
+        --
+        -- Approval remains bound to the reviewed snapshot identity here too; Phoenix
+        -- cannot seed a new conversation from arbitrary current file contents after a
+        -- post-review swap or edit.
 }
 
 rule UserRequestsTaskChanges {
@@ -1705,11 +1778,14 @@ rule UserHardDeletesConversationRule {
         -- Direct call: cascade_projects_on_delete
         -- (specs/projects/ subscriber rule).
     ensures: AggregateTranscriptRowsRemoved(aggregate)
-    ensures: SolelyOwnedConversationChildrenRemoved(aggregate)
     ensures: SolelyOwnedConversationMessagesRemoved(aggregate)
-    ensures: SolelyOwnedConversationApprovalsRemoved(aggregate)
-    ensures: SolelyOwnedConversationAttachmentsRemoved(aggregate)
-    ensures: ConversationIndexAndFtsRowsRemoved(aggregate)
+    ensures: SolelyOwnedConversationToolCallRowsRemoved(aggregate)
+    ensures: SolelyOwnedConversationApprovalRowsRemoved(aggregate)
+    ensures: SolelyOwnedConversationAttachmentRowsRemoved(aggregate)
+    ensures: SolelyOwnedConversationRetrievalChunkRowsRemoved(aggregate)
+    ensures: SolelyOwnedConversationRetrievalLocatorRowsRemoved(aggregate)
+    ensures: SolelyOwnedConversationFtsRowsRemoved(aggregate)
+    ensures: RepeatedDeleteRemainsIdempotent(aggregate)
     ensures: NonCascadeProvenanceRelationsPreservedAsTypedTombstones(aggregate)
     ensures: NonCascadeBranchAndPullRequestRelationsRemain(aggregate)
     ensures: ProductConversationRemoved(aggregate)
@@ -1732,10 +1808,13 @@ rule UserHardDeletesConversationRule {
         --      applicable.
         --   5. db.delete_product_conversation(product_conversation_id) — remove
         --      every transcript row and solely-owned child row in the History
-        --      aggregate, including messages, approval records, attachments,
-        --      and FTS/index projections, while retaining typed tombstones for
-        --      surviving provenance links and leaving separately-owned branch /
+        --      aggregate, including message rows, tool-call rows, approval rows,
+        --      attachment rows, retrieval chunk rows, retrieval locator rows,
+        --      and FTS rows, while retaining typed tombstones for surviving
+        --      provenance links and leaving separately-owned branch /
         --      pull-request relations untouched.
+        --      Re-running the same delete after rows are already gone still
+        --      returns the same idempotent success post-state.
         --   6. Broadcast ConversationHardDeleted SSE wire event.
         --   7. Return success to the user.
         --
@@ -1933,7 +2012,7 @@ surface UserConversation {
         conversation.mode
         conversation.context_usage_ratio
         conversation.context_warning
-        conversation.proposal when conversation.parent_status = awaiting_task_approval
+        conversation.proposal_snapshot when conversation.parent_status = awaiting_task_approval
         conversation.pending_questions when conversation.parent_status = awaiting_user_response
         conversation.error_message when conversation.core_status = error
         conversation.recovery_message when conversation.parent_status = awaiting_recovery
