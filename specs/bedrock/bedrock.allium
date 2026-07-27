@@ -124,23 +124,11 @@ entity ProductConversation {
     transcript_rows: Conversation with product_conversation = this
 }
 
-value TranscriptBoundary {
-    predecessor: Conversation
-    successor: Conversation
-    summary: String
-}
-
-extend entity ProductConversation {
-    -- Navigation/list identity is the durable root transcript row. The root is the
-    -- unique row in transcript_rows that is not the successor of another row in the
-    -- same aggregate. Latest-row authority remains derived from continuation topology.
-    transcript_root: Conversation
-    latest_activity_row: Conversation
-    transcript_boundaries: List<TranscriptBoundary>
-
-    route_target: transcript_root
-    live_target: latest_activity_row
-}
+-- Navigation/list identity is the durable root transcript row. The root is the
+-- unique row in transcript_rows that is not the successor of another row in the
+-- same aggregate. Latest-row authority remains derived from continuation topology.
+-- Where rules/surfaces need root/latest identity, they derive it from
+-- transcript_rows and continued_in_conv_id rather than storing parallel fields.
 
 entity CloseObligation {
     product_conversation: ProductConversation
@@ -1209,13 +1197,6 @@ rule ContinuationHandoffBecomesBoundary {
     requires: conversation.product_lifecycle = open
     ensures: conversation.parent_status = handed_off
     ensures: conversation.continuation_boundary_summary = conversation.continuation_summary
-    ensures: conversation.product_conversation.transcript_boundaries =
-        append_boundary(
-            conversation.product_conversation.transcript_boundaries,
-            predecessor: conversation,
-            successor: new_conv,
-            summary: conversation.continuation_summary
-        )
 
     @guidance
         -- The exact persisted continuation summary that initialized the successor
@@ -1225,11 +1206,14 @@ rule ContinuationHandoffBecomesBoundary {
 
 rule ProductConversationRouteResolvesLegacyMemberLinks {
     when: ProductConversationRouteRequested(target_row)
+    requires: not exists Conversation{product_conversation: target_row.product_conversation, continued_in_conv_id: target_row}
+    requires: exists Conversation{product_conversation: target_row.product_conversation, continued_in_conv_id: absent}
+
     ensures: ProductConversationRouteResolved(
         product_conversation: target_row.product_conversation,
-        route_target: target_row.product_conversation.transcript_root,
+        route_target: target_row,
         anchor_row: target_row,
-        live_target: target_row.product_conversation.live_target
+        live_target: target_row
     )
 
     @guidance
@@ -1289,12 +1273,15 @@ rule ProductConversationListProjectsOncePerRoot {
 -- PARENT 8. TERMINAL (REQ-BED-029)
 -- ===========================================================
 
-rule ConversationLifecycleBecomesHistory {
-    when: CloseConversationCompleted(conversation)
-    requires: conversation.kind = Parent
-    requires: conversation.is_latest_row
-    requires: conversation.lifecycle = open
-    ensures: conversation.root_conversation.lifecycle = history
+rule ProductConversationTransitionsToHistory {
+    when: ProductConversationTransitionToHistoryRequested(product_conversation)
+    requires: product_conversation.lifecycle = open
+    ensures: product_conversation.lifecycle = history
+
+    @guidance
+        -- Bedrock owns only the aggregate lifecycle capability: an open product
+        -- conversation may become history. The trigger/orchestration deciding
+        -- when to invoke this transition is owned downstream.
 }
 
 rule UserRequestsCloseConversation {
@@ -1787,30 +1774,14 @@ invariant ProductConversationHasSingleRootRow {
         count(Conversation{product_conversation: pc} where not exists Conversation{product_conversation: pc, continued_in_conv_id: this}) = 1
 }
 
-invariant ProductConversationRouteUsesDurableRoot {
+invariant ProductConversationHasSingleTopologyLatestRow {
     for pc in ProductConversation:
-        pc.route_target = pc.transcript_root
+        count(Conversation{product_conversation: pc, continued_in_conv_id: absent}) = 1
 }
 
-invariant ProductConversationLiveTargetIsTopologyLatest {
-    for pc in ProductConversation:
-        pc.live_target.product_conversation = pc
-            and pc.live_target.continued_in_conv_id = absent
-}
-
-invariant ContinuationBoundaryMatchesExactPersistedSummary {
-    for pc in ProductConversation:
-        for boundary in pc.transcript_boundaries:
-            boundary.predecessor.product_conversation = pc
-            and boundary.successor.product_conversation = pc
-            and boundary.predecessor.continued_in_conv_id = boundary.successor
-            and boundary.predecessor.parent_status = handed_off
-            and boundary.predecessor.continuation_boundary_summary = boundary.summary
-}
-
-invariant AtMostOneBoundaryPerContinuationJoin {
-    for predecessor in Parent:
-        count(predecessor.product_conversation.transcript_boundaries where predecessor = this.predecessor) <= 1
+invariant ContinuationBoundarySummaryLivesOnHandedOffPredecessor {
+    for conversation in Parent:
+        conversation.continuation_boundary_summary when conversation.parent_status = handed_off
 }
 
 -- REQ-BED-005a: Bounded cancellation liveness.
@@ -1854,8 +1825,8 @@ surface UserConversation {
         conversation.recovery_resume_target when conversation.parent_status = awaiting_recovery
         conversation.continuation_summary when conversation.parent_status = context_exhausted
         conversation.continuation_boundary_summary when conversation.parent_status = handed_off
-        conversation.product_conversation.route_target
-        conversation.product_conversation.live_target
+        conversation.product_conversation.transcript_rows when not exists Conversation{product_conversation: conversation.product_conversation, continued_in_conv_id: conversation}
+        conversation.product_conversation.transcript_rows when conversation.continued_in_conv_id = absent
 
     provides:
         UserSendsMessage(conversation, text, images?)
