@@ -343,7 +343,9 @@ CREATE TABLE wake_terminal_receipts (
     contract_id TEXT NOT NULL CHECK (contract_id <> ''),
     resource_kind TEXT NOT NULL CHECK (resource_kind IN ('Bash', 'TmuxWindow')),
     terminal_kind TEXT NOT NULL CHECK (terminal_kind IN ('Fired', 'Cancelled', 'Expired', 'Forgotten')),
-    resolved_at INTEGER NOT NULL CHECK (resolved_at >= 0), bash_handle_id TEXT,
+    resolved_at INTEGER NOT NULL CHECK (resolved_at >= 0),
+    resolution_ordinal INTEGER NOT NULL UNIQUE CHECK (resolution_ordinal > 0),
+    bash_handle_id TEXT,
     tmux_server_token TEXT, tmux_window_id TEXT,
     bash_status TEXT CHECK (bash_status IN ('Exited', 'Killed', 'KillPendingKernel')),
     tmux_status TEXT CHECK (tmux_status IN ('ExitMarkerObserved', 'WindowKilled')),
@@ -373,7 +375,28 @@ CREATE TABLE wake_terminal_receipts (
     CHECK ((cancelled_reason IS NOT NULL) = (terminal_kind = 'Cancelled')),
     CHECK ((cancelled_at IS NOT NULL) = (terminal_kind = 'Cancelled'))
 ) WITHOUT ROWID;
-INSERT INTO wake_terminal_receipts SELECT * FROM wake_terminal_receipts_old;
+INSERT INTO wake_terminal_receipts (
+    workflow_id, receipt_id, delivery_id, conversation_id, contract_id, resource_kind,
+    terminal_kind, resolved_at, resolution_ordinal, bash_handle_id, tmux_server_token,
+    tmux_window_id, bash_status, tmux_status, occurred_at, exit_code, duration_ms,
+    signal_number, kill_signal_sent, forgotten_reason, cancelled_reason, cancelled_at,
+    bash_cmd, bash_label, bash_partial, tail_start_offset, tail_end_offset,
+    tail_truncated_before, kill_attempted_at
+)
+SELECT workflow_id, receipt_id, delivery_id, conversation_id, contract_id, resource_kind,
+       terminal_kind, resolved_at,
+       ROW_NUMBER() OVER (ORDER BY resolved_at, workflow_id, receipt_id),
+       bash_handle_id, tmux_server_token, tmux_window_id, bash_status, tmux_status,
+       occurred_at, exit_code, duration_ms, signal_number, kill_signal_sent,
+       forgotten_reason, cancelled_reason, cancelled_at, bash_cmd, bash_label, bash_partial,
+       tail_start_offset, tail_end_offset, tail_truncated_before, kill_attempted_at
+FROM wake_terminal_receipts_old;
+INSERT INTO workflow_global_sequences(sequence_name, next_value)
+SELECT 'wake_resolution', COALESCE(MAX(resolution_ordinal), 0) + 1 FROM wake_terminal_receipts
+WHERE true
+ON CONFLICT(sequence_name) DO UPDATE SET next_value = MAX(
+    workflow_global_sequences.next_value, excluded.next_value
+);
 CREATE TABLE wake_terminal_receipt_tails (
     workflow_id INTEGER NOT NULL, receipt_id INTEGER NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0), line TEXT NOT NULL,
@@ -3230,6 +3253,65 @@ mod tests {
                 "hash-1".into()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn migration_063_preserves_existing_bash_receipt_columns_explicitly() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version < 63) {
+            sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO _migrations(version, name) VALUES (?1, ?2)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::raw_sql("PRAGMA foreign_keys = OFF;")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO wake_terminal_receipts (
+                workflow_id, receipt_id, delivery_id, conversation_id, contract_id,
+                resource_kind, terminal_kind, resolved_at, bash_handle_id, bash_status,
+                occurred_at, exit_code, duration_ms, kill_signal_sent,
+                tail_start_offset, tail_end_offset, tail_truncated_before,
+                bash_cmd, bash_label, bash_partial, kill_attempted_at
+             ) VALUES (7, 3, 4, 'conv', 'contract', 'Bash', 'Fired', 10, 'b-1',
+                       'Exited', 9, 0, 5, 'TERM', 11, 13, 1,
+                       'printf ready', 'build', 'partial', 8)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_063).execute(&pool).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT resolution_ordinal, tail_start_offset, tail_end_offset,
+                    tail_truncated_before, bash_cmd, bash_label, bash_partial,
+                    kill_attempted_at
+             FROM wake_terminal_receipts WHERE workflow_id = 7 AND receipt_id = 3",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("resolution_ordinal"), 1);
+        assert_eq!(row.get::<i64, _>("tail_start_offset"), 11);
+        assert_eq!(row.get::<i64, _>("tail_end_offset"), 13);
+        assert_eq!(row.get::<i64, _>("tail_truncated_before"), 1);
+        assert_eq!(row.get::<String, _>("bash_cmd"), "printf ready");
+        assert_eq!(row.get::<String, _>("bash_label"), "build");
+        assert_eq!(row.get::<String, _>("bash_partial"), "partial");
+        assert_eq!(row.get::<i64, _>("kill_attempted_at"), 8);
     }
 
     #[tokio::test]

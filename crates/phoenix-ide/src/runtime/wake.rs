@@ -50,8 +50,7 @@ pub(crate) struct ProductionWakeRegistrar {
             std::collections::HashMap<(String, String), crate::runtime::SteeringAcceptanceReceipt>,
         >,
     >,
-    conversation_acceptance_locks:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    conversation_acceptance_locks: crate::runtime::ConversationAcceptanceLocks,
 }
 
 impl ProductionWakeRegistrar {
@@ -66,9 +65,7 @@ impl ProductionWakeRegistrar {
                 >,
             >,
         >,
-        conversation_acceptance_locks: Arc<
-            tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-        >,
+        conversation_acceptance_locks: crate::runtime::ConversationAcceptanceLocks,
     ) -> Self {
         Self {
             repo,
@@ -96,14 +93,11 @@ impl WakeRegistrar for ProductionWakeRegistrar {
         let prepared_fingerprint = input.prepared_fingerprint.clone();
         let conversation_id = input.conversation_id.clone();
         let intent = input.into_intent(now);
-        let conversation_lock = self
-            .conversation_acceptance_locks
-            .lock()
-            .await
-            .entry(conversation_id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _conversation_guard = conversation_lock.lock().await;
+        let _conversation_guard = crate::runtime::acquire_conversation_acceptance_lock(
+            &self.conversation_acceptance_locks,
+            &conversation_id,
+        )
+        .await;
         let _acceptance_guard = self.acceptance_lock.lock().await;
         let outcome = self
             .repo
@@ -499,13 +493,7 @@ fn handle_is_idle(handle: &crate::runtime::ConversationHandle) -> bool {
 }
 
 fn sort_pending_for_materialization(pending: &mut [WakePendingDelivery]) {
-    pending.sort_by_key(|delivery| {
-        (
-            terminal_resolved_at(&delivery.receipt.terminal),
-            delivery.workflow_id,
-            delivery.receipt.receipt_id,
-        )
-    });
+    pending.sort_by_key(|delivery| delivery.receipt.resolution_ordinal);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -729,19 +717,6 @@ struct BashWakeResolutionObservation<'a> {
     resolved_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
-}
-
-fn terminal_resolved_at(
-    terminal: &phoenix_workflow::wake_profile::WakeTerminalPayload,
-) -> Timestamp {
-    match terminal {
-        phoenix_workflow::wake_profile::WakeTerminalPayload::Fired { resolved_at, .. }
-        | phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled { resolved_at, .. }
-        | phoenix_workflow::wake_profile::WakeTerminalPayload::Expired { resolved_at, .. }
-        | phoenix_workflow::wake_profile::WakeTerminalPayload::Forgotten { resolved_at, .. } => {
-            *resolved_at
-        }
-    }
 }
 
 fn terminal_kind(
@@ -2518,6 +2493,7 @@ mod tests {
         ));
         let mut pending = pending;
         sort_pending_for_materialization(&mut pending);
+        assert!(pending[0].receipt.resolution_ordinal < pending[1].receipt.resolution_ordinal);
         for (index, delivery) in pending.iter().enumerate() {
             let auto_resume = !matches!(
                 delivery.receipt.terminal,

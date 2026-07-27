@@ -161,6 +161,30 @@ pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
 }
 
 /// Manager for all conversation runtimes
+pub(crate) type ConversationAcceptanceLocks =
+    Arc<AsyncMutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>>;
+
+pub(crate) async fn acquire_conversation_acceptance_lock(
+    locks: &ConversationAcceptanceLocks,
+    conversation_id: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks
+            .get(conversation_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            lock
+        } else {
+            let lock = Arc::new(AsyncMutex::new(()));
+            locks.insert(conversation_id.to_string(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    lock.lock_owned().await
+}
+
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
@@ -193,7 +217,7 @@ pub struct RuntimeManager {
     /// Serializes legacy steering admission until the normalized queue row is visible.
     steering_acceptance_receipts:
         Arc<AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>>,
-    steering_acceptance_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    steering_acceptance_locks: ConversationAcceptanceLocks,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1393,7 +1417,8 @@ impl RuntimeManager {
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
         let steering_acceptance_receipts = Arc::new(AsyncMutex::new(HashMap::new()));
-        let steering_acceptance_locks = Arc::new(AsyncMutex::new(HashMap::new()));
+        let steering_acceptance_locks: ConversationAcceptanceLocks =
+            Arc::new(AsyncMutex::new(HashMap::new()));
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
@@ -3383,14 +3408,7 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = self
-            .steering_acceptance_locks
-            .lock()
-            .await
-            .entry(conversation_id.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone();
-        lock.lock_owned().await
+        acquire_conversation_acceptance_lock(&self.steering_acceptance_locks, conversation_id).await
     }
 
     pub(crate) async fn lock_steering_acceptance(
@@ -4533,6 +4551,25 @@ mod broadcaster_tests {
             anchor + i64::try_from(events.len()).expect("ring length fits i64"),
             "with seq 11..17 in the ring, highest is 17"
         );
+    }
+}
+
+#[cfg(test)]
+mod conversation_acceptance_lock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn weak_keyed_locks_reclaim_idle_conversation_entries() {
+        let locks: ConversationAcceptanceLocks = Arc::new(AsyncMutex::new(HashMap::new()));
+        let first = acquire_conversation_acceptance_lock(&locks, "missing-1").await;
+        assert_eq!(locks.lock().await.len(), 1);
+        drop(first);
+        let second = acquire_conversation_acceptance_lock(&locks, "missing-2").await;
+
+        let locks = locks.lock().await;
+        assert_eq!(locks.len(), 1);
+        assert!(locks.contains_key("missing-2"));
+        drop(second);
     }
 }
 

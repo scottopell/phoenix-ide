@@ -185,6 +185,7 @@ pub struct WakeTerminalReceiptProjection {
     pub conversation_id: String,
     pub contract_id: String,
     pub terminal: WakeTerminalPayload,
+    pub resolution_ordinal: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2411,7 +2412,7 @@ impl WakeRepository {
                     d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
                     d.suppression_reason, d.accepted_by_transition_id,
                     p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
-                    p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
+                    p.resolved_at, p.resolution_ordinal, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                     p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                     p.signal_number, p.kill_signal_sent, p.kill_attempted_at, p.forgotten_reason, p.cancelled_reason,
                     p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, p.bash_partial, b.work_scope_id, b.tmux_completion_policy, b.registering_tool_use_id
@@ -3926,6 +3927,8 @@ async fn insert_terminal_receipt_projection_tx(
         | WakeTerminalPayload::Expired { .. }
         | WakeTerminalPayload::Forgotten { .. } => (None, None, None),
     };
+    let resolution_ordinal =
+        super::next_global_sequence_value_tx(tx, "wake_resolution", "resolution_ordinal").await?;
     sqlx::query(
         "UPDATE wake_bindings SET resolved_at = ?2 WHERE workflow_id = ?1 AND resolved_at IS NULL",
     )
@@ -3936,11 +3939,11 @@ async fn insert_terminal_receipt_projection_tx(
     sqlx::query(
         "INSERT INTO wake_terminal_receipts (
             workflow_id, receipt_id, delivery_id, conversation_id, contract_id, resource_kind,
-            terminal_kind, resolved_at, bash_handle_id, tmux_server_token, tmux_window_id,
+            terminal_kind, resolved_at, resolution_ordinal, bash_handle_id, tmux_server_token, tmux_window_id,
             bash_status, tmux_status, occurred_at, exit_code, duration_ms, signal_number,
             kill_signal_sent, kill_attempted_at, forgotten_reason, cancelled_reason, cancelled_at,
             tail_start_offset, tail_end_offset, tail_truncated_before, bash_cmd, bash_label, bash_partial
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)"
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)"
     )
     .bind(to_i64(binding.workflow_id.0, "workflow_id")?)
     .bind(to_i64(receipt.receipt_id.0, "receipt_id")?)
@@ -3950,6 +3953,7 @@ async fn insert_terminal_receipt_projection_tx(
     .bind(resource_kind)
     .bind(terminal_kind)
     .bind(to_i64(resolved_at.0, "resolved_at")?)
+    .bind(to_i64(resolution_ordinal, "resolution_ordinal")?)
     .bind(bash_handle_id)
     .bind(tmux_server_token)
     .bind(tmux_window_id)
@@ -4260,7 +4264,7 @@ async fn fetch_pending_delivery_exact_tx(
                 d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
                 d.suppression_reason, d.accepted_by_transition_id,
                 p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
-                p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
+                p.resolved_at, p.resolution_ordinal, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.kill_attempted_at, p.forgotten_reason, p.cancelled_reason,
                 p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, p.bash_partial, b.work_scope_id, b.tmux_completion_policy
@@ -4301,7 +4305,7 @@ async fn fetch_pending_deliveries_for_conversation_tx(
                 d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
                 d.suppression_reason, d.accepted_by_transition_id,
                 p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind, p.terminal_kind,
-                p.resolved_at, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
+                p.resolved_at, p.resolution_ordinal, p.bash_handle_id, p.tmux_server_token, p.tmux_window_id,
                 p.bash_status, p.tmux_status, p.occurred_at, p.exit_code, p.duration_ms,
                 p.signal_number, p.kill_signal_sent, p.kill_attempted_at, p.forgotten_reason, p.cancelled_reason,
                 p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, p.bash_partial, b.work_scope_id, b.tmux_completion_policy
@@ -4345,7 +4349,7 @@ async fn fetch_materialized_pending_batches_for_conversation_tx(
 > {
     let rows = sqlx::query(
         "SELECT d.*, p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind,
-                p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
+                p.terminal_kind, p.resolved_at, p.resolution_ordinal, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.kill_attempted_at, p.forgotten_reason,
                 p.cancelled_reason, p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, p.bash_partial, b.work_scope_id, b.tmux_completion_policy,
@@ -4408,7 +4412,7 @@ async fn fetch_materialized_pending_deliveries_tx(
 ) -> DbResult<Vec<WakeMaterializedPendingDelivery>> {
     let rows = sqlx::query(
         "SELECT d.*, p.receipt_id, p.conversation_id, p.contract_id, p.resource_kind,
-                p.terminal_kind, p.resolved_at, p.bash_handle_id, p.tmux_server_token,
+                p.terminal_kind, p.resolved_at, p.resolution_ordinal, p.bash_handle_id, p.tmux_server_token,
                 p.tmux_window_id, p.bash_status, p.tmux_status, p.occurred_at, p.exit_code,
                 p.duration_ms, p.signal_number, p.kill_signal_sent, p.kill_attempted_at, p.forgotten_reason,
                 p.cancelled_reason, p.cancelled_at, p.tail_start_offset, p.tail_end_offset, p.tail_truncated_before, p.bash_cmd, p.bash_label, p.bash_partial, b.work_scope_id, b.tmux_completion_policy,
@@ -4573,6 +4577,10 @@ fn projection_from_row(
     let conversation_id: String = row.get("conversation_id");
     let resource = resource_from_projection_row(row)?;
     let resolved_at = Timestamp(to_u64(row.get::<i64, _>("resolved_at"), "resolved_at")?);
+    let resolution_ordinal = to_u64(
+        row.get::<i64, _>("resolution_ordinal"),
+        "resolution_ordinal",
+    )?;
     let terminal = match row.get::<String, _>("terminal_kind").as_str() {
         "Fired" => WakeTerminalPayload::Fired {
             contract_id: contract_id.clone(),
@@ -4627,6 +4635,7 @@ fn projection_from_row(
         conversation_id,
         contract_id,
         terminal,
+        resolution_ordinal,
     })
 }
 
