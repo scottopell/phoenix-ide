@@ -630,7 +630,20 @@ surface ProjectManagement {
         worktree.approved_task
 
     provides:
-        UserRequestsCloseConversation(conversation)
+        UserClicksClose(conversation)
+}
+
+rule ProjectManagementCloseClickDispatchesTypedBedrockCommand {
+    when: UserClicksClose(conversation)
+    ensures: bedrock/UserRequestsCloseConversation(
+        conversation,
+        next_close_attempt_id(conversation.product_conversation)
+    )
+
+    @guidance
+        -- Projects emits the exact bedrock close command with a fresh attempt_id and
+        -- leaves lifecycle state to bedrock; this surface does not mutate any local
+        -- project lifecycle on its own.
 }
 
 surface BranchPicker {

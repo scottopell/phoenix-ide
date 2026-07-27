@@ -398,7 +398,7 @@ rule ResourceRetirementFailureProducesResidualRepairState {
         retirement_requested,
         needs_repair
     }
-    requires: exists RetirementResidualResource{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation}, product_conversation: product_conversation}
+    requires: exists RetirementResidualResource{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope}, product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     ensures: ResourceRetirementFailed(product_conversation, attempt_id)
 
     @guidance
@@ -420,7 +420,7 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation)
-    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
     ensures: ResourceRetirementFailed(product_conversation, attempt_id)
 
     @guidance
@@ -442,7 +442,7 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation)
-    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
     ensures: ResourceRetirementProgressRecorded(product_conversation)
 
     @guidance
