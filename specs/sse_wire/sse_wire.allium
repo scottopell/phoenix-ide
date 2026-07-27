@@ -9,8 +9,8 @@
 --
 -- Includes: All SSE event types (init, message, message_updated,
 --           state_change, token, llm_first_byte, llm_attempt, agent_done,
---           conversation_became_terminal, conversation_hard_deleted,
---           conversation_update, browser_session_state, steer_message_queued,
+--           conversation_hard_deleted, conversation_update,
+--           browser_session_state, steer_message_queued,
 --           rate_limit_snapshot, error); ordering constraints between them;
 --           the persist-before-broadcast invariant; broadcast-lag semantics;
 --           the per-conversation ReplayRing that buffers ephemeral events
@@ -88,8 +88,8 @@ value InitSnapshot {
 -- full set defined by `crates/phoenix-ide/src/api/wire.rs::event_type`
 -- is:
 --   "init", "message", "message_updated", "state_change", "token",
---   "agent_done", "conversation_became_terminal",
---   "conversation_update", "error", "browser_session_state",
+--   "agent_done", "conversation_update", "error",
+--   "browser_session_state",
 --   "steer_message_queued", "rate_limit_snapshot",
 --   "conversation_hard_deleted", "llm_first_byte", "llm_attempt"
 --
@@ -97,8 +97,8 @@ value InitSnapshot {
 --   - "message" enters the ring via the eager-assistant path
 --     (EagerAssistantMessageAppendedToReplayRing below).
 --   - "token", "state_change", "message_updated", "agent_done",
---     "conversation_update", "conversation_became_terminal",
---     "error", "browser_session_state", "steer_message_queued",
+--     "conversation_update", "error", "browser_session_state",
+--     "steer_message_queued",
 --     "rate_limit_snapshot", "llm_first_byte", "llm_attempt" enter
 --     via the ephemeral path (EphemeralEventAppendedToReplayRing
 --     below). All non-Message broadcasts go through
@@ -582,7 +582,7 @@ rule PersistedMessageClearsReplayRing {
 
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
--- conversation_became_terminal, error, browser_session_state,
+-- error, browser_session_state,
 -- steer_message_queued, rate_limit_snapshot, llm_first_byte,
 -- llm_attempt. Excludes Init (per-stream, never broadcast) and
 -- ConversationHardDeleted (terminal action; no subsequent init can
@@ -612,7 +612,7 @@ rule EphemeralEventAppendedToReplayRing {
 
     requires: entry.event_type in {
         "token", "state_change", "message_updated", "agent_done",
-        "conversation_update", "conversation_became_terminal", "error",
+        "conversation_update", "error",
         "browser_session_state", "steer_message_queued",
         "rate_limit_snapshot", "llm_first_byte", "llm_attempt"
     }
@@ -734,10 +734,10 @@ rule StateChangeBroadcast {
         -- display_state is a human-readable string derived from new_state.
 }
 
--- When a conversation reaches a terminal state, the terminal event is
--- broadcast. The terminal subsystem uses this to tear down PTYs.
-rule ConversationBecameTerminalBroadcast {
-    when: ConversationEnteredTerminalState(conv_id, seq)
+-- When the unified product-conversation lifecycle projects into History, that
+-- aggregate lifecycle update is broadcast on the root conversation stream.
+rule ProductConversationLifecycleBroadcast {
+    when: ProductConversationLifecycleProjected(conv_id, lifecycle, seq)
 
     requires: seq > 0
 
@@ -784,6 +784,8 @@ rule AggregateLifecycleProjectionBroadcast {
         -- A handed-off predecessor inside an Open aggregate does not produce a
         -- History projection; the whole aggregate lifecycle appears atomically from
         -- the UI perspective.
+        -- `ProductConversationLifecycleBroadcast` above names the wire-level
+        -- delivery obligation; this rule names the projection semantics.
 }
 
 rule ConversationUpdateBroadcast {

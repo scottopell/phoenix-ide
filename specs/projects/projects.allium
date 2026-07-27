@@ -579,10 +579,10 @@ rule TaskApprovalNewConversationExecuted {
 --
 -- The terminal-action git-effect rules — worktree removal, mode-dependent
 -- branch disposition, abandon diff snapshot, and TaskResolved emission — are
--- specified in specs/work-lifecycle/work-lifecycle.allium (MarkAsMerged,
--- ConfirmAbandon). Projects retains only the projects-domain constraints on
--- those user triggers (UserMarksAsMerged / UserConfirmsAbandon): the
--- TerminalActionRequiresNoContinuation invariant and the ProjectManagement
+-- specified in specs/work-lifecycle/work-lifecycle.allium. Projects retains
+-- only the projects-domain constraint that Close acts on the latest live owner
+-- row for a shared WorkScope rather than on a handed-off predecessor.
+
 -- surface below.
 
 -- ===========================================================
@@ -1160,20 +1160,12 @@ invariant WorktreeOwnershipFollowsContinuationPointer {
         w.conversation.continued_in_conv_id = absent
 }
 
--- REQ-BED-031: A context-exhausted parent with a continuation cannot be
--- abandoned; the abandon UI targets the continuation in that case.
--- Structurally enforced by the `continued_in_conv_id = absent` clauses
--- on ConfirmAbandon and MarkAsMerged. This invariant names the contract
--- for auditability: any user-triggered terminal action on a conversation
--- leaves that conversation with `continued_in_conv_id = absent` at the
--- time of the transition. A context-exhausted parent that has been
--- continued is operated on via the continuation, not the parent — both
--- abandon and mark-as-merged follow the same rule.
-invariant TerminalActionRequiresNoContinuation {
+-- REQ-BED-031 / unified Close: a context-exhausted parent with a continuation
+-- cannot be the direct destructive-retirement target. Close acts on the latest
+-- live owner row, so any row receiving the close request has no successor.
+invariant CloseActionTargetsLatestRow {
     for c in Conversations:
-        UserConfirmsAbandon(c) implies c.continued_in_conv_id = absent
-    for c in Conversations:
-        UserMarksAsMerged(c) implies c.continued_in_conv_id = absent
+        UserRequestsCloseConversation(c) implies c.continued_in_conv_id = absent
 }
 
 invariant ApprovedTaskPlacementsAreMutuallyExclusive {
@@ -1220,8 +1212,7 @@ surface ProjectManagement {
         worktree.task_file.status when conversation.mode = work and exists worktree.task_file
 
     provides:
-        UserMarksAsMerged(conversation)
-        UserConfirmsAbandon(conversation)
+        UserRequestsCloseConversation(conversation)
 
     @guarantee NonFatalBookkeeping
         -- Task file status updates are best-effort. If they fail,
