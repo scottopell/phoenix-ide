@@ -11458,8 +11458,20 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("delete");
 
         assert!(
-            state.runtime.bash_handles().remove(&scope).await.is_none(),
-            "bash registry entry must be removed by cascade"
+            state
+                .runtime
+                .bash_handles()
+                .owner_handles(&scope)
+                .await
+                .is_empty(),
+            "delete cascade must leave no owned bash handles"
+        );
+        assert!(
+            matches!(
+                state.runtime.bash_handles().reserve_spawn(&scope).await,
+                Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+            ),
+            "delete cascade must preserve the teardown fence"
         );
         assert!(state.db.get_conversation("c-2").await.is_err());
     }
