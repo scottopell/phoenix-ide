@@ -124,6 +124,24 @@ entity ProductConversation {
     transcript_rows: Conversation with product_conversation = this
 }
 
+value TranscriptBoundary {
+    predecessor: Conversation
+    successor: Conversation
+    summary: String
+}
+
+extend entity ProductConversation {
+    -- Navigation/list identity is the durable root transcript row. The root is the
+    -- unique row in transcript_rows that is not the successor of another row in the
+    -- same aggregate. Latest-row authority remains derived from continuation topology.
+    transcript_root: Conversation
+    latest_activity_row: Conversation
+    transcript_boundaries: List<TranscriptBoundary>
+
+    route_target: transcript_root
+    live_target: latest_activity_row
+}
+
 entity CloseObligation {
     product_conversation: ProductConversation
     phase: ClosePhase
@@ -303,6 +321,7 @@ variant Parent : Conversation {
     recovery_message: String when parent_status = awaiting_recovery
     continuation_summary: String when parent_status = context_exhausted
     successor: Conversation when parent_status = handed_off
+    continuation_boundary_summary: String when parent_status = handed_off
 
     open_row_condition: parent_status in { context_exhausted, handed_off }
     is_latest_row: continued_in_conv_id = absent
@@ -1183,6 +1202,89 @@ rule UserStartsContinuationConversation {
 }
 }
 
+rule ContinuationHandoffBecomesBoundary {
+    when: UserStartsContinuationConversation(conversation, new_conv)
+    requires: conversation.parent_status = context_exhausted
+    requires: conversation.continued_in_conv_id = absent
+    requires: conversation.product_lifecycle = open
+    ensures: conversation.parent_status = handed_off
+    ensures: conversation.continuation_boundary_summary = conversation.continuation_summary
+    ensures: conversation.product_conversation.transcript_boundaries =
+        append_boundary(
+            conversation.product_conversation.transcript_boundaries,
+            predecessor: conversation,
+            successor: new_conv,
+            summary: conversation.continuation_summary
+        )
+
+    @guidance
+        -- The exact persisted continuation summary that initialized the successor
+        -- becomes the one visible boundary at the predecessor/successor join. It is
+        -- not duplicated as ordinary transcript messages on either side.
+}
+
+rule ProductConversationRouteResolvesLegacyMemberLinks {
+    when: ProductConversationRouteRequested(target_row)
+    ensures: ProductConversationRouteResolved(
+        product_conversation: target_row.product_conversation,
+        route_target: target_row.product_conversation.transcript_root,
+        anchor_row: target_row,
+        live_target: target_row.product_conversation.live_target
+    )
+
+    @guidance
+        -- Open, History, search, provenance, and legacy member links all resolve to
+        -- the same stable product-conversation route keyed by the durable root.
+        -- Member identity survives only as an exact anchor target inside that page;
+        -- absent an explicit member/message anchor, the latest row is the default
+        -- live target derived from topology.
+}
+
+rule ProductConversationTranscriptProjectsChronologically {
+    when: ProductConversationProjectionRequested(product_conversation)
+    ensures: TranscriptRowsProjectedChronologically(product_conversation)
+    ensures: ContinuationBoundariesProjectedBetweenAdjacentRows(product_conversation)
+    ensures: PersistedMessagesRemainTranscriptAuthority(product_conversation)
+
+    @guidance
+        -- Projection walks transcript_rows from transcript_root through
+        -- continued_in_conv_id to the latest row, preserving message chronology and
+        -- row/message identity across reload, reconnect, pagination, and
+        -- virtualization. Boundaries render exactly once between adjacent rows using
+        -- transcript_boundaries; earlier full transcripts are not injected into the
+        -- successor and boundary summaries are not duplicated as ordinary messages.
+}
+
+rule ProductConversationHistoryProjectionIsReadOnly {
+    when: ProductConversationProjectionRequested(product_conversation)
+    requires: product_conversation.lifecycle = history
+    ensures: TranscriptProjectionReadOnly(product_conversation)
+    ensures: OrdinaryInputHidden(product_conversation)
+
+    @guidance
+        -- History is the same unified transcript surface projected from the same
+        -- aggregate; it is read-only and exposes no ordinary message input.
+}
+
+rule ProductConversationOpenProjectionKeepsHandedOffRowsInsideOpen {
+    when: ProductConversationProjectionRequested(product_conversation)
+    requires: product_conversation.lifecycle = open
+    requires: exists Parent{product_conversation: product_conversation, parent_status: handed_off}
+    ensures: HandedOffRowsProjectedInsideOpenAggregate(product_conversation)
+
+    @guidance
+        -- A handed_off predecessor is a read-only transcript segment within the live
+        -- Open aggregate while the latest successor remains Open. It is not projected
+        -- as a History conversation.
+}
+
+rule ProductConversationListProjectsOncePerRoot {
+    when: ProductConversationListProjectionRequested(product_conversation)
+    ensures: ProductConversationListedOnce(product_conversation)
+    ensures: ProductConversationListUsesRootTitle(product_conversation)
+    ensures: ProductConversationListOrdersByLatestActivity(product_conversation)
+}
+
 -- ===========================================================
 -- PARENT 8. TERMINAL (REQ-BED-029)
 -- ===========================================================
@@ -1680,6 +1782,37 @@ invariant LatestRowDerivedFromTopology {
         c.is_latest_row = (c.continued_in_conv_id = absent)
 }
 
+invariant ProductConversationHasSingleRootRow {
+    for pc in ProductConversation:
+        count(Conversation{product_conversation: pc} where not exists Conversation{product_conversation: pc, continued_in_conv_id: this}) = 1
+}
+
+invariant ProductConversationRouteUsesDurableRoot {
+    for pc in ProductConversation:
+        pc.route_target = pc.transcript_root
+}
+
+invariant ProductConversationLiveTargetIsTopologyLatest {
+    for pc in ProductConversation:
+        pc.live_target.product_conversation = pc
+            and pc.live_target.continued_in_conv_id = absent
+}
+
+invariant ContinuationBoundaryMatchesExactPersistedSummary {
+    for pc in ProductConversation:
+        for boundary in pc.transcript_boundaries:
+            boundary.predecessor.product_conversation = pc
+            and boundary.successor.product_conversation = pc
+            and boundary.predecessor.continued_in_conv_id = boundary.successor
+            and boundary.predecessor.parent_status = handed_off
+            and boundary.predecessor.continuation_boundary_summary = boundary.summary
+}
+
+invariant AtMostOneBoundaryPerContinuationJoin {
+    for predecessor in Parent:
+        count(predecessor.product_conversation.transcript_boundaries where predecessor = this.predecessor) <= 1
+}
+
 -- REQ-BED-005a: Bounded cancellation liveness.
 -- cancelling_tool and cancelling_sub_agents are never livelocks: each has a
 -- deadline-driven exit to idle (CancellingToolDeadlineFires,
@@ -1720,6 +1853,9 @@ surface UserConversation {
         conversation.recovery_kind when conversation.parent_status = awaiting_recovery
         conversation.recovery_resume_target when conversation.parent_status = awaiting_recovery
         conversation.continuation_summary when conversation.parent_status = context_exhausted
+        conversation.continuation_boundary_summary when conversation.parent_status = handed_off
+        conversation.product_conversation.route_target
+        conversation.product_conversation.live_target
 
     provides:
         UserSendsMessage(conversation, text, images?)

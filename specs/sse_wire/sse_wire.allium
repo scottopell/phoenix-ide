@@ -149,6 +149,7 @@ value ConversationMetadataUpdate {
     -- task_title: opaque
 }
 
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -160,6 +161,19 @@ value ConversationMetadataUpdate {
 entity PersistedMessage {
     conversation_id: String
     message_id: String
+    sequence_id: Integer
+}
+
+entity ProjectedTranscriptRow {
+    root_conversation_id: String
+    member_conversation_id: String
+    sequence_id: Integer
+}
+
+entity ProjectedContinuationBoundary {
+    root_conversation_id: String
+    predecessor_conversation_id: String
+    successor_conversation_id: String
     sequence_id: Integer
 }
 
@@ -275,6 +289,24 @@ config {
 -- conversation metadata, etc.) AND the current ReplayRing contents
 -- so that a reconnect during an in-flight turn can resume the UI's
 -- mid-stream view rather than blanking out until the next checkpoint.
+rule RootConversationStreamOpened {
+    when: ClientSubscribes(root_conversation_id, snapshot)
+
+    requires: SnapshotIsForRootConversationAggregate(snapshot, root_conversation_id)
+    requires: SnapshotUsesPersistedMessagesAsTranscriptAuthority(snapshot, root_conversation_id)
+    requires: SnapshotProjectsTranscriptRowsChronologically(snapshot, root_conversation_id)
+    requires: SnapshotProjectsContinuationBoundariesExactlyOnce(snapshot, root_conversation_id)
+    requires: SnapshotDerivesDefaultLiveTargetFromTopology(snapshot, root_conversation_id)
+
+    ensures: RootConversationInitDelivered(root_conversation_id, snapshot)
+
+    @guidance
+        -- The stable SSE/read route is keyed by the durable root product-conversation
+        -- identity. Init/replay projects the entire root-to-latest transcript from
+        -- persisted rows in chronological order, including exact continuation
+        -- boundaries, rather than letting the client synthesize transcript authority.
+}
+
 rule StreamOpened {
     when: ClientSubscribes(conversation_id, snapshot)
 
@@ -401,6 +433,22 @@ rule MessageCommittedToDb {
 -- (the next reconnect's init reads it from the DB), so any prior
 -- ephemeral events between the previous anchor and this message are
 -- no longer needed for replay. See PersistedMessageClearsReplayRing.
+rule PersistedTranscriptMessageProjectsIntoRootStream {
+    when: msg: PersistedMessage.created
+
+    ensures: ProjectedTranscriptRow.created(
+        root_conversation_id: DurableRootOf(msg.conversation_id),
+        member_conversation_id: msg.conversation_id,
+        sequence_id: msg.sequence_id
+    )
+
+    @guidance
+        -- Persisted messages remain the only transcript content authority. The wire
+        -- projects every member row into the root conversation stream in the same
+        -- chronological sequence the durable rows committed; reconnect/replay never
+        -- invents client-owned transcript rows.
+}
+
 rule MessageBroadcast {
     when: msg: PersistedMessage.created
 
@@ -700,6 +748,44 @@ rule ConversationBecameTerminalBroadcast {
 
 -- Partial conversation metadata changes are broadcast as conversation_update.
 -- The client merges the payload shallowly onto its local Conversation copy.
+rule ContinuationBoundaryBroadcast {
+    when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, seq)
+
+    requires: seq > 0
+
+    ensures: ProjectedContinuationBoundary.created(
+        root_conversation_id: root_conversation_id,
+        predecessor_conversation_id: predecessor_conversation_id,
+        successor_conversation_id: successor_conversation_id,
+        sequence_id: seq
+    )
+    ensures:
+        for stream in SseStreams where conversation_id = root_conversation_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+
+    @guidance
+        -- Each context continuation emits exactly one expandable boundary sourced
+        -- from the exact persisted continuation summary that initialized the
+        -- successor. The boundary is its own projection event, not an ordinary
+        -- message clone on either transcript side.
+}
+
+rule AggregateLifecycleProjectionBroadcast {
+    when: ProductConversationLifecycleProjected(root_conversation_id, lifecycle, seq)
+
+    requires: seq > 0
+
+    ensures:
+        for stream in SseStreams where conversation_id = root_conversation_id and status = open and init_sent:
+            stream.last_delivered_seq = seq
+
+    @guidance
+        -- Open/History is projected from the singular product-conversation aggregate.
+        -- A handed-off predecessor inside an Open aggregate does not produce a
+        -- History projection; the whole aggregate lifecycle appears atomically from
+        -- the UI perspective.
+}
+
 rule ConversationUpdateBroadcast {
     when: ConversationMetadataChanged(conv_id, update, seq)
 
@@ -852,6 +938,24 @@ invariant InitSnapshotMirrorsRing {
         for ring in ReplayRings:
             ring.conversation_id = stream.conversation_id
                 implies stream.init_snapshot.pending_anchor_sequence_id = ring.anchor_sequence_id
+}
+
+invariant RootConversationInitUsesDurableAggregateProjection {
+    for stream in SseStreams:
+        SnapshotIsForRootConversationAggregate(stream.init_snapshot, stream.conversation_id)
+            and SnapshotUsesPersistedMessagesAsTranscriptAuthority(stream.init_snapshot, stream.conversation_id)
+            and SnapshotProjectsTranscriptRowsChronologically(stream.init_snapshot, stream.conversation_id)
+            and SnapshotProjectsContinuationBoundariesExactlyOnce(stream.init_snapshot, stream.conversation_id)
+}
+
+invariant TranscriptProjectionPreservesMemberIdentity {
+    for row in ProjectedTranscriptRows:
+        row.root_conversation_id = DurableRootOf(row.member_conversation_id)
+}
+
+invariant ContinuationBoundaryProjectionIsUniquePerJoin {
+    for boundary in ProjectedContinuationBoundaries:
+        count(ProjectedContinuationBoundary{root_conversation_id: boundary.root_conversation_id, predecessor_conversation_id: boundary.predecessor_conversation_id, successor_conversation_id: boundary.successor_conversation_id}) = 1
 }
 
 -- Ring entries are in strictly increasing sequence_id order. Not
