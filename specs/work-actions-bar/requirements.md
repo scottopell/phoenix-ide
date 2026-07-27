@@ -39,7 +39,8 @@ THE SYSTEM SHALL render the work actions bar.
 
 WHEN the Open conversation is in `context_exhausted`
 THE SYSTEM SHALL NOT render the work actions bar
-AND SHALL reserve the focused handoff surface for continuation actions defined by bedrock REQ-BED-021.
+AND SHALL reserve the focused handoff surface for continuation actions defined by bedrock REQ-BED-021
+AND SHALL NOT treat hiding this Git-capability bar as suppression of the ordinary Close conversation lifecycle action that bedrock REQ-BED-031 keeps available on the latest exhausted row when no continuation exists.
 
 WHEN the conversation is in lifecycle `History`
 OR has no attached Git-backed `WorkScope`
@@ -49,9 +50,10 @@ THE SYSTEM SHALL NOT render the work actions bar.
 **Design:** `idle` is the ordinary resting state; `error` and
 `recoverable_continuation_failure` are stuck conditions where terminal resolution remains directly
 useful. Context exhaustion has a dedicated continuation surface; placing Close beside its handoff
-controls makes an unrelated terminal action appear to be part of continuation. The bar is a
-Git-capability surface, not a mode surface: it belongs to Open conversations whose attached
-`WorkScope` can inspect and retire Git-backed work.
+controls makes an unrelated terminal action appear to be part of continuation. Ordinary Close
+remains available through the bedrock-owned lifecycle surface when the latest exhausted row has no
+continuation; this focused Git-capability bar merely does not expose it. The bar belongs to Open
+conversations whose attached `WorkScope` can inspect and retire Git-backed work.
 
 ---
 

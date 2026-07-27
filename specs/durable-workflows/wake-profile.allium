@@ -12,6 +12,18 @@ use "../bedrock/bedrock.allium" as bedrock
 use "../bash/bash.allium" as bash
 use "../tmux-integration/tmux-integration.allium" as tmux
 
+surface BedrockCloseSettlementImport {
+    facing product_conversation: bedrock/ProductConversation
+
+    demonstrates:
+        bedrock_close_settlement_request(product_conversation)
+
+    @guarantee TypedImportBridge
+        -- This surface names the exact bedrock-produced close-settlement event
+        -- consumed by the wake profile without inventing a second local producer
+        -- or reshaping the root ProductConversation payload.
+}
+
 ------------------------------------------------------------
 -- Types
 ------------------------------------------------------------
@@ -140,10 +152,6 @@ value WakeAcceptancePayload {
     conversation_id: String
     snapshot_upper_bound: Integer
     items: List<WakeBatchItem>
-}
-
-value CloseSettlementRequest {
-    product_conversation: bedrock/ProductConversation
 }
 
 ------------------------------------------------------------
@@ -401,18 +409,8 @@ rule PendingWakeBlocksDestructiveLifecycleWithoutBusyState {
         -- fabricate runtime-busy state for an otherwise idle conversation.
 }
 
-rule BedrockCloseSettlementRequestBridgesIntoWakeProfile {
-    when: CloseSettlementRequest(product_conversation)
-    ensures: wake_close_settlement_request(product_conversation)
-
-    @guidance
-        -- Import bridge for the bedrock close-settlement lifecycle event. This
-        -- profile consumes the same root ProductConversation payload without
-        -- renaming or reshaping it.
-}
-
 rule CloseSettlementCancelsPendingWakeBindings {
-    when: CloseSettlementRequest(product_conversation)
+    when: bedrock_close_settlement_request(product_conversation)
     let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
     let manager = WakeLifecycleManager{identified_by: latest_parent}
     requires: pending_wake_count(latest_parent) > 0

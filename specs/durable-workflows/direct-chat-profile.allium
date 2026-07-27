@@ -13,6 +13,18 @@
 use "./durable-workflows.allium" as dwf
 use "../bedrock/bedrock.allium" as bedrock
 
+surface BedrockCloseSettlementImport {
+    facing product_conversation: bedrock/ProductConversation
+
+    demonstrates:
+        bedrock_close_settlement_request(product_conversation)
+
+    @guarantee TypedImportBridge
+        -- This surface names the exact bedrock-produced close-settlement event
+        -- consumed by the direct-chat profile without inventing a second local
+        -- producer or reshaping the root ProductConversation payload.
+}
+
 ------------------------------------------------------------
 -- Types
 ------------------------------------------------------------
@@ -85,10 +97,6 @@ value DirectChatOutcome {
     replay_queued_steering: AcceptedTurnRef? when kind = ReplayQueuedSteering
     conflicting_key_reuse: PreparedTurnFingerprint? when kind = ConflictingKeyReuse
     terminal_rejected: DirectChatRejectReason? when kind = TerminalRejected
-}
-
-value CloseSettlementRequest {
-    product_conversation: bedrock/ProductConversation
 }
 
 ------------------------------------------------------------
@@ -368,18 +376,8 @@ rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
     ensures: acceptance.accepted_turn = acceptance.accepted_turn
 }
 
-rule BedrockCloseSettlementRequestBridgesIntoDirectChatProfile {
-    when: CloseSettlementRequest(product_conversation)
-    ensures: direct_chat_close_settlement_request(product_conversation)
-
-    @guidance
-        -- Bridge contract: this local typed trigger is a direct import bridge for
-        -- bedrock/CloseSettlementRequested(product_conversation), preserving the
-        -- exact root ProductConversation payload without renaming or reshaping it.
-}
-
 rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
-    when: CloseSettlementRequest(product_conversation)
+    when: bedrock_close_settlement_request(product_conversation)
     let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
     let acceptance = latest_row_direct_turn_acceptance(latest_parent)
     requires: acceptance != null
