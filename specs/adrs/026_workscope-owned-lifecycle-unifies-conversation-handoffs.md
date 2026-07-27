@@ -35,13 +35,15 @@ The **ProductConversation** aggregate is the durable user-facing root, identifie
 
 Durable **`Conversation` rows** remain transcript and execution segments. Context continuation creates a new row in the **same** product conversation and keeps the same attached `WorkScope`; `continued_in_conv_id` is the sole linear topology for predecessor/successor order and latest-row resolution. Phoenix does not add a second latest/root authority or describe context continuation as new product lifecycle creation, and it avoids framing transcript rows as owning or transferring the `WorkScope` attachment.
 
-Attached **`WorkScope`** values own resources: worktrees, bash/process resources, tmux, browser state, and other work-affine resources. Conversations, execution rows, and sub-agents may have a `WorkScope` attached, but those attachments do not themselves own cleanup. Phoenix therefore does not assert a global one-to-one rule between product conversations and `WorkScope`s beyond the specific contracts the requirements already state.
+Attached **`WorkScope`** values own resources: worktrees, bash/process resources, tmux, browser state, PTY/terminal state, and other work-affine resources. Conversations, execution rows, and sub-agents may have a `WorkScope` attached, but those attachments do not themselves own cleanup. Phoenix therefore does not assert a global one-to-one rule between product conversations and `WorkScope`s beyond the specific contracts the requirements already state.
 
 **Git-backed** and **chat-only** remain environment-intent vocabulary. Git-backed conversations normally attach a `WorkScope`; chat-only conversations do not own Git-backed lifecycle. Whether a chat-only conversation may also carry some non-Git `WorkScope` attachment is intentionally left undecided here; this ADR does not need that decision to separate lifecycle from resource ownership.
 
 Approved-task **Start in new conversation** creates a separate ProductConversation with a fresh `WorkScope` and worktree because that path is Git-backed. **Follow-up** also creates a separate ProductConversation with a fresh environment appropriate to its intent plus a typed source relation: Git-backed follow-up gets a fresh `WorkScope` and worktree, while chat-only follow-up does not fabricate a Git `WorkScope`. They are not continuations. **Continue here** is only a checkpoint inside the same product conversation and same attached `WorkScope`.
 
 Source relation remains a distinct fact from continuation topology, lifecycle ownership, and resource attachment.
+
+Close retirement inspects worktree-loss risk only when no attached scope in the product aggregate owns a Git-backed worktree; mixed attachments do not waive inspection. Retirement then proceeds per owned resource, recording exact-attempt evidence as each resource is retired or found absent before the product conversation may enter History. Same-aggregate continuation rows and subordinate execution conversations do not veto retirement of that attached `WorkScope`; preservation applies only when a distinct still-Open ProductConversation shares the same scope, or when identity conflict prevents Phoenix from proving whether such a distinct aggregate exists.
 
 Branches and pull requests are **observed**, never lifecycle-owned. Phoenix may observe branch and PR facts through `WorkScope`-keyed evidence and may guide the user with those facts, but conversation lifecycle does not own, mutate, or derive authority from branch or PR state.
 
@@ -52,6 +54,7 @@ Branches and pull requests are **observed**, never lifecycle-owned. Phoenix may 
 - **Positive:** The model preserves ADR-008's branch/PR observation boundary: lifecycle can guide from repository facts without mutating or owning them.
 - **Negative:** Consumers must distinguish product vocabulary from implementation vocabulary. A read-only predecessor row inside an Open product conversation is not History, and an attached `WorkScope` is not itself the lifecycle root.
 - **Negative:** Some reads must derive latest execution from `continued_in_conv_id` instead of relying on duplicated latest/root tables or cached row ownership fields.
+- **Negative:** Consumers must resolve attached scope from the ProductConversation while resolving live execution state from only the latest execution row; inventing a row owner for `WorkScope` would collapse those distinct authorities again.
 - **Neutral:** This ADR leaves open whether some chat-only conversations may carry non-Git `WorkScope` attachments, because that question does not change the accepted ownership split.
 
 ## References

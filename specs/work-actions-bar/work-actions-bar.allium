@@ -309,7 +309,7 @@ entity WorkActionsBar {
 --       FINISH-primary dispositions:
 --         PR merged           -> clean_up
 --         PR closed unmerged  -> abandon
---         PR open/draft       -> abandon   (stuck only: merge on GitHub or abandon)
+--         PR open/draft       -> abandon   (stuck only: resolve on GitHub stays primary; Close remains available only as a secondary FINISH action)
 --         no PR (refresh ok)  -> clean_up
 --         gh unavailable      -> clean_up
 --       Returns clean_up for stuck-with-no-PR and stuck-with-gh-unavailable.
@@ -446,7 +446,7 @@ rule DispositionAddressFeedback {
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = address_feedback
     ensures: bar.presentation.resolve_zone.secondary = address_secondary_for(bar.inputs.pr_status)
-    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_clean_up = true
     ensures: bar.presentation.finish_zone.show_abandon = true
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = null
@@ -470,7 +470,7 @@ rule DispositionMergeReady {
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = merge_link
     ensures: bar.presentation.resolve_zone.secondary = null
-    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_clean_up = true
     ensures: bar.presentation.finish_zone.show_abandon = true
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = null
@@ -494,7 +494,7 @@ rule DispositionPrOpenOther {
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = open_pr_link
     ensures: bar.presentation.resolve_zone.secondary = null
-    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_clean_up = true
     ensures: bar.presentation.finish_zone.show_abandon = true
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = null

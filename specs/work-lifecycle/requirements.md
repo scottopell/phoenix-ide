@@ -82,10 +82,11 @@ WHEN the workspace changes after inspection and before destructive retirement be
 THE SYSTEM SHALL invalidate the outstanding confirmation
 AND SHALL require reinspection before retirement may proceed
 
-WHEN a product conversation has no attached Git-backed `WorkScope`
+WHEN a product conversation has no attached `WorkScope` that owns a Git-backed worktree
 THE SYSTEM SHALL skip worktree-loss inspection
 AND SHALL emit the no-confirmation inspection outcome for that exact Close attempt
 AND SHALL NOT require a discard confirmation that implies worktree-owned loss
+AND SHALL NOT let the presence of other attached non-worktree scopes bypass inspection for any simultaneously attached worktree-owning scope
 
 **Rationale:** The confirmation is only trustworthy for the exact inspected workspace. A changed workspace must not inherit stale approval to discard different state.
 
@@ -94,7 +95,7 @@ AND SHALL NOT require a discard confirmation that implies worktree-owned loss
 ### REQ-WL-002b: Retirement Retires Owned Resources Stepwise, Idempotently, and Without Automatic Recovery Artifacts
 
 WHEN bedrock requests resource retirement for an attached Git-backed `WorkScope`
-THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources, including bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that same WorkScope
+THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources, including the worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that same WorkScope
 
 THE SYSTEM SHALL treat the attached `WorkScope` as the owner of the retireable resources
 AND SHALL derive cleanup authority only from the root product conversation's committed Close retirement operation targeting that attached `WorkScope`
@@ -105,20 +106,28 @@ AND SHALL NOT let those subordinate participants independently own, veto, or del
 THE SYSTEM SHALL distinguish those same-aggregate participants from a genuinely separate open product conversation that also resolves to the same `WorkScope`, or from unresolved conversation-identity evidence that prevents Phoenix from proving whether another open product aggregate exists
 AND SHALL block destructive teardown only for that distinct-open-aggregate or unresolved-identity-conflict case
 
-THE SYSTEM SHALL perform retirement as a stepwise idempotent operation that records enough completion or residual-error evidence to retry safely
+THE SYSTEM SHALL perform retirement as a stepwise idempotent operation that records per-owned-resource completion or residual-error evidence as each step is attempted so retries can safely continue from the exact prior state
 
-WHEN retirement succeeds
-THE SYSTEM SHALL emit success only after every owned resource has been retired
+WHEN retirement attempts one owned resource
+THE SYSTEM SHALL record typed evidence for that exact retirement attempt before any all-retired completion is emitted
+AND SHALL classify the attempted resource as one of: worktree, bash/process-group, tmux, PTY/terminal, browser, or equivalent live execution resource
+
+WHEN a retirement step succeeds for one owned resource
+THE SYSTEM SHALL record `RetiredResource` evidence for that resource bound to the exact retirement attempt and attached `WorkScope`
+AND SHALL treat a later retry that encounters the same resource already retired as an idempotent no-op rather than as a failure or a second completion
+
+WHEN retirement succeeds overall
+THE SYSTEM SHALL emit success only after every owned resource has either produced `RetiredResource` evidence for that exact attempt or been accepted as an idempotent already-retired no-op for that exact attempt
 
 WHEN retirement cannot retire every owned resource
 THE SYSTEM SHALL report typed residual cleanup state and repair information rather than silently succeeding
+AND SHALL bind every residual cleanup item to the exact retirement attempt and attached `WorkScope`
+AND SHALL preserve the previously recorded per-resource retirement evidence so the remaining residual set is explicit
 
 WHEN the worktree is already absent
 THE SYSTEM SHALL bind that absence evidence to the exact retirement attempt and attached `WorkScope`
 AND SHALL accept the absence only when retained identity and evidence show that the same requested retirement already removed it or is adopting that exact absence
-
-WHEN cleanup cannot retire every owned resource
-THE SYSTEM SHALL bind every residual cleanup item to the exact retirement attempt and attached `WorkScope`
+AND SHALL otherwise report typed residual evidence rather than silently treating the absence as success
 
 WHEN the attached `WorkScope` also owns attachments or other work-affine retained resources that are shared across transcript rows of the same open product conversation
 THE SYSTEM SHALL retire or preserve those resources according to that same WorkScope ownership boundary rather than according to individual transcript-row ownership

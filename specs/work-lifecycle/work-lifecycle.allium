@@ -131,6 +131,7 @@ external entity RetirementLossCategoryRow {
 }
 
 external entity RetiredResource {
+    attempt: RetirementAttempt
     product_conversation: bedrock/ProductConversation
     scope: WorkScope
     kind: RetiredResourceKind
@@ -157,7 +158,6 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
     when: RetirementInspectionRequested(product_conversation)
     requires:
         not exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
-        or exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: false}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         inspection_generation: "no-worktree",
@@ -165,8 +165,9 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
     )
 
     @guidance
-        -- Chat-only and other non-Git-backed scopes own no disposable worktree,
-        -- so there is no worktree-loss inventory and no discard confirmation.
+        -- Skip inspection only when NO attached scope owns a Git-backed worktree.
+        -- The presence of other attached non-worktree scopes does not bypass
+        -- inspection for a mixed-attachment aggregate that still owns a worktree.
 }
 
 rule GitBackedInspectionWithoutLossRequestsRetirement {
@@ -256,6 +257,29 @@ rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
         -- whether such a distinct aggregate exists because identity evidence conflicts.
 }
 
+rule RetirementStepSuccessRecordsTypedEvidence {
+    when: ResourceRetirementRequested(product_conversation)
+    requires: exists RetiredResource{attempt: RetirementAttempt, product_conversation: product_conversation, scope: AttachedWorkScope.scope, kind: RetiredResourceKind}
+    ensures: ResourceRetirementProgressRecorded(product_conversation)
+
+    @guidance
+        -- Each successful step records typed RetiredResource evidence for the exact
+        -- RetirementAttempt BEFORE all-owned-resource completion is emitted. The
+        -- kind enumerates worktree, bash_process_group, tmux_server, pty_session,
+        -- browser_session, or equivalent_live_resource.
+}
+
+rule RetirementAlreadyRetiredIsIdempotentNoOp {
+    when: ResourceRetirementRequested(product_conversation)
+    requires: exists RetiredResource{attempt: RetirementAttempt, product_conversation: product_conversation, scope: AttachedWorkScope.scope, kind: RetiredResourceKind}
+    requires: exact_attempt_retries_same_resource(product_conversation)
+    ensures: ResourceRetirementProgressRecorded(product_conversation)
+
+    @guidance
+        -- A retry that encounters the same exact attempt/resource already retired is
+        -- a no-op adoption of prior evidence, not a second completion and not a failure.
+}
+
 rule ResourceRetirementFailureProducesResidualRepairState {
     when: ResourceRetirementRequested(product_conversation)
     requires: exists RetirementResidualResource{attempt: RetirementAttempt, product_conversation: product_conversation}
@@ -263,7 +287,9 @@ rule ResourceRetirementFailureProducesResidualRepairState {
 
     @guidance
         -- Failure is typed and residual: report the exact remaining resource and
-        -- repair information rather than silently succeeding.
+        -- repair information rather than silently succeeding. Residual rows are bound
+        -- to the same exact RetirementAttempt as any earlier RetiredResource evidence,
+        -- so partial completion remains visible across retries.
 }
 
 rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
@@ -277,8 +303,23 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     @guidance
         -- An already-absent worktree is accepted only when retained identity and
         -- evidence show this retirement is adopting that exact absence rather than
-        -- guessing over a missing path.
+        -- guessing over a missing path. Without that exact-attempt absence evidence,
+        -- report typed residual state instead of silently treating absence as success.
 }
+
+rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
+    when: ResourceRetirementRequested(product_conversation)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: worktree_already_absent(product_conversation)
+    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt, product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    ensures: ResourceRetirementProgressRecorded(product_conversation)
+
+    @guidance
+        -- Exact-attempt absence evidence lets retirement adopt an already-absent
+        -- worktree idempotently without synthesizing a new success shape.
+}
+
 
 rule PrStatusObservedAsAdvisoryCloseGuidance {
     when: PrStatusQueried(product_conversation)

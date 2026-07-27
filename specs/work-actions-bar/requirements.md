@@ -152,9 +152,9 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
 | 2 | phase ∈ {`error`, `recoverable_continuation_failure`} | `stuck` | **Close conversation** (FINISH) when close is legal | RESOLVE suppressed; review context may explain why recovery failed |
-| 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | Close suppressed; `Merge on GitHub #N ↗` secondary when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
-| 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | Close suppressed |
-| 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Close suppressed |
+| 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | `Close conversation` remains available as a secondary FINISH action; `Merge on GitHub #N ↗` secondary link when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
+| 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | `Close conversation` remains available as a secondary FINISH action |
+| 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | `Close conversation` remains available as a secondary FINISH action |
 | 6 | idle, PR merged | `ready_to_close_after_merge` | **Close conversation** (FINISH) | — |
 | 7 | idle, PR closed unmerged | `ready_to_close_closed_pr` | **Close conversation** (FINISH) | note explains PR closed without merge |
 | 8a | idle, no PR found, refresh ≠ unavailable, work-change state = clean | `no_pr_clean` | **Close conversation** (FINISH) | — |
@@ -180,11 +180,11 @@ FINISH rows), total over PR state:
 |---|---|---|
 | merged | `Close conversation` | — |
 | closed unmerged | `Close conversation` | "PR #N closed without merge — close when you're done with this thread of work." |
-| open / draft | none | "PR #N still open — resolve on GitHub or review the diff before closing." |
+| open / draft / failing / pending | `Close conversation` available as a secondary FINISH action only | "PR #N still open — resolve on GitHub or review the diff before closing." |
 | no PR found (refresh ok) | `Close conversation` | — |
 | gh unavailable | `Close conversation` | "GitHub status unavailable — close only if you're satisfied from local review." |
 
-Rows 3–5 together cover **every** idle open-or-draft PR. Address feedback is the primary on
+Rows 3–5 together cover **every** idle open-or-draft PR. In all of those open/draft/failing/pending PR states, `Close conversation` remains present as a visually secondary FINISH action while PR guidance stays primary in the RESOLVE zone. Address feedback is the primary on
 every reachable open PR — not gated on failing checks, refresh availability, or a prior
 feedback-freshness signal — because review comments may need addressing whether checks pass or
 fail and whether or not a freshness baseline has yet been seeded; the freshness and coverage

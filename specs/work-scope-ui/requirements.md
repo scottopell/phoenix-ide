@@ -269,20 +269,22 @@ conversation→scope resolution the browser lifecycle bridge already performs
 ### REQ-WSUI-009: Unified Conversation Surface Resolves the Live Scope Once
 
 WHEN the unified conversation surface renders the work-scope panel for a
-conversation that spans continuation members
-THE SYSTEM SHALL resolve the one live `scope_key` from the latest execution row
-that currently owns the `WorkScope`
+ProductConversation that spans continuation members
+THE SYSTEM SHALL resolve the attached `WorkScope` from that ProductConversation
+AND SHALL derive live execution-state fields from only the latest execution row
+for that ProductConversation
 AND SHALL render one work-scope panel that shares the per-resource row
 vocabulary of the conversation page's section (REQ-WSUI-010)
-AND SHALL NOT aggregate per-member inventories.
+AND SHALL NOT aggregate per-member inventories
+AND SHALL NOT model any transcript row as the owner of the `WorkScope`.
 
 **Rationale:** A unified conversation can contain multiple durable transcript
-rows, but only one latest execution row owns the live `WorkScope`. Querying
-that one owner is complete and avoids inventing a per-member merge layer. The
-older continuation members remain visible transcript history; they are not
-independent runtime-scope surfaces. Resolving the live owner once keeps the
-work-scope panel aligned with the single-surface conversation model and avoids
-showing an empty or stale inventory from an earlier member.
+rows, but the ProductConversation carries the attached `WorkScope` while only
+the latest execution row carries the live execution state that can differ across
+continuations. Resolving scope from the ProductConversation and execution state
+from the latest row avoids inventing a row-owner model, keeps the panel aligned
+with the single-surface conversation model, and avoids showing an empty or
+stale inventory from an earlier member.
 
 ---
 
