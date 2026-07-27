@@ -2,54 +2,15 @@
 
 ## What This Spec Covers
 
-The work actions surface is rendered in Work and Branch conversations while the conversation is
-idle, errored, or context-exhausted. Desktop presents a persistent rich PR rail when multiple
-actionable PRs can represent the active selection, and otherwise presents the same derived verbs in
-a thin compact rail. Narrow mobile viewports preserve the transcript with a thin rail of actionable PRs that expands
-the selected PR's hero and supporting actions upward. Its purpose is first-time legibility: a user should know
-the next action immediately and be able to inspect every other available verb without losing the
-conversation as the primary work surface.
+The work actions bar describes the current finish/review/resolve action rail shown for legacy Work and Branch conversations, including PR-driven action emphasis, tooltip copy, and mobile/desktop presentation.
 
-This is a composition spec. It selects which verb is primary and which verbs are present; it
-re-derives none of its inputs. It owns:
+## Current Reality
 
-- **Visibility** — when the bar appears and when it is hidden.
-- **Responsive compact presentation** — REVIEW, RESOLVE, and FINISH semantics, the single-primary rule,
-  and the responsive active-PR rail with expandable action rows.
-- **`WorkDisposition` derivation** — the single derived state that selects the primary verb,
-  total over every open-PR and stuck-with-PR case.
-- **Verb labels and tooltip copy** — the text of each button, info-icon tooltip, and inline
-  note.
-- **Structural interaction principles** — no disabled buttons used as status displays; no
-  click-to-enable-then-click-again toggles.
-- **View Browser exclusion** — why the browser session affordance lives in the work scope,
-  surfaced through the viewer slot, not in this bar.
+This surface is implemented against the pre-unification product model. It still appears only for legacy Work/Branch contexts, still exposes legacy FINISH actions such as **Clean up** / **Abandon** semantics tied to current PR and branch state, and still composes around the shipped mark-merged / abandon flows rather than a unified Close conversation action. The bar therefore remains implemented current reality, but not current normative lifecycle design.
 
-It does **not** own:
-
-- **PR status, explicit active-PR selection, any compatibility primary-PR projection, the CI
-  check-state and feedback-freshness signals, or the auto-fix affordance** — the
-  `pr-association` spec (`PrStatusView`, `PrCheckState`, `PrFeedbackFreshness`,
-  `PrAutoFixAffordance`, `WorkScopePrStatusContract`, `WorkActionsPrAffordanceContract`).
-- **Terminal action git semantics** — worktree deletion, diff snapshot, confirmation gate,
-  mode-dependent branch disposition — the `work-lifecycle` spec (REQ-WL-001/002/003).
-- **Action legality** — when a terminal action may legally fire — bedrock's `TaskResolved`
-  rule (REQ-BED-029 terminal-on-resolution; REQ-BED-031 context-exhausted disposability).
-- **Diff and browser viewer mechanics** — the `viewer_slot` spec (REQ-VS-003 diff; REQ-VS-008
-  browser), and the browser session inventory in `work-scope-ui` (REQ-WSUI-004).
-
-## User Need
-
-A developer who has finished (or got stuck on) a Work or Branch conversation needs to know, at
-a glance, what to do next. Stable PR identity and status are shown in the StateBar (the PR badge /
-selector), while the work actions bar carries only action-facing context such as freshness or
-coverage around Address feedback. The work actions bar is pure verbs: each button does one fixed
-thing when clicked, present only when that thing is safe to do. No button is disabled and used as
-a status display; no button requires a second click to arm.
+Anchors for that current reality include `ui/src/components/WorkActions.tsx`, `ui/src/components/prRailAvailability.ts`, `ui/src/components/prReviewState.ts`, and `ui/src/hooks/useConversationPrStatus.ts`.
 
 ## Requirements Summary
-Current authority for work-action behavior is `requirements.md` plus the active-PR and close-lifecycle contracts it cites. The legacy `design.md` has been removed; rationale now lives either inline in the requirements or, for lifecycle/workscope ownership, in ADR-025.
-
 
 | ID | Summary |
 |----|---------|
@@ -66,39 +27,23 @@ Current authority for work-action behavior is `requirements.md` plus the active-
 | REQ-WAB-011 | Mobile rail shows actionable PR status/freshness and expands one active PR without parallel selection state |
 | REQ-WAB-012 | Desktop multi-PR rail shows rich PR context and sidebar-consistent review state, shares active selection authority, and preserves selector fallback |
 
-Increment 1 also depends on the `pr-association` migration from hidden singular-primary targeting
-to one explicit active PR. The work actions bar remains a composition surface: it does not infer
-among multiple associated PRs itself. Its job is to render whatever explicit active selection the
-PR-association layer provides, and to stay silent rather than silently retarget when selection is
-ambiguous.
-
 ## Implementation Status
 
-| ID | Status |
-|----|--------|
-| REQ-WAB-001 | Implemented |
-| REQ-WAB-002 | Implemented |
-| REQ-WAB-003 | Implemented |
-| REQ-WAB-004 | Implemented |
-| REQ-WAB-005 | Implemented |
-| REQ-WAB-006 | Implemented |
-| REQ-WAB-007 | Implemented |
-| REQ-WAB-008 | Implemented |
-| REQ-WAB-009 | Implemented |
-| REQ-WAB-010 | Implemented |
-| REQ-WAB-011 | Implemented |
-| REQ-WAB-012 | Implemented |
+| ID | Status | Notes |
+|----|--------|-------|
+| REQ-WAB-001 | Implemented (legacy current reality) | Still keyed to Work/Branch mode visibility |
+| REQ-WAB-002 | Implemented (legacy current reality) | Current responsive rail is shipped |
+| REQ-WAB-003 | Implemented (legacy current reality) | Current single-primary derivation is shipped |
+| REQ-WAB-004 | Implemented (legacy current reality) | `WorkDisposition` remains derived from current PR/work state |
+| REQ-WAB-005 | Implemented (legacy current reality) | Stuck-phase suppression is shipped |
+| REQ-WAB-006 | Implemented | Browser affordance remains outside this bar |
+| REQ-WAB-007 | Implemented (legacy current reality) | Tooltips still explain legacy Clean up / Abandon semantics |
+| REQ-WAB-008 | Implemented | No disabled-as-status behavior in shipped rail |
+| REQ-WAB-009 | Implemented | Continuation still suppresses legacy finish actions on predecessors |
+| REQ-WAB-010 | Implemented | GitHub link behavior remains shipped |
+| REQ-WAB-011 | Implemented | Mobile rail behavior is shipped |
+| REQ-WAB-012 | Implemented | Desktop multi-PR rail behavior is shipped |
 
-## Implementation Map
+## Reconciliation Note
 
-| Surface | Location |
-|---------|----------|
-| `WorkControlBar` component | `ui/src/components/WorkActions.tsx` |
-| Responsive active-PR rail styling | `ui/src/components/WorkActions.css` |
-| Shared rail availability derivation | `ui/src/components/prRailAvailability.ts` |
-| Shared sidebar/Work Actions review-state mapping | `ui/src/components/prReviewState.ts` |
-| Desktop multi-PR QA surface | `ui/src/fixtures/desktopMultiPrConversation/renderFixture.tsx` |
-| `WorkDisposition` derivation | `deriveWorkDisposition` in the same file |
-| Shared FINISH-primary selector | `finishPrimaryForDisposition` in the same file |
-| PR status polling | `ui/src/hooks/useConversationPrStatus.ts` |
-| PR feedback freshness label | `ui/src/components/prBadge.ts` (`prFeedbackFreshnessLabel`) |
+When the unified lifecycle lands, this spec's current implementation status will need to be revisited around visibility, primary verb selection, and the removal of Clean up / Abandon terminology. For now, the honest status is: implemented, but implemented against the legacy lifecycle surface.

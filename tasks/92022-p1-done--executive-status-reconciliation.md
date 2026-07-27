@@ -41,3 +41,38 @@ Append a completion note to this task body with these headings:
 - **Validation** — grep and spec-shape checks run
 - **Review corrections** — table/reference cleanups after review, or `None`
 - **Commit** — commit hash that landed the work
+
+
+## Completion evidence
+
+**Files changed**
+- `specs/bedrock/executive.md`
+- `specs/projects/executive.md`
+- `specs/work-lifecycle/executive.md`
+- `specs/chains/executive.md`
+- `specs/work-actions-bar/executive.md`
+- `specs/pr-association/executive.md`
+- `specs/durable-workflows/executive.md`
+- `specs/sse_wire/executive.md`
+- `specs/api/executive.md`
+- `specs/work-scope-ui/executive.md`
+- `specs/conversation-creation/executive.md`
+- `tasks/92022-p1-in-progress--executive-status-reconciliation.md`
+
+**Decisions captured**
+- Rewrote affected executives to report current implementation honestly instead of treating newly landed lifecycle requirements/Allium as already shipped.
+- Explicitly called out legacy current reality where code still has modes, archive/archived lists, abandon/mark-merged endpoints, chain page/routes, and Work/Branch action rails.
+- Preserved direct-chat durable-workflow foundations as partially landed rather than fully implemented.
+- Captured 92030 drift at the executive layer by aligning SSE status with `conversation_update`/`work_scope_update`, noting chain/legacy surfaces as current behavior, and removing stale references that implied deleted `design.md` remained authoritative.
+- Corrected `work-scope-ui` executive from stale “0 of 11 implemented” to the actually shipped panel/SSE/inventory surfaces.
+
+**Validation**
+- `python3 scripts/spec_shape_check.py` — attempted from the worktree; script is absent in this checkout, so I recorded the missing local helper instead of fabricating a pass
+- `rg -n 'design\.md is authority|design\.md.*authoritative|Open/History|mark-merged|abandon-task|/api/chains|WorkScopeUpdate|conversation_update|ConvMode|archived' specs/*/executive.md`
+- `git diff --check`
+
+**Review corrections**
+- `scripts/spec_shape_check.py` is referenced by sibling task evidence but is absent in this worktree checkout; no replacement helper was available locally, so only semantic grep plus `git diff --check` validation ran here.
+
+**Commit**
+- `15834c891` — `docs: reconcile lifecycle executive status`

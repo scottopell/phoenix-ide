@@ -2,9 +2,13 @@
 
 ## Requirements Summary
 
-Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model. Messages flow through well-defined states: idle, awaiting LLM (with retry tracking), executing tools serially, and handling errors. Tools execute one at a time in LLM-requested order to respect intent and prevent conflicts. Cancellation generates synthetic tool results to maintain message chain integrity required by LLM APIs. Error handling distinguishes retryable errors (network, rate limit) from non-retryable (auth), with automatic retry and UI-visible state. Sub-agents complete by calling a dedicated result submission tool. Each conversation has a fixed working directory set at creation. User messages with images are passed through to the LLM provider. Messages sent while agent is busy are rejected (user can cancel if needed). Conversations have an Explore or Work mode (see `specs/projects/`) stored alongside state; mode determines tool availability and is separate from state machine state.
+Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model: messages move through explicit idle, LLM, tool, cancellation, error, continuation, and approval states; tools execute serially; cancellation synthesizes tool results when needed to preserve transcript/API integrity; retryable versus non-retryable failures stay distinct; and committed transcript history survives restarts.
 
-The removed legacy `design.md` is no longer authoritative. Current behavior is split between `requirements.md` for timeless rules, `bedrock.allium` for precise lifecycle/state-machine behavior, and ADR-025 for lifecycle-versus-WorkScope ownership.
+Current normative authority is `requirements.md` for timeless rules, `bedrock.allium` for precise lifecycle/state-machine behavior, and ADR-025 for lifecycle-versus-WorkScope ownership.
+
+## Current Reality
+
+The implementation still reflects the pre-unification product model in several user-facing places. The durable conversation row continues to carry `ConvMode` (`Direct`, `Explore`, `Work`, `Branch`), task approval still parks in `AwaitingTaskApproval`, task resolution still drives legacy terminal actions (`/abandon-task`, `/mark-merged`), and archived versus non-archived remains the shipped lifecycle split. Continuation already uses `continued_in_conv_id` and transfers the live worktree/work-scope forward, but Phoenix has not yet cut over to one Open/History conversation surface.
 
 ## Technical Summary
 
@@ -40,11 +44,11 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-024:** Sub-Agent Context Exhaustion | ✅ Complete | Fail immediately, no continuation flow |
 | **REQ-BED-025:** Token-by-Token LLM Output | ✅ Complete | Task 582. Fire-and-forget `StreamToken` effects via SSE |
 | **REQ-BED-026:** Sub-Agent Timeout Enforcement | ✅ Complete | Task 578. Mandatory `timeout: Duration`, deadline in executor `select!` |
-| **REQ-BED-027:** Explore, Work, and Direct Conversation Modes | ✅ Complete | `ConvMode` enum + DB column (migration in `db.rs:130-138`); UI surfaces via `conv_mode_label`; replaces REQ-BED-014. `Direct` absorbed the former `Standalone` mode (see REQ-PROJ-018) |
-| **REQ-BED-028:** Task Approval State | ✅ Complete | `ConvState::AwaitingTaskApproval` (`state.rs:454,992`); `propose_task` interception; git ops in `effect.rs:148` / `executor.rs:2143`; UI overlay in `ui/src/components/TaskApprovalReader.tsx`; replaces REQ-BED-015 |
-| **REQ-BED-029:** Conversation Terminal State on Task Resolution | ✅ Complete | `ConvState::Terminal` transitions on complete/abandon (`runtime/executor.rs:2091,2121`); task resolution events in `state_machine/event.rs:139`; UI handles `phase.type === 'terminal'`; replaces REQ-BED-016 |
-| **REQ-BED-030:** Context Continuation Inherits Parent Environment | ✅ Complete | Task 24696. Worktree ownership transfers via `continued_in_conv_id` pointer; mode mapping W→W/B→B/E→E/D→D; idempotent `POST /api/conversations/:id/continue`. Obsoletes task 08678 |
-| **REQ-BED-031:** Exhausted Parent Post-Handoff Behavior | ✅ Complete | Task 24696. Auto-cleanup removed; `reconcile_worktrees` skips context-exhausted + continued rows; abandon/mark-as-merged gated on `continued_in_conv_id = NULL`; typed `continuation_id` on 409 response |
+| **REQ-BED-027:** Explore, Work, and Direct Conversation Modes | ✅ Complete (legacy current reality) | `ConvMode` is still persisted and surfaced (`crates/phoenix-db/src/lib.rs:8147-8255`, `ui/src/utils/conversationIdentity.ts`); this remains shipped compatibility behavior until the unified lifecycle migration removes mode-driven product semantics |
+| **REQ-BED-028:** Task Approval State | ✅ Complete (legacy current reality) | `ConvState::AwaitingTaskApproval` and `propose_task` parking are live in the reducer/runtime (`crates/phoenix-state-machine/src/transition.rs`, `ui/src/components/TaskApprovalReader.tsx`); approval-placement unification is not yet implemented |
+| **REQ-BED-029:** Conversation Terminal State on Task Resolution | ✅ Complete (legacy current reality) | Task resolution still reaches terminal cleanup through legacy abandon / mark-merged flows (`crates/phoenix-ide/src/api/lifecycle_handlers.rs`, `crates/phoenix-state-machine/src/transition.rs`) rather than the future Close→History cutover |
+| **REQ-BED-030:** Context Continuation Inherits Parent Environment | ✅ Complete | Continuation still reuses the attached environment via `continued_in_conv_id` / transferred work-scope ownership (`crates/phoenix-db/src/lib.rs:5316-5537`) |
+| **REQ-BED-031:** Exhausted Parent Post-Handoff Behavior | ✅ Complete | Parent cleanup is already suppressed once continuation exists; legacy abandon / mark-merged endpoints reject when `continued_in_conv_id` is set (`crates/phoenix-ide/src/api/lifecycle_handlers.rs:908-918`) |
 | **REQ-BED-032:** Conversation Hard-Delete Cascade | ✅ Complete | `ConversationHardDeleted` lifecycle event emitted from `runtime.rs:426,1198`; bash + tmux subscribers wired; `RejectHardDeleteWhileBusy` enforced (see `bedrock.allium:899-958`) |
 
 **Progress:** 29 of 32 complete (3 deprecated, not counted)
