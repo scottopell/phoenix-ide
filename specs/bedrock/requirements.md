@@ -636,12 +636,14 @@ AND read the referenced file and persist the assistant message and a synthetic t
 AND transition the conversation to AwaitingTaskApproval state (the blocking planning-to-approved-work checkpoint)
 
 WHEN the same `propose_task` call occurs while the conversation already has write capability
-  (an attached `WorkScope`, or chat-only execution inside a git repo)
+  via an attached `WorkScope` in a Git-backed environment
 THE SYSTEM SHALL instead treat it as a proposal for a separate derived conversation (REQ-PROJ-033/036):
   record the proposal as control-plane state and continue the conversation's own work
   WITHOUT parking — it does not enter AwaitingTaskApproval. The parking behavior of this
-  requirement is scoped to read-only planning authority; the write-capable derived-conversation review
-  (review, spawn, dismiss) is owned by REQ-PROJ-033/034/035.
+  requirement is scoped to read-only planning authority; an attached `WorkScope` can evidence
+  Git-backed environment intent, but chat-only execution in a git repository is not eligible.
+  The write-capable derived-conversation review (review, spawn, dismiss) is owned by
+  REQ-PROJ-033/034/035.
 
 THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a display copy
   of the title, priority, and body — all serializable; on approval the executor re-reads

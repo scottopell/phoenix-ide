@@ -69,6 +69,7 @@ Append a completion note to this task body with these headings:
 - Corrected source-relation direction to say the target conversation records the source.
 - Removed WorkScope authority wording that implied row ownership transfer during continuation.
 - Removed Direct/chat-only `propose_task` eligibility inside Git repositories.
+- Caught final review defect in `REQ-BED-028`: Git-backed eligibility now requires environment intent via attached `WorkScope`; cwd being git alone no longer makes chat-only execution eligible.
 
 ### Commit
-- `0bc2b2e0b` — `docs: finish workscope provenance requirements task`
+- `6b62bbb05` — `docs: tighten task proposal eligibility`
