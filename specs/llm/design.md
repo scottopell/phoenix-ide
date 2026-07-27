@@ -284,7 +284,7 @@ pub struct ModelSpec {
     pub id: String,
     pub api_name: String,
     pub backend: ModelBackend,
-    pub family: ModelFamily,
+    pub family: String,
     pub description: String,
     pub context_window: usize,
     pub max_output_tokens: u32,
@@ -308,14 +308,15 @@ Registration requires an auth route for the model backend: static API key, crede
 
 ### Model Discovery
 
-When a credential helper and compatible base URL are configured, Phoenix derives model-listing URLs by replacing the final path segment with `models`:
+When compatible exact endpoints are configured, Phoenix derives model-listing URLs by replacing the request endpoint with `models`; the standard `chat/completions` suffix is treated as one endpoint path:
 
-| Base URL | Discovery URL |
-|----------|---------------|
+| Exact endpoint | Discovery URL |
+|----------------|---------------|
 | `https://proxy.example/v1/messages` | `https://proxy.example/v1/models` |
 | `https://proxy.example/v1/responses` | `https://proxy.example/v1/models` |
+| `https://proxy.example/v1/chat/completions` | `https://proxy.example/v1/models` |
 
-Discovery is backend-scoped. Anthropic discovery results only validate `anthropic` models; OpenAI Responses discovery results only validate `openai_responses` models. Chat Completions models remain configuration-authoritative because they have no dedicated discovery bucket. If discovery returns no usable configured models, Phoenix falls back to the configured model list and logs a warning.
+Discovery is wire-backend-scoped. Anthropic, OpenAI Responses, and OpenAI Chat Completions results validate only models declared for the corresponding backend. If discovery returns no usable configured models for one backend, Phoenix falls back to the configured model list for that backend and logs a warning.
 
 ## Request Translation (REQ-LLM-004)
 
@@ -473,8 +474,14 @@ pub struct LlmConfig {
     /// Exact Anthropic Messages-compatible endpoint override.
     pub anthropic_base_url: Option<String>,
 
-    /// Exact OpenAI Responses-compatible endpoint override.
+    /// Legacy exact OpenAI endpoint override.
     pub openai_base_url: Option<String>,
+
+    /// Exact OpenAI Responses-compatible endpoint override.
+    pub openai_responses_base_url: Option<String>,
+
+    /// Exact OpenAI Chat Completions-compatible endpoint override.
+    pub openai_chat_completions_base_url: Option<String>,
 
     /// Default model ID
     pub default_model: Option<String>,
@@ -487,6 +494,8 @@ impl LlmConfig {
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
             anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
             openai_base_url: std::env::var("OPENAI_BASE_URL").ok(),
+            openai_responses_base_url: std::env::var("OPENAI_RESPONSES_BASE_URL").ok(),
+            openai_chat_completions_base_url: std::env::var("OPENAI_CHAT_COMPLETIONS_BASE_URL").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
         }
     }

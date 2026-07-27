@@ -2362,8 +2362,9 @@ pub async fn complete_chat(
         return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
     }
 
-    let chat_response: ChatCompletionsResponse = serde_json::from_str(&body).map_err(|e| {
-        LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
+    let chat_response: ChatCompletionsResponse = serde_json::from_str(&body).map_err(|error| {
+        tracing::debug!(error = %error, body_bytes = body.len(), "failed to parse chat completions response");
+        LlmError::invalid_response("Failed to parse Chat Completions response")
     })?;
 
     normalize_chat_response(chat_response, &spec.api_name)
@@ -2492,6 +2493,13 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
                     ordered_parts.push(ChatContentPart::Text { text: text.clone() });
                 }
                 super::types::ContentBlock::Image { source } => {
+                    if msg.role == MessageRole::Assistant {
+                        tracing::debug!(
+                            role,
+                            "dropping assistant image in chat completions translation — image_url content is user-role only"
+                        );
+                        continue;
+                    }
                     let ImageSource::Base64 { media_type, data } = source;
                     has_image = true;
                     ordered_parts.push(ChatContentPart::ImageUrl {
@@ -2630,11 +2638,6 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
     }
 }
 
-fn is_chat_reasoning_marker_content(text: &str) -> bool {
-    let trimmed = text.trim();
-    !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '<')
-}
-
 fn log_dropped_reasoning_content(model: &str, text: &str) {
     if !text.is_empty() {
         tracing::debug!(
@@ -2649,11 +2652,16 @@ fn normalize_chat_response(
     resp: ChatCompletionsResponse,
     model: &str,
 ) -> Result<LlmResponse, LlmError> {
-    let Some(choice) = resp.choices.into_iter().next() else {
+    if resp.choices.len() != 1 {
         return Err(LlmError::invalid_response(
-            "Chat completions returned no choices",
+            "Chat completions must return exactly one choice",
         ));
-    };
+    }
+    let choice = resp
+        .choices
+        .into_iter()
+        .next()
+        .expect("length checked above");
     match choice.finish_reason.as_deref() {
         Some("length") => {
             log_chat_completion_length(
@@ -2703,26 +2711,40 @@ fn chat_message_to_response(
     if let Some(reasoning) = message.reasoning_content {
         log_dropped_reasoning_content(model, &reasoning);
     }
-    if let Some(text) = message.content {
-        if !text.is_empty() && !is_chat_reasoning_marker_content(&text) {
-            content.push(ContentBlock::Text { text });
-        } else if is_chat_reasoning_marker_content(&text) {
-            tracing::debug!(
-                model,
-                bytes = text.len(),
-                "dropping chat completions marker content"
-            );
-        }
+    let visible_text = message.content.filter(|text| !text.is_empty());
+    let refusal = message.refusal.filter(|text| !text.is_empty());
+    if refusal.is_some() && !message.tool_calls.as_deref().unwrap_or_default().is_empty() {
+        return Err(LlmError::invalid_response(
+            "Chat completions refusal included tool calls",
+        ));
+    }
+    if visible_text.is_some() && refusal.is_some() {
+        return Err(LlmError::invalid_response(
+            "Chat completions returned both content and refusal text",
+        ));
+    }
+    if let Some(text) = visible_text.or(refusal) {
+        content.push(ContentBlock::Text { text });
     }
     for call in message.tool_calls.unwrap_or_default() {
-        let input = serde_json::from_str(&call.function.arguments).unwrap_or_else(|e| {
+        if call.r#type != "function" {
+            return Err(LlmError::invalid_response(
+                "Chat completions returned a non-function tool call",
+            ));
+        }
+        if call.id.is_empty() || call.function.name.is_empty() {
+            return Err(LlmError::invalid_response(
+                "Chat completions tool call omitted its id or function name",
+            ));
+        }
+        let input = serde_json::from_str(&call.function.arguments).map_err(|error| {
             tracing::warn!(
-                error = %e,
-                arguments = %call.function.arguments,
+                error = %error,
+                arguments_bytes = call.function.arguments.len(),
                 "failed to parse chat tool call arguments"
             );
-            serde_json::Value::Object(serde_json::Map::new())
-        });
+            LlmError::invalid_response("Chat completions returned malformed tool arguments")
+        })?;
         content.push(ContentBlock::ToolUse {
             id: call.id,
             name: call.function.name,
@@ -2738,6 +2760,11 @@ fn chat_message_to_response(
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
     let usage = usage.unwrap_or_default();
+    if usage.prompt_tokens_details.cached_tokens > usage.prompt_tokens {
+        return Err(LlmError::invalid_response(
+            "Chat completions cached prompt tokens exceed total prompt tokens",
+        ));
+    }
     let cached = u64::from(usage.prompt_tokens_details.cached_tokens);
     Ok(LlmResponse::non_streaming(
         content,
@@ -2751,8 +2778,16 @@ fn chat_message_to_response(
     ))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatVisibleKind {
+    Content,
+    Refusal,
+}
+
 struct ChatStreamAccumulator {
     content: String,
+    visible_kind: Option<ChatVisibleKind>,
+    choice_index: Option<usize>,
     tool_calls: Vec<ChatToolCallBuilder>,
     usage: Option<ChatUsage>,
     done: bool,
@@ -2760,11 +2795,21 @@ struct ChatStreamAccumulator {
     telemetry: StreamTelemetryRecorder,
 }
 
-fn chat_stream_error_code_as_string(code: Option<&serde_json::Value>) -> String {
+fn classify_chat_stream_error(code: Option<&serde_json::Value>, message: &str) -> LlmError {
     match code {
-        Some(serde_json::Value::String(value)) => value.clone(),
-        Some(value) => value.to_string(),
-        None => String::new(),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .and_then(|status| u16::try_from(status).ok())
+            .map_or_else(
+                || LlmError::server_error(message),
+                |status| LlmError::from_http_status(status, message),
+            ),
+        Some(serde_json::Value::String(value)) => value.parse::<u16>().map_or_else(
+            |_| classify_responses_error(value, message),
+            |status| LlmError::from_http_status(status, message),
+        ),
+        Some(value) => classify_responses_error(&value.to_string(), message),
+        None => classify_responses_error("", message),
     }
 }
 
@@ -2772,6 +2817,9 @@ fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmE
     if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(body) {
         let message = error_resp.error.message;
         let code = error_resp.error.code.as_deref().unwrap_or("");
+        if matches!(code, "server_is_overloaded" | "slow_down") {
+            return classify_responses_error(code, &message);
+        }
         return match status_code {
             401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
             429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
@@ -2787,6 +2835,8 @@ impl ChatStreamAccumulator {
     fn new(dispatch_at: Instant, request: &LlmRequest) -> Self {
         Self {
             content: String::new(),
+            visible_kind: None,
+            choice_index: None,
             tool_calls: Vec::new(),
             usage: None,
             done: false,
@@ -2801,6 +2851,7 @@ impl ChatStreamAccumulator {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_event(
         &mut self,
         data: &str,
@@ -2819,12 +2870,25 @@ impl ChatStreamAccumulator {
             let msg = err
                 .message
                 .unwrap_or_else(|| "gateway returned error chunk".to_string());
-            let code = chat_stream_error_code_as_string(err.code.as_ref());
-            return Err(classify_responses_error(&code, &msg));
+            return Err(classify_chat_stream_error(err.code.as_ref(), &msg));
         }
         self.usage = event.usage.or(self.usage.take());
         let reasoning_tokens = self.usage.as_ref().and_then(ChatUsage::reasoning_tokens);
+        if event.choices.len() > 1 {
+            return Err(LlmError::invalid_response(
+                "Chat completions stream returned multiple choices",
+            ));
+        }
         for choice in event.choices {
+            if self
+                .choice_index
+                .is_some_and(|existing| existing != choice.index)
+            {
+                return Err(LlmError::invalid_response(
+                    "Chat completions stream changed choice index",
+                ));
+            }
+            self.choice_index = Some(choice.index);
             if let Some(reasoning) = choice.delta.reasoning_content {
                 log_dropped_reasoning_content("<streaming-chat-completions>", &reasoning);
                 if !reasoning.is_empty() {
@@ -2855,33 +2919,80 @@ impl ChatStreamAccumulator {
                     _ => {}
                 }
             }
-            if let Some(delta) = choice.delta.content {
-                if !delta.is_empty() && !is_chat_reasoning_marker_content(&delta) {
-                    self.content.push_str(&delta);
-                    self.telemetry
-                        .record_generation_event_at(now, GenerationKind::Text);
-                    self.telemetry.record_visible_text_at(now);
-                    let _ = chunk_tx.send(super::TokenChunk::Text(delta)).await;
-                } else if is_chat_reasoning_marker_content(&delta) {
-                    tracing::debug!(
-                        bytes = delta.len(),
-                        "dropping chat completions marker content"
-                    );
+            for (kind, delta) in [
+                (ChatVisibleKind::Content, choice.delta.content),
+                (ChatVisibleKind::Refusal, choice.delta.refusal),
+            ] {
+                let Some(delta) = delta.filter(|delta| !delta.is_empty()) else {
+                    continue;
+                };
+                if self.visible_kind.is_some_and(|existing| existing != kind) {
+                    return Err(LlmError::invalid_response(
+                        "Chat completions stream mixed content and refusal text",
+                    ));
                 }
+                if kind == ChatVisibleKind::Refusal && !self.tool_calls.is_empty() {
+                    return Err(LlmError::invalid_response(
+                        "Chat completions refusal included tool calls",
+                    ));
+                }
+                self.visible_kind = Some(kind);
+                self.content.push_str(&delta);
+                self.telemetry
+                    .record_generation_event_at(now, GenerationKind::Text);
+                self.telemetry.record_visible_text_at(now);
+                let _ = chunk_tx.send(super::TokenChunk::Text(delta)).await;
+            }
+            if self.visible_kind == Some(ChatVisibleKind::Refusal)
+                && choice
+                    .delta
+                    .tool_calls
+                    .as_deref()
+                    .is_some_and(|calls| !calls.is_empty())
+            {
+                return Err(LlmError::invalid_response(
+                    "Chat completions refusal included tool calls",
+                ));
             }
             for tool_delta in choice.delta.tool_calls.unwrap_or_default() {
                 self.telemetry
                     .record_generation_event_at(now, GenerationKind::Tool);
-                let index = tool_delta.index.unwrap_or(self.tool_calls.len());
-                while self.tool_calls.len() <= index {
+                let Some(index) = tool_delta.index else {
+                    return Err(LlmError::invalid_response(
+                        "Chat completions tool delta omitted its index",
+                    ));
+                };
+                if index > self.tool_calls.len() {
+                    return Err(LlmError::invalid_response(
+                        "Chat completions tool delta used a sparse index",
+                    ));
+                }
+                if index == self.tool_calls.len() {
                     self.tool_calls.push(ChatToolCallBuilder::default());
                 }
                 let builder = &mut self.tool_calls[index];
+                if let Some(tool_type) = tool_delta.r#type {
+                    if tool_type != "function" {
+                        return Err(LlmError::invalid_response(
+                            "Chat completions returned a non-function tool delta",
+                        ));
+                    }
+                }
                 if let Some(id) = tool_delta.id {
+                    if !builder.id.is_empty() && builder.id != id {
+                        return Err(LlmError::invalid_response(
+                            "Chat completions tool call changed id while streaming",
+                        ));
+                    }
                     builder.id = id;
                 }
                 if let Some(function) = tool_delta.function {
                     if let Some(name) = function.name {
+                        if !builder.name.is_empty() && builder.name != name {
+                            return Err(LlmError::invalid_response(
+                                "Chat completions tool call changed function name while streaming",
+                            ));
+                        }
                         builder.name = name;
                     }
                     if let Some(arguments) = function.arguments {
@@ -2913,6 +3024,7 @@ impl ChatStreamAccumulator {
             } else {
                 Some(self.content)
             },
+            refusal: None,
             tool_calls: if self.tool_calls.is_empty() {
                 None
             } else {
@@ -2920,7 +3032,7 @@ impl ChatStreamAccumulator {
                     self.tool_calls
                         .into_iter()
                         .map(ChatToolCallBuilder::build)
-                        .collect(),
+                        .collect::<Result<Vec<_>, _>>()?,
                 )
             },
         };
@@ -2939,15 +3051,20 @@ struct ChatToolCallBuilder {
 }
 
 impl ChatToolCallBuilder {
-    fn build(self) -> ChatToolCall {
-        ChatToolCall {
+    fn build(self) -> Result<ChatToolCall, LlmError> {
+        if self.id.is_empty() || self.name.is_empty() {
+            return Err(LlmError::invalid_response(
+                "Chat completions tool call omitted its id or function name",
+            ));
+        }
+        Ok(ChatToolCall {
             id: self.id,
             r#type: "function".to_string(),
             function: ChatFunctionCall {
                 name: self.name,
                 arguments: self.arguments,
             },
-        }
+        })
     }
 }
 
@@ -3057,6 +3174,8 @@ struct ChatResponseMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ChatToolCall>>,
 }
 
@@ -3087,6 +3206,8 @@ struct ChatStreamError {
 
 #[derive(Debug, Deserialize)]
 struct ChatStreamChoice {
+    #[serde(default)]
+    index: usize,
     delta: ChatDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -3099,6 +3220,8 @@ struct ChatDelta {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ChatToolCallDelta>>,
 }
 
@@ -3106,6 +3229,8 @@ struct ChatDelta {
 struct ChatToolCallDelta {
     #[serde(default)]
     index: Option<usize>,
+    #[serde(default)]
+    r#type: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -5051,6 +5176,7 @@ mod tests {
                 message: ChatResponseMessage {
                     reasoning_content: Some("private reasoning".to_string()),
                     content: None,
+                    refusal: None,
                     tool_calls: Some(vec![ChatToolCall {
                         id: "call-7".to_string(),
                         r#type: "function".to_string(),
@@ -5080,6 +5206,68 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn chat_normalization_preserves_literal_angle_bracket_and_refusal() {
+        let literal = normalize_chat_response(
+            ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: None,
+                        content: Some("<".to_string()),
+                        refusal: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+            },
+            "compatible-chat-model",
+        )
+        .unwrap();
+        assert!(matches!(
+            &literal.content[0],
+            ContentBlock::Text { text } if text == "<"
+        ));
+
+        let refusal = normalize_chat_response(
+            ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: None,
+                        content: None,
+                        refusal: Some("I can't help with that.".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+            },
+            "compatible-chat-model",
+        )
+        .unwrap();
+        assert!(matches!(
+            &refusal.content[0],
+            ContentBlock::Text { text } if text == "I can't help with that."
+        ));
+    }
+
+    #[test]
+    fn chat_errors_preserve_numeric_status_and_overload_semantics() {
+        for code in [serde_json::json!(401), serde_json::json!("401")] {
+            let numeric = classify_chat_stream_error(Some(&code), "credential rejected");
+            assert_eq!(numeric.kind, crate::LlmErrorKind::Auth);
+        }
+
+        for (status, code) in [(429, "slow_down"), (503, "server_is_overloaded")] {
+            let body = serde_json::json!({
+                "error": {"message": "at capacity", "code": code}
+            })
+            .to_string();
+            let overload = openai_http_error(status, &status.to_string(), &body);
+            assert_eq!(overload.kind, crate::LlmErrorKind::ServerOverloaded);
+        }
+    }
+
     #[tokio::test]
     async fn chat_stream_surfaces_inline_errors_and_requires_terminal_event() {
         let request = empty_request();
@@ -5101,6 +5289,180 @@ mod tests {
             .unwrap();
         let error = incomplete.into_response().unwrap_err();
         assert_eq!(error.kind, crate::LlmErrorKind::InvalidResponse);
+    }
+
+    #[test]
+    fn chat_normalization_rejects_malformed_tools_and_usage() {
+        let malformed_tool = ChatCompletionsResponse {
+            choices: vec![ChatChoice {
+                message: ChatResponseMessage {
+                    reasoning_content: None,
+                    content: None,
+                    refusal: None,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: "call-1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: "bash".to_string(),
+                            arguments: "{".to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+        assert_eq!(
+            normalize_chat_response(malformed_tool, "compatible-chat-model")
+                .unwrap_err()
+                .kind,
+            crate::LlmErrorKind::InvalidResponse
+        );
+
+        let invalid_usage = ChatCompletionsResponse {
+            choices: vec![ChatChoice {
+                message: ChatResponseMessage {
+                    reasoning_content: None,
+                    content: Some("ok".to_string()),
+                    refusal: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: Some(ChatUsage {
+                prompt_tokens: 10,
+                completion_tokens: 1,
+                prompt_tokens_details: ChatPromptTokensDetails { cached_tokens: 11 },
+                completion_tokens_details: ChatCompletionTokensDetails::default(),
+            }),
+        };
+        assert_eq!(
+            normalize_chat_response(invalid_usage, "compatible-chat-model")
+                .unwrap_err()
+                .kind,
+            crate::LlmErrorKind::InvalidResponse
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_rejects_multiple_choices_and_invalid_tool_indices() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        for event in [
+            r#"{"choices":[{"delta":{"content":"a"}},{"delta":{"content":"b"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1000000,"id":"call","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+        ] {
+            let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+            assert_eq!(
+                acc.process_event(event, &tx).await.unwrap_err().kind,
+                crate::LlmErrorKind::InvalidResponse
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_rejects_choice_changes_and_mutated_tool_identity() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut choices = ChatStreamAccumulator::new(Instant::now(), &request);
+        choices
+            .process_event(r#"{"choices":[{"index":0,"delta":{"content":"a"}}]}"#, &tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            choices
+                .process_event(r#"{"choices":[{"index":1,"delta":{"content":"b"}}]}"#, &tx,)
+                .await
+                .unwrap_err()
+                .kind,
+            crate::LlmErrorKind::InvalidResponse
+        );
+
+        let mut tool = ChatStreamAccumulator::new(Instant::now(), &request);
+        tool.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"bash","arguments":""}}]}}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tool.process_event(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-b","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+                &tx,
+            )
+            .await
+            .unwrap_err()
+            .kind,
+            crate::LlmErrorKind::InvalidResponse
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_rejects_mixed_content_and_refusal() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(r#"{"choices":[{"delta":{"content":"text"}}]}"#, &tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            acc.process_event(r#"{"choices":[{"delta":{"refusal":"no"}}]}"#, &tx)
+                .await
+                .unwrap_err()
+                .kind,
+            crate::LlmErrorKind::InvalidResponse
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_rejects_incomplete_tool_call() {
+        let request = empty_request();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ChatStreamAccumulator::new(Instant::now(), &request);
+        acc.process_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            acc.into_response().unwrap_err().kind,
+            crate::LlmErrorKind::InvalidResponse
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_preserves_literal_angle_bracket_and_refusal_deltas() {
+        let request = empty_request();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut literal = ChatStreamAccumulator::new(Instant::now(), &request);
+        literal
+            .process_event(
+                r#"{"choices":[{"delta":{"content":"<"},"finish_reason":"stop"}]}"#,
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(crate::TokenChunk::Text(text)) if text == "<"));
+        assert!(matches!(
+            &literal.into_response().unwrap().content[0],
+            ContentBlock::Text { text } if text == "<"
+        ));
+
+        let mut refusal = ChatStreamAccumulator::new(Instant::now(), &request);
+        refusal
+            .process_event(
+                r#"{"choices":[{"delta":{"refusal":"declined"},"finish_reason":"stop"}]}"#,
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(crate::TokenChunk::Text(text)) if text == "declined"));
+        assert!(matches!(
+            &refusal.into_response().unwrap().content[0],
+            ContentBlock::Text { text } if text == "declined"
+        ));
     }
 
     #[tokio::test]

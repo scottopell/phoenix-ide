@@ -71,6 +71,7 @@ entity ChatRequest {
 entity ChatResponse {
     finish_reason: ChatFinishReason
     final_text: String?
+    refusal: String?
     private_reasoning: String?
     tool_calls: List<ChatToolCall>
     usage: ChatUsage?
@@ -180,6 +181,19 @@ rule ChatTextNormalized {
     )
 }
 
+rule ChatRefusalNormalized {
+    when: NormalizeChatResponse(response)
+
+    requires: response.finish_reason in { stop, other }
+    requires: response.refusal != null
+
+    ensures: llm/LlmResponse.created(
+        end_turn: true,
+        usage: normalize_chat_usage(response.usage)
+    )
+    ensures: normalized_visible_text(response) = response.refusal
+}
+
 rule ChatToolCallsNormalized {
     when: NormalizeChatResponse(response)
 
@@ -256,6 +270,15 @@ rule ChatStreamCompleted {
         end_turn: stream.tool_calls.count = 0,
         usage: normalize_chat_usage(stream.usage)
     )
+}
+
+rule ChatDoneSentinelObserved {
+    when: ChatDoneSentinelReceived(stream)
+
+    requires: stream.status = accumulating
+
+    ensures: stream.status = done
+    ensures: stream.terminal_observed = true
 }
 
 rule ChatInlineErrorRejected {
@@ -335,6 +358,7 @@ surface ChatCompletionsBoundary {
         NormalizeChatResponse(response)
         ChatStreamEventReceived(stream, generation_kind?)
         ChatTerminalEventReceived(stream, finish_reason, usage?)
+        ChatDoneSentinelReceived(stream)
         ChatInlineErrorReceived(stream, code, message)
         ChatTransportEnded(stream)
 }

@@ -435,19 +435,16 @@ fn legacy_openai_base_url_for_responses(url: Option<&str>) -> Option<String> {
 
 fn legacy_openai_base_url_for_chat(url: Option<&str>) -> Option<String> {
     let url = url?;
-    if url.contains("/responses") {
-        None
-    } else {
-        Some(url.to_string())
-    }
+    url.contains("/chat/completions").then(|| url.to_string())
 }
 
-fn legacy_openai_base_url_is_chat_only(config: &LlmConfig) -> bool {
+fn openai_config_is_chat_only(config: &LlmConfig) -> bool {
     config.openai_responses_base_url.is_none()
-        && config
-            .openai_base_url
-            .as_deref()
-            .is_some_and(|url| url.contains("/chat/completions"))
+        && (config.openai_chat_completions_base_url.is_some()
+            || config
+                .openai_base_url
+                .as_deref()
+                .is_some_and(|url| url.contains("/chat/completions")))
 }
 
 fn warn_if_endpoint_url_has_no_path(name: &str, url: &str) {
@@ -494,18 +491,20 @@ fn infer_provider_display_from_model_id(model_id: &str) -> String {
     }
 }
 
-/// Derive a `/v1/models` URL from a base URL like `/v1/messages` or `/v1/responses`.
-/// Replaces the last path segment with `"models"`, stripping any query string first.
+/// Derive a provider-compatible models URL from an exact request endpoint.
 fn derive_models_url(base_url: &str) -> Option<String> {
     let path = base_url.split('?').next().unwrap_or(base_url);
     let scheme_end = path.find("://").map_or(0, |idx| idx + 3);
-    let last_slash = path.rfind('/')?;
-    if last_slash < scheme_end {
+    let endpoint_start = if let Some(prefix) = path.strip_suffix("/chat/completions") {
+        prefix.len() + 1
+    } else {
+        path.rfind('/')? + 1
+    };
+    if endpoint_start <= scheme_end {
         return None;
     }
-    // Safety: `last_slash` is from `rfind('/')` on `path`
     #[allow(clippy::string_slice)]
-    Some(format!("{}models", &path[..=last_slash]))
+    Some(format!("{}models", &path[..endpoint_start]))
 }
 
 /// Registry of available LLM models.
@@ -699,16 +698,20 @@ impl ModelRegistry {
         specs: &[super::ModelSpec],
         discovered: &DiscoveredModels,
     ) -> HashSet<ModelBackend> {
-        [ModelBackend::Anthropic, ModelBackend::OpenAIResponses]
-            .into_iter()
-            .filter(|backend| {
-                discovered.was_listed(*backend)
-                    && !specs.iter().any(|spec| {
-                        spec.backend == *backend
-                            && Self::spec_matches_discovered_model(spec, discovered)
-                    })
-            })
-            .collect()
+        [
+            ModelBackend::Anthropic,
+            ModelBackend::OpenAIResponses,
+            ModelBackend::OpenAIChatCompletions,
+        ]
+        .into_iter()
+        .filter(|backend| {
+            discovered.was_listed(*backend)
+                && !specs.iter().any(|spec| {
+                    spec.backend == *backend
+                        && Self::spec_matches_discovered_model(spec, discovered)
+                })
+        })
+        .collect()
     }
 
     fn spec_matches_discovered_model(
@@ -740,11 +743,18 @@ impl ModelRegistry {
             .anthropic_base_url
             .as_deref()
             .and_then(derive_models_url);
-        let openai_models_url = config
+        let openai_responses_models_url = config
             .openai_responses_base_url
             .as_deref()
             .and_then(derive_models_url);
-        if anthropic_models_url.is_none() && openai_models_url.is_none() {
+        let openai_chat_completions_models_url = config
+            .openai_chat_completions_base_url
+            .as_deref()
+            .and_then(derive_models_url);
+        if anthropic_models_url.is_none()
+            && openai_responses_models_url.is_none()
+            && openai_chat_completions_models_url.is_none()
+        {
             return None;
         }
 
@@ -763,7 +773,7 @@ impl ModelRegistry {
         } else {
             None
         };
-        let openai_auth_headers = if openai_models_url.is_some() {
+        let openai_responses_auth_headers = if openai_responses_models_url.is_some() {
             discovery_auth_headers(
                 ModelBackend::OpenAIResponses,
                 helper_token.as_deref(),
@@ -773,15 +783,35 @@ impl ModelRegistry {
         } else {
             None
         };
-        if anthropic_auth_headers.is_none() && openai_auth_headers.is_none() {
+        let openai_chat_completions_auth_headers = if openai_chat_completions_models_url.is_some() {
+            discovery_auth_headers(
+                ModelBackend::OpenAIChatCompletions,
+                helper_token.as_deref(),
+                config.openai_api_key.as_deref(),
+                auth_style,
+            )
+        } else {
+            None
+        };
+        if anthropic_auth_headers.is_none()
+            && openai_responses_auth_headers.is_none()
+            && openai_chat_completions_auth_headers.is_none()
+        {
             return None;
         }
 
         Some(DiscoveryConfig {
             anthropic_models_url: anthropic_auth_headers.as_ref().and(anthropic_models_url),
-            openai_models_url: openai_auth_headers.as_ref().and(openai_models_url),
+            openai_responses_models_url: openai_responses_auth_headers
+                .as_ref()
+                .and(openai_responses_models_url),
+            openai_chat_completions_models_url: openai_chat_completions_auth_headers
+                .as_ref()
+                .and(openai_chat_completions_models_url),
             anthropic_auth_headers: anthropic_auth_headers.unwrap_or_default(),
-            openai_auth_headers: openai_auth_headers.unwrap_or_default(),
+            openai_responses_auth_headers: openai_responses_auth_headers.unwrap_or_default(),
+            openai_chat_completions_auth_headers: openai_chat_completions_auth_headers
+                .unwrap_or_default(),
             custom_headers: config.custom_headers.clone(),
         })
     }
@@ -841,12 +871,10 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
-        if spec.backend == ModelBackend::OpenAIResponses
-            && legacy_openai_base_url_is_chat_only(config)
-        {
+        if spec.backend == ModelBackend::OpenAIResponses && openai_config_is_chat_only(config) {
             tracing::debug!(
                 model = %spec.id,
-                "skipping OpenAI Responses model because OPENAI_BASE_URL points at Chat Completions and OPENAI_RESPONSES_BASE_URL is unset"
+                "skipping OpenAI Responses model because only a Chat Completions endpoint is configured"
             );
             return None;
         }
@@ -1581,6 +1609,8 @@ mod tests {
             ]),
             openai_responses_listed: false,
             openai_responses: HashSet::new(),
+            openai_chat_completions_listed: false,
+            openai_chat_completions: HashSet::new(),
         };
 
         assert!(ModelRegistry::spec_matches_discovered_model(
@@ -1600,6 +1630,8 @@ mod tests {
             anthropic: HashSet::new(),
             openai_responses_listed: true,
             openai_responses: HashSet::from(["openai/gpt-5.6-sol".to_string()]),
+            openai_chat_completions_listed: false,
+            openai_chat_completions: HashSet::new(),
         };
 
         assert!(ModelRegistry::spec_matches_discovered_model(
@@ -1618,6 +1650,8 @@ mod tests {
             openai_responses: HashSet::from(
                 ["gateway-provider/example-org/Chat-Model".to_string()],
             ),
+            openai_chat_completions_listed: false,
+            openai_chat_completions: HashSet::new(),
         };
 
         assert!(!ModelRegistry::spec_matches_discovered_model(
@@ -1634,6 +1668,10 @@ mod tests {
             anthropic: HashSet::from(["unmatched-anthropic".to_string()]),
             openai_responses_listed: true,
             openai_responses: HashSet::from(["openai-compatible/custom".to_string()]),
+            openai_chat_completions_listed: true,
+            openai_chat_completions: HashSet::from([
+                "gateway-provider/example-org/Code-Model".to_string()
+            ]),
         };
 
         let fallback = ModelRegistry::discovery_fallback_backends(&specs, &discovered);
@@ -1773,7 +1811,7 @@ mod tests {
             vec![("x-api-key".to_string(), "anthropic-key".to_string())]
         );
         assert_eq!(
-            discovery.openai_auth_headers,
+            discovery.openai_responses_auth_headers,
             vec![("Authorization".to_string(), "Bearer openai-key".to_string())]
         );
     }
@@ -1793,7 +1831,7 @@ mod tests {
 
         assert!(discovery.anthropic_models_url.is_none());
         assert_eq!(
-            discovery.openai_models_url.as_deref(),
+            discovery.openai_responses_models_url.as_deref(),
             Some("https://proxy.example/v1/models")
         );
     }
@@ -2316,6 +2354,13 @@ mod tests {
             Some("https://gw.example/v1/responses")
         );
         assert_eq!(legacy_openai_base_url_for_chat(responses), None);
+
+        let ambiguous = Some("https://gw.example/openai");
+        assert_eq!(
+            legacy_openai_base_url_for_responses(ambiguous).as_deref(),
+            Some("https://gw.example/openai")
+        );
+        assert_eq!(legacy_openai_base_url_for_chat(ambiguous), None);
     }
 
     #[test]
@@ -2337,6 +2382,51 @@ mod tests {
         assert!(registry
             .get("gateway-provider/example-org/Code-Model")
             .is_some());
+    }
+
+    #[test]
+    fn explicit_chat_only_base_url_suppresses_responses_models() {
+        let config = LlmConfig {
+            openai_api_key: Some("gateway-token".to_string()),
+            openai_chat_completions_base_url: Some(
+                "https://gateway.example/v1/chat/completions".to_string(),
+            ),
+            external_models: vec![external_chat_completions_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(registry.get("gpt-5.5").is_none());
+        assert!(registry
+            .get("gateway-provider/example-org/Code-Model")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn chat_base_url_builds_backend_scoped_discovery() {
+        let config = LlmConfig {
+            openai_api_key: Some("gateway-token".to_string()),
+            openai_chat_completions_base_url: Some(
+                "https://gateway.example/v1/chat/completions".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("chat endpoint should produce discovery config");
+
+        assert!(discovery.openai_responses_models_url.is_none());
+        assert_eq!(
+            discovery.openai_chat_completions_models_url.as_deref(),
+            Some("https://gateway.example/v1/models")
+        );
+        assert_eq!(
+            discovery.openai_chat_completions_auth_headers,
+            vec![(
+                "Authorization".to_string(),
+                "Bearer gateway-token".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -2373,6 +2463,14 @@ mod tests {
         assert_eq!(
             derive_models_url("https://ai-gateway.us1.ddbuild.io/v1/responses"),
             Some("https://ai-gateway.us1.ddbuild.io/v1/models".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_models_url_from_chat_completions() {
+        assert_eq!(
+            derive_models_url("https://gateway.example/v1/chat/completions"),
+            Some("https://gateway.example/v1/models".to_string())
         );
     }
 

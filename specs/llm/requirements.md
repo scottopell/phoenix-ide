@@ -42,8 +42,8 @@ AND make unavailable models inaccessible
 
 WHEN server starts with credential-helper auth and provider-compatible base URLs
 THE SYSTEM SHALL query model listing endpoints derived from those base URLs when possible
-AND filter configured models against discovered IDs
-AND fall back to the configured model list if model listing is unavailable or unhelpful
+AND filter configured models against discovered IDs within the matching wire-format backend
+AND fall back per backend to the configured model list if model listing is unavailable or unhelpful
 
 WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
@@ -54,15 +54,16 @@ THE SYSTEM SHALL return only models that are currently available
 
 ### REQ-LLM-003a: Model Discovery
 
-WHEN deriving a model-list URL from a provider-compatible base URL
-THE SYSTEM SHALL replace the final path segment with `models`
+WHEN deriving a model-list URL from a provider-compatible exact endpoint
+THE SYSTEM SHALL replace the endpoint path with `models`
+AND SHALL treat the standard `chat/completions` suffix as one endpoint path
 AND SHALL skip discovery when the configured URL has no path segment to replace
 
 WHEN a model-list endpoint returns models
 THE SYSTEM SHALL match discovered IDs against configured model IDs, wire model names, and backend-prefixed aliases
 
-WHEN model-list discovery returns no usable configured models
-THE SYSTEM SHALL fall back to the configured model list
+WHEN model-list discovery returns no usable configured models for a wire-format backend
+THE SYSTEM SHALL fall back to the configured model list for that backend
 AND log warning about fallback
 
 **Rationale:** Model listing is a validation aid, not a required deployment dependency.

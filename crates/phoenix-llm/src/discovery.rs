@@ -12,12 +12,16 @@ use std::sync::OnceLock;
 pub struct DiscoveryConfig {
     /// URL for Anthropic models endpoint
     pub anthropic_models_url: Option<String>,
-    /// URL for `OpenAI` models endpoint
-    pub openai_models_url: Option<String>,
+    /// URL for the `OpenAI` Responses models endpoint.
+    pub openai_responses_models_url: Option<String>,
+    /// URL for the `OpenAI` Chat Completions models endpoint.
+    pub openai_chat_completions_models_url: Option<String>,
     /// Auth headers to send to the Anthropic models endpoint.
     pub anthropic_auth_headers: Vec<(String, String)>,
-    /// Auth headers to send to the `OpenAI` models endpoint.
-    pub openai_auth_headers: Vec<(String, String)>,
+    /// Auth headers to send to the `OpenAI` Responses models endpoint.
+    pub openai_responses_auth_headers: Vec<(String, String)>,
+    /// Auth headers to send to the `OpenAI` Chat Completions models endpoint.
+    pub openai_chat_completions_auth_headers: Vec<(String, String)>,
     /// Custom headers to inject on discovery requests
     pub custom_headers: Vec<(String, String)>,
 }
@@ -39,6 +43,8 @@ pub struct DiscoveredModels {
     pub anthropic: HashSet<String>,
     pub openai_responses_listed: bool,
     pub openai_responses: HashSet<String>,
+    pub openai_chat_completions_listed: bool,
+    pub openai_chat_completions: HashSet<String>,
 }
 
 fn empty_ids() -> &'static HashSet<String> {
@@ -49,17 +55,19 @@ fn empty_ids() -> &'static HashSet<String> {
 impl DiscoveredModels {
     #[must_use]
     pub fn any_listed(&self) -> bool {
-        self.anthropic_listed || self.openai_responses_listed
+        self.anthropic_listed || self.openai_responses_listed || self.openai_chat_completions_listed
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.anthropic.is_empty() && self.openai_responses.is_empty()
+        self.anthropic.is_empty()
+            && self.openai_responses.is_empty()
+            && self.openai_chat_completions.is_empty()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.anthropic.len() + self.openai_responses.len()
+        self.anthropic.len() + self.openai_responses.len() + self.openai_chat_completions.len()
     }
 
     #[must_use]
@@ -67,9 +75,8 @@ impl DiscoveredModels {
         match backend {
             ModelBackend::Anthropic => self.anthropic_listed,
             ModelBackend::OpenAIResponses => self.openai_responses_listed,
-            // Chat Completions models bypass discovery filtering; they always
-            // appear as configured regardless of what the gateway listing returns.
-            ModelBackend::OpenAIChatCompletions | ModelBackend::Mock => false,
+            ModelBackend::OpenAIChatCompletions => self.openai_chat_completions_listed,
+            ModelBackend::Mock => false,
         }
     }
 
@@ -78,8 +85,8 @@ impl DiscoveredModels {
         match backend {
             ModelBackend::Anthropic => &self.anthropic,
             ModelBackend::OpenAIResponses => &self.openai_responses,
-            // Chat Completions has no dedicated discovery bucket.
-            ModelBackend::OpenAIChatCompletions | ModelBackend::Mock => empty_ids(),
+            ModelBackend::OpenAIChatCompletions => &self.openai_chat_completions,
+            ModelBackend::Mock => empty_ids(),
         }
     }
 }
@@ -108,11 +115,11 @@ pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
         }
     }
 
-    if let Some(ref url) = config.openai_models_url {
+    if let Some(ref url) = config.openai_responses_models_url {
         match discover_provider(
             url,
             "openai",
-            config.openai_auth_headers.as_slice(),
+            config.openai_responses_auth_headers.as_slice(),
             &config.custom_headers,
             &[],
         )
@@ -122,7 +129,29 @@ pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
                 models.openai_responses_listed = true;
                 models.openai_responses.extend(m);
             }
-            Err(e) => tracing::warn!(provider = "openai", error = %e, "Discovery failed"),
+            Err(e) => {
+                tracing::warn!(provider = "openai", backend = "responses", error = %e, "Discovery failed");
+            }
+        }
+    }
+
+    if let Some(ref url) = config.openai_chat_completions_models_url {
+        match discover_provider(
+            url,
+            "openai",
+            config.openai_chat_completions_auth_headers.as_slice(),
+            &config.custom_headers,
+            &[],
+        )
+        .await
+        {
+            Ok(m) => {
+                models.openai_chat_completions_listed = true;
+                models.openai_chat_completions.extend(m);
+            }
+            Err(e) => {
+                tracing::warn!(provider = "openai", backend = "chat_completions", error = %e, "Discovery failed");
+            }
         }
     }
 
