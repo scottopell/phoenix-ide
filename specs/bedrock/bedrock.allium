@@ -1105,15 +1105,15 @@ rule UserApprovesTaskNewConversation {
     ensures: fresh_work_conversation.product_conversation != conversation.product_conversation
     ensures: fresh_work_conversation.continued_in_conv_id = absent
     ensures: FreshGitWorktreeProvisioningRequested(fresh_work_conversation)
-    ensures: LlmRequestDispatched(fresh_work_conversation)
 
     @guidance
         -- Starting fresh for approved task work creates a separate product
         -- conversation boundary. It is not a continuation: the source stays open,
         -- no continuation edge is written, and no handed_off row condition is introduced.
-        -- The initial handoff is only a typed provisioning boundary at the canonical
-        -- detached default-commit base; detailed worktree/branch provisioning is owned
-        -- downstream rather than by task approval itself.
+        -- Typed provisioning owns when the spawned conversation becomes runnable:
+        -- approval requests fresh provisioning, and only a later successful durable
+        -- provisioning-completed event may dispatch the first LLM request. Failed
+        -- provisioning never dispatches the fresh conversation.
         --
         -- Approval remains bound to the reviewed snapshot identity here too; Phoenix
         -- cannot seed a new conversation from arbitrary current file contents after a
@@ -1447,16 +1447,20 @@ rule UserRequestsCloseConversation {
         product_conversation: conversation.product_conversation,
         phase: awaiting_blocker_resolution
     )
+    ensures: CloseEvaluationRequested(conversation.product_conversation, attempt_id)
 
     @guidance
         -- Close is a durable root-owned obligation separate from the row-local
         -- message-admission state. Each request carries one durable attempt_id,
         -- and at most one non-completed attempt may exist per ProductConversation.
-        -- Admission uses close_eligible rather than
-        -- row_accepts_user_messages so the latest context_exhausted row with no
-        -- continuation may still close, while handed-off predecessors, nonlatest
-        -- rows, task-approval blockers, and continuation-in-progress blockers
-        -- remain ineligible per the action table.
+        -- Creation of the durable obligation and emission of the aggregate-scoped
+        -- CloseEvaluationRequested(product_conversation, attempt_id) event are one
+        -- atomic decision boundary so busy and idle branches advance from the same
+        -- committed attempt without an emit-vs-persist race.
+        -- Admission uses close_eligible rather than row_accepts_user_messages so the
+        -- latest context_exhausted row with no continuation may still close, while
+        -- handed-off predecessors, nonlatest rows, task-approval blockers, and
+        -- continuation-in-progress blockers remain ineligible per the action table.
 }
 
 rule CloseObligationRequiresExplicitStopWorkConfirmation {
@@ -1746,13 +1750,16 @@ rule SubAgentTurnLimitHardStop {
 
 -- Lifecycle announcement: fires once from the singular root-owned product lifecycle.
 rule ConversationLifecycleEnteredHistory {
-    when: ProductConversationEnteredHistory(product_conversation)
+    when: ProductConversationEnteredHistory(product_conversation, attempt_id)
     ensures: ConversationBecameHistory(product_conversation)
 
     @guidance
         -- Downstream specs consume one aggregate lifecycle transition from the
         -- ProductConversation itself rather than inferring History from row-local
-        -- conditions such as handed_off or context_exhausted.
+        -- conditions such as handed_off or context_exhausted. The producer and every
+        -- consumer use the same (product_conversation, attempt_id) signature so the
+        -- single aggregate announcement preserves which durable Close attempt entered
+        -- History.
 }
 
 -- REQ-BED-032: User hard-deletes a conversation when the conversation is

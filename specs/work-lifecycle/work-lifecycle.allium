@@ -112,6 +112,7 @@ external entity CloseRetirementAuthority {
 }
 
 external entity RetirementAttempt {
+    attempt_id: String
     product_conversation: bedrock/ProductConversation
     scope: WorkScope
     inspection: RetirementInspection?
@@ -191,12 +192,12 @@ rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
 rule GitBackedInspectionWithoutLossRequestsRetirement {
     when: RetirementInspectionRequested(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
-    requires: exists RetirementAttempt{product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: staged_tracked_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: unstaged_tracked_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: untracked_non_ignored_paths}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: initialized_submodule_state}
-    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: detached_unreachable_commits}
+    requires: exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         attempt_id,
@@ -218,13 +219,13 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
 rule GitBackedInspectionWithLossRequiresConfirmation {
     when: RetirementInspectionRequested(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
-    requires: exists RetirementAttempt{product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
+    requires: exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
     requires:
-        exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: staged_tracked_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: unstaged_tracked_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: untracked_non_ignored_paths}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: initialized_submodule_state}
-        or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: detached_unreachable_commits}
+        exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionRequiresConfirmation(
         product_conversation,
         attempt_id,
@@ -307,7 +308,7 @@ rule RetirementRequestedCreatesPerResourceEvidence {
     requires: owned_resource_pending_retirement(product_conversation, scope_binding.scope)
     requires: retirement_step_succeeds_for_pending_resource(product_conversation, scope_binding.scope)
     ensures: RetiredResource.created(
-        attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope},
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
         kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope)
@@ -352,7 +353,7 @@ rule RetirementStepSuccessRecordsTypedEvidence {
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists RetiredResource{
-        attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope},
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
         kind: retired_resource_kind_for_completed_step(product_conversation, scope_binding.scope)
@@ -376,7 +377,7 @@ rule RetirementAlreadyRetiredIsIdempotentNoOp {
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists RetiredResource{
-        attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope},
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
         kind: retired_resource_kind_for_retried_step(product_conversation, scope_binding.scope)
@@ -397,7 +398,7 @@ rule ResourceRetirementFailureProducesResidualRepairState {
         retirement_requested,
         needs_repair
     }
-    requires: exists RetirementResidualResource{attempt: RetirementAttempt, product_conversation: product_conversation}
+    requires: exists RetirementResidualResource{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation}, product_conversation: product_conversation}
     ensures: ResourceRetirementFailed(product_conversation, attempt_id)
 
     @guidance

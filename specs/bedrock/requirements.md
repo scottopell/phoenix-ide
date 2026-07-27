@@ -674,10 +674,12 @@ AND create a fresh Open conversation with a fresh attached `WorkScope`
 AND record one visible source relation of kind `approved_task` on the new conversation that points to the source conversation
 AND keep the source conversation Open rather than linking it through `continued_in_conv_id`
 AND dispatch the next LLM request only in the spawned conversation
+AND SHALL gate that dispatch on successful durable typed provisioning completion for the spawned ProductConversation and its attached `WorkScope`/worktree
 AND seed that conversation's first LLM-visible context from the approved task brief
   and approval metadata, excluding the source transcript
 AND SHALL treat the spawned conversation as a separate Open conversation derived from the source conversation rather than as an in-place continuation of the predecessor's runtime environment
 AND SHALL carry only the exact approved task as the derived starting context
+AND SHALL NOT dispatch the spawned conversation when provisioning ends in an unresolved failure result
 
 WHEN the user provides annotation feedback while in AwaitingTaskApproval
 THE SYSTEM SHALL close the prose reader

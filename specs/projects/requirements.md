@@ -146,10 +146,11 @@ AND SHALL treat that spawned conversation as an independent ProductConversation 
 AND seed only the exact approved task as the spawned conversation's starting context
 AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
 AND record exactly one source relation of kind `approved_task` on the spawned conversation that points to the source conversation
-AND resume execution in the spawned conversation
+AND dispatch execution in the spawned conversation only after successful durable typed provisioning completion for that spawned ProductConversation and attached `WorkScope`/worktree
 AND leave the source conversation Open
 AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
 AND SHALL NOT copy, summarize, or inject the source conversation transcript into the spawned conversation as part of approval placement
+AND SHALL NOT dispatch the spawned conversation when provisioning finishes in an unresolved failure result
 
 WHEN the user rejects or discards the task
 THE SYSTEM SHALL return a rejection result to the agent

@@ -28,6 +28,19 @@ surface TaskApprovalDecisionImport {
         -- one local typed import surface instead of inventing an unrelated trigger.
 }
 
+surface ProvisioningCompletedImport {
+    facing conversation: bedrock/Conversation
+
+    provides:
+        FreshGitWorktreeProvisioningCompleted(target, provisioned)
+            when bedrock/FreshGitWorktreeProvisioningCompleted(target, provisioned)
+
+    @guarantee TypedProvisioningCompletionBridge
+        -- Projects consumes one durable typed provisioning-completed event carrying
+        -- the target ProductConversation plus the attached WorkScope/worktree tuple
+        -- that successful provisioning established.
+}
+
 ------------------------------------------------------------
 -- External Entities
 ------------------------------------------------------------
@@ -88,6 +101,11 @@ value ApprovedTaskSource {
     identity: ApprovedTaskIdentity
     reviewed_snapshot: ReviewedProposalSnapshotIdentity
     kind: taskmd | plain_markdown
+}
+
+value ProvisionedWorkScope {
+    scope: bedrock/WorkScope
+    worktree_path: String
 }
 
 ------------------------------------------------------------
@@ -417,7 +435,25 @@ rule TaskApprovalNewConversationExecuted {
     @guidance
         -- Start in new conversation creates a separate ProductConversation with a
         -- fresh WorkScope and detached-default worktree. It is not a continuation
-        -- of the source conversation and does not copy the source scope.
+        -- of the source conversation and does not copy the source scope. Approval
+        -- only requests provisioning; the first LLM dispatch is gated on the later
+        -- durable successful provisioning-completed event for that exact target.
+}
+
+rule StartInNewConversationDispatchesOnlyAfterSuccessfulProvisioning {
+    when: FreshGitWorktreeProvisioningCompleted(target, provisioned)
+    requires: exists CreatedFromApprovedTask(target, approved_source)
+    requires: exists ApprovedTaskSourceRecorded(target, approved_source)
+    ensures: ProvisionedWorkScopeAttached(target, provisioned)
+    ensures: LlmRequestDispatched(target)
+
+    @guidance
+        -- The durable provisioning-completed event is the only success boundary that
+        -- may dispatch the spawned conversation. It carries the target ProductConversation
+        -- plus the attached WorkScope/worktree path established by provisioning, so
+        -- downstream resume uses typed provisioning output rather than timing or emit
+        -- order. Failed provisioning emits no completion event and therefore cannot
+        -- dispatch the target conversation.
 }
 
 rule WorktreeTransferredOnContinuation {
