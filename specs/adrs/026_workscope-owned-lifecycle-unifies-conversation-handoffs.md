@@ -31,22 +31,24 @@ The point-in-time decision needed here is not whether Phoenix should invent anot
 
 Phoenix separates **product lifecycle**, **transcript topology**, and **resource ownership**.
 
-The **product conversation** is the durable user-facing root and is the only owner of the Open/History lifecycle. The Close action transitions that product conversation to History **only after** the committed retirement flow has released the resources Phoenix owns or has reached the typed repair state defined by the lifecycle contract. Close does not classify one transcript row, one branch, or one pull request as "the" lifecycle owner.
+The **ProductConversation** aggregate is the durable user-facing root, identified by its durable root identity rather than by any one root transcript row, and it is the only owner of the Open/History lifecycle. The Close action transitions that product conversation to History **only after** the committed retirement flow has released every owned resource. A typed `needs-repair` outcome remains an Open-state condition that is retryable; it is not an alternative completion condition for entering History. Close does not classify one transcript row, one branch, or one pull request as "the" lifecycle owner.
 
-Durable **`Conversation` rows** remain transcript and execution segments. Context continuation creates a new row in the **same** product conversation and keeps the attached `WorkScope`; `continued_in_conv_id` is the sole linear topology for predecessor/successor order and latest-row resolution. Phoenix does not add a second latest/root authority or describe context continuation as new product lifecycle creation.
+Durable **`Conversation` rows** remain transcript and execution segments. Context continuation creates a new row in the **same** product conversation and keeps the same attached `WorkScope`; `continued_in_conv_id` is the sole linear topology for predecessor/successor order and latest-row resolution. Phoenix does not add a second latest/root authority or describe context continuation as new product lifecycle creation, and it avoids framing transcript rows as owning or transferring the `WorkScope` attachment.
 
 Attached **`WorkScope`** values own resources: worktrees, bash/process resources, tmux, browser state, and other work-affine resources. Conversations, execution rows, and sub-agents may have a `WorkScope` attached, but those attachments do not themselves own cleanup. Phoenix therefore does not assert a global one-to-one rule between product conversations and `WorkScope`s beyond the specific contracts the requirements already state.
 
 **Git-backed** and **chat-only** remain environment-intent vocabulary. Git-backed conversations normally attach a `WorkScope`; chat-only conversations do not own Git-backed lifecycle. Whether a chat-only conversation may also carry some non-Git `WorkScope` attachment is intentionally left undecided here; this ADR does not need that decision to separate lifecycle from resource ownership.
 
-Approved-task **Start in new conversation** and **follow-up** create separate product conversations with fresh `WorkScope`s plus typed source relations. They are not continuations. **Continue here** is only a checkpoint inside the same product conversation and same attached `WorkScope`.
+Approved-task **Start in new conversation** creates a separate ProductConversation with a fresh `WorkScope` and worktree because that path is Git-backed. **Follow-up** also creates a separate ProductConversation with a fresh environment appropriate to its intent plus a typed source relation: Git-backed follow-up gets a fresh `WorkScope` and worktree, while chat-only follow-up does not fabricate a Git `WorkScope`. They are not continuations. **Continue here** is only a checkpoint inside the same product conversation and same attached `WorkScope`.
+
+Source relation remains a distinct fact from continuation topology, lifecycle ownership, and resource attachment.
 
 Branches and pull requests are **observed**, never lifecycle-owned. Phoenix may observe branch and PR facts through `WorkScope`-keyed evidence and may guide the user with those facts, but conversation lifecycle does not own, mutate, or derive authority from branch or PR state.
 
 ## Consequences
 
 - **Positive:** Each semantic fact now has one owner. Product lifecycle questions resolve through the product conversation, transcript/latest questions resolve through `continued_in_conv_id`, and cleanup/resource questions resolve through `WorkScope` ownership.
-- **Positive:** Context continuation, Close, approved-task placement, PR targeting, chain rendering, and Coordinator orientation can compose without inventing hidden row-lifecycle or branch-lifecycle rules.
+- **Positive:** Context continuation, Close, approved-task placement, PR targeting, unified transcript presentation, and Coordinator orientation can compose without inventing hidden row-lifecycle or branch-lifecycle rules.
 - **Positive:** The model preserves ADR-008's branch/PR observation boundary: lifecycle can guide from repository facts without mutating or owning them.
 - **Negative:** Consumers must distinguish product vocabulary from implementation vocabulary. A read-only predecessor row inside an Open product conversation is not History, and an attached `WorkScope` is not itself the lifecycle root.
 - **Negative:** Some reads must derive latest execution from `continued_in_conv_id` instead of relying on duplicated latest/root tables or cached row ownership fields.

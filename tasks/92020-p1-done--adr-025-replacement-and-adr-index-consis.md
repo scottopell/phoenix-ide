@@ -47,26 +47,25 @@ Append a completion note to this task body with these headings:
 - `tasks/92020-p1-in-progress--adr-025-replacement-and-adr-index-consis.md`
 
 **Decisions captured**
-- Rewrote ADR-025 in place and accepted it honestly because it was still an unaccepted branch-local draft, not frozen accepted history.
-- Replaced the incorrect "WorkScope-owned lifecycle" framing with an explicit dimensional split: product conversation owns Open/History lifecycle, `Conversation` rows own transcript topology through `continued_in_conv_id`, and `WorkScope` owns resources only.
-- Recorded the required rejected alternatives explicitly: row-owned lifecycle, `WorkScope` owning product lifecycle, branch/task/PR ownership, task spawn as continuation, and duplicate root/latest authority.
-- Preserved the intentionally undecided point that chat-only conversations may or may not have non-Git `WorkScope` attachments.
-- Updated the ADR index title, routing row, and dependency tree wording to match the accepted decision and keep task-routing language aligned.
+- Rewrote ADR-025 in place and kept the existing README/index title because the title text already matched the corrected decision.
+- Corrected the lifecycle rule so ProductConversation enters History only after every owned resource is retired; typed `needs-repair` remains Open and retryable rather than an alternative completion condition.
+- Clarified that ProductConversation is an aggregate identified by its durable root identity, not the root transcript row itself.
+- Tightened continuation/source semantics: context continuation keeps the same attached `WorkScope` without rows owning or transferring it; approved-task Start new creates a separate Git-backed ProductConversation with a fresh `WorkScope` and worktree; follow-up creates a separate ProductConversation with a fresh environment appropriate to intent, so Git-backed follow-up gets a fresh `WorkScope`/worktree while chat-only follow-up does not fabricate a Git `WorkScope`; source relation remains distinct from continuation topology.
+- Updated ADR-025 consequences language from "chain rendering" to "unified transcript presentation" while leaving README/index text unchanged because no title correction was needed.
 
 **Validation**
-- Read-first artifacts reviewed: `specs/AUTHORING.md`, `specs/adrs/README.md`, `specs/adrs/008_multi-pr-selection-uses-durable-branch-observations.md`, `specs/adrs/025_workscope-owned-lifecycle-unifies-conversation-handoffs.md`, parent `tasks/92009-p1-in-progress--unify-conversation-workstream-lifecycle.md`, done children `tasks/92017-p1-done--terminology-authority-requirements-basel.md`, `tasks/92018-p1-done--lifecycle-close-allium-behavior.md`, `tasks/92025-p1-done--bedrock-root-lifecycle-continuation-topology.md`, `tasks/92026-p1-done--durable-close-orchestration-cancellation-contract.md`, `tasks/92027-p1-done--workscope-retirement-loss-classification.md`, `tasks/92028-p1-done--approved-task-placement-behavior.md`, `tasks/92029-p1-done--history-sse-projection.md`, and `tasks/92030-p1-done--cross-file-allium-review.md`.
-- Requirement/ADR trace review:
-  - `rg -n 'REQ-BED-019|REQ-BED-028|REQ-BED-029|REQ-BED-030|REQ-PROJ-004|REQ-PROJ-015|REQ-PROJ-WS-001|REQ-WL-001|REQ-WL-002|REQ-PRA-000|REQ-CHN-008|REQ-GR-001' specs/adrs/025_workscope-owned-lifecycle-unifies-conversation-handoffs.md specs/adrs/README.md`
-- Spec-shape / task validation:
+- Read-first artifacts reviewed: `specs/AUTHORING.md`, `specs/adrs/README.md`, `specs/adrs/025_workscope-owned-lifecycle-unifies-conversation-handoffs.md`, parent `tasks/92009-p1-in-progress--unify-conversation-workstream-lifecycle.md`, and sibling evidence noted in the prior completion draft.
+- ADR/index consistency review:
+  - `rg -n 'ADR-025|Product conversation lifecycle is separate from WorkScope resource ownership|unified transcript presentation|needs-repair|Source relation' specs/adrs/025_workscope-owned-lifecycle-unifies-conversation-handoffs.md specs/adrs/README.md`
+- Spec-shape / ADR / task validation:
   - `./dev.py check --lanes spec-shape`
   - `./dev.py tasks validate`
-- Timelessness / authoring grep:
-  - `rg -n 'task [0-9]{3,}|tasks/[0-9]|PR #|see #[0-9]|RESOLVED [0-9]|Open Question|Q[0-9]\. |Progress:|Status Summary|✅|currently|for now|at the moment|recently|previously|landed|MVP|rollout|stopgap' specs/adrs/025_workscope-owned-lifecycle-unifies-conversation-handoffs.md specs/adrs/README.md`
-- Independent dimensional self-review performed against the required separations: lifecycle vs transcript topology vs resource ownership vs branch/PR observation.
+- Working tree cleanliness check:
+  - `git status --short`
 
 **Review corrections**
-- Replaced an initial invalid attempt to run a non-existent `scripts/spec_shape_check.py` with the repo-supported `./dev.py check --lanes spec-shape` check.
-- Confirmed the only timelessness grep hit was the pre-existing README phrase `frozen at the moment it was made`, which is an ADR-chain convention statement rather than drift in ADR-025.
+- Corrected the accepted-decision prose so `needs-repair` is no longer described as a path to History.
+- Clarified ProductConversation/root-row language, WorkScope attachment wording, follow-up environment semantics, and consequences terminology after review.
 
 **Commit**
-- Pending
+- f447f3fdd
