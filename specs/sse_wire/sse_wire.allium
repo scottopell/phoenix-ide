@@ -1028,23 +1028,21 @@ invariant ContinuationBoundaryProjectionCarriesDurableSummary {
         boundary.summary = PersistedContinuationBoundarySummary(boundary.predecessor_conversation_id, boundary.successor_conversation_id)
 }
 
+-- There is one root-sequence ledger per ProductConversation root. Every init
+-- watermark, replayable projection, and live root-stream envelope derives from
+-- that ledger, so no parallel unnamed allocator can produce a competing root
+-- ordering.
 invariant RootStreamLedgerIsMonotonicAndAuthoritative {
     for ledger in RootStreamLedgers:
         ledger.last_allocated_root_sequence_id >= 0
 
     for row in ProjectedTranscriptRows:
         exists RootStreamLedger{root_conversation_id: row.root_conversation_id}
-        row.root_sequence_id <= RootStreamLedger{root_conversation_id: row.root_conversation_id}.last_allocated_root_sequence_id
+            and row.root_sequence_id <= RootStreamLedger{root_conversation_id: row.root_conversation_id}.last_allocated_root_sequence_id
 
     for boundary in ProjectedContinuationBoundaries:
         exists RootStreamLedger{root_conversation_id: boundary.root_conversation_id}
-        boundary.root_sequence_id <= RootStreamLedger{root_conversation_id: boundary.root_conversation_id}.last_allocated_root_sequence_id
-
-    @guidance
-        -- There is one root-sequence ledger per ProductConversation root. Every init
-        -- watermark, replayable projection, and live root-stream envelope derives from
-        -- that ledger, so no parallel unnamed allocator can produce a competing root
-        -- ordering.
+            and boundary.root_sequence_id <= RootStreamLedger{root_conversation_id: boundary.root_conversation_id}.last_allocated_root_sequence_id
 }
 
 -- Ring entries are in strictly increasing sequence_id order. Not
