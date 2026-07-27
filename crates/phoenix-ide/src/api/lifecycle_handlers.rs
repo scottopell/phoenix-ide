@@ -373,7 +373,7 @@ pub(crate) async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let _acceptance_guard = state.runtime.lock_steering_acceptance().await;
+    let _acceptance_guard = state.runtime.lock_conversation_acceptance(&id).await;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(&id)
         .await
@@ -677,7 +677,7 @@ pub(crate) async fn mark_merged(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let _acceptance_guard = state.runtime.lock_steering_acceptance().await;
+    let _acceptance_guard = state.runtime.lock_conversation_acceptance(&id).await;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(&id)
         .await

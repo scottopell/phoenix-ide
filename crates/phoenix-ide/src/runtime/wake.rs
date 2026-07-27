@@ -50,6 +50,8 @@ pub(crate) struct ProductionWakeRegistrar {
             std::collections::HashMap<(String, String), crate::runtime::SteeringAcceptanceReceipt>,
         >,
     >,
+    conversation_acceptance_locks:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ProductionWakeRegistrar {
@@ -64,11 +66,15 @@ impl ProductionWakeRegistrar {
                 >,
             >,
         >,
+        conversation_acceptance_locks: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+        >,
     ) -> Self {
         Self {
             repo,
             kick_tx,
             acceptance_lock,
+            conversation_acceptance_locks,
         }
     }
 
@@ -88,7 +94,16 @@ impl WakeRegistrar for ProductionWakeRegistrar {
                 .as_secs(),
         );
         let prepared_fingerprint = input.prepared_fingerprint.clone();
+        let conversation_id = input.conversation_id.clone();
         let intent = input.into_intent(now);
+        let conversation_lock = self
+            .conversation_acceptance_locks
+            .lock()
+            .await
+            .entry(conversation_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _conversation_guard = conversation_lock.lock().await;
         let _acceptance_guard = self.acceptance_lock.lock().await;
         let outcome = self
             .repo
@@ -392,16 +407,30 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                     return Ok(Duration::ZERO);
                 }
                 let observation_time = self.clock.now();
-                let outcome = self
+                let outcome = match self
                     .repo
                     .record_terminal_allocated(&WakeTerminalEvidenceInput {
                         workflow_id: candidate.workflow_id,
-                        authority,
+                        authority: authority.clone(),
                         observation_time,
                         evidence: evidence.clone(),
                     })
                     .await
-                    .map_err(|e| e.to_string())?;
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if let Err(release_error) =
+                            self.repo.release_observation_authority(&authority).await
+                        {
+                            tracing::warn!(
+                                %release_error,
+                                workflow_id = candidate.workflow_id.0,
+                                "failed to release wake observation authority after persistence error"
+                            );
+                        }
+                        return Err(error.to_string());
+                    }
+                };
                 if matches!(
                     outcome,
                     WakeTerminalEvidenceOutcome::Recorded { .. }
@@ -513,6 +542,9 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             };
+            let _conversation_acceptance = manager
+                .lock_conversation_acceptance(&current.conversation_id)
+                .await;
             let _steering_acceptance = manager.lock_steering_acceptance().await;
             let active_direct_turn =
                 phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone())
@@ -1923,7 +1955,12 @@ mod tests {
         let (kick_tx, _) = watch::channel(0u64);
         let acceptance_lock = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let lifecycle_guard = acceptance_lock.lock().await;
-        let registrar = ProductionWakeRegistrar::new(repo, kick_tx, Arc::clone(&acceptance_lock));
+        let registrar = ProductionWakeRegistrar::new(
+            repo,
+            kick_tx,
+            Arc::clone(&acceptance_lock),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        );
         let registration = tokio::spawn(async move {
             registrar
                 .register(register_input(&scope, "b-1", "fp-1", 50))
@@ -1947,6 +1984,7 @@ mod tests {
         let registrar = ProductionWakeRegistrar::new(
             repo,
             kick_tx,
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         );
 
@@ -1998,6 +2036,7 @@ mod tests {
         let registrar = ProductionWakeRegistrar::new(
             repo,
             kick_tx,
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         );
 
@@ -2427,6 +2466,7 @@ mod tests {
         ProductionWakeRegistrar::new(
             repo.clone(),
             kick_tx,
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         )
         .cancel(CancelWakeInput {

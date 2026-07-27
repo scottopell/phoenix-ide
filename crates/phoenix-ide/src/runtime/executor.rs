@@ -2253,7 +2253,20 @@ where
             let deadline = self.deadline;
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
+            let wake_cancellation_retry_owed = !self.wake_cancellations_owed.is_empty();
+            let wake_cancellation_retry = async move {
+                if wake_cancellation_retry_owed {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(wake_cancellation_retry);
+
             tokio::select! {
+                () = &mut wake_cancellation_retry => {
+                    self.request_registered_wake_cancellation().await;
+                }
                 Some(event) = self.event_rx.recv() => {
                     // Eviction shutdown signal — exit cleanly so the broadcaster
                     // is dropped and connected SSE clients detect the closed

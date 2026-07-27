@@ -275,6 +275,10 @@ impl SendChatApplicationService {
         let repo = WorkflowRepository::new(self.db.pool().clone());
         let client_key = ClientTurnKey::new(req.message_id.clone())
             .ok_or(SendChatServiceError::IdempotencyConflict)?;
+        let _conversation_guard = self
+            .runtime
+            .lock_conversation_acceptance(&req.conversation_id)
+            .await;
         let _acceptance_guard = self.runtime.lock_steering_acceptance().await;
         let step = match repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {

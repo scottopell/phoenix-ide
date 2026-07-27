@@ -4481,7 +4481,7 @@ async fn archive_conversation(
 /// continue; only the final `archived = 1` write is fatal.
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "archive").await?;
-    let _acceptance_guard = state.runtime.lock_steering_acceptance().await;
+    let _acceptance_guard = state.runtime.lock_conversation_acceptance(id).await;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(id)
         .await
@@ -4843,7 +4843,7 @@ async fn delete_conversation(
 /// log WARN and continue per REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "delete").await?;
-    let _acceptance_guard = state.runtime.lock_steering_acceptance().await;
+    let _acceptance_guard = state.runtime.lock_conversation_acceptance(id).await;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(id)
         .await

@@ -193,6 +193,7 @@ pub struct RuntimeManager {
     /// Serializes legacy steering admission until the normalized queue row is visible.
     steering_acceptance_receipts:
         Arc<AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>>,
+    steering_acceptance_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1392,11 +1393,13 @@ impl RuntimeManager {
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
         let steering_acceptance_receipts = Arc::new(AsyncMutex::new(HashMap::new()));
+        let steering_acceptance_locks = Arc::new(AsyncMutex::new(HashMap::new()));
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
                 wake_kick_tx.clone(),
                 Arc::clone(&steering_acceptance_receipts),
+                Arc::clone(&steering_acceptance_locks),
             ));
         Self {
             db,
@@ -1419,6 +1422,7 @@ impl RuntimeManager {
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             steering_acceptance_receipts,
+            steering_acceptance_locks,
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
@@ -3373,6 +3377,20 @@ impl RuntimeManager {
                 "Runtime evicted; shutdown signal sent, broadcaster preserved for new runtime"
             );
         }
+    }
+
+    pub(crate) async fn lock_conversation_acceptance(
+        &self,
+        conversation_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .steering_acceptance_locks
+            .lock()
+            .await
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
+        lock.lock_owned().await
     }
 
     pub(crate) async fn lock_steering_acceptance(
