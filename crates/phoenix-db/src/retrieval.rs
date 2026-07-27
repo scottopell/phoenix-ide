@@ -790,13 +790,25 @@ fn build_fts_query(natural: &str, match_mode: RetrievalMatchMode) -> Option<Stri
         .enumerate()
         .map(|(idx, t)| {
             if idx == last && match_mode == RetrievalMatchMode::FinalTokenPrefix {
-                format!("\"{t}\"*")
+                build_prefix_alternatives(&t)
             } else {
                 format!("\"{t}\"")
             }
         })
         .collect();
     Some(terms.join(" OR "))
+}
+
+fn build_prefix_alternatives(term: &str) -> String {
+    const MIN_TRUNCATED_PREFIX_CHARS: usize = 4;
+    let mut chars = term.chars();
+    let last = chars.next_back();
+    let truncated = chars.as_str();
+    if last.is_some() && truncated.chars().count() >= MIN_TRUNCATED_PREFIX_CHARS {
+        format!("(\"{term}\"* OR \"{truncated}\"*)")
+    } else {
+        format!("\"{term}\"*")
+    }
 }
 
 /// Stable, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used to
@@ -852,8 +864,8 @@ mod tests {
 
     #[test]
     fn build_query_prefixes_only_for_palette_mode() {
-        let q = build_fts_query("observed kang", RetrievalMatchMode::FinalTokenPrefix).unwrap();
-        assert_eq!(q, "\"observed\" OR \"kang\"*");
+        let q = build_fts_query("observed groundi", RetrievalMatchMode::FinalTokenPrefix).unwrap();
+        assert_eq!(q, "\"observed\" OR (\"groundi\"* OR \"ground\"*)");
     }
 
     #[test]
@@ -1293,6 +1305,33 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, "prefix-1");
+    }
+
+    #[tokio::test]
+    async fn prefix_match_handles_partial_porter_stem() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("c1", "prefix-porter", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "m1",
+            "c1",
+            &MessageContent::user("Review the grounding conversation"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let retriever = Fts5Retriever::new(db.pool().clone());
+        retriever.reconcile().await.unwrap();
+
+        let hits = retriever
+            .retrieve(RetrievalRequest::palette_conversation_search("groundi", 10))
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id, "c1");
     }
 
     #[tokio::test]
