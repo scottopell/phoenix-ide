@@ -116,7 +116,6 @@ entity TaskFile {
 }
 
 entity Worktree {
-    conversation: bedrock/Conversation
     product_conversation: bedrock/ProductConversation
     project: Project
     attached_scope: WorkScope
@@ -241,7 +240,6 @@ rule GitBackedConversationProvisioned {
                 detached_start_commit: resolution.resolved.starting_commit
             )
             and Worktree.created(
-                conversation: conversation,
                 product_conversation: target,
                 project: project,
                 attached_scope: WorkScope{product_conversation: target},
@@ -319,9 +317,9 @@ rule SearchRemoteBranches {
 rule TaskApprovalExecuted {
     when: UserApprovesTask(conversation, decision)
     requires: decision = approved_continue_current
-    requires: exists Worktree{conversation: conversation}
+    requires: exists Worktree{product_conversation: conversation.product_conversation}
 
-    let worktree = Worktree{conversation: conversation}
+    let worktree = Worktree{product_conversation: conversation.product_conversation}
     let approved_source = ApprovedTaskSource {
         task_path: conversation.proposal.task_file,
         title: conversation.proposal.title,
@@ -383,17 +381,16 @@ rule WorktreeTransferredOnContinuation {
     when: UserStartsContinuationConversation(parent, new_conv, handoff_text, first_message_id)
 
     requires: parent.parent_status = context_exhausted
-    requires: exists Worktree{conversation: parent}
+    requires: exists Worktree{product_conversation: parent.product_conversation}
     requires: parent.continued_in_conv_id = absent
 
-    let worktree = Worktree{conversation: parent}
+    let worktree = Worktree{product_conversation: parent.product_conversation}
     let scope = worktree.attached_scope
 
     ensures: new_conv.product_conversation = parent.product_conversation
     ensures: new_conv.working_dir = parent.working_dir
     ensures: new_conv.worktree_path = parent.worktree_path
     ensures: parent.continued_in_conv_id = new_conv.id
-    ensures: worktree.conversation = new_conv
     ensures: worktree.product_conversation = new_conv.product_conversation
     ensures: worktree.attached_scope = scope
     ensures: HandedOffPredecessorReadOnly(parent)
@@ -409,7 +406,7 @@ rule DirectContinuationInheritsCwd {
     when: UserStartsContinuationConversation(parent, new_conv, handoff_text, first_message_id)
 
     requires: parent.parent_status = context_exhausted
-    requires: not exists Worktree{conversation: parent}
+    requires: not exists Worktree{product_conversation: parent.product_conversation}
     requires: parent.continued_in_conv_id = absent
 
     ensures: new_conv.product_conversation = parent.product_conversation
@@ -421,7 +418,8 @@ rule DirectContinuationInheritsCwd {
 rule WriteBlockedOutsideWorktree {
     when: WriteAttempted(conversation, target_path)
 
-    requires: exists Worktree{conversation: conversation}
+    requires: exists Worktree{product_conversation: conversation.product_conversation}
+    requires: conversation.continued_in_conv_id = absent
     requires: not is_within(target_path, conversation.worktree_path)
 
     ensures: WriteRejected(conversation, target_path,
@@ -431,7 +429,8 @@ rule WriteBlockedOutsideWorktree {
 rule WorkSubAgentInheritsWorktree {
     when: SubAgentSpawned(parent, sub_agent, mode)
 
-    requires: exists Worktree{conversation: parent}
+    requires: exists Worktree{product_conversation: parent.product_conversation}
+    requires: parent.continued_in_conv_id = absent
     requires: mode = work
 
     ensures: sub_agent.working_dir = parent.worktree_path
@@ -448,7 +447,7 @@ rule ExploreSubAgentDirectory {
     requires: mode = explore
 
     ensures:
-        if exists Worktree{conversation: parent}:
+        if exists Worktree{product_conversation: parent.product_conversation}:
             sub_agent.working_dir = parent.worktree_path
             and SubAgentAttachedToSharedWorkScope(parent, sub_agent)
         else:
@@ -458,7 +457,7 @@ rule ExploreSubAgentDirectory {
 rule ServerRestartWorktreeReconciliation {
     when: ServerRestarted(conversation)
 
-    requires: exists Worktree{conversation: conversation}
+    requires: exists Worktree{product_conversation: conversation.product_conversation}
     requires: conversation.continued_in_conv_id = absent
     requires: conversation.parent_status != context_exhausted
     requires: conversation.state != terminal
@@ -490,15 +489,15 @@ invariant WorktreePathsUnique {
             a != b implies a.path != b.path
 }
 
-invariant OneWorktreePerConversation {
+invariant OneWorktreePerProductConversation {
     for a in Worktrees:
         for b in Worktrees:
-            a != b implies a.conversation != b.conversation
+            a != b implies a.product_conversation != b.product_conversation
 }
 
-invariant WorktreeOwnershipFollowsContinuationPointer {
+invariant WorktreeTargetsTopologyLatestRow {
     for w in Worktrees:
-        w.conversation.continued_in_conv_id = absent
+        exists bedrock/Parent{product_conversation: w.product_conversation, continued_in_conv_id: absent}
 }
 
 invariant WorkScopeSharedAcrossContinuation {
@@ -538,9 +537,11 @@ surface ProjectManagement {
     facing: bedrock/User
 
     context conversation: bedrock/Conversation
-        where exists Worktree{conversation: conversation} and core_status in { idle, error }
+        where exists Worktree{product_conversation: conversation.product_conversation}
+          and conversation.continued_in_conv_id = absent
+          and core_status in { idle, error }
 
-    let worktree = Worktree{conversation: conversation}
+    let worktree = Worktree{product_conversation: conversation.product_conversation}
 
     exposes:
         worktree.starting_branch_name

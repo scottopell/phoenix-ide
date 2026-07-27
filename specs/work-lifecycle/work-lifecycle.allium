@@ -160,7 +160,7 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
         not exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
-        bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id,
+        bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_retirement_inspection}.attempt_id,
         inspection_generation: "no-worktree",
         inspection_fingerprint: "no-worktree"
     )
@@ -173,7 +173,12 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
 
 rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     requires: not exists AttachedWorkScope{product_conversation: product_conversation}
     ensures: ResourceRetirementCompleted(product_conversation, attempt_id)
 
@@ -194,7 +199,7 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
     requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
-        bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id,
+        bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_retirement_inspection}.attempt_id,
         inspection_generation: RetirementInspection.generation,
         inspection_fingerprint: RetirementInspection.fingerprint
     )
@@ -222,7 +227,7 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
         or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionRequiresConfirmation(
         product_conversation,
-        bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id,
+        bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_retirement_inspection}.attempt_id,
         inspection_generation: RetirementInspection.generation,
         inspection_fingerprint: RetirementInspection.fingerprint
     )
@@ -238,13 +243,18 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
 
 rule ChangedWorkspaceInvalidatesOutstandingConfirmation {
     when: WorkspaceFingerprintChanged(product_conversation)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.phase = awaiting_loss_confirmation
-    ensures: RetirementInspectionChanged(product_conversation, bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_loss_confirmation}.phase = awaiting_loss_confirmation
+    ensures: RetirementInspectionChanged(product_conversation, bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_loss_confirmation}.attempt_id)
 }
 
 rule RetirementRequestedRetiresOwnedResources {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
@@ -260,7 +270,12 @@ rule RetirementRequestedRetiresOwnedResources {
 
 rule RetirementRequestedCreatesPerResourceEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
@@ -283,7 +298,12 @@ rule RetirementRequestedCreatesPerResourceEvidence {
 
 rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
     requires: blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
@@ -299,7 +319,12 @@ rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
 
 rule RetirementStepSuccessRecordsTypedEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists RetiredResource{
@@ -318,7 +343,12 @@ rule RetirementStepSuccessRecordsTypedEvidence {
 
 rule RetirementAlreadyRetiredIsIdempotentNoOp {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists RetiredResource{
@@ -337,7 +367,12 @@ rule RetirementAlreadyRetiredIsIdempotentNoOp {
 
 rule ResourceRetirementFailureProducesResidualRepairState {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     requires: exists RetirementResidualResource{attempt: RetirementAttempt, product_conversation: product_conversation}
     ensures: ResourceRetirementFailed(product_conversation, attempt_id)
 
@@ -350,7 +385,12 @@ rule ResourceRetirementFailureProducesResidualRepairState {
 
 rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
@@ -367,7 +407,12 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
 
 rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
     let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}

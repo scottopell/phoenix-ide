@@ -1358,14 +1358,21 @@ rule UserRequestsCloseConversation {
     requires: not exists Parent{product_conversation: conversation.product_conversation, parent_status: awaiting_task_approval}
     requires: not exists Parent{product_conversation: conversation.product_conversation, core_status: awaiting_continuation}
     requires:
-        not CloseObligation.exists(product_conversation: conversation.product_conversation)
-        or CloseObligation{product_conversation: conversation.product_conversation}.phase = completed
+        not exists CloseObligation{product_conversation: conversation.product_conversation}
+            where phase in {
+                awaiting_blocker_resolution,
+                awaiting_stop_work_confirmation,
+                settling_active_work,
+                cancel_requested_during_settlement,
+                awaiting_retirement_inspection,
+                awaiting_loss_confirmation,
+                retirement_requested,
+                needs_repair
+            }
     ensures: CloseObligation.created(
         attempt_id: attempt_id,
         product_conversation: conversation.product_conversation,
-        phase: awaiting_blocker_resolution,
-        inspection_generation: null,
-        inspection_fingerprint: null
+        phase: awaiting_blocker_resolution
     )
 
     @guidance
@@ -1381,56 +1388,50 @@ rule UserRequestsCloseConversation {
 
 rule CloseObligationRequiresExplicitStopWorkConfirmation {
     when: CloseEvaluationRequested(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_blocker_resolution
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_blocker_resolution
     requires: exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_stop_work_confirmation
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_stop_work_confirmation
     ensures: StopWorkAndContinueClosingConfirmationRequired(product_conversation)
 }
 
 rule CloseObligationUserConfirmsStopWork {
     when: UserConfirmsStopWorkAndContinueClosing(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_stop_work_confirmation
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_stop_work_confirmation
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     ensures: CloseSettlementRequested(product_conversation, attempt_id)
 }
 
 rule CloseObligationCanBeCancelledBeforeSettlementStarts {
     when: UserCancelsClose(product_conversation, attempt_id)
-    requires: CloseObligation.exists(product_conversation: product_conversation)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase in {
+    requires: CloseObligation.exists(product_conversation: product_conversation, attempt_id: attempt_id)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
         awaiting_blocker_resolution,
         awaiting_stop_work_confirmation,
         awaiting_retirement_inspection,
         awaiting_loss_confirmation
     }
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
     ensures: CloseObligationCancelled(product_conversation, attempt_id)
 }
 
 rule CloseObligationQueuesCancellationDuringSettlement {
     when: UserCancelsClose(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = cancel_requested_during_settlement
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
     ensures: CloseSettlementCancellationQueued(product_conversation, attempt_id)
 }
 
 rule CloseObligationBeginsSettlementWithoutBusyWork {
     when: CloseEvaluationRequested(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_blocker_resolution
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_blocker_resolution
     requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     ensures: CloseSettlementRequested(product_conversation, attempt_id)
 }
 
 rule CloseObligationWaitsForSettlement {
     when: CloseSettlementProgressed(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase in { settling_active_work, cancel_requested_during_settlement }
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { settling_active_work, cancel_requested_during_settlement }
     requires: not all_close_owned_authorities_released(product_conversation)
     ensures: CloseSettlementStillOwed(product_conversation)
 
@@ -1443,19 +1444,17 @@ rule CloseObligationWaitsForSettlement {
 
 rule CloseObligationRequestsRetirementInspectionAfterSettlement {
     when: CloseSettlementProgressed(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     requires: all_close_owned_authorities_released(product_conversation)
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_retirement_inspection
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
     ensures: RetirementInspectionRequested(product_conversation, attempt_id)
 }
 
 rule CloseSettlementCancellationCompletesAfterBusyOwnershipReleased {
     when: CloseSettlementProgressed(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = cancel_requested_during_settlement
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
     requires: all_close_owned_authorities_released(product_conversation)
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
     ensures: CloseObligationCancelled(product_conversation, attempt_id)
 
     @guidance
@@ -1470,30 +1469,27 @@ rule CloseSettlementCancellationCompletesAfterBusyOwnershipReleased {
 
 rule RetirementInspectionShowsNoConfirmationRequired {
     when: RetirementInspectionCompletedWithoutConfirmation(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_retirement_inspection
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = retirement_requested
-    ensures: CloseObligation{product_conversation: product_conversation}.inspection_generation = inspection_generation
-    ensures: CloseObligation{product_conversation: product_conversation}.inspection_fingerprint = inspection_fingerprint
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
     ensures: ResourceRetirementRequested(product_conversation, attempt_id)
 }
 
 rule RetirementInspectionRequiresLossConfirmation {
     when: RetirementInspectionRequiresConfirmation(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_retirement_inspection
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_loss_confirmation
-    ensures: CloseObligation{product_conversation: product_conversation}.inspection_generation = inspection_generation
-    ensures: CloseObligation{product_conversation: product_conversation}.inspection_fingerprint = inspection_fingerprint
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
 }
 
 rule BoundLossConfirmationRequestsRetirement {
     when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_loss_confirmation
-    requires: CloseObligation{product_conversation: product_conversation}.inspection_generation = inspection_generation
-    requires: CloseObligation{product_conversation: product_conversation}.inspection_fingerprint = inspection_fingerprint
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = retirement_requested
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
     ensures: ResourceRetirementRequested(product_conversation, attempt_id)
 
     @guidance
@@ -1504,20 +1500,18 @@ rule BoundLossConfirmationRequestsRetirement {
 
 rule ChangedInspectionInvalidatesOutstandingConfirmation {
     when: RetirementInspectionChanged(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = awaiting_loss_confirmation
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_retirement_inspection
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
     ensures: RetirementInspectionRequested(product_conversation, attempt_id)
 }
 
 rule CloseRetirementCompletionFinalizesAggregateHistory {
     when: ResourceRetirementCompleted(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase in { retirement_requested, needs_repair }
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { retirement_requested, needs_repair }
     requires: product_conversation.lifecycle = open
     ensures: CloseOutcomeSystemMessagePersisted(product_conversation)
     ensures: product_conversation.lifecycle = history
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
     ensures: ProductConversationEnteredHistory(product_conversation, attempt_id)
 
     @guidance
@@ -1530,18 +1524,16 @@ rule CloseRetirementCompletionFinalizesAggregateHistory {
 
 rule CloseRetirementFailureLeavesOpenNeedsRepair {
     when: ResourceRetirementFailed(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase in { retirement_requested, needs_repair }
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { retirement_requested, needs_repair }
     requires: product_conversation.lifecycle = open
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = needs_repair
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
     ensures: CloseNeedsRepairVisible(product_conversation, attempt_id)
 }
 
 rule CloseNeedsRepairCanRetryRetirement {
     when: CloseRetirementRetryRequested(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation}.attempt_id = attempt_id
-    requires: CloseObligation{product_conversation: product_conversation}.phase = needs_repair
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = retirement_requested
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
     ensures: ResourceRetirementRequested(product_conversation, attempt_id)
 }
 
@@ -1891,7 +1883,16 @@ invariant ProductConversationHasSingleTopologyLatestRow {
 
 invariant ProductConversationHasAtMostOneActiveCloseAttempt {
     for pc in ProductConversation:
-        count(CloseObligation where product_conversation = pc and phase != completed) <= 1
+        count(CloseObligation where product_conversation = pc and phase in {
+            awaiting_blocker_resolution,
+            awaiting_stop_work_confirmation,
+            settling_active_work,
+            cancel_requested_during_settlement,
+            awaiting_retirement_inspection,
+            awaiting_loss_confirmation,
+            retirement_requested,
+            needs_repair
+        }) <= 1
 }
 
 invariant ContinuationBoundarySummaryLivesOnHandedOffPredecessor {
