@@ -706,7 +706,7 @@ representation (the task-approval reader). `propose_task` follows the submit_res
 interception pattern — pure data carrier (its `run()` is an unreachable fallback), no
 side effects, no tool execution. The plan is a real file the agent edits with `patch`,
 so revisions are file edits; all git operations are deferred to the approval moment and
-happen on the task branch.
+happen when the approved task artifact is committed; approval itself does not imply a task-branch lifecycle.
 
 **Dependencies:** REQ-PROJ-003, REQ-PROJ-004
 
@@ -839,66 +839,35 @@ THE SYSTEM SHALL treat the operation as idempotent success rather than recreatin
 ### REQ-BED-032: Conversation Terminal-Transition Cascade
 
 
-A conversation transitions to a terminal lifecycle state via:
-- **hard-delete** — user permanently removes the conversation aggregate and
-  all solely-owned dependent rows
-- **archive** — user signals "this work is over"; row + messages
-  preserved for retrospection, live resources released
-- **abandon** (Work/Branch) — user signals "this work failed"; cleanup
-  matches archive plus the abandon-specific diff snapshot
-- **mark-merged** (Work/Branch) — user signals "this work shipped";
-  cleanup matches archive plus the post-merge state recording
+Permanent Delete is the only terminal transition this requirement owns directly. Close-to-History resource retirement is specified by REQ-BED-029 plus `specs/work-lifecycle/requirements.md`; it is not a parallel hard-delete path.
 
-All four transitions are terminal — the conversation cannot resume in-
-place after them, and the live resources (bash handles, tmux server,
-worktree, browser session) MUST be released.
-
-WHEN any of the above terminal transitions fires
-THE SYSTEM SHALL run the resource-cleanup cascade, which performs the
+WHEN a permanent Delete request targets a History conversation
+THE SYSTEM SHALL run the hard-delete resource-cleanup cascade, which performs the
 following sequence of direct calls in order:
-1. Cancel-or-reject if busy (REQ-BED-032 below)
+1. Reject if the conversation is still busy or otherwise not yet eligible for permanent Delete
 2. `cascade_bash_on_delete(conversation)` — kills live bash handles for
    the conversation and drops in-memory tombstones (REQ-BASH-006)
 3. `cascade_tmux_on_delete(work_scope, inheritor_scope)` — runs
    `tmux kill-server` against the scope's socket, unlinks the socket
-   file, removes the registry entry, unless the continuation inherits
+   file, removes the registry entry, unless another still-live owner retains
    the same `WorkScope` (REQ-TMUX-007, REQ-TMUX-WS-002)
 4. `cascade_projects_on_delete(conversation, inheritor_scope)` —
-   worktree/branch cleanup, unless a live conversation other than the one
-   being deleted still owns the same `WorkScope` (a continuation that
-   inherits it, or a Work-mode sub-agent that shares its parent's
-   worktree). A Work sub-agent inherits the parent's `worktree_path`, so
-   removing the worktree or deleting the branch while the parent is live
-   would destroy the parent's still-in-use checkout — the same
-   any-live-owner preservation signal that gates steps 3 and 5 gates this
-   step (REQ-BASH-WS-002, REQ-PROJ-015)
+   worktree cleanup only when no other live conversation still has the same
+   attached `WorkScope`; hard delete does not create, move, or delete branches
+   as part of cleanup (REQ-PROJ-015)
 5. `cascade_browser_on_delete(work_scope, inheritor_scope)` — drops the
-   Chrome session for the scope unless the continuation inherits the
+   Chrome session for the scope unless another still-live owner retains the
    same `WorkScope` (REQ-BROWSER-WS-003)
-6. For hard-delete only: `db.delete_conversation(conversation_id)` —
-   permanent Delete removes the complete conversation aggregate, including solely-owned messages,
+6. `db.delete_conversation(conversation_id)` — permanent Delete removes the complete conversation aggregate, including solely-owned messages,
    tool calls, approval records, attachments, and index projections, while leaving related but
-   separately-owned conversations, branches, and pull requests untouched. Close preserves the row as
-   History instead.
-7. Broadcast the matching SSE wire event for UI consumers —
-   `ConversationHardDeleted` for hard-delete, the existing
-   archive/abandon/merged events for the other three transitions.
+   separately-owned conversations, branches, and pull requests untouched
+7. Broadcast `ConversationHardDeleted` for UI consumers
 
 THE handler SHALL invoke each cascade step on its own; there is no
 event bus, no subscriber registration, and no dynamic dispatch. The
 "subscribers first, row last" ordering is a property of the call sequence
 in the handler. Each cascade function reads whatever conversation state
-it needs (working_dir, mode, etc.) before the row delete in step 5.
-
-WHEN the conversation is busy (the agent is in any `core_status` that
-makes `is_busy` true)
-THE SYSTEM SHALL either:
-(a) reject the hard-delete request with a structured "cancel first"
-    response (HTTP 409 or equivalent), OR
-(b) issue cancellation, wait for the conversation to settle to
-    `core_status = idle`, then proceed with the cascade
-The choice is an API-layer policy decision; the contract is that a
-hard-delete cascade NEVER fires while the conversation is busy.
+it needs before the row delete in step 6.
 
 WHEN a cascade step fails (subprocess error, file system error,
 registry-state inconsistency)
@@ -911,26 +880,17 @@ the conversation row deletion
 AND THE SYSTEM SHALL NOT attempt automatic recovery on a subsequent
 Phoenix startup. Orphans created by failed cleanup are the operator's
 problem; reconciliation machinery for hard-delete orphans is
-deliberately out of scope for v1.
+intentionally out of scope here.
 
-THE SYSTEM SHALL distinguish terminal transitions (hard-delete,
-archive, abandon, mark-merged — all of which run the cascade) from
-UI-only state changes (close-tab, blur, parent window closed — which
+THE SYSTEM SHALL distinguish permanent Delete from UI-only state changes (close-tab, blur, parent window closed — which
 do NOT run the cascade). The latter category exists purely to support
 "close the tab, come back later" — for those, long-lived per-scope
 resources (tmux servers, browser sessions) survive (REQ-TMUX-008
 makes this explicit on the tmux side; REQ-BROWSER-WS-003 on the
 browser side).
 
-History after Close is NOT reversible in place. The cascade releases live resources at
-archive time; the row is preserved for retrospection only. There is
-no `unarchive` operation — see REQ-API-006. Earlier drafts of this
-spec treated archive as a soft-state flag flip, but reviewing the
-unified-cleanup-cascade work (PR #135) made it obvious that "live
-resources reclaimed but row claims it can be resumed" is an
-incoherent state: an unarchived conversation would have no worktree
-or tmux session to resume into, so the resume promise would silently
-break.
+History after Close is NOT reversible in place. Close moves the conversation to History through the separate Close lifecycle; permanent Delete later removes that retained aggregate entirely. There is
+no `unarchive` operation because Archive is not a normative lifecycle concept.
 
 THE `ConversationHardDeleted` SSE wire event (step 6) SHALL be emitted
 exactly once per hard-delete operation, after all cascade steps have
@@ -939,8 +899,8 @@ related views. It is NOT a subscriber-dispatch hook for cleanup logic;
 cleanup runs synchronously inside the handler.
 
 **Rationale:** Bash handles live in-process; tmux servers and project
-worktrees live outside Phoenix. Without an explicit cascade, deleting a
-conversation leaves these resources orphaned: the OS-visible processes
+worktrees live outside Phoenix. Without an explicit hard-delete cascade, deleting a
+conversation aggregate leaves these resources orphaned: the OS-visible processes
 keep running, socket files accumulate in `~/.phoenix-ide/tmux-sockets/`,
 worktrees stay on disk. A direct-call orchestrator in the hard-delete
 handler is the simplest shape that satisfies the cleanup contract — a
