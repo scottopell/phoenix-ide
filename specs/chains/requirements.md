@@ -13,9 +13,9 @@ normal conversation list and want one place where I can:
   old rows or re-explaining the context
 
 I do not want Phoenix to make me manage a separate product object for
-that lineage. The durable root conversation is the product identity; the
-continued rows are implementation topology Phoenix uses to preserve the
-history of that one product conversation.
+that lineage. The durable root conversation is the product identity, and
+continuation-linked rows are implementation topology Phoenix uses to
+preserve the history of that one product conversation.
 
 ## Why the User Cares
 
@@ -273,9 +273,9 @@ scope within the product conversation rather than as a separately named,
 archivable, or deletable object
 
 **Rationale:** Separate management actions would imply a second
-user-facing object with its own lifecycle. The current product truth is
-one root-keyed ProductConversation whose lineage affects transcript
-history and recall scope, not a parallel chain entity.
+user-facing object with its own lifecycle. One root-keyed
+ProductConversation already carries the transcript history and recall
+scope for that work.
 
 ---
 

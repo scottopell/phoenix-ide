@@ -18,6 +18,8 @@ The affected requirements now distinguish those dimensions explicitly:
 
 The point-in-time decision needed here is not whether Phoenix should invent another aggregate or cache table. It is which persisted identity owns which kind of truth, so later requirements and Allium rules do not drift back into mixed authority.
 
+This decision also leaves a naming artifact in the spec set: the requirements covering continuation-linked conversation history remain in `specs/chains/` and keep `REQ-CHN-*` identifiers even though the accepted model treats that topology as implementation structure inside one ProductConversation rather than as a separate user-facing chain entity. Those identifiers remain stable anchors for cross-spec references; the user-facing model does not inherit a separate "chain" object from them.
+
 ## Options considered
 
 1. **Let transcript rows own lifecycle and latest resolution.** Each durable `Conversation` row would carry enough lifecycle meaning to answer whether the user-facing conversation is open, historical, and current. This keeps everything on one row type, but it duplicates product-lifecycle truth across a chain, makes predecessor read-only status easy to confuse with History, and pushes consumers toward extra "latest" caches or lookup tables.
@@ -55,6 +57,7 @@ Branches and pull requests are **observed**, never lifecycle-owned. Phoenix may 
 - **Positive:** Context continuation, Close, approved-task placement, PR targeting, unified transcript presentation, and Coordinator orientation can compose without inventing hidden row-lifecycle or branch-lifecycle rules.
 - **Positive:** The model preserves ADR-008's branch/PR observation boundary: lifecycle can guide from repository facts without mutating or owning them.
 - **Negative:** Consumers must distinguish product vocabulary from implementation vocabulary. A read-only predecessor row inside an Open product conversation is not History, and an attached `WorkScope` is not itself the lifecycle root.
+- **Neutral:** Some spec filenames and requirement identifiers retain `chain` / `CHN` naming as stable cross-reference anchors even though the accepted product model treats continuation topology as implementation structure inside one ProductConversation.
 - **Negative:** Some reads must derive latest execution from `continued_in_conv_id` instead of relying on duplicated latest/root tables or cached row ownership fields.
 - **Negative:** Consumers must resolve attached scope from the ProductConversation while resolving live execution state from only the latest execution row; inventing a row owner for `WorkScope` would collapse those distinct authorities again.
 - **Neutral:** This ADR leaves open whether some chat-only conversations may carry non-Git `WorkScope` attachments, because that question does not change the accepted ownership split.
