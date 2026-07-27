@@ -157,3 +157,42 @@ Append a completion note with these headings:
 
 **Commit**
 - Pending
+
+
+## 92030 correction pass A2 evidence
+
+**Files changed**
+- `specs/projects/projects.allium`
+- `tasks/92030-p1-in-progress--cross-file-allium-review.md`
+
+**Settled facts enforced**
+- Canonical default identity no longer falls back to `repo.current_branch`. `GitDirectoryDetected` now resolves `canonical_default_branch` only from `authoritative_default_identity(repo)`, and the guidance explicitly limits authority to configured remote-default identity or cached local/remote-tracking evidence for that same branch.
+- Unified Git-backed provisioning now models the exact single-branch truth flow: `SingleBranchFetchAttempted(project, default_branch)`, fetched remote-tracking tip preferred when available, cached remote-tracking ref allowed only as a stale-warning fallback, and typed provisioning failure when no commit resolves.
+- Detached-start provisioning now records provenance on the worktree/work-scope side only. `Worktree` exposes `starting_branch_name` and `starting_commit`, and `DetachedStartProvenance`/`DefaultIdentityProvenance` capture where the default identity came from without stamping `conversation.base_branch`, `conversation.branch_name`, or a synthetic detached label as ownership.
+- Continuation no longer duplicates branch fields. `WorktreeTransferredOnContinuation` keeps the same `ProductConversation`, `WorkScope`, `working_dir`, and `worktree_path`, but no longer writes `new_conv.base_branch` or `new_conv.branch_name`.
+- `current_branch` remains only a repository observation field declaration; it is no longer referenced by provisioning fallback logic. Branch picker remains observation-only.
+
+**Validation**
+- Command: `allium check specs/projects/projects.allium specs/bedrock/bedrock.allium`
+- Parsed result: `error_count 0` for `specs/projects/projects.allium` (CLI exit `1` due to existing non-error info/warning diagnostics only).
+- Command: `rg -n 'remote_default_branch\s+or\s+repo\.current_branch|repo\.current_branch' specs/projects/projects.allium`
+- Result: no matches.
+- Command: `rg -n 'ensures: .*base_branch|ensures: .*branch_name' specs/projects/projects.allium`
+- Result: no matches.
+- Command: `rg -n 'current_branch|base_branch|branch_name|continued_in_conv_id' specs/projects/projects.allium`
+- Result classification:
+  - `current_branch` appears only on `GitRepository.current_branch` as repository observation.
+  - `branch_name` appears on `DefaultIdentityProvenance.branch_name` and detached-start provenance wiring, not on conversation provisioning/continuation assignment.
+  - `continued_in_conv_id` remains only for continuation topology / ownership transfer.
+
+**Review / evidence ledger**
+- This pass corrected the specific reopened defects inside `specs/projects/projects.allium` only.
+- No other specs, code, or task files were edited beyond this appended evidence block.
+
+**Speculation avoided**
+- Did not reintroduce any arbitrary `repo.current_branch` default-branch fallback.
+- Did not restore conversation-level branch/base ownership writes for detached start or continuation.
+- Did not broaden the task into non-projects spec edits.
+
+**Commit**
+- Pending

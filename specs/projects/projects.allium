@@ -128,6 +128,16 @@ entity Worktree {
     is_clean: git_status_clean(path)
 }
 
+value DefaultIdentityProvenance {
+    branch_name: String
+    source: configured_remote_default | fetched_remote_tracking | cached_remote_tracking
+}
+
+value DetachedStartProvenance {
+    starting_commit: String
+    default_identity: DefaultIdentityProvenance
+}
+
 entity WorkScope {
     product_conversation: bedrock/ProductConversation
     project: Project
@@ -156,15 +166,21 @@ rule GitDirectoryDetected {
     requires: is_git_repository(directory)
 
     let repo = git_repo_at(directory)
+    let default_identity = authoritative_default_identity(repo)
 
+    ensures: ConfiguredOrCachedDefaultIdentityResolved(repo, default_identity)
     ensures: Project.created(
         repo: repo,
-        canonical_default_branch: repo.remote_default_branch or repo.current_branch
+        canonical_default_branch: default_identity.branch_name
     )
 
     @guidance
         -- Project association is keyed to the repository root, not the leaf
         -- directory the user supplied.
+        -- Canonical default identity comes only from authoritative configured
+        -- remote-default identity or cached local/remote-tracking evidence for
+        -- that same branch. The repository's current branch is observational and
+        -- never establishes canonical default ownership.
 }
 
 rule GitBackedConversationProvisioned {
@@ -177,17 +193,25 @@ rule GitBackedConversationProvisioned {
     let project = Project{repo: repo}
     let default_branch = project.canonical_default_branch
     let target = bedrock/ProductConversation{id: conversation.product_conversation.id}
+    let default_identity = DefaultIdentityProvenance {
+        branch_name: default_branch,
+        source: canonical_default_identity_source(project, default_branch)
+    }
+    let detached_start = DetachedStartProvenance {
+        starting_commit: detached_default_commit(project, default_branch),
+        default_identity: default_identity
+    }
 
     ensures: CanonicalDefaultBranchResolved(project, default_branch)
+    ensures: SingleBranchFetchAttempted(project, default_branch)
     ensures: CanonicalDefaultCommitSelected(project, default_branch)
-    ensures: DetachedDefaultStartSelected(project, default_branch)
-    ensures: FreshBranchFetchRequested(project, default_branch)
+    ensures: DetachedDefaultStartSelected(project, detached_start)
     ensures: WorkScope.created(
         product_conversation: target,
         project: project,
         worktree_path: WorktreePath { absolute_path: worktree_path(conversation) },
         canonical_default_branch: default_branch,
-        detached_start_commit: detached_default_commit(project, default_branch)
+        detached_start_commit: detached_start.starting_commit
     )
     ensures: Worktree.created(
         conversation: conversation,
@@ -195,13 +219,11 @@ rule GitBackedConversationProvisioned {
         project: project,
         attached_scope: WorkScope{product_conversation: target},
         path: WorktreePath { absolute_path: worktree_path(conversation) },
-        starting_branch_name: default_branch,
-        starting_commit: detached_default_commit(project, default_branch)
+        starting_branch_name: detached_start.default_identity.branch_name,
+        starting_commit: detached_start.starting_commit
     )
     ensures: conversation.working_dir = worktree_path(conversation)
     ensures: conversation.worktree_path = worktree_path(conversation)
-    ensures: conversation.base_branch = default_branch
-    ensures: conversation.branch_name = detached_default_branch_label(default_branch)
 
     @guidance
         -- Provisioning starts from the repository's canonical default branch and
@@ -210,12 +232,19 @@ rule GitBackedConversationProvisioned {
         --
         -- The fetch boundary is single-branch and truthful:
         --   1. Try a bounded fetch for exactly the canonical default branch.
-        --   2. If network refresh fails but a cached local remote-tracking ref for
-        --      that same branch exists, report that cached source explicitly and use it.
-        --   3. If neither fresh nor cached truth is available, fail with a typed
-        --      provisioning error.
+        --   2. Prefer the fetched remote-tracking tip when that fetch succeeds.
+        --   3. If refresh fails but a cached local/remote-tracking ref for that
+        --      same canonical branch still resolves, surface a stale-warning event
+        --      and use the cached ref truthfully.
+        --   4. If no commit resolves from either path, fail with a typed
+        --      provisioning error rather than synthesizing ownership.
+        --
+        -- Detached starts record starting_commit plus default-identity provenance
+        -- on the Phoenix-owned worktree, but do not stamp conversation branch/base
+        -- ownership fields or fabricate a detached branch label.
         --
         -- No fallback to an arbitrary current branch is allowed.
+}
 }
 
 rule DirectConversationHasNoProjectLifecycle {
@@ -319,8 +348,6 @@ rule WorktreeTransferredOnContinuation {
     ensures: new_conv.product_conversation = parent.product_conversation
     ensures: new_conv.working_dir = parent.working_dir
     ensures: new_conv.worktree_path = parent.worktree_path
-    ensures: new_conv.base_branch = parent.base_branch
-    ensures: new_conv.branch_name = parent.branch_name
     ensures: parent.continued_in_conv_id = new_conv.id
     ensures: worktree.conversation = new_conv
     ensures: worktree.product_conversation = new_conv.product_conversation
@@ -329,8 +356,9 @@ rule WorktreeTransferredOnContinuation {
 
     @guidance
         -- Continuation stays inside the same ProductConversation and the same
-        -- WorkScope. The predecessor row becomes a read-only handed-off segment,
-        -- not a separate history aggregate and not a new owner.
+        -- WorkScope/worktree attachment. The predecessor row becomes a read-only
+        -- handed-off segment, not a separate history aggregate and not a new owner.
+        -- Branch/base ownership is not duplicated onto the continuation row.
 }
 
 rule DirectContinuationInheritsCwd {
@@ -472,6 +500,7 @@ surface ProjectManagement {
 
     exposes:
         worktree.starting_branch_name
+        worktree.starting_commit
         worktree.attached_scope.canonical_default_branch
         worktree.is_clean
         worktree.approved_task
