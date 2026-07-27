@@ -377,9 +377,10 @@ AND SHALL report why safe reclamation was skipped
 ### REQ-PROJ-017: Record Detached Default-Branch Provenance Without Mode Semantics
 
 WHEN Phoenix provisions a Git-backed disposable worktree
-THE SYSTEM SHALL record the repository's authoritative canonical default-branch identity used to resolve the starting commit
-AND SHALL record the exact commit chosen after the bounded single-branch refresh-or-fallback rule
-AND SHALL record the worktree path and any approved task metadata needed for truthful UI and provenance
+THE SYSTEM SHALL first produce a typed provisioning result that is either resolved(commit, canonical default-branch identity, freshness) or unresolved(error)
+AND SHALL record the repository's authoritative canonical default-branch identity and exact commit only in the resolved case
+AND SHALL record the worktree path and any approved task metadata needed for truthful UI and provenance only in the resolved case
+AND SHALL persist the unresolved failure reason without omitting it or encoding it as missing worktree metadata in the unresolved case
 AND SHALL NOT require conversation ownership semantics to include a selected branch name, a dedicated branch-type discriminator, or a Phoenix-owned branch-lifecycle field
 
 THE Direct mode SHALL carry no Git-backed worktree metadata
@@ -492,11 +493,15 @@ WHEN the targeted refresh succeeds
 THE SYSTEM SHALL provision from the refreshed canonical default-branch tip at detached `HEAD`
 
 WHEN the targeted refresh fails but a previously resolved local or remote-tracking ref for the canonical default branch still exists
-THE SYSTEM SHALL provision from that cached canonical-default ref at detached `HEAD`
+THE SYSTEM SHALL return a typed resolved provisioning result carrying the exact commit, canonical default-branch identity, and `stale_cached` freshness
+AND SHALL provision from that cached canonical-default ref at detached `HEAD`
 AND SHALL surface that the starting point may be stale
 
 WHEN no canonical default-branch commit can be resolved after the bounded refresh-or-fallback attempt
-THE SYSTEM SHALL fail provisioning with a typed error instead of guessing from the repository's currently checked out branch or another arbitrary ref
+THE SYSTEM SHALL return a typed unresolved provisioning result carrying the failure reason
+AND SHALL persist that unresolved provisioning failure on the still-Open conversation
+AND SHALL NOT fabricate a `WorkScope`, worktree attachment, detached branch label, or fallback branch selection for that conversation
+AND SHALL fail provisioning with a typed error instead of guessing from the repository's currently checked out branch or another arbitrary ref
 
 THE SYSTEM SHALL preserve that one-branch refresh rule for provisioning even when repository-operations surfaces support broader branch discovery elsewhere
 

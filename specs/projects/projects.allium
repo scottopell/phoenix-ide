@@ -133,9 +133,30 @@ value DefaultIdentityProvenance {
     source: configured_remote_default | fetched_remote_tracking | cached_remote_tracking
 }
 
-value DetachedStartProvenance {
+value DetachedStartFreshness {
+    freshness: fresh | stale_cached
+}
+
+value ResolvedDetachedStart {
     starting_commit: String
     default_identity: DefaultIdentityProvenance
+    freshness: DetachedStartFreshness
+}
+
+value UnresolvedDetachedStart {
+    error: missing_canonical_default_identity | missing_canonical_default_commit
+}
+
+value DetachedStartResolution {
+    outcome: resolved | unresolved
+    resolved: ResolvedDetachedStart when outcome = resolved
+    unresolved: UnresolvedDetachedStart when outcome = unresolved
+}
+
+entity ProvisioningFailure {
+    conversation: bedrock/Conversation
+    project: Project
+    resolution: DetachedStartResolution
 }
 
 entity WorkScope {
@@ -166,13 +187,21 @@ rule GitDirectoryDetected {
     requires: is_git_repository(directory)
 
     let repo = git_repo_at(directory)
-    let default_identity = authoritative_default_identity(repo)
+    let default_resolution = authoritative_default_resolution(repo)
 
-    ensures: ConfiguredOrCachedDefaultIdentityResolved(repo, default_identity)
-    ensures: Project.created(
-        repo: repo,
-        canonical_default_branch: default_identity.branch_name
-    )
+    ensures:
+        if default_resolution.outcome = resolved:
+            ConfiguredOrCachedDefaultIdentityResolved(repo, default_resolution.resolved.default_identity)
+            and Project.created(
+                repo: repo,
+                canonical_default_branch: default_resolution.resolved.default_identity.branch_name
+            )
+        else:
+            ProvisioningFailure.created(
+                conversation: conversation,
+                project: Project{repo: repo},
+                resolution: default_resolution
+            )
 
     @guidance
         -- Project association is keyed to the repository root, not the leaf
@@ -191,57 +220,66 @@ rule GitBackedConversationProvisioned {
 
     let repo = git_repo_at(directory)
     let project = Project{repo: repo}
-    let default_branch = project.canonical_default_branch
     let target = bedrock/ProductConversation{id: conversation.product_conversation.id}
-    let default_identity = DefaultIdentityProvenance {
-        branch_name: default_branch,
-        source: canonical_default_identity_source(project, default_branch)
-    }
-    let detached_start = DetachedStartProvenance {
-        starting_commit: detached_default_commit(project, default_branch),
-        default_identity: default_identity
-    }
+    let resolution = detached_default_resolution(project)
 
-    ensures: CanonicalDefaultBranchResolved(project, default_branch)
-    ensures: SingleBranchFetchAttempted(project, default_branch)
-    ensures: CanonicalDefaultCommitSelected(project, default_branch)
-    ensures: DetachedDefaultStartSelected(project, detached_start)
-    ensures: WorkScope.created(
-        product_conversation: target,
-        project: project,
-        worktree_path: WorktreePath { absolute_path: worktree_path(conversation) },
-        canonical_default_branch: default_branch,
-        detached_start_commit: detached_start.starting_commit
-    )
-    ensures: Worktree.created(
-        conversation: conversation,
-        product_conversation: target,
-        project: project,
-        attached_scope: WorkScope{product_conversation: target},
-        path: WorktreePath { absolute_path: worktree_path(conversation) },
-        starting_branch_name: detached_start.default_identity.branch_name,
-        starting_commit: detached_start.starting_commit
-    )
-    ensures: conversation.working_dir = worktree_path(conversation)
-    ensures: conversation.worktree_path = worktree_path(conversation)
+    ensures:
+        if resolution.outcome = resolved:
+            CanonicalDefaultBranchResolved(project, resolution.resolved.default_identity.branch_name)
+            and SingleBranchFetchAttempted(project, resolution.resolved.default_identity.branch_name)
+            and CanonicalDefaultCommitSelected(project, resolution.resolved.default_identity.branch_name)
+            and DetachedDefaultStartSelected(project, resolution.resolved)
+            and (
+                resolution.resolved.freshness = stale_cached
+                implies CachedDefaultStartMayBeStale(project, resolution.resolved.default_identity.branch_name)
+            )
+            and WorkScope.created(
+                product_conversation: target,
+                project: project,
+                worktree_path: WorktreePath { absolute_path: worktree_path(conversation) },
+                canonical_default_branch: resolution.resolved.default_identity.branch_name,
+                detached_start_commit: resolution.resolved.starting_commit
+            )
+            and Worktree.created(
+                conversation: conversation,
+                product_conversation: target,
+                project: project,
+                attached_scope: WorkScope{product_conversation: target},
+                path: WorktreePath { absolute_path: worktree_path(conversation) },
+                starting_branch_name: resolution.resolved.default_identity.branch_name,
+                starting_commit: resolution.resolved.starting_commit
+            )
+            and conversation.working_dir = worktree_path(conversation)
+            and conversation.worktree_path = worktree_path(conversation)
+        else:
+            ProvisioningFailure.created(
+                conversation: conversation,
+                project: project,
+                resolution: resolution
+            )
 
     @guidance
         -- Provisioning starts from the repository's canonical default branch and
         -- checks out the resulting commit at detached HEAD inside the disposable
         -- Phoenix-owned worktree.
         --
+        -- The typed resolution boundary is disjoint:
+        --   1. Resolve either ResolvedDetachedStart(starting_commit,
+        --      default_identity, freshness) or UnresolvedDetachedStart(error).
+        --   2. Only the resolved branch may create the detached WorkScope/worktree
+        --      attachment and assign the conversation's worktree cwd.
+        --   3. The unresolved branch persists a typed ProvisioningFailure while the
+        --      conversation remains open without any fabricated WorkScope, worktree,
+        --      branch/base ownership fields, or detached label.
+        --
         -- The fetch boundary is single-branch and truthful:
         --   1. Try a bounded fetch for exactly the canonical default branch.
         --   2. Prefer the fetched remote-tracking tip when that fetch succeeds.
         --   3. If refresh fails but a cached local/remote-tracking ref for that
         --      same canonical branch still resolves, surface a stale-warning event
-        --      and use the cached ref truthfully.
-        --   4. If no commit resolves from either path, fail with a typed
-        --      provisioning error rather than synthesizing ownership.
-        --
-        -- Detached starts record starting_commit plus default-identity provenance
-        -- on the Phoenix-owned worktree, but do not stamp conversation branch/base
-        -- ownership fields or fabricate a detached branch label.
+        --      and record freshness = stale_cached before using the cached ref.
+        --   4. If no commit resolves from either path, persist unresolved(error)
+        --      rather than synthesizing ownership.
         --
         -- No fallback to an arbitrary current branch is allowed.
 }

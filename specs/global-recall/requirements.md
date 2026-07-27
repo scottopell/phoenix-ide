@@ -4,7 +4,7 @@
 
 As a Phoenix user, I often have several unrelated streams of work active across projects, continuation chains, and standalone conversations. I want one durable Phoenix-wide conversation where I can survey that work, inspect relevant history, and send useful text guidance to existing conversations without opening and operating each one manually.
 
-The Coordinator is an open-ended cross-conversation console, not ambient memory for ordinary coding conversations and not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. The Coordinator is excluded from the product conversation lifecycle and WorkScope model used for ordinary user and sub-agent execution conversations.
+The Coordinator is an open-ended cross-conversation console, not ambient memory for ordinary coding conversations and not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. Structurally, Phoenix models Coordinator identity separately from ordinary product-conversation lifecycle rows: ordinary parent transcript rows participate in the Open/History product lifecycle and WorkScope model, while the Coordinator retains normal transcript persistence, continuation, and message runtime without any ProductConversation Open/History lifecycle or ordinary Close/Delete controls. Sub-agents remain a separate execution kind and are not Coordinators.
 
 ## Why the User Cares
 
@@ -100,7 +100,10 @@ THE SYSTEM SHALL create that Coordinator conversation on demand when it does not
 
 THE Coordinator SHALL use the normal transcript, composer, streaming, continuation, persistence, and user-message runtime
 
+THE SYSTEM SHALL structurally distinguish the Coordinator from ordinary product conversations rather than encoding that difference as omitted lifecycle fields or nullable product-conversation links
+
 THE SYSTEM SHALL NOT present the Coordinator as ordinary project coding work or as a user-created open-work item
+AND SHALL NOT give the Coordinator an ordinary ProductConversation Open/History lifecycle, WorkScope attachment, Close control, or Delete control
 
 THE SYSTEM SHALL reject archive and hard-delete operations targeting any member of the Coordinator continuation chain so its transcript and singleton identity remain durable
 
@@ -221,6 +224,7 @@ IF the target cannot accept the message
 THE SYSTEM SHALL report a rejected result with a stable reason code and explanatory message and SHALL NOT report it as delivered or queued
 
 THE SYSTEM SHALL reject the Coordinator conversation and every member of its continuation chain as message targets
+AND SHALL continue to treat sub-agent conversations as separately ineligible targets under the ordinary acceptance rules rather than by conflating them with Coordinator identity
 
 THE SYSTEM SHALL reject archived, deleted, unavailable, terminal, context-exhausted, awaiting-question, and awaiting-approval targets according to authoritative conversation state
 

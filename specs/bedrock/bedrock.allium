@@ -116,11 +116,14 @@ enum ClosePhase {
 -- Conversation uses a sum type to structurally separate parent and sub-agent
 -- conversations. The kind discriminator determines which states are reachable.
 entity ProductConversation {
-    lifecycle: open | history
+    kind: ordinary | coordinator
+    lifecycle: open | history when kind = ordinary
 
     -- Aggregate membership is singular by construction: each durable
-    -- transcript row belongs to exactly one product conversation, and the
-    -- aggregate alone owns lifecycle.
+    -- transcript row belongs to exactly one product conversation. Only
+    -- ordinary product conversations own Open/History lifecycle; the
+    -- Coordinator keeps the same durable transcript/runtime identity without
+    -- entering that lifecycle.
     transcript_rows: Conversation with product_conversation = this
 }
 
@@ -314,12 +317,20 @@ variant Parent : Conversation {
     open_row_condition: parent_status in { context_exhausted, handed_off }
     is_latest_row: continued_in_conv_id = absent
     root_conversation: this when root = absent else root
-    product_lifecycle: history when root_conversation.lifecycle = history else open
-    row_accepts_user_messages: product_lifecycle = open
-        and is_latest_row
-        and parent_status != context_exhausted
-        and parent_status != handed_off
-    close_eligible: product_lifecycle = open
+    product_lifecycle: open | history when product_conversation.kind = ordinary
+    row_accepts_user_messages:
+        if product_conversation.kind = coordinator:
+            is_latest_row
+            and parent_status != context_exhausted
+            and parent_status != handed_off
+        else:
+            product_lifecycle = open
+            and is_latest_row
+            and parent_status != context_exhausted
+            and parent_status != handed_off
+    close_eligible:
+        product_conversation.kind = ordinary
+        and product_lifecycle = open
         and is_latest_row
         and parent_status != handed_off
 
@@ -754,6 +765,7 @@ rule RejectMessageDuringUserQuestion {
 rule RejectMessageContextExhausted {
     when: UserSendsMessage(conversation, text, images?)
     requires: conversation.parent_status = context_exhausted
+    requires: conversation.product_conversation.kind = ordinary
     requires: conversation.product_lifecycle = open
     ensures: MessageRejected(conversation, reason: context_exhausted)
 }
@@ -1198,6 +1210,7 @@ rule UserStartsContinuationConversation {
     when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
+    requires: conversation.product_conversation.kind = ordinary
     requires: conversation.product_lifecycle = open
     ensures: conversation.continued_in_conv_id = new_conv
     ensures: new_conv.predecessor = conversation
@@ -1213,6 +1226,7 @@ rule ContinuationHandoffBecomesBoundary {
     when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
+    requires: conversation.product_conversation.kind = ordinary
     requires: conversation.product_lifecycle = open
     ensures: conversation.parent_status = handed_off
     ensures: conversation.continuation_boundary_summary = conversation.continuation_summary
@@ -1229,6 +1243,7 @@ rule ContinuationBoundaryPersistenceSignature {
     when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
+    requires: conversation.product_conversation.kind = ordinary
     requires: conversation.product_lifecycle = open
     ensures: ContinuationBoundaryPersisted(
         root_conversation_id: conversation.product_conversation,
@@ -1283,17 +1298,19 @@ rule ProductConversationTranscriptProjectsChronologically {
 
 rule ProductConversationHistoryProjectionIsReadOnly {
     when: ProductConversationProjectionRequested(product_conversation)
+    requires: product_conversation.kind = ordinary
     requires: product_conversation.lifecycle = history
     ensures: TranscriptProjectionReadOnly(product_conversation)
     ensures: OrdinaryInputHidden(product_conversation)
 
     @guidance
         -- History is the same unified transcript surface projected from the same
-        -- aggregate; it is read-only and exposes no ordinary message input.
+        -- ordinary aggregate; it is read-only and exposes no ordinary message input.
 }
 
 rule ProductConversationOpenProjectionKeepsHandedOffRowsInsideOpen {
     when: ProductConversationProjectionRequested(product_conversation)
+    requires: product_conversation.kind = ordinary
     requires: product_conversation.lifecycle = open
     requires: exists Parent{product_conversation: product_conversation, parent_status: handed_off}
     ensures: HandedOffRowsProjectedInsideOpenAggregate(product_conversation)
@@ -1304,11 +1321,29 @@ rule ProductConversationOpenProjectionKeepsHandedOffRowsInsideOpen {
         -- as a History conversation.
 }
 
+rule CoordinatorProjectionStaysChatOnly {
+    when: ProductConversationProjectionRequested(product_conversation)
+    requires: product_conversation.kind = coordinator
+    ensures: TranscriptProjectionWritable(product_conversation)
+    ensures: CloseControlHidden(product_conversation)
+    ensures: DeleteControlHidden(product_conversation)
+
+    @guidance
+        -- The Coordinator keeps the normal transcript/composer/runtime surface but
+        -- is structurally outside the ordinary ProductConversation Open/History
+        -- lifecycle and its close/delete controls.
+}
+
 rule ProductConversationListProjectsOncePerRoot {
     when: ProductConversationListProjectionRequested(product_conversation)
     ensures: ProductConversationListedOnce(product_conversation)
     ensures: ProductConversationListUsesRootTitle(product_conversation)
     ensures: ProductConversationListOrdersByLatestActivity(product_conversation)
+
+    @guidance
+        -- Ordinary and Coordinator product conversations both list once per durable
+        -- root, but only ordinary rows participate in the Open/History lifecycle
+        -- facets and actions.
 }
 
 -- ===========================================================
@@ -1646,6 +1681,7 @@ rule UserHardDeletesConversationRule {
     when: UserHardDeletesConversation(conversation)
     let aggregate = conversation.product_conversation
 
+    requires: aggregate.kind = ordinary
     requires: not conversation.is_busy
     requires: aggregate.lifecycle = history
     requires: DestructiveLifecycleMayProceed(conversation, hard_delete)
@@ -1816,13 +1852,7 @@ invariant SpawnLimit {
 
 invariant RootLifecycleAuthority {
     for c in Parent:
-        c.product_lifecycle = c.root_conversation.lifecycle
-}
-
-invariant ContinuedRowStaysOpenUntilRootHistory {
-    for c in Parent:
-        c.parent_status in { context_exhausted, handed_off }
-            implies c.product_lifecycle = open
+        c.product_conversation.kind = ordinary implies c.product_lifecycle = c.product_conversation.lifecycle
 }
 
 invariant LatestRowDerivedFromTopology {
