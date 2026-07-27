@@ -196,3 +196,56 @@ Append a completion note with these headings:
 
 **Commit**
 - Pending
+
+
+## 92030 correction pass B evidence
+
+**Files changed**
+- `specs/bedrock/bedrock.allium`
+- `specs/pr-association/pr-association.allium`
+- `specs/sse_wire/sse_wire.allium`
+- `tasks/92030-p1-in-progress--cross-file-allium-review.md`
+
+**Settled facts enforced**
+- PR-association user/cleanup surfaces no longer gate on `conversation.mode in { work, branch }`. The affected normative entry points now key Git-backed availability off `conversation.environment_kind = git_backed`, while `resolve_work_scope(...)` guidance describes attached Git-backed worktree vs conversation scope instead of Work/Branch product modes.
+- Close-triggered PR refresh remains explicitly non-blocking cleanup, but its authority is now tied to Git-backed conversations with attached `WorkScope` capability rather than deprecated product-mode terminology.
+- SSE lifecycle projection no longer duplicates the terminal delivery obligation. `specs/sse_wire/sse_wire.allium` now keeps one lifecycle projection/broadcast rule (`AggregateLifecycleProjectionBroadcast`) for `ProductConversationLifecycleProjected(...)`, eliminating the parallel `ProductConversationLifecycleBroadcast` rule that repeated the same root-stream sequence effect.
+- Bedrock hard-delete guidance now explicitly states that hard delete does not own ordinary WorkScope retirement authority, that Open→History remains Close-owned, and that History owns no resources.
+
+**Validation**
+- Semantic grep clusters reviewed after edits:
+  - `rg -n 'mode in \{ work, branch \}|environment_kind = git_backed|resolve_work_scope|CloseTriggeredRetirementBoundaryReached|PrStatusRequested|PrAutoFixContextRequested' specs/pr-association/pr-association.allium`
+  - `rg -n 'ProductConversationLifecycleProjected|ProductConversationLifecycleBroadcast|AggregateLifecycleProjectionBroadcast|conversation_became_terminal|terminal event' specs/sse_wire/sse_wire.allium`
+  - `rg -n 'History itself owns no resources|WorkScope retirement authority|Open -> History|hard-delete cascade' specs/bedrock/bedrock.allium`
+- `allium check specs/bedrock/bedrock.allium` → parsed `errors=0`
+- `allium check specs/work-lifecycle/work-lifecycle.allium` → parsed `errors=0`
+- `allium check specs/durable-workflows/durable-workflows.allium` → parsed `errors=0`
+- `allium check specs/pr-association/pr-association.allium` → parsed `errors=0`
+- `allium check specs/sse_wire/sse_wire.allium` → parsed `errors=0`
+- Combined check `allium check specs/bedrock/bedrock.allium specs/work-lifecycle/work-lifecycle.allium specs/durable-workflows/durable-workflows.allium specs/pr-association/pr-association.allium specs/sse_wire/sse_wire.allium` → parsed `errors=0`
+
+**Retained term classification**
+- `cleanup` in `specs/work-lifecycle/work-lifecycle.allium` remains normative only for WorkScope retirement residuals / committed Close retirement authority.
+- `cleanup` in `specs/bedrock/bedrock.allium` remains only in hard-delete cascade commentary and direct-cascade ensures, explicitly separated from Close/History retirement authority.
+- `generation` in `specs/durable-workflows/durable-workflows.allium` remains typed workflow/attempt/effect authority and exact accepted-turn settlement fencing; no class-level shorthand was introduced.
+- `History` in `specs/sse_wire/sse_wire.allium` remains aggregate lifecycle projection terminology, not a separate terminal wire event.
+- `WorkScope` in `specs/pr-association/pr-association.allium` remains the durable capability/ownership key for PR facts and refresh boundaries, not a product mode.
+
+**Review / evidence ledger**
+- Concrete residual mismatches corrected in this pass:
+  1. `specs/pr-association/pr-association.allium:346-351, 671-686, 726-780` still used Work/Branch mode terminology and gating for PR status, auto-fix, and close-triggered refresh surfaces, conflicting with the accepted attached-WorkScope / Git-backed capability model.
+  2. `specs/sse_wire/sse_wire.allium:737-789` still carried two rules for the same `ProductConversationLifecycleProjected(...)` sequence delivery obligation, creating duplicate normative SSE lifecycle-event authority.
+  3. `specs/bedrock/bedrock.allium:1550-1554` still distinguished Close vs hard delete without explicitly excluding ordinary WorkScope retirement authority or stating that History owns no resources.
+- Proven-clean areas left unchanged after semantic review:
+  - `specs/work-lifecycle/work-lifecycle.allium` already kept Close as the only terminal action, retirement authority on attached `WorkScope`, and PR guidance advisory-only.
+  - `specs/durable-workflows/durable-workflows.allium` plus `requirements.md` already bound direct-turn settlement to exact accepted-turn identity and current generation fence; no correction was proven necessary in this pass.
+- Did not touch `projects` in this pass.
+
+**Speculation avoided**
+- Did not rewrite unaffected PR-association rules to invent new helper surfaces beyond replacing proven mode-gating drift with existing Git-backed/environment facts.
+- Did not broaden bedrock hard-delete semantics into code or requirement changes beyond clarifying the already-owned authority split.
+- Did not alter durable-workflow direct-turn rules because the exact accepted-turn identity/generation contract was already present.
+- Did not mark task 92030 done; appended evidence only.
+
+**Commit**
+- Pending

@@ -1650,9 +1650,12 @@ rule UserHardDeletesConversationRule {
         -- checks the post-state suffices.
         --
         -- Close conversation / History and hard-delete are distinct flows.
-        -- This hard-delete cascade does not model Close orchestration; Close's
-        -- product-lifecycle transition is owned by ConversationLifecycleBecomesHistory.
-        -- Wake-plane destructive-lifecycle admission remains owned elsewhere.
+        -- This hard-delete cascade does not model Close orchestration or
+        -- ordinary WorkScope retirement authority; the Open -> History
+        -- transition is owned by ProductConversationTransitionsToHistory, and
+        -- WorkScope-owned worktree/terminal retirement remains owned by the
+        -- Close retirement path. Branches remain observed repository facts.
+        -- History itself owns no resources.
         -- UI-only state changes (close-tab, blur) do NOT trigger this rule
         -- — tmux servers and browser sessions deliberately survive them
         -- (specs/tmux-integration/ REQ-TMUX-008; specs/browser-tool/

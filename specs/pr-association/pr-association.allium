@@ -344,9 +344,9 @@ config {
 -- semantics so rule references stay unambiguous.
 --
 --   resolve_work_scope(conversation: bedrock/Conversation) -> WorkScope
---       Returns the durable WorkScope key for a conversation. Work and Branch
---       conversations with a managed worktree resolve to a worktree scope;
---       conversations without a worktree resolve to a conversation scope.
+--       Returns the durable WorkScope key for a conversation. Any conversation
+--       with an attached Git-backed worktree resolves to a worktree scope;
+--       conversations without such a worktree resolve to a conversation scope.
 --       Continuations that inherit a worktree resolve to the same scope as the
 --       predecessor.
 --
@@ -673,7 +673,7 @@ rule CloseTriggeredBestEffortRefreshIsBoundedAndNonFatal {
 
     let scope = resolve_work_scope(conversation)
 
-    requires: conversation.mode in { work, branch }
+    requires: conversation.environment_kind = git_backed
 
     ensures: BestEffortPrRefreshAttempted(scope, config.close_refresh_deadline_ms)
     ensures: CleanupContinues(conversation)
@@ -733,7 +733,7 @@ surface PrStatusApi {
 
     provides:
         PrStatusRequested(conversation)
-            when conversation.mode in { work, branch }
+            when conversation.environment_kind = git_backed
 
     contracts:
         fulfils WorkScopePrStatusContract
@@ -749,7 +749,7 @@ surface PrAutoFixApi {
 
     provides:
         PrAutoFixContextRequested(conversation)
-            when conversation.mode in { work, branch }
+            when conversation.environment_kind = git_backed
 
     contracts:
         fulfils WorkScopePrAutoFixContract
@@ -777,7 +777,7 @@ surface CloseRetirementBoundary {
 
     provides:
         CloseTriggeredRetirementBoundaryReached(conversation)
-            when conversation.mode in { work, branch }
+            when conversation.environment_kind = git_backed
 
     @guarantee PrRefreshNeverBlocksCleanup
         -- Close-triggered retirement may attempt to enrich PR association history

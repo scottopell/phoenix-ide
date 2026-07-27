@@ -734,18 +734,6 @@ rule StateChangeBroadcast {
         -- display_state is a human-readable string derived from new_state.
 }
 
--- When the unified product-conversation lifecycle projects into History, that
--- aggregate lifecycle update is broadcast on the root conversation stream.
-rule ProductConversationLifecycleBroadcast {
-    when: ProductConversationLifecycleProjected(conv_id, lifecycle, seq)
-
-    requires: seq > 0
-
-    ensures:
-        for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
-            stream.last_delivered_seq = seq
-}
-
 -- Partial conversation metadata changes are broadcast as conversation_update.
 -- The client merges the payload shallowly onto its local Conversation copy.
 rule ContinuationBoundaryBroadcast {
@@ -784,8 +772,8 @@ rule AggregateLifecycleProjectionBroadcast {
         -- A handed-off predecessor inside an Open aggregate does not produce a
         -- History projection; the whole aggregate lifecycle appears atomically from
         -- the UI perspective.
-        -- `ProductConversationLifecycleBroadcast` above names the wire-level
-        -- delivery obligation; this rule names the projection semantics.
+        -- This rule carries both the wire-level delivery obligation and the
+        -- aggregate lifecycle projection semantics.
 }
 
 rule ConversationUpdateBroadcast {
