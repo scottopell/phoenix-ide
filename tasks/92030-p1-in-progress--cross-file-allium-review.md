@@ -106,3 +106,54 @@ Append a completion note with these headings:
 
 **Commit**
 - Pending local commit after reviewer sign-off in this subtask run.
+
+
+## 92030 correction pass A evidence
+
+**Files changed**
+- `specs/projects/projects.allium`
+- `tasks/92030-p1-in-progress--cross-file-allium-review.md`
+
+**Settled facts enforced**
+- Rewrote `specs/projects/projects.allium` around a unified Git-backed provisioning boundary instead of product lifecycle modes. The spec now models Git-backed conversation creation as canonical-default-branch resolution plus detached-start worktree/work-scope provisioning, with no mode picker or branch-picker conversation creation path.
+- Removed normative mode-selection and branch-creation rules (`UserSelectsManaged`, `UserSelectsBranch`, temp/task branch provisioning, branch-mode lifecycle cleanup, approval-time branch materialization) and replaced them with repository-observation-only branch picker rules plus approval placement rules that keep `Continue here` same aggregate/scope and `Start in new conversation` fresh aggregate/fresh provisioning.
+- Replaced task/conversation ownership semantics with `WorkScope` ownership: `Worktree` now attaches to a `WorkScope` owned by the `ProductConversation`, continuation keeps the same `ProductConversation` and same `WorkScope`, and the predecessor is modeled as `HandedOffPredecessorReadOnly(...)` rather than as a separate history owner.
+- Preserved branch observation capability only as post-creation repository operations (`ListLocalBranches`, `SearchRemoteBranches`, `BranchPicker`), explicitly guaranteed as observation-only and not a conversation mode or lifecycle selector.
+- Kept teardown out of projects Allium. Startup reconciliation now classifies missing worktrees without `BranchDeleted(...)` or any ref mutation; teardown authority remains delegated to work-lifecycle.
+- Preserved approved-task proposal rules from 92028 while aligning them to the unified model: continue-here writes only onto the existing worktree/scope, and start-fresh records approved-task provenance then emits `FreshGitWorktreeProvisioningRequested(...)` without branch/base/current-branch side effects.
+- Preserved sub-agent same-scope attachment semantics while removing cleanup ownership from sub-agents.
+
+**Validation**
+- Command: `allium check specs/projects/projects.allium specs/bedrock/bedrock.allium`
+- Result: exit `1` because the checker emitted existing info/warning diagnostics, but parsed diagnostics contained `0` `severity: "error"` findings for `specs/projects/projects.allium`.
+- Command: `rg -n 'UserSelectsManaged|UserSelectsBranch|TaskApprovalStarted|BranchDeleted|TaskRejectedCleanup|UserMarksAsMerged|MarkAsMerged|UserConfirmsAbandon|ConfirmAbandon|mode = explore|mode = work|mode = branch|Explore|Work mode|Branch mode|Managed mode|task branch|temp branch|continued_in_conv_id|base_branch|branch_name|main_ref|current_branch' specs/projects/projects.allium`
+- Result: only retained structural terms remained (classified below); removed lifecycle/action hits produced no matches.
+
+**Retained old terms and classification**
+- `current_branch`
+  - `specs/projects/projects.allium:25` — retained as a `GitRepository` observation field.
+  - `specs/projects/projects.allium:162` — retained only inside canonical default branch resolution fallback to `repo.current_branch` at project detection; not a runtime arbitrary provisioning fallback.
+- `branch_name`
+  - `specs/projects/projects.allium:204,322,323` — retained as existing bedrock conversation provenance/workspace fields threaded across continuation.
+- `base_branch`
+  - `specs/projects/projects.allium:203,322` — retained as existing bedrock provenance/workspace field threaded across continuation.
+- `continued_in_conv_id`
+  - `specs/projects/projects.allium:314,324,341,345,390,429,447` — retained only for continuation topology and latest-owner derivation, not as history ownership.
+- `mode = work` / `mode = explore`
+  - `specs/projects/projects.allium:363,376` — retained only as sub-agent authority selector values inherited from bedrock mode taxonomy; not as product conversation creation or lifecycle rules.
+- `ExploreSubAgentDirectory`
+  - `specs/projects/projects.allium:373` — retained rule name from prior scope, but semantics now mean read-only sub-agent directory selection, not Explore-mode product lifecycle.
+- `starting_branch_name`
+  - `specs/projects/projects.allium:124,198,474` — new provenance field recording the canonical default branch used for detached start; not a branch-ownership field.
+
+**Review / evidence ledger**
+- This correction intentionally broad-rewrote `specs/projects/projects.allium` instead of making isolated line edits because the prior file still structurally centered obsolete mode/branch lifecycle concepts throughout entities, rules, invariants, and surfaces.
+- No requirements, ADRs, executive docs, or non-projects Allium files were modified in this pass.
+
+**Speculation avoided**
+- Did not add new PR-association or teardown orchestration semantics to projects; those remain owned by `pr-association` and `work-lifecycle`.
+- Did not invent a current-branch provisioning fallback beyond the accepted project-detection fallback for establishing the canonical default branch when the remote symref is unavailable.
+- Did not mark task 92030 done; this is appended evidence only.
+
+**Commit**
+- Pending
