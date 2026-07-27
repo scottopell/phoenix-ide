@@ -738,13 +738,15 @@ constraints
 
 WHEN the Coordinator exposes `bash`
 THE SYSTEM SHALL reuse the same Explore read-only sandbox execution path
-AND SHALL require each `op="run"` call to provide a WorkScope ID and cwd from the same active persisted WorkScope environment, which Phoenix validates as a pair after canonicalizing the cwd
+AND SHALL require each `op="run"` call to provide an active persisted `WorkScope` ID
+AND SHALL resolve and canonicalize that `WorkScope`'s execution directory server-side
 AND SHALL NOT assign the Coordinator a default cwd
+AND SHALL store the process solely under the selected `WorkScope`
+AND SHALL retain Coordinator continuation control as handle authorization metadata
 AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
 AND SHALL keep Coordinator-controlled terminal events from triggering branch-observation reconciliation
-AND SHALL retain Coordinator as the control scope for `peek`, `wait`, and `kill`
-AND SHALL bind each running process to the validated WorkScope as its lifecycle owner so WorkScope process inventory, lifecycle broadcasts, inspection, health attribution, and teardown include the process
-AND SHALL address an inventoried handle by both its lifecycle WorkScope and control scope so handles with the same local ID cannot be confused
+AND SHALL include the process in the owning WorkScope's inventory, lifecycle broadcasts, inspection, health attribution, and teardown
+AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
 
 WHEN conversation is in Direct, Work, or Branch mode
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
@@ -826,6 +828,9 @@ THE handle registry SHALL key its per-scope handle tables by `WorkScope`, not
 by conversation id — matching the terminal, browser, and tmux registries
 (REQ-TERM-WS-001, REQ-BROWSER-WS-001).
 
+THE registry SHALL fence new Bash spawn admission before tearing down a `WorkScope`
+AND SHALL wait for already admitted spawn reservations to commit or abort before removing that WorkScope's handle table.
+
 WHEN two conversations resolve to the same `WorkScope` (a continuation chain on
 one worktree)
 THE SYSTEM SHALL give them the same handle table, so a handle spawned before a
@@ -833,10 +838,9 @@ continuation boundary remains addressable for peek/wait/kill after it
 AND count both conversations' live handles against the one per-`WorkScope`
 `LIVE_HANDLE_CAP` (REQ-BASH-005)
 
-WHEN a handle id owned by one `WorkScope` is presented in a call running under a
-different `WorkScope`
-THE SYSTEM SHALL return `error: "handle_not_found"` (no cross-scope leakage of
-handle existence)
+WHEN a caller presents a globally unique handle ID
+THE SYSTEM SHALL resolve its owning `WorkScope`
+AND SHALL return `error: "handle_not_found"` unless the handle's controller metadata authorizes that caller
 
 **Rationale:** A backgrounded process is a `WorkScope`-level resource, like the
 tmux server and browser session that share its worktree. Conversation-keying

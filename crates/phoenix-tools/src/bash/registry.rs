@@ -283,6 +283,7 @@ pub struct BashLifecycleEvent {
     pub owner: ResourceScopeKey,
     pub handle_id: Option<HandleId>,
     pub phase: BashLifecyclePhase,
+    pub cause: Option<crate::bash::handle::FinalCause>,
     pub terminal_effect: Option<BashTerminalEffect>,
 }
 
@@ -365,6 +366,7 @@ impl BashHandleRegistry {
         owner: &ResourceScopeKey,
         handle_id: Option<HandleId>,
         phase: BashLifecyclePhase,
+        cause: Option<&crate::bash::handle::FinalCause>,
         terminal_effect: Option<BashTerminalEffect>,
     ) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
@@ -375,12 +377,14 @@ impl BashHandleRegistry {
             owner: owner.clone(),
             handle_id,
             phase,
+            cause: cause.cloned(),
             terminal_effect,
         };
         if let Err(e) = sink.send(event) {
             tracing::debug!(
                 owner = %owner,
                 phase = ?phase,
+                cause = ?cause,
                 handle_id = handle_id_for_log.as_deref(),
                 terminal_effect = ?terminal_effect,
                 error = %e,
@@ -752,6 +756,7 @@ pub async fn cascade_bash_on_delete(
         work_scope,
         None,
         BashLifecyclePhase::Terminal,
+        None,
         Some(BashTerminalEffect::InventoryAndBranchReconcile),
     );
 
@@ -791,6 +796,7 @@ async fn kill_selected_handles(
         work_scope,
         None,
         BashLifecyclePhase::Terminal,
+        None,
         Some(BashTerminalEffect::InventoryAndBranchReconcile),
     );
     report
@@ -858,11 +864,13 @@ mod tests {
             Some(HandleId::new("b-a")),
             BashLifecyclePhase::Spawned,
             None,
+            None,
         );
         registry.emit_lifecycle(
             &b,
             None,
             BashLifecyclePhase::Terminal,
+            None,
             Some(BashTerminalEffect::InventoryAndBranchReconcile),
         );
 
@@ -890,6 +898,7 @@ mod tests {
             &scope,
             Some(HandleId::new("b-x")),
             BashLifecyclePhase::Spawned,
+            None,
             None,
         );
         assert!(registry.lifecycle_sink().is_none());

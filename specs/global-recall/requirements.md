@@ -118,8 +118,8 @@ WHILE the Coordinator is answering a user request
 THE SYSTEM MAY provide host-bound tools for global message search, bounded conversation reads, bounded read-only database queries, reference resolution, and OS-sandboxed filesystem inspection
 
 WHEN the Coordinator invokes sandboxed filesystem inspection
-THE SYSTEM SHALL require an explicit cwd for every new command
-AND SHALL canonicalize that cwd and verify the canonical path matches the persisted cwd or worktree path of an active WorkScope before launching the existing Explore-mode `nono` sandbox
+THE SYSTEM SHALL require an explicit active `WorkScope` ID for every new command
+AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching the existing Explore-mode `nono` sandbox
 AND SHALL NOT infer a default repository or cwd
 AND SHALL withhold the tool when the Explore sandbox is unavailable
 

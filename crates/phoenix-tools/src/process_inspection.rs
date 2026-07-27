@@ -65,14 +65,13 @@ pub async fn assemble_inspection(
         access.can_control(&handle.creator_conversation_id, handle.authority)
     });
     let owner_visible = conversation.is_some_and(|conversation| {
-        registered.owner.work_scope_id().is_some_and(|work_scope_id| {
-            conversation.work_scope_id.as_ref() == Some(work_scope_id)
-        })
+        registered
+            .owner
+            .work_scope_id()
+            .is_some_and(|work_scope_id| conversation.work_scope_id.as_ref() == Some(work_scope_id))
     });
-    if actor.is_some() || conversation.is_some() {
-        if !controller_visible && !owner_visible {
-            return None;
-        }
+    if (actor.is_some() || conversation.is_some()) && !controller_visible && !owner_visible {
+        return None;
     }
     Some(project_inspection(&registered, since).await)
 }

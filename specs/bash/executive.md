@@ -37,15 +37,17 @@ assumption that SIGHUP cascade would clean up children when Phoenix died.
 
 ## Technical Summary
 
-`BashTool` is a stateless `Tool` reached via `ToolContext.bash_handles()`.
-The registry holds per-`ResourceScopeKey` maps of live handles and tombstones.
-Work conversations share the table identified by their durable WorkScope;
-Coordinator continuations share the singleton Coordinator table; the namespaces
-are disjoint. The registry is in-memory only, with no SQLite shadow store or
-cross-restart persistence.
-Coordinator-started processes retain that Coordinator control scope while carrying
-the validated WorkScope as a distinct lifecycle owner, so WorkScope inventory and
-teardown include them without moving or duplicating handles.
+`BashTool` is a stateless `Tool` backed by an in-memory registry. Each process is
+stored solely in the table for its durable WorkScope owner and has one globally
+unique opaque handle ID. A global lookup index resolves that ID to the owning
+table; controller authorization metadata determines which conversation or
+Coordinator continuation may operate it. The registry has no SQLite shadow store
+or cross-restart persistence.
+
+Coordinator selects an active WorkScope ID, Phoenix resolves its canonical
+execution directory, and the existing Explore `nono` sandbox launches the process.
+Coordinator control remains authorization metadata while inventory, inspection,
+health attribution, lifecycle broadcasts, and teardown belong to the WorkScope.
 
 A live handle owns a 4MB byte-bounded ring buffer with monotonic per-line
 offsets; reader tasks split incoming pipe bytes on newlines and append to
@@ -108,7 +110,7 @@ entirely.
 | **REQ-BASH-012:** Explore `nono` Sandbox | ✅ Complete | `SandboxedBashTool` uses a Phoenix child-process launcher; the server never applies the irreversible sandbox to itself |
 | **REQ-BASH-013:** Fail-Closed Explore Bash | ✅ Complete | Startup uses `nono::Sandbox::support_info()`; unsupported hosts omit bash from top-level Explore registries |
 | **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | ✅ Complete | Tool stays stateless; `ctx.bash_handles()` resolves the caller's structural resource scope |
-| **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ✅ Complete | Work handles use durable WorkScope identity; Coordinator continuations share a disjoint singleton scope |
+| **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ✅ Complete | All handles are stored under durable WorkScope identity; globally unique IDs and controller metadata preserve Coordinator continuation control |
 | **REQ-BASH-WS-002:** Hard-Delete Cascade Respects Inheritor Scope | ❌ New | `cascade_bash_on_delete` consults inheritor `WorkScope` and skips teardown on scope match, like `cascade_terminal/browser_on_delete` |
 | **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill, and compact conversation summaries retain identity/status/duration/output-tail rather than a generic done badge |
 

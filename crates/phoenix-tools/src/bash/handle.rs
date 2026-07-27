@@ -69,7 +69,7 @@ pub use phoenix_core::domain::kill_signal::KillSignal;
 /// `Killed` are the two terminal causes that `transition_to_terminal`
 /// accepts. `KillPendingKernel` is a separate non-terminal status modeled
 /// via [`KillAttempt`] on the live handle, NOT a `FinalCause`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalCause {
     /// Process exited with a kernel-supplied status code.
     Exited { exit_code: Option<i32> },

@@ -619,6 +619,7 @@ async fn run_run(
                 Some(handle.handle_id.clone()),
                 crate::bash::registry::BashLifecyclePhase::Spawned,
                 None,
+                None,
             );
             let progress_reporter = ctx
                 .bash_progress_sink()
@@ -746,6 +747,14 @@ fn spawn_child(
     Ok((handle, child, sandbox_scratch_dir))
 }
 
+struct WaiterContext {
+    owner_scope: ResourceScopeKey,
+    lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    terminal_effect: BashTerminalEffect,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
+    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
+}
+
 fn start_io_tasks(
     handle: &Arc<Handle>,
     owner_scope: ResourceScopeKey,
@@ -794,18 +803,19 @@ fn start_io_tasks(
     // Waiter task: call wait(), drain readers, then demote the handle.
     let h = handle.clone();
     tokio::spawn(async move {
-            run_waiter(
-                h,
+        run_waiter(
+            h,
+            child,
+            stdout_join,
+            stderr_join,
+            WaiterContext {
                 owner_scope,
-                child,
-                stdout_join,
-                stderr_join,
                 lifecycle_sink,
                 terminal_effect,
                 sandbox_scratch_dir,
                 progress_reporter,
-            )
-
+            },
+        )
         .await;
     });
 }
@@ -1053,14 +1063,10 @@ impl LiveBashProgressReporter {
 
 async fn run_waiter(
     handle: Arc<Handle>,
-    owner_scope: ResourceScopeKey,
     mut child: tokio::process::Child,
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
-    lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
-    terminal_effect: BashTerminalEffect,
-    sandbox_scratch_dir: Option<std::path::PathBuf>,
-    progress_reporter: Option<Arc<LiveBashProgressReporter>>,
+    context: WaiterContext,
 ) {
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
@@ -1090,14 +1096,14 @@ async fn run_waiter(
         }
     };
     let _ = tokio::time::timeout(READER_DRAIN_TIMEOUT, drain).await;
-    if let Some(reporter) = &progress_reporter {
+    if let Some(reporter) = &context.progress_reporter {
         reporter.maybe_emit_handle(&handle, true).await;
         reporter.deactivate();
     }
 
     let elapsed = started_at.elapsed();
     if handle
-        .transition_to_terminal(cause, elapsed, finished_at, TOMBSTONE_TAIL_LINES)
+        .transition_to_terminal(cause.clone(), elapsed, finished_at, TOMBSTONE_TAIL_LINES)
         .await
     {
         handle.publish_exit(ExitState::Exited);
@@ -1105,24 +1111,25 @@ async fn run_waiter(
         // work-scope state-transition signal (REQ-WSUI-007). Guarded by the
         // `transition_to_terminal` return so a redundant late transition does
         // not double-emit. Best-effort: a closed sink is logged by the bridge.
-        if let Some(sink) = &lifecycle_sink {
+        if let Some(sink) = &context.lifecycle_sink {
             if let Err(e) = sink.send(crate::bash::registry::BashLifecycleEvent {
-                owner: owner_scope.clone(),
+                owner: context.owner_scope.clone(),
                 handle_id: Some(handle.handle_id.clone()),
                 phase: crate::bash::registry::BashLifecyclePhase::Terminal,
-                terminal_effect: Some(terminal_effect),
+                cause: Some(cause),
+                terminal_effect: Some(context.terminal_effect),
             }) {
                 tracing::debug!(
-                    owner = %owner_scope,
+                    owner = %context.owner_scope,
                     handle_id = %handle.handle_id,
-                    terminal_effect = ?terminal_effect,
+                    terminal_effect = ?context.terminal_effect,
                     error = %e,
                     "dropping bash terminal lifecycle event — sink closed"
                 );
             }
         }
     }
-    if let Some(dir) = sandbox_scratch_dir {
+    if let Some(dir) = context.sandbox_scratch_dir {
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
         }
@@ -1345,18 +1352,24 @@ async fn run_kill(
             // state the inventory reflects (REQ-WSUI-007). Emit a non-
             // reconciling lifecycle phase now; the later true terminal
             // transition still emits from the waiter after final I/O drains.
-            let owner = ctx
+            if let Some(registered) = ctx
                 .bash_handle_registry()
                 .get_by_id(&handle.handle_id)
                 .await
-                .map(|registered| registered.owner)
-                .unwrap_or_else(|| ctx.work_scope.clone());
-            ctx.bash_handle_registry().emit_lifecycle(
-                &owner,
-                Some(handle.handle_id.clone()),
-                crate::bash::registry::BashLifecyclePhase::KillPendingKernel,
-                None,
-            );
+            {
+                ctx.bash_handle_registry().emit_lifecycle(
+                    &registered.owner,
+                    Some(handle.handle_id.clone()),
+                    crate::bash::registry::BashLifecyclePhase::KillPendingKernel,
+                    None,
+                    None,
+                );
+            } else {
+                tracing::debug!(
+                    handle_id = %handle.handle_id,
+                    "skipping kill-pending lifecycle event — handle owner unavailable"
+                );
+            }
             shape_handle_response(
                 &handle,
                 &ReadArgs::default(),
@@ -2586,6 +2599,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn kill_pending_emits_non_reconciling_phase_before_true_terminal() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let socket_dir = tempfile::tempdir().expect("socket dir");
@@ -2629,7 +2643,10 @@ mod tests {
         let spawned = rx.recv().await.expect("spawned event");
         assert_eq!(spawned.phase, BashLifecyclePhase::Spawned);
         assert_eq!(spawned.owner, ctx.work_scope);
-        assert_eq!(spawned.handle_id.as_ref().map(|id| id.as_str()), Some(handle_id.as_str()));
+        assert_eq!(
+            spawned.handle_id.as_ref().map(HandleId::as_str),
+            Some(handle_id.as_str())
+        );
         assert_eq!(spawned.terminal_effect, None);
 
         // Wait for the trap-installed marker to appear in the ring. Deterministic
@@ -2681,7 +2698,7 @@ mod tests {
         assert_eq!(kill_pending.phase, BashLifecyclePhase::KillPendingKernel);
         assert_eq!(kill_pending.owner, ctx.work_scope);
         assert_eq!(
-            kill_pending.handle_id.as_ref().map(|id| id.as_str()),
+            kill_pending.handle_id.as_ref().map(HandleId::as_str),
             Some(handle_id.as_str())
         );
         assert_eq!(kill_pending.terminal_effect, None);
@@ -2711,7 +2728,7 @@ mod tests {
         assert_eq!(terminal.phase, BashLifecyclePhase::Terminal);
         assert_eq!(terminal.owner, ctx.work_scope);
         assert_eq!(
-            terminal.handle_id.as_ref().map(|id| id.as_str()),
+            terminal.handle_id.as_ref().map(HandleId::as_str),
             Some(handle_id.as_str())
         );
         assert_eq!(

@@ -34,8 +34,7 @@ use crate::tools::browser::session::{
 };
 use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BashTerminalEffect, BrowserSessionManager,
-    ExploreToolPolicy,
-    TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
+    ExploreToolPolicy, TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
 };
 use phoenix_core::work_scope::ResourceScopeKey;
 
@@ -1633,10 +1632,9 @@ impl RuntimeManager {
     /// member.
     fn bash_lifecycle_bridge_action(event: &BashLifecycleEvent) -> BashLifecycleBridgeAction {
         match (&event.owner, event.terminal_effect) {
-            (
-                ResourceScopeKey::Work(_),
-                Some(BashTerminalEffect::InventoryAndBranchReconcile),
-            ) => BashLifecycleBridgeAction::Reconcile,
+            (ResourceScopeKey::Work(_), Some(BashTerminalEffect::InventoryAndBranchReconcile)) => {
+                BashLifecycleBridgeAction::Reconcile
+            }
             (ResourceScopeKey::Work(_), _) => BashLifecycleBridgeAction::Broadcast,
             (ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal, _) => {
                 BashLifecycleBridgeAction::Ignore
@@ -1674,22 +1672,20 @@ impl RuntimeManager {
                             tracing::debug!(
                                 owner = %event.owner,
                                 phase = ?event.phase,
-                                handle_id = event.handle_id.as_ref().map(|id| id.as_str()),
+                                handle_id = event
+                                    .handle_id
+                                    .as_ref()
+                                    .map(phoenix_tools::bash::HandleId::as_str),
                                 terminal_effect = ?event.terminal_effect,
                                 "skipping work-scope reconciliation for non-Work bash lifecycle"
                             );
                         }
                         BashLifecycleBridgeAction::Broadcast => {
-                            manager
-                                .broadcast_work_scope_update(&event.owner)
-                                .await;
+                            manager.broadcast_work_scope_update(&event.owner).await;
                         }
                         BashLifecycleBridgeAction::Reconcile => {
-                            manager
-                                .broadcast_work_scope_update(&event.owner)
-                                .await;
-                            let ResourceScopeKey::Work(work_scope_id) = &event.owner
-                            else {
+                            manager.broadcast_work_scope_update(&event.owner).await;
+                            let ResourceScopeKey::Work(work_scope_id) = &event.owner else {
                                 unreachable!("bridge action requires Work scope");
                             };
                             let generation = manager
@@ -3582,8 +3578,8 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
 mod bash_lifecycle_bridge_tests {
     use super::{BashLifecycleBridgeAction, RuntimeManager};
     use crate::tools::{BashLifecycleEvent, BashLifecyclePhase, BashTerminalEffect};
-    use phoenix_tools::bash::HandleId;
     use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+    use phoenix_tools::bash::HandleId;
 
     #[test]
     fn coordinator_lifecycle_is_not_sent_to_work_scope_reconciliation() {
@@ -3597,6 +3593,7 @@ mod bash_lifecycle_bridge_tests {
                     owner: ResourceScopeKey::Coordinator,
                     handle_id: None,
                     phase,
+                    cause: None,
                     terminal_effect: None,
                 }),
                 BashLifecycleBridgeAction::Ignore
@@ -3612,6 +3609,7 @@ mod bash_lifecycle_bridge_tests {
                 owner: scope.clone(),
                 handle_id: Some(HandleId::new("b-1")),
                 phase: BashLifecyclePhase::Spawned,
+                cause: None,
                 terminal_effect: None,
             }),
             BashLifecycleBridgeAction::Broadcast
@@ -3622,6 +3620,7 @@ mod bash_lifecycle_bridge_tests {
                 handle_id: Some(HandleId::new("b-1")),
                 phase: BashLifecyclePhase::Terminal,
                 terminal_effect: Some(BashTerminalEffect::InventoryAndBranchReconcile),
+                cause: Some(phoenix_tools::bash::FinalCause::Exited { exit_code: Some(0) }),
             }),
             BashLifecycleBridgeAction::Reconcile
         );
@@ -3631,6 +3630,10 @@ mod bash_lifecycle_bridge_tests {
                 handle_id: Some(HandleId::new("b-1")),
                 phase: BashLifecyclePhase::Terminal,
                 terminal_effect: Some(BashTerminalEffect::InventoryOnly),
+                cause: Some(phoenix_tools::bash::FinalCause::Killed {
+                    exit_code: Some(137),
+                    signal_number: Some(9),
+                }),
             }),
             BashLifecycleBridgeAction::Broadcast
         );
