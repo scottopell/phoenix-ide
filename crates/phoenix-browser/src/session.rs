@@ -1491,6 +1491,19 @@ impl BrowserSessionManager {
         hit
     }
 
+    async fn remove_session_if_current(
+        &self,
+        key: &str,
+        session: &Arc<RwLock<BrowserSession>>,
+    ) -> Option<ScopedSession> {
+        let mut sessions = self.sessions.write().await;
+        sessions
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.session, session))
+            .then(|| sessions.remove(key))
+            .flatten()
+    }
+
     /// Kill the session belonging to `work_scope` (called from the cleanup
     /// cascade on archive/abandon/mark-merged/delete of the chain leaf).
     ///
@@ -1571,8 +1584,7 @@ impl BrowserSessionManager {
                 let Some(user_data_key) = ({
                     let sessions = manager.sessions.read().await;
                     sessions.get(&key).and_then(|entry| {
-                        Arc::ptr_eq(&entry.session, &session)
-                            .then(|| entry.user_data_key.clone())
+                        Arc::ptr_eq(&entry.session, &session).then(|| entry.user_data_key.clone())
                     })
                 }) else {
                     tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was removed or replaced");
@@ -1592,17 +1604,7 @@ impl BrowserSessionManager {
                     }
                 }
 
-                let removed = {
-                    let mut sessions = manager.sessions.write().await;
-                    if sessions
-                        .get(&key)
-                        .is_some_and(|entry| Arc::ptr_eq(&entry.session, &session))
-                    {
-                        sessions.remove(&key)
-                    } else {
-                        None
-                    }
-                };
+                let removed = manager.remove_session_if_current(&key, &session).await;
                 let Some(entry) = removed else {
                     tracing::debug!(work_scope = %requested_scope, "browser kill cleaned profile after session was removed or replaced");
                     task_attempt.complete(Ok(()));
