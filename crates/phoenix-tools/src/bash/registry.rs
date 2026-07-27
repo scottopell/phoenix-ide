@@ -19,7 +19,10 @@
 
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::SystemTime;
 
 use phoenix_core::work_scope::ResourceScopeKey;
@@ -73,17 +76,40 @@ pub struct RegisteredHandle {
     pub handle: Arc<Handle>,
 }
 
+#[derive(Debug, Default)]
+struct SpawnAdmission {
+    pending: AtomicUsize,
+    settled: Arc<Notify>,
+}
+
 #[derive(Debug)]
 pub struct SpawnReservation {
     owner: ResourceScopeKey,
     handle_id: HandleId,
     committed: bool,
+    admission: Arc<SpawnAdmission>,
 }
 
 impl SpawnReservation {
     #[must_use]
     pub fn handle_id(&self) -> &HandleId {
         &self.handle_id
+    }
+}
+
+impl SpawnReservation {
+    fn settle(&mut self) {
+        if !self.committed {
+            self.committed = true;
+            self.admission.pending.fetch_sub(1, Ordering::AcqRel);
+            self.admission.settled.notify_waiters();
+        }
+    }
+}
+
+impl Drop for SpawnReservation {
+    fn drop(&mut self) {
+        self.settle();
     }
 }
 
@@ -102,10 +128,8 @@ pub struct ResourceScopeKeyHandles {
     handles: HashMap<HandleId, Arc<Handle>>,
     /// Once teardown begins, no new spawn reservation may commit for this owner.
     teardown_started: bool,
-    /// Spawn slots admitted before teardown fenced this owner but not yet committed.
-    pending_spawns: usize,
-    /// Wakes teardown after the final admitted spawn commits or aborts.
-    spawn_settled: Arc<Notify>,
+    /// Cancellation-safe admission count and teardown notification.
+    admission: Arc<SpawnAdmission>,
 }
 
 impl ResourceScopeKeyHandles {
@@ -468,21 +492,24 @@ impl BashHandleRegistry {
         owner: &ResourceScopeKey,
     ) -> Result<SpawnReservation, BashHandleError> {
         let entry = self.get_or_create(owner).await;
-        let mut handles = entry.write().await;
+        let handles = entry.write().await;
         if handles.teardown_started {
             return Err(BashHandleError::SpawnFenced);
         }
-        if handles.live_count().await + handles.pending_spawns >= self.live_handle_cap {
+        if handles.live_count().await + handles.admission.pending.load(Ordering::Acquire)
+            >= self.live_handle_cap
+        {
             return Err(BashHandleError::HandleCapReached {
                 cap: self.live_handle_cap,
                 live_handles: handles.live_summary().await,
             });
         }
-        handles.pending_spawns += 1;
+        handles.admission.pending.fetch_add(1, Ordering::AcqRel);
         Ok(SpawnReservation {
             owner: owner.clone(),
             handle_id: Self::allocate_handle_id(),
             committed: false,
+            admission: handles.admission.clone(),
         })
     }
 
@@ -501,8 +528,7 @@ impl BashHandleRegistry {
             .ok_or(BashHandleError::SpawnFenced)?;
         let mut table = entry.write().await;
         let inserted = table.insert(handle.clone());
-        table.pending_spawns = table.pending_spawns.saturating_sub(1);
-        table.spawn_settled.notify_waiters();
+        reservation.settle();
         self.handles_by_id.write().await.insert(
             inserted.handle_id.clone(),
             RegisteredHandle {
@@ -510,17 +536,11 @@ impl BashHandleRegistry {
                 handle: inserted.clone(),
             },
         );
-        reservation.committed = true;
         Ok(inserted)
     }
 
-    pub async fn abort_spawn(&self, reservation: SpawnReservation) {
-        let Some(entry) = self.get_existing(&reservation.owner).await else {
-            return;
-        };
-        let mut table = entry.write().await;
-        table.pending_spawns = table.pending_spawns.saturating_sub(1);
-        table.spawn_settled.notify_waiters();
+    pub fn abort_spawn(&self, mut reservation: SpawnReservation) {
+        reservation.settle();
     }
 
     pub async fn get_by_id(&self, handle_id: &HandleId) -> Option<RegisteredHandle> {
@@ -617,10 +637,10 @@ impl BashHandleRegistry {
             let notified = {
                 let mut table = entry.write().await;
                 table.teardown_started = true;
-                if table.pending_spawns == 0 {
+                if table.admission.pending.load(Ordering::Acquire) == 0 {
                     return Some(entry.clone());
                 }
-                table.spawn_settled.clone().notified_owned()
+                table.admission.settled.clone().notified_owned()
             };
             notified.await;
         }
@@ -969,7 +989,7 @@ mod tests {
 
         let reservation = registry.reserve_spawn(&owner).await.expect("reserve abort");
         let aborted_id = reservation.handle_id().clone();
-        registry.abort_spawn(reservation).await;
+        registry.abort_spawn(reservation);
         assert!(registry.get_by_id(&aborted_id).await.is_none());
 
         let mut reservation = registry
@@ -1032,6 +1052,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_reservation_releases_teardown_waiter() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("conv-a");
+        let reservation = registry.reserve_spawn(&owner).await.expect("reservation");
+        let teardown = {
+            let registry = registry.clone();
+            let owner = owner.clone();
+            tokio::spawn(async move { registry.begin_teardown(&owner).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!teardown.is_finished());
+        drop(reservation);
+        assert!(teardown.await.expect("join").is_some());
+    }
+
+    #[tokio::test]
     async fn teardown_waits_for_admitted_spawn_to_settle() {
         let registry = Arc::new(BashHandleRegistry::new());
         let owner = scope("conv-a");
@@ -1043,7 +1079,7 @@ mod tests {
         };
         tokio::task::yield_now().await;
         assert!(!teardown.is_finished());
-        registry.abort_spawn(reservation).await;
+        registry.abort_spawn(reservation);
         assert!(teardown.await.expect("join").is_some());
     }
 

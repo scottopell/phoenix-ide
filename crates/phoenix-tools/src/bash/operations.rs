@@ -639,7 +639,7 @@ async fn run_run(
             race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
         }
         Err(e) => {
-            registry.abort_spawn(reservation).await;
+            registry.abort_spawn(reservation);
             BashError::SpawnFailed { error_message: e }.into_tool_output()
         }
     }
@@ -702,6 +702,8 @@ fn spawn_child(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    command.kill_on_drop(true);
 
     #[cfg(unix)]
     unsafe {
