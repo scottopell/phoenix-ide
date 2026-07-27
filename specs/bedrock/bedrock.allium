@@ -1558,17 +1558,15 @@ rule RetirementInspectionRequiresLossConfirmation {
 }
 
 rule BoundLossConfirmationRequestsRetirement {
-    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
-    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
 
     @guidance
         -- Crossing into retirement_requested commits Close past the user-cancellable
-        -- phase boundary. The user's confirmation is bound to the exact inspection
-        -- generation and fingerprint that justified asking for confirmation.
+        -- phase boundary. Work-lifecycle owns the atomic re-inspection decision at the
+        -- confirmation click and emits ResourceRetirementRequested only when the freshly
+        -- recomputed inspection still matches the stored evidence for this exact attempt.
 }
 
 rule ChangedInspectionInvalidatesOutstandingConfirmation {

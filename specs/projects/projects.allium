@@ -16,6 +16,18 @@
 
 use "../bedrock/bedrock.allium" as bedrock
 
+surface TaskApprovalDecisionImport {
+    facing conversation: bedrock/Conversation
+
+    provides:
+        TaskApprovalDecisionImported(conversation, decision)
+            when bedrock/TaskApprovalDecided(conversation, decision)
+
+    @guarantee TypedImportBridge
+        -- Projects consumes the exact bedrock task-approval decision boundary through
+        -- one local typed import surface instead of inventing an unrelated trigger.
+}
+
 ------------------------------------------------------------
 -- External Entities
 ------------------------------------------------------------
@@ -322,7 +334,7 @@ rule SearchRemoteBranches {
 }
 
 rule TaskApprovalExecuted {
-    when: UserApprovesTask(conversation, decision)
+    when: TaskApprovalDecisionImported(conversation, decision)
     requires: decision = approved_continue_current
     requires: exists Worktree{product_conversation: conversation.product_conversation}
 
@@ -370,7 +382,7 @@ rule TaskApprovalExecuted {
 }
 
 rule TaskApprovalNewConversationExecuted {
-    when: UserApprovesTask(conversation, decision)
+    when: TaskApprovalDecisionImported(conversation, decision)
     requires: decision = approved_start_fresh
 
     let approved_source = ApprovedTaskSource {

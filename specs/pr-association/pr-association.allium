@@ -669,7 +669,7 @@ rule WorkActionsDisablesAutoFixForNonOpenActivePr {
 }
 
 rule CloseTriggeredBestEffortRefreshIsBoundedAndNonFatal {
-    when: CloseTriggeredRetirementBoundaryReached(conversation)
+    when: CloseRetirementBoundaryReached(conversation, attempt_id)
 
     let scope = resolve_work_scope(conversation)
 
@@ -776,8 +776,9 @@ surface CloseRetirementBoundary {
     context conversation: bedrock/Conversation
 
     provides:
-        CloseTriggeredRetirementBoundaryReached(conversation)
+        CloseRetirementBoundaryReached(conversation, attempt_id)
             when conversation.environment_kind = git_backed
+                 and bedrock/RetirementInspectionRequested(conversation.product_conversation, attempt_id)
 
     @guarantee PrRefreshNeverBlocksCleanup
         -- Close-triggered retirement may attempt to enrich PR association history

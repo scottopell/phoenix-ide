@@ -236,6 +236,18 @@ enum InlineNote {
 -- The rendered bar for one conversation. One per conversation; present only
 -- when the conversation is Open, Git-capable, and in an eligible execution
 -- phase (phase_is_eligible). Non-eligible conversations have no bar entity at all.
+surface WorkActionsBarUi {
+    facing conversation: bedrock/Conversation
+
+    provides:
+        UserClicksClose(conversation)
+            when phase_is_eligible(conversation)
+
+    @guarantee TypedCloseCommandOnly
+        -- The UI surface only emits user intents. Any Close lifecycle mutation remains
+        -- bedrock-owned and is not initiated by a local work-actions state machine.
+}
+
 entity WorkActionsBar {
     conversation: bedrock/Conversation
 
@@ -356,6 +368,11 @@ entity WorkActionsBar {
 --
 --   same_pr(left: pra/PrIdentity, right: pra/PrIdentity) -> Boolean
 --       Compares repository owner, repository name, and PR number.
+--
+--   next_close_attempt_id(conv: bedrock/Conversation) -> String
+--       Allocates a fresh close attempt identity for one user-initiated Close click.
+--       The Work Actions bar never mutates lifecycle locally; it emits the typed
+--       bedrock command carrying this fresh attempt_id.
 --
 --------------------------------------------------------------
 -- Rules
@@ -709,6 +726,28 @@ rule ResolveLinkVerbNavigatesToGitHub {
         -- calls a Phoenix endpoint.
 }
 
+-- ===========================================================
+-- WAB 6. CLOSE EMITS BEDROCK COMMAND (REQ-WAB-009)
+-- ===========================================================
+
+rule CloseClickDispatchesTypedBedrockCommand {
+    when: UserClicksClose(conversation)
+
+    let bar = WorkActionsBar{conversation: conversation}
+    requires: bar.presentation.finish_zone.show_close = true
+
+    ensures: bedrock/UserRequestsCloseConversation(conversation, next_close_attempt_id(conversation))
+
+    @guidance
+        -- The Close button dispatches the bedrock-owned terminal command with a fresh
+        -- attempt_id. The bar does not start or advance any local close lifecycle; any
+        -- user_close_started-style UI is only an acknowledgement of downstream bedrock
+        -- state after that typed command is accepted.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------

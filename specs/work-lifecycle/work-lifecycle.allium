@@ -155,12 +155,12 @@ external entity RetirementAbsenceEvidence {
 ------------------------------------------------------------
 
 rule ChatOnlyCloseSkipsWorktreeInspection {
-    when: RetirementInspectionRequested(product_conversation)
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
     requires:
         not exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
-        bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_retirement_inspection}.attempt_id,
+        attempt_id,
         inspection_generation: "no-worktree",
         inspection_fingerprint: "no-worktree"
     )
@@ -189,7 +189,7 @@ rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
 }
 
 rule GitBackedInspectionWithoutLossRequestsRetirement {
-    when: RetirementInspectionRequested(product_conversation)
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     requires: exists RetirementAttempt{product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
     requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: staged_tracked_paths}
@@ -199,7 +199,7 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
     requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
-        bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_retirement_inspection}.attempt_id,
+        attempt_id,
         inspection_generation: RetirementInspection.generation,
         inspection_fingerprint: RetirementInspection.fingerprint
     )
@@ -216,7 +216,7 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
 }
 
 rule GitBackedInspectionWithLossRequiresConfirmation {
-    when: RetirementInspectionRequested(product_conversation)
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     requires: exists RetirementAttempt{product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
     requires:
@@ -227,7 +227,7 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
         or exists RetirementLossCategoryRow{attempt: RetirementAttempt, inspection: RetirementInspection, category: detached_unreachable_commits}
     ensures: RetirementInspectionRequiresConfirmation(
         product_conversation,
-        bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_retirement_inspection}.attempt_id,
+        attempt_id,
         inspection_generation: RetirementInspection.generation,
         inspection_fingerprint: RetirementInspection.fingerprint
     )
@@ -241,10 +241,34 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
         -- snapshot as a recovery artifact.
 }
 
-rule ChangedWorkspaceInvalidatesOutstandingConfirmation {
-    when: WorkspaceFingerprintChanged(product_conversation)
-    requires: bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_loss_confirmation}.phase = awaiting_loss_confirmation
-    ensures: RetirementInspectionChanged(product_conversation, bedrock/CloseObligation{product_conversation: product_conversation, phase: awaiting_loss_confirmation}.attempt_id)
+rule LossConfirmationRecomputesInspectionBeforeRetirement {
+    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
+    requires: current_retirement_inspection_generation(product_conversation) = inspection_generation
+    requires: current_retirement_inspection_fingerprint(product_conversation) = inspection_fingerprint
+    ensures: RetirementInspectionRecomputed(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- The loss-confirmation click re-runs the authoritative retirement inspection
+        -- inside the same atomic decision boundary that decides whether Close may enter
+        -- retirement_requested. Phoenix compares the freshly recomputed generation and
+        -- fingerprint against the stored inspection evidence from the outstanding Close
+        -- obligation before requesting destructive retirement, so an async watcher
+        -- notification cannot race ahead or lag behind the decision.
+}
+
+rule LossConfirmationDetectsChangedInspection {
+    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
+    requires: current_retirement_inspection_generation(product_conversation) != inspection_generation
+        or current_retirement_inspection_fingerprint(product_conversation) != inspection_fingerprint
+    ensures: RetirementInspectionChanged(product_conversation, attempt_id)
+
+    @guidance
+        -- If the just-in-time recomputation differs from the evidence the user saw,
+        -- Close does not cross into retirement_requested. The typed mismatch event
+        -- sends the flow back through inspection so the user sees the new loss set.
 }
 
 rule RetirementRequestedRetiresOwnedResources {

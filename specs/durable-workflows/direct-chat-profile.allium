@@ -17,7 +17,7 @@ surface BedrockCloseSettlementImport {
     facing product_conversation: bedrock/ProductConversation
 
     demonstrates:
-        bedrock_close_settlement_request(product_conversation)
+        bedrock_close_settlement_request(product_conversation, attempt_id)
 
     @guarantee TypedImportBridge
         -- This surface names the exact bedrock-produced close-settlement event
@@ -181,7 +181,7 @@ entity DirectChatConsumerCursor {
 -- replay_runtime_accepted_outcome(accepted_turn), replay_queued_steering_outcome(accepted_turn)
 -- independent_prepared_events_emitted(request, targets)
 -- replay_preserves_prepared_payload(acceptance, prepared_payload), acceptance_created_once(turn_key)
--- direct_chat_close_settlement_request(product_conversation)
+-- direct_chat_close_settlement_request(product_conversation, attempt_id)
 
 ------------------------------------------------------------
 -- Invariants
@@ -377,7 +377,7 @@ rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
 }
 
 rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
-    when: bedrock_close_settlement_request(product_conversation)
+    when: bedrock_close_settlement_request(product_conversation, attempt_id)
     let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
     let acceptance = latest_row_direct_turn_acceptance(latest_parent)
     requires: acceptance != null
@@ -385,7 +385,7 @@ rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
     ensures: DirectTurnSettlementRequested(acceptance, generation)
 
     @guidance
-        -- Close emits only the root product-conversation settlement event. The
+        -- Close emits only the root product-conversation settlement event for one
         -- direct-turn profile resolves the exact accepted turn owned by the
         -- latest transcript row, reads that acceptance's current generation, and
         -- bridges into DirectTurnSettlementRequested without fabricating an

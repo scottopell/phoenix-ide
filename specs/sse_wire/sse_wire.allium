@@ -310,6 +310,7 @@ rule RootConversationStreamOpened {
     requires: SnapshotProjectsTranscriptRowsChronologically(snapshot, root_conversation_id)
     requires: SnapshotProjectsContinuationBoundariesExactlyOnce(snapshot, root_conversation_id)
     requires: SnapshotDerivesDefaultLiveTargetFromTopology(snapshot, root_conversation_id)
+    requires: SnapshotWatermarkDerivedFromRootStreamLedger(snapshot, RootStreamLedger{root_conversation_id: root_conversation_id})
 
     ensures: RootConversationInitDelivered(root_conversation_id, snapshot)
 
@@ -324,6 +325,7 @@ rule StreamOpened {
     when: ClientSubscribes(conversation_id, snapshot)
 
     requires: snapshot.pending_anchor_sequence_id <= snapshot.last_sequence_id
+    requires: SnapshotReplayWindowDerivedFromRootStreamLedger(snapshot, RootStreamLedger{root_conversation_id: conversation_id})
     requires:
         for entry in snapshot.pending_events:
             entry.sequence_id > snapshot.pending_anchor_sequence_id
@@ -1043,6 +1045,16 @@ invariant RootStreamLedgerIsMonotonicAndAuthoritative {
     for boundary in ProjectedContinuationBoundaries:
         exists RootStreamLedger{root_conversation_id: boundary.root_conversation_id}
             and boundary.root_sequence_id <= RootStreamLedger{root_conversation_id: boundary.root_conversation_id}.last_allocated_root_sequence_id
+}
+
+invariant EveryRootProjectedFactUsesRootStreamLedger {
+    for committed in RootProjectedEventCommitteds:
+        exists RootStreamLedger{root_conversation_id: committed.root_conversation_id}
+            and committed.root_sequence_id <= RootStreamLedger{root_conversation_id: committed.root_conversation_id}.last_allocated_root_sequence_id
+
+    for stream in SseStreams:
+        exists RootStreamLedger{root_conversation_id: stream.conversation_id}
+            and stream.init_snapshot.last_sequence_id <= RootStreamLedger{root_conversation_id: stream.conversation_id}.last_allocated_root_sequence_id
 }
 
 -- Ring entries are in strictly increasing sequence_id order. Not
