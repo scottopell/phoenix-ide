@@ -2,7 +2,7 @@
 
 ## User Story
 
-As a developer with a finished (or stuck) Work or Branch conversation, I need a clear,
+As a developer with an Open conversation that owns Git-backed work, I need a clear,
 unambiguous row of action verbs so I know what to do next — without having to decode status
 badges or click a button twice to arm it.
 
@@ -14,8 +14,8 @@ are present, given inputs owned by sibling specs. It re-derives none of those in
 
 It does **not** govern:
 
-- Terminal action git semantics (worktree deletion, diff snapshot, mode-dependent branch
-  disposition, confirmation gate) → `work-lifecycle` spec (REQ-WL-001/002/003).
+- Terminal action git semantics (worktree deletion, diff snapshot, confirmation gate,
+  resource retirement) → `work-lifecycle` spec (REQ-WL-001/002/003).
 - PR status, explicit active-PR selection, any compatibility primary-PR projection, the CI
   check-state and feedback-freshness signals, and the auto-fix affordance → `pr-association`
   spec (`PrStatusView`, `PrCheckState`, `PrFeedbackFreshness`, `PrAutoFixAffordance`,
@@ -31,25 +31,27 @@ It does **not** govern:
 
 ### REQ-WAB-001: Bar Visibility
 
-WHEN a conversation's `conv_mode_label` is `"Work"` or `"Branch"`
-AND the conversation is in a disposable, non-running condition — phase one of `idle`,
-  `error`, or `recoverable_continuation_failure`
+WHEN a `ProductConversation` is in lifecycle `Open`
+AND it has an attached `WorkScope` with Git-backed worktree capabilities
+AND its live execution phase is a disposable, non-running condition — `idle`, `error`, or
+  `recoverable_continuation_failure`
 THE SYSTEM SHALL render the work actions bar.
 
-WHEN the conversation is in `context_exhausted`
+WHEN the Open conversation is in `context_exhausted`
 THE SYSTEM SHALL NOT render the work actions bar
 AND SHALL reserve the focused handoff surface for continuation actions defined by bedrock REQ-BED-021.
 
-WHEN the conversation is in any other phase, or its mode is not `Work` or `Branch`
+WHEN the conversation is in lifecycle `History`
+OR has no attached Git-backed `WorkScope`
+OR its live execution phase is any other condition
 THE SYSTEM SHALL NOT render the work actions bar.
 
 **Design:** `idle` is the ordinary resting state; `error` and
-`recoverable_continuation_failure` are stuck conditions where terminal resolution remains directly useful. Context exhaustion has a dedicated continuation surface;
-placing cleanup beside its handoff controls makes an unrelated destructive action appear to be
-part of continuation. Bedrock REQ-BED-031 continues to govern backend disposability, but the work
-actions bar does not expose it from this focused surface. Any other phase, or a non-Work/Branch
-mode, hides the bar: no terminal action is legal while the agent is live, and the bar's verbs have
-no meaning outside Work and Branch.
+`recoverable_continuation_failure` are stuck conditions where terminal resolution remains directly
+useful. Context exhaustion has a dedicated continuation surface; placing Close beside its handoff
+controls makes an unrelated terminal action appear to be part of continuation. The bar is a
+Git-capability surface, not a mode surface: it belongs to Open conversations whose attached
+`WorkScope` can inspect and retire Git-backed work.
 
 ---
 
@@ -140,11 +142,11 @@ never glowing — so it cannot collapse into a second primary.
 
 ### REQ-WAB-004: WorkDisposition Derivation
 
-THE SYSTEM SHALL derive a single `WorkDisposition` value from the conversation's phase,
-`continued_in_conv_id`, the explicit active PR selected by `pr-association`, `PrStatusView`
-(from `pr-association`, including its `check_state` and `feedback_freshness` fields), and
-`PrAutoFixAffordance` (from `pr-association`). The `WorkDisposition` selects the primary verb and
-which verbs are present.
+THE SYSTEM SHALL derive a single `WorkDisposition` value from the Open conversation's eligible
+execution phase, `continued_in_conv_id`, the explicit active PR selected by `pr-association`,
+`PrStatusView` (from `pr-association`, including its `check_state` and `feedback_freshness`
+fields), and `PrAutoFixAffordance` (from `pr-association`). The `WorkDisposition` selects the
+primary verb and which verbs are present.
 
 The derivation is evaluated top-to-bottom; the first matching row wins. It is **total**: every
 reachable combination of phase, continuation, and PR state maps to exactly one row.
@@ -152,16 +154,16 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | # | Condition | WorkDisposition | Primary verb | Secondary / suppressed |
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
-| 2 | phase ∈ {`error`, `recoverable_continuation_failure`} | `stuck` | **Close conversation** (FINISH) when close is legal | RESOLVE suppressed; review context may explain why recovery failed |
-| 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | `Close conversation` remains available as a secondary FINISH action; `Merge on GitHub #N ↗` secondary link when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
-| 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | `Close conversation` remains available as a secondary FINISH action |
-| 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | `Close conversation` remains available as a secondary FINISH action |
-| 6 | idle, PR merged | `ready_to_close_after_merge` | **Close conversation** (FINISH) | — |
-| 7 | idle, PR closed unmerged | `ready_to_close_closed_pr` | **Close conversation** (FINISH) | note explains PR closed without merge |
-| 8a | idle, no PR found, refresh ≠ unavailable, work-change state = clean | `no_pr_clean` | **Close conversation** (FINISH) | — |
-| 8b | idle, no PR found, refresh ≠ unavailable, work-change state = dirty and PR-ready | `no_pr_create_pr` | **Create PR on GitHub ↗** (RESOLVE, GitHub link) | Close suppressed; note |
-| 8c | idle, no PR found, refresh ≠ unavailable, work-change state dirty-needs-review / loading / unavailable | `no_pr_review` | **View Diff** (REVIEW) | Close suppressed; note |
-| 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Close conversation** (FINISH) | warning note; single click |
+| 2 | eligible phase ∈ {`error`, `recoverable_continuation_failure`} | `stuck` | **Close conversation** (FINISH) when close is legal | RESOLVE suppressed; review context may explain why recovery failed |
+| 3 | eligible phase = idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | `Close conversation` remains available as a secondary FINISH action; `Merge on GitHub #N ↗` secondary link when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
+| 4 | eligible phase = idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | `Close conversation` remains available as a secondary FINISH action |
+| 5 | eligible phase = idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | `Close conversation` remains available as a secondary FINISH action |
+| 6 | eligible phase = idle, PR merged | `ready_to_close_after_merge` | **Close conversation** (FINISH) | — |
+| 7 | eligible phase = idle, PR closed unmerged | `ready_to_close_closed_pr` | **Close conversation** (FINISH) | note explains PR closed without merge |
+| 8a | eligible phase = idle, no PR found, refresh ≠ unavailable, work-change state = clean | `no_pr_clean` | **Close conversation** (FINISH) | — |
+| 8b | eligible phase = idle, no PR found, refresh ≠ unavailable, work-change state = dirty and PR-ready | `no_pr_create_pr` | **Create PR on GitHub ↗** (RESOLVE, GitHub link) | Close suppressed; note |
+| 8c | eligible phase = idle, no PR found, refresh ≠ unavailable, work-change state dirty-needs-review / loading / unavailable | `no_pr_review` | **View Diff** (REVIEW) | Close suppressed; note |
+| 9 | eligible phase = idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Close conversation** (FINISH) | warning note; single click |
 
 The **Address feedback** affordance is enabled when Phoenix can post an auto-fix message to
 the conversation: the conversation has a live message channel and the PR is open
@@ -220,8 +222,7 @@ THE SYSTEM SHALL NOT render the RESOLVE zone (no Address feedback, no PR link).
 
 **Design:** Address feedback posts a `UserMessage` to the conversation. In `error`,
 `recoverable_continuation_failure`, or `context_exhausted`, the conversation cannot resume a new
-LLM turn from a user message — the message would be rejected or would silently reopen a
-non-resumable stuck state. The stuck-state actions are terminal cleanup verbs, so RESOLVE is
+LLM turn from a user message. The stuck-state action is terminal Close guidance, so RESOLVE is
 suppressed entirely rather than shown disabled
 (REQ-WAB-008). Context exhaustion does not render this bar at all (REQ-WAB-001).
 
@@ -321,8 +322,8 @@ THE SYSTEM SHALL render a thin PR rail directly above the conversation input tha
 WHEN the active PR is expanded
 THE SYSTEM SHALL animate a non-modal action region into rows above the rail. The first row SHALL
 contain the single hero action. A supporting row SHALL provide the legal review, GitHub link-out,
-cleanup, and abandon controls without promoting cleanup as the suggested action. The action region
-SHALL expose active-PR branch context and SHALL collapse when the active PR is activated again.
+and Close controls without promoting Close as the suggested action. The action region SHALL expose
+active-PR branch context and SHALL collapse when the active PR is activated again.
 
 The rail SHALL NOT store a parallel active PR, infer by recency, show closed PRs as selectable, or
 reinterpret a compatibility primary-PR projection as authoritative.
@@ -354,5 +355,5 @@ THE SYSTEM SHALL render the RESOLVE verb as a link that opens the PR's GitHub UR
 browser tab, NOT as a button that calls a Phoenix API.
 
 Phoenix has no PR merge API. The ↗ glyph signals external navigation. Phoenix never merges or
-pushes to origin on the user's behalf (`work-lifecycle` REQ-WL-002); the verb navigates the
+pushes to origin on the user's behalf (`work-lifecycle` REQ-WL-002b); the verb navigates the
 user to GitHub to complete the merge through their normal PR workflow.
