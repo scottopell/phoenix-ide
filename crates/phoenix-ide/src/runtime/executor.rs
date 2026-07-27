@@ -4886,7 +4886,7 @@ where
                                     error: "approved_commission_review is runtime-only and cannot be emitted by the model".to_string(),
                                 }
                             } else if is_coordinator {
-                                ToolInput::from_name_and_value_with_explicit_working_directory(name, input.clone())
+                                ToolInput::from_name_and_value_with_work_scope_target(name, input.clone())
                             } else {
                                 ToolInput::from_name_and_value(name, input.clone())
                             };

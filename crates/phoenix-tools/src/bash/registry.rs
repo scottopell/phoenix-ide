@@ -396,7 +396,7 @@ impl BashHandleRegistry {
         self.live_handle_cap
     }
 
-    fn allocate_handle_id(&self) -> HandleId {
+    fn allocate_handle_id() -> HandleId {
         HandleId::new(format!("b-{}", uuid::Uuid::new_v4()))
     }
 
@@ -439,6 +439,11 @@ impl BashHandleRegistry {
         self.inner.read().await.get(work_scope).cloned()
     }
 
+    /// Reserves one owner-local live-handle slot and an opaque global handle id.
+    ///
+    /// # Errors
+    /// Returns [`BashHandleError::SpawnFenced`] after owner teardown begins, or
+    /// [`BashHandleError::HandleCapReached`] when live and pending spawns fill the cap.
     pub async fn reserve_spawn(
         &self,
         owner: &ResourceScopeKey,
@@ -457,11 +462,15 @@ impl BashHandleRegistry {
         handles.pending_spawns += 1;
         Ok(SpawnReservation {
             owner: owner.clone(),
-            handle_id: self.allocate_handle_id(),
+            handle_id: Self::allocate_handle_id(),
             committed: false,
         })
     }
 
+    /// Commits an admitted spawn into its owner table and global lookup index.
+    ///
+    /// # Errors
+    /// Returns [`BashHandleError::SpawnFenced`] if the owner table disappeared.
     pub async fn commit_spawn(
         &self,
         reservation: &mut SpawnReservation,

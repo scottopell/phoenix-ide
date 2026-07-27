@@ -31,6 +31,7 @@ use super::registry::{BashHandleError, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
+use super::{SharedSandboxedBashRequest, ValidatedBashSpawnTarget};
 use crate::{
     work_scope_identity, RegisterWakeInput, RegisteredWake, ResourceScopeKey, ToolContext,
     ToolOutput,
@@ -430,6 +431,12 @@ pub enum BashSpawnMode {
     SharedReadOnly,
 }
 
+#[derive(Debug, Clone)]
+struct SpawnContext {
+    working_dir: std::path::PathBuf,
+    lifecycle_scope: ResourceScopeKey,
+}
+
 impl BashSpawnMode {
     fn authority(self) -> phoenix_core::work_scope::ResourceAuthority {
         match self {
@@ -443,21 +450,31 @@ impl BashSpawnMode {
 
 /// Run a bash request end-to-end and produce the `ToolOutput`.
 pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct).await
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct, None).await
 }
 
 pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly, None).await
 }
 
-pub async fn dispatch_shared_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::SharedReadOnly).await
+pub async fn dispatch_shared_sandboxed(
+    request: SharedSandboxedBashRequest,
+    ctx: ToolContext,
+) -> ToolOutput {
+    dispatch_with_spawn_mode(
+        request.input,
+        ctx,
+        BashSpawnMode::SharedReadOnly,
+        request.spawn_target,
+    )
+    .await
 }
 
 async fn dispatch_with_spawn_mode(
     input: Value,
     ctx: ToolContext,
     spawn_mode: BashSpawnMode,
+    spawn_target: Option<ValidatedBashSpawnTarget>,
 ) -> ToolOutput {
     // Dispatch kind, not caller convention, selects effective Bash authority.
     let ctx = ctx.with_resource_authority(spawn_mode.authority());
@@ -472,7 +489,34 @@ async fn dispatch_with_spawn_mode(
             label,
             wait_seconds,
             read_args,
-        } => run_run(&cmd, label, wait_seconds, read_args, &ctx, spawn_mode).await,
+        } => {
+            let spawn_context = match spawn_mode {
+                BashSpawnMode::Direct | BashSpawnMode::ExploreReadOnly => SpawnContext {
+                    working_dir: ctx.working_dir().to_path_buf(),
+                    lifecycle_scope: ctx.work_scope.clone(),
+                },
+                BashSpawnMode::SharedReadOnly => match spawn_target {
+                    Some(target) => SpawnContext {
+                        working_dir: target.working_dir,
+                        lifecycle_scope: ResourceScopeKey::Work(target.lifecycle_scope),
+                    },
+                    None => SpawnContext {
+                        working_dir: ctx.working_dir().to_path_buf(),
+                        lifecycle_scope: ctx.work_scope.clone(),
+                    },
+                },
+            };
+            run_run(
+                &cmd,
+                label,
+                wait_seconds,
+                read_args,
+                &ctx,
+                &spawn_context,
+                spawn_mode,
+            )
+            .await
+        }
         BashRequest::Peek {
             handle_id,
             read_args,
@@ -506,6 +550,7 @@ async fn run_run(
     wait_seconds: u64,
     read_args: ReadArgs,
     ctx: &ToolContext,
+    spawn_context: &SpawnContext,
     spawn_mode: BashSpawnMode,
 ) -> ToolOutput {
     // REQ-BASH-011: command safety is enforced upstream by the permission seam
@@ -513,8 +558,15 @@ async fn run_run(
     // not here — see `crate::bash_check`, which the seam invokes. No second
     // check at the tool boundary keeps enforcement single-homed.
 
+    if !matches!(spawn_context.lifecycle_scope, ResourceScopeKey::Work(_)) {
+        return BashError::SpawnFailed {
+            error_message: "bash processes require a WorkScope owner".to_string(),
+        }
+        .into_tool_output();
+    }
+
     let registry = ctx.bash_handle_registry().clone();
-    let mut reservation = match registry.reserve_spawn(&ctx.bash_lifecycle_scope()).await {
+    let mut reservation = match registry.reserve_spawn(&spawn_context.lifecycle_scope).await {
         Ok(reservation) => reservation,
         Err(BashHandleError::HandleCapReached { cap, live_handles }) => {
             return BashError::HandleCapReached(BashHandleError::HandleCapReached {
@@ -536,6 +588,7 @@ async fn run_run(
         cmd,
         label,
         ctx,
+        spawn_context,
         reservation.handle_id().clone(),
         ring_bytes_cap,
         spawn_mode,
@@ -591,6 +644,7 @@ fn spawn_child(
     cmd: &str,
     label: Option<String>,
     ctx: &ToolContext,
+    spawn_context: &SpawnContext,
     handle_id: HandleId,
     ring_bytes_cap: usize,
     spawn_mode: BashSpawnMode,
@@ -624,11 +678,14 @@ fn spawn_child(
     let mut command = match spawn_mode {
         BashSpawnMode::Direct => {
             let mut command = Command::new("bash");
-            command.arg("-c").arg(cmd).current_dir(ctx.working_dir());
+            command
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(&spawn_context.working_dir);
             command
         }
         BashSpawnMode::ExploreReadOnly | BashSpawnMode::SharedReadOnly => {
-            let sandbox_command = ExploreSandboxLauncher::command(cmd, ctx.working_dir())?;
+            let sandbox_command = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
         }
@@ -670,7 +727,7 @@ fn spawn_child(
 
     let handle = Handle::new_live_for_actor_with_lifecycle(
         ctx.work_scope.clone(),
-        ctx.bash_lifecycle_scope(),
+        spawn_context.lifecycle_scope.clone(),
         handle_id,
         ctx.resource_access.conversation_id().to_string(),
         ctx.resource_access.authority(),
@@ -1317,9 +1374,10 @@ async fn lookup_handle(ctx: &ToolContext, handle_id: &str) -> Result<Arc<Handle>
         .ok_or_else(|| BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
         })?;
-    if !ctx
-        .resource_access
-        .can_control(&handle.creator_conversation_id, handle.authority)
+    if handle.work_scope != ctx.work_scope
+        || !ctx
+            .resource_access
+            .can_control(&handle.creator_conversation_id, handle.authority)
     {
         return Err(BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
@@ -1952,6 +2010,13 @@ mod tests {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
     }
 
+    fn spawn_context_for(ctx: &ToolContext) -> SpawnContext {
+        SpawnContext {
+            working_dir: ctx.working_dir().to_path_buf(),
+            lifecycle_scope: ctx.work_scope.clone(),
+        }
+    }
+
     #[derive(Debug, Clone)]
     enum RegistrarBehavior {
         Registered(u64),
@@ -2282,6 +2347,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2308,6 +2374,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2329,6 +2396,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2350,6 +2418,7 @@ mod tests {
             5,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2389,6 +2458,12 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &SpawnContext {
+                working_dir: ctx.working_dir().to_path_buf(),
+                lifecycle_scope: ResourceScopeKey::Work(
+                    phoenix_core::work_scope::WorkScopeId::parse("coordinator-target").unwrap(),
+                ),
+            },
             BashSpawnMode::Direct,
         )
         .await;
@@ -2411,14 +2486,14 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
         assert!(!output.is_success());
-        assert_eq!(
-            output.output(),
-            "global terminal scope cannot own a durable wake"
-        );
+        assert!(output
+            .output()
+            .contains("bash processes require a WorkScope owner"));
         assert!(registrar.register_calls().is_empty());
     }
 
@@ -2431,6 +2506,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2453,6 +2529,7 @@ mod tests {
             10,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2473,6 +2550,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;
@@ -2516,6 +2594,7 @@ mod tests {
             0,
             ReadArgs::default(),
             &ctx,
+            &spawn_context_for(&ctx),
             BashSpawnMode::Direct,
         )
         .await;

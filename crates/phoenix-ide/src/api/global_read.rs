@@ -148,7 +148,7 @@ pub(crate) struct GlobalReadService {
 }
 
 #[derive(Debug)]
-pub(crate) struct ValidatedWorkScopeCwd {
+pub(crate) struct ValidatedCoordinatorBashSpawnTarget {
     pub(crate) path: std::path::PathBuf,
     pub(crate) work_scope_id: phoenix_core::work_scope::WorkScopeId,
 }
@@ -241,32 +241,35 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         ))
     }
 
-    pub(crate) async fn validate_active_work_scope_cwd(
+    pub(crate) async fn resolve_active_work_scope_bash_target(
         &self,
         requested_work_scope_id: &str,
-        requested_cwd: &str,
-    ) -> Result<ValidatedWorkScopeCwd, String> {
-        let canonical = crate::conversation_cwd::validate_conversation_cwd(requested_cwd)
-            .map_err(|error| format!("invalid Coordinator bash cwd: {error}"))?
-            .path_buf();
-        let canonical_text = canonical.to_string_lossy();
-        let work_scope_id = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM work_scopes
+    ) -> Result<ValidatedCoordinatorBashSpawnTarget, String> {
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT id, worktree_path, cwd FROM work_scopes
              WHERE id = ?1
                AND lifecycle = 'active'
-               AND environment_kind <> 'none'
-               AND (cwd = ?2 OR worktree_path = ?2)",
+               AND environment_kind <> 'none'",
         )
         .bind(requested_work_scope_id)
-        .bind(canonical_text.as_ref())
         .fetch_optional(self.db.pool())
         .await
-        .map_err(|error| format!("failed to validate explicit bash cwd: {error}"))?
+        .map_err(|error| format!("failed to resolve Coordinator bash WorkScope: {error}"))?
         .ok_or_else(|| {
-            "explicit bash WorkScope id and cwd do not identify the same active persisted environment"
-                .to_string()
+            "active persisted WorkScope not found for Coordinator bash run".to_string()
         })?;
-        Ok(ValidatedWorkScopeCwd {
+        let (work_scope_id, worktree_path, cwd) = row;
+        let preferred = worktree_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .or_else(|| cwd.as_deref().filter(|path| !path.trim().is_empty()))
+            .ok_or_else(|| {
+                "active persisted WorkScope is missing both worktree_path and cwd".to_string()
+            })?;
+        let canonical = crate::conversation_cwd::validate_conversation_cwd(preferred)
+            .map_err(|error| format!("invalid persisted Coordinator bash cwd: {error}"))?
+            .path_buf();
+        Ok(ValidatedCoordinatorBashSpawnTarget {
             path: canonical,
             work_scope_id: phoenix_core::work_scope::WorkScopeId::parse(work_scope_id)
                 .map_err(|error| format!("invalid persisted WorkScope id: {error}"))?,
@@ -1165,7 +1168,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_bash_cwd_must_resolve_to_active_persisted_environment() {
+    async fn coordinator_bash_scope_resolution_prefers_nonempty_worktree_path_then_cwd_and_canonicalizes(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cwd-resolution.db");
         let work = dir.path().join("work");
@@ -1195,32 +1199,48 @@ mod tests {
             .unwrap();
 
         let binding = service
-            .validate_active_work_scope_cwd(work_scope_id.as_str(), canonical.to_str().unwrap())
+            .resolve_active_work_scope_bash_target(work_scope_id.as_str())
             .await
             .unwrap();
         assert_eq!(binding.path, canonical);
-        assert!(service
-            .validate_active_work_scope_cwd(work_scope_id.as_str(), dir.path().to_str().unwrap())
+
+        let fallback = dir.path().join("fallback");
+        std::fs::create_dir(&fallback).unwrap();
+        let fallback_noncanonical = fallback.join("..").join("fallback");
+        sqlx::query(
+            "UPDATE work_scopes
+             SET environment_kind = 'unowned_cwd', worktree_path = NULL,
+                 branch_name = NULL, base_branch = NULL, cwd = ?1
+             WHERE id = ?2",
+        )
+        .bind(fallback_noncanonical.to_str().unwrap())
+        .bind(work_scope_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let binding = service
+            .resolve_active_work_scope_bash_target(work_scope_id.as_str())
             .await
-            .unwrap_err()
-            .contains("active persisted environment"));
+            .unwrap();
+        assert_eq!(binding.path, fallback.canonicalize().unwrap());
 
         sqlx::query(
             "UPDATE work_scopes
              SET lifecycle = 'retired', retired_at = '2026-01-01T00:00:00Z',
                  environment_kind = 'allocated_worktree', worktree_path = ?1,
                  branch_name = 'feature/history', base_branch = 'main'
-             WHERE cwd = ?1",
+             WHERE id = ?2",
         )
         .bind(canonical.to_str().unwrap())
+        .bind(work_scope_id.as_str())
         .execute(db.pool())
         .await
         .unwrap();
         assert!(service
-            .validate_active_work_scope_cwd(work_scope_id.as_str(), canonical.to_str().unwrap())
+            .resolve_active_work_scope_bash_target(work_scope_id.as_str())
             .await
             .unwrap_err()
-            .contains("active persisted environment"));
+            .contains("active persisted WorkScope not found"));
         let snapshot = service.coordinator_snapshot().await.unwrap();
         assert!(snapshot.contains("\"cwd\": null"), "{snapshot}");
         assert!(snapshot.contains("\"worktree_path\": null"), "{snapshot}");
@@ -1232,45 +1252,5 @@ mod tests {
             snapshot.contains("\"cm_base_branch\": \"main\""),
             "{snapshot}"
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn coordinator_bash_cwd_canonicalizes_symlinks_before_scope_matching() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("symlink-resolution.db");
-        let work = dir.path().join("work");
-        let alias = dir.path().join("alias");
-        std::fs::create_dir(&work).unwrap();
-        std::os::unix::fs::symlink(&work, &alias).unwrap();
-        let canonical = work.canonicalize().unwrap();
-        let db = crate::db::Database::open(path.to_str().unwrap())
-            .await
-            .unwrap();
-        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
-        db.create_conversation(
-            "scope-owner",
-            "scope-owner",
-            canonical.to_str().unwrap(),
-            true,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
-        let service = GlobalReadService::new(db.clone(), retriever);
-        let work_scope_id = db
-            .get_conversation("scope-owner")
-            .await
-            .unwrap()
-            .work_scope_id
-            .unwrap();
-
-        let binding = service
-            .validate_active_work_scope_cwd(work_scope_id.as_str(), alias.to_str().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(binding.path, canonical);
     }
 }

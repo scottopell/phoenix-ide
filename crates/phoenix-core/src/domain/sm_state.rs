@@ -305,7 +305,7 @@ impl<'de> Deserialize<'de> for ToolInput {
                     )
                 }
             }
-            "coordinator_bash" => BashInvocation::from_with_explicit_run_directory(payload.clone())
+            "coordinator_bash" => BashInvocation::from_with_work_scope_target(payload.clone())
                 .map_or_else(
                     |error| malformed_known_input("bash", payload, error),
                     ToolInput::Bash,
@@ -423,7 +423,7 @@ impl From<AskUserQuestionInput> for ToolInput {
 #[derive(Clone, Copy)]
 enum ToolInputContract {
     ContextWorkingDirectory,
-    ExplicitWorkingDirectory,
+    WorkScopeTarget,
 }
 
 impl ToolInput {
@@ -495,12 +495,8 @@ impl ToolInput {
     }
 
     #[must_use]
-    pub fn from_name_and_value_with_explicit_working_directory(name: &str, value: Value) -> Self {
-        Self::from_name_and_value_with_contract(
-            name,
-            value,
-            ToolInputContract::ExplicitWorkingDirectory,
-        )
+    pub fn from_name_and_value_with_work_scope_target(name: &str, value: Value) -> Self {
+        Self::from_name_and_value_with_contract(name, value, ToolInputContract::WorkScopeTarget)
     }
 
     fn from_name_and_value_with_contract(
@@ -519,8 +515,8 @@ impl ToolInput {
             }
         }
         match name {
-            "bash" if matches!(contract, ToolInputContract::ExplicitWorkingDirectory) => {
-                BashInvocation::from_with_explicit_run_directory(value.clone()).map_or_else(
+            "bash" if matches!(contract, ToolInputContract::WorkScopeTarget) => {
+                BashInvocation::from_with_work_scope_target(value.clone()).map_or_else(
                     |error| malformed_known_input(name, value, error),
                     ToolInput::Bash,
                 )
@@ -571,7 +567,7 @@ mod tests {
             input,
             BashInvocation::Run {
                 cmd,
-                working_directory: crate::domain::bash_types::BashWorkingDirectory::Context,
+                target: crate::domain::bash_types::BashSpawnTarget::Context,
                 ..
             } if cmd == "echo legacy"
         ));
@@ -595,24 +591,30 @@ mod tests {
     }
 
     #[test]
-    fn explicit_directory_bash_is_typed_and_context_bash_rejects_cwd() {
+    fn work_scope_target_bash_is_typed_and_context_bash_rejects_work_scope_id() {
+        let work_scope_id = crate::work_scope::WorkScopeId::new();
         let payload = serde_json::json!({
             "op": "run",
             "cmd": "pwd",
-            "cwd": "/tmp/work"
+            "work_scope_id": work_scope_id
         });
-        let typed =
-            ToolInput::from_name_and_value_with_explicit_working_directory("bash", payload.clone());
+        let typed = ToolInput::from_name_and_value_with_work_scope_target("bash", payload.clone());
         assert!(matches!(typed, ToolInput::Bash(_)));
         assert_eq!(typed.tool_name(), "bash");
         let redispatched = typed.to_value();
         assert_eq!(redispatched["op"], "run");
         assert_eq!(redispatched["cmd"], "pwd");
-        assert_eq!(redispatched["cwd"], "/tmp/work");
+        assert_eq!(redispatched["work_scope_id"], work_scope_id.to_string());
 
         let durable = serde_json::to_value(&typed).unwrap();
         let restored: ToolInput = serde_json::from_value(durable).unwrap();
         assert_eq!(restored, typed);
+        let ToolInput::Bash(BashInvocation::Run { target, .. }) = restored else {
+            panic!("expected bash run");
+        };
+        assert!(
+            matches!(target, crate::domain::bash_types::BashSpawnTarget::WorkScope(id) if id == work_scope_id)
+        );
         assert!(matches!(
             ToolInput::from_name_and_value("bash", payload),
             ToolInput::Malformed { .. }
@@ -620,12 +622,13 @@ mod tests {
     }
 
     #[test]
-    fn short_lived_coordinator_bash_representation_migrates_to_bash_invocation() {
+    fn short_lived_coordinator_bash_representation_migrates_to_work_scope_invocation() {
+        let work_scope_id = crate::work_scope::WorkScopeId::new();
         let durable = serde_json::json!({
             "_tool": "coordinator_bash",
             "op": "run",
             "cmd": "pwd",
-            "cwd": "/tmp/work",
+            "work_scope_id": work_scope_id,
             "label": null,
             "wait_seconds": null,
             "lines": null,
@@ -633,13 +636,13 @@ mod tests {
         });
         let restored: ToolInput = serde_json::from_value(durable).unwrap();
         let ToolInput::Bash(BashInvocation::Run {
-            working_directory: crate::domain::bash_types::BashWorkingDirectory::Explicit(cwd),
+            target: crate::domain::bash_types::BashSpawnTarget::WorkScope(id),
             ..
         }) = restored
         else {
-            panic!("expected explicit-directory bash invocation");
+            panic!("expected work-scope-target bash invocation");
         };
-        assert_eq!(cwd, "/tmp/work");
+        assert_eq!(id, work_scope_id);
     }
 
     #[test]
