@@ -142,6 +142,10 @@ value WakeAcceptancePayload {
     items: List<WakeBatchItem>
 }
 
+value CloseSettlementRequest {
+    product_conversation: bedrock/ProductConversation
+}
+
 ------------------------------------------------------------
 -- Actors and profile-owned entities
 ------------------------------------------------------------
@@ -214,6 +218,7 @@ config {
 -- successor_safe_delivery_identity(item, successor), transfer_is_atomic(predecessor, successor)
 -- predecessor_history_unchanged(predecessor), registering_conversation_owns_child(conversation, resource)
 -- subagent_resource_matches_child_conversation(resource), terminal_receipt_already_exists(binding)
+-- wake_close_settlement_request(product_conversation)
 
 ------------------------------------------------------------
 -- Rules
@@ -396,8 +401,18 @@ rule PendingWakeBlocksDestructiveLifecycleWithoutBusyState {
         -- fabricate runtime-busy state for an otherwise idle conversation.
 }
 
+rule BedrockCloseSettlementRequestBridgesIntoWakeProfile {
+    when: CloseSettlementRequest(product_conversation)
+    ensures: wake_close_settlement_request(product_conversation)
+
+    @guidance
+        -- Import bridge for the bedrock close-settlement lifecycle event. This
+        -- profile consumes the same root ProductConversation payload without
+        -- renaming or reshaping it.
+}
+
 rule CloseSettlementCancelsPendingWakeBindings {
-    when: bedrock/CloseSettlementRequested(product_conversation)
+    when: CloseSettlementRequest(product_conversation)
     let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
     let manager = WakeLifecycleManager{identified_by: latest_parent}
     requires: pending_wake_count(latest_parent) > 0

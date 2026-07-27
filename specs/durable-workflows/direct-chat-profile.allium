@@ -11,6 +11,7 @@
 -- REQ-DWF-CHAT-014.
 
 use "./durable-workflows.allium" as dwf
+use "../bedrock/bedrock.allium" as bedrock
 
 ------------------------------------------------------------
 -- Types
@@ -84,6 +85,10 @@ value DirectChatOutcome {
     replay_queued_steering: AcceptedTurnRef? when kind = ReplayQueuedSteering
     conflicting_key_reuse: PreparedTurnFingerprint? when kind = ConflictingKeyReuse
     terminal_rejected: DirectChatRejectReason? when kind = TerminalRejected
+}
+
+value CloseSettlementRequest {
+    product_conversation: bedrock/ProductConversation
 }
 
 ------------------------------------------------------------
@@ -168,6 +173,7 @@ entity DirectChatConsumerCursor {
 -- replay_runtime_accepted_outcome(accepted_turn), replay_queued_steering_outcome(accepted_turn)
 -- independent_prepared_events_emitted(request, targets)
 -- replay_preserves_prepared_payload(acceptance, prepared_payload), acceptance_created_once(turn_key)
+-- direct_chat_close_settlement_request(product_conversation)
 
 ------------------------------------------------------------
 -- Invariants
@@ -362,8 +368,18 @@ rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
     ensures: acceptance.accepted_turn = acceptance.accepted_turn
 }
 
+rule BedrockCloseSettlementRequestBridgesIntoDirectChatProfile {
+    when: CloseSettlementRequest(product_conversation)
+    ensures: direct_chat_close_settlement_request(product_conversation)
+
+    @guidance
+        -- Bridge contract: this local typed trigger is a direct import bridge for
+        -- bedrock/CloseSettlementRequested(product_conversation), preserving the
+        -- exact root ProductConversation payload without renaming or reshaping it.
+}
+
 rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
-    when: bedrock/CloseSettlementRequested(product_conversation)
+    when: CloseSettlementRequest(product_conversation)
     let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
     let acceptance = latest_row_direct_turn_acceptance(latest_parent)
     requires: acceptance != null
