@@ -74,6 +74,7 @@ value UserQuestion {
 }
 
 value TaskProposal {
+    task_file: String
     title: String
     priority: String
     plan: String
@@ -88,7 +89,12 @@ enum ToolOutcome { success | error | cancelled }
 enum SubAgentOutcome { success | failure | timed_out }
 enum RecoveryKind { credential }
 enum RecoveryResumeTarget { conversation_turn | continuation_summary }
-enum TaskApprovalDecision { approved | rejected | feedback_provided }
+enum TaskApprovalDecision {
+    approved_continue_current
+    | approved_start_fresh
+    | request_changes
+    | rejected
+}
 enum ModeKind { direct | managed | branch }
 enum ClosePhase {
     awaiting_blocker_resolution
@@ -272,19 +278,11 @@ variant Parent : Conversation {
     parent_status: awaiting_recovery | awaiting_task_approval
                   | awaiting_user_response | context_exhausted | handed_off
 
-    -- Provenance breadcrumb for a fork (projects/ ForkProposalApproved). Points at
-    -- the conversation whose agent proposed this one. Lives on Parent, not the shared
-    -- Conversation, so a SubAgent structurally cannot carry it — the "a fork is a
-    -- top-level Parent, never a sub-agent" guarantee is correct-by-construction rather
-    -- than convention. Distinct from `continued_in_conv_id` (chains) and SubAgent.parent
-    -- (sub-agents); carries NO lifecycle/notification semantics — no rule keys off it.
-    -- A non-live audit reference, NOT an FK-enforced edge: the origin has an
-    -- independent lifecycle and may be hard-deleted while this fork lives on, so the
-    -- breadcrumb may point at a since-deleted conversation. Deleting the origin neither
-    -- cascades to nor clears this field (the fork survives untouched, REQ-PROJ-035).
-    -- Typed as a RAW conversation id (String), not a `Conversation` reference, precisely so
-    -- nothing models it as an FK with cascade/null-on-delete behaviour — a dangling id is the
-    -- intended, valid state.
+    -- Provenance breadcrumb for approved-task "Start in new conversation".
+    -- Points at the source product conversation rather than a continuation predecessor.
+    -- The new conversation remains a top-level Parent with its own lifecycle; this raw id
+    -- is purely for the visible "Derived from" link and does not participate in row
+    -- ownership, continuation routing, or delete cascades.
     spawned_from_conversation_id: String?
 
     proposal: TaskProposal when parent_status = awaiting_task_approval
@@ -312,8 +310,8 @@ variant Parent : Conversation {
     -- the Allium v3 grammar does not currently support transitions or
     -- invariants inside `variant` bodies — see the triage note below):
     --
-    --   awaiting_task_approval -> idle            (approval in current exits)
-    --   awaiting_task_approval -> handed_off      (approval into fresh Work exits)
+    --   awaiting_task_approval -> idle            (approve here / request changes / reject)
+    --   awaiting_task_approval -> idle            (approve into fresh conversation exits source)
     --   awaiting_user_response -> idle            (user question exits)
     --   awaiting_recovery      -> idle            (conversation-turn recovery exits)
     --   awaiting_recovery      -> awaiting_continuation (continuation recovery succeeds)
@@ -745,41 +743,44 @@ rule ParentLlmRespondsTextOnly {
 }
 
 -- REQ-BED-028, REQ-PROJ-003/012: propose_task interception for every Git-backed
--- parent conversation. The review is always blocking: the same conversation parks
--- for human review regardless of whether it is planning-only or already write-capable.
+-- parent conversation that either already has a worktree-capable environment or an
+-- attached WorkScope. Review is always blocking: proposal authority does not split by
+-- mode, and writing-capable parents do not get a parallel non-blocking path.
 rule ProposeTaskIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
+    requires: is_git_repository(conversation.working_dir)
     requires: conversation.mode in { explore, work, branch }
-           or (conversation.mode = direct and is_git_repository(conversation.working_dir))
+           or has_attached_work_scope(conversation)
     let proposal = parse_task_proposal(tool_calls.first)
     ensures: conversation.parent_status = awaiting_task_approval
     ensures: conversation.proposal = proposal
     ensures: TaskApprovalRequested(conversation, proposal)
 
     @guidance
-        -- There is one proposal authority only: a sole propose_task from a Git-backed
-        -- parent always enters AwaitingTaskApproval. Writing-capable conversations do
-        -- not get a parallel non-blocking fork path.
+        -- There is exactly one blocking proposal-review authority: a sole propose_task
+        -- from a Git-backed parent that can land work through a managed worktree or an
+        -- attached WorkScope always parks in AwaitingTaskApproval.
         -- At the continuation threshold ContextThresholdReachedParent still wins first,
         -- parking into awaiting_continuation with the propose_task call in
         -- rejected_tool_calls for replay after continuation.
 }
 
 -- REQ-PROJ-003/012: an invalid propose_task is rejected before the blocking review
--- state is entered. The same validation applies for every Git-backed parent shape,
--- so there is no second validity authority for writing-mode proposals.
+-- state is entered. The same validation boundary applies to every eligible Git-backed
+-- parent, so there is no competing validity authority in work / branch / explore.
 rule ProposeTaskInvalid {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
+    requires: is_git_repository(conversation.working_dir)
     requires: conversation.mode in { explore, work, branch }
-           or (conversation.mode = direct and is_git_repository(conversation.working_dir))
+           or has_attached_work_scope(conversation)
     let proposal = parse_task_proposal(tool_calls.first)
     requires: not task_proposal_valid(proposal)
     ensures: conversation.core_status = llm_requesting
@@ -984,21 +985,26 @@ rule UserApprovesTaskNewConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_start_fresh
-    let successor = conversation.continued_in_conv_id
-    ensures: FreshWorkConversationCreated(conversation, successor)
-    ensures: conversation.continued_in_conv_id = successor
-    ensures: successor.predecessor = conversation
-    ensures: successor.root = conversation.root_conversation
-    ensures: conversation.parent_status = handed_off
-    ensures: conversation.successor = successor
-    ensures: successor.mode = work
-    ensures: LlmRequestDispatched(successor)
+    let fresh_work_conversation = created_fresh_work_conversation(conversation)
+    ensures: FreshWorkConversationCreated(conversation, fresh_work_conversation)
+    ensures: fresh_work_conversation.product_conversation != conversation.product_conversation
+    ensures: fresh_work_conversation.continued_in_conv_id = absent
+    ensures: FreshGitWorktreeProvisioningRequested(fresh_work_conversation)
+    ensures: LlmRequestDispatched(fresh_work_conversation)
+
+    @guidance
+        -- Starting fresh for approved task work creates a separate product
+        -- conversation boundary. It is not a continuation: the source stays open,
+        -- no continuation edge is written, and no handed_off row condition is introduced.
+        -- The initial handoff is only a typed provisioning boundary at the canonical
+        -- detached default-commit base; detailed worktree/branch provisioning is owned
+        -- downstream rather than by task approval itself.
 }
 
-rule UserProvidesFeedback {
+rule UserRequestsTaskChanges {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
-    requires: decision = feedback_provided
+    requires: decision = request_changes
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
@@ -1019,11 +1025,10 @@ rule CancelDuringTaskApproval {
     ensures: AgentDone(conversation)
 }
 
--- Approved-task placement never writes continuation topology for Start in new
--- conversation: it creates a separate top-level lineage while the source stays
--- Open. Continue here resumes the same conversation with no continuation edge.
--- A fork proposal is likewise resolved entirely in projects/ and leaves its
--- originating conversation untouched.
+-- Approved-task placement never writes continuation topology. Start in new
+-- conversation creates a separate top-level lineage while the source stays Open;
+-- Continue here resumes the same aggregate, transcript context, and attached scope.
+-- A fork proposal is resolved entirely in projects/ and leaves its origin untouched.
 
 -- ===========================================================
 -- PARENT 6. USER QUESTION RESPONSE

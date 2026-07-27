@@ -8,7 +8,6 @@
 --           branch discovery, task approval, worktree lifecycle,
 --           task file lifecycle, mark-as-merged flow, abandon flow,
 --           write scoping, sub-agent worktree inheritance,
---           task forks (decoupled spawn from a writing mode),
 --           server restart worktree reconciliation
 -- Excludes:
 --   - Conversation state machine (see bedrock.allium)
@@ -18,8 +17,7 @@
 --   - Diff snapshot capture (implementation detail of abandon)
 --
 -- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-029
--- (2 descoped: REQ-PROJ-009, REQ-PROJ-015) plus REQ-PROJ-033..037 (task forks +
--- Request Changes promotion)
+-- (2 descoped: REQ-PROJ-009, REQ-PROJ-015) plus REQ-PROJ-033..037
 
 use "../bedrock/bedrock.allium" as bedrock
 
@@ -96,8 +94,8 @@ entity Project {
     -- The repository default branch (e.g. "main"). Mandatory and immutable,
     -- resolved once at project creation: repo.remote_default_branch when
     -- detectable, else repo.current_branch at creation time. This is the
-    -- canonical, single source of truth for the fork base (approved-task placement rule);
-    -- forks never use an origin conversation's base_branch.
+    -- canonical detached-default-commit source of truth for fresh approved-task
+    -- provisioning; task approval never inherits a predecessor branch/base branch.
     main_ref: String
 
     -- ls-remote output cached for branch-picker typeahead.
@@ -174,15 +172,10 @@ entity Worktree {
     base_branch: String            -- recorded at creation time
     task_file: TaskFile?           -- present only for managed (work mode) worktrees
     plain_brief_path: String?      -- repo-relative path of the committed *plain* (non-taskmd)
-                                   -- brief on ANY plain-brief Work worktree — a plain-brief fork
-                                   -- (REQ-PROJ-034) OR an ordinary Explore→Work approval of a
-                                   -- plain markdown brief (REQ-PROJ-006, set by
-                                   -- TaskApprovalExecuted / TaskApprovalNewConversationExecuted).
-                                   -- Absent for taskmd worktrees. It is the durable marker that
-                                   -- a Work worktree legitimately has no task_file (and, on a
-                                   -- fork, outlives the origin so the exemption survives origin
-                                   -- hard-delete). Exactly one of task_file / plain_brief_path is
-                                   -- set on a Work worktree.
+                                   -- brief for a plain-markdown approved task. Absent for taskmd
+                                   -- worktrees. It is the durable marker that a Work worktree
+                                   -- legitimately has no typed task_file. Exactly one of
+                                   -- task_file / plain_brief_path is set on a Work worktree.
 
     -- Derived
     is_clean: git_status_clean(path)
@@ -191,11 +184,20 @@ entity Worktree {
 -- A normalized approved-task source captured at the blocking review boundary.
 -- It is the exact reviewed artifact, independent of later source-worktree state,
 -- and is reused by either placement: Continue here or Start in new conversation.
+value ApprovedTaskIdentity {
+    task_kind: taskmd | plain_brief
+    task_id: String?
+    priority: String?
+    slug: String?
+    plain_title: String?
+}
+
 value ApprovedTaskSource {
-    task_file: String                   -- repository-relative markdown path accepted by propose_task
+    task_path: String                   -- repository-relative markdown path accepted by propose_task
     title: String
     priority: String
     body: String                        -- authoritative snapshot body at approval time
+    identity: ApprovedTaskIdentity      -- typed taskmd identity or plain-brief identity
     kind: taskmd | plain_markdown
 }
 
@@ -395,11 +397,9 @@ rule ManagedWorktreeOnFirstMessage {
 }
 
 -- REQ-PROJ-016/018: Non-git or Direct mode has no Managed project ceremony of its
--- own (no Explore/Work worktree, no task file). Direct-in-a-git-repo is the one
--- exception that still gets `propose_task` — as the non-blocking *fork proposal*
--- of REQ-PROJ-033/036 (it spawns a managed fork; the Direct origin itself stays
--- ceremony-free). Direct-not-in-a-repo gets no `propose_task` at all. Enforced by
--- tool registry configuration, not by rules.
+-- own (no Explore/Work worktree, no task file). Proposal availability is owned by
+-- bedrock's single blocking review boundary; branch-picker and provisioning rules
+-- below are disjoint and must not become alternate proposal paths.
 
 -- ===========================================================
 -- 2. BRANCH DISCOVERY (REQ-PROJ-020, 021, 022)
@@ -526,28 +526,21 @@ rule MaterializeBranch {
 -- uncommitted. Tool availability (Explore only, no sub-agents) enforced
 -- by bedrock.
 
--- REQ-PROJ-004/006/028: User approves task into the current conversation —
--- permission upgrade + commit
--- the (already-written) task file on the task branch.
--- Subscribes to bedrock's UserApprovesTask event (see bedrock.allium).
---
--- This rule models the taskmd-filename case (the default). For a
--- plain-markdown brief the shape is the same except: the branch
--- is `task-{sanitized-stem}-{conversation-id-prefix}` (the conv-id prefix is
--- the uniquifier — the approval mutex serializes but does not uniquify),
--- there is no `...-ready--` -> `...-in-progress--` rename, the file is
--- committed at its own path (not under the tasks dir), and the recorded
--- `task_id` is the sanitized stem. See the guidance below.
+-- REQ-PROJ-004/006/028: User approves task into the current conversation.
+-- The shared approval mutex snapshots and revalidates the exact reviewed markdown,
+-- then commits it in place on the conversation's existing worktree. No new branch,
+-- worktree, or provenance authority is created here.
 rule TaskApprovalExecuted {
     when: UserApprovesTask(conversation, decision)
     requires: decision = approved_continue_current
 
     let worktree = Worktree{conversation: conversation}
     let approved_source = ApprovedTaskSource {
-        task_file: conversation.proposal.task_file,
+        task_path: conversation.proposal.task_file,
         title: conversation.proposal.title,
         priority: conversation.proposal.priority,
         body: reread_task_body(conversation.proposal.task_file),
+        identity: approved_task_identity(conversation.proposal.task_file),
         kind: approved_task_kind(conversation.proposal.task_file)
     }
 
@@ -555,32 +548,22 @@ rule TaskApprovalExecuted {
     ensures: ApprovedTaskRevalidated(conversation, approved_source)
     ensures:
         if approved_source.kind = taskmd:
-            worktree.task_file = TaskFile{task_id: approval_task_id(approved_source.task_file), status: in_progress}
-            and TaskFileCommittedOnBranch(worktree, approval_task_id(approved_source.task_file))
+            worktree.task_file = TaskFile{task_id: approval_task_id(approved_source.task_path), status: in_progress}
+            and TaskFileCommittedOnBranch(worktree, approval_task_id(approved_source.task_path))
         else:
-            worktree.plain_brief_path = approved_source.task_file
-            and BriefCommittedOnBranch(worktree, approved_source.task_file, approved_source.body)
+            worktree.plain_brief_path = approved_source.task_path
+            and BriefCommittedOnBranch(worktree, approved_source.task_path, approved_source.body)
 
-    ensures: conversation.task_id = approval_task_id(approved_source.task_file)
+    ensures: conversation.task_id = approval_task_id(approved_source.task_path)
     ensures: conversation.task_title = approved_source.title
-    ensures: ApprovedTaskContinuedHere(conversation)
+    ensures: ApprovedTaskContinuedHere(conversation, approved_source)
 
     @guidance
-        -- Continue-here approval runs under the shared task-approval mutex so the
-        -- exact approved snapshot is captured once, then revalidated against the
-        -- same repo-relative markdown path before commit. The placement remains the
-        -- same conversation: no new conversation row, no continuation edge, no
-        -- worktree transfer, and no provenance record are written here.
-        --
-        -- taskmd vs plain markdown stay typed, not inferred later from prose:
-        --   - taskmd => filename metadata remains authoritative, rename to
-        --     ...-in-progress--<slug> if needed, commit the exact approved file,
-        --     and keep a typed TaskFile attachment.
-        --   - plain_markdown => no status rename, commit at its own path, and mark
-        --     the worktree with plain_brief_path instead of synthesizing TaskFile.
-        --
-        -- The worktree already belongs to this conversation when one exists; approval
-        -- does not provision a new environment for Continue here.
+        -- Continue-here approval preserves the same aggregate, context, and scope.
+        -- Only the objective/approval state changes: exact snapshot capture,
+        -- revalidation, in-place commit, and work-mode identity on the same
+        -- conversation. No new conversation row, continuation edge, provenance
+        -- edge, branch mutation, or provisioning side effect is written.
 }
 
 rule TaskApprovalNewConversationExecuted {
@@ -588,71 +571,38 @@ rule TaskApprovalNewConversationExecuted {
     requires: decision = approved_start_fresh
 
     let approved_source = ApprovedTaskSource {
-        task_file: conversation.proposal.task_file,
+        task_path: conversation.proposal.task_file,
         title: conversation.proposal.title,
         priority: conversation.proposal.priority,
         body: reread_task_body(conversation.proposal.task_file),
+        identity: approved_task_identity(conversation.proposal.task_file),
         kind: approved_task_kind(conversation.proposal.task_file)
     }
-    let successor = Conversation{id: approved_task_child_id(conversation)}
-    let base = conversation.project.main_ref
-    let task_id = approval_task_id(approved_source.task_file)
-    let branch_name = fork_branch_name(approved_source.task_file, successor)
+    let target = ProductConversation{id: approved_task_child_id(conversation)}
 
     ensures: ApprovedTaskSnapshotted(conversation, approved_source)
     ensures: ApprovedTaskRevalidated(conversation, approved_source)
-    ensures: BestEffortFetch(conversation.project.repo, base)
-    ensures: ApprovedTaskChildCreated(conversation, successor, approved_source)
-    ensures: successor.kind = Parent
-    ensures: successor.mode = work
-    ensures: successor.task_id = task_id
-    ensures: successor.task_title = approved_source.title
-    ensures: successor.branch_name = branch_name
-    ensures: successor.base_branch = base
-    ensures: successor.worktree_path = worktree_path(successor)
-    ensures: successor.working_dir = worktree_path(successor)
-    ensures: successor.spawned_from_conversation_id = conversation.id
-    ensures: Worktree.created(
-        conversation: successor,
-        project: conversation.project,
-        path: WorktreePath { absolute_path: worktree_path(successor) },
-        branch_name: branch_name,
-        base_branch: base,
-        task_file: absent
-    )
-    ensures:
-        if approved_source.kind = taskmd:
-            Worktree{conversation: successor}.task_file = TaskFile{task_id: task_id, status: in_progress}
-            and TaskFileCommittedOnBranch(Worktree{conversation: successor}, task_id)
-        else:
-            Worktree{conversation: successor}.plain_brief_path = approved_source.task_file
-            and BriefCommittedOnBranch(Worktree{conversation: successor}, approved_source.task_file, approved_source.body)
-    ensures: ApprovedTaskDerivedChild(conversation) = successor
-    ensures: ApprovedTaskDerivedFromRecorded(conversation, successor, approved_source)
-    ensures: LlmRequestDispatched(successor)
+    ensures: ApprovedTaskSourceRecorded(target, approved_source)
+    ensures: ApprovedTaskDerivedFromRecorded(conversation.product_conversation, target, approved_source)
+    ensures: target.lifecycle = open
+    ensures: CreatedFromApprovedTask(target, approved_source)
+    ensures: FreshGitWorktreeProvisioningRequested(target, conversation.project.main_ref)
 
     @guidance
-        -- This placement is mutually exclusive with Continue here because the same
-        -- TaskApprovalDecided decision value selects exactly one rule.
+        -- Start in new conversation writes the approved-task placement once onto a
+        -- fresh product-conversation aggregate keyed deterministically from the
+        -- source review. Retries adopt the same target aggregate rather than spawning
+        -- a second winner.
         --
-        -- Retry/crash idempotency is keyed on the deterministic successor id derived
-        -- from the source conversation plus the approved-task placement kind; retries
-        -- adopt the same child/worktree rather than spawning a second winner.
-        --
-        -- The child starts with only the approved task snapshot as initial context.
-        -- No source transcript, summary, continuation edge, handed_off state, branch
-        -- mutation on the source, or other provenance authority is written.
+        -- Task approval itself does not materialize a branch, base_branch, or worktree
+        -- record. It emits only the typed fresh-provisioning boundary at the canonical
+        -- detached default commit (Project.main_ref) and the root approved_task source
+        -- link used for the visible "Derived from" breadcrumb.
 }
 
--- REQ-PROJ-004 propose/feedback/reject loop: no git operations. Until
--- UserApprovesTask fires, the task file sits uncommitted on the temp
--- branch and the agent can revise it (UserProvidesFeedback) or the user
--- can reject. This spec emits no rule for those events — bedrock handles
--- the state transitions and there are no git side-effects.
-
--- ===========================================================
--- 3b. APPROVED-TASK START-IN-NEW-CONVERSATION PLACEMENT
--- ===========================================================
+-- REQ-PROJ-004 request-changes/reject loop: no git operations. Until approval
+-- succeeds, the task file sits uncommitted on the existing worktree and the agent
+-- may revise it or the user may reject it; bedrock owns those state transitions.
 
 -- ===========================================================
 -- 4. TERMINAL ACTIONS (mark-merged, abandon)
@@ -1260,14 +1210,24 @@ invariant TerminalActionRequiresNoContinuation {
 
 invariant ApprovedTaskPlacementsAreMutuallyExclusive {
     for c in bedrock/Conversations:
-        not (exists ApprovedTaskContinuedHere(c) and exists ApprovedTaskDerivedChild(c))
+        not (exists ApprovedTaskContinuedHere(c, source) and exists ApprovedTaskDerivedFromRecorded(c.product_conversation, target, source))
 }
 
-invariant ApprovedTaskDerivedChildCarriesOnlyProvenanceLink {
-    for c in bedrock/Conversations:
-        exists ApprovedTaskDerivedChild(c) implies
-            ApprovedTaskDerivedChild(c).spawned_from_conversation_id = c.id
-            and c.continued_in_conv_id = absent
+invariant ApprovedTaskFreshPlacementHasOneSpawnWinner {
+    for source_conv in bedrock/Conversations:
+        for target_a in bedrock/ProductConversations:
+            for target_b in bedrock/ProductConversations:
+                ApprovedTaskDerivedFromRecorded(source_conv.product_conversation, target_a, approved_source)
+                and ApprovedTaskDerivedFromRecorded(source_conv.product_conversation, target_b, approved_source)
+                implies target_a = target_b
+}
+
+invariant ApprovedTaskFreshPlacementCarriesNoContinuationEdge {
+    for source_conv in bedrock/Conversations:
+        for target in bedrock/ProductConversations:
+            exists ApprovedTaskDerivedFromRecorded(source_conv.product_conversation, target, approved_source) implies
+                source_conv.continued_in_conv_id = absent
+                and source_conv.product_conversation.lifecycle = open
 }
 
 ------------------------------------------------------------

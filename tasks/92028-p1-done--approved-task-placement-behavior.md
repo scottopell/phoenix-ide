@@ -74,3 +74,42 @@ Append a completion note with these headings:
 
 **Commit**
 - Pending
+
+
+## Reopen review evidence
+
+**Files changed**
+- `specs/bedrock/bedrock.allium`
+- `specs/projects/projects.allium`
+- `tasks/92028-p1-in-progress--approved-task-placement-behavior.md`
+
+**Settled facts encoded**
+- `specs/bedrock/bedrock.allium` now defines a single blocking `propose_task` review authority for Git-backed parent conversations, gated by Git-backed/worktree capability or attached WorkScope rather than old mode splits.
+- Bedrock approval decisions now distinguish `approved_continue_current`, `approved_start_fresh`, `request_changes`, and `rejected`, so request-changes vs reject semantics are explicit and the old `feedback_provided` branch is gone.
+- `UserApprovesTaskNewConversation` now emits only `FreshGitWorktreeProvisioningRequested(...)` for the fresh target and no longer writes work-mode/branch/base-branch/continuation/handoff state at approval time.
+- `specs/projects/projects.allium` removes task-fork authority from proposal placement: no nonblocking fork rules/entities, no writing-mode fork split, and no approval-time branch creation/deletion side effects.
+- `ApprovedTaskSource` now preserves the exact approved body, repo-relative path bookkeeping (`task_path`), and typed identity (`ApprovedTaskIdentity`) independent from source lifetime.
+- Start-in-new placement is now owned by the target `ProductConversation`: it records the approved source on the target aggregate, emits the root `approved_task` provenance edge from source product conversation to target product conversation, keeps the source product conversation `open`, and forbids any continuation edge.
+- Continue-here placement remains same aggregate/context/scope only, with objective/approval-state changes but no provenance, branch mutation, or worktree/provisioning side effect.
+
+**Validation**
+- Command: `allium check specs/bedrock/bedrock.allium specs/projects/projects.allium`
+- Result: exit `1` with warnings/info only after the reopen edits; no `severity: "error"` diagnostics remained.
+
+**Review / evidence ledger**
+- Restored the prior completion evidence from commit `afe95432` and appended this reopen review section rather than replacing the historical note.
+- Repository-wide semantic grep (scoped to proposal symbols and branch side effects) confirmed removal of competing proposal authorities from the edited specs: no surviving `ForkProposal`, `UserApprovesTaskFreshWorkConversation`, `feedback_provided`, or approval-time `fork_branch_name` usage in `bedrock.allium` / `projects.allium`.
+- Review correction: the prior version still let start-fresh approval allocate `mode = work`, `branch_name`, `base_branch`, `worktree_path`, and `spawned_from_conversation_id` at approval time. This reopen pass replaced that with a typed fresh-provisioning boundary plus target-owned approved-task source recording.
+- Review correction: prior prose still described direct-mode/nonblocking fork proposal authority in `projects.allium`; this reopen pass replaced it with explicit disjointness so branch picker / provisioning rules cannot become alternate product proposal paths.
+- Structural proof captured by invariants and rule shape:
+  - exact one placement per approved proposal (`ApprovedTaskPlacementsAreMutuallyExclusive`)
+  - one spawn winner on retries (`ApprovedTaskFreshPlacementHasOneSpawnWinner`)
+  - no continuation edge / source stays open (`ApprovedTaskFreshPlacementCarriesNoContinuationEdge`)
+  - no approval-time branch mutation for start-fresh placement (fresh placement emits only `FreshGitWorktreeProvisioningRequested`)
+
+**Speculation avoided**
+- No requirements were changed because this reopen was reconciled within existing Allium ownership.
+- No unrelated branch-picker, restart reconciliation, terminal cleanup, or downstream provisioning mechanics were rewritten beyond adding disjointness / removing proposal-flow coupling.
+
+**Commit**
+- Pending
