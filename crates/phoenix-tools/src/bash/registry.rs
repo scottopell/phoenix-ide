@@ -523,7 +523,7 @@ impl BashHandleRegistry {
         self.handles_by_id.read().await.get(handle_id).cloned()
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub async fn register_existing_handle(&self, owner: &ResourceScopeKey, handle: Arc<Handle>) {
         let entry = self.get_or_create(owner).await;
         entry.write().await.insert(handle.clone());

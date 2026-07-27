@@ -10437,7 +10437,6 @@ pub(crate) mod hard_delete_cascade_tests {
         let scope = create_inspector_actor(&state, actor_id, "Inventory live").await;
 
         // Insert a live handle directly into the ResourceScopeKey-keyed registry.
-        let table = state.runtime.bash_handles().get_or_create(&scope).await;
         let handle = Handle::new_live(
             scope.clone(),
             HandleId::new("b-1"),
@@ -10447,7 +10446,11 @@ pub(crate) mod hard_delete_cascade_tests {
             1234,
             RING_BUFFER_BYTES,
         );
-        table.write().await.insert(handle);
+        state
+            .runtime
+            .bash_handles()
+            .register_existing_handle(&scope, handle)
+            .await;
 
         let Json(inv) = super::get_work_scope_inventory(
             State(state),
@@ -10617,7 +10620,6 @@ pub(crate) mod hard_delete_cascade_tests {
         #[allow(clippy::cast_possible_wrap)]
         let pgid = pid as i32;
 
-        let table = state.runtime.bash_handles().get_or_create(&scope).await;
         let handle = Handle::new_live(
             scope.clone(),
             HandleId::new("b-1"),
@@ -10631,7 +10633,11 @@ pub(crate) mod hard_delete_cascade_tests {
         if let HandleState::Live(live) = handle.state().await.as_ref() {
             live.ring.lock().await.append(b"hello from inspector\n");
         }
-        table.write().await.insert(handle);
+        state
+            .runtime
+            .bash_handles()
+            .register_existing_handle(&scope, handle)
+            .await;
 
         let Json(inspection) = super::inspect_bash_handle(
             State(state),
@@ -10698,7 +10704,6 @@ pub(crate) mod hard_delete_cascade_tests {
         let actor_id = "conv-inspect-term";
         let scope = create_inspector_actor(&state, actor_id, "Inspect terminal").await;
 
-        let table = state.runtime.bash_handles().get_or_create(&scope).await;
         let handle = Handle::new_live(
             scope.clone(),
             HandleId::new("b-1"),
@@ -10720,7 +10725,11 @@ pub(crate) mod hard_delete_cascade_tests {
                 phoenix_tools::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
-        table.write().await.insert(handle);
+        state
+            .runtime
+            .bash_handles()
+            .register_existing_handle(&scope, handle)
+            .await;
 
         let Json(inspection) = super::inspect_bash_handle(
             State(state),
