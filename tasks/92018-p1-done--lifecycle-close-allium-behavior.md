@@ -39,3 +39,25 @@ Append a completion note to this task body with these headings:
 - **Validation** — exact `allium check` commands and outputs summarized
 - **Review corrections** — helper/import/cross-spec fixes made after review, or `None`
 - **Commit** — commit hash that landed the work
+
+
+## Completion evidence
+
+**Files changed**
+- `tasks/92018-p1-in-progress--lifecycle-close-allium-behavior.md`
+
+**Decisions captured**
+- Parent task 92018 is complete through six child/spec-review tasks: `92025`, `92026`, `92027`, `92028`, `92029`, and `92030`.
+- Review corrections across the child stack included: unified close authority on projects/spec surfaces, unified SSE lifecycle projection, WorkScope-vs-lifecycle cleanup boundary clarifications, approved-task placement exactness, and the final recovery acceptance removing the residual Continue-here mode transition from `specs/bedrock/bedrock.allium`.
+- Final recovery acceptance also classified residual `mode` hits as internal execution authority only, and `requested_branch` in durable creation as generic legacy/internal creation API rather than the unified user-facing conversation path.
+- Remaining implementation drift findings were explicitly deferred to implementation gates, not treated as spec blockers: executor Continue-here mode upgrade behavior and DB/task fresh-continuation behavior.
+
+**Validation**
+- See child task evidence, especially `tasks/92030-p1-in-progress--cross-file-allium-review.md`, for the final semantic grep set, individual+combined `allium check` runs, `python3 scripts/spec_shape_check.py`, and `./dev.py tasks validate`.
+- This parent summary task did not introduce additional spec artifacts beyond status/evidence reconciliation.
+
+**Review corrections**
+- Summarized the six-child closure and final review corrections only; no new spec beyond the child-owned corrections.
+
+**Commit**
+- Pending local commit for task status/evidence reconciliation.
