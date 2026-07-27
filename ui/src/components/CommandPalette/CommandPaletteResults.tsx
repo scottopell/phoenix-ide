@@ -82,14 +82,14 @@ export function CommandPaletteResults({ results, selectedIndex, mode, searchStat
                 <span className={`conv-state-dot ${getConversationState(item)}`} />
               )}
               <div className="cp-result-text">
-                <span className="cp-result-title">{item.title}</span>
+                <span className="cp-result-title-row">
+                  <span className="cp-result-title">{item.title}</span>
+                  {item.badge && mode !== 'action' && (
+                    <span className="cp-inline-indicator">{item.badge}</span>
+                  )}
+                </span>
                 {item.subtitle && mode !== 'action' && (
                   <span className="cp-result-subtitle">{item.subtitle}</span>
-                )}
-                {item.badge && mode !== 'action' && (
-                  <span className="cp-result-subtitle">
-                    <span className="cp-inline-indicator">{item.badge}</span>
-                  </span>
                 )}
                 {item.snippet && mode !== 'action' && (
                   <span className="cp-result-snippet">{item.snippet}</span>

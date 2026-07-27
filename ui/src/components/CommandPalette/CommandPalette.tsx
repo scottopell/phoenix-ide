@@ -154,19 +154,17 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
   const searchQuery = state.status === 'open' ? state.query : null;
 
   useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
+
     if (!isOpen || searchMode !== 'search') return;
     const query = searchQuery ?? '';
 
     if (searchScope === 'conversation-content' && query.trim().length === 0) {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      searchAbortRef.current?.abort();
       setState(prev => transition(prev, { type: 'SEARCH_AWAITING_QUERY' }, actions));
       return;
     }
-
-    // Cancel previous debounce + in-flight request
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    searchAbortRef.current?.abort();
 
     setState(prev => transition(prev, { type: 'SEARCH_DEBOUNCING' }, actions));
 
@@ -207,6 +205,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
+      searchAbortRef.current?.abort();
     };
   }, [isOpen, searchMode, searchScope, searchQuery, actions]);
 

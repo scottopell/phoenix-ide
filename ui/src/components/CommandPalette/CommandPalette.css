@@ -1,3 +1,10 @@
+.cp-result-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .cp-inline-indicator {
   display: inline-flex;
   align-items: center;

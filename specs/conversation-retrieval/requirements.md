@@ -272,7 +272,7 @@ ships FTS5, so it adds no dependency, runs offline, and answers the
 lexical recall questions that dominate ("which file", "the auth bug",
 "what optimizations"). The interface seam is what lets a semantic
 backend be substituted as a pure swap — callers, having only ever seen
-`retrieve(query, scope, top_k)`, are unaffected. A vector backend sits
+`retrieve(request)`, are unaffected. A vector backend sits
 outside this contract because it requires an embedding provider (the
 Anthropic provider offers none) and a chunk-splitting strategy, neither
 of which this spec defines.

@@ -410,7 +410,7 @@ impl MessageRetriever for Fts5Retriever {
                      SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, snippet, score \
                      FROM grouped_hits \
                      WHERE conversation_rank = 1 \
-                     ORDER BY score, created_at DESC \
+                     ORDER BY score, created_at DESC, conversation_id \
                      LIMIT ?",
                 );
             }
@@ -1411,6 +1411,55 @@ mod tests {
         let conversations: HashSet<_> = hits.into_iter().map(|h| h.conversation_id).collect();
         assert!(conversations.contains("c-a"));
         assert!(conversations.contains("c-b"));
+    }
+
+    #[tokio::test]
+    async fn best_per_conversation_grouping_uses_conversation_id_as_final_tiebreaker() {
+        let db = seed().await;
+        db.create_conversation("c-z", "z", "/tmp/z", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("c-y", "y", "/tmp/y", true, None, None)
+            .await
+            .unwrap();
+        for (message_id, conversation_id) in [("m-z", "c-z"), ("m-y", "c-y")] {
+            db.add_message(
+                message_id,
+                conversation_id,
+                &MessageContent::user("deterministic tie"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE message_fts_rows SET created_at = '2026-01-01T00:00:00Z' \
+             WHERE message_id IN ('m-z', 'm-y')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+
+        let hits = r
+            .retrieve(RetrievalRequest {
+                query: "deterministic".to_string(),
+                scope: RetrievalScope::Global,
+                visibility: RetrievalVisibility::UserTopLevel,
+                grouping: RetrievalGrouping::BestPerConversation,
+                match_mode: RetrievalMatchMode::ExactTerms,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.into_iter()
+                .map(|hit| hit.conversation_id)
+                .collect::<Vec<_>>(),
+            ["c-y", "c-z"]
+        );
     }
 
     #[tokio::test]

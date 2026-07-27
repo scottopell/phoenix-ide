@@ -397,9 +397,69 @@ describe('CommandPalette conversation scope', () => {
     fireEvent.keyDown(window, { key: 'p', metaKey: true });
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'c archived' } });
 
-    expect(await screen.findAllByText('Archived')).toHaveLength(1);
+    const archivedBadge = (await screen.findAllByText('Archived'))[0];
+    expect(archivedBadge?.closest('.cp-result-title-row')).toHaveTextContent('archived-hitArchived');
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
     expect(screen.getByTestId('location')).toHaveTextContent('/c/archived-hit');
+  });
+
+  it('aborts content search before entering action mode', async () => {
+    let resolveContent: ((value: {
+      hits: Array<{
+        conversation_id: string;
+        slug: string;
+        archived: boolean;
+        message_id: string;
+        message_type: string;
+        created_at: string;
+        snippet: string;
+        score: number;
+      }>;
+    }) => void) | null = null;
+    let contentSignal: AbortSignal | null = null;
+    mocks.searchConversationContent.mockImplementation((_, __, signal?: AbortSignal) => {
+      contentSignal = signal ?? null;
+      return new Promise(resolve => {
+        resolveContent = resolve;
+      });
+    });
+
+    renderPalette(makeConversation());
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    const input = screen.getByRole('textbox');
+    fireEvent.change(input, { target: { value: 'c pending' } });
+    await waitFor(() => expect(mocks.searchConversationContent).toHaveBeenCalledOnce());
+
+    fireEvent.change(input, { target: { value: '>new' } });
+    expect(await screen.findByText('New Conversation')).toBeInTheDocument();
+    const abortedContentSignal = contentSignal as AbortSignal | null;
+    expect(abortedContentSignal?.aborted).toBe(true);
+
+    const finishContent = resolveContent as ((value: { hits: Array<{
+      conversation_id: string;
+      slug: string;
+      archived: boolean;
+      message_id: string;
+      message_type: string;
+      created_at: string;
+      snippet: string;
+      score: number;
+    }> }) => void) | null;
+    finishContent?.({
+      hits: [{
+        conversation_id: 'conv-stale',
+        slug: 'stale-content-hit',
+        archived: false,
+        message_id: 'msg-stale',
+        message_type: 'user',
+        created_at: '2026-01-01T00:00:00Z',
+        snippet: 'Must not replace actions',
+        score: 0.1,
+      }],
+    });
+
+    await waitFor(() => expect(screen.queryByText('stale-content-hit')).not.toBeInTheDocument());
+    expect(screen.getByText('New Conversation')).toBeInTheDocument();
   });
 
   it('suppresses stale out-of-order content responses', async () => {
