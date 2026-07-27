@@ -667,9 +667,9 @@ AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, repository state b
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Start in new conversation policy
 THE SYSTEM SHALL perform the same task-approval artifact persistence
-AND create a fresh Open conversation that becomes the live owner of a fresh `WorkScope`
+AND create a fresh Open conversation with a fresh attached `WorkScope`
   and worktree
-AND record one visible source relation of kind `approved_task` from the source conversation to the new one
+AND record one visible source relation of kind `approved_task` on the new conversation that points to the source conversation
 AND keep the source conversation Open rather than linking it through `continued_in_conv_id`
 AND dispatch the next LLM request only in the spawned conversation
 AND seed that conversation's first LLM-visible context from the approved task brief
@@ -732,18 +732,17 @@ separate in-Phoenix merged-versus-abandoned lifecycle.
 
 WHEN user initiates continuation from a context-exhausted conversation
 THE SYSTEM SHALL create a new transcript row within the same product conversation that inherits:
-  - the parent's execution authority, preserving whether the latest live row is read-only planning, write-capable against a `WorkScope`, or chat-only
+  - the parent's execution authority, preserving whether the latest live row is read-only planning, write-capable against an attached `WorkScope`, or chat-only
   - the parent's working directory
-  - the parent's worktree, if any, via ownership transfer rather than destroy-and-recreate
+  - the parent's worktree, if any, without destroy-and-recreate
   - any uncommitted changes in that worktree
   - any parent task/proposal context that remains part of the same live conversation authority
 
 WHEN the current execution row has a worktree
-THE SYSTEM SHALL transfer `WorkScope` ownership atomically in a single database transaction while keeping the durable root conversation identity unchanged:
+THE SYSTEM SHALL keep the same attached `WorkScope` atomically in a single database transaction while keeping the durable root conversation identity unchanged:
   - the parent retains its `worktree_path` field as a read-only reference for history navigation
   - the continuation's `worktree_path` is set to the same value
   - the continuation inherits the same `work_scope_id`
-  - the live owner of that `WorkScope` moves from parent to continuation
   - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
 
 WHEN a continuation successor row is newly created
@@ -761,8 +760,7 @@ matches that intent directly and eliminates the need for `git stash`/restore
 ceremony or a separate auto-stash feature. Transferring ownership rather than
 destroying and recreating is the only shape that preserves uncommitted work
 structurally, without a separate auto-stash mechanism. Single-continuation
-policy keeps work ownership unambiguous: at any moment, exactly one
-live row in the product conversation's continuation topology owns the `WorkScope` and therefore the inherited worktree.
+policy keeps execution topology unambiguous: at any moment, continuation identifies the latest execution row for one product conversation while that conversation keeps one attached `WorkScope` and therefore one inherited worktree.
 
 **Dependencies:** REQ-BED-021, REQ-PROJ-025, work-lifecycle REQ-WL-001/REQ-WL-002, REQ-PROJ-028
 
@@ -802,11 +800,46 @@ ambiguous about which conversation the action affects.
 
 ---
 
+### REQ-BED-031A: Start Follow-up Creates a Fresh Open Conversation from History
+
+WHEN the user starts a follow-up from a History conversation
+THE SYSTEM SHALL create a separate Open conversation rather than reopening or continuing the historical one
+AND SHALL attach a fresh `WorkScope`
+AND SHALL provision a fresh detached-default-branch disposable worktree when the follow-up is Git-backed
+AND SHALL set the new conversation's user objective from the follow-up request rather than from the historical transcript
+AND SHALL NOT inject, copy, or summarize the source transcript into the new conversation's starting transcript
+AND SHALL record exactly one visible source relation of kind `follow_up` on the new conversation that points to the source conversation
+AND SHALL render that Follow-up relationship visibly from the source conversation
+
+**Rationale:** A follow-up from History is new work that benefits from a clean objective and a clean environment, while retaining explicit navigable provenance back to the source conversation.
+
+---
+
+### REQ-BED-031B: Permanent Delete Removes Only the Conversation Aggregate and Is Idempotent
+
+WHEN the user permanently deletes a conversation
+THE SYSTEM SHALL remove the complete conversation aggregate that is solely owned by that conversation, including its conversation rows, messages, approval records, attachments, and retrieval/index projections
+AND SHALL NOT cascade the deletion into related but separately-owned conversations, branches, or pull requests
+
+WHEN source relations on surviving conversations still point to the deleted conversation
+THE SYSTEM SHALL preserve tombstone-grade source root identity and deleted status sufficient for later UI and retrieval surfaces to distinguish **Deleted source** from an absent or never-recorded source
+
+WHEN conversation content has been removed by permanent Delete
+THE SYSTEM SHALL remove the corresponding FTS/index rows in the same delete path or a deterministic reconciliation path before deleted content can surface again
+
+WHEN the same permanent Delete request is retried after the aggregate has already been removed
+THE SYSTEM SHALL treat the operation as idempotent success rather than recreating work, failing because rows are already gone, or cascading into unrelated records
+
+**Rationale:** Permanent Delete is about one conversation aggregate and its solely-owned data, not about erasing every related object in the repository or navigation graph. Tombstone-grade source identity preserves truthful surviving provenance.
+
+---
+
 ### REQ-BED-032: Conversation Terminal-Transition Cascade
 
+
 A conversation transitions to a terminal lifecycle state via:
-- **hard-delete** — user permanently removes the conversation row and
-  all dependent rows
+- **hard-delete** — user permanently removes the conversation aggregate and
+  all solely-owned dependent rows
 - **archive** — user signals "this work is over"; row + messages
   preserved for retrospection, live resources released
 - **abandon** (Work/Branch) — user signals "this work failed"; cleanup
@@ -841,9 +874,10 @@ following sequence of direct calls in order:
    Chrome session for the scope unless the continuation inherits the
    same `WorkScope` (REQ-BROWSER-WS-003)
 6. For hard-delete only: `db.delete_conversation(conversation_id)` —
-   SQLite ON DELETE CASCADE removes messages, tool calls, and other
-   dependent rows. Close preserves the row as History, while permanent Delete removes it,
-   flipping `archived = 1` (or recording mode-specific state) instead.
+   permanent Delete removes the complete conversation aggregate, including solely-owned messages,
+   tool calls, approval records, attachments, and index projections, while leaving related but
+   separately-owned conversations, branches, and pull requests untouched. Close preserves the row as
+   History instead.
 7. Broadcast the matching SSE wire event for UI consumers —
    `ConversationHardDeleted` for hard-delete, the existing
    archive/abandon/merged events for the other three transitions.

@@ -138,7 +138,7 @@ THE SYSTEM SHALL create a separate Open conversation derived from the source con
 AND provision a fresh detached-default-branch disposable worktree for the spawned conversation
 AND seed only the exact approved task as the spawned conversation's starting context
 AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
-AND record exactly one source relation of kind `approved_task` from the spawned conversation to the source conversation
+AND record exactly one source relation of kind `approved_task` on the spawned conversation that points to the source conversation
 AND resume execution in the spawned conversation
 AND leave the source conversation Open
 AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
@@ -278,8 +278,8 @@ THE SYSTEM SHALL treat it as the blocking review path defined by REQ-PROJ-003 an
 WHEN `propose_task` is called from a Git-backed conversation that already has write authority
 THE SYSTEM SHALL treat it as a proposal to start a separate derived conversation rather than as an in-place lifecycle transition
 
-WHEN `propose_task` is called in a Direct conversation whose working directory is not in a Git repository
-THE SYSTEM SHALL NOT provide the tool
+WHEN `propose_task` is called in a chat-only Direct conversation
+THE SYSTEM SHALL NOT provide the tool, even if its working directory happens to be inside a Git repository
 
 WHEN `propose_task` is called by a sub-agent
 THE SYSTEM SHALL reject the call
@@ -346,9 +346,9 @@ WHEN a conversation is in context-exhausted state and has not transferred owners
 THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
 
 WHEN a transcript row has transferred execution through `continued_in_conv_id`
-THE SYSTEM SHALL treat that row as a historical transcript segment rather than a live worktree owner
-AND SHALL derive the latest execution row from continuation topology rather than storing a second latest-owner authority
-AND SHALL preserve the worktree only while a non-History live conversation remains the owner of the same `WorkScope`
+THE SYSTEM SHALL treat that row as a historical transcript segment rather than as an independent WorkScope authority
+AND SHALL derive the latest execution row from continuation topology rather than storing a second ownership authority
+AND SHALL preserve the worktree only while a non-History open product conversation still has that same `WorkScope` attached
 
 WHEN teardown or startup reconciliation evaluates a Phoenix-owned worktree
 AND another live conversation still resolves to the same `WorkScope`
@@ -400,7 +400,7 @@ Direct mode is the chat-only / non-worktree conversation shape.
 WHEN a conversation is created in Direct mode
 THE SYSTEM SHALL provide full tool access (bash, patch, all tools)
 AND set the working directory to the target directory (not a Phoenix-owned worktree)
-AND include `propose_task` only when the working directory is inside a Git repository and the proposal can spawn a separate Git-backed conversation
+AND SHALL NOT include `propose_task`
 AND NOT create worktrees, branches, or task files for the Direct conversation itself
 
 THE SYSTEM SHALL visually distinguish Direct mode from Git-backed worktree conversations in the UI
@@ -574,7 +574,7 @@ Branch discovery and checkout capabilities MAY still be reused later inside the 
 
 ### REQ-PROJ-033: Propose a Derived Task from an Already-Active Conversation
 
-WHILE a Git-backed conversation already has write authority, or a Direct conversation is operating inside a Git repository
+WHILE a Git-backed conversation already has write authority
 THE SYSTEM SHALL provide `propose_task` as a way to hand a self-contained unit of work to a separate derived conversation
 
 WHEN the agent calls `propose_task` with a markdown file inside its allowed workspace
@@ -589,7 +589,7 @@ AND return the originating conversation to its running state so it may continue 
 WHEN `propose_task` is called from a planning/read-only phase
 THE SYSTEM SHALL keep the blocking review behavior of REQ-PROJ-003 rather than this derived-conversation path
 
-WHEN `propose_task` is called in Direct mode outside a Git repository
+WHEN `propose_task` is called in Direct mode
 THE SYSTEM SHALL NOT provide the tool
 
 WHEN `propose_task` is called by a sub-agent
@@ -613,7 +613,7 @@ AND SHALL write the snapshot's approved task artifact into the spawned workspace
 AND SHALL persist one normalized approved-task source record containing the exact approved body plus its original repository-relative path and taskmd/plain-brief identity
 AND SHALL seed the spawned conversation's initial context with the approved task brief and nothing else from the source transcript
 AND SHALL record the proposal resolution as `spawned`
-AND SHALL record exactly one source relation of kind `approved_task` from the spawned conversation to the originating conversation
+AND SHALL record exactly one source relation of kind `approved_task` on the spawned conversation that points to the originating conversation
 
 
 WHEN the user dismisses a `pending` derived proposal
@@ -630,7 +630,7 @@ THE SYSTEM SHALL retire that pending proposal rather than silently attaching it 
 ### REQ-PROJ-035: Derived-Conversation Provenance and Decoupling Guarantees
 
 WHEN a derived conversation is created
-THE SYSTEM SHALL record one visible source relation of kind `approved_task` pointing at the originating conversation
+THE SYSTEM SHALL record one visible source relation of kind `approved_task` on the derived conversation, pointing at the originating conversation
 AND this source relation SHALL remain distinct from `parent_conversation_id`, `continued_in_conv_id`, and any continuation topology
 AND SHALL carry no lifecycle notification semantics
 
@@ -653,13 +653,10 @@ THE `propose_task` tool SHALL be available as follows:
 |-------------------------------|-------------------------|
 | Git-backed planning/read-only conversation | Blocking review path (REQ-PROJ-003 / REQ-PROJ-004) |
 | Git-backed conversation with write authority | Derived-conversation proposal (REQ-PROJ-033) |
-| Direct conversation inside a Git repository | Derived-conversation proposal (REQ-PROJ-033) |
-| Direct conversation outside a Git repository | Not provided |
+| Any Direct conversation | Not provided |
 | Any sub-agent | Not provided |
 
-A Direct origin owns no Phoenix worktree of its own, yet a derived conversation it proposes may still become a fresh Git-backed Open conversation with its own disposable worktree.
-
-**Rationale:** Availability depends on whether the host can either review a task in place or spawn a Git-backed derived conversation, not on obsolete lifecycle mode labels.
+**Rationale:** Availability depends on whether the host conversation itself is Git-backed and can either review a task in place or spawn a Git-backed derived conversation, not on obsolete lifecycle mode labels or on whether a chat-only working directory happens to sit inside a repository.
 
 ---
 
@@ -709,5 +706,5 @@ AND SHALL keep the worktree checkout's remote relationship distinct from the bas
 
 ### REQ-PROJ-WS-001: WorkScope as Resource Owner
 
-Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from conversation ids, working directories, or worktree paths. Continuations that keep one product conversation alive transfer that same `work_scope_id` to the live successor instead of minting a parallel owner. Attachments and other work-affine execution resources share that same WorkScope ownership model. Conversations retaining one identity share its resources; conversations with distinct identities remain isolated even when their environments use the same path.
+Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from conversation ids, transcript-row ids, sub-agent ids, working directories, or worktree paths. Product conversations, transcript rows, and subordinate execution conversations MAY have a `WorkScope` attached, but attachment is not ownership. When continuation creates a new execution row within the same product conversation, the conversation keeps the same attached `WorkScope`; Phoenix SHALL NOT describe that step as transferring WorkScope ownership from one row to another or as electing a latest row owner. Attachments and other work-affine execution resources share that same WorkScope ownership model. Distinct product conversations remain isolated by distinct WorkScope identities even when their environments use the same path.
 
