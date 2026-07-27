@@ -47,33 +47,27 @@ Append a completion note with these headings:
 
 **Files changed**
 - `specs/bedrock/bedrock.allium`
-- `specs/sse_wire/sse_wire.allium`
 - `tasks/92029-p1-done--history-sse-projection.md`
 
 **Settled facts encoded**
-- `specs/bedrock/bedrock.allium` no longer uses invalid `extend entity ProductConversation` syntax. Product-conversation root/latest identity remains derived from `transcript_rows` plus `continued_in_conv_id`, with no writable `transcript_root`, `latest_activity_row`, `route_target`, or `live_target` fields introduced.
-- Bedrock keeps boundary authority singular on durable predecessor facts: `ContinuationHandoffBecomesBoundary` preserves `continuation_boundary_summary` on the handed-off predecessor only, while `ContinuationBoundarySummaryLivesOnHandedOffPredecessor` avoids any parallel `List<TranscriptBoundary>` authority.
-- Bedrock still encodes one-root / one-latest topology structurally via `ProductConversationHasSingleRootRow` and `ProductConversationHasSingleTopologyLatestRow`, so list ordering and live-target semantics stay derived from continuation topology rather than stored helper fields.
-- The history transition rule no longer self-triggers by name: `ProductConversationTransitionsToHistory` now listens for `ProductConversationTransitionToHistoryRequested(product_conversation)`, removing the obvious naming conflict without broadening scope.
-- `specs/sse_wire/sse_wire.allium` remains the place where projection payloads may carry root/latest identifiers (`root_conversation_id`, row/member IDs, boundary predecessor/successor IDs), but those payloads are projections of durable facts rather than new writable authorities.
-- SSE transcript/boundary projection continues to key everything by durable root identity: `PersistedTranscriptMessageProjectsIntoRootStream`, `ContinuationBoundaryBroadcast`, and the root-aggregate init requirements keep root/latest IDs as projection payload derived from persisted rows and continuation edges.
+- `ProductConversationRouteResolvesLegacyMemberLinks` now resolves legacy member links by deriving `root_row` as the sole transcript row in the same `ProductConversation` with no predecessor and `latest_row` as the sole row with `continued_in_conv_id = absent`, then emits `ProductConversationRouteResolved(route_target: root_row, anchor_row: target_row, live_target: latest_row)`.
+- This removes the incorrect earlier assumption that a legacy member target was itself the product root, preserving explicit member anchors while keeping the stable product route keyed by the durable root and the default live target keyed by the latest continuation row.
+- `ProductConversationTranscriptProjectsChronologically` now describes boundary projection from durable predecessor facts (`continuation_boundary_summary`) plus the `continued_in_conv_id` continuation edge instead of the stale `transcript_boundaries` helper reference.
 
 **Validation**
 - Command: `allium check specs/bedrock/bedrock.allium`
-  - Result: exit `1` with existing `info`/`warning` diagnostics only; parsed successfully with zero `severity: "error"` diagnostics after removing the invalid `extend entity ProductConversation` block.
-- Command: `allium check specs/sse_wire/sse_wire.allium`
-  - Result: exit `0`; zero `severity: "error"` diagnostics.
+  - Result: exit `1` with existing `info`/`warning` diagnostics only; zero `severity: "error"` diagnostics.
 - Command: `allium check specs/bedrock/bedrock.allium specs/sse_wire/sse_wire.allium`
   - Result: exit `1` with existing `info`/`warning` diagnostics only; zero `severity: "error"` diagnostics across both files.
 
 **Review / evidence ledger**
-- Self-review: corrected reopened task 92029 by removing the invalid `extend entity ProductConversation` block instead of trying to preserve derived fields with unsupported syntax.
-- Self-review: removed the parallel boundary authority introduced by `List<TranscriptBoundary>`/`append_boundary(...)`; the final bedrock spec leaves boundary truth on predecessor `continuation_boundary_summary` plus the successor continuation edge.
-- Self-review: renamed the self-triggering `ProductConversationTransitionsToHistory` trigger to `ProductConversationTransitionToHistoryRequested(...)` to eliminate the obvious naming conflict without broadening the behavior surface.
+- Self-review: replaced the legacy-member route rule’s implicit “target row is root/live row” behavior with explicit derived root/latest bindings so ordinary root routes can still default to latest while legacy member links preserve the exact anchor row.
+- Self-review: replaced the stale `transcript_boundaries` guidance reference with the actual durable predecessor-boundary plus continuation-edge model already established elsewhere in bedrock.
+- Reviewer follow-up addressed: removed the invalid first requirement that asserted the requested legacy member target had no predecessor.
 
 **Speculation avoided**
-- No requirements, executive docs, UI/code, dedicated chain route/page, helper storage fields, or duplicate persisted fields for root/latest/boundary authority were added.
-- The final change uses existing durable facts (`transcript_rows`, `continued_in_conv_id`, `continuation_boundary_summary`) rather than inventing writable projection state.
+- No additional files, helper fields, route types, or projection contracts were introduced; the update stays inside `specs/bedrock/bedrock.allium` and the task ledger.
+- The route and transcript semantics remain derived from existing durable facts (`product_conversation`, predecessor absence, `continued_in_conv_id`, `continuation_boundary_summary`) rather than new stored projection authority.
 
 **Commit**
-- `adafbe81a8dffeafc471cf50487f3e6b7be45fd0`
+- `45ff6fbaeb5fb07170256667e5d37175e066fe3c`

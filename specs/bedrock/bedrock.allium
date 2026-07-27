@@ -1206,14 +1206,14 @@ rule ContinuationHandoffBecomesBoundary {
 
 rule ProductConversationRouteResolvesLegacyMemberLinks {
     when: ProductConversationRouteRequested(target_row)
-    requires: not exists Conversation{product_conversation: target_row.product_conversation, continued_in_conv_id: target_row}
-    requires: exists Conversation{product_conversation: target_row.product_conversation, continued_in_conv_id: absent}
+    let root_row = sole_conversation_without_predecessor(target_row.product_conversation)
+    let latest_row = sole_conversation_without_successor(target_row.product_conversation)
 
     ensures: ProductConversationRouteResolved(
         product_conversation: target_row.product_conversation,
-        route_target: target_row,
+        route_target: root_row,
         anchor_row: target_row,
-        live_target: target_row
+        live_target: latest_row
     )
 
     @guidance
@@ -1235,7 +1235,8 @@ rule ProductConversationTranscriptProjectsChronologically {
         -- continued_in_conv_id to the latest row, preserving message chronology and
         -- row/message identity across reload, reconnect, pagination, and
         -- virtualization. Boundaries render exactly once between adjacent rows using
-        -- transcript_boundaries; earlier full transcripts are not injected into the
+        -- the predecessor continuation_boundary_summary plus the continued_in_conv_id
+        -- edge to its successor; earlier full transcripts are not injected into the
         -- successor and boundary summaries are not duplicated as ordinary messages.
 }
 
