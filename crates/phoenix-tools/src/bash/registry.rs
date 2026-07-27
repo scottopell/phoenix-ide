@@ -604,7 +604,15 @@ impl BashHandleRegistry {
         &self,
         work_scope: &ResourceScopeKey,
     ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
-        let entry = self.get_existing(work_scope).await?;
+        let entry = {
+            let mut tables = self.inner.write().await;
+            let entry = tables
+                .entry(work_scope.clone())
+                .or_insert_with(|| Arc::new(RwLock::new(ResourceScopeKeyHandles::new())))
+                .clone();
+            entry.write().await.teardown_started = true;
+            entry
+        };
         loop {
             let notified = {
                 let mut table = entry.write().await;
@@ -766,7 +774,7 @@ pub async fn cascade_bash_on_delete(
         None,
         BashLifecyclePhase::Terminal,
         None,
-        Some(BashTerminalEffect::InventoryAndBranchReconcile),
+        Some(BashTerminalEffect::InventoryOnly),
     );
 
     report
@@ -806,7 +814,7 @@ async fn kill_selected_handles(
         None,
         BashLifecyclePhase::Terminal,
         None,
-        Some(BashTerminalEffect::InventoryAndBranchReconcile),
+        Some(BashTerminalEffect::InventoryOnly),
     );
     report
 }
@@ -880,7 +888,7 @@ mod tests {
             None,
             BashLifecyclePhase::Terminal,
             None,
-            Some(BashTerminalEffect::InventoryAndBranchReconcile),
+            Some(BashTerminalEffect::InventoryOnly),
         );
 
         let e1 = rx.try_recv().expect("first event missing");
@@ -892,10 +900,7 @@ mod tests {
         assert_eq!(e2.owner, b);
         assert_eq!(e2.handle_id, None);
         assert_eq!(e2.phase, BashLifecyclePhase::Terminal);
-        assert_eq!(
-            e2.terminal_effect,
-            Some(BashTerminalEffect::InventoryAndBranchReconcile)
-        );
+        assert_eq!(e2.terminal_effect, Some(BashTerminalEffect::InventoryOnly));
         assert!(rx.try_recv().is_err(), "no more events expected");
     }
 
@@ -1001,6 +1006,18 @@ mod tests {
             .await
             .expect("begin teardown");
         assert!(registry.reserve_spawn(&owner).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn teardown_of_unseen_owner_installs_spawn_fence() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("never-spawned");
+        assert!(registry.get_existing(&owner).await.is_none());
+        assert!(registry.begin_teardown(&owner).await.is_some());
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
     }
 
     #[tokio::test]
@@ -1346,10 +1363,7 @@ mod tests {
         let evt = rx.try_recv().expect("teardown must emit a lifecycle edge");
         assert_eq!(evt.owner, s);
         assert_eq!(evt.handle_id, None);
-        assert_eq!(
-            evt.terminal_effect,
-            Some(BashTerminalEffect::InventoryAndBranchReconcile)
-        );
+        assert_eq!(evt.terminal_effect, Some(BashTerminalEffect::InventoryOnly));
         assert!(rx.try_recv().is_err(), "exactly one edge per teardown");
     }
 

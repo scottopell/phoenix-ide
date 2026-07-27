@@ -62,9 +62,9 @@ state, an output delta, and a resource sample, drawn only from the in-memory
 bash handle registry and a request-time process-group sample
 AND SHALL NOT read from or write to any persistent store to do so.
 
-WHEN no handle with `handle_id` exists in the scope keyed by `scope_key`
-THE SYSTEM SHALL report this as a not-found condition rather than an empty or
-fabricated snapshot.
+WHEN no handle with the globally unique `handle_id` exists
+OR the requesting conversation is neither authorized by its controller metadata nor a member of its owning `WorkScope`
+THE SYSTEM SHALL report this as a not-found condition rather than an empty or fabricated snapshot.
 
 **Rationale:** One typed snapshot, sourced from the authoritative registry plus
 a live sample, keeps the inspector correct-by-construction: there is no second
@@ -180,17 +180,9 @@ with an optional `since=K` query parameter
 THE SYSTEM SHALL resolve the globally unique `handle_id`
 AND SHALL return `Json<BashHandleInspection>` only when the requesting conversation may control the handle or belongs to its owning `WorkScope`.
 
-THE endpoint SHALL follow the existing work-scope handler shape (path
-parameters, `State(AppState)`, `Json<…>` response), the same shape as
-`GET /api/work-scope/:scope_key/inventory` (`specs/work-scope-ui/` REQ-WSUI-006).
+THE endpoint SHALL use the opaque handle ID as its sole path identity and accept `conversation_id` plus the optional output cursor as query authorization/read parameters.
 
-**Rationale:** The inspector needs the snapshot at first paint and on every
-poll; a plain JSON GET keyed by `stable_key()` plus `handle_id` serves both. It
-nests under the existing work-scope route family, reusing the `scope_key`
-resolution and disjoint-namespace guarantee that endpoint already relies on. The
-`since` query parameter mirrors the ring read's incremental mode (`specs/bash/`
-REQ-BASH-004) so the same offset cursor the bash peek uses drives the
-inspector's tail.
+**Rationale:** The inspector needs the snapshot at first paint and on every poll. A plain JSON GET keyed by the globally unique opaque handle ID serves both without exposing registry routing coordinates. The server resolves ownership and controller authorization from the authoritative handle record. The `since` query parameter mirrors the ring read's incremental mode (`specs/bash/` REQ-BASH-004) so the same offset cursor the bash peek uses drives the inspector's tail.
 
 ---
 
