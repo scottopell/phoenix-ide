@@ -319,6 +319,9 @@ variant Parent : Conversation {
         and is_latest_row
         and parent_status != context_exhausted
         and parent_status != handed_off
+    close_eligible: product_lifecycle = open
+        and is_latest_row
+        and parent_status != handed_off
 
     -- Parent-only status transitions.
     -- Recovery/approval/question states exit by resetting to a core_status
@@ -1315,9 +1318,7 @@ rule ProductConversationListProjectsOncePerRoot {
 
 rule UserRequestsCloseConversation {
     when: UserRequestsCloseConversation(conversation)
-    requires: conversation.product_lifecycle = open
-    requires: conversation.is_latest_row
-    requires: conversation.row_accepts_user_messages
+    requires: conversation.close_eligible
     requires: not exists Parent{product_conversation: conversation.product_conversation, parent_status: awaiting_task_approval}
     requires: not exists Parent{product_conversation: conversation.product_conversation, core_status: awaiting_continuation}
     requires:
@@ -1332,9 +1333,11 @@ rule UserRequestsCloseConversation {
 
     @guidance
         -- Close is a durable root-owned obligation separate from the row-local
-        -- lifecycle state. Admission requires the latest row to be the one that
-        -- still accepts ordinary user input, so handed-off predecessors and other
-        -- read-only rows cannot open a new Close obligation.
+        -- message-admission state. Admission uses close_eligible rather than
+        -- row_accepts_user_messages so the latest context_exhausted row with no
+        -- continuation may still close, while handed-off predecessors, nonlatest
+        -- rows, task-approval blockers, and continuation-in-progress blockers
+        -- remain ineligible per the action table.
 }
 
 rule CloseObligationRequiresExplicitStopWorkConfirmation {
@@ -1383,14 +1386,20 @@ rule CloseObligationBeginsSettlementWithoutBusyWork {
 rule CloseObligationWaitsForSettlement {
     when: CloseSettlementProgressed(product_conversation)
     requires: CloseObligation{product_conversation: product_conversation}.phase in { settling_active_work, cancel_requested_during_settlement }
-    requires: exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
+    requires: not all_close_owned_authorities_released(product_conversation)
     ensures: CloseSettlementStillOwed(product_conversation)
+
+    @guidance
+        -- Settlement stays owed until every close-owned authority for the latest
+        -- row has released: ordinary bedrock busy ownership plus any typed direct-
+        -- turn, wake, tool, sub-agent, or background authorities rooted in that
+        -- same product conversation.
 }
 
 rule CloseObligationRequestsRetirementInspectionAfterSettlement {
     when: CloseSettlementProgressed(product_conversation)
     requires: CloseObligation{product_conversation: product_conversation}.phase = settling_active_work
-    requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
+    requires: all_close_owned_authorities_released(product_conversation)
     ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_retirement_inspection
     ensures: RetirementInspectionRequested(product_conversation)
 }
@@ -1398,18 +1407,18 @@ rule CloseObligationRequestsRetirementInspectionAfterSettlement {
 rule CloseSettlementCancellationCompletesAfterBusyOwnershipReleased {
     when: CloseSettlementProgressed(product_conversation)
     requires: CloseObligation{product_conversation: product_conversation}.phase = cancel_requested_during_settlement
-    requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
+    requires: all_close_owned_authorities_released(product_conversation)
     ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
     ensures: CloseObligationCancelled(product_conversation)
 
     @guidance
         -- A cancellation request during settlement does not interrupt the same
-        -- settlement pass that releases latest-row busy ownership. Phoenix first
-        -- waits for that busy ownership to clear through settlement, then marks the
-        -- Close obligation completed and emits CloseObligationCancelled. It does not
-        -- request retirement inspection, enter retirement_requested, or continue into
-        -- destructive Close after the user has cancelled. The user may later start a
-        -- fresh Close from the still-open ProductConversation.
+        -- settlement pass that releases latest-row ownership. Phoenix first waits
+        -- for every close-owned authority to clear through settlement, then marks
+        -- the Close obligation completed and emits CloseObligationCancelled. It
+        -- does not request retirement inspection, enter retirement_requested, or
+        -- continue into destructive Close after the user has cancelled. The user
+        -- may later start a fresh Close from the still-open ProductConversation.
 }
 
 rule RetirementInspectionShowsNoConfirmationRequired {
@@ -1635,23 +1644,31 @@ rule ConversationLifecycleEnteredHistory {
 -- consumers. There is no event-bus / subscriber-registration pattern.
 rule UserHardDeletesConversationRule {
     when: UserHardDeletesConversation(conversation)
+    let aggregate = conversation.product_conversation
 
     requires: not conversation.is_busy
+    requires: aggregate.lifecycle = history
     requires: DestructiveLifecycleMayProceed(conversation, hard_delete)
 
-    ensures: BashHandlesCleanedUp(conversation)
+    ensures: BashHandlesCleanedUp(aggregate)
         -- Direct call: cascade_bash_on_delete (REQ-BASH-006).
-    ensures: TmuxServerCleanedUp(conversation)
+    ensures: TmuxServerCleanedUp(aggregate)
         -- Direct call: cascade_tmux_on_delete (REQ-TMUX-007).
-    ensures: ProjectWorktreeCleanedUp(conversation)
+    ensures: ProjectWorktreeCleanedUp(aggregate)
         -- Direct call: cascade_projects_on_delete
         -- (specs/projects/ subscriber rule).
-    ensures: ConversationRowRemoved(conversation)
-        -- Direct call: db.delete_conversation. SQLite ON DELETE CASCADE
-        -- removes messages, tool calls, and other dependent rows.
-    ensures: ConversationHardDeleted(conversation)
+    ensures: AggregateTranscriptRowsRemoved(aggregate)
+    ensures: SolelyOwnedConversationChildrenRemoved(aggregate)
+    ensures: SolelyOwnedConversationMessagesRemoved(aggregate)
+    ensures: SolelyOwnedConversationApprovalsRemoved(aggregate)
+    ensures: SolelyOwnedConversationAttachmentsRemoved(aggregate)
+    ensures: ConversationIndexAndFtsRowsRemoved(aggregate)
+    ensures: NonCascadeProvenanceRelationsPreservedAsTypedTombstones(aggregate)
+    ensures: NonCascadeBranchAndPullRequestRelationsRemain(aggregate)
+    ensures: ProductConversationRemoved(aggregate)
+    ensures: ConversationHardDeleted(aggregate)
         -- SSE wire event for UI consumers (sidebar refresh, etc.).
-        -- Emitted AFTER row removal; not a cleanup-dispatch hook.
+        -- Emitted AFTER aggregate removal; not a cleanup-dispatch hook.
 
     @guidance
         -- Handler sequence (in src/api/handlers.rs::delete_conversation):
@@ -1664,11 +1681,14 @@ rule UserHardDeletesConversationRule {
         --   2. cascade_bash_on_delete — kill live handles, drop tombstones.
         --   3. cascade_tmux_on_delete — kill-server, unlink socket, drop
         --      registry entry.
-        --   4. cascade_projects_on_delete — worktree/branch cleanup if
-        --      applicable (non-terminal conversations may still have
-        --      worktrees; terminal conversations had theirs handled per
-        --      REQ-PROJ-028).
-        --   5. db.delete_conversation(conv_id) — SQLite ON DELETE CASCADE.
+        --   4. cascade_projects_on_delete — aggregate-scoped worktree cleanup if
+        --      applicable.
+        --   5. db.delete_product_conversation(product_conversation_id) — remove
+        --      every transcript row and solely-owned child row in the History
+        --      aggregate, including messages, approval records, attachments,
+        --      and FTS/index projections, while retaining typed tombstones for
+        --      surviving provenance links and leaving separately-owned branch /
+        --      pull-request relations untouched.
         --   6. Broadcast ConversationHardDeleted SSE wire event.
         --   7. Return success to the user.
         --

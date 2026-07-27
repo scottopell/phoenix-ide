@@ -170,6 +170,17 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
         -- inspection for a mixed-attachment aggregate that still owns a worktree.
 }
 
+rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
+    when: ResourceRetirementRequested(product_conversation)
+    requires: not exists AttachedWorkScope{product_conversation: product_conversation}
+    ensures: ResourceRetirementCompleted(product_conversation)
+
+    @guidance
+        -- A Close on a chat-only or otherwise no-scope aggregate has no owned
+        -- retirement resources. Emit completion idempotently so Close can progress
+        -- without inventing residual work or requiring a synthetic WorkScope.
+}
+
 rule GitBackedInspectionWithoutLossRequestsRetirement {
     when: RetirementInspectionRequested(product_conversation)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}

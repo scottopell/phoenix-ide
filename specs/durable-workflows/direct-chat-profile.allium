@@ -362,6 +362,22 @@ rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
     ensures: acceptance.accepted_turn = acceptance.accepted_turn
 }
 
+rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
+    when: bedrock/CloseSettlementRequested(product_conversation)
+    let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
+    let acceptance = latest_row_direct_turn_acceptance(latest_parent)
+    requires: acceptance != null
+    let generation = current_generation_for(acceptance)
+    ensures: DirectTurnSettlementRequested(acceptance, generation)
+
+    @guidance
+        -- Close emits only the root product-conversation settlement event. The
+        -- direct-turn profile resolves the exact accepted turn owned by the
+        -- latest transcript row, reads that acceptance's current generation, and
+        -- bridges into DirectTurnSettlementRequested without fabricating an
+        -- acceptance when none exists.
+}
+
 rule LifecycleSettlementTargetsExactAcceptedTurnGeneration {
     when: DirectTurnSettlementRequested(acceptance, generation)
     requires: generation = current_generation_for(acceptance)

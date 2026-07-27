@@ -822,8 +822,9 @@ AND SHALL render that Follow-up relationship visibly from the source conversatio
 
 ### REQ-BED-031B: Permanent Delete Removes Only the Conversation Aggregate and Is Idempotent
 
-WHEN the user permanently deletes a conversation
-THE SYSTEM SHALL remove the complete conversation aggregate that is solely owned by that conversation, including its conversation rows, messages, approval records, attachments, and retrieval/index projections
+WHEN the user permanently deletes a History conversation
+THE SYSTEM SHALL remove the complete ProductConversation aggregate that is solely owned by that History conversation, including every transcript row in that aggregate plus solely-owned messages, approval records, attachments, and retrieval/index projections
+AND SHALL preserve typed tombstone-grade source identity needed by surviving provenance consumers
 AND SHALL NOT cascade the deletion into related but separately-owned conversations, branches, or pull requests
 
 WHEN source relations on surviving conversations still point to the deleted conversation
@@ -861,8 +862,8 @@ following sequence of direct calls in order:
 5. `cascade_browser_on_delete(work_scope, inheritor_scope)` — drops the
    Chrome session for the scope unless another still-live owner retains the
    same `WorkScope` (REQ-BROWSER-WS-003)
-6. `db.delete_conversation(conversation_id)` — permanent Delete removes the complete conversation aggregate, including solely-owned messages,
-   tool calls, approval records, attachments, and index projections, while leaving related but
+6. `db.delete_product_conversation(product_conversation_id)` — permanent Delete removes the complete History ProductConversation aggregate, including every transcript row plus solely-owned messages,
+   tool calls, approval records, attachments, and index/FTS projections, while retaining typed tombstones for surviving provenance links and leaving related but
    separately-owned conversations, branches, and pull requests untouched
 7. Broadcast `ConversationHardDeleted` for UI consumers
 

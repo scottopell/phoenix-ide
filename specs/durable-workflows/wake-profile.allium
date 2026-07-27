@@ -397,17 +397,20 @@ rule PendingWakeBlocksDestructiveLifecycleWithoutBusyState {
 }
 
 rule CloseSettlementCancelsPendingWakeBindings {
-    when: CloseSettlementRequested(manager, conversation)
-    requires: pending_wake_count(conversation) > 0
+    when: bedrock/CloseSettlementRequested(product_conversation)
+    let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
+    let manager = WakeLifecycleManager{identified_by: latest_parent}
+    requires: pending_wake_count(latest_parent) > 0
     ensures:
-        for binding in pending_bindings(conversation):
+        for binding in pending_bindings(latest_parent):
             WakeCancellationRequested(manager, binding)
 
     @guidance
-        -- Close settles wake-owned obligations through the profile's existing
-        -- explicit cancellation authority. The resulting cancelled receipt still
-        -- follows the normal canonical-delivery path, but close orchestration does
-        -- not wait for a separate wake-specific lifecycle state machine.
+        -- Bedrock emits one root CloseSettlementRequested(product_conversation).
+        -- The wake profile derives the exact latest Parent row in that aggregate
+        -- and reuses its existing WakeLifecycleManager/binding authority to issue
+        -- WakeCancellationRequested for each pending binding associated with that
+        -- latest-row execution target.
 }
 
 rule ContinuationTransfersPendingWakeStateAtomically {
