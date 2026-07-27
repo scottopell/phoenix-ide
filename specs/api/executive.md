@@ -10,7 +10,7 @@ The API still reflects the legacy lifecycle and chain model. Current shipped end
 
 ## Technical Summary
 
-REST/JSON plus SSE. The conversation SSE stream already includes `conversation_update` and `work_scope_update` alongside persisted message, state-change, token, LLM lifecycle, and deletion events. The server continues to back both ordinary conversation routes and dedicated chain routes. Conversation creation remains the existing shell-first HTTP flow; the durable creation protocol is only partially cut over.
+REST/JSON plus SSE. The conversation SSE stream already includes `conversation_update`, aggregate lifecycle projection, continuation-boundary projection, and `work_scope_update` alongside persisted message, state-change, token, LLM lifecycle, and deletion events. The server continues to back both ordinary conversation routes and dedicated chain routes. Conversation creation remains the existing shell-first HTTP flow; the durable creation protocol is only partially cut over.
 
 ## Requirement Map
 

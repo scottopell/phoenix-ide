@@ -10,7 +10,7 @@
 -- Includes: All SSE event types (init, message, message_updated,
 --           state_change, token, llm_first_byte, llm_attempt, agent_done,
 --           conversation_hard_deleted, conversation_update,
---           browser_session_state, steer_message_queued,
+--           continuation_boundary, browser_session_state, steer_message_queued,
 --           rate_limit_snapshot, error); ordering constraints between them;
 --           the persist-before-broadcast invariant; broadcast-lag semantics;
 --           the per-conversation ReplayRing that buffers ephemeral events
@@ -88,7 +88,7 @@ value InitSnapshot {
 -- full set defined by `crates/phoenix-ide/src/api/wire.rs::event_type`
 -- is:
 --   "init", "message", "message_updated", "state_change", "token",
---   "agent_done", "conversation_update", "error",
+--   "agent_done", "conversation_update", "continuation_boundary", "error",
 --   "browser_session_state",
 --   "steer_message_queued", "rate_limit_snapshot",
 --   "conversation_hard_deleted", "llm_first_byte", "llm_attempt"
@@ -97,7 +97,7 @@ value InitSnapshot {
 --   - "message" enters the ring via the eager-assistant path
 --     (EagerAssistantMessageAppendedToReplayRing below).
 --   - "token", "state_change", "message_updated", "agent_done",
---     "conversation_update", "error", "browser_session_state",
+--     "conversation_update", "continuation_boundary", "error", "browser_session_state",
 --     "steer_message_queued",
 --     "rate_limit_snapshot", "llm_first_byte", "llm_attempt" enter
 --     via the ephemeral path (EphemeralEventAppendedToReplayRing
@@ -149,6 +149,12 @@ value ConversationMetadataUpdate {
     -- task_title: opaque
 }
 
+value ContinuationBoundaryPayload {
+    predecessor_conversation_id: String
+    successor_conversation_id: String
+    summary: String
+}
+
 
 ------------------------------------------------------------
 -- Entities
@@ -167,14 +173,16 @@ entity PersistedMessage {
 entity ProjectedTranscriptRow {
     root_conversation_id: String
     member_conversation_id: String
-    sequence_id: Integer
+    member_sequence_id: Integer
+    root_sequence_id: Integer
 }
 
 entity ProjectedContinuationBoundary {
     root_conversation_id: String
     predecessor_conversation_id: String
     successor_conversation_id: String
-    sequence_id: Integer
+    summary: String
+    root_sequence_id: Integer
 }
 
 -- Join entity: records that a message-type SSE event was delivered
@@ -439,7 +447,8 @@ rule PersistedTranscriptMessageProjectsIntoRootStream {
     ensures: ProjectedTranscriptRow.created(
         root_conversation_id: DurableRootOf(msg.conversation_id),
         member_conversation_id: msg.conversation_id,
-        sequence_id: msg.sequence_id
+        member_sequence_id: msg.sequence_id,
+        root_sequence_id: RootAggregateSequenceForPersistedMessage(msg)
     )
 
     @guidance
@@ -447,6 +456,12 @@ rule PersistedTranscriptMessageProjectsIntoRootStream {
         -- projects every member row into the root conversation stream in the same
         -- chronological sequence the durable rows committed; reconnect/replay never
         -- invents client-owned transcript rows.
+        --
+        -- Member `message.sequence_id` remains row-local identity. It is NOT the
+        -- root stream watermark once multiple member rows share one ProductConversation.
+        -- The root stream allocates its own monotonic envelope sequence at the
+        -- ProductConversation boundary; replay and `applyIfNewer` advance on that
+        -- root sequence while still carrying member row/message identity.
 }
 
 rule MessageBroadcast {
@@ -582,7 +597,7 @@ rule PersistedMessageClearsReplayRing {
 
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
--- error, browser_session_state,
+-- continuation_boundary, error, browser_session_state,
 -- steer_message_queued, rate_limit_snapshot, llm_first_byte,
 -- llm_attempt. Excludes Init (per-stream, never broadcast) and
 -- ConversationHardDeleted (terminal action; no subsequent init can
@@ -612,7 +627,7 @@ rule EphemeralEventAppendedToReplayRing {
 
     requires: entry.event_type in {
         "token", "state_change", "message_updated", "agent_done",
-        "conversation_update", "error",
+        "conversation_update", "continuation_boundary", "error",
         "browser_session_state", "steer_message_queued",
         "rate_limit_snapshot", "llm_first_byte", "llm_attempt"
     }
@@ -737,15 +752,23 @@ rule StateChangeBroadcast {
 -- Partial conversation metadata changes are broadcast as conversation_update.
 -- The client merges the payload shallowly onto its local Conversation copy.
 rule ContinuationBoundaryBroadcast {
-    when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, seq)
+    when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, summary, seq)
 
     requires: seq > 0
+    requires: ContinuationBoundaryPayloadParses(
+        ContinuationBoundaryPayload{
+            predecessor_conversation_id: predecessor_conversation_id,
+            successor_conversation_id: successor_conversation_id,
+            summary: summary
+        }
+    )
 
     ensures: ProjectedContinuationBoundary.created(
         root_conversation_id: root_conversation_id,
         predecessor_conversation_id: predecessor_conversation_id,
         successor_conversation_id: successor_conversation_id,
-        sequence_id: seq
+        summary: summary,
+        root_sequence_id: seq
     )
     ensures:
         for stream in SseStreams where conversation_id = root_conversation_id and status = open and init_sent:
@@ -754,8 +777,13 @@ rule ContinuationBoundaryBroadcast {
     @guidance
         -- Each context continuation emits exactly one expandable boundary sourced
         -- from the exact persisted continuation summary that initialized the
-        -- successor. The boundary is its own projection event, not an ordinary
-        -- message clone on either transcript side.
+        -- successor. The boundary is its own typed replayable event carrier,
+        -- not an ordinary message clone on either transcript side.
+        --
+        -- The same durable boundary appears exactly once in the init snapshot's
+        -- aggregate projection. Live persistence emits the typed carrier and advances
+        -- the root stream watermark only after the payload is parseable, so replay and
+        -- fresh snapshot agree on a single boundary fact with no duplicate synthesis.
 }
 
 rule AggregateLifecycleProjectionBroadcast {
@@ -772,8 +800,11 @@ rule AggregateLifecycleProjectionBroadcast {
         -- A handed-off predecessor inside an Open aggregate does not produce a
         -- History projection; the whole aggregate lifecycle appears atomically from
         -- the UI perspective.
-        -- This rule carries both the wire-level delivery obligation and the
-        -- aggregate lifecycle projection semantics.
+        --
+        -- This aggregate lifecycle projection is the authoritative replacement for any
+        -- row-local terminal event on the root conversation stream. The event list/ring
+        -- treat the lifecycle projection consistently; no separate
+        -- `conversation_became_terminal` carrier is required for reconnect correctness.
 }
 
 rule ConversationUpdateBroadcast {
@@ -943,9 +974,20 @@ invariant TranscriptProjectionPreservesMemberIdentity {
         row.root_conversation_id = DurableRootOf(row.member_conversation_id)
 }
 
+invariant RootAggregateSequenceStrictlyDominatesMemberLocals {
+    for row in ProjectedTranscriptRows:
+        row.root_sequence_id > 0
+            and row.member_sequence_id > 0
+}
+
 invariant ContinuationBoundaryProjectionIsUniquePerJoin {
     for boundary in ProjectedContinuationBoundaries:
         count(ProjectedContinuationBoundary{root_conversation_id: boundary.root_conversation_id, predecessor_conversation_id: boundary.predecessor_conversation_id, successor_conversation_id: boundary.successor_conversation_id}) = 1
+}
+
+invariant ContinuationBoundaryProjectionCarriesDurableSummary {
+    for boundary in ProjectedContinuationBoundaries:
+        boundary.summary = PersistedContinuationBoundarySummary(boundary.predecessor_conversation_id, boundary.successor_conversation_id)
 }
 
 -- Ring entries are in strictly increasing sequence_id order. Not

@@ -1223,6 +1223,25 @@ rule ContinuationHandoffBecomesBoundary {
         -- duplicated as an ordinary transcript message on either side.
 }
 
+rule ContinuationBoundaryPersistenceSignature {
+    when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
+    requires: conversation.parent_status = context_exhausted
+    requires: conversation.continued_in_conv_id = absent
+    requires: conversation.product_lifecycle = open
+    ensures: ContinuationBoundaryPersisted(
+        root_conversation_id: conversation.product_conversation,
+        predecessor_conversation_id: conversation,
+        successor_conversation_id: new_conv,
+        summary: conversation.continuation_summary
+    )
+
+    @guidance
+        -- Downstream consumers use the typed persisted boundary signature as the
+        -- sole event-shape authority for the predecessor/successor join. The
+        -- summary is the exact durable continuation text, not a synthesized or
+        -- display-only derivative.
+}
+
 rule ProductConversationRouteResolvesLegacyMemberLinks {
     when: ProductConversationRouteRequested(target_row)
     let root_row = sole_conversation_without_predecessor(target_row.product_conversation)

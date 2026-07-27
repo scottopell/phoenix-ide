@@ -15,6 +15,10 @@ AND include conversation ID, slug, working directory, state, and timestamps
 WHEN the client requests History conversations
 THE SYSTEM SHALL return closed conversations separately from Open conversations
 
+WHEN the server projects aggregate lifecycle to streaming clients
+THE SYSTEM SHALL use the product-conversation Open/History lifecycle carrier consistently as the authoritative stream/list lifecycle fact
+AND SHALL NOT require a separate row-local `conversation_became_terminal` event for reconnect or listing correctness
+
 **Rationale:** Users need to see and navigate their conversations.
 
 ---
@@ -201,7 +205,7 @@ AND apply appropriate cache headers
 
 ### REQ-API-012: Reconnect Replay Buffer
 
-WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
+WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, continuation_boundary, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
 THE SYSTEM SHALL retain the event in a per-conversation in-memory ring buffer until the next persisted Message broadcast replaces it (anchor reset)
 
 WHEN the server emits an eager (non-persisted) assistant Message via the runtime's BroadcastAssistantMessage effect
@@ -227,8 +231,8 @@ SO THAT pathological large-event-dominated rings can be detected before they bec
 
 WHEN a client subscribes to a conversation's SSE stream
 THE SYSTEM SHALL include in the init payload:
-- `pending_anchor_sequence_id`: the sequence_id of the last persisted Message (the ring's anchor)
-- `pending_events`: the ordered ring entries with sequence_ids strictly greater than the anchor
+- `pending_anchor_sequence_id`: the root aggregate envelope sequence_id of the last persisted transcript anchor carried on the stream
+- `pending_events`: the ordered ring entries with root-stream sequence_ids strictly greater than the anchor
 - `pending_truncated`: whether the ring overflowed since the anchor
 
 WHEN the server process restarts
