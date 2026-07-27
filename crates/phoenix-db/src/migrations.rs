@@ -303,7 +303,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 58,
-        name: "bind_adoption_receipts_to_observations",
+        name: "register_direct_turn_llm_codecs",
         sql: MIGRATION_058,
     },
 ];
@@ -330,45 +330,7 @@ INSERT OR IGNORE INTO workflow_supported_codecs (
 SELECT workflow_id, 'direct_turn.llm_receipt_event', 1
 FROM workflows WHERE profile_kind = 'direct_turn';
 
-CREATE TABLE workflow_receipt_adoptions (
-    workflow_id INTEGER NOT NULL,
-    receipt_id INTEGER NOT NULL,
-    delivery_id INTEGER NOT NULL,
-    observation_id INTEGER NOT NULL,
-    PRIMARY KEY (workflow_id, receipt_id),
-    UNIQUE (workflow_id, observation_id),
-    UNIQUE (workflow_id, delivery_id),
-    FOREIGN KEY (workflow_id, receipt_id)
-        REFERENCES workflow_receipts(workflow_id, receipt_id) ON DELETE CASCADE,
-    FOREIGN KEY (workflow_id, delivery_id)
-        REFERENCES workflow_deliveries(workflow_id, delivery_id) ON DELETE CASCADE,
-    FOREIGN KEY (workflow_id, observation_id)
-        REFERENCES workflow_authoritative_observations(workflow_id, observation_id) ON DELETE RESTRICT
-) WITHOUT ROWID;
 
-CREATE TRIGGER workflow_receipt_adoptions_shape
-BEFORE INSERT ON workflow_receipt_adoptions
-BEGIN
-    SELECT CASE WHEN NOT EXISTS (
-        SELECT 1
-        FROM workflow_receipts receipt
-        JOIN workflow_authoritative_observations observation
-          ON observation.workflow_id = receipt.workflow_id
-         AND observation.observation_id = NEW.observation_id
-        JOIN workflow_deliveries delivery
-          ON delivery.workflow_id = receipt.workflow_id
-         AND delivery.delivery_id = NEW.delivery_id
-        WHERE receipt.workflow_id = NEW.workflow_id
-          AND receipt.receipt_id = NEW.receipt_id
-          AND receipt.origin = 'Adoption'
-          AND receipt.attempt_id IS NULL
-          AND receipt.effect_id = observation.effect_id
-          AND receipt.generation = observation.generation
-          AND receipt.declared_workflow_version = observation.declared_workflow_version
-          AND delivery.effect_id = receipt.effect_id
-          AND delivery.payload_kind = 'Receipt'
-    ) THEN RAISE(ABORT, 'workflow receipt adoption shape mismatch') END;
-END;
 ";
 
 const MIGRATION_057: &str = r"
