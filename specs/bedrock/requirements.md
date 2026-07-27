@@ -603,10 +603,10 @@ THE SYSTEM SHALL configure the tool registry with full local write access
 AND that chat-only authority SHALL NOT change into Git-backed lifecycle
 ownership for the lifetime of the conversation
 AND SHALL provide `propose_task` **only** when the working directory is inside a git
-  repository — there as a non-blocking **fork proposal** (REQ-PROJ-033/036), never as a
+  repository — there as a way to propose a separate derived conversation (REQ-PROJ-033/036), never as a
   gateway between product lifecycle modes. A chat-only conversation whose working directory
   is not in a git repository SHALL NOT provide the tool (no repository default branch to
-  fork from)
+  derive from)
 
 WHEN conversation execution authority changes after an approval or spawn decision
 THE SYSTEM SHALL persist the updated authority before resuming execution
@@ -628,19 +628,19 @@ WHEN the LLM response contains a `propose_task` tool call (which must be the onl
   call in the response, and references a markdown file the agent already wrote inside the
   worktree — a taskmd file under the project's tasks directory, or any other `.md` accepted
   as a plain brief at its own path, classified by `TaskSource` per REQ-PROJ-006)
-  **WHILE the conversation is in Explore mode**
+  WHILE the conversation has read-only planning authority
 THE SYSTEM SHALL intercept it at the LlmResponse handler (same pattern as submit_result)
 AND NOT route it through the tool executor
 AND read the referenced file and persist the assistant message and a synthetic tool
   result as a CheckpointData::ToolRound
 AND transition the conversation to AwaitingTaskApproval state (the blocking planning-to-approved-work checkpoint)
 
-WHEN the same `propose_task` call occurs **while the conversation already has write capability**
+WHEN the same `propose_task` call occurs while the conversation already has write capability
   (an attached `WorkScope`, or chat-only execution inside a git repo)
-THE SYSTEM SHALL instead treat it as a non-blocking **fork proposal** (REQ-PROJ-033/036):
+THE SYSTEM SHALL instead treat it as a proposal for a separate derived conversation (REQ-PROJ-033/036):
   record the proposal as control-plane state and continue the conversation's own work
   WITHOUT parking — it does not enter AwaitingTaskApproval. The parking behavior of this
-  requirement is scoped to read-only planning authority; the write-capable fork lifecycle
+  requirement is scoped to read-only planning authority; the write-capable derived-conversation review
   (review, spawn, dismiss) is owned by REQ-PROJ-033/034/035.
 
 THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a display copy
@@ -662,14 +662,14 @@ THE SYSTEM SHALL record the approved task as the conversation's next objective,
 AND SHALL treat the approval as a checkpoint only
 AND SHALL NOT create a fresh conversation row
 AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, repository state beyond the
-  approved task commit, or provenance records beyond the approval itself
+  approved task commit, or source/provenance records beyond the approval itself
 
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Start in new conversation policy
 THE SYSTEM SHALL perform the same task-approval artifact persistence
 AND create a fresh Open conversation that becomes the live owner of a fresh `WorkScope`
   and worktree
-AND record one typed derived-from provenance link from the source conversation to the new one
+AND record one visible source relation of kind `approved_task` from the source conversation to the new one
 AND keep the source conversation Open rather than linking it through `continued_in_conv_id`
 AND dispatch the next LLM request only in the spawned conversation
 AND seed that conversation's first LLM-visible context from the approved task brief
@@ -684,7 +684,7 @@ AND transition the conversation back to its ordinary read-only planning authorit
   (the agent may revise the task file and call `propose_task` again, re-entering AwaitingTaskApproval)
 
 WHEN the user discards the task while in AwaitingTaskApproval
-THE SYSTEM SHALL transition the conversation to Idle in Explore mode
+THE SYSTEM SHALL transition the conversation to Idle in its prior read-only planning authority
 AND NOT perform any repository lifecycle mutations (the task file stays on disk where the agent left it)
 
 **Persistence and restart:**

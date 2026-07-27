@@ -120,6 +120,9 @@ AND SHALL accept the absence only when retained identity and evidence show that 
 WHEN cleanup cannot retire every owned resource
 THE SYSTEM SHALL bind every residual cleanup item to the exact retirement attempt and attached `WorkScope`
 
+WHEN the attached `WorkScope` also owns attachments or other work-affine retained resources that are shared across transcript rows of the same open product conversation
+THE SYSTEM SHALL retire or preserve those resources according to that same WorkScope ownership boundary rather than according to individual transcript-row ownership
+
 CONFIRMED retirement SHALL NOT create a branch, tag, commit, stash, patch, diff snapshot, or other automatic recovery artifact
 
 THE SYSTEM SHALL leave every branch, tag, stash, remote-tracking ref, and pull request untouched

@@ -137,10 +137,12 @@ WHEN the user approves the task and chooses **Start in new conversation**
 THE SYSTEM SHALL create a separate Open conversation derived from the source conversation
 AND provision a fresh detached-default-branch disposable worktree for the spawned conversation
 AND seed only the exact approved task as the spawned conversation's starting context
-AND preserve the approved task artifact independently of the source worktree's eventual closure
+AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
+AND record exactly one source relation of kind `approved_task` from the spawned conversation to the source conversation
 AND resume execution in the spawned conversation
 AND leave the source conversation Open
 AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
+AND SHALL NOT copy, summarize, or inject the source conversation transcript into the spawned conversation as part of approval placement
 
 WHEN the user rejects or discards the task
 THE SYSTEM SHALL return a rejection result to the agent
@@ -374,7 +376,8 @@ AND SHALL report why safe reclamation was skipped
 ### REQ-PROJ-017: Record Detached Default-Branch Provenance Without Mode Semantics
 
 WHEN Phoenix provisions a Git-backed disposable worktree
-THE SYSTEM SHALL record the canonical default branch used to resolve the starting commit
+THE SYSTEM SHALL record the repository's authoritative canonical default-branch identity used to resolve the starting commit
+AND SHALL record the exact commit chosen after the bounded single-branch refresh-or-fallback rule
 AND SHALL record the worktree path and any approved task metadata needed for truthful UI and provenance
 AND SHALL NOT require conversation ownership semantics to include a selected branch name, a dedicated branch-type discriminator, or a Phoenix-owned branch-lifecycle field
 
@@ -479,35 +482,26 @@ patterns: full branch name paste, prefix search (`sopell/`), and keyword search.
 
 ---
 
-### REQ-PROJ-022: Branch Materialization (Single-Branch Fetch)
+### REQ-PROJ-022: Default-Branch Materialization Uses One Bounded Refresh and Typed Fallback
 
-WHEN a Managed conversation's task is approved (worktree creation begins)
-THE SYSTEM SHALL run `git fetch origin <base_branch>` (single-branch) before
-  creating the worktree, regardless of whether the branch is local or remote-only
-AND this fetch SHALL be best-effort (network failure is non-fatal, logged at debug)
+WHEN Phoenix materializes the starting commit for a new Git-backed conversation, a Start-in-new-conversation spawn, or a follow-up conversation
+THE SYSTEM SHALL resolve the repository's authoritative canonical default branch first
+AND SHALL run at most one targeted refresh for that branch before provisioning the detached worktree
+AND SHALL NOT run a blanket fetch, prune, or multi-branch refresh as part of ordinary provisioning
 
-WHEN the fetch succeeds AND the branch exists locally
-THE SYSTEM SHALL fast-forward the local ref to match the remote tip
-  (if fast-forward is not possible, the local ref is left as-is and a warning is logged)
-AND use the updated local ref as the worktree base
+WHEN the targeted refresh succeeds
+THE SYSTEM SHALL provision from the refreshed canonical default-branch tip at detached `HEAD`
 
-WHEN the fetch succeeds AND the branch exists only as a remote ref
-THE SYSTEM SHALL create a local tracking branch from the fetched remote ref
-AND use that local branch as the base for worktree creation
+WHEN the targeted refresh fails but a previously resolved local or remote-tracking ref for the canonical default branch still exists
+THE SYSTEM SHALL provision from that cached canonical-default ref at detached `HEAD`
+AND SHALL surface that the starting point may be stale
 
-WHEN the fetch fails (network unavailable)
-THE SYSTEM SHALL fall back to the local ref if one exists
-AND fail with a clear error if no local ref exists
+WHEN no canonical default-branch commit can be resolved after the bounded refresh-or-fallback attempt
+THE SYSTEM SHALL fail provisioning with a typed error instead of guessing from the repository's currently checked out branch or another arbitrary ref
 
-THE SYSTEM SHALL NOT run `git fetch` without a refspec (no blanket fetch)
+THE SYSTEM SHALL preserve that one-branch refresh rule for provisioning even when repository-operations surfaces support broader branch discovery elsewhere
 
-**Rationale:** Always fetching the selected branch at materialization time ensures
-the worktree starts from the latest remote tip. This is a single targeted network
-call at a moment where the user already expects a brief wait (worktree creation
-involves git operations). It eliminates the "stale local branch" problem without
-requiring the user to confirm an update -- the answer is always "yes, give me the
-latest." Listing remains instant (REQ-PROJ-020); the network cost moves to the
-commit point where it has the highest value.
+**Rationale:** Ordinary conversation provisioning needs one predictable, bounded starting-point rule. A single targeted refresh keeps creation current without turning provisioning into repository-wide synchronization, and the cached fallback preserves availability without silently pretending the starting point is fresh.
 
 ---
 
@@ -607,7 +601,7 @@ THE SYSTEM SHALL reject the call
 
 ### REQ-PROJ-034: Approve a Derived Proposal by Spawning a Fresh Conversation
 
-WHEN a `pending` derived-task proposal exists on a conversation and the originating conversation is still Open
+WHEN a `pending` derived proposal exists on a conversation and the originating conversation is still Open
 THE SYSTEM SHALL surface it for review in the same task-review interface used for blocking approvals
 AND SHALL resolve it exactly once as spawned, dismissed, or revision-requested
 
@@ -616,8 +610,11 @@ THE SYSTEM SHALL create a fresh top-level Open conversation in its own new dispo
 AND SHALL start that worktree from the repository's canonical default branch at detached `HEAD`
 AND SHALL treat the new conversation as a separate derived conversation rather than as a continuation row
 AND SHALL write the snapshot's approved task artifact into the spawned workspace according to REQ-PROJ-006
+AND SHALL persist one normalized approved-task source record containing the exact approved body plus its original repository-relative path and taskmd/plain-brief identity
 AND SHALL seed the spawned conversation's initial context with the approved task brief and nothing else from the source transcript
 AND SHALL record the proposal resolution as `spawned`
+AND SHALL record exactly one source relation of kind `approved_task` from the spawned conversation to the originating conversation
+
 
 WHEN the user dismisses a `pending` derived proposal
 THE SYSTEM SHALL spawn nothing
@@ -633,11 +630,11 @@ THE SYSTEM SHALL retire that pending proposal rather than silently attaching it 
 ### REQ-PROJ-035: Derived-Conversation Provenance and Decoupling Guarantees
 
 WHEN a derived conversation is created
-THE SYSTEM SHALL record provenance pointing at the originating conversation
-AND this provenance SHALL remain distinct from `parent_conversation_id` and `continued_in_conv_id`
+THE SYSTEM SHALL record one visible source relation of kind `approved_task` pointing at the originating conversation
+AND this source relation SHALL remain distinct from `parent_conversation_id`, `continued_in_conv_id`, and any continuation topology
 AND SHALL carry no lifecycle notification semantics
 
-THE SYSTEM SHALL NOT establish any lifecycle relationship between the originating conversation and the derived conversation beyond derived-from provenance
+THE SYSTEM SHALL NOT establish any lifecycle relationship between the originating conversation and the derived conversation beyond that `approved_task` source relation
 AND the originating conversation SHALL receive no automatic notification of the derived conversation's later progress, completion, or failure inside the agent context
 
 WHEN a derived proposal's resolution is recorded
@@ -712,5 +709,5 @@ AND SHALL keep the worktree checkout's remote relationship distinct from the bas
 
 ### REQ-PROJ-WS-001: WorkScope as Resource Owner
 
-Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from conversation ids, working directories, or worktree paths. Continuations and fresh Work handoffs that keep one unit of work alive transfer that same `work_scope_id` to the live successor instead of minting a parallel owner. Conversations retaining one identity share its resources; conversations with distinct identities remain isolated even when their environments use the same path.
+Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from conversation ids, working directories, or worktree paths. Continuations that keep one product conversation alive transfer that same `work_scope_id` to the live successor instead of minting a parallel owner. Attachments and other work-affine execution resources share that same WorkScope ownership model. Conversations retaining one identity share its resources; conversations with distinct identities remain isolated even when their environments use the same path.
 

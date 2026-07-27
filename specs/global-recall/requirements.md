@@ -115,19 +115,20 @@ WHILE a normal coding conversation is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 WHILE the Coordinator is answering a user request
-THE SYSTEM MAY provide host-bound tools for global message search, bounded conversation reads, bounded read-only database queries, reference resolution, and OS-sandboxed filesystem inspection
+THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own conversation/message corpus, bounded conversation reads, bounded read-only database queries, reference resolution, and OS-sandboxed filesystem inspection
+AND those tools SHALL remain host-bound capabilities that ordinary conversations cannot widen or invoke as Phoenix-wide ambient memory
 
 WHEN the Coordinator invokes sandboxed filesystem inspection
 THE SYSTEM SHALL require an explicit active `WorkScope` ID for every new command
-AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching the existing Explore-mode `nono` sandbox
+AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching the read-only planning `nono` sandbox
 AND SHALL NOT infer a default repository or cwd
-AND SHALL withhold the tool when the Explore sandbox is unavailable
+AND SHALL withhold the tool when the sandbox is unavailable
 
 THE SYSTEM MAY provide exactly one cross-conversation mutation capability to the Coordinator: sending non-empty text to one existing non-Coordinator conversation through the authoritative user-message acceptance path
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
-THE SYSTEM SHALL NOT provide writable filesystem, browser, MCP, task drafting, task approval, project, workspace, conversation creation, or other lifecycle mutation tools to the Coordinator
+THE SYSTEM SHALL NOT provide writable filesystem, browser, MCP, task drafting, task approval, project, workspace, conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other lifecycle mutation tools to the Coordinator
 
 ---
 

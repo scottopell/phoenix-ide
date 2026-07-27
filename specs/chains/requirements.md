@@ -64,8 +64,7 @@ latest conversation in the chain would be misleading.
 ### REQ-CHN-002: Continuation Chains Surface as First-Class Entities
 
 WHEN two or more transcript rows share a linear handoff lineage through
-`continued_in_conv_id` (one was created via context continuation from another,
-or a managed Explore task approval was handed off to Start in new conversation)
+`continued_in_conv_id` (one was created via context continuation from another)
 THE SYSTEM SHALL present them as one grouped product conversation in conversation
 navigation surfaces, identifiable by the durable root conversation as
 its identity
@@ -352,7 +351,7 @@ wandering outside the chain while still giving it full depth within it.
 Read-only because Q&A is recall, not work. Reusing the product-wide
 retrieval primitive as the search tool means the same agent, pointed at
 the `Global` scope, becomes an application-wide Q&A surface — chain Q&A
-and global Q&A differ only in the scope the host binds into the tools.
+and global Q&A differ only in the scope the host binds into the tools, while the Coordinator remains the one global host that may receive that wider binding.
 Keeping each question a fresh run preserves REQ-CHN-006's
 no-cross-question-drift guarantee; the cost/latency now varies with
 question difficulty rather than chain size, which is the intended
