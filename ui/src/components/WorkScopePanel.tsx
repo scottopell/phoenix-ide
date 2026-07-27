@@ -170,13 +170,13 @@ function useHealthAttention(health: BashHandleInventory['health']): HealthAttent
  *  renders this, so it never calls the hook — the standalone work-scope dock and
  *  plain tests can render bash rows without a provider. An inspectable row does
  *  need the provider; it is rendered inside one by construction. */
-function BashInspectButton({ scopeKey, controlScopeKey, handleId }: { scopeKey: string; controlScopeKey: string; handleId: string }) {
+function BashInspectButton({ handleId }: { handleId: string }) {
   const { openInspect } = useViewerSlotCommands();
   return (
     <button
       type="button"
       className="ws-row-inspect"
-      onClick={() => openInspect(scopeKey, controlScopeKey, handleId)}
+      onClick={() => openInspect(handleId)}
       title="Open the process inspector for this handle"
     >
       inspect →
@@ -234,13 +234,11 @@ function BrowserStopButton({ scopeKey, conversationId, onStopped, onError }: { s
 function BashRow({
   handle,
   now,
-  scopeKey,
   inspectable,
   healthFresh,
 }: {
   handle: BashHandleInventory;
   now: number;
-  scopeKey: string;
   inspectable: boolean;
   healthFresh: boolean;
 }) {
@@ -302,8 +300,6 @@ function BashRow({
           )}
           {inspectable && (
             <BashInspectButton
-              scopeKey={scopeKey}
-              controlScopeKey={handle.control_scope_key}
               handleId={handle.handle_id}
             />
           )}
@@ -543,7 +539,6 @@ function WorkScopeBody({
   error,
   now,
   onRetry,
-  scopeKey,
   conversationId,
   inspectable,
 }: {
@@ -551,7 +546,6 @@ function WorkScopeBody({
   error: boolean;
   now: number;
   onRetry: () => void;
-  scopeKey: string;
   conversationId: string;
   /** Whether bash rows offer the "inspect" affordance. True only on the
    *  conversation page, where the meta-viewer slot is rendered to host the
@@ -589,7 +583,7 @@ function WorkScopeBody({
               <div className="ws-empty">no handles</div>
             ) : (
               inventory.bash.map((h) => (
-                <BashRow key={`${h.control_scope_key}:${h.handle_id}`} handle={h} now={now} scopeKey={scopeKey} inspectable={inspectable} healthFresh={healthIsFresh(inventory.health_sampled_at, now)} />
+                <BashRow key={h.handle_id} handle={h} now={now} inspectable={inspectable} healthFresh={healthIsFresh(inventory.health_sampled_at, now)} />
               ))
             )}
           </section>
@@ -678,7 +672,7 @@ export function WorkScopeSection({ scopeKey, conversationId, liveInventory, expa
       onToggle={() => onToggleExpanded(!expanded)}
     >
       <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>
-        <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} conversationId={conversationId} inspectable />
+        <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} conversationId={conversationId} inspectable />
       </div>
     </GroundingSection>
   );
@@ -756,7 +750,7 @@ export function WorkScopePanel({ scopeKey, conversationId, liveInventory, collap
         <span className="ws-title">Work scope</span>
         <span className={`ws-count-badge${count > 0 ? ' ws-count-badge--active' : ''}`}>{count}</span>
       </div>
-      <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} conversationId={conversationId} inspectable={false} />
+      <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} conversationId={conversationId} inspectable={false} />
     </aside>
   );
 }

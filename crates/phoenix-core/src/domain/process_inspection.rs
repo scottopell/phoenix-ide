@@ -1,7 +1,7 @@
 //! Process Inspector wire types (`specs/process-inspector/`).
 //!
 //! [`BashHandleInspection`] is the per-handle drill-down read-projection
-//! served over `GET /api/work-scope/:scope_key/bash/:handle_id/inspect`. It
+//! served over `GET /api/bash/:handle_id/inspect`. It
 //! complements the work-scope roll-up ([`crate::domain::work_scope_inventory`]):
 //! the inventory answers "what is running?"; the inspection answers "what is
 //! *this one* doing, and is it healthy?".

@@ -81,7 +81,7 @@ describe('ViewerSlot — message kind', () => {
   it.each(['pane', 'fullscreen'] as const)(
     'opens a message directly in %s with canonical URL identity',
     (presentation) => {
-      const h = renderSlot('/c/conv-A?viewer=inspect&scope=scope-1&handle=b-7');
+      const h = renderSlot('/c/conv-A?viewer=inspect&handle=b-7');
 
       act(() => { h.get().openMessage(42, presentation); });
 
@@ -144,14 +144,14 @@ describe('ViewerSlot — commission-review kind', () => {
 });
 
 describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
-  it('opens the inspector, encoding (scope, handle) in the URL', () => {
+  it('opens the inspector, encoding the opaque handle in the URL', () => {
     const h = renderSlot();
     expect(h.get().slot.kind).toBe('none');
 
-    act(() => { h.get().openInspect('scope-1', 'scope-1', 'b-7'); });
-    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-1', controlScopeKey: 'scope-1', handleId: 'b-7' });
+    act(() => { h.get().openInspect('b-7'); });
+    expect(h.get().slot).toEqual({ kind: 'inspect', handleId: 'b-7' });
     expect(h.search()).toContain('viewer=inspect');
-    expect(h.search()).toContain('scope=scope-1');
+    expect(h.search()).not.toContain('scope=');
     expect(h.search()).toContain('handle=b-7');
 
     act(() => { h.get().close(); });
@@ -160,34 +160,31 @@ describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
   });
 
   it('parses an inspect URL on cold entry (URL-as-source-of-truth)', () => {
-    const h = renderSlot('/c/conv-A?viewer=inspect&scope=scope-9&controlScope=coordinator&handle=b-3');
-    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-9', controlScopeKey: 'coordinator', handleId: 'b-3' });
+    const h = renderSlot('/c/conv-A?viewer=inspect&handle=b-3');
+    expect(h.get().slot).toEqual({ kind: 'inspect', handleId: 'b-3' });
   });
 
-  it('normalizes an inspect URL missing scope or handle to none', async () => {
+  it('normalizes an inspect URL missing handle to none', async () => {
     const noHandle = renderSlot('/c/conv-A?viewer=inspect&scope=scope-1');
     expect(noHandle.get().slot.kind).toBe('none');
     await waitFor(() => { expect(noHandle.search()).not.toContain('viewer='); });
 
-    const noScope = renderSlot('/c/conv-A?viewer=inspect&handle=b-1');
-    expect(noScope.get().slot.kind).toBe('none');
-    await waitFor(() => { expect(noScope.search()).not.toContain('viewer='); });
   });
 
   it('clears inspect params when switching to another viewer kind', () => {
     const h = renderSlot();
-    act(() => { h.get().openInspect('scope-1', 'scope-1', 'b-7'); });
-    expect(h.search()).toContain('scope=scope-1');
+    act(() => { h.get().openInspect('b-7'); });
+    expect(h.search()).not.toContain('scope=');
 
     act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
     expect(h.get().slot.kind).toBe('prose');
     expect(h.search()).not.toContain('scope=');
     expect(h.search()).not.toContain('handle=');
 
-    act(() => { h.get().openInspect('scope-2', 'scope-2', 'b-9'); });
+    act(() => { h.get().openInspect('b-9'); });
     expect(h.search()).not.toContain('file=');
     expect(h.search()).not.toContain('root=');
-    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-2', controlScopeKey: 'scope-2', handleId: 'b-9' });
+    expect(h.get().slot).toEqual({ kind: 'inspect', handleId: 'b-9' });
   });
 });
 

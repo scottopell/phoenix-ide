@@ -30,7 +30,7 @@ The inspector is a single-handle, live view rendered in the meta-viewer slot
 (`specs/viewer_slot/`) — the right-side surface that hosts exactly one of the
 prose reader, the diff viewer, or the live browser view at a time. The inspector
 is a fourth viewer kind in that slot. It is launched from a work-scope panel
-bash row and addresses one handle by its `(lifecycle_scope_key, control_scope_key, handle_id)` pair.
+bash row and addresses one handle by its globally unique opaque `handle_id`.
 
 **Transport boundary:** the inspector is a *polling* read view. While open it
 fetches a combined snapshot from a pull endpoint about once per second,
@@ -56,8 +56,7 @@ no per-process drill-down here (see `design.md`, Non-Goals / Future Work).
 
 ### REQ-PINSP-001: Combined Inspection Snapshot
 
-WHEN the system assembles a `BashHandleInspection` for a `(lifecycle_scope_key, control_scope_key,
-handle_id)` pair
+WHEN the system assembles a `BashHandleInspection` for an opaque `handle_id`
 THE SYSTEM SHALL produce a single snapshot carrying the handle's identity and
 state, an output delta, and a resource sample, drawn only from the in-memory
 bash handle registry and a request-time process-group sample
@@ -176,10 +175,10 @@ is open bounds the cost to the rare moments an operator is actively watching.
 
 ### REQ-PINSP-005: Inspection Endpoint
 
-WHEN a client issues `GET /api/work-scope/:scope_key/bash/:handle_id/inspect`
+WHEN a client issues `GET /api/bash/:handle_id/inspect`
 with an optional `since=K` query parameter
-THE SYSTEM SHALL return `Json<BashHandleInspection>` for the handle identified
-by `handle_id` within the `WorkScope` whose `stable_key()` equals `:scope_key`.
+THE SYSTEM SHALL resolve the globally unique `handle_id`
+AND SHALL return `Json<BashHandleInspection>` only when the requesting conversation may control the handle or belongs to its owning `WorkScope`.
 
 THE endpoint SHALL follow the existing work-scope handler shape (path
 parameters, `State(AppState)`, `Json<…>` response), the same shape as
@@ -198,7 +197,7 @@ inspector's tail.
 ### REQ-PINSP-006: Polling Cadence and Termination
 
 WHILE an inspector is open on a live handle
-THE SYSTEM SHALL poll `GET /api/work-scope/:scope_key/bash/:handle_id/inspect`
+THE SYSTEM SHALL poll `GET /api/bash/:handle_id/inspect`
 about once per second, passing `since` equal to the prior response's
 `end_offset` for an incremental output tail.
 
@@ -226,8 +225,7 @@ THE SYSTEM SHALL open the process inspector for that handle in the meta-viewer
 slot (`specs/viewer_slot/`), closing any other viewer per the slot's
 one-at-a-time contract (`specs/viewer_slot/` REQ-VS-007).
 
-THE inspector SHALL be a viewer kind addressed by the handle's `(lifecycle_scope_key, control_scope_key,
-handle_id)` in the slot's URL contract, so the slot's URL-as-source-of-truth
+THE inspector SHALL be a viewer kind addressed by the handle's opaque `handle_id` in the slot's URL contract, so the slot's URL-as-source-of-truth
 behaviour (`specs/viewer_slot/` REQ-VS-005, REQ-VS-006) restores the same
 inspector on cold reload.
 
@@ -243,7 +241,7 @@ THE SYSTEM SHALL close the inspector per the slot's conversation-change reset
 what the right-side meta-viewer slot is for. Making it a viewer kind — rather
 than an ad-hoc overlay — inherits the slot's mutex, close, conversation-reset,
 and URL-restoration behaviour for free, with no parallel view-state machine
-(`specs/viewer_slot/`). The `(lifecycle_scope_key, control_scope_key, handle_id)` pair is the inspector's
+(`specs/viewer_slot/`). The opaque `handle_id` is the inspector's
 identity, the analogue of prose's file path: encoding it in the URL is what lets
 a cold reload restore the same handle's inspector.
 

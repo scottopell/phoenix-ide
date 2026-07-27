@@ -28,7 +28,6 @@ import { useIsDesktop } from '../hooks';
 import { useDensity } from '../hooks/useDensity';
 import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
-import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 
 import { linkifyText } from '../utils/linkify';
 import { getMessageMarkdown } from '../utils/messageCopy';
@@ -1354,20 +1353,6 @@ function tryParseJson(text: string): Record<string, unknown> | null {
   return null;
 }
 
-function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; handle: string }) {
-  const { openInspect } = useViewerSlotCommands();
-  return (
-    <button
-      type="button"
-      className="bash-inspect"
-      onClick={() => openInspect(workScopeKey, workScopeKey, handle)}
-      title="Open the process inspector for this handle"
-    >
-      inspect →
-    </button>
-  );
-}
-
 // REQ-BASH-002 / REQ-BASH-003 / REQ-BASH-006: render the typed bash tool
 // response. Renders a status pill, optional kill-pending badge, the line
 // tail, and (when present) the agent-supplied `label` so concurrent
@@ -1445,7 +1430,7 @@ function BashOutputView({
   );
 }
 
-function BashResponseView({ response, workScopeKey }: { response: Record<string, unknown>; workScopeKey?: string | undefined }) {
+function BashResponseView({ response }: { response: Record<string, unknown> }) {
   // Error envelope branch (REQ-BASH-008): `error` field present.
   if (typeof response['error'] === 'string') {
     return <BashErrorView response={response} />;
@@ -1478,7 +1463,6 @@ function BashResponseView({ response, workScopeKey }: { response: Record<string,
       <div className="bash-response-header">
         <span className={`bash-status bash-status-${status.replace(/_/g, '-')}`}>{statusText}</span>
         {handle && <span className="bash-handle">{handle}</span>}
-        {handle && workScopeKey && <BashInspectButton workScopeKey={workScopeKey} handle={handle} />}
         {label && <span className="bash-label" title="agent-supplied handle label">{label}</span>}
         {(isExited || isTombstone) && exitCode !== undefined && exitCode !== null && (
           <span className="bash-exit-code">exit {String(exitCode)}</span>
@@ -2335,7 +2319,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult, liveBashProgress, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, knownResultIds, toolStartedAtMs, showMissingResult, liveBashProgress, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = useMemo(() => block.input || {}, [block.input]);
   const toolId = block.id || '';
@@ -2681,7 +2665,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
               />
             </div>
           ) : bashResponse ? (
-            <BashResponseView response={bashResponse} workScopeKey={workScopeKey} />
+            <BashResponseView response={bashResponse} />
           ) : tmuxResponse ? (
             <TmuxResponseView response={tmuxResponse} />
           ) : name === 'browser_profile' &&

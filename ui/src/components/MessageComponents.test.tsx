@@ -2930,68 +2930,6 @@ describe('console log find parity', () => {
   });
 });
 
-describe('bash tool inspector affordance', () => {
-  const bashToolUse = { type: 'tool_use', id: 'tool-bash', name: 'bash', input: { op: 'run', cmd: 'sleep 60' } };
-
-  function bashResult(response: Record<string, unknown>) {
-    return toolMessage('tool-bash', JSON.stringify(response));
-  }
-
-  it('opens the process inspector for a structured bash result handle', async () => {
-    render(
-      <MemoryRouter initialEntries={['/c/test-conv']}>
-        <ViewerSlotProvider scopeKey="test-conv" browserSessionActive={false}>
-          <AgentMessage
-            message={agentMessage('agent-msg-bash', [bashToolUse])}
-            toolResults={new Map([['tool-bash', bashResult({ status: 'running', handle: 'b-17', lines: [] })]])}
-            onOpenFile={undefined}
-            workScopeKey="ws-test-123"
-          />
-          <LocationProbe />
-        </ViewerSlotProvider>
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'inspect →' }));
-
-    await waitFor(() => {
-      expect(screen.getByTestId('location-search')).toHaveTextContent(
-        '?viewer=inspect&scope=ws-test-123&controlScope=ws-test-123&handle=b-17',
-      );
-    });
-  });
-
-  it('does not render inspect without a work scope key', () => {
-    render(
-      <MemoryRouter>
-        <AgentMessage
-          message={agentMessage('agent-msg-bash', [bashToolUse])}
-          toolResults={new Map([['tool-bash', bashResult({ status: 'running', handle: 'b-17', lines: [] })]])}
-          onOpenFile={undefined}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.queryByRole('button', { name: 'inspect →' })).not.toBeInTheDocument();
-  });
-
-  it('does not render inspect when the bash response has no handle', () => {
-    render(
-      <MemoryRouter>
-        <ViewerSlotProvider scopeKey="test-conv" browserSessionActive={false}>
-          <AgentMessage
-            message={agentMessage('agent-msg-bash', [bashToolUse])}
-            toolResults={new Map([['tool-bash', bashResult({ status: 'exited', exit_code: 0, lines: [] })]])}
-            onOpenFile={undefined}
-            workScopeKey="ws-test-123"
-          />
-        </ViewerSlotProvider>
-      </MemoryRouter>,
-    );
-
-    expect(screen.queryByRole('button', { name: 'inspect →' })).not.toBeInTheDocument();
-  });
-});
 describe('SubAgentStatus inline activity', () => {
   beforeEach(() => {
     vi.clearAllMocks();

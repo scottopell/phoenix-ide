@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
+use phoenix_core::domain::db_schema::Conversation;
 use phoenix_core::domain::process_inspection::BashHandleInspection;
 use phoenix_core::domain::work_scope_inventory::BashHandleState;
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceScopeKey};
@@ -39,33 +40,39 @@ use crate::bash::registry::BashHandleRegistry;
 pub struct InspectionAssembly {
     pub inspection: BashHandleInspection,
     pub live_pgid: Option<i32>,
+    pub lifecycle_scope: ResourceScopeKey,
 }
 
-/// Resolve `handle_id` within `work_scope` and project its inspection
-/// snapshot for the given incremental `since` offset.
+/// Resolve `handle_id` through the global registry and project its
+/// inspection snapshot for the given incremental `since` offset.
 ///
 /// Read-only: the registry is queried through its non-creating `get_existing`
 /// accessor and the table's `get` lookup, so inspecting a handle never
 /// allocates a handle table. Returns `None` when the scope has no handle
 /// table or the handle id is absent — a not-found condition (REQ-PINSP-001).
 pub async fn assemble_inspection(
-    lifecycle_scope: &ResourceScopeKey,
-    _control_scope: &ResourceScopeKey,
     handle_id: &str,
     since: Option<u64>,
     actor: Option<&EffectiveResourceAccess>,
+    conversation: Option<&Conversation>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Option<InspectionAssembly> {
     let handle = bash_handles
         .lookup_handle(&HandleId::new(handle_id.to_string()))
         .await?;
-    if &handle.lifecycle_scope != lifecycle_scope {
-        return None;
-    }
-    if actor.is_some_and(|access| {
-        !access.can_control(&handle.creator_conversation_id, handle.authority)
-    }) {
-        return None;
+    let controller_visible = actor.is_some_and(|access| {
+        access.can_control(&handle.creator_conversation_id, handle.authority)
+    });
+    let owner_visible = conversation.is_some_and(|conversation| {
+        handle
+            .lifecycle_scope
+            .work_scope_id()
+            .is_some_and(|work_scope_id| conversation.work_scope_id.as_ref() == Some(work_scope_id))
+    });
+    if actor.is_some() || conversation.is_some() {
+        if !controller_visible && !owner_visible {
+            return None;
+        }
     }
     Some(project_inspection(&handle, since).await)
 }
@@ -112,6 +119,7 @@ async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> Inspect
                     resources: None,
                 },
                 live_pgid: Some(live.pgid),
+                lifecycle_scope: handle.lifecycle_scope.clone(),
             }
         }
         HandleState::Tombstoned(tomb) => {
@@ -133,6 +141,7 @@ async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> Inspect
                     resources: None,
                 },
                 live_pgid: None,
+                lifecycle_scope: handle.lifecycle_scope.clone(),
             }
         }
     }
@@ -152,22 +161,55 @@ mod tests {
         )
     }
 
+    fn owner_conversation(work_scope_id: phoenix_core::work_scope::WorkScopeId) -> Conversation {
+        Conversation {
+            id: "owner".into(),
+            slug: Some("owner".into()),
+            title: Some("Owner".into()),
+            cwd: "/tmp".into(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: phoenix_core::domain::db_schema::ConvState::Idle,
+            state_updated_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            archived: false,
+            model: None,
+            project_id: None,
+            conv_mode: phoenix_core::domain::db_schema::ConvMode::Work {
+                branch_name: phoenix_core::domain::db_schema::NonEmptyString::new("owner").unwrap(),
+                worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new("/tmp")
+                    .unwrap(),
+                base_branch: phoenix_core::domain::db_schema::NonEmptyString::new("main").unwrap(),
+                task_id: phoenix_core::domain::db_schema::NonEmptyString::new("owner").unwrap(),
+                task_title: phoenix_core::domain::db_schema::NonEmptyString::new("Owner").unwrap(),
+            },
+            runtime_role: phoenix_core::work_scope::RuntimeRole::User,
+            work_scope_id: Some(work_scope_id),
+            desired_base_branch: None,
+            message_count: 0,
+            transcript_generation: 0,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            spawned_from_conversation_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn unknown_scope_or_handle_is_none() {
         let bash = Arc::new(BashHandleRegistry::new());
         // No table at all.
-        assert!(
-            assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
-                .await
-                .is_none()
-        );
+        assert!(assemble_inspection("b-1", None, None, None, &bash)
+            .await
+            .is_none());
         // Table exists but handle absent.
         let _ = bash.get_or_create(&scope()).await;
-        assert!(
-            assemble_inspection(&scope(), &scope(), "b-999", None, None, &bash)
-                .await
-                .is_none()
-        );
+        assert!(assemble_inspection("b-999", None, None, None, &bash)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -193,7 +235,7 @@ mod tests {
         let actor = EffectiveResourceAccess::new("sibling-a", ResourceAuthority::Restricted);
 
         assert!(
-            assemble_inspection(&scope(), &scope(), "b-private", None, Some(&actor), &bash)
+            assemble_inspection("b-private", None, Some(&actor), None, &bash)
                 .await
                 .is_none()
         );
@@ -216,7 +258,7 @@ mod tests {
             .await
             .expect("commit");
 
-        let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
+        let assembly = assemble_inspection("b-1", None, None, None, &bash)
             .await
             .expect("inspection");
         let inv = &assembly.inspection;
@@ -235,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distinct_lifecycle_and_control_scopes_address_the_same_handle() {
+    async fn owner_scope_can_inspect_coordinator_controlled_handle() {
         let bash = Arc::new(BashHandleRegistry::new());
         let control_scope = ResourceScopeKey::Coordinator;
         let lifecycle_scope = scope();
@@ -256,13 +298,41 @@ mod tests {
             .await
             .expect("commit");
 
-        assert!(
-            assemble_inspection(&lifecycle_scope, &control_scope, "b-1", None, None, &bash,)
-                .await
-                .is_some()
+        let owner =
+            owner_conversation(lifecycle_scope.work_scope_id().expect("work scope").clone());
+        assert!(assemble_inspection("b-1", None, None, Some(&owner), &bash)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn unrelated_owner_cannot_inspect_handle() {
+        let bash = Arc::new(BashHandleRegistry::new());
+        let lifecycle_scope = scope();
+        let handle = Handle::new_live_for_actor_with_lifecycle(
+            ResourceScopeKey::Coordinator,
+            lifecycle_scope.clone(),
+            HandleId::new("b-1"),
+            "coordinator".into(),
+            ResourceAuthority::Restricted,
+            "sleep 10".into(),
+            None,
+            4321,
+            1234,
+            RING_BUFFER_BYTES,
         );
+        let mut reservation = bash.reserve_spawn(&scope()).await.expect("reserve");
+        bash.commit_spawn(&mut reservation, handle)
+            .await
+            .expect("commit");
+
+        let unrelated_scope = ResourceScopeKey::Work(
+            phoenix_core::work_scope::WorkScopeId::parse("conv-other").unwrap(),
+        );
+        let unrelated =
+            owner_conversation(unrelated_scope.work_scope_id().expect("work scope").clone());
         assert!(
-            assemble_inspection(&control_scope, &control_scope, "b-1", None, None, &bash,)
+            assemble_inspection("b-1", None, None, Some(&unrelated), &bash)
                 .await
                 .is_none()
         );
@@ -288,7 +358,7 @@ mod tests {
             .await
             .expect("commit");
 
-        let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
+        let assembly = assemble_inspection("b-1", None, None, None, &bash)
             .await
             .expect("inspection");
         assert_eq!(
@@ -326,7 +396,7 @@ mod tests {
             .await
             .expect("commit");
 
-        let assembly = assemble_inspection(&scope(), &scope(), "b-1", None, None, &bash)
+        let assembly = assemble_inspection("b-1", None, None, None, &bash)
             .await
             .expect("inspection");
         let inv = &assembly.inspection;

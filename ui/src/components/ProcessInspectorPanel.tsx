@@ -122,7 +122,7 @@ function metric(value: number | null | undefined, render: (v: number) => string)
  */
 type InspectStatus = 'ok' | 'loading-failed' | 'stale' | 'gone';
 
-function useHandleInspection(scopeKey: string, controlScopeKey: string, handleId: string, conversationId: string | undefined) {
+function useHandleInspection(handleId: string, conversationId: string | undefined) {
   const [snapshot, setSnapshot] = useState<BashHandleInspection | null>(null);
   const [entries, setEntries] = useState<OutputEntry[]>([]);
   const [status, setStatus] = useState<InspectStatus>('ok');
@@ -224,7 +224,7 @@ function useHandleInspection(scopeKey: string, controlScopeKey: string, handleId
     if (!conversationId) return;
 
     api
-      .getBashHandleInspection(scopeKey, handleId, conversationId!, controlScopeKey)
+      .getBashHandleInspection(handleId, conversationId!)
       .then((insp) => {
         if (!cancelled) applyResponse(insp);
       })
@@ -235,7 +235,7 @@ function useHandleInspection(scopeKey: string, controlScopeKey: string, handleId
     return () => {
       cancelled = true;
     };
-  }, [scopeKey, controlScopeKey, handleId, conversationId, applyResponse, applyError]);
+  }, [handleId, conversationId, applyResponse, applyError]);
 
   // Recurring fetch loop: ~1s while open and not terminal. Self-limiting — the
   // interval is cleared on unmount, on handle change, and once the handle goes
@@ -265,7 +265,7 @@ function useHandleInspection(scopeKey: string, controlScopeKey: string, handleId
       // for a now-replaced target cannot unlock the new target's gate.
       const generation = generationRef.current;
       api
-        .getBashHandleInspection(scopeKey, handleId, conversationId!, controlScopeKey, sinceRef.current)
+        .getBashHandleInspection(handleId, conversationId!, sinceRef.current)
         .then((insp) => {
           if (!cancelled) applyResponse(insp);
         })
@@ -280,14 +280,12 @@ function useHandleInspection(scopeKey: string, controlScopeKey: string, handleId
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [polling, scopeKey, controlScopeKey, handleId, conversationId, applyResponse, applyError]);
+  }, [polling, handleId, conversationId, applyResponse, applyError]);
 
   return { snapshot, entries, status };
 }
 
 interface ProcessInspectorPanelProps {
-  scopeKey: string;
-  controlScopeKey: string;
   handleId: string;
   conversationId: string | undefined;
   /** Close handler for the header button (REQ-PINSP-007). */
@@ -297,19 +295,12 @@ interface ProcessInspectorPanelProps {
 }
 
 export function ProcessInspectorPanel({
-  scopeKey,
   handleId,
-  controlScopeKey,
   conversationId,
   onClose,
   inline,
 }: ProcessInspectorPanelProps) {
-  const { snapshot, entries, status } = useHandleInspection(
-    scopeKey,
-    controlScopeKey,
-    handleId,
-    conversationId,
-  );
+  const { snapshot, entries, status } = useHandleInspection(handleId, conversationId);
 
   // Tick once a second so a live handle's elapsed time advances between polls.
   // A `gone` handle no longer has a live process, so freeze the elapsed clock.

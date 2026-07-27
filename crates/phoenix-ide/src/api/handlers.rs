@@ -283,10 +283,7 @@ pub fn create_router(state: AppState) -> Router {
         // delta, live resource sample). `:scope_key` is a
         // `ResourceScopeKey::stable_key()`; `:handle_id` names a bash handle in that
         // scope. See `specs/process-inspector/` REQ-PINSP-005.
-        .route(
-            "/api/work-scope/:scope_key/bash/:handle_id/inspect",
-            get(inspect_bash_handle),
-        )
+        .route("/api/bash/:handle_id/inspect", get(inspect_bash_handle))
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
         .route(
@@ -3077,16 +3074,14 @@ async fn get_work_scope_inventory(
     if inventory.bash.iter().any(|handle| handle.state.is_live()) {
         let generation = state.resource_monitor.observe(&state).await;
         for handle in &mut inventory.bash {
-            if let Some(pids) =
-                generation.handle_pids(&scope_key, &handle.control_scope_key, &handle.handle_id)
-            {
+            if let Some(pids) = generation.handle_pids(&scope_key, &handle.handle_id) {
                 handle.health = Some(super::resource_monitor::health_for_pids(&generation, pids));
             }
         }
         let visible_handle_ids = inventory
             .bash
             .iter()
-            .map(|handle| (handle.control_scope_key.clone(), handle.handle_id.clone()))
+            .map(|handle| handle.handle_id.clone())
             .collect::<Vec<_>>();
         let visible_pids = generation.visible_handle_pids(&scope_key, &visible_handle_ids);
         inventory.health = (!visible_pids.is_empty())
@@ -3164,63 +3159,61 @@ async fn stop_work_scope_browser_session(
 #[derive(serde::Deserialize)]
 struct InspectQuery {
     conversation_id: String,
-    control_scope_key: String,
     since: Option<u64>,
 }
 
-/// `GET /api/work-scope/:scope_key/bash/:handle_id/inspect?since=K` — the
-/// per-handle drill-down snapshot (`specs/process-inspector/` REQ-PINSP-005).
+/// `GET /api/bash/:handle_id/inspect?since=K` — the per-handle drill-down
+/// snapshot (`specs/process-inspector/` REQ-PINSP-005).
 ///
-/// Resolves `:scope_key` into a `ResourceScopeKey` (400 on a malformed key, like the
-/// inventory handler), looks up `:handle_id` in that scope's bash table (404
-/// when absent), reads the output window for the optional `since` cursor via
-/// the existing ring/tombstone read helpers, and attaches a request-time
-/// process-group resource sample iff the handle is live.
+/// Resolves `:handle_id` through the global bash registry (404 when absent),
+/// authorizes either the owning controller metadata or a conversation that
+/// belongs to the handle's owning work scope, reads the output window for the
+/// optional `since` cursor via the existing ring/tombstone read helpers, and
+/// attaches a request-time process-group resource sample iff the handle is live.
 async fn inspect_bash_handle(
     State(state): State<AppState>,
-    Path((scope_key, handle_id)): Path<(String, String)>,
+    Path(handle_id): Path<String>,
     Query(query): Query<InspectQuery>,
 ) -> Result<Json<phoenix_core::domain::process_inspection::BashHandleInspection>, AppError> {
-    let work_scope = crate::work_scope::ResourceScopeKey::from_stable_key(&scope_key)
-        .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
-    let control_scope = crate::work_scope::ResourceScopeKey::from_stable_key(
-        &query.control_scope_key,
-    )
-    .ok_or_else(|| {
-        AppError::BadRequest(format!(
-            "malformed control-scope key: {}",
-            query.control_scope_key
-        ))
-    })?;
-    let actor = work_scope_actor(&state, &work_scope, &query.conversation_id).await?;
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&query.conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let authority = match conversation.conv_mode {
+        crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
+        _ => crate::work_scope::ResourceAuthority::Work,
+    };
+    let actor = if authority == crate::work_scope::ResourceAuthority::Restricted
+        && conversation.runtime_role == crate::work_scope::RuntimeRole::User
+    {
+        crate::work_scope::EffectiveResourceAccess::shared_restricted(conversation.id.clone())
+    } else {
+        crate::work_scope::EffectiveResourceAccess::new(conversation.id.clone(), authority)
+    };
 
     let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
-        &work_scope,
-        &control_scope,
         &handle_id,
         query.since,
         Some(&actor),
+        Some(&conversation),
         state.runtime.bash_handles(),
     )
     .await
-    .ok_or_else(|| {
-        AppError::NotFound(format!(
-            "handle {handle_id} not found in work scope {scope_key}"
-        ))
-    })?;
+    .ok_or_else(|| AppError::NotFound(format!("handle {handle_id} not found or not visible")))?;
 
     if assembly.live_pgid.is_some() {
         let generation = state.resource_monitor.observe(&state).await;
-        let health = generation
-            .handle_pids(&scope_key, &query.control_scope_key, &handle_id)
-            .map_or_else(
-                || phoenix_core::domain::work_scope_inventory::ResourceHealth {
-                    cpu_percent: None,
-                    memory_bytes: None,
-                    process_count: None,
-                },
-                |pids| super::resource_monitor::health_for_pids(&generation, pids),
-            );
+        let scope_key = assembly.lifecycle_scope.stable_key();
+        let health = generation.handle_pids(&scope_key, &handle_id).map_or_else(
+            || phoenix_core::domain::work_scope_inventory::ResourceHealth {
+                cpu_percent: None,
+                memory_bytes: None,
+                process_count: None,
+            },
+            |pids| super::resource_monitor::health_for_pids(&generation, pids),
+        );
         assembly.inspection.resources_sampled_at = Some(generation.sampled_at);
         assembly.inspection.resources =
             Some(phoenix_core::domain::process_inspection::ResourceSample {
@@ -10642,10 +10635,9 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let Json(inspection) = super::inspect_bash_handle(
             State(state),
-            Path((scope.stable_key(), "b-1".to_string())),
+            Path("b-1".to_string()),
             Query(super::InspectQuery {
                 conversation_id: actor_id.into(),
-                control_scope_key: scope.stable_key(),
                 since: None,
             }),
         )
@@ -10732,10 +10724,9 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let Json(inspection) = super::inspect_bash_handle(
             State(state),
-            Path((scope.stable_key(), "b-1".to_string())),
+            Path("b-1".to_string()),
             Query(super::InspectQuery {
                 conversation_id: actor_id.into(),
-                control_scope_key: scope.stable_key(),
                 since: None,
             }),
         )
@@ -10762,23 +10753,6 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn inspect_rejects_malformed_scope_key() {
-        let state = make_test_state().await;
-        let err = super::inspect_bash_handle(
-            State(state),
-            Path(("bogus-no-namespace".to_string(), "b-1".to_string())),
-            Query(super::InspectQuery {
-                conversation_id: "conv-inspect".into(),
-                control_scope_key: crate::scope("conv-inspect").stable_key(),
-                since: None,
-            }),
-        )
-        .await
-        .expect_err("malformed key must be rejected");
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[tokio::test]
     async fn inspect_unknown_handle_is_not_found() {
         let state = make_test_state().await;
         let scope = crate::scope("conv-inspect-missing");
@@ -10786,10 +10760,9 @@ pub(crate) mod hard_delete_cascade_tests {
         let _ = state.runtime.bash_handles().get_or_create(&scope).await;
         let err = super::inspect_bash_handle(
             State(state),
-            Path((scope.stable_key(), "b-404".to_string())),
+            Path("b-404".to_string()),
             Query(super::InspectQuery {
                 conversation_id: "conv-inspect".into(),
-                control_scope_key: scope.stable_key(),
                 since: None,
             }),
         )

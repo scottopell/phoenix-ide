@@ -1752,19 +1752,16 @@ export const api = {
    *  a recent tail (REQ-PINSP-003). The process inspector polls this while open
    *  on a live handle (REQ-PINSP-006). */
   async getBashHandleInspection(
-    scopeKey: string,
     handleId: string,
     conversationId: string,
-    controlScopeKey: string,
     since?: number,
   ): Promise<BashHandleInspectionType> {
     const query = new URLSearchParams({
       conversation_id: conversationId,
-      control_scope_key: controlScopeKey,
     });
     if (since !== undefined) query.set('since', String(since));
     const resp = await fetch(
-      `/api/work-scope/${encodeURIComponent(scopeKey)}/bash/${encodeURIComponent(handleId)}/inspect?${query}`,
+      `/api/bash/${encodeURIComponent(handleId)}/inspect?${query}`,
     );
     // 404 = the handle table no longer knows this id (e.g. lost after a
     // restart). A typed error lets the inspector stop polling and show a

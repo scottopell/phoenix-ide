@@ -40,7 +40,7 @@
 --     ?viewer=prose&presentation=<pane|fullscreen>&file=<absolute-path>&root=<absolute-path>
 --     ?viewer=diff&presentation=<fullscreen|pane>
 --     ?viewer=browser
---     ?viewer=inspect&scope=<scope-key>&handle=<handle-id>
+--     ?viewer=inspect&handle=<opaque-handle-id>
 --     ?viewer=message&presentation=<pane|fullscreen>&message=<sequence-id>
 --     ?viewer=commission-review&presentation=<pane|fullscreen>&review=<request-sequence-id>
 --   patchContext (modifiedLines: Set<Integer>) rides alongside in

@@ -11,7 +11,7 @@ live-tailing output pane, and a compact resource readout (CPU, memory, process
 count) that refreshes on its own.
 
 The inspector is a polling read view. While open it fetches a combined snapshot
-from `GET /api/work-scope/:scope_key/bash/:handle_id/inspect?since=K` about once
+from `GET /api/bash/:handle_id/inspect?since=K` about once
 per second, passing the prior output offset for an incremental tail. Polling
 stops when the viewer closes or the handle is terminal (then it shows the final
 snapshot — there is nothing more to learn). There is no push transport: the
@@ -74,9 +74,9 @@ weight (see `design.md`, "Why No Allium Spec"), mirroring `specs/work-scope-ui/`
 | **REQ-PINSP-002:** Handle Identity and State | Implemented | Reuses the inventory's `BashHandleState`; adds tombstone `exit_code` / `signal_number` (`specs/bash/` REQ-BASH-006) |
 | **REQ-PINSP-003:** Output Delta | Implemented | Thin wrapper over the ring read (`specs/bash/` REQ-BASH-004); reuses `tool_wire::BashRingWindow` |
 | **REQ-PINSP-004:** Resource Sample — The Core Trio | Implemented | `cpu_pct` / `memory_bytes` (PSS/phys_footprint, not RSS) / `process_count` over the `pgid`; null-on-gap, logged at debug; sampled only while open |
-| **REQ-PINSP-005:** Inspection Endpoint | Implemented | `GET /api/work-scope/:scope_key/bash/:handle_id/inspect?since=K`; mirrors the inventory handler shape |
+| **REQ-PINSP-005:** Inspection Endpoint | Implemented | `GET /api/bash/:handle_id/inspect?since=K`; mirrors the inventory handler shape |
 | **REQ-PINSP-006:** Polling Cadence and Termination | Implemented | ~1s poll with `since = end_offset`; stops on close or terminal handle |
-| **REQ-PINSP-007:** Inspector Viewer Kind | Implemented | New `inspect` `ViewerKind` keyed by `(scope_key, handle_id)`; inherits the slot's mutex / close / reset / URL restore (`specs/viewer_slot/`) |
+| **REQ-PINSP-007:** Inspector Viewer Kind | Implemented | New `inspect` `ViewerKind` keyed by globally unique opaque `handle_id`; inherits the slot's mutex / close / reset / URL restore (`specs/viewer_slot/`) |
 | **REQ-PINSP-008:** Inspector Layout and Live Behaviour | Implemented | Header + autoscroll-with-pause output pane + resource readout; null metric renders unavailable, `truncated_before` shown inline |
 
 **Progress:** 8 of 8 implemented.

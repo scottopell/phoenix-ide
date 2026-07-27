@@ -879,7 +879,6 @@ mod tests {
                 scope_key: "conversation:conv-1".to_string(),
                 bash: vec![BashHandleInventory {
                     handle_id: "b-1".to_string(),
-                    control_scope_key: "conversation:conv-1".to_string(),
                     label: Some("dev".to_string()),
                     cmd: "npm run dev".to_string(),
                     state: BashHandleState::Running,
