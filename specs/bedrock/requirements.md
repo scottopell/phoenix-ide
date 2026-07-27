@@ -587,6 +587,7 @@ until a later approval or creation path attaches write capability to a
 WHEN a conversation is created for a non-git directory
 THE SYSTEM SHALL initialize the conversation as chat-only with full local
 write capability in its chosen working directory
+AND SHALL NOT provide `propose_task`
 
 WHILE a conversation has read-only planning authority
 THE SYSTEM SHALL configure the tool registry with read-only settings
@@ -602,11 +603,8 @@ WHILE a conversation is chat-only
 THE SYSTEM SHALL configure the tool registry with full local write access
 AND that chat-only authority SHALL NOT change into Git-backed lifecycle
 ownership for the lifetime of the conversation
-AND SHALL provide `propose_task` **only** when the working directory is inside a git
-  repository — there as a way to propose a separate derived conversation (REQ-PROJ-033/036), never as a
-  gateway between product lifecycle modes. A chat-only conversation whose working directory
-  is not in a git repository SHALL NOT provide the tool (no repository default branch to
-  derive from)
+AND SHALL NOT provide `propose_task`, even if the working directory happens to be inside a git
+  repository
 
 WHEN conversation execution authority changes after an approval or spawn decision
 THE SYSTEM SHALL persist the updated authority before resuming execution
@@ -637,13 +635,13 @@ AND transition the conversation to AwaitingTaskApproval state (the blocking plan
 
 WHEN the same `propose_task` call occurs while the conversation already has write capability
   via an attached `WorkScope` in a Git-backed environment
-THE SYSTEM SHALL instead treat it as a proposal for a separate derived conversation (REQ-PROJ-033/036):
-  record the proposal as control-plane state and continue the conversation's own work
-  WITHOUT parking — it does not enter AwaitingTaskApproval. The parking behavior of this
-  requirement is scoped to read-only planning authority; an attached `WorkScope` can evidence
-  Git-backed environment intent, but chat-only execution in a git repository is not eligible.
-  The write-capable derived-conversation review (review, spawn, dismiss) is owned by
-  REQ-PROJ-033/034/035.
+THE SYSTEM SHALL treat it as the same blocking approval path rather than as a nonblocking derived-conversation review
+AND SHALL intercept it at the LlmResponse handler
+AND SHALL NOT route it through the tool executor
+AND SHALL read the referenced file and persist the assistant message and a synthetic tool
+  result as a CheckpointData::ToolRound
+AND SHALL transition the conversation to AwaitingTaskApproval state
+AND SHALL scope that behavior only to Git-backed write authority; chat-only execution remains ineligible for `propose_task`
 
 THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a display copy
   of the title, priority, and body — all serializable; on approval the executor re-reads
@@ -651,20 +649,22 @@ THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a displ
   as a rollout shim; a row with an empty `task_file` is surfaced as a "reject and
   re-propose" error rather than silently resetting to Idle.)
 
-THE HandedOff state SHALL carry `successor_conv_id` and reject further user messages;
-  it represents a history row whose live execution target is the successor linked by
+THE HandedOff state SHALL reject further user messages;
+  it represents a read-only predecessor row whose live execution target is derived solely through
   `continued_in_conv_id`.
 
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Continue here policy
 THE SYSTEM SHALL record the approved task as the conversation's next objective,
   promote the task file's status to `in-progress` if needed, commit only the approved
-  task artifact if that task-tracking contract requires it, and continue the
-  same product conversation as the current live writable conversation
+  task artifact if that task-tracking contract requires it, and durably persist typed
+  Git-backed write authority against the existing attached `WorkScope` before resuming execution
+AND SHALL continue the same product conversation as the current live writable conversation
 AND SHALL treat the approval as a checkpoint only
 AND SHALL NOT create a fresh conversation row
-AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, repository state beyond the
-  approved task commit, or source/provenance records beyond the approval itself
+AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, lifecycle, mode, repository state beyond the
+  approved task commit, `WorkScope` attachment, source/provenance records beyond the approval itself,
+  or branch/worktree provenance
 
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Start in new conversation policy
@@ -716,11 +716,11 @@ happen when the approved task artifact is committed; approval itself does not im
 
 WHEN Close conversation completes for an Open conversation that owns a `WorkScope`
 THE SYSTEM SHALL transition the product conversation to History state
-AND the conversation SHALL NOT accept new user messages
+AND the latest transcript row SHALL NOT accept new user messages
+AND SHALL durably persist one Close-outcome system message in the finalization transaction before the aggregate lifecycle announcement is emitted
 
-WHEN a conversation enters History after Close
-THE SYSTEM SHALL inject a synthetic system message indicating the outcome
-  (for example, "Conversation closed…")
+WHEN a conversation enters History after successful Close completion
+THE SYSTEM SHALL emit one aggregate lifecycle announcement for downstream consumers
 AND the conversation SHALL remain visible in the sidebar for reference
 AND the user SHALL be able to start a new conversation on the same project
 
@@ -741,15 +741,18 @@ THE SYSTEM SHALL create a new transcript row within the same product conversatio
   - any parent task/proposal context that remains part of the same live conversation authority
 
 WHEN the current execution row has a worktree
-THE SYSTEM SHALL keep the same attached `WorkScope` atomically in a single database transaction while keeping the durable root conversation identity unchanged:
+THE SYSTEM SHALL keep the same attached `WorkScope` atomically in a single database transaction while keeping the durable ProductConversation identity unchanged:
   - the parent retains its `worktree_path` field as a read-only reference for history navigation
   - the continuation's `worktree_path` is set to the same value
   - the continuation inherits the same `work_scope_id`
   - no `git worktree add` or `git worktree remove` command is executed (the filesystem state is unchanged)
 
 WHEN a continuation successor row is newly created
-THE SYSTEM SHALL submit the user-selected handoff text as that successor row's first user message
-AND SHALL use a client-generated message identifier for idempotent acceptance
+THE SYSTEM SHALL atomically create that successor row, link it through `continued_in_conv_id`,
+  persist the exact continuation boundary summary on the predecessor, and accept the user-selected
+  handoff text as the successor row's first user message
+AND SHALL use a client-generated message identifier for idempotent acceptance of that first user message
+AND SHALL keep the exact persisted continuation boundary summary distinct from the successor's first user message
 
 WHEN a parent conversation already has a continuation
 THE SYSTEM SHALL present the Continue action as a navigation link to the existing continuation

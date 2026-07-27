@@ -124,11 +124,13 @@ entity ProductConversation {
     transcript_rows: Conversation with product_conversation = this
 }
 
--- Navigation/list identity is the durable root transcript row. The root is the
--- unique row in transcript_rows that is not the successor of another row in the
--- same aggregate. Latest-row authority remains derived from continuation topology.
--- Where rules/surfaces need root/latest identity, they derive it from
--- transcript_rows and continued_in_conv_id rather than storing parallel fields.
+-- Navigation/list identity is the durable ProductConversation aggregate. Member
+-- root/anchor/latest transcript rows are derived views within that aggregate: the
+-- root row is the unique transcript row that is not the successor of another row
+-- in the same aggregate, and latest-row authority remains derived from
+-- continuation topology. Where rules/surfaces need root/latest identity, they
+-- derive it from transcript_rows and continued_in_conv_id rather than storing
+-- parallel fields.
 
 entity CloseObligation {
     product_conversation: ProductConversation
@@ -298,7 +300,7 @@ variant Parent : Conversation {
     -- Points at the source product conversation rather than a continuation predecessor.
     -- The new conversation remains a top-level Parent with its own lifecycle; this raw id
     -- is purely for the visible "Derived from" link and does not participate in row
-    -- ownership, continuation routing, or delete cascades.
+    -- ownership, continuation routing, delete cascades, or sub-agent topology.
     spawned_from_conversation_id: String?
 
     proposal: TaskProposal when parent_status = awaiting_task_approval
@@ -315,6 +317,7 @@ variant Parent : Conversation {
     root_conversation: this when root = absent else root
     product_lifecycle: history when root_conversation.lifecycle = history else open
     row_accepts_user_messages: product_lifecycle = open
+        and is_latest_row
         and parent_status != context_exhausted
         and parent_status != handed_off
 
@@ -406,7 +409,7 @@ config {
 rule UserSendsMessage {
     when: UserSendsMessage(conversation, text, images?)
     requires: conversation.core_status in { idle, error }
-    requires: conversation.product_lifecycle = open
+    requires: conversation.row_accepts_user_messages
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
@@ -416,6 +419,13 @@ rule RejectMessageWhileBusy {
     when: UserSendsMessage(conversation, text, images?)
     requires: conversation.is_busy
     ensures: MessageRejected(conversation, reason: agent_busy)
+}
+
+rule RejectMessageWhenRowDoesNotAcceptInput {
+    when: UserSendsMessage(conversation, text, images?)
+    requires: not conversation.is_busy
+    requires: not conversation.row_accepts_user_messages
+    ensures: MessageRejected(conversation, reason: conversation_read_only)
 }
 
 -- ===========================================================
@@ -988,16 +998,18 @@ rule UserApprovesTaskCurrentConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_continue_current
+    ensures: WriteAuthorityPersistedBeforeResume(conversation)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
 
     @guidance
         -- Continue here resolves the blocking approval inside the same
-        -- conversation. It resumes execution with the exact approved objective,
-        -- but does not transition product mode, write continuation topology,
-        -- transfer provenance/work-scope ownership, or create any fresh
-        -- lifecycle/task-placement record beyond the approval checkpoint itself.
+        -- conversation. It durably establishes typed write authority on the
+        -- existing Git-backed scope before resume, but does not transition
+        -- product lifecycle, product mode, work-scope attachment, continuation
+        -- topology, provenance, or branch/worktree state beyond the approval
+        -- checkpoint itself.
 }
 
 rule UserApprovesTaskNewConversation {
@@ -1181,7 +1193,7 @@ rule IgnoreStaleOrDuplicateContinuationResult {
     ensures: ContinuationResultIgnored(conversation, operation_id)
 
 rule UserStartsContinuationConversation {
-    when: UserStartsContinuationConversation(conversation, new_conv)
+    when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
     requires: conversation.product_lifecycle = open
@@ -1191,11 +1203,12 @@ rule UserStartsContinuationConversation {
     ensures: new_conv.lifecycle = open
     ensures: new_conv.mode = conversation.mode
     ensures: new_conv.working_dir = conversation.working_dir
+    ensures: SuccessorFirstUserMessageAccepted(new_conv, handoff_text, first_message_id)
 }
 }
 
 rule ContinuationHandoffBecomesBoundary {
-    when: UserStartsContinuationConversation(conversation, new_conv)
+    when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
     requires: conversation.product_lifecycle = open
@@ -1203,9 +1216,11 @@ rule ContinuationHandoffBecomesBoundary {
     ensures: conversation.continuation_boundary_summary = conversation.continuation_summary
 
     @guidance
-        -- The exact persisted continuation summary that initialized the successor
-        -- becomes the one visible boundary at the predecessor/successor join. It is
-        -- not duplicated as ordinary transcript messages on either side.
+        -- The exact persisted continuation summary becomes the one visible
+        -- boundary at the predecessor/successor join. The user-selected handoff
+        -- text is accepted atomically as the successor's first user message via
+        -- the client-generated first_message_id, and the boundary summary is not
+        -- duplicated as an ordinary transcript message on either side.
 }
 
 rule ProductConversationRouteResolvesLegacyMemberLinks {
@@ -1215,17 +1230,18 @@ rule ProductConversationRouteResolvesLegacyMemberLinks {
 
     ensures: ProductConversationRouteResolved(
         product_conversation: target_row.product_conversation,
-        route_target: root_row,
+        route_target: target_row.product_conversation,
         anchor_row: target_row,
+        root_row: root_row,
         live_target: latest_row
     )
 
     @guidance
         -- Open, History, search, provenance, and legacy member links all resolve to
-        -- the same stable product-conversation route keyed by the durable root.
-        -- Member identity survives only as an exact anchor target inside that page;
-        -- absent an explicit member/message anchor, the latest row is the default
-        -- live target derived from topology.
+        -- the same stable ProductConversation route keyed by the aggregate durable id.
+        -- Root/member/latest transcript-row identities remain derived views inside
+        -- that route: explicit links keep member anchoring, while the latest row is
+        -- the default live target derived from topology.
 }
 
 rule ProductConversationTranscriptProjectsChronologically {
@@ -1293,6 +1309,7 @@ rule UserRequestsCloseConversation {
     when: UserRequestsCloseConversation(conversation)
     requires: conversation.product_lifecycle = open
     requires: conversation.is_latest_row
+    requires: conversation.row_accepts_user_messages
     requires: not exists Parent{product_conversation: conversation.product_conversation, parent_status: awaiting_task_approval}
     requires: not exists Parent{product_conversation: conversation.product_conversation, core_status: awaiting_continuation}
     requires:
@@ -1307,9 +1324,9 @@ rule UserRequestsCloseConversation {
 
     @guidance
         -- Close is a durable root-owned obligation separate from the row-local
-        -- lifecycle state. Admission rejects rows still awaiting approval or
-        -- continuation decisions so Close is not offered and no obligation is
-        -- created until the latest row can actually act on it.
+        -- lifecycle state. Admission requires the latest row to be the one that
+        -- still accepts ordinary user input, so handed-off predecessors and other
+        -- read-only rows cannot open a new Close obligation.
 }
 
 rule CloseObligationRequiresExplicitStopWorkConfirmation {
@@ -1336,6 +1353,7 @@ rule CloseObligationCanBeCancelledBeforeSettlementStarts {
         awaiting_retirement_inspection,
         awaiting_loss_confirmation
     }
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
     ensures: CloseObligationCancelled(product_conversation)
 }
 
@@ -1431,6 +1449,7 @@ rule CloseRetirementCompletionFinalizesAggregateHistory {
 rule ProductConversationEnteredHistory {
     when: ProductConversationEnteredHistory(product_conversation)
     requires: product_conversation.lifecycle = open
+    ensures: CloseOutcomeSystemMessagePersisted(product_conversation)
     ensures: product_conversation.lifecycle = history
 }
 
@@ -1588,12 +1607,13 @@ rule SubAgentTurnLimitHardStop {
 -- Lifecycle announcement: fires when the root-owned product lifecycle enters History.
 rule ConversationLifecycleEnteredHistory {
     when: conversation: Parent.product_lifecycle becomes history
-    ensures: ConversationBecameHistory(conversation)
+    requires: conversation.is_latest_row
+    ensures: ConversationBecameHistory(conversation.product_conversation)
 
     @guidance
-        -- Downstream specs consume the product-lifecycle transition on the
-        -- durable root-owned conversation rather than inferring History from
-        -- row-local conditions such as handed_off or context_exhausted.
+        -- Downstream specs consume one aggregate lifecycle transition from the
+        -- ProductConversation itself rather than inferring History from row-local
+        -- conditions such as handed_off or context_exhausted.
 }
 
 -- REQ-BED-032: User hard-deletes a conversation when the conversation is
@@ -1855,7 +1875,7 @@ surface UserConversation {
             when conversation.parent_status = awaiting_user_response
         UserTriggersContinuation(conversation, operation_id)
             when conversation.core_status in { idle, recoverable_continuation_failure }
-        UserStartsContinuationConversation(conversation, new_conv)
+        UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
             when conversation.parent_status = context_exhausted
                  and conversation.continued_in_conv_id = absent
                  and conversation.product_lifecycle = open

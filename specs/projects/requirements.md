@@ -276,7 +276,8 @@ WHEN `propose_task` is called from a planning/read-only phase
 THE SYSTEM SHALL treat it as the blocking review path defined by REQ-PROJ-003 and REQ-PROJ-004
 
 WHEN `propose_task` is called from a Git-backed conversation that already has write authority
-THE SYSTEM SHALL treat it as a proposal to start a separate derived conversation rather than as an in-place lifecycle transition
+THE SYSTEM SHALL treat it as the same blocking review path used for planning/read-only conversations
+AND SHALL NOT reinterpret that call as a nonblocking derived-conversation proposal
 
 WHEN `propose_task` is called in a chat-only Direct conversation
 THE SYSTEM SHALL NOT provide the tool, even if its working directory happens to be inside a Git repository
@@ -575,19 +576,17 @@ Branch discovery and checkout capabilities MAY still be reused later inside the 
 ### REQ-PROJ-033: Propose a Derived Task from an Already-Active Conversation
 
 WHILE a Git-backed conversation already has write authority
-THE SYSTEM SHALL provide `propose_task` as a way to hand a self-contained unit of work to a separate derived conversation
+THE SYSTEM SHALL provide `propose_task` as the same blocking approval tool used in planning/read-only conversations
 
 WHEN the agent calls `propose_task` with a markdown file inside its allowed workspace
 THE SYSTEM SHALL intercept it at the LlmResponse handler
 AND require it to be the only tool call in the response
 AND validate the file by the same taskmd/plain-brief rules as REQ-PROJ-003
-AND capture a content snapshot with normalized repository-relative path metadata and a stable `proposal_id`
-AND leave the referenced file untouched in the originating workspace
-AND persist a synthetic result reporting that the proposal was recorded for later review
-AND return the originating conversation to its running state so it may continue its own work
+AND read and persist the proposal as the blocking approval artifact defined by REQ-PROJ-003/004
+AND transition the conversation to AwaitingTaskApproval rather than leaving it running
 
 WHEN `propose_task` is called from a planning/read-only phase
-THE SYSTEM SHALL keep the blocking review behavior of REQ-PROJ-003 rather than this derived-conversation path
+THE SYSTEM SHALL keep the same blocking review behavior
 
 WHEN `propose_task` is called in Direct mode
 THE SYSTEM SHALL NOT provide the tool
@@ -595,53 +594,19 @@ THE SYSTEM SHALL NOT provide the tool
 WHEN `propose_task` is called by a sub-agent
 THE SYSTEM SHALL reject the call
 
-**Rationale:** A conversation can discover an unrelated task that deserves its own fresh context. The derived-task proposal preserves that user value without turning task shedding into a branch-owned or mode-owned lifecycle fork.
+**Rationale:** Approved product behavior uses one blocking human-review checkpoint for all Git-backed `propose_task` calls. Write authority changes what approval can grant or preserve; it does not create a second nonblocking proposal meaning.
 
 ---
 
-### REQ-PROJ-034: Approve a Derived Proposal by Spawning a Fresh Conversation
+### REQ-PROJ-034: Reserved
 
-WHEN a `pending` derived proposal exists on a conversation and the originating conversation is still Open
-THE SYSTEM SHALL surface it for review in the same task-review interface used for blocking approvals
-AND SHALL resolve it exactly once as spawned, dismissed, or revision-requested
-
-WHEN the user approves a `pending` derived proposal
-THE SYSTEM SHALL create a fresh top-level Open conversation in its own new disposable worktree
-AND SHALL start that worktree from the repository's canonical default branch at detached `HEAD`
-AND SHALL treat the new conversation as a separate derived conversation rather than as a continuation row
-AND SHALL write the snapshot's approved task artifact into the spawned workspace according to REQ-PROJ-006
-AND SHALL persist one normalized approved-task source record containing the exact approved body plus its original repository-relative path and taskmd/plain-brief identity
-AND SHALL seed the spawned conversation's initial context with the approved task brief and nothing else from the source transcript
-AND SHALL record the proposal resolution as `spawned`
-AND SHALL record exactly one source relation of kind `approved_task` on the spawned conversation that points to the originating conversation
-
-
-WHEN the user dismisses a `pending` derived proposal
-THE SYSTEM SHALL spawn nothing
-AND SHALL record the proposal resolution as `dismissed`
-
-WHEN the originating conversation is no longer Open before a pending derived proposal is reviewed
-THE SYSTEM SHALL retire that pending proposal rather than silently attaching it to a closed conversation lifecycle
-
-**Rationale:** A derived task must begin as an independent fresh conversation. Starting from the canonical default-branch snapshot preserves clean separation without requiring a separate branch-specific conversation type or Phoenix-owned branch model.
+Derived-conversation review and spawn semantics were removed when `propose_task` was unified into one blocking approval flow. This REQ id remains reserved for traceability only.
 
 ---
 
-### REQ-PROJ-035: Derived-Conversation Provenance and Decoupling Guarantees
+### REQ-PROJ-035: Reserved
 
-WHEN a derived conversation is created
-THE SYSTEM SHALL record one visible source relation of kind `approved_task` on the derived conversation, pointing at the originating conversation
-AND this source relation SHALL remain distinct from `parent_conversation_id`, `continued_in_conv_id`, and any continuation topology
-AND SHALL carry no lifecycle notification semantics
-
-THE SYSTEM SHALL NOT establish any lifecycle relationship between the originating conversation and the derived conversation beyond that `approved_task` source relation
-AND the originating conversation SHALL receive no automatic notification of the derived conversation's later progress, completion, or failure inside the agent context
-
-WHEN a derived proposal's resolution is recorded
-THE SYSTEM SHALL track that resolution as control-plane state bound to the originating conversation record
-AND SHALL NOT inject it into the originating conversation's LLM context
-
-**Rationale:** Derived tasks are related for navigation and audit, not because they share one lifecycle. This preserves parallelism and prevents provenance from turning into hidden execution coupling.
+Derived-proposal control-plane state and extra decoupling contracts were removed with the nonblocking derived-proposal model. Continuation topology and approved-task source relations are specified elsewhere.
 
 ---
 
@@ -652,29 +617,17 @@ THE `propose_task` tool SHALL be available as follows:
 | Conversation capability shape | `propose_task` behavior |
 |-------------------------------|-------------------------|
 | Git-backed planning/read-only conversation | Blocking review path (REQ-PROJ-003 / REQ-PROJ-004) |
-| Git-backed conversation with write authority | Derived-conversation proposal (REQ-PROJ-033) |
+| Git-backed conversation with write authority | Blocking review path (REQ-PROJ-003 / REQ-PROJ-004) |
 | Any Direct conversation | Not provided |
 | Any sub-agent | Not provided |
 
-**Rationale:** Availability depends on whether the host conversation itself is Git-backed and can either review a task in place or spawn a Git-backed derived conversation, not on obsolete lifecycle mode labels or on whether a chat-only working directory happens to sit inside a repository.
+**Rationale:** Availability depends on whether the host conversation itself is Git-backed and therefore eligible for the one blocking approval flow. Chat-only/direct conversations and sub-agents remain excluded, even if a chat-only working directory happens to sit inside a repository.
 
 ---
 
-### REQ-PROJ-037: Request Changes on a Derived Proposal Opens a Fresh Refinement Conversation
+### REQ-PROJ-037: Reserved
 
-WHEN a `pending` derived proposal is under review and the originating conversation is still Open
-THE SYSTEM SHALL offer **Request Changes** alongside Approve and Dismiss
-
-WHEN the user chooses Request Changes with a change request
-THE SYSTEM SHALL create a fresh Open refinement conversation in its own new disposable worktree from the repository's canonical default branch
-AND write the proposal snapshot as an editable draft task artifact in that refinement workspace
-AND seed the refinement conversation with the brief body plus the user's change request, and nothing else from the originating transcript
-AND record the proposal resolution as a single-use refinement outcome
-AND leave the originating conversation unaffected and uninformed inside the agent context
-
-THEREAFTER refinement proceeds through the ordinary blocking approval loop rather than through a second hidden fork mechanism.
-
-**Rationale:** Requesting changes still has user value, but it now deliberately opens a fresh refinement conversation instead of implying an obsolete planning-mode taxonomy as a long-lived product lifecycle.
+Fresh refinement-conversation behavior was removed with the nonblocking derived-proposal model. Request changes remains part of the ordinary blocking approval loop in REQ-PROJ-004.
 
 ---
 

@@ -293,6 +293,7 @@ rule TaskApprovalExecuted {
         kind: approved_task_kind(conversation.proposal.task_file)
     }
 
+    ensures: WriteAuthorityPersistedBeforeResume(conversation)
     ensures: ApprovedTaskSnapshotted(conversation, approved_source)
     ensures: ApprovedTaskRevalidated(conversation, approved_source)
     ensures: worktree.approved_task = approved_source
@@ -305,6 +306,12 @@ rule TaskApprovalExecuted {
     ensures: conversation.task_id = approval_task_id(approved_source.task_path)
     ensures: conversation.task_title = approved_source.title
     ensures: ApprovedTaskContinuedHere(conversation, approved_source)
+
+    @guidance
+        -- Continue here reuses the existing attached WorkScope/worktree. Approval
+        -- persists typed write authority on that existing Git-backed attachment
+        -- before resume; it does not create or swap scopes, change lifecycle, or
+        -- mutate branch/worktree provenance beyond the approved artifact commit.
 }
 
 rule TaskApprovalNewConversationExecuted {
@@ -335,7 +342,7 @@ rule TaskApprovalNewConversationExecuted {
 }
 
 rule WorktreeTransferredOnContinuation {
-    when: UserStartsContinuationConversation(parent, new_conv)
+    when: UserStartsContinuationConversation(parent, new_conv, handoff_text, first_message_id)
 
     requires: parent.parent_status = context_exhausted
     requires: exists Worktree{conversation: parent}
@@ -361,7 +368,7 @@ rule WorktreeTransferredOnContinuation {
 }
 
 rule DirectContinuationInheritsCwd {
-    when: UserStartsContinuationConversation(parent, new_conv)
+    when: UserStartsContinuationConversation(parent, new_conv, handoff_text, first_message_id)
 
     requires: parent.parent_status = context_exhausted
     requires: not exists Worktree{conversation: parent}
