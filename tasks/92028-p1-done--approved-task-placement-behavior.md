@@ -188,3 +188,38 @@ Append a completion note with these headings:
 
 **Commit**
 - `6c6351cb7`
+
+
+## 92028 reopen: derived-field syntax correction evidence
+
+**Files changed**
+- `specs/bedrock/bedrock.allium`
+- `tasks/92028-p1-in-progress--approved-task-placement-behavior.md`
+
+**Exact correction**
+- Fixed the derived field syntax at `specs/bedrock/bedrock.allium:259-260` by changing `task_proposal_eligible = ...` to `task_proposal_eligible: ...`.
+- This matches neighboring derived-field syntax such as `is_busy:` and `context_warning:`.
+- No expression semantics changed; only the entity derived-field delimiter changed from `=` to `:`.
+
+**Review / false-validation evidence**
+- Prior task evidence claimed validation success while the derived field still rendered as:
+  - `task_proposal_eligible = environment_kind = git_backed`
+  - `    and is_git_repository(working_dir)`
+- Reopen reason confirmed: that syntax is invalid for an entity derived field in Allium even though the prior task marked itself done.
+- This pass explicitly re-ran `allium check` on each requested scope and parsed diagnostic severities, requiring zero `severity: "error"` findings before closing.
+
+**Validation**
+- Command: `allium check specs/bedrock/bedrock.allium`
+- Result: exit `0`; parsed diagnostics contained zero `severity: "error"` findings.
+- Command: `allium check specs/projects/projects.allium`
+- Result: exit `0`; parsed diagnostics contained zero `severity: "error"` findings.
+- Command: `allium check specs/bedrock/bedrock.allium specs/projects/projects.allium`
+- Result: exit `0`; parsed diagnostics contained zero `severity: "error"` findings.
+- Parsed summary:
+  - `allium-bedrock-check.txt`: errors `0`
+  - `allium-projects-check.txt`: errors `0`
+  - `allium-bedrock-projects-check.txt`: errors `0`
+
+**Scope discipline**
+- Only `specs/bedrock/bedrock.allium` and this task file were modified for the reopen fix.
+- No semantics were changed beyond the required Allium syntax correction.

@@ -271,7 +271,7 @@ entity Conversation {
     is_busy: core_status in { llm_requesting, executing_tools,
                               awaiting_sub_agents, cancelling_tool,
                               cancelling_sub_agents }
-    task_proposal_eligible = environment_kind = git_backed
+    task_proposal_eligible: environment_kind = git_backed
         and is_git_repository(working_dir)
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
