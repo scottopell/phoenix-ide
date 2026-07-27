@@ -249,3 +249,59 @@ Append a completion note with these headings:
 
 **Commit**
 - Pending
+
+
+## 92030 final recovery acceptance evidence
+
+**Files reviewed**
+- Task reconciliation: `tasks/92030-p1-in-progress--cross-file-allium-review.md`, `tasks/92030-p1-done--cross-file-allium-review.md`
+- Parent/summary task: `tasks/92018-p1-in-progress--lifecycle-close-allium-behavior.md`
+- Affected specs revisited after boundary recovery: `specs/bedrock/bedrock.allium`, `specs/projects/projects.allium`, `specs/subagents/subagents.allium`, `specs/durable-workflows/creation-profile.allium`, `specs/pr-association/pr-association.allium`, `specs/work-lifecycle/work-lifecycle.allium`, `specs/sse_wire/sse_wire.allium`
+- Requirements context consulted for approval semantics: `specs/bedrock/requirements.md`, `specs/projects/requirements.md`
+
+**Settled facts enforced**
+- `UserApprovesTaskCurrentConversation` has **no** mode/task ownership/lifecycle/provenance/WorkScope effect: **Confirmed and clarified**. The rule now resumes the same conversation with the exact approved objective only; no fresh placement record, topology edge, provenance transfer, or scope ownership change is introduced there.
+- Exact approved objective is represented through the approved proposal/source record: **Confirmed**. `projects/TaskApprovalExecuted` rereads the proposal file into typed `ApprovedTaskSource`, snapshots/revalidates it, writes it to the workspace, and records `conversation.task_id` / `conversation.task_title` from that exact approved source.
+- `Start in new conversation` remains separate/fresh/derived instead of continuation: **Confirmed** through `ApprovedTaskSourceRecorded(...)`, `ApprovedTaskDerivedFromRecorded(...)`, `CreatedFromApprovedTask(...)`, and `FreshGitWorktreeProvisioningRequested(...)`.
+- Continue-here mode transition removed: **Fixed in spec**. `specs/bedrock/bedrock.allium` no longer encodes `explore -> work` in the normative `mode` transition graph.
+
+**Residual mode / branch hit classification**
+- `specs/projects/projects.allium:391-404` (`mode = work`, `mode = explore`) — **Allowed internal execution authority**. These hits govern sub-agent execution attachment (`WorkSubAgentInheritsWorktree`, `ExploreSubAgentDirectory`), not product lifecycle or user-facing conversation placement.
+- `specs/subagents/subagents.allium` work/explore hits — **Allowed internal execution authority**. They describe spawn validation/defaulting and explicitly distinguish read-only vs write-capable sub-agent execution, not product lifecycle.
+- `specs/durable-workflows/creation-profile.allium:41-46` `requested_branch` — **Allowed legacy/internal creation API**. This remains only inside generic engine-backed creation intent typing; it is not the user-facing unified conversation path. Implementation follow-up may eventually retire it when the legacy/internal creation path is removed, but it is not a spec blocker for this acceptance.
+
+**Validation**
+- Semantic grep:
+  - `rg -n 'UserApprovesTaskCurrentConversation|approved_continue_current|approved_start_fresh|Continue here|requested_branch|mode = work|mode = branch|mode = explore|ApprovedTaskSourceRecorded|ApprovedTaskContinuedHere|created_fresh_work_conversation' specs`
+  - `rg -n 'explore -> work|direct -> branch|continued_in_conv_id|ApprovedTaskSource|ApprovedTaskDerivedFromRecorded|WorkScope' specs/bedrock/bedrock.allium specs/projects/projects.allium specs/subagents/subagents.allium specs/durable-workflows/creation-profile.allium`
+- Individual Allium checks parsed for `severity: "error"`:
+  - `allium check specs/bedrock/bedrock.allium` → `errors=0`
+  - `allium check specs/projects/projects.allium` → `errors=0`
+  - `allium check specs/work-lifecycle/work-lifecycle.allium` → `errors=0`
+  - `allium check specs/pr-association/pr-association.allium` → `errors=0`
+  - `allium check specs/sse_wire/sse_wire.allium` → `errors=0`
+  - `allium check specs/durable-workflows/durable-workflows.allium` → `errors=0`
+  - `allium check specs/durable-workflows/wake-profile.allium` → `errors=0`
+  - `allium check specs/durable-workflows/creation-profile.allium` → `errors=0`
+  - `allium check specs/subagents/subagents.allium` → `errors=0`
+- Combined check:
+  - `allium check specs/bedrock/bedrock.allium specs/projects/projects.allium specs/work-lifecycle/work-lifecycle.allium specs/pr-association/pr-association.allium specs/sse_wire/sse_wire.allium specs/durable-workflows/durable-workflows.allium specs/durable-workflows/wake-profile.allium specs/durable-workflows/creation-profile.allium specs/subagents/subagents.allium` → parsed `errors=0`
+- Repository/task validation:
+  - `python3 scripts/spec_shape_check.py` → pass
+  - `./dev.py tasks validate` → pass
+
+**Review / evidence ledger**
+- Reconciled duplicate task 92030 paths by treating `tasks/92030-p1-in-progress--cross-file-allium-review.md` as authoritative and merging this final acceptance evidence there before removing the stale done duplicate.
+- Boundary recovery step completed first: restored only `crates/phoenix-db/src/lib.rs` to `HEAD`, preserving the uncommitted `specs/bedrock/bedrock.allium` fix.
+- Implementation drift explicitly classified as deferred implementation gates, **not spec blockers**:
+  1. Executor still appears to perform a Continue-here mode upgrade in code paths outside this spec-only acceptance scope.
+  2. DB/task persistence still appears to allow fresh-continuation behavior inconsistent with the unified conversation acceptance target.
+- No code edits were made in this recovery pass.
+
+**Speculation avoided**
+- Did not rewrite code, requirements, or unrelated Allium clusters.
+- Did not classify internal sub-agent execution authority as user-facing product lifecycle.
+- Did not treat legacy/internal durable creation typing as the unified user-facing conversation path.
+
+**Commit**
+- Pending local commit for this recovery acceptance pass.

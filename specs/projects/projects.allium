@@ -245,7 +245,6 @@ rule GitBackedConversationProvisioned {
         --
         -- No fallback to an arbitrary current branch is allowed.
 }
-}
 
 rule DirectConversationHasNoProjectLifecycle {
     when: ConversationCreated(conversation, directory)

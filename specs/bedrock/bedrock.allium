@@ -211,7 +211,6 @@ entity Conversation {
 
     -- Mode transitions (REQ-BED-027)
     transitions mode {
-        explore -> work
         direct -> branch
         terminal: direct, work, branch
     }
@@ -989,11 +988,16 @@ rule UserApprovesTaskCurrentConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_continue_current
-    ensures: conversation.mode = work
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
-    ensures: ModeTransitioned(conversation, from: explore, to: work)
     ensures: LlmRequestDispatched(conversation)
+
+    @guidance
+        -- Continue here resolves the blocking approval inside the same
+        -- conversation. It resumes execution with the exact approved objective,
+        -- but does not transition product mode, write continuation topology,
+        -- transfer provenance/work-scope ownership, or create any fresh
+        -- lifecycle/task-placement record beyond the approval checkpoint itself.
 }
 
 rule UserApprovesTaskNewConversation {
