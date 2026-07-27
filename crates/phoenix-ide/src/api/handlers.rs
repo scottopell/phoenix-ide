@@ -11881,8 +11881,20 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(conv.archived, "archived flag must be set");
 
         assert!(
-            state.runtime.bash_handles().remove(&scope).await.is_none(),
-            "bash registry entry must be dropped by archive cascade"
+            state
+                .runtime
+                .bash_handles()
+                .owner_handles(&scope)
+                .await
+                .is_empty(),
+            "archive cascade must drain owned bash handles"
+        );
+        assert!(
+            matches!(
+                state.runtime.bash_handles().reserve_spawn(&scope).await,
+                Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+            ),
+            "archive cascade must preserve the teardown admission fence"
         );
     }
 
@@ -11911,14 +11923,22 @@ pub(crate) mod hard_delete_cascade_tests {
                 .await
                 .unwrap_or_else(|_| panic!("{id} row preserved"));
             assert!(conv.archived, "{id} must be archived");
+            let scope = conversation_scope(&state, id).await;
             assert!(
                 state
                     .runtime
                     .bash_handles()
-                    .remove(&conversation_scope(&state, id).await)
+                    .owner_handles(&scope)
                     .await
-                    .is_none(),
-                "bash registry leaked entry for {id}"
+                    .is_empty(),
+                "bash registry retained handles for {id}"
+            );
+            assert!(
+                matches!(
+                    state.runtime.bash_handles().reserve_spawn(&scope).await,
+                    Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+                ),
+                "bash registry lost teardown fence for {id}"
             );
         }
     }
