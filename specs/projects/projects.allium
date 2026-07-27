@@ -236,7 +236,7 @@ rule GitBackedConversationProvisioned {
             and WorkScope.created(
                 product_conversation: target,
                 project: project,
-                worktree_path: WorktreePath { absolute_path: worktree_path(conversation) },
+                worktree_path: WorktreePath { absolute_path: worktree_path(target) },
                 canonical_default_branch: resolution.resolved.default_identity.branch_name,
                 detached_start_commit: resolution.resolved.starting_commit
             )
@@ -245,12 +245,12 @@ rule GitBackedConversationProvisioned {
                 product_conversation: target,
                 project: project,
                 attached_scope: WorkScope{product_conversation: target},
-                path: WorktreePath { absolute_path: worktree_path(conversation) },
+                path: WorktreePath { absolute_path: worktree_path(target) },
                 starting_branch_name: resolution.resolved.default_identity.branch_name,
                 starting_commit: resolution.resolved.starting_commit
             )
-            and conversation.working_dir = worktree_path(conversation)
-            and conversation.worktree_path = worktree_path(conversation)
+            and conversation.working_dir = worktree_path(target)
+            and conversation.worktree_path = worktree_path(target)
         else:
             ProvisioningFailure.created(
                 conversation: conversation,
@@ -478,10 +478,10 @@ rule ServerRestartWorktreeReconciliation {
 -- Invariants
 ------------------------------------------------------------
 
-invariant WorktreePathDerivedFromConversation {
+invariant WorktreePathDerivedFromProductConversation {
     for w in Worktrees:
         w.path.absolute_path = w.project.repo.root_path
-            + "/.phoenix/worktrees/" + w.conversation.id
+            + "/.phoenix/worktrees/" + w.product_conversation.id
 }
 
 invariant WorktreePathsUnique {

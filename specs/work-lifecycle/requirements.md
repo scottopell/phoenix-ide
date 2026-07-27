@@ -44,7 +44,7 @@ AND SHALL NOT expose those deprecated verbs as current writable lifecycle choice
 
 ### REQ-WL-002: Retirement Inspection Classifies Exact Worktree-Loss Risk Before Destructive Teardown
 
-WHEN bedrock requests retirement inspection for an attached Git-backed `WorkScope`
+WHEN bedrock requests retirement inspection for an attached Git-backed `WorkScope` for one exact Close attempt
 THE SYSTEM SHALL inspect only state whose durability depends on the attached worktree and its owned resources
 AND SHALL classify loss risk into these independent categories:
 - staged tracked paths
@@ -94,7 +94,7 @@ AND SHALL NOT let the presence of other attached non-worktree scopes bypass insp
 
 ### REQ-WL-002b: Retirement Retires Owned Resources Stepwise, Idempotently, and Without Automatic Recovery Artifacts
 
-WHEN bedrock requests resource retirement for an attached Git-backed `WorkScope`
+WHEN bedrock requests resource retirement for an attached Git-backed `WorkScope` for one exact Close attempt
 THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources, including the worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that same WorkScope
 
 THE SYSTEM SHALL treat the attached `WorkScope` as the owner of the retireable resources

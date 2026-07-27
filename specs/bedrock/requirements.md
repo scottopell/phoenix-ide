@@ -724,6 +724,12 @@ THE SYSTEM SHALL emit one aggregate lifecycle announcement for downstream consum
 AND the conversation SHALL remain visible in the sidebar for reference
 AND the user SHALL be able to start a new conversation on the same project
 
+EACH Close operation SHALL carry one durable Close-attempt identity bound to that ProductConversation
+AND THE SYSTEM SHALL permit at most one non-completed Close attempt for a given ProductConversation at a time
+AND SHALL bind every Close phase transition, confirmation, cancellation, settlement, inspection, retirement, retry, and finalization event to that exact Close-attempt identity
+AND MAY retain completed Close attempts as historical records
+AND SHALL create a new Close-attempt identity after cancellation only when no earlier Close attempt for that ProductConversation remains active
+
 **Rationale:** Closing is the one product-facing way to retire active work. The
 conversation moves to History because its owned live environment is gone; there is no
 separate in-Phoenix merged-versus-abandoned lifecycle.
@@ -762,10 +768,13 @@ AND NOT permit creation of a second continuation from the same parent
 next action is to keep working on the same task with a fresh context window.
 Preserving the full environment — execution authority, branch state, worktree, uncommitted changes —
 matches that intent directly and eliminates the need for `git stash`/restore
-ceremony or a separate auto-stash feature. Transferring ownership rather than
-destroying and recreating is the only shape that preserves uncommitted work
-structurally, without a separate auto-stash mechanism. Single-continuation
-policy keeps execution topology unambiguous: at any moment, continuation identifies the latest execution row for one product conversation while that conversation keeps one attached `WorkScope` and therefore one inherited worktree.
+ceremony or a separate auto-stash feature. Keeping the same attached `WorkScope`
+and filesystem path across continuation, rather than destroying and recreating,
+is the only shape that preserves uncommitted work structurally without a separate
+auto-stash mechanism. Single-continuation policy keeps execution topology
+unambiguous: at any moment, continuation identifies the latest execution row for
+one product conversation while that conversation keeps one attached `WorkScope`
+and therefore one inherited worktree.
 
 **Dependencies:** REQ-BED-021, REQ-PROJ-025, work-lifecycle REQ-WL-001/REQ-WL-002, REQ-PROJ-028
 

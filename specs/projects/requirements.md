@@ -336,7 +336,7 @@ THE SYSTEM SHALL indicate its current capabilities and whether it is Open or in 
 ### REQ-PROJ-015: Project Worktree Registry
 
 WHEN a Phoenix-owned disposable worktree exists for a conversation
-THE SYSTEM SHALL register enough data to report its owning conversation, worktree path, and `WorkScope`
+THE SYSTEM SHALL register enough data to report its owning conversation, stable owning ProductConversation, worktree path, and `WorkScope`
 
 WHEN the server starts
 THE SYSTEM SHALL reconcile the registry against worktrees on disk
@@ -349,6 +349,7 @@ THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
 WHEN a transcript row has transferred execution through `continued_in_conv_id`
 THE SYSTEM SHALL treat that row as a historical transcript segment rather than as an independent WorkScope authority
 AND SHALL derive the latest execution row from continuation topology rather than storing a second ownership authority
+AND SHALL keep the same stable ProductConversation-scoped `WorkScope` identity and the same filesystem worktree path across that continuation
 AND SHALL preserve the worktree only while a non-History open product conversation still has that same `WorkScope` attached
 
 WHEN teardown or startup reconciliation evaluates a Phoenix-owned worktree
@@ -386,8 +387,10 @@ AND SHALL NOT require conversation ownership semantics to include a selected bra
 THE Direct mode SHALL carry no Git-backed worktree metadata
 
 WHEN a conversation later closes
-THE SYSTEM SHALL release the worktree according to the Close contract
+WHEN a Git-backed conversation later closes
+THE SYSTEM SHALL release the same ProductConversation-scoped worktree according to the Close contract
 AND SHALL NOT infer any branch-ownership mutation from the recorded starting provenance
+
 
 **Rationale:** Users still need to know where a conversation started, but the new model records that as provenance rather than as an owned lifecycle mode with branch-selection semantics.
 
