@@ -1313,16 +1313,6 @@ rule ProductConversationListProjectsOncePerRoot {
 -- PARENT 8. TERMINAL (REQ-BED-029)
 -- ===========================================================
 
-rule ProductConversationTransitionsToHistory {
-    when: ProductConversationTransitionToHistoryRequested(product_conversation)
-    requires: product_conversation.lifecycle = open
-    ensures: product_conversation.lifecycle = history
-
-    @guidance
-        -- Bedrock owns only the aggregate lifecycle capability: an open product
-        -- conversation may become history. The trigger/orchestration deciding
-        -- when to invoke this transition is owned downstream.
-}
 
 rule UserRequestsCloseConversation {
     when: UserRequestsCloseConversation(conversation)
@@ -1406,12 +1396,18 @@ rule CloseObligationRequestsRetirementInspectionAfterSettlement {
     ensures: RetirementInspectionRequested(product_conversation)
 }
 
-rule CloseSettlementCancellationCompletesOnlyAfterOwnershipReleases {
+rule CloseSettlementCancellationReturnsToRetirementInspection {
     when: CloseSettlementProgressed(product_conversation)
     requires: CloseObligation{product_conversation: product_conversation}.phase = cancel_requested_during_settlement
     requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
-    ensures: CloseObligationCancelled(product_conversation)
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = awaiting_retirement_inspection
+    ensures: RetirementInspectionRequested(product_conversation)
+
+    @guidance
+        -- A cancellation request during settlement only cancels the active-work stop.
+        -- Once busy execution has settled, Close still resolves structurally through
+        -- the same retirement-inspection path used by non-cancelled Close rather than
+        -- completing early while resources may remain owned.
 }
 
 rule RetirementInspectionShowsNoConfirmationRequired {
@@ -1456,20 +1452,17 @@ rule CloseRetirementCompletionFinalizesAggregateHistory {
     when: ResourceRetirementCompleted(product_conversation)
     requires: CloseObligation{product_conversation: product_conversation}.phase in { retirement_requested, needs_repair }
     requires: product_conversation.lifecycle = open
-    ensures: ProductConversationEnteredHistory(product_conversation)
-    ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
-
-    @guidance
-        -- The lifecycle transition event name is intentionally completion-oriented:
-        -- it fires only after retirement completion, avoiding confusion with the
-        -- user action that merely requested Close.
-}
-
-rule ProductConversationEnteredHistory {
-    when: ProductConversationEnteredHistory(product_conversation)
-    requires: product_conversation.lifecycle = open
     ensures: CloseOutcomeSystemMessagePersisted(product_conversation)
     ensures: product_conversation.lifecycle = history
+    ensures: CloseObligation{product_conversation: product_conversation}.phase = completed
+    ensures: ProductConversationEnteredHistory(product_conversation)
+
+    @guidance
+        -- Close finalization is one transaction boundary: first persist the durable
+        -- synthetic Close-outcome message on the aggregate transcript, then commit the
+        -- aggregate lifecycle transition to History, then complete the Close obligation,
+        -- and only then expose the aggregate-entered-History event for downstream
+        -- announcement and SSE projection.
 }
 
 rule CloseRetirementFailureLeavesOpenNeedsRepair {
@@ -1623,11 +1616,10 @@ rule SubAgentTurnLimitHardStop {
 -- Rules: Lifecycle and cross-cutting
 ------------------------------------------------------------
 
--- Lifecycle announcement: fires when the root-owned product lifecycle enters History.
+-- Lifecycle announcement: fires once from the singular root-owned product lifecycle.
 rule ConversationLifecycleEnteredHistory {
-    when: conversation: Parent.product_lifecycle becomes history
-    requires: conversation.is_latest_row
-    ensures: ConversationBecameHistory(conversation.product_conversation)
+    when: ProductConversationEnteredHistory(product_conversation)
+    ensures: ConversationBecameHistory(product_conversation)
 
     @guidance
         -- Downstream specs consume one aggregate lifecycle transition from the
@@ -1818,12 +1810,12 @@ invariant LatestRowDerivedFromTopology {
 
 invariant ProductConversationHasSingleRootRow {
     for pc in ProductConversation:
-        count(Conversation{product_conversation: pc} where not exists Conversation{product_conversation: pc, continued_in_conv_id: this}) = 1
+        count(Parent{product_conversation: pc} where not exists Parent{product_conversation: pc, continued_in_conv_id: this}) = 1
 }
 
 invariant ProductConversationHasSingleTopologyLatestRow {
     for pc in ProductConversation:
-        count(Conversation{product_conversation: pc, continued_in_conv_id: absent}) = 1
+        count(Parent{product_conversation: pc, continued_in_conv_id: absent}) = 1
 }
 
 invariant ContinuationBoundarySummaryLivesOnHandedOffPredecessor {

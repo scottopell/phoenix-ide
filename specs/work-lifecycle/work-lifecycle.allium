@@ -229,17 +229,39 @@ rule ChangedWorkspaceInvalidatesOutstandingConfirmation {
 
 rule RetirementRequestedRetiresOwnedResources {
     when: ResourceRetirementRequested(product_conversation)
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: not blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
     requires: all_owned_resources_retired(product_conversation)
     ensures: ResourceRetirementCompleted(product_conversation)
 
     @guidance
-        -- Retirement is stepwise and idempotent. It retires the worktree and
-        -- WorkScope-owned bash/process-group, tmux, PTY/terminal, browser, and
-        -- equivalent live resources. Success is emitted only after every owned
-        -- resource has been retired.
+        -- Retirement completion is the final aggregate gate only after per-resource
+        -- retirement has already produced exact-attempt evidence for every owned
+        -- resource or exact-attempt absence evidence where applicable.
+}
+
+rule RetirementRequestedCreatesPerResourceEvidence {
+    when: ResourceRetirementRequested(product_conversation)
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: not blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
+    requires: owned_resource_pending_retirement(product_conversation, scope_binding.scope)
+    requires: retirement_step_succeeds_for_pending_resource(product_conversation, scope_binding.scope)
+    ensures: RetiredResource.created(
+        attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope},
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope)
+    )
+    ensures: ResourceRetirementProgressRecorded(product_conversation)
+
+    @guidance
+        -- Resource retirement is stepwise and idempotent. Each successful step creates
+        -- typed RetiredResource evidence for the exact RetirementAttempt before the
+        -- all-owned-resources completion gate can fire.
 }
 
 rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
@@ -259,19 +281,32 @@ rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
 
 rule RetirementStepSuccessRecordsTypedEvidence {
     when: ResourceRetirementRequested(product_conversation)
-    requires: exists RetiredResource{attempt: RetirementAttempt, product_conversation: product_conversation, scope: AttachedWorkScope.scope, kind: RetiredResourceKind}
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists RetiredResource{
+        attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope},
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        kind: retired_resource_kind_for_completed_step(product_conversation, scope_binding.scope)
+    }
     ensures: ResourceRetirementProgressRecorded(product_conversation)
 
     @guidance
-        -- Each successful step records typed RetiredResource evidence for the exact
-        -- RetirementAttempt BEFORE all-owned-resource completion is emitted. The
-        -- kind enumerates worktree, bash_process_group, tmux_server, pty_session,
-        -- browser_session, or equivalent_live_resource.
+        -- Progress reporting consumes already-created exact-attempt RetiredResource
+        -- evidence for the bound attached scope; it does not stand in for creating
+        -- that evidence.
 }
 
 rule RetirementAlreadyRetiredIsIdempotentNoOp {
     when: ResourceRetirementRequested(product_conversation)
-    requires: exists RetiredResource{attempt: RetirementAttempt, product_conversation: product_conversation, scope: AttachedWorkScope.scope, kind: RetiredResourceKind}
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists RetiredResource{
+        attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope},
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        kind: retired_resource_kind_for_retried_step(product_conversation, scope_binding.scope)
+    }
     requires: exact_attempt_retries_same_resource(product_conversation)
     ensures: ResourceRetirementProgressRecorded(product_conversation)
 
@@ -294,10 +329,11 @@ rule ResourceRetirementFailureProducesResidualRepairState {
 
 rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     when: ResourceRetirementRequested(product_conversation)
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation)
-    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt, product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
     ensures: ResourceRetirementFailed(product_conversation)
 
     @guidance
@@ -309,10 +345,11 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
 
 rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
     when: ResourceRetirementRequested(product_conversation)
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation)
-    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt, product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
     ensures: ResourceRetirementProgressRecorded(product_conversation)
 
     @guidance

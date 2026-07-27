@@ -396,8 +396,6 @@ AND SHALL NOT infer any branch-ownership mutation from the recorded starting pro
 
 Direct mode is the chat-only / non-worktree conversation shape.
 
-**Historical note — Standalone → Direct migration.** An earlier design split non-Git directory conversations into a separate `Standalone` mode. That distinction was removed because both shapes represented the same chat-only semantics: full tool access in the target directory, no Phoenix-owned worktree, and no Git-backed lifecycle ownership.
-
 WHEN a conversation is created in Direct mode
 THE SYSTEM SHALL provide full tool access (bash, patch, all tools)
 AND set the working directory to the target directory (not a Phoenix-owned worktree)

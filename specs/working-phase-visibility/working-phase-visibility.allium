@@ -542,10 +542,9 @@ rule WatchdogResetOnAnyEvent {
         -- `crates/phoenix-ide/src/api/wire.rs`:
         --
         --   init, message, message_updated, state_change, token,
-        --   agent_done, conversation_became_terminal,
-        --   conversation_update, error, browser_session_state,
-        --   steer_message_queued, rate_limit_snapshot,
-        --   conversation_hard_deleted
+        --   agent_done, conversation_update, continuation_boundary,
+        --   error, browser_session_state, steer_message_queued,
+        --   rate_limit_snapshot, conversation_hard_deleted
         --
         -- Plus the new variants this spec introduces:
         --
