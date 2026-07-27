@@ -851,7 +851,7 @@ mod tests {
             ))
             .await
             .iter()
-            .any(|owned| owned.handle_id.as_str() == handle));
+            .any(|owned| owned.handle.handle_id.as_str() == handle));
         let _ = tool
             .run_shared_sandboxed(
                 SharedSandboxedBashRequest {

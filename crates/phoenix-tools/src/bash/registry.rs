@@ -67,6 +67,12 @@ pub struct LiveHandleProcessGroup {
     pub pgid: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegisteredHandle {
+    pub owner: ResourceScopeKey,
+    pub handle: Arc<Handle>,
+}
+
 #[derive(Debug)]
 pub struct SpawnReservation {
     owner: ResourceScopeKey,
@@ -295,7 +301,7 @@ pub type BashLifecycleSink = tokio::sync::mpsc::UnboundedSender<BashLifecycleEve
 #[derive(Debug, Default)]
 pub struct BashHandleRegistry {
     inner: RwLock<HashMap<ResourceScopeKey, Arc<RwLock<ResourceScopeKeyHandles>>>>,
-    handles_by_id: RwLock<HashMap<HandleId, Arc<Handle>>>,
+    handles_by_id: RwLock<HashMap<HandleId, RegisteredHandle>>,
     /// Per-handle ring byte cap. Defaults to [`RING_BUFFER_BYTES`]; tests
     /// override to small values to exercise eviction.
     ring_bytes_cap: usize,
@@ -484,10 +490,13 @@ impl BashHandleRegistry {
         let inserted = table.insert(handle.clone());
         table.pending_spawns = table.pending_spawns.saturating_sub(1);
         table.spawn_settled.notify_waiters();
-        self.handles_by_id
-            .write()
-            .await
-            .insert(inserted.handle_id.clone(), inserted.clone());
+        self.handles_by_id.write().await.insert(
+            inserted.handle_id.clone(),
+            RegisteredHandle {
+                owner: reservation.owner.clone(),
+                handle: inserted.clone(),
+            },
+        );
         reservation.committed = true;
         Ok(inserted)
     }
@@ -501,8 +510,21 @@ impl BashHandleRegistry {
         table.spawn_settled.notify_waiters();
     }
 
-    pub async fn lookup_handle(&self, handle_id: &HandleId) -> Option<Arc<Handle>> {
+    pub async fn get_by_id(&self, handle_id: &HandleId) -> Option<RegisteredHandle> {
         self.handles_by_id.read().await.get(handle_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub async fn register_existing_handle(&self, owner: &ResourceScopeKey, handle: Arc<Handle>) {
+        let entry = self.get_or_create(owner).await;
+        entry.write().await.insert(handle.clone());
+        self.handles_by_id.write().await.insert(
+            handle.handle_id.clone(),
+            RegisteredHandle {
+                owner: owner.clone(),
+                handle,
+            },
+        );
     }
 
     /// Snapshot live process-group ids across ALL work scopes, for the
@@ -529,13 +551,13 @@ impl BashHandleRegistry {
     pub async fn snapshot_live_process_groups(&self) -> Vec<LiveHandleProcessGroup> {
         let mut out = Vec::new();
         let map = self.inner.read().await;
-        for entry in map.values() {
+        for (owner, entry) in map.iter() {
             let scope_handles = entry.read().await;
             for handle in scope_handles.all() {
                 if let Some(pgid) = handle.live_pgid().await {
                     out.push(LiveHandleProcessGroup {
-                        work_scope: handle.lifecycle_scope.clone(),
-                        control_scope: handle.work_scope.clone(),
+                        work_scope: owner.clone(),
+                        control_scope: handle.controller_scope.clone(),
                         handle_id: handle.handle_id.clone(),
                         pgid,
                     });
@@ -545,12 +567,21 @@ impl BashHandleRegistry {
         out
     }
 
-    pub async fn owner_handles(&self, owner: &ResourceScopeKey) -> Vec<Arc<Handle>> {
+    pub async fn owner_handles(&self, owner: &ResourceScopeKey) -> Vec<RegisteredHandle> {
         let Some(entry) = self.get_existing(owner).await else {
             return Vec::new();
         };
-        let handles = entry.read().await.all().cloned().collect();
-        handles
+        let registered = entry
+            .read()
+            .await
+            .all()
+            .cloned()
+            .map(|handle| RegisteredHandle {
+                owner: owner.clone(),
+                handle,
+            })
+            .collect();
+        registered
     }
 
     /// Remove a `ResourceScopeKey`'s handle table outright. Used by the
@@ -881,7 +912,7 @@ mod tests {
         let reservation = registry.reserve_spawn(&owner).await.expect("reserve abort");
         let aborted_id = reservation.handle_id().clone();
         registry.abort_spawn(reservation).await;
-        assert!(registry.lookup_handle(&aborted_id).await.is_none());
+        assert!(registry.get_by_id(&aborted_id).await.is_none());
 
         let mut reservation = registry
             .reserve_spawn(&owner)
@@ -904,7 +935,7 @@ mod tests {
             .await
             .expect("commit spawn");
         assert_eq!(inserted.handle_id, committed_id);
-        assert!(registry.lookup_handle(&committed_id).await.is_some());
+        assert!(registry.get_by_id(&committed_id).await.is_some());
     }
 
     #[tokio::test]
@@ -1120,10 +1151,8 @@ mod tests {
     async fn work_scope_teardown_removes_coordinator_controlled_handle() {
         let registry = Arc::new(BashHandleRegistry::new());
         let lifecycle_scope = scope("inspected-work");
-        let coordinator_table = registry.get_or_create(&lifecycle_scope).await;
-        let handle = Handle::new_live_for_actor_with_lifecycle(
+        let handle = Handle::new_live_for_actor_with_owner(
             ResourceScopeKey::Coordinator,
-            lifecycle_scope.clone(),
             HandleId::new("b-coordinator"),
             "coordinator".to_string(),
             phoenix_core::work_scope::ResourceAuthority::Work,
@@ -1133,7 +1162,9 @@ mod tests {
             12345,
             RING_BUFFER_BYTES,
         );
-        coordinator_table.write().await.insert(handle.clone());
+        registry
+            .register_existing_handle(&lifecycle_scope, handle.clone())
+            .await;
         handle
             .transition_to_terminal(
                 FinalCause::Exited { exit_code: Some(0) },

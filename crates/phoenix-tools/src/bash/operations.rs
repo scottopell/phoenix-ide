@@ -611,8 +611,8 @@ async fn run_run(
             // detached waiter started below carries the sink so it can
             // emit the terminal edge off-thread.
             registry.emit_lifecycle(
-                &handle.lifecycle_scope,
-                &handle.work_scope,
+                &spawn_context.lifecycle_scope,
+                &handle.controller_scope,
                 crate::bash::registry::BashLifecyclePhase::Spawned,
             );
             let progress_reporter = ctx
@@ -623,6 +623,7 @@ async fn run_run(
                 .map(|reporter| LiveBashProgressLease(reporter.clone()));
             start_io_tasks(
                 &inserted,
+                spawn_context.lifecycle_scope.clone(),
                 child,
                 registry.lifecycle_sink(),
                 sandbox_scratch_dir,
@@ -725,9 +726,8 @@ fn spawn_child(
     // pgid == pid because we made the child a process group leader.
     let pgid = i32::try_from(pid).unwrap_or(0);
 
-    let handle = Handle::new_live_for_actor_with_lifecycle(
+    let handle = Handle::new_live_for_actor_with_owner(
         ctx.work_scope.clone(),
-        spawn_context.lifecycle_scope.clone(),
         handle_id,
         ctx.resource_access.conversation_id().to_string(),
         ctx.resource_access.authority(),
@@ -742,6 +742,7 @@ fn spawn_child(
 
 fn start_io_tasks(
     handle: &Arc<Handle>,
+    owner_scope: ResourceScopeKey,
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
     sandbox_scratch_dir: Option<std::path::PathBuf>,
@@ -786,15 +787,17 @@ fn start_io_tasks(
     // Waiter task: call wait(), drain readers, then demote the handle.
     let h = handle.clone();
     tokio::spawn(async move {
-        run_waiter(
-            h,
-            child,
-            stdout_join,
-            stderr_join,
-            lifecycle_sink,
-            sandbox_scratch_dir,
-            progress_reporter,
-        )
+            run_waiter(
+                h,
+                owner_scope,
+                child,
+                stdout_join,
+                stderr_join,
+                lifecycle_sink,
+                sandbox_scratch_dir,
+                progress_reporter,
+            )
+
         .await;
     });
 }
@@ -1042,6 +1045,7 @@ impl LiveBashProgressReporter {
 
 async fn run_waiter(
     handle: Arc<Handle>,
+    owner_scope: ResourceScopeKey,
     mut child: tokio::process::Child,
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
@@ -1094,13 +1098,13 @@ async fn run_waiter(
         // not double-emit. Best-effort: a closed sink is logged by the bridge.
         if let Some(sink) = &lifecycle_sink {
             if let Err(e) = sink.send(crate::bash::registry::BashLifecycleEvent {
-                lifecycle_scope: handle.lifecycle_scope.clone(),
-                control_scope: handle.work_scope.clone(),
+                lifecycle_scope: owner_scope.clone(),
+                control_scope: handle.controller_scope.clone(),
                 phase: crate::bash::registry::BashLifecyclePhase::Terminal,
             }) {
                 tracing::debug!(
-                    lifecycle_scope = %handle.lifecycle_scope,
-                    control_scope = %handle.work_scope,
+                    lifecycle_scope = %owner_scope,
+                    control_scope = %handle.controller_scope,
                     error = %e,
                     "dropping bash terminal lifecycle event — sink closed"
                 );
@@ -1331,8 +1335,8 @@ async fn run_kill(
             // reconciling lifecycle phase now; the later true terminal
             // transition still emits from the waiter after final I/O drains.
             ctx.bash_handle_registry().emit_lifecycle(
-                &handle.lifecycle_scope,
-                &handle.work_scope,
+                &ctx.work_scope,
+                &handle.controller_scope,
                 crate::bash::registry::BashLifecyclePhase::KillPendingKernel,
             );
             shape_handle_response(
@@ -1367,14 +1371,15 @@ fn send_signal_to_group(_pgid: i32, _signal: KillSignal) {
 // ---------------------------------------------------------------------------
 
 async fn lookup_handle(ctx: &ToolContext, handle_id: &str) -> Result<Arc<Handle>, BashError> {
-    let handle = ctx
+    let registered = ctx
         .bash_handle_registry()
-        .lookup_handle(&HandleId::new(handle_id.to_string()))
+        .get_by_id(&HandleId::new(handle_id.to_string()))
         .await
         .ok_or_else(|| BashError::HandleNotFound {
             handle_id: handle_id.to_string(),
         })?;
-    if handle.work_scope != ctx.work_scope
+    let handle = registered.handle;
+    if handle.controller_scope != ctx.work_scope
         || !ctx
             .resource_access
             .can_control(&handle.creator_conversation_id, handle.authority)

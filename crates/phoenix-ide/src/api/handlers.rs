@@ -3205,7 +3205,7 @@ async fn inspect_bash_handle(
 
     if assembly.live_pgid.is_some() {
         let generation = state.resource_monitor.observe(&state).await;
-        let scope_key = assembly.lifecycle_scope.stable_key();
+        let scope_key = assembly.owner.stable_key();
         let health = generation.handle_pids(&scope_key, &handle_id).map_or_else(
             || phoenix_core::domain::work_scope_inventory::ResourceHealth {
                 cpu_percent: None,

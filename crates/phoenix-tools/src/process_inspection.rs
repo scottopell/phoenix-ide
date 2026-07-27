@@ -23,7 +23,7 @@ use phoenix_core::domain::process_inspection::BashHandleInspection;
 use phoenix_core::domain::work_scope_inventory::BashHandleState;
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceScopeKey};
 
-use crate::bash::handle::{Handle, HandleId, HandleState};
+use crate::bash::handle::{HandleId, HandleState};
 use crate::bash::operations::{
     read_window_from_ring, read_window_from_tombstone, window_to_typed, ReadArgs, RingRead,
 };
@@ -40,7 +40,7 @@ use crate::bash::registry::BashHandleRegistry;
 pub struct InspectionAssembly {
     pub inspection: BashHandleInspection,
     pub live_pgid: Option<i32>,
-    pub lifecycle_scope: ResourceScopeKey,
+    pub owner: ResourceScopeKey,
 }
 
 /// Resolve `handle_id` through the global registry and project its
@@ -57,31 +57,35 @@ pub async fn assemble_inspection(
     conversation: Option<&Conversation>,
     bash_handles: &Arc<BashHandleRegistry>,
 ) -> Option<InspectionAssembly> {
-    let handle = bash_handles
-        .lookup_handle(&HandleId::new(handle_id.to_string()))
+    let registered = bash_handles
+        .get_by_id(&HandleId::new(handle_id.to_string()))
         .await?;
+    let handle = &registered.handle;
     let controller_visible = actor.is_some_and(|access| {
         access.can_control(&handle.creator_conversation_id, handle.authority)
     });
     let owner_visible = conversation.is_some_and(|conversation| {
-        handle
-            .lifecycle_scope
-            .work_scope_id()
-            .is_some_and(|work_scope_id| conversation.work_scope_id.as_ref() == Some(work_scope_id))
+        registered.owner.work_scope_id().is_some_and(|work_scope_id| {
+            conversation.work_scope_id.as_ref() == Some(work_scope_id)
+        })
     });
     if actor.is_some() || conversation.is_some() {
         if !controller_visible && !owner_visible {
             return None;
         }
     }
-    Some(project_inspection(&handle, since).await)
+    Some(project_inspection(&registered, since).await)
 }
 
 /// Project one resolved handle into an [`InspectionAssembly`] for the given
 /// `since` offset. The output window delegates to the same ring/tombstone
 /// read helpers the bash peek uses (`read_window_from_ring` /
 /// `read_window_from_tombstone` + `window_to_typed`).
-async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> InspectionAssembly {
+async fn project_inspection(
+    registered: &crate::bash::registry::RegisteredHandle,
+    since: Option<u64>,
+) -> InspectionAssembly {
+    let handle = &registered.handle;
     let started_at: DateTime<Utc> = handle.started_at.into();
     let read_args = ReadArgs::from_since(since);
     let state_arc = handle.state().await;
@@ -119,7 +123,7 @@ async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> Inspect
                     resources: None,
                 },
                 live_pgid: Some(live.pgid),
-                lifecycle_scope: handle.lifecycle_scope.clone(),
+                owner: registered.owner.clone(),
             }
         }
         HandleState::Tombstoned(tomb) => {
@@ -141,7 +145,7 @@ async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> Inspect
                     resources: None,
                 },
                 live_pgid: None,
-                lifecycle_scope: handle.lifecycle_scope.clone(),
+                owner: registered.owner.clone(),
             }
         }
     }
@@ -281,9 +285,8 @@ mod tests {
         let bash = Arc::new(BashHandleRegistry::new());
         let control_scope = ResourceScopeKey::Coordinator;
         let lifecycle_scope = scope();
-        let handle = Handle::new_live_for_actor_with_lifecycle(
+        let handle = Handle::new_live_for_actor_with_owner(
             control_scope.clone(),
-            lifecycle_scope.clone(),
             HandleId::new("b-1"),
             "coordinator".into(),
             ResourceAuthority::Restricted,
@@ -308,10 +311,8 @@ mod tests {
     #[tokio::test]
     async fn unrelated_owner_cannot_inspect_handle() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let lifecycle_scope = scope();
-        let handle = Handle::new_live_for_actor_with_lifecycle(
+        let handle = Handle::new_live_for_actor_with_owner(
             ResourceScopeKey::Coordinator,
-            lifecycle_scope.clone(),
             HandleId::new("b-1"),
             "coordinator".into(),
             ResourceAuthority::Restricted,

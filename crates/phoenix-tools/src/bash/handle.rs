@@ -178,8 +178,7 @@ pub enum ExitState {
 // would diverge from the spec.
 #[allow(clippy::struct_field_names)]
 pub struct Handle {
-    pub work_scope: ResourceScopeKey,
-    pub lifecycle_scope: ResourceScopeKey,
+    pub controller_scope: ResourceScopeKey,
     pub handle_id: HandleId,
     pub creator_conversation_id: String,
     pub authority: ResourceAuthority,
@@ -208,7 +207,7 @@ pub struct Handle {
 impl std::fmt::Debug for Handle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handle")
-            .field("work_scope", &self.work_scope)
+            .field("controller_scope", &self.controller_scope)
             .field("handle_id", &self.handle_id)
             .field("cmd", &self.cmd)
             .field("label", &self.label)
@@ -228,7 +227,7 @@ impl Handle {
     #[allow(clippy::similar_names)]
     #[must_use]
     pub fn new_live(
-        work_scope: ResourceScopeKey,
+        controller_scope: ResourceScopeKey,
         handle_id: HandleId,
         cmd: String,
         label: Option<String>,
@@ -237,7 +236,7 @@ impl Handle {
         ring_bytes_cap: usize,
     ) -> Arc<Self> {
         Self::new_live_for_actor(
-            work_scope,
+            controller_scope,
             handle_id,
             "system".to_string(),
             ResourceAuthority::Work,
@@ -252,7 +251,7 @@ impl Handle {
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
     #[must_use]
     pub fn new_live_for_actor(
-        work_scope: ResourceScopeKey,
+        controller_scope: ResourceScopeKey,
         handle_id: HandleId,
         creator_conversation_id: String,
         authority: ResourceAuthority,
@@ -262,9 +261,8 @@ impl Handle {
         pid: u32,
         ring_bytes_cap: usize,
     ) -> Arc<Self> {
-        Self::new_live_for_actor_with_lifecycle(
-            work_scope.clone(),
-            work_scope,
+        Self::new_live_for_actor_with_owner(
+            controller_scope,
             handle_id,
             creator_conversation_id,
             authority,
@@ -278,9 +276,8 @@ impl Handle {
 
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
     #[must_use]
-    pub fn new_live_for_actor_with_lifecycle(
-        work_scope: ResourceScopeKey,
-        lifecycle_scope: ResourceScopeKey,
+    pub fn new_live_for_actor_with_owner(
+        controller_scope: ResourceScopeKey,
         handle_id: HandleId,
         creator_conversation_id: String,
         authority: ResourceAuthority,
@@ -297,8 +294,7 @@ impl Handle {
         };
         let (tx, rx) = watch::channel::<Option<ExitState>>(None);
         Arc::new(Self {
-            work_scope,
-            lifecycle_scope,
+            controller_scope,
             handle_id,
             creator_conversation_id,
             authority,

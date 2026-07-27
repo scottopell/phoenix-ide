@@ -17,8 +17,8 @@ use phoenix_core::domain::work_scope_inventory::{
 };
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceScopeKey};
 
-use crate::bash::handle::{Handle, HandleState};
-use crate::bash::registry::BashHandleRegistry;
+use crate::bash::handle::HandleState;
+use crate::bash::registry::{BashHandleRegistry, RegisteredHandle};
 use crate::browser::session::{BrowserInventoryState, BrowserSessionManager};
 use crate::tmux::registry::{ServerStatus, TmuxRegistry};
 
@@ -59,17 +59,21 @@ async fn assemble_bash(
 ) -> Vec<BashHandleInventory> {
     let handles = bash_handles.owner_handles(work_scope).await;
     let mut out = Vec::new();
-    for handle in &handles {
+    for registered in &handles {
         if actor.is_none_or(|access| {
-            access.can_control(&handle.creator_conversation_id, handle.authority)
+            access.can_control(
+                &registered.handle.creator_conversation_id,
+                registered.handle.authority,
+            )
         }) {
-            out.push(project_handle(handle).await);
+            out.push(project_handle(registered).await);
         }
     }
     out
 }
 
-async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
+async fn project_handle(registered: &RegisteredHandle) -> BashHandleInventory {
+    let handle = &registered.handle;
     let started_at: DateTime<Utc> = handle.started_at.into();
     let state_arc = handle.state().await;
     match state_arc.as_ref() {
@@ -193,7 +197,6 @@ mod tests {
     #[tokio::test]
     async fn live_handle_projects_running_with_pid_and_ring() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -203,7 +206,7 @@ mod tests {
             1234,
             RING_BUFFER_BYTES,
         );
-        table.write().await.insert(handle);
+        bash.register_existing_handle(&scope(), handle).await;
 
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
@@ -229,13 +232,10 @@ mod tests {
         use phoenix_core::work_scope::ResourceAuthority;
 
         let bash = Arc::new(BashHandleRegistry::new());
-        let coordinator = bash.get_or_create(&scope()).await;
-        coordinator
-            .write()
-            .await
-            .insert(Handle::new_live_for_actor_with_lifecycle(
+        bash.register_existing_handle(
+            &scope(),
+            Handle::new_live_for_actor_with_owner(
                 ResourceScopeKey::Coordinator,
-                scope(),
                 HandleId::new("b-coordinator"),
                 "coordinator".to_string(),
                 ResourceAuthority::Work,
@@ -244,7 +244,9 @@ mod tests {
                 4321,
                 1234,
                 RING_BUFFER_BYTES,
-            ));
+            ),
+        )
+        .await;
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
         ));
@@ -261,19 +263,22 @@ mod tests {
         use phoenix_core::work_scope::ResourceAuthority;
 
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         for actor in ["sibling-a", "sibling-b"] {
-            table.write().await.insert(Handle::new_live_for_actor(
-                scope(),
-                HandleId::new(format!("b-{actor}")),
-                actor.to_string(),
-                ResourceAuthority::Restricted,
-                format!("secret-{actor}"),
-                None,
-                1,
-                1,
-                RING_BUFFER_BYTES,
-            ));
+            bash.register_existing_handle(
+                &scope(),
+                Handle::new_live_for_actor(
+                    scope(),
+                    HandleId::new(format!("b-{actor}")),
+                    actor.to_string(),
+                    ResourceAuthority::Restricted,
+                    format!("secret-{actor}"),
+                    None,
+                    1,
+                    1,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await;
         }
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
@@ -291,7 +296,6 @@ mod tests {
     #[tokio::test]
     async fn kill_pending_handle_projects_kill_pending_kernel() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -304,7 +308,7 @@ mod tests {
         handle
             .mark_kill_pending_kernel(KillSignal::Term, SystemTime::now())
             .await;
-        table.write().await.insert(handle);
+        bash.register_existing_handle(&scope(), handle).await;
 
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
@@ -317,7 +321,6 @@ mod tests {
     #[tokio::test]
     async fn tombstoned_handle_projects_terminal_fields() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -335,7 +338,7 @@ mod tests {
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
-        table.write().await.insert(handle);
+        bash.register_existing_handle(&scope(), handle).await;
 
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
@@ -357,7 +360,6 @@ mod tests {
     #[tokio::test]
     async fn tombstoned_killed_handle_projects_signal_outcome() {
         let bash = Arc::new(BashHandleRegistry::new());
-        let table = bash.get_or_create(&scope()).await;
         let handle = Handle::new_live(
             scope(),
             HandleId::new("b-1"),
@@ -378,7 +380,7 @@ mod tests {
                 crate::bash::handle::TOMBSTONE_TAIL_LINES,
             )
             .await;
-        table.write().await.insert(handle);
+        bash.register_existing_handle(&scope(), handle).await;
 
         let tmux = Arc::new(TmuxRegistry::with_socket_dir(
             "/tmp/phoenix-inv-test".into(),
