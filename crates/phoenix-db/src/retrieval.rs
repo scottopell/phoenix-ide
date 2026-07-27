@@ -101,6 +101,42 @@ impl RetrievalRequest {
             limit,
         }
     }
+
+    /// Natural-language query supplied by the caller.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Conversation scope searched by the backend.
+    #[must_use]
+    pub fn scope(&self) -> &RetrievalScope {
+        &self.scope
+    }
+
+    /// Visibility policy applied before ranking and limiting.
+    #[must_use]
+    pub fn visibility(&self) -> RetrievalVisibility {
+        self.visibility
+    }
+
+    /// Grouping policy applied before the final result limit.
+    #[must_use]
+    pub fn grouping(&self) -> RetrievalGrouping {
+        self.grouping
+    }
+
+    /// Lexical matching policy requested by the caller.
+    #[must_use]
+    pub fn match_mode(&self) -> RetrievalMatchMode {
+        self.match_mode
+    }
+
+    /// Maximum number of results returned after policy application.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 /// Identity of a chunk *within* its message (REQ-RET-006). One chunk per
@@ -146,9 +182,9 @@ pub enum RetrievalError {
 /// lets a vector/hybrid backend replace the lexical one (REQ-RET-005).
 #[async_trait]
 pub trait MessageRetriever: Send + Sync {
-    /// Return up to `top_k` message chunks within `scope`, ranked by relevance
-    /// to `query`. A natural-language `query` is accepted directly; the
-    /// implementation builds the backend query (REQ-RET-001).
+    /// Return message chunks under the request's scope, policy, and limit,
+    /// ranked by relevance to its natural-language query. The implementation
+    /// builds the backend query (REQ-RET-001).
     ///
     /// # Errors
     /// Returns [`RetrievalError`] if the backing query fails.
@@ -743,7 +779,9 @@ pub async fn fts_delete_conversation_conn(
 
 #[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
 fn parse_chunk_row(row: sqlx::sqlite::SqliteRow) -> Result<RetrievedChunk, sqlx::Error> {
+    const MAX_SNIPPET_CHARS: usize = 240;
     let ordinal: i64 = row.try_get("chunk_ordinal")?;
+    let snippet: String = row.try_get("snippet")?;
     Ok(RetrievedChunk {
         conversation_id: row.try_get("conversation_id")?,
         message_id: row.try_get("message_id")?,
@@ -753,9 +791,19 @@ fn parse_chunk_row(row: sqlx::sqlite::SqliteRow) -> Result<RetrievedChunk, sqlx:
         },
         message_type: crate::parse_message_type(&row.try_get::<String, _>("message_type")?),
         created_at: crate::parse_datetime(&row.try_get::<String, _>("created_at")?),
-        snippet: row.try_get("snippet")?,
+        snippet: truncate_chars(&snippet, MAX_SNIPPET_CHARS),
         score: row.try_get("score")?,
     })
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let retained = max_chars.saturating_sub(1);
+    let mut bounded: String = value.chars().take(retained).collect();
+    bounded.push('…');
+    bounded
 }
 
 /// Stop words dropped from a natural-language question so filler does not
@@ -800,15 +848,15 @@ fn build_fts_query(natural: &str, match_mode: RetrievalMatchMode) -> Option<Stri
 }
 
 fn build_prefix_alternatives(term: &str) -> String {
-    const MIN_TRUNCATED_PREFIX_CHARS: usize = 4;
-    let mut chars = term.chars();
-    let last = chars.next_back();
-    let truncated = chars.as_str();
-    if last.is_some() && truncated.chars().count() >= MIN_TRUNCATED_PREFIX_CHARS {
-        format!("(\"{term}\"* OR \"{truncated}\"*)")
-    } else {
-        format!("\"{term}\"*")
-    }
+    const MIN_PREFIX_CHARS: usize = 3;
+    const MAX_PREFIX_CHARS: usize = 64;
+    let chars: Vec<char> = term.chars().take(MAX_PREFIX_CHARS).collect();
+    let shortest = MIN_PREFIX_CHARS.min(chars.len());
+    let alternatives = (shortest..=chars.len())
+        .rev()
+        .map(|length| format!("\"{}\"*", chars[..length].iter().collect::<String>()))
+        .collect::<Vec<_>>();
+    format!("({})", alternatives.join(" OR "))
 }
 
 /// Stable, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used to
@@ -864,8 +912,28 @@ mod tests {
 
     #[test]
     fn build_query_prefixes_only_for_palette_mode() {
-        let q = build_fts_query("observed groundi", RetrievalMatchMode::FinalTokenPrefix).unwrap();
-        assert_eq!(q, "\"observed\" OR (\"groundi\"* OR \"ground\"*)");
+        let q = build_fts_query("observed runni", RetrievalMatchMode::FinalTokenPrefix).unwrap();
+        assert_eq!(q, "\"observed\" OR (\"runni\"* OR \"runn\"* OR \"run\"*)");
+    }
+
+    #[test]
+    fn retrieval_request_exposes_backend_policy_read_only() {
+        let request = RetrievalRequest::palette_conversation_search("needle", 7);
+        assert_eq!(request.query(), "needle");
+        assert!(matches!(request.scope(), RetrievalScope::Global));
+        assert_eq!(request.visibility(), RetrievalVisibility::UserTopLevel);
+        assert_eq!(request.grouping(), RetrievalGrouping::BestPerConversation);
+        assert_eq!(request.match_mode(), RetrievalMatchMode::FinalTokenPrefix);
+        assert_eq!(request.limit(), 7);
+    }
+
+    #[test]
+    fn snippets_are_bounded_by_unicode_characters() {
+        let input = "🦀".repeat(300);
+        let bounded = truncate_chars(&input, 240);
+        assert_eq!(bounded.chars().count(), 240);
+        assert!(bounded.ends_with('…'));
+        assert!(bounded.is_char_boundary(bounded.len()));
     }
 
     #[test]
@@ -1316,7 +1384,7 @@ mod tests {
         db.add_message(
             "m1",
             "c1",
-            &MessageContent::user("Review the grounding conversation"),
+            &MessageContent::user("Review the running optimization conversation"),
             None,
             None,
         )
@@ -1325,13 +1393,40 @@ mod tests {
         let retriever = Fts5Retriever::new(db.pool().clone());
         retriever.reconcile().await.unwrap();
 
+        for query in ["runni", "optimizatio"] {
+            let hits = retriever
+                .retrieve(RetrievalRequest::palette_conversation_search(query, 10))
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "partial Porter input {query} should match");
+            assert_eq!(hits[0].conversation_id, "c1");
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieval_bounds_snippets_with_unbroken_tokens() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("c1", "bounded-snippet", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let long_token = format!("searchprefix{}", "x".repeat(500));
+        db.add_message("m1", "c1", &MessageContent::user(&long_token), None, None)
+            .await
+            .unwrap();
+        let retriever = Fts5Retriever::new(db.pool().clone());
+        retriever.reconcile().await.unwrap();
+
         let hits = retriever
-            .retrieve(RetrievalRequest::palette_conversation_search("groundi", 10))
+            .retrieve(RetrievalRequest::palette_conversation_search(
+                "searchprefix",
+                10,
+            ))
             .await
             .unwrap();
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].conversation_id, "c1");
+        assert_eq!(hits[0].snippet.chars().count(), 240);
+        assert!(hits[0].snippet.ends_with('…'));
     }
 
     #[tokio::test]
