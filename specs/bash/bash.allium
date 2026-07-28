@@ -468,7 +468,7 @@ rule HandleSpawned {
         --      check at the tool boundary.)
         --   3. Check live cap. On reject, return handle_cap_reached;
         --      RunRejectedByCap governs.
-        --   4. Allocate handle_id (next sequential within work scope).
+        --   4. Allocate a globally unique opaque handle_id.
         --   5. Spawn child via Command::new("bash").args(["-c", cmd]) with
         --      pre_exec(setpgid(0,0)) so the child becomes its own process
         --      group leader. stdout and stderr piped, stdin null. Working

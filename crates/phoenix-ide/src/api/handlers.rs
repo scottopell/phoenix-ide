@@ -4506,12 +4506,12 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
 
     run_resource_cleanup_cascade(state, &conv).await?;
 
-    state
-        .runtime
-        .db()
-        .archive_conversation(id)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to set archived flag: {e}")))?;
+    if let Err(error) = state.runtime.db().archive_conversation(id).await {
+        reopen_bash_after_failed_lifecycle_mutation(state, &conv).await;
+        return Err(AppError::Internal(format!(
+            "Failed to set archived flag: {error}"
+        )));
+    }
 
     Ok(())
 }
@@ -4615,6 +4615,23 @@ async fn cleanup_browser_with_retry(
             );
         }
     }
+}
+
+pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
+    state: &AppState,
+    conversation: &crate::db::Conversation,
+) {
+    let Ok(persisted) = state.runtime.db().get_conversation(&conversation.id).await else {
+        return;
+    };
+    if !crate::runtime::conversation_owns_work_scope(&persisted) {
+        return;
+    }
+    state
+        .runtime
+        .bash_handles()
+        .reopen_spawn_admission(&conversation_resource_scope(&persisted))
+        .await;
 }
 
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
@@ -4886,12 +4903,12 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // — partial cleanup above is non-fatal but a missing row deletion
     // means the user's "delete this conversation" never actually
     // happened.
-    state
-        .runtime
-        .db()
-        .delete_conversation(id)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to delete conversation row: {e}")))?;
+    if let Err(error) = state.runtime.db().delete_conversation(id).await {
+        reopen_bash_after_failed_lifecycle_mutation(state, &conv).await;
+        return Err(AppError::Internal(format!(
+            "Failed to delete conversation row: {error}"
+        )));
+    }
 
     // Scope retirement belongs to explicit scope cleanup, not to a terminal
     // transcript transition. The row deletion above removes this conversation's

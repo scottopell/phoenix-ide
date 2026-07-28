@@ -544,6 +544,15 @@ impl BashHandleRegistry {
         reservation.settle();
     }
 
+    /// Reopen admission when the authoritative lifecycle mutation following a
+    /// completed cleanup fails and the `WorkScope` therefore remains active.
+    pub async fn reopen_spawn_admission(&self, owner: &ResourceScopeKey) {
+        let Some(entry) = self.get_existing(owner).await else {
+            return;
+        };
+        entry.write().await.teardown_started = false;
+    }
+
     pub async fn get_by_id(&self, handle_id: &HandleId) -> Option<RegisteredHandle> {
         self.handles_by_id.read().await.get(handle_id).cloned()
     }
@@ -638,10 +647,12 @@ impl BashHandleRegistry {
             let notified = {
                 let mut table = entry.write().await;
                 table.teardown_started = true;
+                let mut notified = Box::pin(table.admission.settled.clone().notified_owned());
+                notified.as_mut().enable();
                 if table.admission.pending.load(Ordering::Acquire) == 0 {
                     return Some(entry.clone());
                 }
-                table.admission.settled.clone().notified_owned()
+                notified
             };
             notified.await;
         }
@@ -1023,6 +1034,21 @@ mod tests {
             .await
             .expect("begin teardown");
         assert!(registry.reserve_spawn(&owner).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_lifecycle_mutation_can_reopen_spawn_admission() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-a");
+        registry.begin_teardown(&owner).await.expect("teardown");
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+
+        registry.reopen_spawn_admission(&owner).await;
+
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
     }
 
     #[tokio::test]
