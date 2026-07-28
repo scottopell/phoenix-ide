@@ -229,8 +229,9 @@ down)
 THE SYSTEM SHALL emit exactly one `WorkScopeUpdate` SSE event per affected open
 product-conversation aggregate carrying:
 - the aggregate root `product_conversation` identifier
-- a root-stream `sequence_id`
+- a root-stream `root_sequence_id`
 - the full refreshed `WorkScopeInventory` for that attached scope
+- an inventory payload identity suitable for the aggregate-bound carrier envelope
 
 THE `WorkScopeUpdate` event SHALL be routed on the aggregate root stream rather
 than on any individual transcript-row stream
@@ -292,7 +293,7 @@ for that ProductConversation
 AND SHALL render one work-scope panel that shares the per-resource row
 vocabulary of the conversation page's section (REQ-WSUI-010)
 AND SHALL consume the aggregate-scoped `WorkScopeUpdate` stream using the root
-`product_conversation` identity and root `sequence_id`
+`product_conversation` identity and root `root_sequence_id`
 AND SHALL NOT aggregate per-member inventories
 AND SHALL NOT model any transcript row as the owner of the `WorkScope`.
 

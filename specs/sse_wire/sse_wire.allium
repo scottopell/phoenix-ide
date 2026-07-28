@@ -289,9 +289,9 @@ enum StreamStatus { open | closed }
 enum AggregateBoundLiveCarrierKind {
     message | state_change | token | message_updated | agent_done |
     conversation_update | product_conversation_lifecycle |
-    continuation_boundary | error | browser_session_state |
-    steer_message_queued | rate_limit_snapshot | llm_first_byte |
-    llm_attempt
+    continuation_boundary | work_scope_update | error |
+    browser_session_state | steer_message_queued |
+    rate_limit_snapshot | llm_first_byte | llm_attempt
 }
 
 
@@ -635,12 +635,12 @@ rule PersistedMessageClearsReplayRing {
 
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
--- product_conversation_lifecycle, continuation_boundary, error,
--- browser_session_state,
--- steer_message_queued, rate_limit_snapshot, llm_first_byte,
--- llm_attempt. Excludes Init (per-stream, never broadcast) and
--- ConversationHardDeleted (terminal action; no subsequent init can
--- fire for this conversation, so replay is moot).
+-- product_conversation_lifecycle, continuation_boundary, work_scope_update,
+-- error, browser_session_state, steer_message_queued,
+-- rate_limit_snapshot, llm_first_byte, llm_attempt. Excludes Init
+-- (per-stream, never broadcast) and ConversationHardDeleted
+-- (terminal action; no subsequent init can fire for this
+-- conversation, so replay is moot).
 --
 -- `llm_first_byte` (introduced by specs/working-phase-visibility/)
 -- MUST replay alongside the `token` events it precedes — if a client
@@ -858,15 +858,34 @@ rule ContinuationBoundaryClaimsRootSequence {
         -- inferred client-side joins.
 }
 
+rule WorkScopeUpdateClaimsRootSequence {
+    when: AggregateBoundRootNativeEventProduced(root_conversation_id, "work_scope_update", payload_identity, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: root_conversation_id,
+        projected_kind: "work_scope_update",
+        payload_identity: payload_identity,
+        root_sequence_id: seq
+    )
+
+    @guidance
+        -- work_scope_update is aggregate-bound because one attached WorkScope inventory
+        -- update routes to the ProductConversation root stream. The root envelope carries
+        -- the root conversation id plus inventory payload identity only; no transcript
+        -- member row owns the attached WorkScope relation.
+}
+
 rule AggregateBoundLiveCarrierEnvelopeAllocated {
     when: AggregateBoundLiveEnvelopeMaterialized(root_conversation_id, root_sequence_id, carrier_kind, member_conversation_id, payload_identity)
 
     requires: carrier_kind in {
         message, state_change, token, message_updated, agent_done,
         conversation_update, product_conversation_lifecycle,
-        continuation_boundary, error, browser_session_state,
-        steer_message_queued, rate_limit_snapshot, llm_first_byte,
-        llm_attempt
+        continuation_boundary, work_scope_update, error,
+        browser_session_state, steer_message_queued,
+        rate_limit_snapshot, llm_first_byte, llm_attempt
     }
 
     ensures: AggregateBoundLiveEvent(
@@ -890,14 +909,11 @@ rule AggregateBoundLiveCarrierEnvelopeAllocated {
         -- `agent_done`, `conversation_update`, `error`, `browser_session_state`,
         -- `steer_message_queued`, `rate_limit_snapshot`, `llm_first_byte`,
         -- `llm_attempt`) carry the emitting member conversation id; aggregate-native
-        -- carriers (`product_conversation_lifecycle`, `continuation_boundary`) carry
-        -- null there.
+        -- carriers (`product_conversation_lifecycle`, `continuation_boundary`,
+        -- `work_scope_update`) carry null there.
         --
         -- Explicit exclusions: `init` is per-subscriber and not a live carrier;
-        -- `conversation_hard_deleted` is terminal and cannot participate in replay;
-        -- `work_scope_update` is not an authoritative ProductConversation aggregate-bound
-        -- carrier in this root stream contract and therefore does not allocate from this
-        -- envelope set.
+        -- `conversation_hard_deleted` is terminal and cannot participate in replay.
 }
 
 rule AggregateBoundMemberLiveCarrierClaimsRootSequence {
