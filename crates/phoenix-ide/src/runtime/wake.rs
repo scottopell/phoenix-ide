@@ -986,10 +986,12 @@ impl RuntimeRegistryInspector {
 }
 
 fn system_time_to_timestamp(time: std::time::SystemTime) -> Timestamp {
-    let seconds = time
+    let duration = time
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+        .unwrap_or_default();
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0));
     Timestamp(seconds)
 }
 
@@ -1506,6 +1508,20 @@ mod tests {
 
         assert!(rendered.len() <= 100 * 1024);
         assert!(rendered.contains("…[truncated "));
+    }
+
+    #[test]
+    fn system_time_evidence_rounds_fractional_seconds_up_at_deadline() {
+        assert_eq!(
+            system_time_to_timestamp(std::time::UNIX_EPOCH + Duration::from_secs(10)),
+            Timestamp(10)
+        );
+        assert_eq!(
+            system_time_to_timestamp(
+                std::time::UNIX_EPOCH + Duration::from_secs(10) + Duration::from_nanos(1),
+            ),
+            Timestamp(11)
+        );
     }
 
     #[tokio::test]
@@ -2675,7 +2691,7 @@ mod tests {
             serde_json::from_str(&render_terminal_result(&pending[0])).unwrap();
         assert_eq!(cancelled["status"], "cancelled");
         assert_eq!(cancelled["handle"], "b-cancelled");
-        assert_eq!(cancelled["reason"], "ExplicitCancel");
+        assert_eq!(cancelled["reason"], "explicit_cancel");
         assert!(cancelled.get("Cancelled").is_none());
 
         let manager = Arc::new(crate::runtime::RuntimeManager::new(
