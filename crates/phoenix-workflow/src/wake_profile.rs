@@ -210,16 +210,24 @@ pub enum WakeTerminalEvidence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WakeCancellationReason {
+    #[serde(alias = "ExplicitCancel")]
     ExplicitCancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WakeForgottenReason {
+    #[serde(alias = "PhoenixRestart")]
     PhoenixRestart,
+    #[serde(alias = "CascadeDestroyedHandle")]
     CascadeDestroyedHandle,
+    #[serde(alias = "BashWaiterPanicked")]
     BashWaiterPanicked,
+    #[serde(alias = "SubagentHandleMissing")]
     SubagentHandleMissing,
+    #[serde(alias = "TmuxHandleMissing")]
     TmuxHandleMissing,
 }
 

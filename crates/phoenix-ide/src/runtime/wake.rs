@@ -796,13 +796,13 @@ fn timestamp_rfc3339(timestamp: Timestamp) -> String {
 }
 
 #[derive(serde::Serialize)]
-struct BashWakeResolutionObservation<'a> {
+struct BashWakeResolutionObservation<'a, R: serde::Serialize> {
     contract_id: &'a str,
     handle: &'a str,
     status: &'static str,
     resolved_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
+    reason: Option<R>,
 }
 
 fn terminal_kind(
@@ -890,7 +890,7 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
             handle: &identity.handle_id,
             status: "cancelled",
             resolved_at: timestamp_rfc3339(*resolved_at),
-            reason: Some(format!("{reason:?}")),
+            reason: Some(*reason),
         }),
         phoenix_workflow::wake_profile::WakeTerminalPayload::Expired {
             contract_id,
@@ -901,7 +901,7 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
             handle: &identity.handle_id,
             status: "expired",
             resolved_at: timestamp_rfc3339(*resolved_at),
-            reason: None,
+            reason: Option::<WakeForgottenReason>::None,
         }),
         phoenix_workflow::wake_profile::WakeTerminalPayload::Forgotten {
             contract_id,
@@ -913,7 +913,7 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
             handle: &identity.handle_id,
             status: "forgotten",
             resolved_at: timestamp_rfc3339(*resolved_at),
-            reason: Some(format!("{reason:?}")),
+            reason: Some(*reason),
         }),
         terminal => serde_json::to_string(terminal),
     };
@@ -1230,8 +1230,8 @@ mod tests {
     }
 
     struct BlockingInspector {
-        started: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
     }
 
     impl TerminalInspector for BlockingInspector {
@@ -1242,8 +1242,13 @@ mod tests {
             _observation_time: Timestamp,
         ) -> Pin<Box<dyn Future<Output = Result<InspectionOutcome, String>> + Send + 'a>> {
             Box::pin(async move {
-                self.started.notify_one();
-                self.release.notified().await;
+                let _ = self.started.send(());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    self.release.lock().await.recv().await
+                })
+                .await
+                .map_err(|_| "blocking inspector release timed out".to_string())?
+                .ok_or_else(|| "blocking inspector release channel closed".to_string())?;
                 Ok(InspectionOutcome::LiveRetry)
             })
         }
@@ -1794,13 +1799,13 @@ mod tests {
     async fn slow_terminal_inspection_does_not_hold_process_wide_acceptance_lock() {
         let (db, repo, scope) = open_repo().await;
         register_bash(&repo, &scope, "b-1", 50).await;
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
         let worker = WakeWorker::new(
             repo,
             Arc::new(BlockingInspector {
-                started: Arc::clone(&started),
-                release: Arc::clone(&release),
+                started: started_tx,
+                release: tokio::sync::Mutex::new(release_rx),
             }),
             Arc::new(TestClock::new(10)),
             ProcessIncarnation(1),
@@ -1818,13 +1823,20 @@ mod tests {
             let manager = Arc::clone(&manager);
             async move { worker.run_once_with_manager(Some(&manager)).await }
         });
-        started.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("inspector start signal timed out")
+            .expect("inspector start channel closed");
 
         let unrelated_guard = manager.lock_steering_acceptance().await;
         drop(unrelated_guard);
-        release.notify_one();
+        release_tx.send(()).unwrap();
 
-        task.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("worker completion timed out")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1855,7 +1867,7 @@ mod tests {
             serde_json::from_str(&render_terminal_result(&pending[0])).unwrap();
         assert_eq!(rendered["status"], "forgotten");
         assert_eq!(rendered["handle"], "missing");
-        assert_eq!(rendered["reason"], "PhoenixRestart");
+        assert_eq!(rendered["reason"], "phoenix_restart");
         assert!(rendered.get("Forgotten").is_none());
 
         worker.run_once().await.unwrap();
@@ -1900,7 +1912,7 @@ mod tests {
             crate::db::MessageContent::User(user)
                 if user.is_meta
                     && user.text.contains("forgotten")
-                    && user.text.contains("PhoenixRestart")
+                    && user.text.contains("phoenix_restart")
         ));
         assert!(!handle_is_idle(&handle));
 

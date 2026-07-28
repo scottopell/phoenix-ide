@@ -32,6 +32,26 @@ fn registration_plan_declares_reclaimable_observation_effect() {
 }
 
 #[test]
+fn terminal_reasons_serialize_with_normative_wire_spelling() {
+    assert_eq!(
+        serde_json::to_string(&WakeForgottenReason::PhoenixRestart).unwrap(),
+        r#""phoenix_restart""#
+    );
+    assert_eq!(
+        serde_json::to_string(&WakeForgottenReason::BashWaiterPanicked).unwrap(),
+        r#""bash_waiter_panicked""#
+    );
+    assert_eq!(
+        serde_json::from_str::<WakeForgottenReason>(r#""PhoenixRestart""#).unwrap(),
+        WakeForgottenReason::PhoenixRestart
+    );
+    assert_eq!(
+        serde_json::to_string(&WakeCancellationReason::ExplicitCancel).unwrap(),
+        r#""explicit_cancel""#
+    );
+}
+
+#[test]
 fn acceptance_profile_exposes_wake_codec_support() {
     let acceptance = acceptance_profile();
     assert!(acceptance.supported_codecs.supports(&snapshot_codec()));
