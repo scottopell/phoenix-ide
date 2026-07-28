@@ -191,7 +191,7 @@ enum WorkDisposition {
     | merge_ready       -- idle, PR open, checks passing, affordance disabled
     | pr_open_other     -- idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not green)
     | ready_to_close_after_merge -- idle, PR merged
-    | pr_closed         -- idle, PR closed unmerged
+    | ready_to_close_closed_pr -- idle, PR closed unmerged
     | no_pr_clean       -- idle, no PR found, work-change summary clean
     | no_pr_create_pr   -- idle, no PR found, dirty committed work pushed to GitHub remote branch
     | no_pr_review      -- idle, no PR found, dirty/unknown work state needs diff review
@@ -338,7 +338,7 @@ entity WorkActionsBar {
 --
 --   inline_note_for(d: WorkDisposition, status: pra/PrStatusView?) -> InlineNote?
 --       Returns the InlineNote for the disposition, or null when no note is
---       needed (continued -> continued_note, pr_closed -> pr_closed_note,
+--       needed (continued -> continued_note, ready_to_close_closed_pr -> pr_closed_note,
 --       gh_unavailable -> gh_unavailable_note, stuck-with-open-PR ->
 --       pr_open_stuck_note, otherwise null).
 
@@ -549,10 +549,10 @@ rule DispositionPrClosed {
     requires: bar.inputs.pr_status.pr != null
     requires: bar.inputs.pr_status.pr.display_state = closed
 
-    ensures: bar.presentation.disposition = pr_closed
+    ensures: bar.presentation.disposition = ready_to_close_closed_pr
     ensures: bar.presentation.resolve_zone.visible = false
     ensures: bar.presentation.finish_zone.show_close = true
-    ensures: bar.presentation.primary = finish_primary_for_disposition(pr_closed, bar.inputs.pr_status)
+    ensures: bar.presentation.primary = finish_primary_for_disposition(ready_to_close_closed_pr, bar.inputs.pr_status)
     ensures: bar.presentation.inline_note = pr_closed_note
 }
 

@@ -343,12 +343,13 @@ config {
 -- Helper names used below are documented here with their signatures and
 -- semantics so rule references stay unambiguous.
 --
---   resolve_work_scope(conversation: bedrock/Conversation) -> WorkScope
---       Returns the durable WorkScope key for a conversation. Any conversation
---       with an attached Git-backed worktree resolves to a worktree scope;
---       conversations without such a worktree resolve to a conversation scope.
---       Continuations that inherit a worktree resolve to the same scope as the
---       predecessor.
+--   attached_git_work_scope(conversation: bedrock/Conversation) -> WorkScope?
+--       Returns the durable attached Git-backed WorkScope key for a conversation
+--       when one actually exists. Conversations without an attached Git-backed
+--       WorkScope return null, including provisioning-failure and repair states.
+--       PR-specific surfaces are unavailable in that case; they do not fall back
+--       to a conversation scope. Continuations that inherit a worktree resolve to
+--       the same attached scope as the predecessor.
 --
 --   identity_from_fact(fact: observed PR fact) -> PrIdentity
 --       Converts one provider observation into the canonical PR identity stored
@@ -428,6 +429,20 @@ rule ReadOnlyLookupDoesNotCreateScopeRecord {
     ensures: not WorkScopeRecord.created
 }
 
+rule PrSurfacesUnavailableWithoutAttachedGitWorkScope {
+    when: ConversationRendered(conversation)
+
+    requires: conversation.environment_kind = git_backed
+    requires: not exists attached_git_work_scope(conversation)
+
+    ensures: UserInformedAutoFixUnavailable("Git-backed worktree unavailable")
+
+    @guidance
+        -- PR status and auto-fix require both Git-backed intent and an actually
+        -- attached Git-backed WorkScope capability. Provisioning-failure and
+        -- repair states do not fall back to a conversation-scoped lookup.
+}
+
 rule NewObservationCreatesAssociation {
     when: PrFactsObserved(scope, fact)
 
@@ -489,9 +504,10 @@ rule ActivePrDerivedAfterObservation {
 rule PrStatusFreshResponseUsesExplicitActivePr {
     when: PrStatusRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
+    requires: exists scope
     requires: refresh.state = fresh
 
     ensures: PrFactsObserved(scope, refresh.facts)
@@ -506,9 +522,10 @@ rule PrStatusFreshResponseUsesExplicitActivePr {
 rule PrStatusStalePersistedActivePrOnNotFound {
     when: PrStatusRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
+    requires: exists scope
     requires: refresh.state = not_found
     requires: exists active_pr(scope)
 
@@ -523,9 +540,10 @@ rule PrStatusStalePersistedActivePrOnNotFound {
 rule PrStatusUnavailableWithPersistedActivePr {
     when: PrStatusRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
+    requires: exists scope
     requires: refresh.state = unavailable
     requires: exists active_pr(scope)
 
@@ -540,9 +558,10 @@ rule PrStatusUnavailableWithPersistedActivePr {
 rule PrStatusUnavailableWithoutActivePr {
     when: PrStatusRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
+    requires: exists scope
     requires: refresh.state = unavailable
     requires: not exists active_pr(scope)
 
@@ -557,10 +576,11 @@ rule PrStatusUnavailableWithoutActivePr {
 rule AssociatedAutoFixTargetsExplicitActivePrByNumber {
     when: PrAutoFixContextRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let target = active_pr(scope)
     let refresh = provider_refresh_by_number(target)
 
+    requires: exists scope
     requires: exists target
     requires: target.display_state = open
     requires: refresh.state != unavailable
@@ -581,10 +601,11 @@ rule AssociatedAutoFixTargetsExplicitActivePrByNumber {
 rule AutoFixUnavailableWhenProviderUnavailable {
     when: PrAutoFixContextRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let target = active_pr(scope)
     let refresh = provider_refresh_by_number(target)
 
+    requires: exists scope
     requires: exists target
     requires: refresh.state = unavailable
 
@@ -595,10 +616,11 @@ rule AutoFixUnavailableWhenProviderUnavailable {
 rule BranchAutoFixFallbackWithoutExplicitActivePr {
     when: PrAutoFixContextRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
     let target = branch_primary(refresh.facts)
 
+    requires: exists scope
     requires: not exists active_pr(scope)
     requires: refresh.state = fresh
     requires: target.display_state = open
@@ -671,9 +693,10 @@ rule WorkActionsDisablesAutoFixForNonOpenActivePr {
 rule CloseTriggeredBestEffortRefreshIsBoundedAndNonFatal {
     when: CloseRetirementBoundaryReached(conversation, attempt_id)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
 
     requires: conversation.environment_kind = git_backed
+    requires: exists scope
 
     ensures: BestEffortPrRefreshAttempted(scope, config.close_refresh_deadline_ms)
     ensures: CleanupContinues(conversation)
@@ -734,6 +757,7 @@ surface PrStatusApi {
     provides:
         PrStatusRequested(conversation)
             when conversation.environment_kind = git_backed
+                 and exists attached_git_work_scope(conversation)
 
     contracts:
         fulfils WorkScopePrStatusContract
@@ -750,6 +774,7 @@ surface PrAutoFixApi {
     provides:
         PrAutoFixContextRequested(conversation)
             when conversation.environment_kind = git_backed
+                 and exists attached_git_work_scope(conversation)
 
     contracts:
         fulfils WorkScopePrAutoFixContract
@@ -778,6 +803,7 @@ surface CloseRetirementBoundary {
     provides:
         CloseRetirementBoundaryReached(conversation, attempt_id)
             when conversation.environment_kind = git_backed
+                 and exists attached_git_work_scope(conversation)
                  and bedrock/RetirementInspectionRequested(conversation.product_conversation, attempt_id)
 
     @guarantee PrRefreshNeverBlocksCleanup

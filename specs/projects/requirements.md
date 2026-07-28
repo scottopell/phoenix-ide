@@ -580,6 +580,22 @@ THE SYSTEM SHALL still clean up the disposable worktree through the ordinary Clo
 **Rationale:** Planning and implementation should observe the same isolated filesystem view. Provisioning the detached worktree at conversation creation preserves that continuity without introducing Managed-mode or task-branch semantics.
 
 ---
+### REQ-PROJ-028a: Restart Reconciles a Missing Registered Worktree as Open Repair Evidence
+
+WHEN Phoenix restarts and the latest Open row of a Git-backed `ProductConversation` still has a registered attached `WorkScope`/worktree tuple but that registered worktree path is missing on disk
+THE SYSTEM SHALL keep the owning `ProductConversation` in lifecycle `Open`
+AND SHALL record a typed repair or provisioning-failure condition bound to that owning `ProductConversation` and its already-attached `WorkScope`
+AND SHALL NOT assign a removed row-terminal state to the latest row as restart classification
+
+THE SYSTEM SHALL treat that typed condition as truthful persisted ownership evidence only
+AND SHALL NOT fabricate a replacement `WorkScope`, worktree attachment, detached branch label, branch owner, or fallback branch selection for the conversation
+
+THE SYSTEM SHALL integrate that typed condition with Close repair and retry semantics
+AND SHALL allow later Close inspection, Close retry, or manual repair flows to adopt the exact missing-worktree evidence idempotently rather than inventing new ownership
+
+**Rationale:** A missing registered worktree after restart is a repair-class ownership problem, not a hidden terminal lifecycle. Keeping the product aggregate Open preserves the one Close/reconciliation contract while typed evidence lets later retries reason from persisted ownership without guessing.
+
+---
 
 ### REQ-PROJ-029: No Branch Picker in Ordinary Conversation Creation
 

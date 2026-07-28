@@ -141,8 +141,9 @@ actionable PRs remain plausible, silence is safer than a wrong silent retarget.
 
 ### REQ-PRA-000b: PR-Specific Surfaces Share One Explicit Target
 
-WHEN Phoenix renders or executes a PR-specific surface for a Git-backed conversation with an attached `WorkScope`
-THE SYSTEM SHALL target the same explicit active PR across:
+WHEN Phoenix renders or executes a PR-specific surface for a conversation
+THE SYSTEM SHALL require both Git-backed environment intent and an actually attached Git-backed `WorkScope` capability before exposing PR-specific status, freshness, coverage, auto-fix, or link-out behavior
+AND SHALL target the same explicit active PR across those PR-specific surfaces only when that attached `WorkScope` capability exists:
 - the StateBar PR identity and status
 - PR-specific status and check-state reads
 - PR feedback freshness and coverage reads
@@ -154,6 +155,10 @@ surface roles even when they target the same PR
 
 THE SYSTEM SHALL carry complete repository-plus-PR-number identity for that target
 AND SHALL NOT persist or route a bare PR number as the full PR identity
+
+WHEN Git-backed provisioning failed or restart/worktree repair left the conversation without an actually attached Git-backed `WorkScope`
+THE SYSTEM SHALL report PR-specific surfaces as unavailable rather than falling back to conversation-scoped lookup
+AND SHALL NOT derive PR status or auto-fix eligibility from `environment_kind` alone
 
 **Design:** Users can tolerate plural PR history; they cannot tolerate one button addressing PR A
 while another badge or freshness marker silently describes PR B. One explicit target per

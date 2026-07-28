@@ -195,6 +195,12 @@ entity ProvisioningFailure {
     resolution: DetachedStartResolution
 }
 
+entity WorktreeRepairCondition {
+    product_conversation: bedrock/ProductConversation
+    attached_scope: WorkScope
+    kind: missing_registered_worktree
+}
+
 entity WorkScope {
     product_conversation: bedrock/ProductConversation
     project: Project
@@ -540,17 +546,30 @@ rule ServerRestartWorktreeReconciliation {
     requires: exists Worktree{product_conversation: conversation.product_conversation}
     requires: conversation.continued_in_conv_id = absent
     requires: conversation.parent_status != context_exhausted
-    requires: conversation.state != terminal
     requires: conversation.worktree_path = ""
         or not exists_on_disk(conversation.worktree_path)
 
-    ensures: conversation.state = terminal
+    let worktree = Worktree{product_conversation: conversation.product_conversation}
+
+    ensures: WorktreeRepairCondition.created(
+        product_conversation: conversation.product_conversation,
+        attached_scope: worktree.attached_scope,
+        kind: missing_registered_worktree
+    )
     ensures: GitWorktreePruned(conversation.project)
 
     @guidance
         -- Startup reconciliation reasons from persisted ownership plus on-disk
-        -- state. Missing worktrees terminate the active owner row but never delete,
-        -- rewrite, or mutate branches/refs as part of this classification.
+        -- state. Missing registered worktrees leave the ProductConversation open
+        -- and record typed repair evidence on the owning ProductConversation plus
+        -- attached WorkScope rather than assigning any removed row-terminal state.
+        --
+        -- The repair evidence is truthful ownership only: Phoenix records the
+        -- previously attached scope/worktree tuple it already persisted, but does
+        -- not fabricate a replacement WorkScope, detached branch label, branch
+        -- owner, or fresh workspace. Close/retry flows may later adopt this exact
+        -- missing-worktree evidence, surface repair guidance, or complete cleanup
+        -- idempotently; startup itself only classifies and records the condition.
 }
 
 ------------------------------------------------------------
