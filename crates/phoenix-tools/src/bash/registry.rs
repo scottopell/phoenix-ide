@@ -705,26 +705,24 @@ pub struct CascadeBashReport {
 /// (REQ-BASH-006, REQ-BASH-WS-002). Mirrors the tmux/browser cascades'
 /// `(work_scope, inheritor_scope)` signature.
 ///
-/// A continuation that inherits the same `ResourceScopeKey` keeps the live
-/// processes and tombstones — they belong to the `ResourceScopeKey`, not the
-/// deleted conversation. When `inheritor_scope == Some(work_scope)` the
-/// teardown is skipped entirely and the handle table is left in place
-/// (early return, empty report).
+/// When `inheritor_scope == Some(work_scope)`, the owner table and its spawn
+/// admission remain active. Handles with shared Work authority remain owned by
+/// the scope; restricted handles created by the deleted conversation are
+/// removed from both indexes and their live process groups are killed.
 ///
-/// Otherwise, atomically:
+/// Without a same-scope inheritor, teardown atomically:
 ///
-///   1. Removes the scope's handle table from the registry — any
-///      subsequent tool call for this `ResourceScopeKey` will see "no handle
-///      table" and produce `handle_not_found`, which is the correct
-///      behaviour once no inheritor survives.
-///   2. Snapshots live pgid / pid / `kill_pending_kernel` state across the
-///      removed handles.
-///   3. Sends `SIGKILL` to each live process group via
+///   1. Fences the owner table against new reservations and waits for admitted
+///      spawns to settle.
+///   2. Drains all handles from the owner table and global lookup index while
+///      retaining the empty fenced table so late spawns remain rejected.
+///   3. Snapshots live pgid / pid / `kill_pending_kernel` state across the
+///      drained handles.
+///   4. Sends `SIGKILL` to each live process group via
 ///      `kill(-pgid, SIGKILL)` (catches immediate descendants per
 ///      REQ-BASH-007's setpgid contract).
 ///
-/// Step 1 alone drops the live handles with the registry entry. Step 3
-/// satisfies the `KillSignalSentForAllLiveHandles` ensures clause; failures
+/// The final step satisfies the `KillSignalSentForAllLiveHandles` ensures clause; failures
 /// populate `kill_failures` for the orchestrator's WARN log but are not
 /// fatal — the spec's policy is "log and continue" (REQ-BED-032).
 ///

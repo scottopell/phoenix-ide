@@ -33,11 +33,10 @@ use super::ring::{RingBuffer, RingLine};
 /// Default tombstone tail size (REQ-BASH-006: `TOMBSTONE_TAIL_LINES`).
 pub const TOMBSTONE_TAIL_LINES: usize = 2000;
 
-/// Stable handle identifier within a `ResourceScopeKey`.
+/// Globally unique opaque Bash handle identifier.
 ///
-/// Format is implementation detail (sequential `b-1`, `b-2`, ...).
-/// The Allium contract is only that the pair `(work_scope, handle_id)`
-/// is unique.
+/// The `b-` prefix is presentation-only; callers must treat the complete value
+/// as an opaque global identity and must not qualify it with an owner scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HandleId(pub String);
 
