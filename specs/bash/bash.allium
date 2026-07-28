@@ -78,6 +78,14 @@ value ResourceScope {
     inner: String?
 }
 
+-- Validated execution target selected before Bash process creation. Coordinator
+-- targets are resolved from a persisted WorkScope with a live owner; callers
+-- cannot supply a working directory directly.
+value BashSpawnTarget {
+    owner_scope: ResourceScope
+    canonical_working_dir: String
+}
+
 -- A single line in the ring buffer or tombstone. The offset is monotonically
 -- increasing since spawn; line index 0 is the first line emitted by the
 -- process. Lines never have their offsets reused; eviction advances the
@@ -434,9 +442,10 @@ rule PhoenixKillsLiveHandlesOnShutdown {
 -- triggers (the OS-level fork/exec) is still called "spawn" in code paths
 -- where that distinction matters.
 rule HandleSpawned {
-    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
+    let selected_target = spawn_target
+    let owner_scope = selected_target.owner_scope
 
     requires: count(Handle{owner_scope: owner_scope, status: running})
               < config.live_handle_cap
@@ -461,8 +470,11 @@ rule HandleSpawned {
 
     @guidance
         -- Run sequence (in src/tools/bash/operations.rs):
-        --   1. Validate inputs (op discriminator and required fields per
-        --      REQ-BASH-010, range checks, label length cap).
+        --   1. Validate inputs and spawn_target. Ordinary runs derive the
+        --      target from the conversation; Coordinator runs resolve a
+        --      persisted WorkScope with a live owner by work_scope_id and
+        --      canonicalize its worktree_path (preferred) or cwd server-side.
+        --      There is no ambient/default cwd.
         --   2. (Command safety already enforced upstream by the permission
         --      seam before this tool is invoked; see specs/permissions/. No
         --      check at the tool boundary.)
@@ -472,7 +484,7 @@ rule HandleSpawned {
         --   5. Spawn child via Command::new("bash").args(["-c", cmd]) with
         --      pre_exec(setpgid(0,0)) so the child becomes its own process
         --      group leader. stdout and stderr piped, stdin null. Working
-        --      dir from ctx.working_dir.
+        --      dir from spawn_target.canonical_working_dir.
         --   6. Spawn two reader tasks (stdout, stderr) feeding the same ring
         --      under a mutex. Each task ingests bytes, splits on '\n', and
         --      appends RingLine entries with monotonically increasing
@@ -489,9 +501,9 @@ rule HandleSpawned {
 -- its cap. Both conversations of a continuation chain count against the one
 -- per-ResourceScope cap. No handle is created.
 rule RunRejectedByCap {
-    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
+    let owner_scope = spawn_target.owner_scope
 
     requires: count(Handle{owner_scope: owner_scope, status: running})
               >= config.live_handle_cap
@@ -506,7 +518,7 @@ rule RunRejectedByCap {
 
 -- REQ-BASH-002: run argument out of range.
 rule RunRejectedByRange {
-    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
 
     requires: wait_seconds < 0 or wait_seconds > config.max_wait_seconds
 
@@ -518,7 +530,7 @@ rule RunRejectedByRange {
 
 -- REQ-BASH-010: label exceeds the configured cap.
 rule RunRejectedByLabelLength {
-    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
 
     requires: label != null and len(label) > config.max_label_length
 
@@ -1216,10 +1228,10 @@ surface AgentBashAccess {
         Handle.final_cause
 
     provides:
-        AgentCallsBashRun(conversation, cmd, wait_seconds, label)
+        AgentCallsBashRun(conversation, cmd, wait_seconds, label, spawn_target)
             when 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
             and (label = null or len(label) <= config.max_label_length)
-            and count(Handle{owner_scope: resolve_bash_lifecycle_scope(conversation), status: running})
+            and count(Handle{owner_scope: spawn_target.owner_scope, status: running})
                 < config.live_handle_cap
 
         AgentCallsBashPeek(conversation, handle_id, args)

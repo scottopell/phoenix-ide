@@ -4504,10 +4504,10 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         ))));
     }
 
-    run_resource_cleanup_cascade(state, &conv).await?;
+    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
 
     if let Err(error) = state.runtime.db().archive_conversation(id).await {
-        reopen_bash_after_failed_lifecycle_mutation(state, &conv).await;
+        reopen_bash_after_failed_lifecycle_mutation(state, &conv, &cleanup).await;
         return Err(AppError::Internal(format!(
             "Failed to set archived flag: {error}"
         )));
@@ -4617,9 +4617,16 @@ async fn cleanup_browser_with_retry(
     }
 }
 
+#[derive(Debug)]
+pub(super) struct ResourceCleanupReceipt {
+    work_scope: crate::work_scope::ResourceScopeKey,
+    bash_teardown_generation: Option<phoenix_tools::bash::registry::BashTeardownGeneration>,
+}
+
 pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
     state: &AppState,
     conversation: &crate::db::Conversation,
+    cleanup: &ResourceCleanupReceipt,
 ) {
     let Ok(persisted) = state.runtime.db().get_conversation(&conversation.id).await else {
         return;
@@ -4627,10 +4634,16 @@ pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
     if !crate::runtime::conversation_owns_work_scope(&persisted) {
         return;
     }
+    let Some(generation) = cleanup.bash_teardown_generation else {
+        return;
+    };
+    if conversation_resource_scope(&persisted) != cleanup.work_scope {
+        return;
+    }
     state
         .runtime
         .bash_handles()
-        .reopen_spawn_admission(&conversation_resource_scope(&persisted))
+        .reopen_spawn_admission(&cleanup.work_scope, generation)
         .await;
 }
 
@@ -4665,7 +4678,7 @@ pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
 pub(super) async fn run_resource_cleanup_cascade(
     state: &AppState,
     conv: &crate::db::Conversation,
-) -> Result<(), AppError> {
+) -> Result<ResourceCleanupReceipt, AppError> {
     let id = conv.id.as_str();
     let work_scope = conversation_resource_scope(conv);
 
@@ -4762,7 +4775,10 @@ pub(super) async fn run_resource_cleanup_cascade(
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
     cleanup_browser_with_retry(state, conv, &work_scope, inheritor_scope).await;
 
-    Ok(())
+    Ok(ResourceCleanupReceipt {
+        work_scope,
+        bash_teardown_generation: bash_report.teardown_generation,
+    })
 }
 
 /// REQ-BED-032: Hard-delete cascade orchestrator.
@@ -4896,7 +4912,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // (returned as 500 so the user can retry). Shared with archive /
     // abandon / mark-merged so the resource teardown is byte-for-byte
     // identical.
-    run_resource_cleanup_cascade(state, &conv).await?;
+    let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
 
     // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
     // rows. This is the only step whose failure is fatal to the request
@@ -4904,7 +4920,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // means the user's "delete this conversation" never actually
     // happened.
     if let Err(error) = state.runtime.db().delete_conversation(id).await {
-        reopen_bash_after_failed_lifecycle_mutation(state, &conv).await;
+        reopen_bash_after_failed_lifecycle_mutation(state, &conv, &cleanup).await;
         return Err(AppError::Internal(format!(
             "Failed to delete conversation row: {error}"
         )));

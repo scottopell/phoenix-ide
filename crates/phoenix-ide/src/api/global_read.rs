@@ -246,17 +246,29 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         requested_work_scope_id: &str,
     ) -> Result<ValidatedCoordinatorBashSpawnTarget, String> {
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            "SELECT id, worktree_path, cwd FROM work_scopes
-             WHERE id = ?1
-               AND lifecycle = 'active'
-               AND environment_kind <> 'none'",
+            "SELECT environment.id, environment.worktree_path, environment.cwd
+             FROM work_scopes environment
+             WHERE environment.id = ?1
+               AND environment.lifecycle = 'active'
+               AND environment.environment_kind <> 'none'
+               AND EXISTS (
+                   SELECT 1
+                   FROM conversations owner
+                   WHERE owner.work_scope_id = environment.id
+                     AND owner.archived = 0
+                     AND json_extract(owner.state, '$.type') NOT IN (
+                         'completed', 'failed', 'context_exhausted', 'handed_off',
+                         'creation_failed', 'creation_cancelled', 'terminal'
+                     )
+               )",
         )
         .bind(requested_work_scope_id)
         .fetch_optional(self.db.pool())
         .await
         .map_err(|error| format!("failed to resolve Coordinator bash WorkScope: {error}"))?
         .ok_or_else(|| {
-            "active persisted WorkScope not found for Coordinator bash run".to_string()
+            "active persisted WorkScope with a live owner not found for Coordinator bash run"
+                .to_string()
         })?;
         let (work_scope_id, worktree_path, cwd) = row;
         let preferred = worktree_path
@@ -1224,6 +1236,20 @@ mod tests {
             .unwrap();
         assert_eq!(binding.path, fallback.canonicalize().unwrap());
 
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = 'scope-owner'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(service
+            .resolve_active_work_scope_bash_target(work_scope_id.as_str())
+            .await
+            .unwrap_err()
+            .contains("live owner not found"));
+        sqlx::query("UPDATE conversations SET archived = 0 WHERE id = 'scope-owner'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
         sqlx::query(
             "UPDATE work_scopes
              SET lifecycle = 'retired', retired_at = '2026-01-01T00:00:00Z',
@@ -1240,7 +1266,7 @@ mod tests {
             .resolve_active_work_scope_bash_target(work_scope_id.as_str())
             .await
             .unwrap_err()
-            .contains("active persisted WorkScope not found"));
+            .contains("active persisted WorkScope with a live owner not found"));
         let snapshot = service.coordinator_snapshot().await.unwrap();
         assert!(snapshot.contains("\"cwd\": null"), "{snapshot}");
         assert!(snapshot.contains("\"worktree_path\": null"), "{snapshot}");

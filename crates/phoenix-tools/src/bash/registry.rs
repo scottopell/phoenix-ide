@@ -90,6 +90,22 @@ pub struct SpawnReservation {
     admission: Arc<SpawnAdmission>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BashTeardownGeneration(u64);
+
+#[derive(Debug)]
+pub struct BashTeardownFence {
+    entry: Arc<RwLock<ResourceScopeKeyHandles>>,
+    generation: BashTeardownGeneration,
+}
+
+impl BashTeardownFence {
+    #[must_use]
+    pub fn generation(&self) -> BashTeardownGeneration {
+        self.generation
+    }
+}
+
 impl SpawnReservation {
     #[must_use]
     pub fn handle_id(&self) -> &HandleId {
@@ -130,6 +146,8 @@ pub struct ResourceScopeKeyHandles {
     teardown_started: bool,
     /// Cancellation-safe admission count and teardown notification.
     admission: Arc<SpawnAdmission>,
+    /// Monotonic identity of the lifecycle request that most recently fenced admission.
+    teardown_generation: u64,
 }
 
 impl ResourceScopeKeyHandles {
@@ -546,11 +564,21 @@ impl BashHandleRegistry {
 
     /// Reopen admission when the authoritative lifecycle mutation following a
     /// completed cleanup fails and the `WorkScope` therefore remains active.
-    pub async fn reopen_spawn_admission(&self, owner: &ResourceScopeKey) {
+    pub async fn reopen_spawn_admission(
+        &self,
+        owner: &ResourceScopeKey,
+        generation: BashTeardownGeneration,
+    ) -> bool {
         let Some(entry) = self.get_existing(owner).await else {
-            return;
+            return false;
         };
-        entry.write().await.teardown_started = false;
+        let mut table = entry.write().await;
+        if table.teardown_started && table.teardown_generation == generation.0 {
+            table.teardown_started = false;
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn get_by_id(&self, handle_id: &HandleId) -> Option<RegisteredHandle> {
@@ -630,18 +658,19 @@ impl BashHandleRegistry {
     /// Remove a `ResourceScopeKey`'s handle table outright. Used by the
     /// hard-delete cascade (REQ-BASH-006). Returns the removed entry so
     /// the caller can SIGKILL its live process groups synchronously.
-    pub async fn begin_teardown(
-        &self,
-        work_scope: &ResourceScopeKey,
-    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
-        let entry = {
+    pub async fn begin_teardown(&self, work_scope: &ResourceScopeKey) -> Option<BashTeardownFence> {
+        let (entry, generation) = {
             let mut tables = self.inner.write().await;
             let entry = tables
                 .entry(work_scope.clone())
                 .or_insert_with(|| Arc::new(RwLock::new(ResourceScopeKeyHandles::new())))
                 .clone();
-            entry.write().await.teardown_started = true;
-            entry
+            let mut table = entry.write().await;
+            table.teardown_generation = table.teardown_generation.wrapping_add(1);
+            table.teardown_started = true;
+            let generation = BashTeardownGeneration(table.teardown_generation);
+            drop(table);
+            (entry, generation)
         };
         loop {
             let notified = {
@@ -650,7 +679,10 @@ impl BashHandleRegistry {
                 let mut notified = Box::pin(table.admission.settled.clone().notified_owned());
                 notified.as_mut().enable();
                 if table.admission.pending.load(Ordering::Acquire) == 0 {
-                    return Some(entry.clone());
+                    return Some(BashTeardownFence {
+                        entry: entry.clone(),
+                        generation,
+                    });
                 }
                 notified
             };
@@ -658,12 +690,12 @@ impl BashHandleRegistry {
         }
     }
 
-    pub async fn remove(
+    async fn drain_owner(
         &self,
         work_scope: &ResourceScopeKey,
-    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
-        let entry = self.begin_teardown(work_scope).await?;
-        let removed_handles = entry.write().await.take_all();
+    ) -> Option<(Arc<RwLock<ResourceScopeKeyHandles>>, BashTeardownGeneration)> {
+        let fence = self.begin_teardown(work_scope).await?;
+        let removed_handles = fence.entry.write().await.take_all();
         self.remove_from_global_index(&removed_handles).await;
 
         let removed = Arc::new(RwLock::new(ResourceScopeKeyHandles::new()));
@@ -673,7 +705,16 @@ impl BashHandleRegistry {
                 table.insert(handle);
             }
         }
-        Some(removed)
+        Some((removed, fence.generation()))
+    }
+
+    pub async fn remove(
+        &self,
+        work_scope: &ResourceScopeKey,
+    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
+        self.drain_owner(work_scope)
+            .await
+            .map(|(removed, _)| removed)
     }
 
     async fn remove_from_global_index(&self, handles: &[Arc<Handle>]) {
@@ -710,6 +751,9 @@ pub struct CascadeBashReport {
     /// Per-pgid kill failures (`kill(2)` returned non-zero). Successful
     /// kills and `ESRCH` (process already gone) do not appear here.
     pub kill_failures: Vec<(i32, String)>,
+    /// Fence identity installed by an owner-level teardown. Absent when the
+    /// owner was preserved and only actor-restricted handles were removed.
+    pub teardown_generation: Option<BashTeardownGeneration>,
 }
 
 /// Run the bash side of the hard-delete cascade for `work_scope`
@@ -767,11 +811,11 @@ pub async fn teardown_bash_owner(
     work_scope: &ResourceScopeKey,
 ) -> CascadeBashReport {
     let mut report = CascadeBashReport::default();
-    let Some(entry) = registry.begin_teardown(work_scope).await else {
+    let Some((removed, generation)) = registry.drain_owner(work_scope).await else {
         return report;
     };
-    let handles: Vec<_> = entry.read().await.all().cloned().collect();
-    let _ = registry.remove(work_scope).await;
+    report.teardown_generation = Some(generation);
+    let handles: Vec<_> = removed.read().await.all().cloned().collect();
 
     for h in &handles {
         let Some(group_id) = h.live_pgid().await else {
@@ -1040,14 +1084,41 @@ mod tests {
     async fn failed_lifecycle_mutation_can_reopen_spawn_admission() {
         let registry = BashHandleRegistry::new();
         let owner = scope("conv-a");
-        registry.begin_teardown(&owner).await.expect("teardown");
+        let generation = registry
+            .begin_teardown(&owner)
+            .await
+            .expect("teardown")
+            .generation();
         assert!(matches!(
             registry.reserve_spawn(&owner).await,
             Err(BashHandleError::SpawnFenced)
         ));
 
-        registry.reopen_spawn_admission(&owner).await;
+        assert!(registry.reopen_spawn_admission(&owner, generation).await);
+        assert!(registry.reserve_spawn(&owner).await.is_ok());
+    }
 
+    #[tokio::test]
+    async fn stale_lifecycle_failure_cannot_reopen_newer_teardown() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-a");
+        let stale = registry
+            .begin_teardown(&owner)
+            .await
+            .expect("first teardown")
+            .generation();
+        let current = registry
+            .begin_teardown(&owner)
+            .await
+            .expect("second teardown")
+            .generation();
+
+        assert!(!registry.reopen_spawn_admission(&owner, stale).await);
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+        assert!(registry.reopen_spawn_admission(&owner, current).await);
         assert!(registry.reserve_spawn(&owner).await.is_ok());
     }
 
