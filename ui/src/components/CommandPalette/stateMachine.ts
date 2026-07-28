@@ -43,7 +43,7 @@ export function transition(
       const scopedQuery = conversationSlugScopeMatch?.[1] ?? conversationContentScopeMatch?.[1];
       const query = isAction
         ? rawInput.slice(1).trimStart()
-        : scopedQuery ?? rawInput;
+        : scopedQuery?.trim() ?? rawInput;
       const mode = isAction ? 'action' : 'search';
       const scope = conversationSlugScopeMatch
         ? 'conversation-slugs'

@@ -146,7 +146,6 @@ pub type DbResult<T> = Result<T, DbError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSearchMetadata {
-    pub id: String,
     pub slug: String,
     pub archived: bool,
 }
@@ -3315,7 +3314,46 @@ impl Database {
         })
     }
 
-    /// List active (non-archived) user-initiated conversations
+    /// Load the navigation metadata for a bounded set of conversation search hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_conversation_search_metadata(
+        &self,
+        conversation_ids: &[String],
+    ) -> DbResult<std::collections::HashMap<String, ConversationSearchMetadata>> {
+        if conversation_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT c.id, c.slug, c.archived FROM conversations c WHERE c.id IN ",
+        );
+        query.push_tuples(conversation_ids.iter(), |mut tuple, conversation_id| {
+            tuple.push_bind(conversation_id);
+        });
+        query.push(
+            " AND c.user_initiated = 1 AND c.runtime_role != 'coordinator' \
+              AND c.parent_conversation_id IS NULL \
+              AND NOT (c.archived = 1 AND EXISTS (\
+                  SELECT 1 FROM conversation_creation_jobs j \
+                  WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
+              ))",
+        );
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut metadata = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let slug: String = row.try_get("slug")?;
+            let archived: bool = row.try_get("archived")?;
+            metadata.insert(id, ConversationSearchMetadata { slug, archived });
+        }
+        Ok(metadata)
+    }
+
+    /// List active (non-archived) user-initiated conversations.
     ///
     /// # Errors
     ///
@@ -10548,6 +10586,22 @@ mod tests {
             .iter()
             .all(|conversation| conversation.id != "conv-hidden-delete"));
         assert!(db.get_conversation("conv-hidden-delete").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn deletion_pending_creation_is_hidden_from_search_metadata() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-hidden-search", "conv-hidden-search").await;
+        db.request_conversation_creation_deletion("conv-hidden-search", Utc::now())
+            .await
+            .unwrap();
+
+        let metadata = db
+            .get_conversation_search_metadata(&["conv-hidden-search".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!metadata.contains_key("conv-hidden-search"));
     }
 
     #[tokio::test]

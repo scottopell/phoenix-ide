@@ -40,6 +40,22 @@ describe('command palette query parsing', () => {
     });
   });
 
+  it('normalizes whitespace-only scoped queries to empty', () => {
+    const slugScope = transition(openPalette(), { type: 'SET_QUERY', rawInput: 'cs   ' });
+    expect(slugScope).toMatchObject({
+      scope: 'conversation-slugs',
+      query: '',
+      rawInput: 'cs   ',
+    });
+
+    const contentScope = transition(openPalette(), { type: 'SET_QUERY', rawInput: 'c   bug   ' });
+    expect(contentScope).toMatchObject({
+      scope: 'conversation-content',
+      query: 'bug',
+      rawInput: 'c   bug   ',
+    });
+  });
+
   it('clears stale search results before an async scoped search completes', () => {
     const open = openPalette();
     if (open.status !== 'open') throw new Error('palette did not open');

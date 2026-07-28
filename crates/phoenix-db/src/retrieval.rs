@@ -360,19 +360,12 @@ impl Fts5Retriever {
     }
 }
 
-#[async_trait]
-impl MessageRetriever for Fts5Retriever {
-    fn index_reconciled(&self) -> bool {
-        self.index_reconciled()
-    }
-
-    async fn retrieve(
+impl Fts5Retriever {
+    async fn retrieve_match_expr(
         &self,
-        request: RetrievalRequest,
+        request: &RetrievalRequest,
+        match_expr: &str,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let Some(match_expr) = build_fts_query(&request.query, request.match_mode) else {
-            return Ok(Vec::new());
-        };
         let (scope_ids, excluding): (&[String], bool) = match &request.scope {
             RetrievalScope::Global => (&[], false),
             RetrievalScope::GlobalExcluding(ids) => (ids, true),
@@ -463,6 +456,42 @@ impl MessageRetriever for Fts5Retriever {
             .fetch_all(&self.pool)
             .await
             .map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl MessageRetriever for Fts5Retriever {
+    fn index_reconciled(&self) -> bool {
+        self.index_reconciled()
+    }
+
+    async fn retrieve(
+        &self,
+        request: RetrievalRequest,
+    ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
+        let Some(mut match_expr) = build_fts_query(&request.query, RetrievalMatchMode::ExactTerms)
+        else {
+            return Ok(Vec::new());
+        };
+        if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
+            let final_term = content_terms(&request.query)
+                .pop()
+                .expect("non-empty query has a term");
+            let mut probe = request.clone();
+            probe.query.clone_from(&final_term);
+            probe.grouping = RetrievalGrouping::None;
+            probe.limit = 1;
+            let exact_final = format!("\"{final_term}\"");
+            if self
+                .retrieve_match_expr(&probe, &exact_final)
+                .await?
+                .is_empty()
+            {
+                match_expr = build_fts_query(&request.query, RetrievalMatchMode::FinalTokenPrefix)
+                    .expect("non-empty query has a prefix expression");
+            }
+        }
+        self.retrieve_match_expr(&request, &match_expr).await
     }
 
     async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError> {
@@ -822,13 +851,17 @@ const STOPWORDS: &[&str] = &[
 /// prefix term so incomplete palette input can match the start of the last
 /// word typed. Returns `None` when nothing content-bearing remains (the caller
 /// returns an empty result).
-fn build_fts_query(natural: &str, match_mode: RetrievalMatchMode) -> Option<String> {
-    let mut terms: Vec<String> = natural
+fn content_terms(natural: &str) -> Vec<String> {
+    natural
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(str::to_lowercase)
         .filter(|t| !STOPWORDS.contains(&t.as_str()))
-        .collect();
+        .collect()
+}
+
+fn build_fts_query(natural: &str, match_mode: RetrievalMatchMode) -> Option<String> {
+    let mut terms = content_terms(natural);
     if terms.is_empty() {
         return None;
     }
@@ -1401,6 +1434,46 @@ mod tests {
             assert_eq!(hits.len(), 1, "partial Porter input {query} should match");
             assert_eq!(hits[0].conversation_id, "c1");
         }
+    }
+
+    #[tokio::test]
+    async fn complete_porter_term_does_not_broaden_to_shorter_prefixes() {
+        let db = Database::open_in_memory().await.unwrap();
+        for (id, slug, content) in [
+            ("c-optimization", "optimization", "optimization work"),
+            ("c-option", "option", "option work"),
+            ("c-optimistic", "optimistic", "optimistic work"),
+        ] {
+            db.create_conversation(id, slug, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.add_message(
+                &format!("m-{id}"),
+                id,
+                &MessageContent::user(content),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let retriever = Fts5Retriever::new(db.pool().clone());
+        retriever.reconcile().await.unwrap();
+
+        let hits = retriever
+            .retrieve(RetrievalRequest::palette_conversation_search(
+                "optimization",
+                10,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.into_iter()
+                .map(|hit| hit.conversation_id)
+                .collect::<Vec<_>>(),
+            ["c-optimization"]
+        );
     }
 
     #[tokio::test]
