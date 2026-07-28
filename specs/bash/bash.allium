@@ -800,14 +800,13 @@ rule HandlePeekArgsMutuallyExclusive {
     )
 }
 
--- REQ-BASH-003, REQ-BASH-014, REQ-BASH-WS-001: handle id not found in this
--- work scope. A handle id owned by another ResourceScope is treated as
--- nonexistent — no cross-scope leakage of handle existence.
+-- REQ-BASH-003, REQ-BASH-014, REQ-BASH-WS-001: handle id is globally absent
+-- or its controller scope does not authorize the caller. Both cases return the
+-- same error so authorization does not leak foreign-handle existence.
 rule HandlePeekNotFound {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: not exists Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: not exists Handle{handle_id: handle_id} or not can_control(conversation, Handle{handle_id: handle_id}.controller_scope)
 
     ensures: AgentReceivesError(
         error:     "handle_not_found",
@@ -879,13 +878,12 @@ rule HandleWaitedAlreadyTerminal {
     )
 }
 
--- REQ-BASH-014, REQ-BASH-WS-001: wait on a foreign (other-ResourceScope) or
--- unknown handle id.
+-- REQ-BASH-014, REQ-BASH-WS-001: wait on a globally absent or unauthorized
+-- handle id.
 rule HandleWaitNotFound {
     when: AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: not exists Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: not exists Handle{handle_id: handle_id} or not can_control(conversation, Handle{handle_id: handle_id}.controller_scope)
 
     ensures: AgentReceivesError(
         error:     "handle_not_found",
@@ -1037,13 +1035,12 @@ rule HandleKilledOnKillPendingKernel {
     ensures: KillResponseWindowOpened(h, signal, config.kill_response_timeout_seconds)
 }
 
--- REQ-BASH-014, REQ-BASH-WS-001: kill on a foreign (other-ResourceScope) or
--- unknown handle id.
+-- REQ-BASH-014, REQ-BASH-WS-001: kill on a globally absent or unauthorized
+-- handle id.
 rule HandleKillNotFound {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
-    let owner_scope = resolve_bash_lifecycle_scope(conversation)
-    requires: not exists Handle{owner_scope: owner_scope, handle_id: handle_id}
+    requires: not exists Handle{handle_id: handle_id} or not can_control(conversation, Handle{handle_id: handle_id}.controller_scope)
 
     ensures: AgentReceivesError(
         error:     "handle_not_found",

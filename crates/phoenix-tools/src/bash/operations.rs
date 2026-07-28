@@ -597,7 +597,7 @@ async fn run_run(
         ring_bytes_cap,
         spawn_mode,
     ) {
-        Ok((handle, child, sandbox_scratch_dir)) => {
+        Ok((handle, spawned)) => {
             let inserted = match registry
                 .commit_spawn(&mut reservation, handle.clone())
                 .await
@@ -627,10 +627,11 @@ async fn run_run(
             let _progress_lease = progress_reporter
                 .as_ref()
                 .map(|reporter| LiveBashProgressLease(reporter.clone()));
+            let (child, sandbox_scratch_dir) = spawned.into_waiter_parts();
             start_io_tasks(
                 &inserted,
                 spawn_context.lifecycle_scope.clone(),
-                child.into_child(),
+                child,
                 registry.lifecycle_sink(),
                 spawn_context.terminal_effect,
                 sandbox_scratch_dir,
@@ -648,20 +649,28 @@ async fn run_run(
 struct SpawnedProcessGroup {
     child: Option<tokio::process::Child>,
     pgid: i32,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
 }
 
 impl SpawnedProcessGroup {
-    fn new(child: tokio::process::Child, pgid: i32) -> Self {
+    fn new(
+        child: tokio::process::Child,
+        pgid: i32,
+        sandbox_scratch_dir: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             child: Some(child),
             pgid,
+            sandbox_scratch_dir,
         }
     }
 
-    fn into_child(mut self) -> tokio::process::Child {
-        self.child
+    fn into_waiter_parts(mut self) -> (tokio::process::Child, Option<std::path::PathBuf>) {
+        let child = self
+            .child
             .take()
-            .expect("spawned child already transferred")
+            .expect("spawned child already transferred");
+        (child, self.sandbox_scratch_dir.take())
     }
 
     #[cfg(test)]
@@ -688,6 +697,9 @@ impl Drop for SpawnedProcessGroup {
             // setpgid below. The direct child also has kill_on_drop enabled.
             libc::kill(-self.pgid, libc::SIGKILL);
         }
+        if let Some(dir) = self.sandbox_scratch_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -702,7 +714,7 @@ fn spawn_child(
     handle_id: HandleId,
     ring_bytes_cap: usize,
     spawn_mode: BashSpawnMode,
-) -> Result<(Arc<Handle>, SpawnedProcessGroup, Option<std::path::PathBuf>), String> {
+) -> Result<(Arc<Handle>, SpawnedProcessGroup), String> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
     //    pre_exec(setpgid(0,0))"
@@ -787,8 +799,7 @@ fn spawn_child(
     );
     Ok((
         handle,
-        SpawnedProcessGroup::new(child, pgid),
-        sandbox_scratch_dir,
+        SpawnedProcessGroup::new(child, pgid, sandbox_scratch_dir),
     ))
 }
 
@@ -2136,7 +2147,7 @@ mod tests {
     async fn dropping_unregistered_spawn_kills_the_process_group() {
         let ctx = ctx_with_registrar(&scope("drop-process-group"), None);
         let spawn_context = spawn_context_for(&ctx);
-        let (_, mut spawned, scratch) = spawn_child(
+        let (_, mut spawned) = spawn_child(
             "(echo ready; exec sleep 30) & wait",
             None,
             &ctx,
@@ -2147,6 +2158,10 @@ mod tests {
         )
         .expect("spawn process group");
         let pgid = spawned.pgid();
+        let scratch_parent = tempfile::tempdir().expect("scratch parent");
+        let scratch = scratch_parent.path().join("spawn-scratch");
+        std::fs::create_dir(&scratch).expect("create scratch");
+        spawned.sandbox_scratch_dir = Some(scratch.clone());
         let stdout = spawned.child_mut().stdout.take().expect("child stdout");
         let mut ready = String::new();
         tokio::time::timeout(
@@ -2172,9 +2187,7 @@ mod tests {
         })
         .await
         .expect("process group survived guard drop");
-        if let Some(dir) = scratch {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        assert!(!scratch.exists(), "sandbox scratch survived guard drop");
     }
 
     #[async_trait::async_trait]
