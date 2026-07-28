@@ -630,7 +630,7 @@ async fn run_run(
             start_io_tasks(
                 &inserted,
                 spawn_context.lifecycle_scope.clone(),
-                child,
+                child.into_child(),
                 registry.lifecycle_sink(),
                 spawn_context.terminal_effect,
                 sandbox_scratch_dir,
@@ -641,6 +641,52 @@ async fn run_run(
         Err(e) => {
             registry.abort_spawn(reservation);
             BashError::SpawnFailed { error_message: e }.into_tool_output()
+        }
+    }
+}
+
+struct SpawnedProcessGroup {
+    child: Option<tokio::process::Child>,
+    pgid: i32,
+}
+
+impl SpawnedProcessGroup {
+    fn new(child: tokio::process::Child, pgid: i32) -> Self {
+        Self {
+            child: Some(child),
+            pgid,
+        }
+    }
+
+    fn into_child(mut self) -> tokio::process::Child {
+        self.child
+            .take()
+            .expect("spawned child already transferred")
+    }
+
+    #[cfg(test)]
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("spawned child already transferred")
+    }
+
+    #[cfg(test)]
+    fn pgid(&self) -> i32 {
+        self.pgid
+    }
+}
+
+impl Drop for SpawnedProcessGroup {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            // SAFETY: a negative pid targets the process group created by
+            // setpgid below. The direct child also has kill_on_drop enabled.
+            libc::kill(-self.pgid, libc::SIGKILL);
         }
     }
 }
@@ -656,14 +702,7 @@ fn spawn_child(
     handle_id: HandleId,
     ring_bytes_cap: usize,
     spawn_mode: BashSpawnMode,
-) -> Result<
-    (
-        Arc<Handle>,
-        tokio::process::Child,
-        Option<std::path::PathBuf>,
-    ),
-    String,
-> {
+) -> Result<(Arc<Handle>, SpawnedProcessGroup, Option<std::path::PathBuf>), String> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
     //    pre_exec(setpgid(0,0))"
@@ -746,7 +785,11 @@ fn spawn_child(
         pid,
         ring_bytes_cap,
     );
-    Ok((handle, child, sandbox_scratch_dir))
+    Ok((
+        handle,
+        SpawnedProcessGroup::new(child, pgid),
+        sandbox_scratch_dir,
+    ))
 }
 
 struct WaiterContext {
@@ -2042,7 +2085,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, ReadBuf};
 
     fn scope(id: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
@@ -2085,6 +2128,52 @@ mod tests {
                 .lock()
                 .expect("register_calls lock")
                 .clone()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_unregistered_spawn_kills_the_process_group() {
+        let ctx = ctx_with_registrar(&scope("drop-process-group"), None);
+        let spawn_context = spawn_context_for(&ctx);
+        let (_, mut spawned, scratch) = spawn_child(
+            "(echo ready; exec sleep 30) & wait",
+            None,
+            &ctx,
+            &spawn_context,
+            HandleId::new("b-drop-process-group"),
+            RING_BUFFER_BYTES,
+            BashSpawnMode::Direct,
+        )
+        .expect("spawn process group");
+        let pgid = spawned.pgid();
+        let stdout = spawned.child_mut().stdout.take().expect("child stdout");
+        let mut ready = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            BufReader::new(stdout).read_line(&mut ready),
+        )
+        .await
+        .expect("descendant readiness timed out")
+        .expect("read descendant readiness");
+        assert_eq!(ready.trim(), "ready");
+
+        drop(spawned);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let result = unsafe { libc::kill(-pgid, 0) };
+                if result != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process group survived guard drop");
+        if let Some(dir) = scratch {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 

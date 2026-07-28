@@ -46,13 +46,14 @@ generation; when no consumer requests metrics there is no recurring sampler. An
 unavailable metric is null (not zero) and logged at `debug`, per the codebase's
 capability-gap convention.
 
-The handler nests under the existing `/api/work-scope/:scope_key/…` route family
-established by `GET /api/work-scope/:scope_key/inventory`. No SSE wire variant is
-added, so the SSE cross-spec whitelist (`specs/sse_wire/`) is untouched.
+The handler uses the global opaque-handle route
+`GET /api/bash/:handle_id/inspect`; owner and controller scope are authorization
+facts, not routing coordinates. No SSE wire variant is added, so the SSE
+cross-spec whitelist (`specs/sse_wire/`) is untouched.
 
 On the client the inspector is a new `inspect` `ViewerKind` in the meta-viewer
-slot (`ui/src/contexts/ViewerSlotContext.tsx`), addressed by `(scope_key,
-handle_id)` in the slot's URL contract so a cold reload restores the same
+slot (`ui/src/contexts/ViewerSlotContext.tsx`), addressed by globally unique
+`handle_id` in the slot's URL contract so a cold reload restores the same
 handle's inspector. It inherits the slot's one-at-a-time mutex, close,
 conversation-change reset, and URL-restoration behaviour. A "view" affordance on
 the work-scope panel's bash row opens it; a `ProcessInspectorPanel` owns the poll
@@ -64,7 +65,7 @@ client-side poll over state whose lifecycles are already modeled by `specs/bash/
 (`bash.allium`, the handle / ring / tombstone) and `specs/viewer_slot/`
 (`viewer_slot.allium`, the slot mutex and URL contract). It adds no new state
 machine, precondition, or ordering obligation, so spEARS alone is the correct
-weight (see `design.md`, "Why No Allium Spec"), mirroring `specs/work-scope-ui/`.
+weight, mirroring `specs/work-scope-ui/`.
 
 ## Status Summary
 

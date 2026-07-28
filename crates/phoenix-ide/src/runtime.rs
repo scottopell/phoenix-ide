@@ -1421,6 +1421,14 @@ impl RuntimeManager {
             .await
         {
             Ok(phoenix_core::work_scope::WorkScopeRetirementOutcome::Retired) => {
+                let report = phoenix_tools::bash::registry::teardown_bash_owner(
+                    &self.bash_handles,
+                    work_scope,
+                )
+                .await;
+                for (pgid, error) in report.kill_failures {
+                    tracing::warn!(work_scope = %scope_id, pgid, %error, "bash process-group cleanup after work-scope retirement failed");
+                }
                 tracing::debug!(work_scope = %scope_id, "retired unowned work scope after browser teardown");
             }
             Ok(_) => {}
@@ -4382,6 +4390,37 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn browser_retirement_fences_late_bash_spawn_admission() {
+        let mgr = test_manager().await;
+        let scope_id = phoenix_core::work_scope::WorkScopeId::parse("retired-browser-scope")
+            .expect("scope id");
+        sqlx::query(
+            "INSERT INTO work_scopes
+             (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+             VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+        )
+        .bind(scope_id.as_str())
+        .execute(mgr.db().pool())
+        .await
+        .expect("insert active scope");
+        let scope = ResourceScopeKey::Work(scope_id.clone());
+
+        mgr.retire_scope_after_browser_teardown(&scope).await;
+
+        let lifecycle: String =
+            sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_one(mgr.db().pool())
+                .await
+                .expect("read lifecycle");
+        assert_eq!(lifecycle, "retired");
+        assert!(matches!(
+            mgr.bash_handles().reserve_spawn(&scope).await,
+            Err(phoenix_tools::bash::registry::BashHandleError::SpawnFenced)
+        ));
     }
 
     /// Register a lingering runtime handle for `conv_id` without spawning a

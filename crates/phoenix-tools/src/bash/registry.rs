@@ -526,16 +526,17 @@ impl BashHandleRegistry {
             .get_existing(&reservation.owner)
             .await
             .ok_or(BashHandleError::SpawnFenced)?;
+        let mut by_id = self.handles_by_id.write().await;
         let mut table = entry.write().await;
-        let inserted = table.insert(handle.clone());
-        reservation.settle();
-        self.handles_by_id.write().await.insert(
+        let inserted = table.insert(handle);
+        by_id.insert(
             inserted.handle_id.clone(),
             RegisteredHandle {
                 owner: reservation.owner.clone(),
                 handle: inserted.clone(),
             },
         );
+        reservation.settle();
         Ok(inserted)
     }
 
@@ -747,55 +748,53 @@ pub async fn cascade_bash_on_delete(
         registry.remove_from_global_index(&handles).await;
         return kill_selected_handles(registry, work_scope, handles).await;
     }
+    teardown_bash_owner(registry, work_scope).await
+}
+
+/// Fence an owner against future Bash spawns, wait for admitted spawns to
+/// settle, remove all registered handles, and kill every live process group.
+pub async fn teardown_bash_owner(
+    registry: &Arc<BashHandleRegistry>,
+    work_scope: &ResourceScopeKey,
+) -> CascadeBashReport {
     let mut report = CascadeBashReport::default();
     let Some(entry) = registry.begin_teardown(work_scope).await else {
         return report;
     };
     let handles: Vec<_> = entry.read().await.all().cloned().collect();
     let _ = registry.remove(work_scope).await;
-    if handles.is_empty() {
-        return report;
-    }
 
-    {
-        for h in &handles {
-            let Some(group_id) = h.live_pgid().await else {
-                continue;
-            };
-            let process_id = h.live_pid().await;
-            let kill_pending = h.is_kill_pending_kernel().await;
-            record_handle_in_report(&mut report, group_id, process_id, kill_pending);
+    for h in &handles {
+        let Some(group_id) = h.live_pgid().await else {
+            continue;
+        };
+        let process_id = h.live_pid().await;
+        let kill_pending = h.is_kill_pending_kernel().await;
+        record_handle_in_report(&mut report, group_id, process_id, kill_pending);
 
-            #[cfg(unix)]
-            {
-                // SAFETY: kill(2) with negative pid signals the process group;
-                // no memory implications. ESRCH (group already gone) is
-                // expected and is not surfaced as an error.
-                let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
-                if rc != 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() != Some(libc::ESRCH) {
-                        report.kill_failures.push((group_id, err.to_string()));
-                    }
+        #[cfg(unix)]
+        {
+            // SAFETY: kill(2) with negative pid signals the process group;
+            // no memory implications. ESRCH (group already gone) is expected.
+            let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    report.kill_failures.push((group_id, err.to_string()));
                 }
             }
         }
     }
 
-    // The handle table was actually removed (and any live process groups
-    // SIGKILL'd), so the scope's inventory is now empty. Publish a lifecycle
-    // edge so the work-scope bridge re-broadcasts the refreshed (empty)
-    // inventory — without it, a scope with no tmux/browser change to drive
-    // the bridge would leave the collapsed work-scope badge showing the
-    // killed handles (REQ-WSUI-007). NOT emitted on the preserved early
-    // return above, where nothing changed.
-    registry.emit_lifecycle(
-        work_scope,
-        None,
-        BashLifecyclePhase::Terminal,
-        None,
-        Some(BashTerminalEffect::InventoryOnly),
-    );
+    if !handles.is_empty() {
+        registry.emit_lifecycle(
+            work_scope,
+            None,
+            BashLifecyclePhase::Terminal,
+            None,
+            Some(BashTerminalEffect::InventoryOnly),
+        );
+    }
 
     report
 }

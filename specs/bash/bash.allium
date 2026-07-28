@@ -1226,25 +1226,25 @@ surface AgentBashAccess {
                 < config.live_handle_cap
 
         AgentCallsBashPeek(conversation, handle_id, args)
-            when exists Handle{owner_scope: resolve_bash_lifecycle_scope(conversation), handle_id: handle_id}
+            when exists Handle{handle_id: handle_id}
+            and can_control(conversation, Handle{handle_id: handle_id}.controller_scope)
 
         AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
-            when exists Handle{owner_scope: resolve_bash_lifecycle_scope(conversation), handle_id: handle_id}
+            when exists Handle{handle_id: handle_id}
+            and can_control(conversation, Handle{handle_id: handle_id}.controller_scope)
             and 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
 
         AgentCallsBashKill(conversation, handle_id, signal)
-            when exists Handle{owner_scope: resolve_bash_lifecycle_scope(conversation), handle_id: handle_id}
+            when exists Handle{handle_id: handle_id}
+            and can_control(conversation, Handle{handle_id: handle_id}.controller_scope)
 
     @guarantee HandleOwnership
-        -- Every handle returned to the agent is owned by the agent's
-        -- ResourceScope. The agent cannot inspect, peek, wait on, or kill
-        -- handles owned by other ResourceScopes even if it learns their
-        -- handle_id strings: the lookup is always ResourceScope-keyed and
-        -- HandlePeekNotFound / HandleWaitNotFound / HandleKillNotFound
-        -- treat foreign handles as nonexistent. Conversations that resolve
-        -- to the same ResourceScope (a continuation chain) share one handle
-        -- table, so a handle spawned before a continuation boundary stays
-        -- addressable after it.
+        -- Every handle is stored under its owner ResourceScope and located by
+        -- its globally unique handle_id. Peek, wait, and kill additionally
+        -- require the caller to control the handle's controller_scope, so a
+        -- foreign handle remains unavailable even if its id is learned. A
+        -- continuation chain shares one owner table, while Coordinator-run
+        -- handles remain controllable through their Coordinator scope.
 
     @guarantee NoSilentEviction
         -- Within a single Phoenix process lifetime, a handle handed to the
