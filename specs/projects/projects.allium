@@ -103,10 +103,6 @@ value ApprovedTaskSource {
     kind: taskmd | plain_markdown
 }
 
-value ApprovedTaskObjective {
-    source: ApprovedTaskSource
-}
-
 value ProvisionedWorkScope {
     scope: bedrock/WorkScope
     worktree_path: String
@@ -404,7 +400,7 @@ rule TaskApprovalExecuted {
     ensures: conversation.approved_task_write_authority = bedrock/ApprovedTaskWriteAuthority {
         objective: conversation.approved_task_objective
     }
-    ensures: ApprovedTaskContinuedHere(conversation, ApprovedTaskObjective { source: approved_source })
+    ensures: ApprovedTaskContinuedHere(conversation, bedrock/ApprovedTaskObjective { source: approved_source })
 
     @guidance
         -- Continue here reuses the existing attached WorkScope/worktree. Approval
@@ -444,7 +440,7 @@ rule TaskApprovalNewConversationExecuted {
         approved_body: approved_source.body
     )
     ensures: ApprovedTaskSourceRecorded(target, approved_source)
-    ensures: ApprovedTaskDerivedFromRecorded(source_conversation.product_conversation, target, ApprovedTaskObjective { source: approved_source })
+    ensures: ApprovedTaskDerivedFromRecorded(source_conversation.product_conversation, target, bedrock/ApprovedTaskObjective { source: approved_source })
     ensures: CreatedFromApprovedTask(target, approved_source)
     ensures: FreshGitWorktreeProvisioningRequested(target, repository_identity)
 
