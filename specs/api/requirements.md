@@ -238,9 +238,12 @@ THE SYSTEM SHALL include in the init payload:
 - `last_sequence_id`: the same RootStreamLedger-derived root-stream watermark used by live delivery
 
 WHEN the server emits any aggregate-bound live SSE carrier (message, token, state_change, message_updated, agent_done, conversation_update, product_conversation_lifecycle, continuation_boundary, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
-THE SYSTEM SHALL allocate or reuse one root-stream sequence_id from the RootStreamLedger before broadcast
+THE SYSTEM SHALL materialize one closed typed aggregate-bound live envelope for that carrier
+AND SHALL allocate or reuse one root-stream sequence_id from the RootStreamLedger before broadcast
 AND SHALL carry the root ProductConversation id plus that `root_sequence_id` on the live envelope
 AND SHALL include member conversation identity on carriers sourced from one transcript member rather than from the aggregate itself
+AND SHALL append the same root-keyed envelope to replay and surface the same ledger watermark through init
+WHERE `init` is excluded because it is per-subscriber, `conversation_hard_deleted` is excluded because it is terminal and non-replayable, and `work_scope_update` is excluded because it is not an authoritative aggregate-bound carrier in the root-stream contract
 SO THAT live delivery, replay, and init snapshots share one authoritative ordering space
 
 WHEN the server process restarts

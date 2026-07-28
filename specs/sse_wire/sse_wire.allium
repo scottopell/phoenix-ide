@@ -162,6 +162,14 @@ value ContinuationBoundaryPayload {
     summary: String
 }
 
+value AggregateBoundLiveEvent {
+    root_conversation_id: String
+    root_sequence_id: Integer
+    carrier_kind: AggregateBoundLiveCarrierKind
+    member_conversation_id: String?
+    payload_identity: String
+}
+
 
 ------------------------------------------------------------
 -- Entities
@@ -278,6 +286,14 @@ entity SseStream {
 ------------------------------------------------------------
 
 enum StreamStatus { open | closed }
+enum AggregateBoundLiveCarrierKind {
+    message | state_change | token | message_updated | agent_done |
+    conversation_update | product_conversation_lifecycle |
+    continuation_boundary | error | browser_session_state |
+    steer_message_queued | rate_limit_snapshot | llm_first_byte |
+    llm_attempt
+}
+
 
 ------------------------------------------------------------
 -- Config
@@ -842,6 +858,75 @@ rule ContinuationBoundaryClaimsRootSequence {
         -- inferred client-side joins.
 }
 
+rule AggregateBoundLiveCarrierEnvelopeAllocated {
+    when: AggregateBoundLiveEnvelopeMaterialized(root_conversation_id, root_sequence_id, carrier_kind, member_conversation_id, payload_identity)
+
+    requires: carrier_kind in {
+        message, state_change, token, message_updated, agent_done,
+        conversation_update, product_conversation_lifecycle,
+        continuation_boundary, error, browser_session_state,
+        steer_message_queued, rate_limit_snapshot, llm_first_byte,
+        llm_attempt
+    }
+
+    ensures: AggregateBoundLiveEvent(
+        root_conversation_id: root_conversation_id,
+        root_sequence_id: root_sequence_id,
+        carrier_kind: carrier_kind,
+        member_conversation_id: member_conversation_id,
+        payload_identity: payload_identity
+    )
+
+    @guidance
+        -- This closed envelope is the structural proof that every aggregate-bound live
+        -- carrier uses the same ProductConversation-scoped RootStreamLedger allocation.
+        -- Producers do not broadcast anonymous seq-bearing payloads: each concrete
+        -- producer first materialises a RootProjectedEventCommitted fact, then that same
+        -- root allocation is reified as the live/replay/init envelope with root identity
+        -- and member identity where applicable. The closed enum makes omission of a
+        -- covered carrier unrepresentable without changing this spec.
+        --
+        -- Member-scoped carriers (`message`, `state_change`, `token`, `message_updated`,
+        -- `agent_done`, `conversation_update`, `error`, `browser_session_state`,
+        -- `steer_message_queued`, `rate_limit_snapshot`, `llm_first_byte`,
+        -- `llm_attempt`) carry the emitting member conversation id; aggregate-native
+        -- carriers (`product_conversation_lifecycle`, `continuation_boundary`) carry
+        -- null there.
+        --
+        -- Explicit exclusions: `init` is per-subscriber and not a live carrier;
+        -- `conversation_hard_deleted` is terminal and cannot participate in replay;
+        -- `work_scope_update` is not an authoritative ProductConversation aggregate-bound
+        -- carrier in this root stream contract and therefore does not allocate from this
+        -- envelope set.
+}
+
+rule AggregateBoundMemberLiveCarrierClaimsRootSequence {
+    when: AggregateBoundMemberEventProduced(member_conversation_id, carrier_kind, payload_identity, seq)
+
+    requires: carrier_kind in {
+        "state_change", "token", "message_updated", "agent_done",
+        "conversation_update", "error", "browser_session_state",
+        "steer_message_queued", "rate_limit_snapshot", "llm_first_byte",
+        "llm_attempt"
+    }
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(member_conversation_id),
+        projected_kind: carrier_kind,
+        payload_identity: payload_identity,
+        root_sequence_id: seq
+    )
+
+    @guidance
+        -- This generic rule covers the authoritative set of aggregate-bound live
+        -- carriers that originate from one transcript member and are emitted through the
+        -- same root SSE stream. Each concrete producer in code (`send_seq` at the member
+        -- broadcaster, bridged onto the root stream) must instantiate one of these closed
+        -- carrier kinds, so root allocation, replay residency, and live broadcast cannot
+        -- silently diverge per carrier.
+}
+
 rule ContinuationBoundaryBroadcast {
     when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, summary, seq)
 
@@ -918,6 +1003,11 @@ rule ConversationUpdateBroadcast {
         for stream in SseStreams where conversation_id = conv_id and status = open and init_sent:
             stream.last_delivered_seq = seq
             stream.last_update = update
+
+    @guidance
+        -- conversation_update is member-scoped even when the changed field is also shown
+        -- on aggregate views. Its root-stream envelope therefore carries both the root
+        -- ProductConversation id and the emitting member identity.
 }
 
 ------------------------------------------------------------
@@ -944,6 +1034,136 @@ rule TokenBroadcast {
         --
         -- No StreamMessage is created for tokens: they are ephemeral
         -- and PersistBeforeBroadcast does not apply to them.
+}
+
+rule TokenClaimsRootSequence {
+    when: LlmTokenReceived(conv_id, request_id, text, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "token",
+        payload_identity: TokenIdentity(request_id, seq),
+        root_sequence_id: seq
+    )
+}
+
+rule StateChangeClaimsRootSequence {
+    when: ConversationStateTransitioned(conv_id, new_state, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "state_change",
+        payload_identity: StateChangeIdentity(conv_id, seq),
+        root_sequence_id: seq
+    )
+}
+
+rule MessageUpdatedClaimsRootSequence {
+    when: MessageFieldsMutated(conv_id, message_id, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "message_updated",
+        payload_identity: message_id,
+        root_sequence_id: seq
+    )
+}
+
+rule AgentDoneClaimsRootSequence {
+    when: LlmTurnCompleted(conv_id, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "agent_done",
+        payload_identity: AgentDoneIdentity(conv_id, seq),
+        root_sequence_id: seq
+    )
+}
+
+rule ErrorClaimsRootSequence {
+    when: UserFacingErrorOccurred(conv_id, error, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "error",
+        payload_identity: ErrorIdentity(conv_id, seq),
+        root_sequence_id: seq
+    )
+}
+
+rule BrowserSessionStateClaimsRootSequence {
+    when: AggregateBoundMemberEventProduced(conv_id, "browser_session_state", payload_identity, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "browser_session_state",
+        payload_identity: payload_identity,
+        root_sequence_id: seq
+    )
+}
+
+rule SteerMessageQueuedClaimsRootSequence {
+    when: AggregateBoundMemberEventProduced(conv_id, "steer_message_queued", payload_identity, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "steer_message_queued",
+        payload_identity: payload_identity,
+        root_sequence_id: seq
+    )
+}
+
+rule RateLimitSnapshotClaimsRootSequence {
+    when: AggregateBoundMemberEventProduced(conv_id, "rate_limit_snapshot", payload_identity, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "rate_limit_snapshot",
+        payload_identity: payload_identity,
+        root_sequence_id: seq
+    )
+}
+
+rule LlmFirstByteClaimsRootSequence {
+    when: AggregateBoundMemberEventProduced(conv_id, "llm_first_byte", payload_identity, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "llm_first_byte",
+        payload_identity: payload_identity,
+        root_sequence_id: seq
+    )
+}
+
+rule LlmAttemptClaimsRootSequence {
+    when: AggregateBoundMemberEventProduced(conv_id, "llm_attempt", payload_identity, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "llm_attempt",
+        payload_identity: payload_identity,
+        root_sequence_id: seq
+    )
 }
 
 -- When an LLM turn completes, agent_done is broadcast. The client uses
@@ -1122,6 +1342,18 @@ invariant EveryRootProjectedFactUsesRootStreamLedger {
     for stream in SseStreams:
         exists RootStreamLedger{root_conversation_id: stream.conversation_id}
             and stream.init_snapshot.last_sequence_id <= RootStreamLedger{root_conversation_id: stream.conversation_id}.last_allocated_root_sequence_id
+}
+
+
+invariant AggregateBoundLiveEnvelopeCoversClosedCarrierSet {
+    for event in AggregateBoundLiveEvents:
+        event.carrier_kind in {
+            message, state_change, token, message_updated, agent_done,
+            conversation_update, product_conversation_lifecycle,
+            continuation_boundary, error, browser_session_state,
+            steer_message_queued, rate_limit_snapshot, llm_first_byte,
+            llm_attempt
+        }
 }
 
 -- Ring entries are in strictly increasing sequence_id order. Not
