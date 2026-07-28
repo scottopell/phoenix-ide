@@ -10,6 +10,7 @@
 -- Includes: All SSE event types (init, message, message_updated,
 --           state_change, token, llm_first_byte, llm_attempt, agent_done,
 --           conversation_hard_deleted, conversation_update,
+--           product_conversation_lifecycle,
 --           continuation_boundary, browser_session_state, steer_message_queued,
 --           rate_limit_snapshot, error); ordering constraints between them;
 --           the persist-before-broadcast invariant; broadcast-lag semantics;
@@ -88,8 +89,8 @@ value InitSnapshot {
 -- full set defined by `crates/phoenix-ide/src/api/wire.rs::event_type`
 -- is:
 --   "init", "message", "message_updated", "state_change", "token",
---   "agent_done", "conversation_update", "continuation_boundary", "error",
---   "browser_session_state",
+--   "agent_done", "conversation_update", "product_conversation_lifecycle",
+--   "continuation_boundary", "error", "browser_session_state",
 --   "steer_message_queued", "rate_limit_snapshot",
 --   "conversation_hard_deleted", "llm_first_byte", "llm_attempt"
 --
@@ -97,7 +98,8 @@ value InitSnapshot {
 --   - "message" enters the ring via the eager-assistant path
 --     (EagerAssistantMessageAppendedToReplayRing below).
 --   - "token", "state_change", "message_updated", "agent_done",
---     "conversation_update", "continuation_boundary", "error", "browser_session_state",
+--     "conversation_update", "product_conversation_lifecycle",
+--     "continuation_boundary", "error", "browser_session_state",
 --     "steer_message_queued",
 --     "rate_limit_snapshot", "llm_first_byte", "llm_attempt" enter
 --     via the ephemeral path (EphemeralEventAppendedToReplayRing
@@ -149,6 +151,11 @@ value ConversationMetadataUpdate {
     -- task_title: opaque
 }
 
+value ProductConversationLifecycleUpdate {
+    root_conversation_id: String
+    lifecycle: String
+}
+
 value ContinuationBoundaryPayload {
     predecessor_conversation_id: String
     successor_conversation_id: String
@@ -173,6 +180,7 @@ entity PersistedMessage {
 entity ProjectedTranscriptRow {
     root_conversation_id: String
     member_conversation_id: String
+    message_id: String
     member_sequence_id: Integer
     root_sequence_id: Integer
 }
@@ -452,16 +460,15 @@ rule PersistedTranscriptMessageProjectsIntoRootStream {
     when: msg: PersistedMessage.created
 
     let root_id = DurableRootOf(msg.conversation_id)
-    let ledger = RootStreamLedger{root_conversation_id: root_id}
     let allocated_root_seq = NextRootSequenceForPersistedMessage(msg)
 
     ensures: ProjectedTranscriptRow.created(
         root_conversation_id: root_id,
         member_conversation_id: msg.conversation_id,
+        message_id: msg.message_id,
         member_sequence_id: msg.sequence_id,
         root_sequence_id: allocated_root_seq
     )
-    ensures: ledger.last_allocated_root_sequence_id = allocated_root_seq
 
     @guidance
         -- Persisted messages remain the only transcript content authority. The wire
@@ -612,7 +619,8 @@ rule PersistedMessageClearsReplayRing {
 
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
--- continuation_boundary, error, browser_session_state,
+-- product_conversation_lifecycle, continuation_boundary, error,
+-- browser_session_state,
 -- steer_message_queued, rate_limit_snapshot, llm_first_byte,
 -- llm_attempt. Excludes Init (per-stream, never broadcast) and
 -- ConversationHardDeleted (terminal action; no subsequent init can
@@ -642,7 +650,8 @@ rule EphemeralEventAppendedToReplayRing {
 
     requires: entry.event_type in {
         "token", "state_change", "message_updated", "agent_done",
-        "conversation_update", "continuation_boundary", "error",
+        "conversation_update", "product_conversation_lifecycle",
+        "continuation_boundary", "error",
         "browser_session_state", "steer_message_queued",
         "rate_limit_snapshot", "llm_first_byte", "llm_attempt"
     }
@@ -764,29 +773,73 @@ rule StateChangeBroadcast {
         -- display_state is a human-readable string derived from new_state.
 }
 
--- Partial conversation metadata changes are broadcast as conversation_update.
--- The client merges the payload shallowly onto its local Conversation copy.
-rule RootStreamLedgerAllocatesMonotonicSequenceForEveryProjectedEvent {
-    when: RootProjectedEventRequested(root_conversation_id, projected_kind, payload_identity)
+-- RootStreamLedger allocates one monotonic root_sequence_id for every concrete
+-- aggregate-bound carrier emitted on the root conversation stream. Each producer
+-- below requests allocation explicitly; there is no detached abstract request
+-- event with no concrete broadcaster.
+rule ProjectedTranscriptMessageClaimsRootSequence {
+    when: msg: PersistedMessage.created
 
-    let ledger = RootStreamLedger{root_conversation_id: root_conversation_id}
-    let next_seq = NextRootSequence(root_conversation_id)
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(msg.conversation_id),
+        projected_kind: "message",
+        payload_identity: msg.message_id,
+        root_sequence_id: NextRootSequenceForPersistedMessage(msg)
+    )
+
+    @guidance
+        -- Transcript row projection is itself the concrete root-stream producer for
+        -- persisted message carriers. The committed root_sequence_id is the same one
+        -- written onto ProjectedTranscriptRow, emitted to live subscribers, inserted
+        -- into the root-keyed replay ring when replayable, and surfaced as init's
+        -- last_sequence_id.
+}
+
+rule ConversationUpdateClaimsRootSequence {
+    when: ConversationMetadataChanged(conv_id, update, seq)
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "conversation_update",
+        payload_identity: ConversationUpdateIdentity(conv_id, seq),
+        root_sequence_id: seq
+    )
+
+    @guidance
+        -- conversation_update is a concrete aggregate-bound carrier. Even when the
+        -- metadata came from one member row, the live envelope rides the root ledger
+        -- and therefore carries root identity plus member identity when relevant.
+}
+
+rule ProductConversationLifecycleClaimsRootSequence {
+    when: ProductConversationLifecycleProjected(root_conversation_id, lifecycle, seq)
 
     ensures: RootProjectedEventCommitted(
         root_conversation_id: root_conversation_id,
-        projected_kind: projected_kind,
-        payload_identity: payload_identity,
-        root_sequence_id: next_seq
+        projected_kind: "product_conversation_lifecycle",
+        payload_identity: ProductConversationLifecycleIdentity(root_conversation_id, lifecycle, seq),
+        root_sequence_id: seq
     )
-    ensures: ledger.last_allocated_root_sequence_id = next_seq
 
     @guidance
-        -- ProductConversation is the only root-stream sequencing boundary. Any live
-        -- root event carrier, replayable projection, or init-visible projected fact
-        -- must first claim one root_sequence_id from RootStreamLedger. The same
-        -- sequence then rides the live SSE envelope, the replay ring entry if
-        -- replayable, and the init snapshot watermark so all three views share one
-        -- monotonic ledger.
+        -- The aggregate lifecycle carrier is replayable and uses the same root ledger
+        -- as transcript rows and metadata updates, so a continuous client and a
+        -- reconnecting client consume one authoritative Open/History fact.
+}
+
+rule ContinuationBoundaryClaimsRootSequence {
+    when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, summary, seq)
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: root_conversation_id,
+        projected_kind: "continuation_boundary",
+        payload_identity: ContinuationBoundaryIdentity(predecessor_conversation_id, successor_conversation_id),
+        root_sequence_id: seq
+    )
+
+    @guidance
+        -- Continuation boundaries are concrete replayable root-stream carriers, not
+        -- inferred client-side joins.
 }
 
 rule ContinuationBoundaryBroadcast {
@@ -829,6 +882,12 @@ rule AggregateLifecycleProjectionBroadcast {
     when: ProductConversationLifecycleProjected(root_conversation_id, lifecycle, seq)
 
     requires: seq > 0
+    requires: ProductConversationLifecyclePayloadParses(
+        ProductConversationLifecycleUpdate{
+            root_conversation_id: root_conversation_id,
+            lifecycle: lifecycle
+        }
+    )
 
     ensures:
         for stream in SseStreams where conversation_id = root_conversation_id and status = open and init_sent:
@@ -840,13 +899,16 @@ rule AggregateLifecycleProjectionBroadcast {
         -- History projection; the whole aggregate lifecycle appears atomically from
         -- the UI perspective.
         --
-        -- This aggregate lifecycle projection is the authoritative replacement for any
-        -- row-local terminal event on the root conversation stream. The event list/ring
-        -- treat the lifecycle projection consistently, and reconnect correctness comes
-        -- from replaying that authoritative projection rather than from any legacy
-        -- row-local terminal carrier.
+        -- The authoritative live carrier is the typed
+        -- `product_conversation_lifecycle` envelope whose discriminator is distinct
+        -- from partial metadata `conversation_update`. It is replayable, root-keyed,
+        -- and consumed both by stable root subscribers and reconnecting clients to
+        -- update Open/History placement plus any UI derived from aggregate lifecycle.
 }
 
+-- Partial conversation metadata changes are broadcast as conversation_update.
+-- The client merges the payload shallowly onto its local Conversation copy while
+-- treating root_sequence_id as the aggregate stream watermark.
 rule ConversationUpdateBroadcast {
     when: ConversationMetadataChanged(conv_id, update, seq)
 
@@ -1034,6 +1096,11 @@ invariant ContinuationBoundaryProjectionCarriesDurableSummary {
 -- watermark, replayable projection, and live root-stream envelope derives from
 -- that ledger, so no parallel unnamed allocator can produce a competing root
 -- ordering.
+invariant RootProjectedMessagesReuseLedgerAllocations {
+    for row in ProjectedTranscriptRows:
+        exists RootProjectedEventCommitted{root_conversation_id: row.root_conversation_id, projected_kind: "message", payload_identity: row.message_id, root_sequence_id: row.root_sequence_id}
+}
+
 invariant RootStreamLedgerIsMonotonicAndAuthoritative {
     for ledger in RootStreamLedgers:
         ledger.last_allocated_root_sequence_id >= 0

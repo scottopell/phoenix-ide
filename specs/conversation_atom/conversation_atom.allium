@@ -89,6 +89,11 @@ value UIError {
     message: String
 }
 
+value ProductConversationLifecycle {
+    root_conversation_id: String
+    lifecycle: String
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -97,6 +102,7 @@ value UIError {
 -- actions.
 entity ConversationAtom {
     conversationId: String?
+    productLifecycle: ProductConversationLifecycle?
     phase: Phase
     messages: List<Message>
     transcriptGeneration: Integer?
@@ -174,6 +180,7 @@ rule WireActionStaleEpochDropped {
         -- atom.ts:256-280 (isStaleEpoch). Applies to:
         -- sse_init, sse_message, sse_message_updated, sse_state_change,
         -- sse_agent_done, sse_token, sse_conversation_update,
+        -- sse_product_conversation_lifecycle,
         -- sse_browser_session_state, sse_error, connection_state.
         -- Bypassed for: connection_opened (which carries the epoch as
         -- DATA, not as a stamp — the rule's monotonic check is the
@@ -512,6 +519,24 @@ rule SseConversationUpdateApplied {
         -- Shallow merge into atom.conversation. If atom.conversation is
         -- null (before init), the rule applies lastSequenceId but leaves
         -- the merge as a no-op.
+}
+
+-- `product_conversation_lifecycle` — authoritative Open/History lifecycle fact
+-- for the stable root subscriber. Applied through the same root-sequence replay
+-- guard as every other aggregate-bound event.
+rule SseProductConversationLifecycleApplied {
+    when: SseProductConversationLifecycleDispatched(atom, lifecycle_update, seq)
+
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.productLifecycle = lifecycle_update
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- The conversation page consumes this typed lifecycle carrier to keep
+        -- Open/History placement and any lifecycle-derived affordances in sync for
+        -- continuously connected clients and reconnecting clients alike. It replaces
+        -- any row-local terminal event consumer.
 }
 
 -- `sse_error` with a sequence_id (wire-originated) routes through

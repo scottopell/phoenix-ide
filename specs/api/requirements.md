@@ -205,12 +205,13 @@ AND apply appropriate cache headers
 
 ### REQ-API-012: Reconnect Replay Buffer
 
-WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, continuation_boundary, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
-THE SYSTEM SHALL retain the event in a per-conversation in-memory ring buffer until the next persisted Message broadcast replaces it (anchor reset)
+WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, product_conversation_lifecycle, continuation_boundary, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
+THE SYSTEM SHALL retain the event in a root-keyed in-memory ring buffer until the next persisted transcript-anchor broadcast replaces it (anchor reset)
 
 WHEN the server emits an eager (non-persisted) assistant Message via the runtime's BroadcastAssistantMessage effect
-THE SYSTEM SHALL append the Message event to the ring buffer without resetting the anchor
-SO THAT a subscriber connecting before the corresponding persist_checkpoint completes still receives the in-flight assistant message
+THE SYSTEM SHALL request one root-stream sequence allocation from the RootStreamLedger for the enclosing ProductConversation
+AND SHALL append the Message event to the root-keyed ring buffer without resetting the anchor
+SO THAT a stable root subscriber connecting before the corresponding persist_checkpoint completes still receives the in-flight assistant message
 
 WHEN the ring buffer reaches its capacity (default 512 entries)
 THE SYSTEM SHALL discard all entries (clear the ring)
@@ -229,11 +230,18 @@ WHERE the metric is observability-only (the cap is enforced by entry count, not 
 AND the accessor (`replay_ring_bytes()`) is intended for periodic scraping (gauge collector / dashboard), NOT per-event tracking
 SO THAT pathological large-event-dominated rings can be detected before they become a memory issue, without making token streaming pay a `serde_json::to_vec` on every append
 
-WHEN a client subscribes to a conversation's SSE stream
+WHEN a client subscribes to a conversation's stable root SSE stream
 THE SYSTEM SHALL include in the init payload:
 - `pending_anchor_sequence_id`: the root aggregate envelope sequence_id of the last persisted transcript anchor carried on the stream
-- `pending_events`: the ordered ring entries with root-stream sequence_ids strictly greater than the anchor
+- `pending_events`: the ordered root-keyed ring entries with root-stream sequence_ids strictly greater than the anchor
 - `pending_truncated`: whether the ring overflowed since the anchor
+- `last_sequence_id`: the same RootStreamLedger-derived root-stream watermark used by live delivery
+
+WHEN the server emits any aggregate-bound live SSE carrier (message, token, state_change, message_updated, agent_done, conversation_update, product_conversation_lifecycle, continuation_boundary, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
+THE SYSTEM SHALL allocate or reuse one root-stream sequence_id from the RootStreamLedger before broadcast
+AND SHALL carry the root ProductConversation id plus that `root_sequence_id` on the live envelope
+AND SHALL include member conversation identity on carriers sourced from one transcript member rather than from the aggregate itself
+SO THAT live delivery, replay, and init snapshots share one authoritative ordering space
 
 WHEN the server process restarts
 THE SYSTEM SHALL discard the ring buffer
