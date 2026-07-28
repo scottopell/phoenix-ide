@@ -2098,6 +2098,30 @@ surface UserConversation {
                  and conversation.continued_in_conv_id = absent
                  and conversation.product_lifecycle = open
 
+        UserCancelsClose(conversation.product_conversation, close.attempt_id)
+            when exists close in CloseObligation{product_conversation: conversation.product_conversation}
+                 and close.phase in {
+                    awaiting_blocker_resolution,
+                    awaiting_stop_work_confirmation,
+                    awaiting_retirement_inspection,
+                    awaiting_loss_confirmation,
+                    settling_active_work,
+                    cancel_requested_during_settlement
+                 }
+        UserConfirmsStopWorkAndContinueClosing(conversation.product_conversation, close.attempt_id)
+            when exists close in CloseObligation{product_conversation: conversation.product_conversation}
+                 and close.phase = awaiting_stop_work_confirmation
+        UserConfirmsCloseAfterRetirementInspection(
+            conversation.product_conversation,
+            close.attempt_id,
+            close.inspection_generation,
+            close.inspection_fingerprint
+        )
+            when exists close in CloseObligation{product_conversation: conversation.product_conversation}
+                 and close.phase = awaiting_loss_confirmation
+                 and close.inspection_generation != absent
+                 and close.inspection_fingerprint != absent
+
     @guarantee IdempotentMessages
         -- Duplicate message submissions (same message_id) are
         -- silently accepted without creating duplicate messages.

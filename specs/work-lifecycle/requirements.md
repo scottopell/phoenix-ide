@@ -75,18 +75,32 @@ THE SYSTEM SHALL allow retirement to proceed without a discard confirmation
 WHEN retirement inspection completes for an attached Git-backed `WorkScope`
 THE SYSTEM SHALL produce an inspection generation and workspace fingerprint together with the categorized results
 
+WHEN that inspection requires discard confirmation
+THE SYSTEM SHALL expose one concrete user-facing discard-confirmation affordance that issues `UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)`
+AND SHALL expose that affordance only while the exact active Close obligation for that `product_conversation` remains in `awaiting_loss_confirmation`
+AND SHALL bind that affordance to the exact active Close-attempt identity, inspection generation, and workspace fingerprint currently held on that Close obligation
+AND SHALL NOT expose that affordance for any stale inspection, completed Close attempt, superseded Close attempt, or non-active transcript row within the same product conversation
+
 WHEN the user confirms discard after a warning-producing inspection
 THE SYSTEM SHALL bind that confirmation to the exact inspection generation and workspace fingerprint that justified the warning
+AND SHALL route the confirmation through the same atomic recomputation boundary that decides whether destructive retirement may begin
 
 WHEN the workspace changes after inspection and before destructive retirement begins
 THE SYSTEM SHALL invalidate the outstanding confirmation
 AND SHALL require reinspection before retirement may proceed
+
+WHEN the user declines to continue from that warning state before destructive retirement begins
+THE SYSTEM SHALL preserve bedrock's pre-retirement `UserCancelsClose(product_conversation, attempt_id)` cancellation path as the only cancel affordance
+AND SHALL NOT reinterpret that cancellation as a discard confirmation
 
 WHEN a product conversation has no attached `WorkScope` that owns a Git-backed worktree
 THE SYSTEM SHALL skip worktree-loss inspection
 AND SHALL emit the no-confirmation inspection outcome for that exact Close attempt
 AND SHALL NOT require a discard confirmation that implies worktree-owned loss
 AND SHALL NOT let the presence of other attached non-worktree scopes bypass inspection for any simultaneously attached worktree-owning scope
+
+WHEN a discard-confirmation request arrives with a stale, mismatched, or no-longer-active generation/fingerprint pair
+THE SYSTEM SHALL treat it as a typed inspection-mismatch path that returns the Close flow to reinspection rather than beginning destructive retirement
 
 **Rationale:** The confirmation is only trustworthy for the exact inspected workspace. A changed workspace must not inherit stale approval to discard different state.
 

@@ -28,22 +28,26 @@ root.
 over three `WorkScope`-keyed registries. The pull handler mirrors
 `get_conversation`, keyed by `WorkScope::stable_key()`. The push path adds a
 `WorkScopeUpdate` variant to `SseWireEvent` (full-snapshot-on-change, no
-deltas) and registers it as a per-stream `ReplayRing` member so a reconnecting
-client gets the latest snapshot; both are carried through the ts_rs codegen
-path (`#[derive(TS)]` + `export_to ui/src/generated/`, then
-`./dev.py codegen`, plus a valibot schema in `sseSchemas.ts`). Routing targets
-the single non-terminal conversation in the scope — sound because
-`specs/projects/` REQ-PROJ-025 (`OneBranchOneActiveWorktree`) guarantees at most
-one non-terminal conversation per scope — reusing the conversation→scope
-resolution the browser lifecycle bridge already performs, with scope caching on
-the runtime handle as a latency optimization. On the client, a `workScope` field
-is added to `ConversationAtom` with a reducer branch guarded by `applyIfNewer`
-(mirroring `sse_state_change`); `useConversationView` field-level isolation keeps
-inventory changes from churning the transcript. On the conversation page the
-work scope is a section in the left `FileExplorerPanel`, stacked with
-Files/Skills/Tasks and always present; the chain page, which has no left panel,
-uses a standalone right-adjacent dock that shares the same resource rows.
-The pull projection attaches one timestamped, deduplicated scope aggregate and per-handle health from the same demand-driven observation generation used by `/about` and process inspectors; lifecycle-only snapshots remain valid where native metrics are unavailable.
+deltas) and registers it as a root-stream `ReplayRing` member so a reconnecting
+client gets the latest aggregate snapshot. The wire event carries the root
+`product_conversation` identity, a root-stream `sequence_id`, and the refreshed
+inventory for the attached scope; both pull and push are carried through the
+`ts_rs` codegen path (`#[derive(TS)]` + `export_to ui/src/generated/`, then
+`./dev.py codegen`, plus a valibot schema in `sseSchemas.ts`). Routing resolves
+the owning open product conversation from the stable attached-`WorkScope`
+relation, not from the latest transcript row and not from a single-nonterminal-
+row assumption. The latest execution row still supplies only live execution
+state for the unified surface. On the client, a `workScope` field is added to
+`ConversationAtom` with a reducer branch guarded by `applyIfNewer` (mirroring
+`sse_state_change`); `useConversationView` field-level isolation keeps inventory
+changes from churning the transcript. On the conversation page the work scope
+is a section in the left `FileExplorerPanel`, stacked with Files/Skills/Tasks
+and always present; the chain page, which has no left panel, uses a standalone
+right-adjacent dock that shares the same resource rows. The pull projection
+attaches one timestamped, deduplicated scope aggregate and per-handle health
+from the same demand-driven observation generation used by `/about` and process
+inspectors; lifecycle-only snapshots remain valid where native metrics are
+unavailable.
 
 No Allium spec accompanies this spec: the feature is a read-projection plus a
 full-snapshot push over resource state whose lifecycles are already modeled by
@@ -63,8 +67,8 @@ correct weight (see `design.md`, "Why No Allium Spec").
 | **REQ-WSUI-006:** Inventory Pull Endpoint | Complete | `GET /api/work-scope/:scope_key/inventory`; `get_conversation` shape |
 | **REQ-WSUI-006b:** Browser Session Stop Endpoint | Complete | Queue-only stop for current scope plus the pre-rekey conversation scope during Explore-to-Work approval |
 | **REQ-WSUI-007:** Inventory Push Event | Complete | `WorkScopeUpdate` `SseWireEvent`; full snapshot, no deltas |
-| **REQ-WSUI-008:** Push Event Routing | Complete | Single non-terminal conversation per scope (REQ-PROJ-025) |
-| **REQ-WSUI-009:** Chain Page Active-Member Scope Query | Complete | Active (latest) member's scope key, root fallback; standalone dock sharing the section's rows; no per-member fan-out; SSE-less dock polls while collapsed |
+| **REQ-WSUI-008:** Push Event Routing | Complete | Runtime routes scope updates by attached WorkScope to the root ProductConversation stream |
+| **REQ-WSUI-009:** Unified Conversation Surface Resolves Aggregate Scope Once | Complete (legacy current reality) | Shipped chain dock still uses the active chain scope |
 | **REQ-WSUI-010:** Conversation Page Section | Complete | `WorkScopeSection` in left `FileExplorerPanel`, stacked with Files/Skills/Tasks; collapsed-rail badge; atom `workScope` field |
 | **REQ-WSUI-011:** CLI Client Not a Visualization Surface | Complete | `phoenix-client.py` text-only; CLI subcommand is future work |
 
