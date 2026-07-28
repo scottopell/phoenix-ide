@@ -155,6 +155,8 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
 const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "http"),
     ("phoenix_ide::otel", "pr_status.refresh"),
+    ("phoenix_ide::otel", "conversation.stream.init"),
+    ("phoenix_ide::otel", "conversation.runtime.materialize"),
     ("phoenix_ide::otel", "conversation.turn"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
@@ -431,6 +433,18 @@ mod tests {
             );
             drop(pr_refresh);
             drop(http);
+            let stream_init = tracing::info_span!(
+                target: "phoenix_ide::otel",
+                "conversation.stream.init",
+                stream.time_to_init_ms = 42_u64,
+            );
+            let runtime_materialize = tracing::info_span!(
+                target: "phoenix_ide::otel",
+                "conversation.runtime.materialize",
+                runtime.materialization_ms = 84_u64,
+            );
+            drop(stream_init);
+            drop(runtime_materialize);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
                 "llm.request",
@@ -479,13 +493,19 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 3);
+        assert_eq!(spans.len(), 5);
         assert_eq!(
             spans
                 .iter()
                 .map(|span| span.name.as_ref())
                 .collect::<Vec<_>>(),
-            ["pr_status.refresh", "http", "llm.request"]
+            [
+                "pr_status.refresh",
+                "http",
+                "conversation.stream.init",
+                "conversation.runtime.materialize",
+                "llm.request"
+            ]
         );
         assert!(spans.iter().all(|span| span.events.is_empty()));
         let llm_span = spans

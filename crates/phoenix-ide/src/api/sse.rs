@@ -20,6 +20,46 @@ use tokio_stream::StreamExt;
 
 const CONVERSATION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Short-lived trace for the work required to produce the first usable SSE
+/// init item. Unlike the HTTP stream span, this ends when init is serialized
+/// and yielded, not when the long-lived `EventSource` disconnects.
+pub(crate) struct SseInitTrace {
+    started: std::time::Instant,
+    span: tracing::Span,
+}
+
+impl SseInitTrace {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            span: tracing::info_span!(
+                target: "phoenix_ide::otel",
+                "conversation.stream.init",
+                "stream.broadcaster_reservation_ms" = tracing::field::Empty,
+                "stream.transcript_read_ms" = tracing::field::Empty,
+                "stream.metadata_hydration_ms" = tracing::field::Empty,
+                "stream.serialization_ms" = tracing::field::Empty,
+                "stream.time_to_init_ms" = tracing::field::Empty,
+                "stream.message_count" = tracing::field::Empty,
+            ),
+        }
+    }
+
+    pub(crate) fn record_ms(&self, field: &'static str, duration: Duration) {
+        self.span.record(
+            field,
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        );
+    }
+
+    pub(crate) fn record_message_count(&self, count: usize) {
+        self.span.record(
+            "stream.message_count",
+            u64::try_from(count).unwrap_or(u64::MAX),
+        );
+    }
+}
+
 fn conversation_keep_alive() -> KeepAlive {
     KeepAlive::new()
         .interval(CONVERSATION_KEEPALIVE_INTERVAL)
@@ -49,11 +89,18 @@ pub fn sse_stream(
     conv_id: String,
     init_event: SseEvent,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
+    init_trace: Option<SseInitTrace>,
 ) -> impl IntoResponse {
-    let init =
-        futures::stream::once(
-            async move { Ok::<Event, Infallible>(sse_event_to_axum(init_event)) },
-        );
+    let init = futures::stream::once(async move {
+        let serialization_started = std::time::Instant::now();
+        let event = sse_event_to_axum(init_event);
+        if let Some(trace) = init_trace {
+            trace.record_ms("stream.serialization_ms", serialization_started.elapsed());
+            trace.record_ms("stream.time_to_init_ms", trace.started.elapsed());
+            drop(trace);
+        }
+        Ok::<Event, Infallible>(event)
+    });
 
     let broadcasts = BroadcastStream::new(broadcast_rx)
         .take_while(move |result| match result {

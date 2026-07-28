@@ -19,7 +19,7 @@ use super::lifecycle_handlers::{
     dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_commission_review, reject_task,
     request_changes_on_fork_proposal, task_feedback,
 };
-use super::sse::sse_stream;
+use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
     AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
     CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
@@ -66,6 +66,7 @@ use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tower_http::trace::TraceLayer;
@@ -2261,17 +2262,14 @@ struct StreamConversationQuery {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamDbMessageSelection {
-    Full,
+    Latest,
     AfterFloor(i64),
     None,
 }
 
 impl StreamDbMessageSelection {
-    fn message_snapshot(self) -> crate::runtime::MessageSnapshotMode {
-        match self {
-            Self::Full => crate::runtime::MessageSnapshotMode::Full,
-            Self::AfterFloor(_) | Self::None => crate::runtime::MessageSnapshotMode::Suffix,
-        }
+    fn message_snapshot() -> crate::runtime::MessageSnapshotMode {
+        crate::runtime::MessageSnapshotMode::Suffix
     }
 }
 
@@ -2323,6 +2321,7 @@ struct AroundMessagesQuery {
 }
 
 const MAX_EXACT_MESSAGE_RANGE_SPAN: i64 = 10_000;
+const DEFAULT_MESSAGE_HISTORY_LIMIT: i64 = 50;
 const MAX_MESSAGE_HISTORY_LIMIT: i64 = 500;
 const MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES: usize = 2_048;
 
@@ -3332,7 +3331,7 @@ fn db_message_selection_for_stream(
         .transcript_generation
         .is_some_and(|query_generation| query_generation != transcript_generation)
     {
-        return StreamDbMessageSelection::Full;
+        return StreamDbMessageSelection::Latest;
     }
 
     if cursor_replay_served
@@ -3351,7 +3350,7 @@ fn db_message_selection_for_stream(
         {
             StreamDbMessageSelection::AfterFloor(after_floor)
         }
-        _ => StreamDbMessageSelection::Full,
+        _ => StreamDbMessageSelection::Latest,
     }
 }
 
@@ -3378,14 +3377,15 @@ async fn read_stream_init_messages_with_tail(
             .transcript_generation,
     );
     if attempt > 1 {
-        db_message_selection = StreamDbMessageSelection::Full;
+        db_message_selection = StreamDbMessageSelection::Latest;
     }
     let messages = match db_message_selection {
         StreamDbMessageSelection::None => Vec::new(),
-        StreamDbMessageSelection::Full => db
-            .get_messages(conversation_id)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?,
+        StreamDbMessageSelection::Latest => {
+            get_latest_aligned_messages(db, conversation_id, DEFAULT_MESSAGE_HISTORY_LIMIT)
+                .await?
+                .0
+        }
         StreamDbMessageSelection::AfterFloor(after_floor) => db
             .get_messages_after(conversation_id, after_floor)
             .await
@@ -3400,6 +3400,7 @@ async fn stream_conversation(
     Path(id): Path<String>,
     Query(query): Query<StreamConversationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let init_trace = SseInitTrace::new();
     let conversation_for_runtime = state
         .runtime
         .db()
@@ -3407,38 +3408,31 @@ async fn stream_conversation(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    // Subscribe and snapshot replay coverage before reading DB messages, then
-    // read messages last. If a persisted message races stream-open, it is
-    // therefore either included in the final DB snapshot or has a sequence_id
-    // above the init floor and survives the client's live-event replay guard.
-    let runtime_handle = if stream_state_starts_runtime(&conversation_for_runtime.state) {
-        Some(state.runtime.get_or_create(&id).await)
-    } else {
-        None
-    };
-    let (broadcast_tx, broadcast_rx) = match runtime_handle {
-        None => {
-            let broadcaster = state.runtime.conversation_broadcaster(&id).await;
-            let broadcast_rx = broadcaster.subscribe();
-            (broadcaster, broadcast_rx)
-        }
-        Some(Ok(handle)) => {
-            tracing::debug!(
-                conv_id = %id,
-                receivers_before = handle.broadcast_tx.receiver_count(),
-                "SSE client subscribing"
-            );
-            let broadcast_rx = handle.broadcast_tx.subscribe();
-            (handle.broadcast_tx, broadcast_rx)
-        }
-        Some(Err(e)) if is_invalid_runtime_cwd_error(&e) => {
-            tracing::warn!(conv_id = %id, error = %e, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
-            let broadcaster = state.runtime.conversation_broadcaster(&id).await;
-            let broadcast_rx = broadcaster.subscribe();
-            (broadcaster, broadcast_rx)
-        }
-        Some(Err(e)) => return Err(AppError::Internal(e)),
-    };
+    // Reserve and subscribe the conversation's stable broadcaster before any
+    // snapshot read or runtime materialization. The eventual runtime inherits
+    // this broadcaster, so events cannot fall into a subscribe/start gap.
+    let broadcaster_started = std::time::Instant::now();
+    let broadcast_tx = state.runtime.conversation_broadcaster(&id).await;
+    init_trace.record_ms(
+        "stream.broadcaster_reservation_ms",
+        broadcaster_started.elapsed(),
+    );
+    tracing::debug!(
+        conv_id = %id,
+        receivers_before = broadcast_tx.receiver_count(),
+        "SSE client subscribing"
+    );
+    let broadcast_rx = broadcast_tx.subscribe();
+
+    // Runtime materialization is not part of transport readiness. Its
+    // single-flight owner publishes any failure once on the reserved channel.
+    if stream_state_starts_runtime(&conversation_for_runtime.state) {
+        let runtime = Arc::clone(&state.runtime);
+        let conversation_id = id.clone();
+        tokio::spawn(async move {
+            let _ = runtime.get_or_create(&conversation_id).await;
+        });
+    }
 
     // Snapshot the ReplayRing before the DB message read. The later DB read is
     // the durable catch-up for any persisted Message that commits before init is
@@ -3451,6 +3445,7 @@ async fn stream_conversation(
         cursor_replay_served,
     ) = snapshot_pending_for_stream(&broadcast_tx, &query);
 
+    let transcript_started = std::time::Instant::now();
     let db = state.runtime.db();
     let stable = stable_transcript_read(db, &id, |db, id, attempt| {
         let query = query.clone();
@@ -3469,9 +3464,11 @@ async fn stream_conversation(
     .await?;
     let conversation = stable.conversation;
     let (last_sequence_id, db_message_selection, messages) = stable.value;
+    init_trace.record_ms("stream.transcript_read_ms", transcript_started.elapsed());
+    init_trace.record_message_count(messages.len());
     let highest_message_seq = match db_message_selection {
         StreamDbMessageSelection::None => last_sequence_id,
-        StreamDbMessageSelection::Full | StreamDbMessageSelection::AfterFloor(_) => {
+        StreamDbMessageSelection::Latest | StreamDbMessageSelection::AfterFloor(_) => {
             messages.iter().map(|m| m.sequence_id).max().unwrap_or(0)
         }
     };
@@ -3481,12 +3478,13 @@ async fn stream_conversation(
     );
     broadcast_tx.observe_seq(init_seq);
 
-    let context_window_size = if matches!(db_message_selection, StreamDbMessageSelection::Full) {
-        messages
-            .iter()
-            .filter_map(|m| m.usage_data.as_ref())
-            .next_back()
-            .map_or(0, crate::db::UsageData::context_window_used)
+    let snapshot_context_window_size = messages
+        .iter()
+        .filter_map(|m| m.usage_data.as_ref())
+        .next_back()
+        .map(crate::db::UsageData::context_window_used);
+    let context_window_size = if let Some(context_window_size) = snapshot_context_window_size {
+        context_window_size
     } else {
         state
             .runtime
@@ -3498,6 +3496,7 @@ async fn stream_conversation(
             .map_or(0, crate::db::UsageData::context_window_used)
     };
 
+    let metadata_started = std::time::Instant::now();
     // Derive project_name from the project's canonical_path (repo root dirname).
     let project_name = if let Some(ref project_id) = conversation.project_id {
         state.db.get_project(project_id).await.ok().and_then(|p| {
@@ -3509,7 +3508,10 @@ async fn stream_conversation(
         None
     };
 
-    let mut init_conversation = enrich_conversation_with_seed(&state, &conversation, true).await?;
+    let mut init_conversation = enrich_conversation_with_seed(&state, &conversation, false).await?;
+    // Cached PR information is enrichment, not connection readiness. The live
+    // PR-status hook starts from this init metadata and fills the rail after
+    // the usable transcript is connected.
     if matches!(
         conversation.state,
         ConvState::Provisioning { .. }
@@ -3527,12 +3529,13 @@ async fn stream_conversation(
         }
     }
 
+    init_trace.record_ms("stream.metadata_hydration_ms", metadata_started.elapsed());
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
-        message_snapshot: db_message_selection.message_snapshot(),
+        message_snapshot: StreamDbMessageSelection::message_snapshot(),
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -3544,11 +3547,7 @@ async fn stream_conversation(
         pending_truncated,
     };
 
-    Ok(sse_stream(id, init_event, broadcast_rx))
-}
-
-fn is_invalid_runtime_cwd_error(error: &str) -> bool {
-    error.contains("has an invalid working directory")
+    Ok(sse_stream(id, init_event, broadcast_rx, Some(init_trace)))
 }
 
 // ============================================================
@@ -7253,7 +7252,7 @@ async fn shared_sse_stream(
         pending_truncated,
     };
 
-    Ok(sse_stream(conversation_id, init_event, broadcast_rx))
+    Ok(sse_stream(conversation_id, init_event, broadcast_rx, None))
 }
 
 // ============================================================
@@ -9687,17 +9686,9 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[test]
-    fn db_message_selection_advertises_authoritative_snapshot_mode() {
+    fn db_message_selection_advertises_bounded_suffix_snapshot_mode() {
         assert!(matches!(
-            StreamDbMessageSelection::Full.message_snapshot(),
-            crate::runtime::MessageSnapshotMode::Full
-        ));
-        assert!(matches!(
-            StreamDbMessageSelection::AfterFloor(7).message_snapshot(),
-            crate::runtime::MessageSnapshotMode::Suffix
-        ));
-        assert!(matches!(
-            StreamDbMessageSelection::None.message_snapshot(),
+            StreamDbMessageSelection::message_snapshot(),
             crate::runtime::MessageSnapshotMode::Suffix
         ));
     }
@@ -9732,7 +9723,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 10,
                 1,
             ),
-            StreamDbMessageSelection::Full,
+            StreamDbMessageSelection::Latest,
             "a covering event cursor cannot omit DB messages unless the client also proves it is on the current transcript generation"
         );
         assert_eq!(
@@ -9748,7 +9739,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 10,
                 3,
             ),
-            StreamDbMessageSelection::Full,
+            StreamDbMessageSelection::Latest,
             "a served cursor covering the DB tail cannot omit DB messages when the supplied transcript generation is stale"
         );
         assert_eq!(
@@ -9764,7 +9755,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 10,
                 1,
             ),
-            StreamDbMessageSelection::Full
+            StreamDbMessageSelection::Latest
         );
         assert_eq!(
             db_message_selection_for_stream(
@@ -9779,7 +9770,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 10,
                 1,
             ),
-            StreamDbMessageSelection::Full
+            StreamDbMessageSelection::Latest
         );
     }
 
@@ -9921,7 +9912,7 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn stable_stream_read_forces_full_selection_after_none_generation_race() {
+    async fn stable_stream_read_keeps_latest_selection_after_none_generation_race() {
         let state = make_test_state().await;
         state
             .db
@@ -9972,7 +9963,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let (selection, messages) = stable.value;
         assert_eq!(stable.attempts, 2);
         assert_eq!(stable.conversation.transcript_generation, 2);
-        assert_eq!(selection, StreamDbMessageSelection::Full);
+        assert_eq!(selection, StreamDbMessageSelection::Latest);
         assert_eq!(
             messages.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
             vec![1, 2]
@@ -9980,7 +9971,7 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn stable_stream_read_forces_full_selection_after_after_floor_generation_race() {
+    async fn stable_stream_read_keeps_latest_selection_after_after_floor_generation_race() {
         let state = make_test_state().await;
         state
             .db
@@ -10034,7 +10025,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let (selection, messages) = stable.value;
         assert_eq!(stable.attempts, 2);
         assert_eq!(stable.conversation.transcript_generation, 2);
-        assert_eq!(selection, StreamDbMessageSelection::Full);
+        assert_eq!(selection, StreamDbMessageSelection::Latest);
         assert_eq!(
             messages.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
             vec![1, 2, 3]
@@ -10042,7 +10033,7 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn above_tail_after_floor_stream_selection_reads_full_transcript() {
+    async fn above_tail_after_floor_stream_selection_reads_latest_slice() {
         let state = make_test_state().await;
         state
             .db
@@ -10101,10 +10092,56 @@ pub(crate) mod hard_delete_cascade_tests {
         let (last_sequence_id, selection, messages) = stable.value;
         assert_eq!(stable.attempts, 1);
         assert_eq!(last_sequence_id, 3);
-        assert_eq!(selection, StreamDbMessageSelection::Full);
+        assert_eq!(selection, StreamDbMessageSelection::Latest);
         assert_eq!(
             messages.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
             vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_stream_selection_is_bounded_to_newest_messages() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("stream-bounded-latest", "bounded", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        for idx in 1..=DEFAULT_MESSAGE_HISTORY_LIMIT + 7 {
+            state
+                .db
+                .add_message(
+                    &format!("stream-bounded-latest-{idx}"),
+                    "stream-bounded-latest",
+                    &crate::db::MessageContent::user(format!("m{idx}")),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add message");
+        }
+
+        let (last_sequence_id, selection, messages) = read_stream_init_messages_with_tail(
+            state.runtime.db(),
+            "stream-bounded-latest",
+            &StreamConversationQuery::default(),
+            false,
+            1,
+            get_stream_last_sequence_id(state.runtime.db(), "stream-bounded-latest").await,
+        )
+        .await
+        .expect("bounded stream read");
+
+        assert_eq!(last_sequence_id, DEFAULT_MESSAGE_HISTORY_LIMIT + 7);
+        assert_eq!(selection, StreamDbMessageSelection::Latest);
+        assert_eq!(
+            messages.len(),
+            usize::try_from(DEFAULT_MESSAGE_HISTORY_LIMIT).unwrap()
+        );
+        assert_eq!(messages.first().map(|message| message.sequence_id), Some(8));
+        assert_eq!(
+            messages.last().map(|message| message.sequence_id),
+            Some(DEFAULT_MESSAGE_HISTORY_LIMIT + 7)
         );
     }
 
@@ -10196,7 +10233,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 75,
                 3,
             ),
-            StreamDbMessageSelection::Full
+            StreamDbMessageSelection::Latest
         );
         assert_eq!(
             db_message_selection_for_stream(
@@ -10211,7 +10248,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 75,
                 3,
             ),
-            StreamDbMessageSelection::Full
+            StreamDbMessageSelection::Latest
         );
         assert_eq!(
             db_message_selection_for_stream(
@@ -10226,7 +10263,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 75,
                 3,
             ),
-            StreamDbMessageSelection::Full
+            StreamDbMessageSelection::Latest
         );
     }
 

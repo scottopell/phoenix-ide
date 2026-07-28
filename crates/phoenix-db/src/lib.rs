@@ -7285,6 +7285,75 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get the exact projection consumed by runtime recovery: the newest agent
+    /// plus the suffix beginning at the newest user or skill boundary. If no
+    /// boundary exists, returns the full pre-turn transcript.
+    ///
+    /// Including the newest agent even when it predates the boundary preserves
+    /// `should_auto_continue` for malformed/legacy histories while avoiding all
+    /// unrelated earlier messages in ordinary turn-shaped transcripts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message query or attachment hydration fails.
+    pub async fn get_recovery_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
+        let mut rows = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1
+               AND (
+                   sequence_id >= COALESCE(
+                       (SELECT MAX(sequence_id)
+                        FROM messages
+                        WHERE conversation_id = ?1 AND message_type IN ('user', 'skill')),
+                       0
+                   )
+                   OR sequence_id = (
+                       SELECT MAX(sequence_id)
+                       FROM messages
+                       WHERE conversation_id = ?1 AND message_type = 'agent'
+                   )
+               )
+             ORDER BY sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        hydrate_attachments(&self.pool, &mut rows).await?;
+
+        // Adopted wake results form a consecutive user-message tail. The newest
+        // user boundary above contains only the last result, but recovery must
+        // inspect the entire tail because any non-cancelled terminal requests
+        // auto-resume. Expand only that semantic tail, stopping at the first
+        // ordinary message rather than hydrating older transcript turns.
+        if rows.last().is_some_and(is_adopted_wake_result_message) {
+            let mut cursor = rows.last().map_or(0, |message| message.sequence_id);
+            let mut wake_tail = Vec::new();
+            'tail: loop {
+                let older = self
+                    .get_messages_before(conversation_id, cursor, 64)
+                    .await?;
+                if older.is_empty() {
+                    break;
+                }
+                cursor = older.first().map_or(cursor, |message| message.sequence_id);
+                for message in older.into_iter().rev() {
+                    if !is_adopted_wake_result_message(&message) {
+                        break 'tail;
+                    }
+                    wake_tail.push(message);
+                }
+            }
+            rows.extend(wake_tail);
+            rows.sort_by_key(|message| message.sequence_id);
+            rows.dedup_by_key(|message| message.sequence_id);
+        }
+
+        Ok(rows)
+    }
+
     /// Get messages after a sequence ID
     ///
     /// # Errors
@@ -9258,6 +9327,14 @@ fn parse_project_row(row: SqliteRow) -> Result<Project, sqlx::Error> {
     })
 }
 
+fn is_adopted_wake_result_message(message: &Message) -> bool {
+    message.message_type == MessageType::User
+        && message.display_data.as_ref().is_some_and(|data| {
+            data.get("type").and_then(serde_json::Value::as_str) == Some("wake_result")
+                && data.get("adopted").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+}
+
 /// Parse a message row from the database
 #[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
 fn parse_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
@@ -9340,6 +9417,88 @@ mod tests {
         .await
         .unwrap()
         .expect("cleanup claim")
+    }
+
+    #[tokio::test]
+    async fn recovery_messages_start_at_newest_user_or_skill_boundary() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("recovery-suffix", "slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let contents = [
+            MessageContent::user("old user"),
+            MessageContent::System(SystemContent {
+                text: "old system".into(),
+            }),
+            MessageContent::user("new user"),
+            MessageContent::System(SystemContent {
+                text: "tail system".into(),
+            }),
+        ];
+        for (index, content) in contents.iter().enumerate() {
+            db.add_message(
+                &format!("recovery-message-{index}"),
+                "recovery-suffix",
+                content,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let messages = db.get_recovery_messages("recovery-suffix").await.unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_messages_include_the_complete_adopted_wake_tail() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("recovery-wake-tail", "slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "wake-boundary",
+            "recovery-wake-tail",
+            &MessageContent::user("ordinary"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for (index, terminal) in ["Completed", "Cancelled"].iter().enumerate() {
+            db.add_message(
+                &format!("wake-result-{index}"),
+                "recovery-wake-tail",
+                &MessageContent::user("wake"),
+                Some(&serde_json::json!({
+                    "type": "wake_result",
+                    "adopted": true,
+                    "terminal": { (*terminal): {} },
+                })),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let messages = db
+            .get_recovery_messages("recovery-wake-tail")
+            .await
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[tokio::test]
