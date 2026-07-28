@@ -172,6 +172,47 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
         -- inspection for a mixed-attachment aggregate that still owns a worktree.
 }
 
+rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
+    ensures: RetirementAttempt.created(
+        attempt_id: attempt_id,
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        inspection: RetirementInspection {
+            generation: current_retirement_inspection_generation(product_conversation),
+            fingerprint: current_retirement_inspection_fingerprint(product_conversation)
+        }
+    )
+    ensures:
+        for category in current_retirement_loss_categories(product_conversation):
+            RetirementLossCategoryRow.created(
+                attempt: RetirementAttempt{
+                    attempt_id: attempt_id,
+                    product_conversation: product_conversation,
+                    scope: scope_binding.scope,
+                    inspection: RetirementInspection {
+                        generation: current_retirement_inspection_generation(product_conversation),
+                        fingerprint: current_retirement_inspection_fingerprint(product_conversation)
+                    }
+                },
+                inspection: RetirementInspection {
+                    generation: current_retirement_inspection_generation(product_conversation),
+                    fingerprint: current_retirement_inspection_fingerprint(product_conversation)
+                },
+                category: category,
+                item_identity: current_retirement_loss_item_identity(product_conversation, category)
+            )
+
+    @guidance
+        -- Before selecting the with-loss or without-loss inspection outcome, Phoenix
+        -- materializes one exact RetirementAttempt plus its exact RetirementInspection
+        -- and categorized loss inventory for the attached Git-backed scope bound to
+        -- this Close attempt_id. Outcome selection then reads this attempt-bound
+        -- evidence rather than recomputing from an untyped side channel.
+}
+
 rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
@@ -313,7 +354,7 @@ rule RetirementRequestedCreatesPerResourceEvidence {
         scope: scope_binding.scope,
         kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope)
     )
-    ensures: ResourceRetirementProgressRecorded(product_conversation)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
     @guidance
         -- Resource retirement is stepwise and idempotent. Each successful step creates
@@ -358,7 +399,7 @@ rule RetirementStepSuccessRecordsTypedEvidence {
         scope: scope_binding.scope,
         kind: retired_resource_kind_for_completed_step(product_conversation, scope_binding.scope)
     }
-    ensures: ResourceRetirementProgressRecorded(product_conversation)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
     @guidance
         -- Progress reporting consumes already-created exact-attempt RetiredResource
@@ -383,11 +424,44 @@ rule RetirementAlreadyRetiredIsIdempotentNoOp {
         kind: retired_resource_kind_for_retried_step(product_conversation, scope_binding.scope)
     }
     requires: exact_attempt_retries_same_resource(product_conversation)
-    ensures: ResourceRetirementProgressRecorded(product_conversation)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
     @guidance
         -- A retry that encounters the same exact attempt/resource already retired is
         -- a no-op adoption of prior evidence, not a second completion and not a failure.
+}
+
+rule RetirementProgressTriggersNextExactAttemptStep {
+    when: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: owned_resource_pending_retirement(product_conversation, AttachedWorkScope.scope)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- Every exact-attempt progress record immediately drives the next retirement
+        -- pass for that same attempt while owned resources remain.
+}
+
+rule RetirementProgressReevaluatesCompletionForExactAttempt {
+    when: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: all_owned_resources_retired(product_conversation)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- Progress also reissues the exact attempt request when the last owned
+        -- resource retires so the aggregate completion gate can fire from the same
+        -- attempt-bound path.
 }
 
 rule ResourceRetirementFailureProducesResidualRepairState {
@@ -443,7 +517,7 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation)
     requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
-    ensures: ResourceRetirementProgressRecorded(product_conversation)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
     @guidance
         -- Exact-attempt absence evidence lets retirement adopt an already-absent

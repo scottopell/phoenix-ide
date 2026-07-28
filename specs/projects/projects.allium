@@ -400,44 +400,45 @@ rule TaskApprovalExecuted {
 }
 
 rule TaskApprovalNewConversationExecuted {
-    when: TaskApprovalDecisionImported(conversation, decision)
-    requires: decision = approved_start_fresh
+    when: FreshWorkConversationProvisioningRequested(source_conversation, target_conversation, target_product_conversation, repository_identity)
+    requires: repository_identity = source_conversation.project.repo
 
     let approved_source = ApprovedTaskSource {
-        task_path: conversation.proposal_snapshot.task_file,
-        title: conversation.proposal_snapshot.title,
-        priority: conversation.proposal_snapshot.priority,
-        body: reread_task_body(conversation.proposal_snapshot.task_file),
-        identity: approved_task_identity(conversation.proposal_snapshot.task_file),
+        task_path: source_conversation.proposal_snapshot.task_file,
+        title: source_conversation.proposal_snapshot.title,
+        priority: source_conversation.proposal_snapshot.priority,
+        body: reread_task_body(source_conversation.proposal_snapshot.task_file),
+        identity: approved_task_identity(source_conversation.proposal_snapshot.task_file),
         reviewed_snapshot: ReviewedProposalSnapshotIdentity {
-            repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
-            task_kind: conversation.proposal_snapshot.task_kind,
-            content_digest: conversation.proposal_snapshot.content_digest
+            repo_relative_path: source_conversation.proposal_snapshot.repo_relative_path,
+            task_kind: source_conversation.proposal_snapshot.task_kind,
+            content_digest: source_conversation.proposal_snapshot.content_digest
         },
-        kind: approved_task_kind(conversation.proposal_snapshot.task_file)
+        kind: approved_task_kind(source_conversation.proposal_snapshot.task_file)
     }
-    let target = bedrock/ProductConversation{id: approved_task_child_id(conversation)}
+    let target = target_product_conversation
 
-    ensures: ApprovedTaskSnapshotted(conversation, approved_source)
-    ensures: ApprovedTaskRevalidated(conversation, approved_source)
+    ensures: target_conversation.product_conversation = target
+    ensures: ApprovedTaskSnapshotted(source_conversation, approved_source)
+    ensures: ApprovedTaskRevalidated(source_conversation, approved_source)
     ensures: ApprovedTaskRereadBoundToReviewedSnapshot(
-        conversation,
+        source_conversation,
         approved_source.reviewed_snapshot,
         approved_path: approved_source.task_path,
         approved_kind: approved_source.kind,
         approved_body: approved_source.body
     )
     ensures: ApprovedTaskSourceRecorded(target, approved_source)
-    ensures: ApprovedTaskDerivedFromRecorded(conversation.product_conversation, target, approved_source)
+    ensures: ApprovedTaskDerivedFromRecorded(source_conversation.product_conversation, target, approved_source)
     ensures: CreatedFromApprovedTask(target, approved_source)
-    ensures: FreshGitWorktreeProvisioningRequested(target, conversation.project.repo)
+    ensures: FreshGitWorktreeProvisioningRequested(target, repository_identity)
 
     @guidance
-        -- Start in new conversation creates a separate ProductConversation with a
-        -- fresh WorkScope and detached-default worktree. It is not a continuation
-        -- of the source conversation and does not copy the source scope. Approval
-        -- only requests provisioning; the first LLM dispatch is gated on the later
-        -- durable successful provisioning-completed event for that exact target.
+        -- Start in new conversation is owned by one typed provisioning request emitted
+        -- from bedrock approval. That request carries the source transcript row, the
+        -- fresh target conversation/product aggregate, and repository identity so
+        -- projects records approved-task provenance and requests provisioning exactly
+        -- once for that exact target.
 }
 
 rule StartInNewConversationDispatchesOnlyAfterSuccessfulProvisioning {

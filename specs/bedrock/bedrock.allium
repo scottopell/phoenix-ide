@@ -798,7 +798,9 @@ rule ProposeTaskIntercepted {
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
     requires: conversation.task_proposal_eligible
+    requires: not conversation.context_at_threshold
     let proposal_snapshot = snapshot_task_proposal(tool_calls.first)
+    requires: task_proposal_valid(proposal_snapshot)
     ensures: conversation.parent_status = awaiting_task_approval
     ensures: conversation.proposal_snapshot = proposal_snapshot
     ensures: TaskApprovalRequested(conversation, proposal_snapshot)
@@ -1032,6 +1034,9 @@ rule UserApprovesTaskCurrentConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_continue_current
+    requires: reread_task_repo_relative_path(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.repo_relative_path
+    requires: reread_task_kind(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.task_kind
+    requires: reread_task_digest(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.content_digest
     ensures: ApprovalRereadSnapshot(
         conversation,
         original_task_file: conversation.proposal_snapshot.task_file,
@@ -1078,6 +1083,9 @@ rule UserApprovesTaskNewConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_start_fresh
+    requires: reread_task_repo_relative_path(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.repo_relative_path
+    requires: reread_task_kind(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.task_kind
+    requires: reread_task_digest(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.content_digest
     ensures: ApprovalRereadSnapshot(
         conversation,
         original_task_file: conversation.proposal_snapshot.task_file,
@@ -1101,10 +1109,16 @@ rule UserApprovesTaskNewConversation {
         approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
     )
     let fresh_work_conversation = created_fresh_work_conversation(conversation)
+    let target_product_conversation = fresh_work_conversation.product_conversation
     ensures: FreshWorkConversationCreated(conversation, fresh_work_conversation)
     ensures: fresh_work_conversation.product_conversation != conversation.product_conversation
     ensures: fresh_work_conversation.continued_in_conv_id = absent
-    ensures: FreshGitWorktreeProvisioningRequested(fresh_work_conversation)
+    ensures: FreshWorkConversationProvisioningRequested(
+        source_conversation: conversation,
+        target_conversation: fresh_work_conversation,
+        target_product_conversation: target_product_conversation,
+        repository_identity: conversation.project.repo
+    )
 
     @guidance
         -- Starting fresh for approved task work creates a separate product
@@ -1504,6 +1518,12 @@ rule CloseObligationBeginsSettlementWithoutBusyWork {
     requires: not exists Parent{product_conversation: product_conversation, is_latest_row: true, is_busy: true}
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
     ensures: CloseSettlementRequested(product_conversation, attempt_id)
+    ensures: CloseSettlementProgressed(product_conversation, attempt_id)
+
+    @guidance
+        -- Entering settlement without ordinary busy ownership still emits one
+        -- exact-attempt progress pass so downstream settlement consumers can
+        -- reevaluate whether any typed close-owned authorities remain.
 }
 
 rule CloseObligationWaitsForSettlement {

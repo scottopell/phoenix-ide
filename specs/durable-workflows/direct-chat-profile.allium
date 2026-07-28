@@ -382,7 +382,7 @@ rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
     let acceptance = latest_row_direct_turn_acceptance(latest_parent)
     requires: acceptance != null
     let generation = current_generation_for(acceptance)
-    ensures: DirectTurnSettlementRequested(acceptance, generation)
+    ensures: DirectTurnSettlementRequested(acceptance, generation, attempt_id)
 
     @guidance
         -- Close emits only the root product-conversation settlement event for one
@@ -393,24 +393,26 @@ rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
 }
 
 rule LifecycleSettlementTargetsExactAcceptedTurnGeneration {
-    when: DirectTurnSettlementRequested(acceptance, generation)
+    when: DirectTurnSettlementRequested(acceptance, generation, attempt_id)
     requires: generation = current_generation_for(acceptance)
-    ensures: settlement_receipt_committed(acceptance)
-    ensures: accepted_turn_ownership_released(acceptance)
+    ensures: settlement_receipt_committed(acceptance, attempt_id)
+    ensures: accepted_turn_ownership_released(acceptance, attempt_id)
+    ensures: bedrock/CloseSettlementProgressed(acceptance.resolved_target.product_conversation, attempt_id)
 
     @guidance
         -- Destructive lifecycle orchestration addresses direct-chat work by the
         -- exact accepted-turn identity (`accepted_turn.workflow_id`, optional
         -- `accepted_turn.canonical_delivery_id`) together with the current
-        -- generation fence. Settlement reuses the profile's existing typed
+        -- generation fence and the exact Close attempt_id. Settlement reuses the profile's existing typed
         -- cancellation/recovery machinery rather than inventing a second close-
         -- specific cancellation state machine.
 }
 
 rule StaleGenerationSettlementCannotMutateCurrentAcceptedTurn {
-    when: DirectTurnSettlementRequested(acceptance, generation)
+    when: DirectTurnSettlementRequested(acceptance, generation, attempt_id)
     requires: generation != current_generation_for(acceptance)
     ensures: acceptance.accepted_turn = acceptance.accepted_turn
+    ensures: bedrock/CloseSettlementProgressed(acceptance.resolved_target.product_conversation, attempt_id)
 }
 
 rule CoordinatorMultiTargetFanOutCreatesIndependentOrdinaryAcceptances {
