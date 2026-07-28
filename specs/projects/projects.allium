@@ -32,13 +32,13 @@ surface ProvisioningCompletedImport {
     facing conversation: bedrock/Conversation
 
     provides:
-        FreshGitWorktreeProvisioningCompleted(target, provisioned)
-            when bedrock/FreshGitWorktreeProvisioningCompleted(target, provisioned)
+        FreshGitWorktreeProvisioningCompleted(target_product_conversation, target_conversation, provisioned)
+            when bedrock/FreshGitWorktreeProvisioningCompleted(target_product_conversation, target_conversation, provisioned)
 
     @guarantee TypedProvisioningCompletionBridge
         -- Projects consumes one durable typed provisioning-completed event carrying
-        -- the target ProductConversation plus the attached WorkScope/worktree tuple
-        -- that successful provisioning established.
+        -- the target ProductConversation, the concrete target transcript conversation,
+        -- and the attached WorkScope/worktree tuple that successful provisioning established.
 }
 
 ------------------------------------------------------------
@@ -101,6 +101,10 @@ value ApprovedTaskSource {
     identity: ApprovedTaskIdentity
     reviewed_snapshot: ReviewedProposalSnapshotIdentity
     kind: taskmd | plain_markdown
+}
+
+value ApprovedTaskObjective {
+    source: ApprovedTaskSource
 }
 
 value ProvisionedWorkScope {
@@ -394,15 +398,20 @@ rule TaskApprovalExecuted {
             and TaskFileCommittedInWorkspace(worktree, approval_task_id(approved_source.task_path))
         else:
             BriefCommittedInWorkspace(worktree, approved_source.task_path, approved_source.body)
-    ensures: conversation.task_id = approval_task_id(approved_source.task_path)
-    ensures: conversation.task_title = approved_source.title
-    ensures: ApprovedTaskContinuedHere(conversation, approved_source)
+    ensures: conversation.approved_task_objective = bedrock/ApprovedTaskObjective {
+        source: approved_source
+    }
+    ensures: conversation.approved_task_write_authority = bedrock/ApprovedTaskWriteAuthority {
+        objective: conversation.approved_task_objective
+    }
+    ensures: ApprovedTaskContinuedHere(conversation, ApprovedTaskObjective { source: approved_source })
 
     @guidance
         -- Continue here reuses the existing attached WorkScope/worktree. Approval
-        -- persists typed write authority on that existing Git-backed attachment
-        -- before resume; it does not create or swap scopes, change lifecycle, or
-        -- mutate branch/worktree provenance beyond the approved artifact commit.
+        -- persists one typed approved-task objective plus write authority that
+        -- references that objective on the existing Git-backed attachment before
+        -- resume; it does not create or swap scopes, change lifecycle, or mutate
+        -- branch/worktree provenance beyond the approved artifact commit.
 }
 
 rule TaskApprovalNewConversationExecuted {
@@ -435,7 +444,7 @@ rule TaskApprovalNewConversationExecuted {
         approved_body: approved_source.body
     )
     ensures: ApprovedTaskSourceRecorded(target, approved_source)
-    ensures: ApprovedTaskDerivedFromRecorded(source_conversation.product_conversation, target, approved_source)
+    ensures: ApprovedTaskDerivedFromRecorded(source_conversation.product_conversation, target, ApprovedTaskObjective { source: approved_source })
     ensures: CreatedFromApprovedTask(target, approved_source)
     ensures: FreshGitWorktreeProvisioningRequested(target, repository_identity)
 
@@ -448,19 +457,20 @@ rule TaskApprovalNewConversationExecuted {
 }
 
 rule StartInNewConversationDispatchesOnlyAfterSuccessfulProvisioning {
-    when: FreshGitWorktreeProvisioningCompleted(target, provisioned)
+    when: FreshGitWorktreeProvisioningCompleted(target, target_conversation, provisioned)
+    requires: target_conversation.product_conversation = target
     requires: exists CreatedFromApprovedTask(target, approved_source)
     requires: exists ApprovedTaskSourceRecorded(target, approved_source)
-    ensures: ProvisionedWorkScopeAttached(target, provisioned)
-    ensures: LlmRequestDispatched(target)
+    ensures: ProvisionedWorkScopeAttached(target, target_conversation, provisioned)
+    ensures: LlmRequestDispatched(target_conversation)
 
     @guidance
         -- The durable provisioning-completed event is the only success boundary that
-        -- may dispatch the spawned conversation. It carries the target ProductConversation
-        -- plus the attached WorkScope/worktree path established by provisioning, so
-        -- downstream resume uses typed provisioning output rather than timing or emit
-        -- order. Failed provisioning emits no completion event and therefore cannot
-        -- dispatch the target conversation.
+        -- may dispatch the spawned conversation. It carries the target ProductConversation,
+        -- the concrete target transcript conversation, and the attached WorkScope/worktree
+        -- path established by provisioning, so downstream resume uses typed provisioning
+        -- output rather than timing or emit order. Failed provisioning emits no completion
+        -- event and therefore cannot dispatch the target conversation.
 }
 
 rule WorktreeTransferredOnContinuation {
@@ -476,7 +486,7 @@ rule WorktreeTransferredOnContinuation {
     ensures: new_conv.product_conversation = parent.product_conversation
     ensures: new_conv.working_dir = parent.working_dir
     ensures: new_conv.worktree_path = parent.worktree_path
-    ensures: parent.continued_in_conv_id = new_conv.id
+    ensures: parent.continued_in_conv_id = new_conv
     ensures: worktree.product_conversation = new_conv.product_conversation
     ensures: worktree.attached_scope = scope
     ensures: HandedOffPredecessorReadOnly(parent)
@@ -497,7 +507,7 @@ rule DirectContinuationInheritsCwd {
 
     ensures: new_conv.product_conversation = parent.product_conversation
     ensures: new_conv.working_dir = parent.working_dir
-    ensures: parent.continued_in_conv_id = new_conv.id
+    ensures: parent.continued_in_conv_id = new_conv
     ensures: HandedOffPredecessorReadOnly(parent)
 }
 
@@ -607,13 +617,13 @@ invariant WorkScopeSharedAcrossContinuation {
 
 invariant ApprovedTaskPlacementsAreMutuallyExclusive {
     for c in bedrock/Conversations:
-        not (exists ApprovedTaskContinuedHere(c, source) and exists ApprovedTaskDerivedFromRecorded(c.product_conversation, target, source))
+        not (exists ApprovedTaskContinuedHere(c, objective) and exists ApprovedTaskDerivedFromRecorded(c.product_conversation, target, objective))
 }
 
 invariant ApprovedTaskFreshPlacementCarriesNoContinuationEdge {
     for source_conv in bedrock/Conversations:
         for target in bedrock/ProductConversations:
-            exists ApprovedTaskDerivedFromRecorded(source_conv.product_conversation, target, approved_source) implies
+            exists ApprovedTaskDerivedFromRecorded(source_conv.product_conversation, target, objective) implies
                 source_conv.continued_in_conv_id = absent
                 and source_conv.product_conversation.lifecycle = open
 }

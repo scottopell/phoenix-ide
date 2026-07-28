@@ -83,6 +83,14 @@ value TaskProposalSnapshot {
     content_digest: String
 }
 
+value ApprovedTaskObjective {
+    source: projects/ApprovedTaskSource
+}
+
+value ApprovedTaskWriteAuthority {
+    objective: ApprovedTaskObjective
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -244,9 +252,8 @@ entity Conversation {
     branch_name: String when mode in { explore, work, branch }
     worktree_path: String when mode in { explore, work, branch }
     base_branch: String when mode in { explore, work, branch }
-    task_id: String when mode = work
-    task_title: String when mode = work    -- human-readable title (for UI), set at approval;
-                                           -- ConvMode::Work persists it alongside task_id
+    approved_task_objective: ApprovedTaskObjective?
+    approved_task_write_authority: ApprovedTaskWriteAuthority?
 
     -- Filesystem cwd. For mode in { explore, work, branch } this equals
     -- worktree_path; for mode = direct it is the user-supplied directory.
@@ -1059,6 +1066,24 @@ rule UserApprovesTaskCurrentConversation {
         content_digest: conversation.proposal_snapshot.content_digest,
         approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
     )
+    ensures: conversation.approved_task_objective = ApprovedTaskObjective {
+        source: projects/ApprovedTaskSource {
+            task_path: conversation.proposal_snapshot.task_file,
+            title: conversation.proposal_snapshot.title,
+            priority: conversation.proposal_snapshot.priority,
+            body: reread_task_body(conversation.proposal_snapshot.task_file),
+            identity: projects/approved_task_identity(conversation.proposal_snapshot.task_file),
+            reviewed_snapshot: projects/ReviewedProposalSnapshotIdentity {
+                repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
+                task_kind: conversation.proposal_snapshot.task_kind,
+                content_digest: conversation.proposal_snapshot.content_digest
+            },
+            kind: projects/approved_task_kind(conversation.proposal_snapshot.task_file)
+        }
+    }
+    ensures: conversation.approved_task_write_authority = ApprovedTaskWriteAuthority {
+        objective: conversation.approved_task_objective
+    }
     ensures: WriteAuthorityPersistedBeforeResume(conversation)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
@@ -1066,11 +1091,11 @@ rule UserApprovesTaskCurrentConversation {
 
     @guidance
         -- Continue here resolves the blocking approval inside the same
-        -- conversation. It durably establishes typed write authority on the
-        -- existing Git-backed scope before resume, but does not transition
-        -- product lifecycle, product mode, work-scope attachment, continuation
-        -- topology, provenance, or branch/worktree state beyond the approval
-        -- checkpoint itself.
+        -- conversation. It durably establishes typed approved-task objective and
+        -- write authority on the existing Git-backed scope before resume, but does
+        -- not transition product lifecycle, product mode, work-scope attachment,
+        -- continuation topology, provenance, or branch/worktree state beyond the
+        -- approval checkpoint itself.
         --
         -- ApprovalRereadSnapshot / ApprovalMatchesReviewedSnapshot bind approval to
         -- the reviewed repo-relative path, task kind, and content digest. The
@@ -1159,8 +1184,9 @@ rule CancelDuringTaskApproval {
 }
 
 -- Approved-task placement never writes continuation topology. Start in new
--- conversation creates a separate top-level lineage while the source stays Open;
--- Continue here resumes the same aggregate, transcript context, and attached scope.
+-- conversation creates a separate top-level lineage while the source stays Open.
+-- Continue here resumes the same ProductConversation, transcript context, attached
+-- WorkScope, and mode with typed approved-task objective/write-authority state.
 -- A fork proposal is resolved entirely in projects/ and leaves its origin untouched.
 
 -- ===========================================================

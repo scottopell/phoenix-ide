@@ -134,8 +134,10 @@ AND the agent MAY revise the plan and call `propose_task` again
 WHEN the user approves the task and chooses **Continue here**
 THE SYSTEM SHALL commit the approved task artifact according to REQ-PROJ-006
 AND SHALL approve only the same reviewed snapshot identity rather than whatever file currently exists at approval time
+AND SHALL persist one typed approved-task objective that references the normalized approved-task source record
+AND SHALL persist Git-backed write authority by referencing that approved-task objective on the same Open conversation and the same attached `WorkScope`
 AND keep the same Open conversation and the same `WorkScope`
-AND resume execution in that conversation
+AND resume execution in that conversation without changing its mode
 AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
 
 WHEN the user approves the task and chooses **Start in new conversation**
@@ -146,7 +148,7 @@ AND SHALL treat that spawned conversation as an independent ProductConversation 
 AND seed only the exact approved task as the spawned conversation's starting context
 AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
 AND record exactly one source relation of kind `approved_task` on the spawned conversation that points to the source conversation
-AND dispatch execution in the spawned conversation only after successful durable typed provisioning completion for that spawned ProductConversation and attached `WorkScope`/worktree
+AND dispatch execution in the spawned conversation only after successful durable typed provisioning completion for that spawned ProductConversation, concrete spawned transcript conversation, and attached `WorkScope`/worktree
 AND leave the source conversation Open
 AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
 AND SHALL NOT copy, summarize, or inject the source conversation transcript into the spawned conversation as part of approval placement

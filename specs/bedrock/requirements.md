@@ -655,13 +655,15 @@ THE HandedOff state SHALL reject further user messages;
 
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Continue here policy
-THE SYSTEM SHALL record the approved task as the conversation's next objective,
-  promote the task file's status to `in-progress` if needed, commit only the approved
-  task artifact if that task-tracking contract requires it, and durably persist typed
-  Git-backed write authority against the existing attached `WorkScope` before resuming execution
+THE SYSTEM SHALL record the approved task as the conversation's next objective through a typed approved-task objective value
+AND SHALL promote the task file's status to `in-progress` if needed
+AND SHALL commit only the approved task artifact if that task-tracking contract requires it
+AND SHALL durably persist typed Git-backed write authority referencing that approved-task objective against the existing attached `WorkScope` before resuming execution
 AND SHALL continue the same product conversation as the current live writable conversation
 AND SHALL treat the approval as a checkpoint only
 AND SHALL NOT create a fresh conversation row
+AND SHALL NOT encode the approved task as `mode=work`-only conversation shape data
+AND SHALL leave the conversation's mode unchanged, including when the pre-approval mode is Explore
 AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, lifecycle, mode, repository state beyond the
   approved task commit, `WorkScope` attachment, source/provenance records beyond the approval itself,
   or branch/worktree provenance
