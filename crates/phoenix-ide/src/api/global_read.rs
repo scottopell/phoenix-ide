@@ -257,8 +257,12 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
                    WHERE owner.work_scope_id = environment.id
                      AND owner.archived = 0
                      AND json_extract(owner.state, '$.type') NOT IN (
-                         'completed', 'failed', 'context_exhausted', 'handed_off',
-                         'creation_failed', 'creation_cancelled', 'terminal'
+                         'completed', 'failed', 'handed_off', 'creation_failed',
+                         'creation_cancelled', 'terminal'
+                     )
+                     AND NOT (
+                         json_extract(owner.state, '$.type') = 'context_exhausted'
+                         AND owner.continued_in_conv_id IS NOT NULL
                      )
                )",
         )
@@ -1179,6 +1183,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn coordinator_bash_scope_resolution_prefers_nonempty_worktree_path_then_cwd_and_canonicalizes(
     ) {
@@ -1235,6 +1240,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(binding.path, fallback.canonicalize().unwrap());
+
+        sqlx::query(
+            "UPDATE conversations
+             SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue me\"}'
+             WHERE id = 'scope-owner'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(service
+            .resolve_active_work_scope_bash_target(work_scope_id.as_str())
+            .await
+            .is_ok());
+        sqlx::query(
+            "UPDATE conversations SET state = '{\"type\":\"idle\"}' WHERE id = 'scope-owner'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         sqlx::query("UPDATE conversations SET archived = 1 WHERE id = 'scope-owner'")
             .execute(db.pool())

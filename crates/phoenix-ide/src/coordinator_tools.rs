@@ -503,6 +503,6 @@ mod tests {
         assert!(!output.is_success());
         assert!(output
             .output()
-            .contains("active persisted WorkScope not found"));
+            .contains("active persisted WorkScope with a live owner not found"));
     }
 }
