@@ -111,6 +111,15 @@ describe('CodexQuotaBlock', () => {
     expect(screen.getByText('Credits: 42.5')).toBeInTheDocument();
   });
 
+  it.each([
+    ['rate_limit_reached', 'Usage limit reached'],
+    ['workspace_owner_usage_limit_reached', 'Workspace usage limit reached'],
+    ['workspace_member_usage_limit_reached', 'Member usage limit reached'],
+  ] as const)('renders explicit non-credit exhaustion %s', (type, message) => {
+    render(<CodexQuotaBlock quota={quota({ rate_limit_reached_type: type })} />);
+    expect(screen.getByText(message)).toBeInTheDocument();
+  });
+
   it('shows depletion only when Codex explicitly reports it', () => {
     render(
       <CodexQuotaBlock

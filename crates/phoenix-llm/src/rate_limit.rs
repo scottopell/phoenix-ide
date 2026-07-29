@@ -9,10 +9,9 @@
 //! The 429 JSON body additionally provides `resets_at` (no header
 //! equivalent) and historically also `plan_type` (now also in a header).
 //!
-//! Phoenix uses the HTTP/SSE transport against this backend. The WebSocket
-//! variant of the same endpoint emits a richer mid-stream `codex.rate_limits`
-//! frame (consumed by codex CLI) — the HTTP path never sees that frame, so
-//! the response headers are the single source of truth here.
+//! Phoenix obtains the authoritative account snapshot from Codex's authenticated
+//! usage endpoint. HTTP response headers and WebSocket `codex.rate_limits`
+//! events provide partial per-turn updates that are normalized into the same shape.
 //!
 //! These types intentionally mirror the codex CLI's `RateLimitSnapshot` shape
 //! (`codex-rs/protocol/src/protocol.rs`) without depending on the

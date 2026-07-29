@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from
 import { useNavigate } from 'react-router-dom';
 import { api, type CodexLoginPreflight, type LlmLanguageSetting, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
-import { clearCodexQuota, replaceCodexQuota, useCodexQuota } from '../codexQuota';
+import { clearCodexQuota, replaceCodexQuota, selectCodexQuotaAccount, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
 import {
   getBrowserNotificationPermission,
@@ -278,7 +278,7 @@ function CodexSection({
   const quota = useCodexQuota();
   useEffect(() => {
     const generation = ++quotaRequestGenerationRef.current;
-    clearCodexQuota();
+    selectCodexQuotaAccount(preflight.account_id);
     api.codexQuota()
       .then((next) => {
         if (quotaRequestGenerationRef.current === generation && next) replaceCodexQuota(next);

@@ -66,6 +66,19 @@ function SpendControlRow({ limit }: { limit: NonNullable<QuotaDetails['individua
   );
 }
 
+function exhaustionMessage(type: QuotaDetails['rate_limit_reached_type']): string | null {
+  switch (type) {
+    case 'rate_limit_reached':
+      return 'Usage limit reached';
+    case 'workspace_owner_usage_limit_reached':
+      return 'Workspace usage limit reached';
+    case 'workspace_member_usage_limit_reached':
+      return 'Member usage limit reached';
+    default:
+      return null;
+  }
+}
+
 function CreditsRow({ credits }: { credits: NonNullable<QuotaDetails['credits']> }) {
   if (credits.unlimited) {
     return <div className="settings-codex-quota__credits">Credits: Unlimited</div>;
@@ -88,8 +101,9 @@ function CreditsRow({ credits }: { credits: NonNullable<QuotaDetails['credits']>
 export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
   const credits = quota.credits;
   const creditsDepleted = creditsAreDepleted(quota.rate_limit_reached_type);
+  const reachedMessage = exhaustionMessage(quota.rate_limit_reached_type);
   const hasCreditsRow = creditsDepleted || (credits && (credits.unlimited || credits.has_credits));
-  if (!quota.primary && !quota.secondary && !hasCreditsRow && !quota.individual_limit) return null;
+  if (!quota.primary && !quota.secondary && !hasCreditsRow && !quota.individual_limit && !reachedMessage) return null;
   return (
     <div className="settings-codex-quota">
       {quota.primary && (
@@ -99,6 +113,7 @@ export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
         <QuotaRow label={windowLabel(quota.secondary.window_minutes)} window={quota.secondary} />
       )}
       {quota.individual_limit ? <SpendControlRow limit={quota.individual_limit} /> : null}
+      {reachedMessage ? <div className="settings-codex-quota__credits">{reachedMessage}</div> : null}
       {creditsDepleted ? (
         <div className="settings-codex-quota__credits">No credits remaining</div>
       ) : credits ? (

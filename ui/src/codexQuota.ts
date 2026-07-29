@@ -17,10 +17,18 @@ import { useSyncExternalStore } from 'react';
 import type { QuotaDetails } from './sseSchemas';
 
 let snapshot: QuotaDetails | null = null;
+let accountId: string | null = null;
 const listeners = new Set<() => void>();
 
 function notify(): void {
   for (const fn of listeners) fn();
+}
+
+export function selectCodexQuotaAccount(nextAccountId: string | null): void {
+  if (accountId === nextAccountId) return;
+  accountId = nextAccountId;
+  snapshot = null;
+  notify();
 }
 
 export function replaceCodexQuota(next: QuotaDetails): void {
@@ -29,6 +37,10 @@ export function replaceCodexQuota(next: QuotaDetails): void {
 }
 
 export function mergeCodexQuota(next: QuotaDetails): void {
+  if (snapshot?.limit_id && next.limit_id && snapshot.limit_id !== next.limit_id) {
+    replaceCodexQuota(next);
+    return;
+  }
   snapshot = snapshot === null ? next : {
     plan_type: next.plan_type ?? snapshot.plan_type,
     resets_at: next.resets_at ?? snapshot.resets_at,
@@ -49,6 +61,7 @@ export function mergeCodexQuota(next: QuotaDetails): void {
 /// longer owns this session. SSE disconnect alone does NOT invalidate
 /// the snapshot — the account is unchanged across reconnects.
 export function clearCodexQuota(): void {
+  accountId = null;
   if (snapshot === null) return;
   snapshot = null;
   notify();
