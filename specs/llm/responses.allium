@@ -329,7 +329,7 @@ rule CodexResponsesLitePrefixTranslated {
             developer_instructions_is_second: true,
             parallel_tool_calls: false,
             reasoning_context: "all_turns",
-            reasoning_effort: "medium",
+            reasoning_effort: request.effort,
             compatibility_header: true
         )
 

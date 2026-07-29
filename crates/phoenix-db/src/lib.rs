@@ -7920,8 +7920,8 @@ impl Database {
         .bind(conversation_id)
         .bind(root_conversation_id)
         .bind(model)
-        .bind(effective_effort.source.as_str())
-        .bind(effective_effort.level.map(ModelEffort::as_wire_name))
+        .bind(effective_effort.source().as_str())
+        .bind(effective_effort.level().map(ModelEffort::as_wire_name))
         .bind(usage.input_tokens.cast_signed())
         .bind(usage.output_tokens.cast_signed())
         .bind(usage.reasoning_tokens.map(u64::cast_signed))
@@ -12029,10 +12029,7 @@ mod tests {
             "conv-fb",
             "conv-fb",
             "mock",
-            EffectiveEffort {
-                source: EffortSource::NativeUnknown,
-                level: None,
-            },
+            EffectiveEffort::native_unknown(),
             &usage,
             None,
         )
@@ -12043,10 +12040,7 @@ mod tests {
             "conv-fb",
             "conv-fb",
             "mock",
-            EffectiveEffort {
-                source: EffortSource::NativeUnknown,
-                level: None,
-            },
+            EffectiveEffort::native_unknown(),
             &usage,
             Some(observed),
         )
@@ -12164,10 +12158,7 @@ mod tests {
             "sub-anchor",
             "root-anchor",
             "mock",
-            EffectiveEffort {
-                source: EffortSource::NativeUnknown,
-                level: None,
-            },
+            EffectiveEffort::native_unknown(),
             &usage,
             None,
         )

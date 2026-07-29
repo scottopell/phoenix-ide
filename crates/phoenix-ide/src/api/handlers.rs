@@ -4181,7 +4181,7 @@ async fn upgrade_conversation_model(
             state.llm_registry.available_models()
         )));
     }
-    if let Some(effort) = req.effort {
+    if let crate::api::types::EffortUpdate::Set(effort) = req.effort {
         if !state.llm_registry.supports_effort(&req.model, effort) {
             return Err(AppError::BadRequest(format!(
                 "Effort '{effort}' is not supported by model '{}'",
@@ -4205,11 +4205,26 @@ async fn upgrade_conversation_model(
         )));
     }
 
+    let next_effort = match req.effort {
+        crate::api::types::EffortUpdate::Omitted => match conv.effort {
+            Some(effort) if state.llm_registry.supports_effort(&req.model, effort) => Some(effort),
+            Some(effort) => {
+                return Err(AppError::BadRequest(format!(
+                    "Effort '{effort}' is not supported by model '{}'; send effort: null to reset or provide a compatible replacement",
+                    req.model
+                )));
+            }
+            None => None,
+        },
+        crate::api::types::EffortUpdate::Reset => None,
+        crate::api::types::EffortUpdate::Set(effort) => Some(effort),
+    };
+
     // Update in DB
     state
         .runtime
         .db()
-        .update_conversation_model_and_effort(&id, &req.model, req.effort)
+        .update_conversation_model_and_effort(&id, &req.model, next_effort)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -13428,7 +13443,7 @@ mod upgrade_model_state_guard_tests {
             Path(id.to_string()),
             Json(UpgradeModelRequest {
                 model: model.to_string(),
-                effort: None,
+                effort: crate::api::types::EffortUpdate::Reset,
             }),
         )
         .await

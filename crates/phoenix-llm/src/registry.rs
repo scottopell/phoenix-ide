@@ -896,26 +896,17 @@ impl ModelRegistry {
         model_id: &str,
         explicit: Option<phoenix_core::domain::llm_types::ModelEffort>,
     ) -> phoenix_core::domain::llm_types::EffectiveEffort {
-        use phoenix_core::domain::llm_types::{EffectiveEffort, EffortSource};
+        use phoenix_core::domain::llm_types::EffectiveEffort;
 
         if let Some(level) = explicit {
-            return EffectiveEffort {
-                source: EffortSource::Explicit,
-                level: Some(level),
-            };
+            return EffectiveEffort::explicit(level);
         }
         match self.effort_capabilities(model_id) {
-            Some(super::EffortCapabilities::Unsupported) => EffectiveEffort {
-                source: EffortSource::Unsupported,
-                level: None,
-            },
+            Some(super::EffortCapabilities::Unsupported) => EffectiveEffort::unsupported(),
             Some(super::EffortCapabilities::Supported {
                 native_default: super::NativeDefault::Known(level),
                 ..
-            }) => EffectiveEffort {
-                source: EffortSource::NativeKnown,
-                level: Some(level),
-            },
+            }) => EffectiveEffort::native_known(level),
             Some(
                 super::EffortCapabilities::Unknown
                 | super::EffortCapabilities::Supported {
@@ -923,10 +914,7 @@ impl ModelRegistry {
                     ..
                 },
             )
-            | None => EffectiveEffort {
-                source: EffortSource::NativeUnknown,
-                level: None,
-            },
+            | None => EffectiveEffort::native_unknown(),
         }
     }
 

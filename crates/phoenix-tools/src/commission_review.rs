@@ -411,6 +411,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     let mut warnings = Vec::new();
     let mut input_tokens = 0;
     let mut output_tokens = 0;
+    let mut reasoning_tokens = None;
     let mut cache_creation_tokens = 0;
     let mut cache_read_tokens = 0;
 
@@ -427,7 +428,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                     usage: phoenix_core::domain::llm_types::Usage {
                         input_tokens,
                         output_tokens,
-                        reasoning_tokens: None,
+                        reasoning_tokens,
                         cache_creation_tokens,
                         cache_read_tokens,
                     },
@@ -459,10 +460,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 request_id: uuid::Uuid::new_v4().to_string(),
                 retry_attempt: 1,
                 attempt_capture: attempt_capture.clone(),
-                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort {
-                    source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
-                    level: None,
-                },
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(
+                ),
             }),
             cache_key: PromptCacheKey::stable(format!(
                 "commission-review:{}:{index}",
@@ -485,7 +484,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                         usage: phoenix_core::domain::llm_types::Usage {
                             input_tokens,
                             output_tokens,
-                            reasoning_tokens: None,
+                            reasoning_tokens,
                             cache_creation_tokens,
                             cache_read_tokens,
                         },
@@ -510,7 +509,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                             usage: phoenix_core::domain::llm_types::Usage {
                                 input_tokens,
                                 output_tokens,
-                                reasoning_tokens: None,
+                                reasoning_tokens,
                                 cache_creation_tokens,
                                 cache_read_tokens,
                             },
@@ -524,6 +523,13 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         };
         input_tokens += response.usage.input_tokens;
         output_tokens += response.usage.output_tokens;
+        if let Some(chunk_reasoning_tokens) = response.usage.reasoning_tokens {
+            reasoning_tokens = Some(
+                reasoning_tokens
+                    .unwrap_or(0u64)
+                    .saturating_add(chunk_reasoning_tokens),
+            );
+        }
         cache_creation_tokens += response.usage.cache_creation_tokens;
         cache_read_tokens += response.usage.cache_read_tokens;
         let (mut chunk_findings, chunk_summary, chunk_warnings) = parse_findings(&response.text());
@@ -546,7 +552,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         usage: phoenix_core::domain::llm_types::Usage {
             input_tokens,
             output_tokens,
-            reasoning_tokens: None,
+            reasoning_tokens,
             cache_creation_tokens,
             cache_read_tokens,
         },

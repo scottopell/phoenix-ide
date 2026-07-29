@@ -317,10 +317,6 @@ CHECK (effort_source IN ('native_known', 'native_unknown', 'explicit', 'unsuppor
 ALTER TABLE turn_usage ADD COLUMN effort_level TEXT
 CHECK (effort_level IS NULL OR effort_level IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
 UPDATE conversations SET model = 'gpt-5.4' WHERE model = 'gpt-5.3-codex';
-UPDATE turn_usage SET model = 'gpt-5.4' WHERE model = 'gpt-5.3-codex';
-UPDATE conversation_creation_jobs
-SET intent_json = json_set(intent_json, '$.model', 'gpt-5.4')
-WHERE json_extract(intent_json, '$.model') = 'gpt-5.3-codex';
 ";
 
 const MIGRATION_057: &str = r"
@@ -3043,19 +3039,19 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(migrated_model, "gpt-5.4");
-        let migrated_turn_usage_model: String =
+        let historical_turn_usage_model: String =
             sqlx::query_scalar("SELECT model FROM turn_usage WHERE id = 9")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(migrated_turn_usage_model, "gpt-5.4");
-        let migrated_job_model: String = sqlx::query_scalar(
-            "SELECT json_extract(intent_json, '$.model') FROM conversation_creation_jobs WHERE id = 'job'",
+        assert_eq!(historical_turn_usage_model, "gpt-5.3-codex");
+        let durable_job_intent: String = sqlx::query_scalar(
+            "SELECT intent_json FROM conversation_creation_jobs WHERE id = 'job'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(migrated_job_model, "gpt-5.4");
+        assert_eq!(durable_job_intent, r#"{"model":"gpt-5.3-codex"}"#);
 
         sqlx::query("INSERT INTO conversations (id) VALUES ('c')")
             .execute(&pool)

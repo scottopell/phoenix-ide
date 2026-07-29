@@ -160,11 +160,52 @@ impl FromStr for EffortSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct EffectiveEffort {
-    pub source: EffortSource,
-    pub level: Option<ModelEffort>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveEffort {
+    Explicit(ModelEffort),
+    NativeKnown(ModelEffort),
+    NativeUnknown,
+    Unsupported,
+}
+
+impl EffectiveEffort {
+    #[must_use]
+    pub const fn explicit(level: ModelEffort) -> Self {
+        Self::Explicit(level)
+    }
+
+    #[must_use]
+    pub const fn native_known(level: ModelEffort) -> Self {
+        Self::NativeKnown(level)
+    }
+
+    #[must_use]
+    pub const fn native_unknown() -> Self {
+        Self::NativeUnknown
+    }
+
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self::Unsupported
+    }
+
+    #[must_use]
+    pub const fn source(self) -> EffortSource {
+        match self {
+            Self::Explicit(_) => EffortSource::Explicit,
+            Self::NativeKnown(_) => EffortSource::NativeKnown,
+            Self::NativeUnknown => EffortSource::NativeUnknown,
+            Self::Unsupported => EffortSource::Unsupported,
+        }
+    }
+
+    #[must_use]
+    pub const fn level(self) -> Option<ModelEffort> {
+        match self {
+            Self::Explicit(level) | Self::NativeKnown(level) => Some(level),
+            Self::NativeUnknown | Self::Unsupported => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -426,6 +467,20 @@ pub struct LlmRequest {
 }
 
 impl LlmRequest {
+    #[must_use]
+    pub fn reserved_output_tokens(&self) -> u32 {
+        self.raised_output_token_ceiling().unwrap_or_else(|| {
+            if self
+                .effort
+                .is_some_and(ModelEffort::needs_extended_output_headroom)
+            {
+                64_000
+            } else {
+                16_384
+            }
+        })
+    }
+
     #[must_use]
     pub fn raised_output_token_ceiling(&self) -> Option<u32> {
         self.max_tokens.map(|current| {
@@ -829,10 +884,7 @@ mod attempt_capture_tests {
             request_id: "request".to_string(),
             retry_attempt: 2,
             attempt_capture: capture.clone(),
-            effective_effort: EffectiveEffort {
-                source: EffortSource::NativeUnknown,
-                level: None,
-            },
+            effective_effort: EffectiveEffort::native_unknown(),
         };
         capture.begin(&telemetry, "openai", "gpt-test", LlmTransport::HttpSse);
         capture.set_transport(LlmTransport::Websocket);

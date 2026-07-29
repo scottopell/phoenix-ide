@@ -870,10 +870,7 @@ where
                     &conv_id,
                     &root_conv_id,
                     &llm_usage.model,
-                    phoenix_core::domain::llm_types::EffectiveEffort {
-                        source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
-                        level: None,
-                    },
+                    phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
                     &llm_usage.usage,
                     None,
                 )
@@ -4718,6 +4715,13 @@ where
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
         let explicit_effort = self.context.effort;
+        if let Some(effort) = explicit_effort {
+            if !self.llm_registry.supports_effort(&model_id, effort) {
+                return Err(format!(
+                    "Persisted effort '{effort}' is not supported by model '{model_id}'"
+                ));
+            }
+        }
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
@@ -4907,7 +4911,7 @@ where
                 messages,
                 tools,
                 max_tokens: Some(16_384),
-                effort: effective_effort.level,
+                effort: effective_effort.level(),
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id.clone(),
@@ -5733,10 +5737,8 @@ where
                     request_id,
                     retry_attempt,
                     attempt_capture: attempt_capture.clone(),
-                    effective_effort: phoenix_core::domain::llm_types::EffectiveEffort {
-                        source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
-                        level: None,
-                    },
+                    effective_effort:
+                        phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
                 }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the

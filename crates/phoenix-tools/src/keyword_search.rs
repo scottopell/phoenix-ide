@@ -456,10 +456,8 @@ impl KeywordSearchTool {
                 request_id: uuid::Uuid::new_v4().to_string(),
                 retry_attempt: 1,
                 attempt_capture: attempt_capture.clone(),
-                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort {
-                    source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
-                    level: None,
-                },
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(
+                ),
             }),
             // Shared by every keyword-search filter call so FILTER_SYSTEM_PROMPT caches.
             cache_key: PromptCacheKey::stable("keyword-search-filter"),

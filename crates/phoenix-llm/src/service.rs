@@ -366,10 +366,8 @@ mod tests {
                 request_id: "request".to_string(),
                 retry_attempt: 1,
                 attempt_capture: attempt_capture.clone(),
-                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort {
-                    source: phoenix_core::domain::llm_types::EffortSource::NativeUnknown,
-                    level: None,
-                },
+                effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(
+                ),
             }),
             cache_key: crate::PromptCacheKey::stable("test"),
         };

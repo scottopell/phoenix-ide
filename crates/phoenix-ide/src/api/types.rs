@@ -76,14 +76,30 @@ impl From<NotificationSettingsRequest> for crate::db::NotificationSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum EffortUpdate {
+    #[default]
+    Omitted,
+    Reset,
+    Set(phoenix_core::domain::llm_types::ModelEffort),
+}
+
+fn deserialize_effort_update<'de, D>(deserializer: D) -> Result<EffortUpdate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<phoenix_core::domain::llm_types::ModelEffort>::deserialize(deserializer)
+        .map(|effort| effort.map_or(EffortUpdate::Reset, EffortUpdate::Set))
+}
+
 /// Request to upgrade a conversation's model
 #[derive(Debug, Deserialize)]
 pub struct UpgradeModelRequest {
     /// Target model ID (e.g., "claude-opus-4-7").
     pub model: String,
-    /// Omitted/null resets to the target model's native default.
-    #[serde(default)]
-    pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    /// Omission preserves a compatible override; null explicitly resets it.
+    #[serde(default, deserialize_with = "deserialize_effort_update")]
+    pub effort: EffortUpdate,
 }
 
 /// Request to send a chat message
@@ -1446,5 +1462,25 @@ impl ErrorResponse {
             error: message.into(),
             error_type: Some(error_type.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod effort_update_tests {
+    use super::{EffortUpdate, UpgradeModelRequest};
+    use phoenix_core::domain::llm_types::ModelEffort;
+
+    #[test]
+    fn effort_update_distinguishes_omission_reset_and_replacement() {
+        let omitted: UpgradeModelRequest = serde_json::from_str(r#"{"model":"gpt-5.4"}"#).unwrap();
+        assert!(matches!(omitted.effort, EffortUpdate::Omitted));
+
+        let reset: UpgradeModelRequest =
+            serde_json::from_str(r#"{"model":"gpt-5.4","effort":null}"#).unwrap();
+        assert!(matches!(reset.effort, EffortUpdate::Reset));
+
+        let set: UpgradeModelRequest =
+            serde_json::from_str(r#"{"model":"gpt-5.4","effort":"high"}"#).unwrap();
+        assert!(matches!(set.effort, EffortUpdate::Set(ModelEffort::High)));
     }
 }

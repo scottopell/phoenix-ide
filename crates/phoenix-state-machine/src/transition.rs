@@ -2438,7 +2438,8 @@ pub fn transition_parent(
                 // below) parks into awaiting_continuation instead, replaying the
                 // propose_task call after continuation. Without this guard a fork
                 // would be recorded while the origin is over-budget.
-                if should_trigger_continuation(&usage_data, context.context_window) {
+                if should_trigger_continuation(&usage_data, context.context_window, context.effort)
+                {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -2590,7 +2591,8 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                if should_trigger_continuation(&usage_data, context.context_window) {
+                if should_trigger_continuation(&usage_data, context.context_window, context.effort)
+                {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -2760,7 +2762,7 @@ pub fn transition_parent(
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
-            if should_trigger_continuation(&usage_data, context.context_window) {
+            if should_trigger_continuation(&usage_data, context.context_window, context.effort) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3179,7 +3181,7 @@ pub fn transition_sub_agent(
         ) => {
             let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(&usage_data, context.context_window) {
+            if should_trigger_continuation(&usage_data, context.context_window, context.effort) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3599,10 +3601,23 @@ const CONTINUATION_THRESHOLD: f64 = 0.90;
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
-fn should_trigger_continuation(usage: &UsageData, context_window: usize) -> bool {
+fn should_trigger_continuation(
+    usage: &UsageData,
+    context_window: usize,
+    effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+) -> bool {
     let used = usage.context_window_used();
-    let threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
-    used >= threshold
+    let proportional_threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
+    let reserved_output = if effort
+        .is_some_and(phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom)
+    {
+        64_000
+    } else {
+        16_384
+    };
+    let reservation_threshold =
+        u64::try_from(context_window.saturating_sub(reserved_output)).unwrap_or(u64::MAX);
+    used >= proportional_threshold.min(reservation_threshold)
 }
 
 /// Handle context exhaustion based on conversation type (REQ-BED-019, REQ-BED-024)
@@ -4655,9 +4670,26 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            !should_trigger_continuation(&usage, 100_000),
+            !should_trigger_continuation(&usage, 100_000, None),
             "89.9% should not trigger continuation"
         );
+    }
+
+    #[test]
+    fn context_threshold_reserves_extended_effort_output_headroom() {
+        let usage = UsageData {
+            input_tokens: 336_000,
+            output_tokens: 0,
+            reasoning_tokens: None,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+
+        assert!(should_trigger_continuation(
+            &usage,
+            400_000,
+            Some(phoenix_core::domain::llm_types::ModelEffort::Xhigh),
+        ));
     }
 
     #[test]
@@ -4671,7 +4703,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000),
+            should_trigger_continuation(&usage, 100_000, None),
             "90% should trigger continuation"
         );
     }
@@ -4687,7 +4719,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000),
+            should_trigger_continuation(&usage, 100_000, None),
             "90.1% should trigger continuation"
         );
     }
@@ -4703,7 +4735,7 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000),
+            should_trigger_continuation(&usage, 100_000, None),
             "Combined tokens should count toward threshold"
         );
     }

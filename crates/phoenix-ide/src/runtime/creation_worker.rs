@@ -17,6 +17,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+fn current_model_id(model: &str) -> &str {
+    match model {
+        "gpt-5.3-codex" => "gpt-5.4",
+        current => current,
+    }
+}
+
 pub(crate) fn resolve_creation_model(
     registry: &ModelRegistry,
     explicit_model: Option<&str>,
@@ -24,7 +31,7 @@ pub(crate) fn resolve_creation_model(
     repo_present: bool,
 ) -> String {
     if let Some(model) = explicit_model {
-        return model.to_string();
+        return current_model_id(model).to_string();
     }
 
     let registry_default = registry.default_model_id();
@@ -1534,6 +1541,15 @@ mod model_resolution_tests {
         assert_eq!(
             resolve_creation_model(&registry, None, "auto", false),
             registry.default_model_id()
+        );
+    }
+
+    #[test]
+    fn retired_creation_job_model_resolves_to_current_route() {
+        let registry = registry();
+        assert_eq!(
+            resolve_creation_model(&registry, Some("gpt-5.3-codex"), "direct", false),
+            "gpt-5.4"
         );
     }
 
