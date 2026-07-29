@@ -215,7 +215,6 @@ pub struct LlmRequestTelemetry {
     pub request_id: String,
     pub retry_attempt: u32,
     pub attempt_capture: LlmAttemptCapture,
-    pub effective_effort: EffectiveEffort,
 }
 
 /// Content-free summary of a provider streaming attempt.
@@ -457,7 +456,7 @@ pub struct LlmRequest {
     pub messages: Vec<LlmMessage>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
-    pub effort: Option<ModelEffort>,
+    pub effective_effort: EffectiveEffort,
     pub telemetry: Option<LlmRequestTelemetry>,
     /// Required cache key. See [`PromptCacheKey`] for how to pick one — the
     /// choice is the caller's because only the caller knows its caching
@@ -471,7 +470,8 @@ impl LlmRequest {
     pub fn reserved_output_tokens(&self) -> u32 {
         self.raised_output_token_ceiling().unwrap_or_else(|| {
             if self
-                .effort
+                .effective_effort
+                .level()
                 .is_some_and(ModelEffort::needs_extended_output_headroom)
             {
                 64_000
@@ -485,7 +485,8 @@ impl LlmRequest {
     pub fn raised_output_token_ceiling(&self) -> Option<u32> {
         self.max_tokens.map(|current| {
             if self
-                .effort
+                .effective_effort
+                .level()
                 .is_some_and(ModelEffort::needs_extended_output_headroom)
             {
                 current.max(64_000)
@@ -884,7 +885,6 @@ mod attempt_capture_tests {
             request_id: "request".to_string(),
             retry_attempt: 2,
             attempt_capture: capture.clone(),
-            effective_effort: EffectiveEffort::native_unknown(),
         };
         capture.begin(&telemetry, "openai", "gpt-test", LlmTransport::HttpSse);
         capture.set_transport(LlmTransport::Websocket);

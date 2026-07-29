@@ -1578,7 +1578,7 @@ fn translate_to_responses_request(
             Some(
                 request
                     .raised_output_token_ceiling()
-                    .unwrap_or_else(|| default_output_headroom(request.effort)),
+                    .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
             )
         },
         stream: None,
@@ -1588,7 +1588,7 @@ fn translate_to_responses_request(
             mode: PromptCacheMode::Implicit,
             ttl: PromptCacheTtl::ThirtyMinutes,
         }),
-        reasoning: request.effort.map(platform_reasoning),
+        reasoning: request.effective_effort.level().map(platform_reasoning),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
         // mirrors the server-side default but stabilises the wire shape so
         // non-default strategies become a smaller change later. Omitted when
@@ -2495,7 +2495,7 @@ mod tests {
                 .collect(),
             tools: vec![],
             max_tokens: None,
-            effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             telemetry: None,
             cache_key: PromptCacheKey::stable("integration"),
         }
@@ -3081,7 +3081,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: None,
-            effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             telemetry: None,
             cache_key: PromptCacheKey::stable("test"),
         }
@@ -3101,7 +3101,8 @@ mod tests {
         assert!(native.get("reasoning").is_none());
         assert_eq!(native["max_output_tokens"], 16_384);
 
-        request.effort = Some(ModelEffort::Max);
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Max);
         let explicit = serde_json::to_value(translate_to_responses_request(
             "gpt-5.6-sol",
             &request,
@@ -3115,7 +3116,8 @@ mod tests {
     #[test]
     fn codex_lite_composes_effort_with_reasoning_context() {
         let mut request = empty_request();
-        request.effort = Some(ModelEffort::High);
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::High);
         let translated = translate_to_backend_request("gpt-5.6-sol", &request, true);
         let json = serde_json::to_value(translated).unwrap();
 

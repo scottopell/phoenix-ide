@@ -4,15 +4,49 @@ use std::collections::HashSet;
 
 use phoenix_core::domain::llm_types::ModelEffort;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case", tag = "support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffortCapabilities {
     Unsupported,
     Unknown,
-    Supported {
-        levels: Vec<ModelEffort>,
-        native_default: NativeDefault,
-    },
+    Supported(SupportedEffortCapabilities),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedEffortCapabilities {
+    levels: Vec<ModelEffort>,
+    native_default: NativeDefault,
+}
+
+impl SupportedEffortCapabilities {
+    #[must_use]
+    pub fn levels(&self) -> &[ModelEffort] {
+        &self.levels
+    }
+
+    #[must_use]
+    pub const fn native_default(&self) -> NativeDefault {
+        self.native_default
+    }
+}
+
+impl serde::Serialize for EffortCapabilities {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::Unsupported => map.serialize_entry("support", "unsupported")?,
+            Self::Unknown => map.serialize_entry("support", "unknown")?,
+            Self::Supported(capabilities) => {
+                map.serialize_entry("support", "supported")?;
+                map.serialize_entry("levels", capabilities.levels())?;
+                map.serialize_entry("native_default", &capabilities.native_default())?;
+            }
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -49,10 +83,10 @@ impl EffortCapabilities {
                 "native effort default must be a supported level"
             );
         }
-        Self::Supported {
+        Self::Supported(SupportedEffortCapabilities {
             levels: levels.to_vec(),
             native_default,
-        }
+        })
     }
 
     #[must_use]
@@ -67,7 +101,7 @@ impl EffortCapabilities {
 
     #[must_use]
     pub fn supports(&self, effort: ModelEffort) -> bool {
-        matches!(self, Self::Supported { levels, .. } if levels.contains(&effort))
+        matches!(self, Self::Supported(capabilities) if capabilities.levels().contains(&effort))
     }
 }
 

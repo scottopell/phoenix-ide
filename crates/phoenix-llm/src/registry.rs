@@ -903,18 +903,13 @@ impl ModelRegistry {
         }
         match self.effort_capabilities(model_id) {
             Some(super::EffortCapabilities::Unsupported) => EffectiveEffort::unsupported(),
-            Some(super::EffortCapabilities::Supported {
-                native_default: super::NativeDefault::Known(level),
-                ..
-            }) => EffectiveEffort::native_known(level),
-            Some(
-                super::EffortCapabilities::Unknown
-                | super::EffortCapabilities::Supported {
-                    native_default: super::NativeDefault::Unknown,
-                    ..
-                },
-            )
-            | None => EffectiveEffort::native_unknown(),
+            Some(super::EffortCapabilities::Supported(capabilities)) => {
+                match capabilities.native_default() {
+                    super::NativeDefault::Known(level) => EffectiveEffort::native_known(level),
+                    super::NativeDefault::Unknown => EffectiveEffort::native_unknown(),
+                }
+            }
+            Some(super::EffortCapabilities::Unknown) | None => EffectiveEffort::native_unknown(),
         }
     }
 

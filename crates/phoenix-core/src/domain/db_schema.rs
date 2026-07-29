@@ -366,6 +366,7 @@ pub struct ConversationCreationIntent {
     pub cwd: String,
     #[serde(default)]
     pub model: Option<String>,
+    // owned: pre-feature creation jobs had no effort; None correctly follows the model default.
     #[serde(default)]
     pub effort: Option<crate::domain::llm_types::ModelEffort>,
     pub text: String,

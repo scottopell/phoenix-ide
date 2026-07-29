@@ -8786,13 +8786,13 @@ async fn insert_conversation_tx(
     sqlx::query(
         "INSERT INTO conversations (
             id, slug, title, parent_conversation_id, user_initiated, state,
-            state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id,
+            state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id,
             desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, llm_language,
             spawned_from_conversation_id,
             cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
             runtime_role, work_scope_id
-        ) VALUES (?1, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+        ) VALUES (?1, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -8808,6 +8808,7 @@ async fn insert_conversation_tx(
     .bind(conv.archived)
     .bind(conv.transcript_generation)
     .bind(&conv.model)
+    .bind(conv.effort.map(ModelEffort::as_wire_name))
     .bind(&conv.project_id)
     .bind(&conv.desired_base_branch)
     .bind(&conv.seed_parent_id)

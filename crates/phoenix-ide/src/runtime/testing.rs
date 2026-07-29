@@ -1373,7 +1373,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: Some(100),
-            effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };

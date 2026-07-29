@@ -321,7 +321,7 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
         messages,
         tools: vec![],
         max_tokens: None,
-        effort: None,
+        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
         telemetry: None,
         cache_key: super::types::PromptCacheKey::stable("proptest"),
     }

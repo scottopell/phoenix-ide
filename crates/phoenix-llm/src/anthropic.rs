@@ -627,11 +627,14 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
         model: spec.api_name.clone(),
         max_tokens: request
             .raised_output_token_ceiling()
-            .unwrap_or_else(|| default_output_headroom(request.effort)),
+            .unwrap_or_else(|| default_output_headroom(request.effective_effort.level())),
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
-        output_config: request.effort.map(explicit_anthropic_effort),
+        output_config: request
+            .effective_effort
+            .level()
+            .map(explicit_anthropic_effort),
         stream: None,
         tags: None,
     }
@@ -1200,7 +1203,7 @@ mod tests {
                 },
             ],
             max_tokens: None,
-            effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
@@ -1212,7 +1215,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: None,
-            effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
@@ -1227,7 +1230,8 @@ mod tests {
         assert!(native.get("output_config").is_none());
         assert_eq!(native["max_tokens"], 16_384);
 
-        request.effort = Some(ModelEffort::Xhigh);
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Xhigh);
         request.max_tokens = Some(16_384);
         let explicit = serde_json::to_value(translate_request(&spec, &request)).unwrap();
         assert_eq!(explicit["output_config"]["effort"], "xhigh");
@@ -1335,7 +1339,7 @@ mod tests {
             }],
             tools: vec![],
             max_tokens: None,
-            effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };

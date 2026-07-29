@@ -47,7 +47,7 @@ pub async fn generate_title(
         }],
         tools: vec![],
         max_tokens: Some(50), // Title should be very short
-        effort: None,
+        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
         telemetry: None,
         // Shared by every title-generation call so TITLE_PROMPT caches.
         cache_key: PromptCacheKey::stable("title-generator"),
@@ -128,7 +128,7 @@ pub async fn generate_chain_name(
         }],
         tools: vec![],
         max_tokens: Some(50), // Name should be very short
-        effort: None,
+        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
         telemetry: None,
         // Distinct key from the title generator so the two prompts cache
         // independently — they have different prefixes and output shapes.

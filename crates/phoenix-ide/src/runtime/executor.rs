@@ -4911,14 +4911,13 @@ where
                 messages,
                 tools,
                 max_tokens: Some(16_384),
-                effort: effective_effort.level(),
+                effective_effort,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id.clone(),
                     request_id: request_id.clone(),
                     retry_attempt,
                     attempt_capture: attempt_capture.clone(),
-                    effective_effort,
                 }),
                 // Every turn in a conversation reuses the same prefix
                 // (system prompt + earlier turns), so all turns share one key.
@@ -5653,6 +5652,17 @@ where
         let continuation_limits = self.llm_client.continuation_request_limits();
         let model_id = self.context.model_id.clone();
         let explicit_effort = self.context.effort;
+        if let Some(effort) = explicit_effort {
+            if !self.llm_registry.supports_effort(&model_id, effort) {
+                let error =
+                    format!("Persisted effort '{effort}' is not supported by model '{model_id}'");
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let _ = event_tx.send(Event::ContinuationFailed { error }).await;
+                });
+                return;
+            }
+        }
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
@@ -5742,14 +5752,13 @@ where
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
                 max_tokens: Some(4096),
-                effort: effective_effort.level(),
+                effective_effort,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id,
                     request_id,
                     retry_attempt,
                     attempt_capture: attempt_capture.clone(),
-                    effective_effort,
                 }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the

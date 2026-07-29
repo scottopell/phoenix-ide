@@ -3626,7 +3626,7 @@ fn should_trigger_continuation(
         .is_some_and(phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom)
     {
         let reservation_threshold =
-            u64::try_from(context_window.saturating_sub(64_000)).unwrap_or(u64::MAX);
+            u64::try_from(context_window.saturating_sub(64_000 + 4_096)).unwrap_or(u64::MAX);
         proportional_threshold.min(reservation_threshold)
     } else {
         proportional_threshold

@@ -684,6 +684,18 @@ async fn provision_conversation(
         phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage
     };
 
+    if let Some(effort) = intent.effort {
+        if !manager
+            .llm_registry
+            .supports_effort(&resolved_model, effort)
+        {
+            return Err((
+                format!("Effort '{effort}' is not supported by resolved model '{resolved_model}'"),
+                ErrorKind::InvalidRequest,
+            ));
+        }
+    }
+
     if creation_metadata_needs_commit(job.protocol.stage) {
         let metadata_outcome = manager
             .db()

@@ -756,7 +756,7 @@ fn build_agent_request(
         messages: messages.to_vec(),
         tools,
         max_tokens: Some(ANSWER_MAX_TOKENS),
-        effort: None,
+        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
         telemetry: None,
         // One cache key per language so phoenix-native and caveman prompts
         // don't collide on a shared cache slot.
