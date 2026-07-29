@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
+use phoenix_mcp::McpToolCallError;
 pub use phoenix_mcp::{oauth, McpClientManager};
 
 /// Wraps a single MCP tool as a Phoenix Tool.
@@ -39,40 +40,14 @@ impl Tool for McpTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        // Spawn call_tool as a detached task so that cancellation never drops
-        // the future mid-write while it holds the stdin/stdout mutex locks.
-        // If we cancelled by dropping the select'd future directly, a partial
-        // JSON-RPC write could corrupt the server's stdin stream.
-        let manager = Arc::clone(&self.manager);
-        let server_name = self.server_name.clone();
-        let tool_name = self.tool_name.clone();
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = manager.call_tool(&server_name, &tool_name, input).await;
-            // If the receiver was dropped (cancellation), this send fails silently.
-            let _ = tx.send(result);
-        });
-
-        tokio::select! {
-            biased;
-
-            () = ctx.cancel.cancelled() => {
-                tracing::debug!(
-                    tool = %self.full_name,
-                    "MCP tool call cancelled -- spawned task will complete in background"
-                );
-                ToolOutput::error("[mcp tool call cancelled]")
-            }
-
-            result = rx => {
-                match result {
-                    Ok(Ok(text)) => ToolOutput::success(text),
-                    Ok(Err(e)) => ToolOutput::error(e),
-                    // Spawned task panicked or was aborted
-                    Err(_) => ToolOutput::error("MCP tool call task terminated unexpectedly"),
-                }
-            }
+        let result = self
+            .manager
+            .call_tool_cancellable(&self.server_name, &self.tool_name, input, ctx.cancel)
+            .await;
+        match result {
+            Ok(text) => ToolOutput::success(text),
+            Err(McpToolCallError::Cancelled) => ToolOutput::error("[mcp tool call cancelled]"),
+            Err(McpToolCallError::Failed(error)) => ToolOutput::error(error),
         }
     }
 }

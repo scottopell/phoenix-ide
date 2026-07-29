@@ -868,13 +868,14 @@ impl SseFramer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{McpClientManager, McpConnState, McpServerConfig};
+    use crate::{server_handle, McpClientManager, McpConnState, McpServerConfig};
     use std::collections::VecDeque;
     use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{watch, RwLock};
+    use tokio_util::sync::CancellationToken;
 
     // -----------------------------------------------------------------------
     // Minimal scripted HTTP/1.1 server: records requests, replays canned
@@ -1387,7 +1388,7 @@ mod tests {
         server.push_responses(vec![sse_response(sse_body)]);
 
         let output = mcp
-            .call_tool("report", serde_json::json!({}))
+            .call_tool("report", serde_json::json!({}), &CancellationToken::new())
             .await
             .expect("tools/call over SSE");
 
@@ -1426,7 +1427,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The call 404s (session expired), recovery re-runs the handshake
         // with a fresh session, then the retried call succeeds.
@@ -1481,7 +1482,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The lazy list_changed refresh 404s (session expired); the refresh
         // path must re-establish (fresh handshake) instead of leaving the
@@ -1554,7 +1555,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The list_changed refresh 404s and escalates into a recovery whose
         // re-initialize is held open for 300ms. A tool call STARTING at
@@ -1861,7 +1862,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Two concurrent calls 404. One failure is held open for 400ms; the
         // other fails instantly and completes its recovery (~ms) long before
@@ -1910,7 +1911,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Simulate an in-flight hold (refresh/recovery): the server is out
         // of the map with a claim parked, released 100ms later.
@@ -1963,7 +1964,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The server is held out of the map (claim parked) when a reload
         // arrives with it gone from config: the sweep must settle the hold
@@ -2045,7 +2046,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The server is held under claim 1; when that claim releases the
         // server is STILL absent because claim 2 is parked in the same
@@ -2097,7 +2098,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Reload 1 restarts the server with a changed config; its connect is
         // held open for 300ms. Reload 2 (arriving at 100ms, removing the
@@ -2239,7 +2240,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The old-config server is held out by a refresh/recovery claim when
         // a reload with a NEW config arrives. The holder reinserts the OLD
@@ -2275,7 +2276,14 @@ mod tests {
         assert!(result.unchanged.is_empty());
         let servers = manager.servers.read().await;
         let live = servers.get("remote").expect("server present");
-        assert_eq!(live.config(), changed, "the new config must be applied");
+        {
+            let live = live.read().await;
+            assert_eq!(
+                live.as_ref().expect("server present").config(),
+                changed,
+                "the new config must be applied"
+            );
+        }
         drop(servers);
 
         // The restarted handshake carried the new static credential.
@@ -2300,7 +2308,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The refresh 404s (recoverable), but the recovery handshake fails:
         // the server must be dropped, not reinserted with stale definitions
@@ -2332,7 +2340,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The first call 404s and leads a recovery whose re-initialize is
         // held open for 300ms. The second call STARTS at 100ms -- while the
@@ -2380,7 +2388,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Two concurrent calls both 404. The delays order the race: the first
         // failure claims the recovery immediately; the second failure lands
@@ -2431,7 +2439,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         server.push_responses(vec![status_response(
             401,
@@ -3286,7 +3294,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // The call 401s (revoked/expired server-side); the silent refresh
         // rotates the bearer and the executor replays the call
@@ -3360,7 +3368,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         install_oauth_discovery(&server, true);
         server.route(
@@ -3434,7 +3442,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         install_oauth_discovery(&server, true);
         // The 403 step-up challenge names the missing scope -- delivered
@@ -3850,7 +3858,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Same URL, different pre-configured client_id: the token was minted
         // under the old client identity and must not restore under the new one
@@ -3917,7 +3925,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         server.push_responses(vec![delete_ack()]);
         server.push_responses(handshake_responses("sess-2"));
@@ -4013,7 +4021,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         // Repoint the URL (same host, different path = different resource).
         // The restart handshake runs unauthenticated -- and crucially the old
@@ -4070,7 +4078,7 @@ mod tests {
             .servers
             .write()
             .await
-            .insert("remote".to_string(), mcp);
+            .insert("remote".to_string(), server_handle(mcp));
 
         server.push_responses(vec![delete_ack()]);
         let result = manager.reload_from_configs(Vec::new()).await;

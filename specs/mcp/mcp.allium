@@ -956,10 +956,11 @@ invariant OneTokenPerServer {
 
 deferred ToolCallCancellationSafety    -- see: crates/phoenix-tools/src/mcp.rs
     -- REQ-MCP-017. Cancellation safety and tool-error surfacing are executor
-    -- mechanics, not connection-lifecycle states: McpTool::run spawns the
-    -- tools/call as a detached task and selects on the cancellation token, so
-    -- a cancel cannot drop an in-flight stdio write mid-frame, and a server
-    -- isError result becomes a ToolOutput::Error rather than a Success. This
+    -- mechanics, not connection-lifecycle states: McpTool::run passes the
+    -- cancellation token into the manager; cancellation exclusively extracts
+    -- the serving connection and re-establishes its transport before returning,
+    -- so a partial or abandoned stdio exchange is never reused. A server isError
+    -- result becomes a ToolOutput::Error rather than a Success. This
     -- is emergent from the tool-execution path and the ToolOutput enum, below
     -- the granularity of the ConnState machine modeled here.
     -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run)
