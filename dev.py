@@ -115,6 +115,7 @@ class CheckWorkProfile:
     started_self: resource.struct_rusage
     started_children: resource.struct_rusage
     started_thread_ns: int
+    finalized_cpu: dict | None = None
 
     @classmethod
     def start(cls, artifact_dir: Path | None = None):
@@ -132,6 +133,24 @@ class CheckWorkProfile:
             started_children=resource.getrusage(resource.RUSAGE_CHILDREN),
             started_thread_ns=time.thread_time_ns(),
         )
+
+    def finalize_cpu(self) -> dict:
+        if self.finalized_cpu is None:
+            self_usage = resource.getrusage(resource.RUSAGE_SELF)
+            child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+            self_cpu = _rusage_delta_attributes(
+                self.started_self, self_usage, "exact_process"
+            )
+            child_cpu = _rusage_delta_attributes(
+                self.started_children, child_usage, "exact_waited_children"
+            )
+            self.finalized_cpu = _cpu_attributes(
+                self_cpu["cpu.user_ms"] + child_cpu["cpu.user_ms"],
+                self_cpu["cpu.system_ms"] + child_cpu["cpu.system_ms"],
+                "exact_process_plus_waited_children",
+                **{"cpu.tree_closure": "command_reaped_descendants_unverified"},
+            )
+        return self.finalized_cpu
 
     def measurement_path(self, lane: str, step: str) -> Path:
         safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", f"{lane}-{step}").strip("-")
@@ -453,20 +472,7 @@ def _shutdown_dev_tracing(error: BaseException | None) -> None:
                 "dev.success": not failed,
             }
             if _CHECK_PROFILE is not None:
-                self_usage = resource.getrusage(resource.RUSAGE_SELF)
-                child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-                self_cpu = _rusage_delta_attributes(
-                    _CHECK_PROFILE.started_self, self_usage, "exact_process"
-                )
-                child_cpu = _rusage_delta_attributes(
-                    _CHECK_PROFILE.started_children, child_usage, "exact_waited_children"
-                )
-                attributes.update(_cpu_attributes(
-                    self_cpu["cpu.user_ms"] + child_cpu["cpu.user_ms"],
-                    self_cpu["cpu.system_ms"] + child_cpu["cpu.system_ms"],
-                    "exact_process_plus_waited_children",
-                    **{"cpu.tree_closure": "command_reaped_descendants_unverified"},
-                ))
+                attributes.update(_CHECK_PROFILE.finalize_cpu())
             tracing.finish_span(tracing.command_span, attributes, failed=failed)
             tracing.command_span = None
         tracing.shutdown()
@@ -5008,9 +5014,20 @@ def cmd_check(
             with results_lock:
                 results.append(("allium specs", 1, elapsed, "allium analyse timed out after 60s"))
             reporter.step_done("allium", "allium specs", 1, elapsed)
+            if measurement_path is not None and not measurement_path.exists():
+                _write_unavailable_measurement(
+                    measurement_path,
+                    identity="step:allium:allium specs",
+                    duration_ms=elapsed * 1000.0,
+                    returncode=1,
+                )
             _finish_check_step_span(
                 span, elapsed=elapsed, timed_out=True, lock_wait=0.0,
-                returncode=1, cpu_attributes=None,
+                returncode=1,
+                cpu_attributes=(
+                    _read_cpu_measurement(measurement_path)
+                    if measurement_path is not None else None
+                ),
             )
             return
         # Parse the concatenated JSON-doc stream that allium-cli emits
@@ -5556,23 +5573,16 @@ def cmd_check(
         )
 
     if profile_work and _CHECK_PROFILE is not None:
-        self_usage = resource.getrusage(resource.RUSAGE_SELF)
-        child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-        self_cpu = _rusage_delta_attributes(
-            _CHECK_PROFILE.started_self, self_usage, "exact_process"
-        )
-        child_cpu = _rusage_delta_attributes(
-            _CHECK_PROFILE.started_children, child_usage, "exact_waited_children"
-        )
+        command_cpu = _CHECK_PROFILE.finalize_cpu()
         command_path = _CHECK_PROFILE.artifact_dir / "command.json"
         command_path.write_text(json.dumps({
             "schema_version": 1,
             "identity": "command:dev.py check",
             "kind": "command",
             "provenance": "exact_process_plus_waited_children",
-            "user_cpu_ms": self_cpu["cpu.user_ms"] + child_cpu["cpu.user_ms"],
-            "system_cpu_ms": self_cpu["cpu.system_ms"] + child_cpu["cpu.system_ms"],
-            "total_cpu_ms": self_cpu["cpu.total_ms"] + child_cpu["cpu.total_ms"],
+            "user_cpu_ms": command_cpu["cpu.user_ms"],
+            "system_cpu_ms": command_cpu["cpu.system_ms"],
+            "total_cpu_ms": command_cpu["cpu.total_ms"],
             "wall_ms": (time.monotonic() - t_start) * 1000.0,
             "tree_closure": "command_reaped_descendants_unverified",
         }, sort_keys=True) + "\n")

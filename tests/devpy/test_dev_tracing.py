@@ -137,6 +137,16 @@ class DevTracingTests(unittest.TestCase):
         self.assertIsInstance(child, FakeSpan)
         self.assertIs(parent, tracing.started[0][3])
 
+    def test_profile_command_cpu_finalization_is_idempotent(self):
+        profile = self.dev.CheckWorkProfile.start()
+        first = profile.finalize_cpu()
+        for _ in range(10000):
+            pass
+        second = profile.finalize_cpu()
+
+        self.assertIs(first, second)
+        self.assertEqual(first["cpu.total_ms"], second["cpu.total_ms"])
+
     def test_profile_rejects_nonempty_explicit_artifact_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
