@@ -2,6 +2,7 @@ use crate::{
     CallContext, McpRequestError, McpServer, McpServerConfig, McpToolDef, OAuthRecoveryKind,
 };
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -104,6 +105,8 @@ impl SupervisorHandle {
                 state,
                 epoch: 0,
                 recovery_from: None,
+                stdio_active: false,
+                stdio_queue: VecDeque::new(),
             }
             .run(),
         );
@@ -191,7 +194,7 @@ impl SupervisorHandle {
     /// (and terminates the server) if the epoch is stale.
     pub(crate) async fn publish(&self, epoch: u64, server: McpServer) -> bool {
         let (reply, receive) = oneshot::channel();
-        if self
+        if let Err(error) = self
             .mailbox
             .send(Command::Publish {
                 epoch,
@@ -199,8 +202,10 @@ impl SupervisorHandle {
                 reply,
             })
             .await
-            .is_err()
         {
+            if let Command::Publish { server, .. } = error.0 {
+                server.terminate().await;
+            }
             return false;
         }
         receive.await.unwrap_or(false)
@@ -273,6 +278,15 @@ pub(crate) enum RecoveryClaim {
     Unavailable(String),
 }
 
+struct QueuedCall {
+    epoch: u64,
+    context: CallContext,
+    tool: String,
+    arguments: Value,
+    cancel: CancellationToken,
+    reply: oneshot::Sender<Result<CallOutcome, String>>,
+}
+
 enum Command {
     Status {
         reply: oneshot::Sender<Snapshot>,
@@ -332,12 +346,14 @@ struct Actor {
     state: SupervisorState,
     epoch: u64,
     recovery_from: Option<u64>,
+    stdio_active: bool,
+    stdio_queue: VecDeque<QueuedCall>,
 }
 
 impl Actor {
     async fn run(mut self) {
         while let Some(command) = self.commands.recv().await {
-            let stop = matches!(command, Command::Shutdown { .. });
+            let stop = matches!(command, Command::Remove { .. } | Command::Shutdown { .. });
             self.handle(command).await;
             if stop {
                 return;
@@ -392,9 +408,15 @@ impl Actor {
                         }
                     });
                 } else {
-                    let result = context.call_tool(&tool, arguments, &cancel).await;
-                    let outcome = context.outcome(epoch, result);
-                    let _ = reply.send(Ok(outcome));
+                    self.stdio_queue.push_back(QueuedCall {
+                        epoch,
+                        context,
+                        tool,
+                        arguments,
+                        cancel,
+                        reply,
+                    });
+                    self.start_next_stdio_call();
                 }
             }
             Command::CallCompleted {
@@ -403,19 +425,14 @@ impl Actor {
                 result,
                 reply,
             } => {
-                if epoch != self.epoch || !matches!(self.state, SupervisorState::Ready(_)) {
-                    if result.is_err() {
-                        // Preserve the serving epoch and failure
-                        // classification. The manager can then join the
-                        // recovery already claimed for that epoch; the stale
-                        // completion never mutates actor state.
-                        let _ = reply.send(Ok(context.outcome(epoch, result)));
-                    } else {
-                        let _ = reply
-                            .send(Err("MCP call superseded by a lifecycle change".to_string()));
-                    }
-                } else {
-                    let _ = reply.send(Ok(context.outcome(epoch, result)));
+                // Epochs fence lifecycle mutation, not delivery of a correlated
+                // call result: a successful remote side effect must still reach
+                // its original waiter even if a sibling triggered recovery.
+                let is_stdio = !context.is_http();
+                let _ = reply.send(Ok(context.outcome(epoch, result)));
+                if is_stdio {
+                    self.stdio_active = false;
+                    self.start_next_stdio_call();
                 }
             }
             Command::Inspect { reply } => {
@@ -526,6 +543,42 @@ impl Actor {
                 self.publish_snapshot(None, None);
                 let _ = reply.send(());
             }
+        }
+    }
+
+    fn start_next_stdio_call(&mut self) {
+        if self.stdio_active {
+            return;
+        }
+        while let Some(call) = self.stdio_queue.pop_front() {
+            if call.cancel.is_cancelled() {
+                let _ = call.reply.send(Ok(call
+                    .context
+                    .outcome(call.epoch, Err(McpRequestError::Cancelled))));
+                continue;
+            }
+            self.stdio_active = true;
+            let mailbox = self.mailbox.clone();
+            tokio::spawn(async move {
+                let result = call
+                    .context
+                    .call_tool(&call.tool, call.arguments, &call.cancel)
+                    .await;
+                if let Err(error) = mailbox
+                    .send(Command::CallCompleted {
+                        epoch: call.epoch,
+                        context: call.context,
+                        result,
+                        reply: call.reply,
+                    })
+                    .await
+                {
+                    if let Command::CallCompleted { reply, .. } = error.0 {
+                        let _ = reply.send(Err(stopped()));
+                    }
+                }
+            });
+            break;
         }
     }
 
@@ -836,10 +889,16 @@ mod epoch_tests {
             panic!("recovery advances the actor epoch");
         };
         releases.add_permits(1);
-        let Err(error) = call.await.expect("call task") else {
-            panic!("the old epoch cannot publish a successful completion");
-        };
-        assert!(error.contains("superseded"));
+        let outcome = call
+            .await
+            .expect("call task")
+            .expect("correlated success reaches its waiter");
+        assert_eq!(outcome.result.expect("successful call"), "ok");
+        assert_eq!(
+            handle.snapshot().epoch,
+            permit.epoch,
+            "stale completion does not mutate lifecycle epoch"
+        );
 
         let (replacement, _, _) = server(http_config());
         assert!(handle.publish(permit.epoch, replacement).await);

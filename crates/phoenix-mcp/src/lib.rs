@@ -2138,12 +2138,16 @@ impl McpClientManager {
             .collect();
         let disabled = self.disabled_servers.read().await;
         let redirect_warning = self.oauth.redirect_warning();
+        let pending_urls = self.pending_oauth_urls.read().await.clone();
         let mut statuses = Vec::new();
         for (name, handle) in handles {
             let Some(snapshot) = handle.status().await else {
                 continue;
             };
-            let pending_url = snapshot.pending_oauth_url.clone();
+            let pending_url = snapshot
+                .pending_oauth_url
+                .clone()
+                .or_else(|| pending_urls.get(&name).cloned());
             let tools = match &snapshot.state {
                 SupervisorState::Ready(server) => server.tools(),
                 SupervisorState::Connecting
@@ -2157,6 +2161,11 @@ impl McpClientManager {
                     (McpConnState::Unauthorized, None)
                 }
                 SupervisorState::Failed => (McpConnState::Failed, snapshot.last_error.clone()),
+                SupervisorState::Connecting | SupervisorState::Recovering
+                    if pending_url.is_some() =>
+                {
+                    (McpConnState::Unauthorized, None)
+                }
                 SupervisorState::Connecting
                 | SupervisorState::Recovering
                 | SupervisorState::Removed => continue,
@@ -2519,9 +2528,13 @@ impl McpClientManager {
                 }
             }
             OAuthRecoveryKind::StepUp { www_authenticate } => {
-                self.step_up_authorization(server_name, &permit.config, &www_authenticate)
+                if let Err(error) = self
+                    .step_up_authorization(server_name, &permit.config, &www_authenticate)
                     .await
-                    .map_err(McpToolCallError::Failed)?;
+                {
+                    handle.fail(permit.epoch, error.clone()).await;
+                    return Err(McpToolCallError::Failed(error));
+                }
                 let url = self
                     .pending_oauth_urls
                     .read()
@@ -3967,7 +3980,14 @@ mod tests {
             .await
             .expect("reload waits for removed server without global map lock");
         drop(map_guard);
-        call.await.expect("call task").expect("call succeeds");
+        let call_result = call.await.expect("call task");
+        assert!(
+            call_result.is_ok()
+                || call_result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("supervisor stopped")),
+            "a removal may complete or supersede the already-started call: {call_result:?}"
+        );
         let result = reload.await.expect("reload task");
         assert_eq!(result.removed, vec!["fake"]);
     }
