@@ -2499,29 +2499,24 @@ impl McpClientManager {
         // operations during list_tools() I/O.
         // Same extract-refresh-reinsert pattern as call_tool() respawn.
         for name in needs_refresh {
-            let extracted = {
-                let mut servers = self.servers.write().await;
-                let refresh = match servers.get(&name) {
-                    Some(handle) => handle
-                        .read()
-                        .await
-                        .as_ref()
-                        .is_some_and(|s| s.tools_changed.swap(false, Ordering::AcqRel)),
-                    None => false,
-                };
-                if refresh {
-                    // Claim the hold under the same lock that removes the
-                    // entry, so a tool call landing mid-refresh (or
-                    // mid-refresh-recovery) waits for the outcome instead
-                    // of failing with "not connected".
-                    let claim = self.claim_server(&name);
-                    match servers.remove(&name) {
-                        Some(handle) => handle.write().await.take().map(|server| (server, claim)),
-                        None => None,
+            let handle = self.servers.read().await.get(&name).cloned();
+            let refresh = match &handle {
+                Some(handle) => handle
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|s| s.tools_changed.swap(false, Ordering::AcqRel)),
+                None => false,
+            };
+            let extracted = if let (true, Some(handle)) = (refresh, handle.as_ref()) {
+                match self.claim_serving_slot(&name, handle).await {
+                    ServingSlot::Take(handle, claim) => {
+                        Some((Self::take_claimed_server(handle).await, claim))
                     }
-                } else {
-                    None
+                    ServingSlot::Stale | ServingSlot::Follow(_) | ServingSlot::Missing => None,
                 }
+            } else {
+                None
             };
             // Lock dropped -- list_tools() runs with no lock held.
             if let Some((mut server, claim)) = extracted {
@@ -2625,12 +2620,16 @@ impl McpClientManager {
         tool_name: &str,
         arguments: &Value,
         cancel: &CancellationToken,
-    ) -> Result<CallAttempt, String> {
+    ) -> Result<CallAttempt, McpToolCallError> {
         loop {
             let server = self.servers.read().await.get(server_name).cloned();
             if let Some(server) = server {
                 let serving_handle = Arc::clone(&server);
-                let guard = server.read().await;
+                let guard = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(McpToolCallError::Cancelled),
+                    guard = server.read() => guard,
+                };
                 if guard.is_some() {
                     return Ok(CallAttempt::run(
                         serving_handle,
@@ -2649,9 +2648,17 @@ impl McpClientManager {
                 .map(tokio::sync::watch::Sender::subscribe);
             match receiver {
                 Some(mut receiver) => {
-                    let _ = receiver.changed().await;
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Err(McpToolCallError::Cancelled),
+                        _ = receiver.changed() => {}
+                    }
                 }
-                None => return Err(format!("MCP server '{server_name}' is not connected")),
+                None => {
+                    return Err(McpToolCallError::Failed(format!(
+                        "MCP server '{server_name}' is not connected"
+                    )));
+                }
             }
         }
     }
@@ -2702,6 +2709,68 @@ impl McpClientManager {
             .await
     }
 
+    async fn claim_serving_slot(&self, server_name: &str, serving: &ServerHandle) -> ServingSlot {
+        let mut servers = self.servers.write().await;
+        match servers.get(server_name) {
+            Some(current) if Arc::ptr_eq(current, serving) => {
+                let claim = self.claim_server(server_name);
+                let handle = servers
+                    .remove(server_name)
+                    .expect("serving handle remains in map");
+                ServingSlot::Take(handle, claim)
+            }
+            Some(_) => ServingSlot::Stale,
+            None => self
+                .recovering_map()
+                .get(server_name)
+                .map(tokio::sync::watch::Sender::subscribe)
+                .map_or(ServingSlot::Missing, ServingSlot::Follow),
+        }
+    }
+
+    async fn take_claimed_server(handle: ServerHandle) -> McpServer {
+        handle
+            .write()
+            .await
+            .take()
+            .expect("serving handle contains server")
+    }
+
+    async fn finish_cancelled_attempt(
+        &self,
+        server_name: &str,
+        attempt: CallAttempt,
+    ) -> Result<String, McpToolCallError> {
+        let ServingSlot::Take(handle, claim) =
+            self.claim_serving_slot(server_name, &attempt.server).await
+        else {
+            return Err(McpToolCallError::Cancelled);
+        };
+        let mut server = Self::take_claimed_server(handle).await;
+        let config = server.config.clone();
+        let result = server.reestablish().await;
+        if result.is_ok() {
+            insert_server(&self.servers, server_name, server).await;
+        }
+        drop(claim);
+        match result {
+            Ok(()) => Err(McpToolCallError::Cancelled),
+            Err(error) => {
+                record_connect_failure(
+                    &self.failed_servers,
+                    &self.pending_oauth_urls,
+                    server_name,
+                    &config,
+                    error.to_string(),
+                )
+                .await;
+                Err(McpToolCallError::Failed(format!(
+                    "MCP server '{server_name}' cancellation cleanup failed: {error}"
+                )))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // One ordered lifecycle: attempt, classify, recover (transport or OAuth), retry.
     async fn call_tool_with_cancel(
         &self,
@@ -2723,97 +2792,70 @@ impl McpClientManager {
 
         match attempt.result {
             Ok(result) => return Ok(result),
+            Err(McpRequestError::Cancelled) => {
+                return self.finish_cancelled_attempt(server_name, attempt).await;
+            }
             Err(e) => {
-                let cancelled = matches!(&e, McpRequestError::Cancelled);
                 // One concurrent failing call leads the recovery; the others
                 // follow by waiting for it to finish, then retrying.
                 // Brief write lock: classify the failure and either claim the
                 // recovery (extracting the server for out-of-lock work) or
                 // join one already in flight.
-                let recovery = {
-                    let mut servers = self.servers.write().await;
-                    if let Some(current_handle) = servers.get(server_name).cloned() {
-                        if Arc::ptr_eq(&current_handle, &attempt.server) {
-                            let removed = servers
-                                .remove(server_name)
-                                .expect("serving handle remains in map");
-                            let mut server = removed
-                                .write()
-                                .await
-                                .take()
-                                .expect("serving handle contains server");
-                            // The failing instance is still the one in the map:
-                            // its own judgement applies. A healthy transport with
-                            // a non-recoverable failure is a tool-level error --
-                            // surface it; retrying could re-execute a
-                            // side-effecting call -- unless it is an OAuth
-                            // re-auth condition, which claims the slot like a
-                            // transport recovery (REQ-MCP-012).
-                            if server.is_alive() && !attempt.recoverable && !cancelled {
-                                match oauth_recovery_kind(&server, &e) {
-                                    Some(OAuthRecoveryKind::Refresh { www_authenticate }) => {
-                                        ToolCallRecovery::OAuthRefresh {
-                                            server: Box::new(server),
-                                            claim: self.claim_server(server_name),
-                                            www_authenticate,
-                                        }
-                                    }
-                                    Some(OAuthRecoveryKind::StepUp { www_authenticate }) => {
-                                        ToolCallRecovery::OAuthStepUp {
-                                            server: Box::new(server),
-                                            claim: self.claim_server(server_name),
-                                            www_authenticate,
-                                        }
-                                    }
-                                    None => {
-                                        servers
-                                            .insert(server_name.to_string(), server_handle(server));
-                                        return Err(McpToolCallError::Failed(
-                                            e.into_message(server_name),
-                                        ));
+                let recovery = match self.claim_serving_slot(server_name, &attempt.server).await {
+                    ServingSlot::Take(handle, claim) => {
+                        let mut server = Self::take_claimed_server(handle).await;
+                        // The serving instance's own policy decides whether this
+                        // is a tool error, OAuth recovery, or transport recovery.
+                        if server.is_alive() && !attempt.recoverable {
+                            match oauth_recovery_kind(&server, &e) {
+                                Some(OAuthRecoveryKind::Refresh { www_authenticate }) => {
+                                    ToolCallRecovery::OAuthRefresh {
+                                        server: Box::new(server),
+                                        claim,
+                                        www_authenticate,
                                     }
                                 }
-                            } else {
-                                // A recoverable transport failure from the
-                                // serving instance: lead the recovery.
-                                let action = server.recovery_action();
-                                tracing::warn!(
-                                    server = %server_name,
-                                    error = %e.into_message(server_name),
-                                    action = action,
-                                    "MCP server connection lost, removing to re-establish"
-                                );
-
-                                // Claim the recovery while still holding the
-                                // servers lock, so a concurrent failing call
-                                // cannot observe the server absent without also
-                                // seeing the claim.
-                                ToolCallRecovery::Lead {
-                                    server: Box::new(server),
-                                    action,
-                                    claim: self.claim_server(server_name),
+                                Some(OAuthRecoveryKind::StepUp { www_authenticate }) => {
+                                    ToolCallRecovery::OAuthStepUp {
+                                        server: Box::new(server),
+                                        claim,
+                                        www_authenticate,
+                                    }
+                                }
+                                None => {
+                                    insert_server(&self.servers, server_name, server).await;
+                                    drop(claim);
+                                    return Err(McpToolCallError::Failed(
+                                        e.into_message(server_name),
+                                    ));
                                 }
                             }
                         } else {
-                            if !attempt.recoverable {
-                                return Err(McpToolCallError::Failed(e.into_message(server_name)));
+                            let action = server.recovery_action();
+                            tracing::warn!(
+                                server = %server_name,
+                                error = %e.into_message(server_name),
+                                action = action,
+                                "MCP server connection lost, removing to re-establish"
+                            );
+                            ToolCallRecovery::Lead {
+                                server: Box::new(server),
+                                action,
+                                claim,
                             }
-                            ToolCallRecovery::Retry
                         }
-                    } else {
-                        // Absent with a claim parked: a concurrent call is
-                        // already re-establishing this server -- wait for it
-                        // rather than failing with "not connected".
-                        let receiver = self
-                            .recovering_map()
-                            .get(server_name)
-                            .map(tokio::sync::watch::Sender::subscribe);
-                        let Some(receiver) = receiver else {
-                            return Err(McpToolCallError::Failed(format!(
-                                "MCP server '{server_name}' is not connected"
-                            )));
-                        };
-                        ToolCallRecovery::Follow(receiver)
+                    }
+                    ServingSlot::Stale => {
+                        if !attempt.recoverable {
+                            return Err(McpToolCallError::Failed(e.into_message(server_name)));
+                        }
+                        ToolCallRecovery::Retry
+                    }
+                    ServingSlot::Follow(receiver) => ToolCallRecovery::Follow(receiver),
+                    ServingSlot::Missing => {
+                        return Err(McpToolCallError::Failed(format!(
+                            "MCP server '{server_name}' is not connected"
+                        )));
                     }
                 };
                 // Write lock is dropped here.
@@ -2849,9 +2891,6 @@ impl McpClientManager {
                             return Err(McpToolCallError::Failed(format!(
                                 "MCP server '{server_name}' connection lost and {action} failed: {reestablish_err}"
                             )));
-                        }
-                        if cancelled {
-                            return Err(McpToolCallError::Cancelled);
                         }
                     }
                     // Silent token refresh (REQ-MCP-012): on success the
@@ -2921,9 +2960,13 @@ impl McpClientManager {
         let retry = self
             .attempt_call(server_name, tool_name, &arguments, &cancel)
             .await?;
-        retry
-            .result
-            .map_err(|e| McpToolCallError::Failed(e.into_message(server_name)))
+        match retry.result {
+            Ok(result) => Ok(result),
+            Err(McpRequestError::Cancelled) => {
+                self.finish_cancelled_attempt(server_name, retry).await
+            }
+            Err(error) => Err(McpToolCallError::Failed(error.into_message(server_name))),
+        }
     }
 
     /// Connect and initialize a single MCP server. A failed handshake shuts
@@ -3354,7 +3397,9 @@ impl McpClientManager {
                 let handle = self.servers.read().await.get(name).cloned();
                 if let Some(handle) = handle {
                     let server = handle.read().await;
-                    return server.as_ref().map(McpServer::config);
+                    if let Some(server) = server.as_ref() {
+                        return Some(server.config());
+                    }
                 }
             }
             let receiver = self
@@ -3401,7 +3446,7 @@ impl McpClientManager {
         // otherwise reinsert it later as a zombie -- so claimed names are
         // settled and swept alongside the map keys.
         let mut removed_servers = Vec::new();
-        let claimed: Vec<String> = {
+        let (claimed, removed_handles) = {
             let mut servers = self.servers.write().await;
             // Revoke connect tickets for names no longer configured while
             // still holding the servers lock: publish_if_current checks the
@@ -3416,12 +3461,11 @@ impl McpClientManager {
                 .retain(|name, _| config_names.contains(name));
 
             let existing_names: Vec<String> = servers.keys().cloned().collect();
+            let mut removed_handles = Vec::new();
             for name in existing_names {
                 if !config_names.contains(&name) {
                     if let Some(handle) = servers.remove(&name) {
-                        if let Some(server) = handle.write().await.take() {
-                            removed_servers.push((name.clone(), server));
-                        }
+                        removed_handles.push((name.clone(), handle));
                     }
                     removed.push(name);
                 }
@@ -3433,8 +3477,13 @@ impl McpClientManager {
             // (swept above) or still claimed (in this snapshot) -- none can
             // slip between the sweep and the snapshot.
             let claimed: Vec<String> = self.recovering_map().keys().cloned().collect();
-            claimed
+            (claimed, removed_handles)
         };
+        for (name, handle) in removed_handles {
+            if let Some(server) = handle.write().await.take() {
+                removed_servers.push((name, server));
+            }
+        }
         // Sweep pending OAuth flows whose server left the config -- BEFORE
         // settling claims, because a step-up flow holds its server's claim
         // until the operator acts, and waiting on it here would block the
@@ -3453,7 +3502,8 @@ impl McpClientManager {
         for name in claimed {
             if !config_names.contains(&name) && !removed.contains(&name) {
                 self.await_claim_release(&name).await;
-                if let Some(handle) = self.servers.write().await.remove(&name) {
+                let handle = self.servers.write().await.remove(&name);
+                if let Some(handle) = handle {
                     if let Some(server) = handle.write().await.take() {
                         removed_servers.push((name.clone(), server));
                     }
@@ -3565,7 +3615,8 @@ impl McpClientManager {
                     // evicted below, so an old attempt's server can neither
                     // race the new connect nor outlive a failed one.
                     let ticket = self.issue_connect_ticket(&name, &entry);
-                    if let Some(stale) = self.servers.write().await.remove(&name) {
+                    let stale = self.servers.write().await.remove(&name);
+                    if let Some(stale) = stale {
                         tracing::warn!(
                             server = %name,
                             "Evicting a stale connect that landed before reload superseded it"
@@ -3630,36 +3681,35 @@ impl McpClientManager {
                     // restart -- the holder would reinsert the OLD config and
                     // this reload would silently fail to apply the new one.
                     let slot = loop {
-                        {
-                            let mut servers = self.servers.write().await;
-                            let current = match servers.get(&name) {
-                                Some(handle) => handle.read().await.as_ref().map(McpServer::config),
-                                None => None,
-                            };
-                            match current {
-                                Some(config) if config == entry => break Slot::Desired,
-                                Some(_) => match servers.remove(&name) {
-                                    Some(handle) => match handle.write().await.take() {
-                                        Some(server) => break Slot::Old(Box::new(server)),
-                                        None => break Slot::Vacant,
-                                    },
-                                    None => break Slot::Vacant,
-                                },
-                                None => {}
+                        let handle = self.servers.read().await.get(&name).cloned();
+                        let Some(handle) = handle else {
+                            let receiver = self
+                                .recovering_map()
+                                .get(&name)
+                                .map(tokio::sync::watch::Sender::subscribe);
+                            match receiver {
+                                Some(mut receiver) => {
+                                    let _ = receiver.changed().await;
+                                    continue;
+                                }
+                                None => break Slot::Vacant,
                             }
+                        };
+                        let current = handle.read().await.as_ref().map(McpServer::config);
+                        if current.as_ref() == Some(&entry) {
+                            break Slot::Desired;
                         }
-                        let receiver = self
-                            .recovering_map()
-                            .get(&name)
-                            .map(tokio::sync::watch::Sender::subscribe);
-                        match receiver {
-                            Some(mut receiver) => {
+                        match self.claim_serving_slot(&name, &handle).await {
+                            ServingSlot::Take(handle, claim) => {
+                                let server = Self::take_claimed_server(handle).await;
+                                drop(claim);
+                                break Slot::Old(Box::new(server));
+                            }
+                            ServingSlot::Stale => {}
+                            ServingSlot::Follow(mut receiver) => {
                                 let _ = receiver.changed().await;
                             }
-                            // Absent with no hold: a recovery dropped the
-                            // server in the gap. The new connect below fills
-                            // the vacancy with the desired config.
-                            None => break Slot::Vacant,
+                            ServingSlot::Missing => break Slot::Vacant,
                         }
                     };
 
@@ -3847,6 +3897,13 @@ impl Drop for ServerClaim {
     fn drop(&mut self) {
         self.recovering.lock().unwrap().remove(&self.name);
     }
+}
+
+enum ServingSlot {
+    Take(ServerHandle, ServerClaim),
+    Stale,
+    Follow(tokio::sync::watch::Receiver<()>),
+    Missing,
 }
 
 enum ToolCallRecovery {
@@ -4593,6 +4650,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_waiting_on_claim_returns_immediately() {
+        let (server, _, _) = fake_server(Vec::new());
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".to_string(), server_handle(server));
+        let claim = {
+            let mut servers = manager.servers.write().await;
+            let claim = manager.claim_server("fake");
+            servers.remove("fake");
+            claim
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.call_tool_cancellable("fake", "report", serde_json::json!({}), cancel),
+        )
+        .await
+        .expect("cancel does not wait for recovery claim");
+        assert_eq!(result, Err(McpToolCallError::Cancelled));
+        drop(claim);
+    }
+
+    #[tokio::test]
+    async fn cancellation_cleanup_does_not_hold_global_map_lock() {
+        let (first, first_started) =
+            witnessed_delayed_exchange(Ok(serde_json::json!({"content": []})), 200);
+        let (second, second_started) =
+            witnessed_delayed_exchange(Ok(serde_json::json!({"content": []})), 200);
+        let (server, _, _) = fake_server(vec![first, second]);
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".to_string(), server_handle(server));
+
+        let first_manager = Arc::clone(&manager);
+        let first_call = tokio::spawn(async move {
+            first_manager
+                .call_tool("fake", "report", serde_json::json!({}))
+                .await
+        });
+        first_started.await.expect("first call started");
+        let cancel = CancellationToken::new();
+        let second_manager = Arc::clone(&manager);
+        let second_cancel = cancel.clone();
+        let second_call = tokio::spawn(async move {
+            second_manager
+                .call_tool_cancellable("fake", "report", serde_json::json!({}), second_cancel)
+                .await
+        });
+        second_started.await.expect("second call started");
+        cancel.cancel();
+        tokio::task::yield_now().await;
+
+        let map_guard = tokio::time::timeout(Duration::from_secs(1), manager.servers.write())
+            .await
+            .expect("cleanup waits for peer call without global map lock");
+        drop(map_guard);
+        first_call.await.expect("first task").expect("first call");
+        let _ = second_call.await.expect("second task");
+    }
+
+    #[tokio::test]
+    async fn reload_removal_waits_without_global_map_lock() {
+        let (exchange, started) =
+            witnessed_delayed_exchange(Ok(serde_json::json!({"content": []})), 200);
+        let (server, _, _) = fake_server(vec![exchange]);
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".to_string(), server_handle(server));
+
+        let caller = Arc::clone(&manager);
+        let call = tokio::spawn(async move {
+            caller
+                .call_tool("fake", "report", serde_json::json!({}))
+                .await
+        });
+        started.await.expect("call started");
+        let reloader = Arc::clone(&manager);
+        let reload = tokio::spawn(async move { reloader.reload_from_configs(Vec::new()).await });
+        tokio::task::yield_now().await;
+
+        let map_guard = tokio::time::timeout(Duration::from_secs(1), manager.servers.write())
+            .await
+            .expect("reload waits for removed server without global map lock");
+        drop(map_guard);
+        call.await.expect("call task").expect("call succeeds");
+        let result = reload.await.expect("reload task");
+        assert_eq!(result.removed, vec!["fake"]);
+    }
+
+    #[tokio::test]
+    async fn settled_config_waits_when_cloned_handle_is_empty() {
+        let (server, _, _) = fake_server(Vec::new());
+        let expected = server.config();
+        let handle = server_handle(server);
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".to_string(), Arc::clone(&handle));
+        let claim = manager.claim_server("fake");
+        let held = handle.write().await.take().expect("server present");
+
+        let waiter = Arc::clone(&manager);
+        let settled = tokio::spawn(async move { waiter.settled_config("fake").await });
+        tokio::task::yield_now().await;
+        *handle.write().await = Some(held);
+        drop(claim);
+
+        assert_eq!(settled.await.expect("settled task"), Some(expected));
+    }
+
+    #[tokio::test]
     async fn server_message_on_sink_sets_tools_changed() {
         let (server, _, _) = fake_server(vec![ScriptedExchange {
             server_messages: vec![serde_json::json!({
@@ -4975,6 +5156,14 @@ for line in sys.stdin:
     elif method == "tools/list":
         send(req_id, {"tools": [{"name": "report", "description": "Report config", "inputSchema": {"type": "object"}}]})
     elif method == "tools/call":
+        crash_then_block = os.environ.get("MCP_CRASH_THEN_BLOCK_FILE")
+        if crash_then_block:
+            if os.path.exists(crash_then_block):
+                os.remove(crash_then_block)
+                os._exit(2)
+            append_marker("retry-start")
+            import time
+            time.sleep(60)
         if os.environ.get("MCP_BLOCK_CALL"):
             append_marker("call-start")
             import time
@@ -5045,6 +5234,54 @@ for line in sys.stdin:
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn cancelled_retry_reestablishes_before_returning() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let crash_then_block = tmp.path().join("crash-then-block");
+        std::fs::write(&crash_then_block, "crash").expect("write crash marker");
+        let manager = Arc::new(McpClientManager::new());
+        let mut config = fixture_config(&script, &marker, "v1", "env1");
+        as_stdio_mut(&mut config).2.insert(
+            "MCP_CRASH_THEN_BLOCK_FILE".to_string(),
+            crash_then_block.display().to_string(),
+        );
+        connect_fixture(&manager, &config).await;
+
+        let cancel = CancellationToken::new();
+        let caller = Arc::clone(&manager);
+        let call_cancel = cancel.clone();
+        let call = tokio::spawn(async move {
+            caller
+                .call_tool_cancellable("fixture", "report", serde_json::json!({}), call_cancel)
+                .await
+        });
+        while !marker_lines(&marker)
+            .iter()
+            .any(|line| line.starts_with("retry-start|"))
+        {
+            tokio::task::yield_now().await;
+        }
+
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("cancelled retry settles promptly")
+            .expect("call task")
+            .expect_err("retry is cancelled");
+        assert_eq!(error, McpToolCallError::Cancelled);
+        assert_eq!(
+            marker_lines(&marker)
+                .iter()
+                .filter(|line| line.starts_with("start|"))
+                .count(),
+            3,
+            "initial crash recovery plus retry cancellation each respawn"
+        );
+        manager.shutdown().await;
     }
 
     #[tokio::test]
