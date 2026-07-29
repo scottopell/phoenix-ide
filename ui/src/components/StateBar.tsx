@@ -972,7 +972,7 @@ export function StateBar({
   const handleSelectEffort = (effort: ModelEffort | null) => {
     setPickerOpen(false);
     if (!onUpgradeModel || !currentModel) return;
-    if ((currentEffort ?? null) === effort) return;
+    if (persistedEffort === effort) return;
     onUpgradeModel(currentModel, effort);
   };
 

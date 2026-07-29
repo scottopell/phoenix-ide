@@ -316,6 +316,18 @@ ALTER TABLE turn_usage ADD COLUMN effort_source TEXT NOT NULL DEFAULT 'native_un
 CHECK (effort_source IN ('native_known', 'native_unknown', 'explicit', 'unsupported'));
 ALTER TABLE turn_usage ADD COLUMN effort_level TEXT
 CHECK (effort_level IS NULL OR effort_level IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
+CREATE TRIGGER turn_usage_effort_shape_insert
+BEFORE INSERT ON turn_usage
+WHEN ((NEW.effort_source IN ('explicit', 'native_known')) != (NEW.effort_level IS NOT NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'invalid turn usage effort shape');
+END;
+CREATE TRIGGER turn_usage_effort_shape_update
+BEFORE UPDATE OF effort_source, effort_level ON turn_usage
+WHEN ((NEW.effort_source IN ('explicit', 'native_known')) != (NEW.effort_level IS NOT NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'invalid turn usage effort shape');
+END;
 UPDATE conversations SET model = 'gpt-5.4' WHERE model = 'gpt-5.3-codex';
 ";
 
@@ -3033,6 +3045,18 @@ mod tests {
         assert_eq!(row.get::<Option<i64>, _>("reasoning_tokens"), None);
         assert_eq!(row.get::<String, _>("effort_source"), "native_unknown");
         assert_eq!(row.get::<Option<String>, _>("effort_level"), None);
+        assert!(sqlx::query(
+            "INSERT INTO turn_usage (id, model, effort_source, effort_level) VALUES (2, 'gpt-5.4', 'explicit', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO turn_usage (id, model, effort_source, effort_level) VALUES (3, 'gpt-5.4', 'unsupported', 'high')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
         let migrated_model: String =
             sqlx::query_scalar("SELECT model FROM conversations WHERE id = 'legacy'")
                 .fetch_one(&pool)

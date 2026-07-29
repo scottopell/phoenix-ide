@@ -5656,6 +5656,13 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
+        let continuation_output_reserve = if effective_effort.level().is_some_and(
+            phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
+        ) {
+            64_000
+        } else {
+            CONTINUATION_OUTPUT_RESERVE_TOKENS
+        };
 
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
@@ -5697,7 +5704,7 @@ where
             // history has filled the budget.
             let fixed_tokens = estimate_text_tokens(&continuation_prompt)
                 + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
-                + CONTINUATION_OUTPUT_RESERVE_TOKENS
+                + continuation_output_reserve
                 + CONTINUATION_SAFETY_MARGIN_TOKENS;
             let history_item_cap = continuation_limits.max_history_messages(1);
             let budget =

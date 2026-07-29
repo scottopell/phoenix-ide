@@ -2322,6 +2322,24 @@ impl RuntimeManager {
             }
         };
 
+        if let Some(effort) = parent_conv.effort {
+            if !self.llm_registry.supports_effort(&spec.model_id, effort) {
+                let _ = parent_event_tx
+                    .send(Event::SubAgentResult {
+                        agent_id: spec.agent_id,
+                        outcome: SubAgentOutcome::Failure {
+                            error: format!(
+                                "Parent effort '{effort}' is not supported by sub-agent model '{}'",
+                                spec.model_id
+                            ),
+                            error_kind: crate::db::ErrorKind::SubAgentError,
+                        },
+                    })
+                    .await;
+                return;
+            }
+        }
+
         // Derive sub-agent conv_mode from spec.mode + parent's mode.
         // Explore sub-agents are always Explore. Work sub-agents inherit
         // the parent's Work mode (branch, base_branch, worktree_path).
