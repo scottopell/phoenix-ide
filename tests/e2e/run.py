@@ -541,6 +541,12 @@ def _assert_next_chat_is_accepted(base_url: str, conv_id: str) -> None:
         f"status={response.status_code}, body={response.text[:500]!r}"
     )
 
+    accepted = response.json()
+    assert accepted.get("steering") is not True, (
+        "ownership probe was queued as steering instead of accepted as a direct turn: "
+        f"body={accepted!r}"
+    )
+
     _poll_to_idle_with_messages(
         base_url,
         conv_id,
