@@ -8814,39 +8814,86 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(!latest.has_older_messages);
     }
 
-    #[tokio::test]
-    async fn latest_message_slice_accepts_exact_ceiling_when_no_older_rows_exist() {
+    #[derive(Clone, Copy)]
+    enum CeilingFixture {
+        Exact,
+        Over,
+    }
+
+    impl CeilingFixture {
+        fn conversation_id(self) -> &'static str {
+            match self {
+                Self::Exact => "conv-history-exact-ceiling-prefix",
+                Self::Over => "conv-history-over-ceiling-turn",
+            }
+        }
+    }
+
+    async fn latest_message_ceiling_fixture(kind: CeilingFixture) -> AppState {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
         let state = make_test_state().await;
+        let conversation_id = kind.conversation_id();
         state
             .db
-            .create_conversation(
-                "conv-history-exact-ceiling-prefix",
-                "history-exact-ceiling-prefix",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
             .await
             .expect("create conversation");
+
+        let first = match kind {
+            CeilingFixture::Exact => crate::db::MessageContent::system("preamble"),
+            CeilingFixture::Over => crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                id: "tool-over-ceiling".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "foo"}),
+            }]),
+        };
+        let first_type = first.message_type().to_string();
+        let first_json = serde_json::to_string(&first.to_stored_json()).expect("serialize first");
+        let tool = crate::db::MessageContent::tool("tool-over-ceiling", "tool output", false);
+        let tool_json = serde_json::to_string(&tool.to_stored_json()).expect("serialize tool");
+        let mut tx = state.db.pool().begin().await.expect("begin fixture load");
         for idx in 0..MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES {
-            let content = if idx == 0 {
-                crate::db::MessageContent::system("preamble")
+            let sequence_id = i64::try_from(idx).expect("fixture index fits i64") + 1;
+            let (message_type, content) = if idx == 0 && matches!(kind, CeilingFixture::Exact) {
+                (first_type.as_str(), first_json.as_str())
             } else {
-                crate::db::MessageContent::tool("orphan-tool", format!("tool output {idx}"), false)
+                ("tool", tool_json.as_str())
             };
-            state
-                .db
-                .add_message(
-                    &format!("exact-ceiling-prefix-{idx}"),
-                    "conv-history-exact-ceiling-prefix",
-                    &content,
-                    None,
-                    None,
-                )
-                .await
-                .expect("add message");
+            sqlx::query(
+                "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(format!("{conversation_id}-{idx}"))
+            .bind(conversation_id)
+            .bind(sequence_id)
+            .bind(message_type)
+            .bind(content)
+            .bind("2025-01-01T00:00:00Z")
+            .execute(&mut *tx)
+            .await
+            .expect("insert ceiling message");
         }
+        if matches!(kind, CeilingFixture::Over) {
+            sqlx::query(
+                "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(format!("{conversation_id}-first"))
+            .bind(conversation_id)
+            .bind(0_i64)
+            .bind(first_type)
+            .bind(first_json)
+            .bind("2025-01-01T00:00:00Z")
+            .execute(&mut *tx)
+            .await
+            .expect("insert over-ceiling first message");
+        }
+        tx.commit().await.expect("commit fixture load");
+        state
+    }
+
+    #[tokio::test]
+    async fn latest_message_slice_accepts_exact_ceiling_when_no_older_rows_exist() {
+        let state = latest_message_ceiling_fixture(CeilingFixture::Exact).await;
 
         let Json(latest) = get_conversation_messages_latest(
             State(state),
@@ -9052,53 +9099,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
     #[tokio::test]
     async fn oversized_render_unit_rejects_rest_slice_but_not_sse_init() {
-        use phoenix_core::domain::llm_types::ContentBlock;
-
-        let state = make_test_state().await;
-        state
-            .db
-            .create_conversation(
-                "conv-history-over-ceiling-turn",
-                "history-over-ceiling-turn",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
-            .await
-            .expect("create conversation");
-        state
-            .db
-            .add_message(
-                "over-ceiling-agent",
-                "conv-history-over-ceiling-turn",
-                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
-                    id: "tool-over-ceiling".to_string(),
-                    name: "read_file".to_string(),
-                    input: serde_json::json!({"path": "foo"}),
-                }]),
-                None,
-                None,
-            )
-            .await
-            .expect("add agent");
-        for idx in 0..MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES {
-            state
-                .db
-                .add_message(
-                    &format!("over-ceiling-tool-{idx}"),
-                    "conv-history-over-ceiling-turn",
-                    &crate::db::MessageContent::tool(
-                        "tool-over-ceiling",
-                        format!("tool output {idx}"),
-                        false,
-                    ),
-                    None,
-                    None,
-                )
-                .await
-                .expect("add tool");
-        }
+        let state = latest_message_ceiling_fixture(CeilingFixture::Over).await;
 
         let err = get_conversation_messages_latest(
             State(state.clone()),
