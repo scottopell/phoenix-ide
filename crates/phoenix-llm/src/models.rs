@@ -237,6 +237,7 @@ struct ExternalModelSpec {
     backend: ExternalBackend,
     description: String,
     context_window: usize,
+    max_output_tokens: Option<u32>,
     recommended: bool,
     supports_tool_search: bool,
     effort_capabilities: Option<ExternalEffortCapabilities>,
@@ -398,6 +399,29 @@ fn external_model_spec_from_config(
     }
     if spec.context_window == 0 {
         return Err(format!("model '{id}' has invalid context_window 0"));
+    }
+    if let Some(max_output_tokens) = spec.max_output_tokens {
+        if max_output_tokens == 0
+            || usize::try_from(max_output_tokens).unwrap_or(usize::MAX) > spec.context_window
+        {
+            return Err(format!(
+                "model '{id}' has invalid max_output_tokens {max_output_tokens} for context_window {}",
+                spec.context_window
+            ));
+        }
+    }
+    if spec
+        .effort_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| {
+            matches!(capabilities, ExternalEffortCapabilities::Supported { levels, .. }
+            if levels.iter().any(|level| level.needs_extended_output_headroom()))
+        })
+        && spec.max_output_tokens.is_none_or(|limit| limit < 64_000)
+    {
+        return Err(format!(
+            "model '{id}' declares xhigh/max effort but max_output_tokens is below 64000"
+        ));
     }
     let effort_capabilities = validate_external_effort_capabilities(&spec)?;
     Ok(ModelSpec {
@@ -685,6 +709,21 @@ mod tests {
             models[2].effort_capabilities,
             EffortCapabilities::supported_unknown(&[ModelEffort::Low, ModelEffort::High])
         );
+    }
+
+    #[test]
+    fn extended_external_effort_requires_output_capacity() {
+        let models = parse_external_models(
+            r#"[{"id":"small","backend":"openai_responses","description":"Small","context_window":50000,"max_output_tokens":50000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["xhigh"]}}]"#,
+        )
+        .expect("top-level external model array parses");
+        assert!(models.is_empty());
+
+        let models = parse_external_models(
+            r#"[{"id":"large","backend":"openai_responses","description":"Large","context_window":128000,"max_output_tokens":64000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["xhigh"]}}]"#,
+        )
+        .expect("top-level external model array parses");
+        assert_eq!(models.len(), 1);
     }
 
     #[test]

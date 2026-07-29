@@ -206,6 +206,14 @@ impl EffectiveEffort {
             Self::NativeUnknown | Self::Unsupported => None,
         }
     }
+
+    #[must_use]
+    pub const fn explicit_level(self) -> Option<ModelEffort> {
+        match self {
+            Self::Explicit(level) => Some(level),
+            Self::NativeKnown(_) | Self::NativeUnknown | Self::Unsupported => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

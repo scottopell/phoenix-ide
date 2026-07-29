@@ -17,10 +17,11 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn current_model_id(model: &str) -> &str {
-    match model {
-        "gpt-5.3-codex" => "gpt-5.4",
-        current => current,
+fn current_model_id<'a>(registry: &ModelRegistry, model: &'a str) -> &'a str {
+    if model == "gpt-5.3-codex" && registry.get(model).is_none() {
+        "gpt-5.4"
+    } else {
+        model
     }
 }
 
@@ -31,7 +32,7 @@ pub(crate) fn resolve_creation_model(
     repo_present: bool,
 ) -> String {
     if let Some(model) = explicit_model {
-        return current_model_id(model).to_string();
+        return current_model_id(registry, model).to_string();
     }
 
     let registry_default = registry.default_model_id();

@@ -633,7 +633,7 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
         tools: if tools.is_empty() { None } else { Some(tools) },
         output_config: request
             .effective_effort
-            .level()
+            .explicit_level()
             .map(explicit_anthropic_effort),
         stream: None,
         tags: None,
@@ -1229,6 +1229,11 @@ mod tests {
         let native = serde_json::to_value(translate_request(&spec, &request)).unwrap();
         assert!(native.get("output_config").is_none());
         assert_eq!(native["max_tokens"], 16_384);
+
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::High);
+        let native_known = serde_json::to_value(translate_request(&spec, &request)).unwrap();
+        assert!(native_known.get("output_config").is_none());
 
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Xhigh);

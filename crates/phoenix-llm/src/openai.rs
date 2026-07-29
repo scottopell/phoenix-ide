@@ -1588,7 +1588,10 @@ fn translate_to_responses_request(
             mode: PromptCacheMode::Implicit,
             ttl: PromptCacheTtl::ThirtyMinutes,
         }),
-        reasoning: request.effective_effort.level().map(platform_reasoning),
+        reasoning: request
+            .effective_effort
+            .explicit_level()
+            .map(platform_reasoning),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
         // mirrors the server-side default but stabilises the wire shape so
         // non-default strategies become a smaller change later. Omitted when
@@ -3100,6 +3103,16 @@ mod tests {
         .unwrap();
         assert!(native.get("reasoning").is_none());
         assert_eq!(native["max_output_tokens"], 16_384);
+
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::native_known(ModelEffort::Medium);
+        let native_known = serde_json::to_value(translate_to_responses_request(
+            "gpt-5.6-sol",
+            &request,
+            false,
+        ))
+        .unwrap();
+        assert!(native_known.get("reasoning").is_none());
 
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::Max);

@@ -1773,33 +1773,6 @@ async fn create_conversation_with_id(
         }
     }
 
-    if req.model.as_deref() == Some("gpt-5.3-codex") {
-        req.model = Some("gpt-5.4".to_string());
-    }
-
-    // Validate requested model exists in the registry
-    if let Some(ref model) = req.model {
-        if state.llm_registry.get(model).is_none() {
-            let available = state.llm_registry.available_models().join(", ");
-            return Err(AppError::BadRequest(format!(
-                "Model '{model}' is not available. Available models: {available}"
-            )));
-        }
-    }
-    let selected_model = crate::runtime::creation_worker::resolve_creation_model(
-        &state.llm_registry,
-        req.model.as_deref(),
-        req.mode.as_deref().unwrap_or("direct"),
-        phoenix_core::git::detect_git_repo_root(std::path::Path::new(&req.cwd)).is_some(),
-    );
-    if let Some(effort) = req.effort {
-        if !state.llm_registry.supports_effort(&selected_model, effort) {
-            return Err(AppError::BadRequest(format!(
-                "Effort '{effort}' is not supported by model '{selected_model}'"
-            )));
-        }
-    }
-
     if let Ok(conv) = state.runtime.db().get_conversation(&id).await {
         if let Some(existing_job) = state
             .runtime
@@ -1874,6 +1847,34 @@ async fn create_conversation_with_id(
                     conversation: conversation_to_json(&state, &conv, None),
                 }));
             }
+        }
+    }
+
+    if req.model.as_deref() == Some("gpt-5.3-codex")
+        && state.llm_registry.get("gpt-5.3-codex").is_none()
+    {
+        req.model = Some("gpt-5.4".to_string());
+    }
+
+    if let Some(ref model) = req.model {
+        if state.llm_registry.get(model).is_none() {
+            let available = state.llm_registry.available_models().join(", ");
+            return Err(AppError::BadRequest(format!(
+                "Model '{model}' is not available. Available models: {available}"
+            )));
+        }
+    }
+    let selected_model = crate::runtime::creation_worker::resolve_creation_model(
+        &state.llm_registry,
+        req.model.as_deref(),
+        req.mode.as_deref().unwrap_or("direct"),
+        phoenix_core::git::detect_git_repo_root(std::path::Path::new(&req.cwd)).is_some(),
+    );
+    if let Some(effort) = req.effort {
+        if !state.llm_registry.supports_effort(&selected_model, effort) {
+            return Err(AppError::BadRequest(format!(
+                "Effort '{effort}' is not supported by model '{selected_model}'"
+            )));
         }
     }
 

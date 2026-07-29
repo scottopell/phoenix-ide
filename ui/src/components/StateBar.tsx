@@ -930,9 +930,9 @@ export function StateBar({
   const currentModelInfo = availableModels?.find((model) => model.id === currentModel);
   const currentEffortCapabilities = currentModelInfo?.effort_capabilities;
   const persistedEffort = conversation?.effort ?? null;
-  const currentEffort = effortCompatible(currentEffortCapabilities, persistedEffort)
-    ? persistedEffort
-    : null;
+  const effortIsStale = persistedEffort !== null
+    && !effortCompatible(currentEffortCapabilities, persistedEffort);
+  const currentEffort = persistedEffort;
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
@@ -1051,8 +1051,8 @@ export function StateBar({
           {variant === "mobile"
             ? (conversation?.model ?? "default")
             : modelAbbrev}
-          {currentEffortCapabilities?.support === 'supported' && (
-            <span className="conv-model-effort"> · {currentEffort ? effortLabel(currentEffort) : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
+          {(currentEffortCapabilities?.support === 'supported' || effortIsStale) && (
+            <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
           )}
           <span className="conv-model-caret" aria-hidden="true">
             &#9662;
@@ -1066,8 +1066,8 @@ export function StateBar({
           {variant === "mobile"
             ? (conversation?.model ?? "default")
             : modelAbbrev}
-          {currentEffortCapabilities?.support === 'supported' && (
-            <span className="conv-model-effort"> · {currentEffort ? effortLabel(currentEffort) : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
+          {(currentEffortCapabilities?.support === 'supported' || effortIsStale) && (
+            <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
           )}
         </span>
       )}
@@ -1100,7 +1100,7 @@ export function StateBar({
               );
             })}
           </div>
-          {currentEffortCapabilities?.support === 'supported' && (
+          {(currentEffortCapabilities?.support === 'supported' || effortIsStale) && (
             <div className="model-picker-list" role="listbox" aria-label="Select effort">
               <button
                 type="button"
