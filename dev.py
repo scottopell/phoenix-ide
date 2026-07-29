@@ -5397,6 +5397,34 @@ def cmd_check(
         ADR-chain structure, but treats existing specs/*/design.md files
         as legacy inventory rather than current-shape failures."""
         t0 = time.monotonic()
+        started_wall_ns = time.time_ns()
+        started_thread_ns = time.thread_time_ns()
+        span = _begin_dev_span("dev.check.step", {
+            "check.lane": "spec-shape", "check.step": "spec shape",
+        })
+
+        def finish_profile(rc: int) -> None:
+            thread_cpu_ms = (time.thread_time_ns() - started_thread_ns) / 1_000_000.0
+            attributes = {
+                "orchestration.cpu.total_ms": thread_cpu_ms,
+                "orchestration.cpu.provenance": "exact_thread",
+            }
+            if profile_work and _CHECK_PROFILE is not None:
+                (_CHECK_PROFILE.artifact_dir / "processes").mkdir(exist_ok=True)
+                path = _CHECK_PROFILE.artifact_dir / "processes" / "spec-shape-spec shape.json"
+                path.write_text(json.dumps({
+                    "schema_version": 1,
+                    "identity": "step:spec-shape:spec shape",
+                    "kind": "step",
+                    "provenance": "exact_thread",
+                    "started_unix_ns": started_wall_ns,
+                    "wall_ms": (time.monotonic() - t0) * 1000.0,
+                    "total_cpu_ms": thread_cpu_ms,
+                    "status": "failed" if rc else "passed",
+                    "returncode": rc,
+                }, sort_keys=True) + "\n")
+            _finish_dev_span(span, attributes, failed=rc != 0)
+
         reporter.step_start("spec-shape", "spec shape")
         try:
             result = _validate_spears_v2_shape(ROOT / "specs")
@@ -5405,6 +5433,7 @@ def cmd_check(
             with results_lock:
                 results.append(("spec shape", 1, elapsed, f"scan failed: {e}"))
             reporter.step_done("spec-shape", "spec shape", 1, elapsed)
+            finish_profile(1)
             return
 
         elapsed = time.monotonic() - t0
@@ -5413,6 +5442,7 @@ def cmd_check(
             with results_lock:
                 results.append(("spec shape", 1, elapsed, out))
             reporter.step_done("spec-shape", "spec shape", 1, elapsed)
+            finish_profile(1)
         else:
             detail = ""
             if result.legacy_design_docs:
@@ -5420,6 +5450,7 @@ def cmd_check(
             with results_lock:
                 results.append(("spec shape", 0, elapsed, detail))
             reporter.step_done("spec-shape", "spec shape", 0, elapsed)
+            finish_profile(0)
             unittest_cmd = [sys.executable, "-m", "unittest", "discover", "tests/devpy"]
             if profile_work and _CHECK_PROFILE is not None:
                 unittest_cmd = [
@@ -5649,7 +5680,6 @@ def cmd_check(
             reporter.lane_start(lane)
             in_process_steps = {
                 "task": "task validation",
-                "spec-shape": "spec shape",
                 "spec-anchors": "spec anchors",
             }
             step_name = in_process_steps.get(lane)
