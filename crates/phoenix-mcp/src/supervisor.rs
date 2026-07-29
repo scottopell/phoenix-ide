@@ -156,14 +156,16 @@ impl SupervisorHandle {
             .send(Command::Call {
                 tool,
                 arguments,
-                cancel,
+                cancel: cancel.clone(),
                 reply,
             })
             .await
             .map_err(|_| stopped())?;
-        match tokio::time::timeout_at(deadline, receive).await {
-            Ok(result) => result.unwrap_or_else(|_| Err(stopped())),
-            Err(_) => Err("MCP tool call timed out while queued".to_string()),
+        if let Ok(result) = tokio::time::timeout_at(deadline, receive).await {
+            result.unwrap_or_else(|_| Err(stopped()))
+        } else {
+            cancel.cancel();
+            Err("MCP tool call timed out while queued".to_string())
         }
     }
 
