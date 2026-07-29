@@ -151,6 +151,7 @@ impl SupervisorHandle {
         cancel: CancellationToken,
     ) -> Result<CallOutcome, String> {
         let (reply, receive) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + self.snapshot().config.tool_call_timeout();
         self.mailbox
             .send(Command::Call {
                 tool,
@@ -160,7 +161,10 @@ impl SupervisorHandle {
             })
             .await
             .map_err(|_| stopped())?;
-        receive.await.unwrap_or_else(|_| Err(stopped()))
+        match tokio::time::timeout_at(deadline, receive).await {
+            Ok(result) => result.unwrap_or_else(|_| Err(stopped())),
+            Err(_) => Err("MCP tool call timed out while queued".to_string()),
+        }
     }
 
     pub(crate) async fn inspect(&self) -> Result<DefinitionsOutcome, String> {

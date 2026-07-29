@@ -2171,22 +2171,9 @@ impl McpClientManager {
     pub fn start_background_discovery(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let mut tasks = Vec::new();
-            for (name, config) in Self::read_all_configs() {
-                let handle = SupervisorHandle::connecting(config.clone());
-                manager
-                    .servers
-                    .write()
-                    .await
-                    .insert(name.clone(), handle.clone());
-                let manager = Arc::clone(&manager);
-                tasks.push(tokio::spawn(async move {
-                    manager.configure_actor(name, config, handle).await;
-                }));
-            }
-            for task in tasks {
-                let _ = task.await;
-            }
+            let _ = manager
+                .reload_from_actor_configs(Self::read_all_configs())
+                .await;
         })
     }
 
@@ -2262,10 +2249,9 @@ impl McpClientManager {
             .iter()
             .map(|(name, handle)| (name.clone(), handle.clone()))
             .collect();
-        let disabled = self.disabled_servers.read().await.clone();
         let mut definitions = Vec::new();
         for (name, handle) in handles {
-            if disabled.contains(&name) {
+            if self.disabled_servers.read().await.contains(&name) {
                 continue;
             }
             let Ok(mut outcome) = handle.inspect().await else {
@@ -2282,6 +2268,9 @@ impl McpClientManager {
                     continue;
                 };
                 outcome = retry;
+            }
+            if self.disabled_servers.read().await.contains(&name) {
+                continue;
             }
             if let Ok(tools) = outcome.result {
                 definitions.extend(
@@ -2355,8 +2344,13 @@ impl McpClientManager {
             }
             Err(_) => match recovery {
                 CallRecovery::OAuth(kind) => {
-                    self.recover_oauth(server_name, &handle, first.epoch, kind, &cancel)
-                        .await?;
+                    let recovery = self.recover_oauth(server_name, &handle, first.epoch, kind);
+                    tokio::pin!(recovery);
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Err(McpToolCallError::Cancelled),
+                        result = &mut recovery => result?,
+                    }
                 }
                 CallRecovery::Transport | CallRecovery::CancelledTransport => {
                     if let Err(error) = self
@@ -2423,6 +2417,9 @@ impl McpClientManager {
                             ) =>
                         {
                             self.wait_for_ready(handle, &cancel).await?;
+                        }
+                        Err(error) if error == "MCP tool call cancelled" => {
+                            return Err(McpToolCallError::Cancelled);
                         }
                         Err(error) => return Err(McpToolCallError::Failed(error)),
                     }
@@ -2535,11 +2532,12 @@ impl McpClientManager {
         handle: &SupervisorHandle,
         observed_epoch: u64,
         kind: OAuthRecoveryKind,
-        cancel: &CancellationToken,
     ) -> Result<(), McpToolCallError> {
         let permit = match handle.claim_recovery(observed_epoch).await {
             RecoveryClaim::Leader(permit) => permit,
-            RecoveryClaim::Follow(_) => return self.wait_for_ready(handle, cancel).await,
+            RecoveryClaim::Follow(_) => {
+                return self.wait_for_ready(handle, &CancellationToken::new()).await;
+            }
             RecoveryClaim::Stale => return Ok(()),
             RecoveryClaim::Unavailable(error) => return Err(McpToolCallError::Failed(error)),
         };
@@ -2630,7 +2628,7 @@ impl McpClientManager {
                         "additional OAuth scopes required".to_string(),
                     )
                     .await;
-                self.wait_for_ready(handle, cancel).await
+                self.wait_for_ready(handle, &CancellationToken::new()).await
             }
         }
     }
@@ -2689,11 +2687,11 @@ impl McpClientManager {
         let mut removed = Vec::new();
         for name in removed_names {
             if let Some(handle) = self.servers.write().await.remove(&name) {
-                self.cancel_pending_oauth_flow(&name).await;
-                self.pending_oauth_urls.write().await.remove(&name);
                 match self.oauth.store().delete_token(&name).await {
                     Ok(()) => {
                         handle.remove().await;
+                        self.cancel_pending_oauth_flow(&name).await;
+                        self.pending_oauth_urls.write().await.remove(&name);
                         removed.push(name);
                     }
                     Err(error) => {
