@@ -44,6 +44,7 @@ value RetirementInspection {
 
 value RetirementResidual {
     resource_kind: RetiredResourceKind
+    resource_identity: String
     reason: RetirementFailureReason
     detail: String?
 }
@@ -136,6 +137,7 @@ external entity RetiredResource {
     product_conversation: bedrock/ProductConversation
     scope: WorkScope
     kind: RetiredResourceKind
+    resource_identity: String
 }
 
 external entity RetirementResidualResource {
@@ -149,6 +151,8 @@ external entity RetirementAbsenceEvidence {
     attempt: RetirementAttempt
     product_conversation: bedrock/ProductConversation
     scope: WorkScope
+    resource_kind: RetiredResourceKind
+    resource_identity: String
 }
 
 ------------------------------------------------------------
@@ -187,30 +191,34 @@ rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
     )
     ensures:
         for category in current_retirement_loss_categories(product_conversation):
-            RetirementLossCategoryRow.created(
-                attempt: RetirementAttempt{
-                    attempt_id: attempt_id,
-                    product_conversation: product_conversation,
-                    scope: scope_binding.scope,
+            for item_identity in current_retirement_loss_item_identities(product_conversation, category):
+                RetirementLossCategoryRow.created(
+                    attempt: RetirementAttempt{
+                        attempt_id: attempt_id,
+                        product_conversation: product_conversation,
+                        scope: scope_binding.scope,
+                        inspection: RetirementInspection {
+                            generation: current_retirement_inspection_generation(product_conversation),
+                            fingerprint: current_retirement_inspection_fingerprint(product_conversation)
+                        }
+                    },
                     inspection: RetirementInspection {
                         generation: current_retirement_inspection_generation(product_conversation),
                         fingerprint: current_retirement_inspection_fingerprint(product_conversation)
-                    }
-                },
-                inspection: RetirementInspection {
-                    generation: current_retirement_inspection_generation(product_conversation),
-                    fingerprint: current_retirement_inspection_fingerprint(product_conversation)
-                },
-                category: category,
-                item_identity: current_retirement_loss_item_identity(product_conversation, category)
-            )
+                    },
+                    category: category,
+                    item_identity: item_identity
+                )
 
     @guidance
         -- Before selecting the with-loss or without-loss inspection outcome, Phoenix
         -- materializes one exact RetirementAttempt plus its exact RetirementInspection
         -- and categorized loss inventory for the attached Git-backed scope bound to
-        -- this Close attempt_id. Outcome selection then reads this attempt-bound
-        -- evidence rather than recomputing from an untyped side channel.
+        -- this Close attempt_id. Each RetirementLossCategoryRow is one exact
+        -- (category, item_identity) row, so every at-risk path or detached commit
+        -- becomes distinct evidence rather than collapsing multiple items into one
+        -- category summary. Outcome selection then reads this attempt-bound evidence
+        -- rather than recomputing from an untyped side channel.
 }
 
 rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
@@ -275,9 +283,10 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
     )
 
     @guidance
-        -- Each RetirementLossCategoryRow is one categorized row in the exact inventory,
-        -- bound both to one exact RetirementInspection and to the RetirementAttempt
-        -- for the product conversation plus attached WorkScope being retired.
+        -- Each RetirementLossCategoryRow is one exact (category, item_identity) row
+        -- in the inventory, bound both to one exact RetirementInspection and to the
+        -- RetirementAttempt for the product conversation plus attached WorkScope being
+        -- retired.
         -- Categories coexist independently. Paths and detached-commit identities
         -- are surfaced without synthesizing a branch, tag, stash, patch, or diff
         -- snapshot as a recovery artifact.
@@ -360,7 +369,8 @@ rule RetirementRequestedCreatesPerResourceEvidence {
         attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
-        kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope)
+        kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope),
+        resource_identity: retired_resource_identity_for_pending_step(product_conversation, scope_binding.scope)
     )
     ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
@@ -405,7 +415,8 @@ rule RetirementStepSuccessRecordsTypedEvidence {
         attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
-        kind: retired_resource_kind_for_completed_step(product_conversation, scope_binding.scope)
+        kind: retired_resource_kind_for_completed_step(product_conversation, scope_binding.scope),
+        resource_identity: retired_resource_identity_for_completed_step(product_conversation, scope_binding.scope)
     }
     ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
@@ -429,9 +440,10 @@ rule RetirementAlreadyRetiredIsIdempotentNoOp {
         attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
         product_conversation: product_conversation,
         scope: scope_binding.scope,
-        kind: retired_resource_kind_for_retried_step(product_conversation, scope_binding.scope)
+        kind: retired_resource_kind_for_retried_step(product_conversation, scope_binding.scope),
+        resource_identity: retired_resource_identity_for_retried_step(product_conversation, scope_binding.scope)
     }
-    requires: exact_attempt_retries_same_resource(product_conversation)
+    requires: exact_attempt_retries_same_resource(product_conversation, scope_binding.scope, retired_resource_identity_for_retried_step(product_conversation, scope_binding.scope))
     ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
     @guidance
@@ -480,7 +492,7 @@ rule ResourceRetirementFailureProducesResidualRepairState {
         retirement_requested,
         needs_repair
     }
-    requires: exists RetirementResidualResource{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope}, product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: exists RetirementResidualResource{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope}, product_conversation: product_conversation, scope: AttachedWorkScope.scope, residual: RetirementResidual{resource_identity: residual_resource_identity_for_attempt(product_conversation, AttachedWorkScope.scope)}}
     ensures: ResourceRetirementFailed(product_conversation, attempt_id)
 
     @guidance
@@ -502,7 +514,7 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation)
-    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
     ensures: ResourceRetirementFailed(product_conversation, attempt_id)
 
     @guidance
@@ -524,7 +536,7 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation)
-    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
     ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
     @guidance

@@ -60,7 +60,8 @@ AND SHALL treat reflog-only detached commits as at-risk detached commits
 AND SHALL scope nested-repository inspection only to declared submodules rather than recursively inventing preservation rules for arbitrary nested repositories
 
 WHEN any one or more of those categories are present
-THE SYSTEM SHALL return an exact categorized inventory with the relevant path rows and detached-commit identities
+THE SYSTEM SHALL return an exact categorized inventory with one materialized loss row per exact `(category, item_identity)`
+AND SHALL include every relevant path row and every detached-commit identity rather than collapsing multiple items into one category summary
 AND SHALL require explicit discard confirmation before destructive retirement begins
 
 WHEN no category is present
@@ -125,9 +126,10 @@ THE SYSTEM SHALL perform retirement as a stepwise idempotent operation that reco
 WHEN retirement attempts one owned resource
 THE SYSTEM SHALL record typed evidence for that exact retirement attempt before any all-retired completion is emitted
 AND SHALL classify the attempted resource as one of: worktree, bash/process-group, tmux, PTY/terminal, browser, or equivalent live execution resource
+AND SHALL carry a stable concrete `resource_identity` alongside `resource_kind` so multiple same-kind owned resources remain distinguishable across retries and restarts
 
 WHEN a retirement step succeeds for one owned resource
-THE SYSTEM SHALL record `RetiredResource` evidence for that resource bound to the exact retirement attempt and attached `WorkScope`
+THE SYSTEM SHALL record `RetiredResource` evidence for that resource bound to the exact retirement attempt, attached `WorkScope`, `resource_kind`, and stable `resource_identity`
 AND SHALL treat a later retry that encounters the same resource already retired as an idempotent no-op rather than as a failure or a second completion
 
 WHEN retirement succeeds overall
@@ -135,11 +137,11 @@ THE SYSTEM SHALL emit success only after every owned resource has either produce
 
 WHEN retirement cannot retire every owned resource
 THE SYSTEM SHALL report typed residual cleanup state and repair information rather than silently succeeding
-AND SHALL bind every residual cleanup item to the exact retirement attempt and attached `WorkScope`
+AND SHALL bind every residual cleanup item to the exact retirement attempt, attached `WorkScope`, `resource_kind`, and stable `resource_identity`
 AND SHALL preserve the previously recorded per-resource retirement evidence so the remaining residual set is explicit
 
 WHEN the worktree is already absent
-THE SYSTEM SHALL bind that absence evidence to the exact retirement attempt and attached `WorkScope`
+THE SYSTEM SHALL bind that absence evidence to the exact retirement attempt, attached `WorkScope`, `resource_kind`, and stable `resource_identity`
 AND SHALL accept the absence only when retained identity and evidence show that the same requested retirement already removed it or is adopting that exact absence
 AND SHALL otherwise report typed residual evidence rather than silently treating the absence as success
 

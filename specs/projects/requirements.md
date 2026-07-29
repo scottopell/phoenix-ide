@@ -520,6 +520,9 @@ THE SYSTEM SHALL return a typed unresolved provisioning result carrying the fail
 AND SHALL persist that unresolved provisioning failure on the still-Open conversation
 AND SHALL NOT fabricate a `WorkScope`, worktree attachment, detached branch label, or fallback branch selection for that conversation
 AND SHALL fail provisioning with a typed error instead of guessing from the repository's currently checked out branch or another arbitrary ref
+AND SHALL bind that unresolved provisioning failure directly to the target `ProductConversation`, the concrete target transcript conversation, and the repository identity being provisioned
+AND MAY also attach an already-valid existing `Project` for that repository when one already exists with a resolved canonical default branch
+AND SHALL NOT require creating or fabricating a `Project` in order to persist unresolved canonical-default failure evidence
 
 THE SYSTEM SHALL preserve that one-branch refresh rule for provisioning even when repository-operations surfaces support broader branch discovery elsewhere
 

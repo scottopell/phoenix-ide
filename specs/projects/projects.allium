@@ -190,8 +190,10 @@ value DetachedStartResolution {
 }
 
 entity ProvisioningFailure {
-    conversation: bedrock/Conversation
-    project: Project
+    product_conversation: bedrock/ProductConversation
+    target_conversation: bedrock/Conversation
+    repository: GitRepository
+    existing_project: Project?
     resolution: DetachedStartResolution
 }
 
@@ -240,8 +242,10 @@ rule GitDirectoryDetected {
             )
         else:
             ProvisioningFailure.created(
-                conversation: conversation,
-                project: Project{repo: repo},
+                product_conversation: bedrock/ProductConversation{id: conversation.product_conversation.id},
+                target_conversation: conversation,
+                repository: repo,
+                existing_project: existing_project_for_repository(repo),
                 resolution: default_resolution
             )
 
@@ -294,8 +298,10 @@ rule GitBackedConversationProvisioned {
             and conversation.worktree_path = worktree_path(target)
         else:
             ProvisioningFailure.created(
-                conversation: conversation,
-                project: project,
+                product_conversation: target,
+                target_conversation: conversation,
+                repository: repo,
+                existing_project: project,
                 resolution: resolution
             )
 
@@ -309,9 +315,13 @@ rule GitBackedConversationProvisioned {
         --      default_identity, freshness) or UnresolvedDetachedStart(error).
         --   2. Only the resolved branch may create the detached WorkScope/worktree
         --      attachment and assign the conversation's worktree cwd.
-        --   3. The unresolved branch persists a typed ProvisioningFailure while the
-        --      conversation remains open without any fabricated WorkScope, worktree,
-        --      branch/base ownership fields, or detached label.
+        --   3. The unresolved branch persists a typed ProvisioningFailure bound
+        --      directly to the target ProductConversation, target transcript
+        --      conversation, and repository identity, with an optional existing
+        --      Project only when a valid canonical-default-backed Project already
+        --      exists for that repository. The failure branch never fabricates a
+        --      Project, WorkScope, worktree, branch/base ownership field, or
+        --      detached label in order to make the error representable.
         --
         -- The fetch boundary is single-branch and truthful:
         --   1. Try a bounded fetch for exactly the canonical default branch.
