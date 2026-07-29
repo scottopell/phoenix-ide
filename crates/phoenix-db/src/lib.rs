@@ -5164,8 +5164,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11, ?12, ?13, 'user', ?14)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, 'user', ?15)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5173,6 +5173,7 @@ impl Database {
             .bind(&seeded_state)
             .bind(&now_str)
             .bind(parent.model.as_deref())
+            .bind(parent.effort.map(ModelEffort::as_wire_name))
             .bind(parent.project_id.as_deref())
             .bind(parent.desired_base_branch.as_deref())
             .bind(parent.llm_language.as_str())
@@ -5466,8 +5467,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
-                 VALUES (?1, ?2, ?3, CASE WHEN ?18 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?17, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?18, ?19, ?20)",
+                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
+                 VALUES (?1, ?2, ?3, CASE WHEN ?19 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?18, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15, ?16, ?17, ?19, ?20, ?21)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5476,6 +5477,7 @@ impl Database {
             .bind(&idle_state)
             .bind(&now_str)
             .bind(parent.model.as_deref())
+            .bind(parent.effort.map(ModelEffort::as_wire_name))
             .bind(parent.project_id.as_deref())
             .bind(parent.desired_base_branch.as_deref())
             // Continuations do not inherit the parent's seed fields — those are
@@ -14552,6 +14554,13 @@ mod tests {
         let parent_mode = work_mode_fixture();
         let parent =
             setup_exhausted_parent(&db, "parent-work", "parent-work", "/tmp", &parent_mode).await;
+        db.update_conversation_model_and_effort(
+            "parent-work",
+            "claude-opus-test",
+            Some(ModelEffort::High),
+        )
+        .await
+        .unwrap();
 
         let outcome = db.continue_conversation("parent-work").await.unwrap();
         let new_conv = match outcome {
@@ -14561,6 +14570,8 @@ mod tests {
                 panic!("expected Created, got {other:?}")
             }
         };
+        let persisted_new_conv = db.get_conversation(&new_conv.id).await.unwrap();
+        assert_eq!(persisted_new_conv.effort, Some(ModelEffort::High));
 
         // Inheritance: every ConvMode::Work field copied verbatim.
         match (&parent.conv_mode, &new_conv.conv_mode) {
@@ -15024,6 +15035,13 @@ mod tests {
         db.create_conversation("handoff-parent", "handoff-parent", "/tmp", true, None, None)
             .await
             .unwrap();
+        db.update_conversation_model_and_effort(
+            "handoff-parent",
+            "claude-opus-test",
+            Some(ModelEffort::High),
+        )
+        .await
+        .unwrap();
         db.add_message_with_seq(
             "preexisting-parent-message",
             "handoff-parent",
@@ -15051,6 +15069,8 @@ mod tests {
             .create_task_approval_handoff_conversation("handoff-parent", &approval)
             .await
             .unwrap();
+        let persisted_successor = db.get_conversation(&successor.id).await.unwrap();
+        assert_eq!(persisted_successor.effort, Some(ModelEffort::High));
 
         let parent_before_reload = db.get_conversation("handoff-parent").await.unwrap();
         assert_eq!(successor.work_scope_id, parent_before_reload.work_scope_id);

@@ -123,14 +123,14 @@ export function SettingsFields({
           </span>
         </label>
       </label>
-      {effortCapabilities?.support !== 'unsupported' && (
+      {effortCapabilities?.support === 'supported' && (
         <label className="settings-field">
           <span className="settings-field-label">Effort</span>
           <select
             className="settings-select"
             value={selectedEffort ?? ''}
             onChange={(e) => setSelectedEffort((e.target.value || null) as ModelEffort | null)}
-            disabled={!models || effortCapabilities?.support === 'unknown'}
+            disabled={!models}
           >
             <option value="">{defaultEffortLabel(effortCapabilities)}</option>
             {effortCapabilities?.support === 'supported' && effortCapabilities.levels.map((level) => (

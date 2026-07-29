@@ -959,7 +959,11 @@ export function StateBar({
     setPickerOpen(false);
     if (!onUpgradeModel) return;
     if (modelId === currentModel) return;
-    onUpgradeModel(modelId, null);
+    const targetCapabilities = availableModels?.find((model) => model.id === modelId)?.effort_capabilities;
+    const compatibleEffort = effortCompatible(targetCapabilities, currentEffort)
+      ? currentEffort
+      : null;
+    onUpgradeModel(modelId, compatibleEffort);
   };
 
   const handleSelectEffort = (effort: ModelEffort | null) => {
@@ -1044,7 +1048,7 @@ export function StateBar({
           {variant === "mobile"
             ? (conversation?.model ?? "default")
             : modelAbbrev}
-          {currentEffortCapabilities?.support !== 'unsupported' && (
+          {currentEffortCapabilities?.support === 'supported' && (
             <span className="conv-model-effort"> · {currentEffort ? effortLabel(currentEffort) : 'default'}</span>
           )}
           <span className="conv-model-caret" aria-hidden="true">
@@ -1059,7 +1063,7 @@ export function StateBar({
           {variant === "mobile"
             ? (conversation?.model ?? "default")
             : modelAbbrev}
-          {currentEffortCapabilities?.support !== 'unsupported' && (
+          {currentEffortCapabilities?.support === 'supported' && (
             <span className="conv-model-effort"> · {currentEffort ? effortLabel(currentEffort) : 'default'}</span>
           )}
         </span>
@@ -1093,7 +1097,7 @@ export function StateBar({
               );
             })}
           </div>
-          {currentEffortCapabilities?.support !== 'unsupported' && (
+          {currentEffortCapabilities?.support === 'supported' && (
             <div className="model-picker-list" role="listbox" aria-label="Select effort">
               <button
                 type="button"
@@ -1104,7 +1108,6 @@ export function StateBar({
                   (currentEffort === null ? ' model-picker-item--selected' : '')
                 }
                 onClick={() => handleSelectEffort(null)}
-                disabled={currentEffortCapabilities?.support === 'unknown'}
                 title={effortTriggerLabel(null, currentEffortCapabilities)}
               >
                 <span className="model-picker-item-check" aria-hidden="true">

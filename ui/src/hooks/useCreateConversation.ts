@@ -216,6 +216,14 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const taskListRequestSeqRef = useRef(0);
   const selectedModelRef = useRef(selectedModel);
   const selectedEffortRef = useRef(selectedEffort);
+  const selectModel = useCallback((model: string | null) => {
+    selectedModelRef.current = model;
+    setSelectedModel(model);
+  }, []);
+  const selectEffort = useCallback((effort: ModelEffort | null) => {
+    selectedEffortRef.current = effort;
+    setSelectedEffort(effort);
+  }, []);
 
   const workflow = effectiveWorkflow(workflowOverride, isGitDir, defaultBranch ?? currentBranch, branchUnavailable);
 
@@ -237,8 +245,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
         selectedModelRef.current,
         selectedEffortRef.current,
       );
-      setSelectedModel(next.selectedModel);
-      setSelectedEffort(next.selectedEffort);
+      selectModel(next.selectedModel);
+      selectEffort(next.selectedEffort);
     });
     api.getEnv().then(env => {
       setHomeDir(env.home_dir);
@@ -250,16 +258,16 @@ export function useCreateConversation(navigate: (path: string) => void) {
       .then((projects) => setProjectDirs(suggestedProjectDirs(projects)))
       .catch((error) => console.warn('Failed to load project suggestions:', error));
     return () => { unsub(); };
-  }, []);
+  }, [selectEffort, selectModel]);
 
   // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
   useEffect(() => {
     if (!effortSupportedByModel(models, selectedModel, selectedEffort)) {
-      setSelectedEffort(null);
+      selectEffort(null);
     }
-  }, [models, selectedModel, selectedEffort]);
+  }, [models, selectedEffort, selectedModel, selectEffort]);
   useEffect(() => { writeNewConversationDraft(draft); }, [draft]);
 
   // A new directory drops any prior workflow choice; the active workflow then
@@ -591,9 +599,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setIsGitDir,
     models,
     selectedModel,
-    setSelectedModel,
+    setSelectedModel: selectModel,
     selectedEffort,
-    setSelectedEffort,
+    setSelectedEffort: selectEffort,
     showAllModels,
     setShowAllModels,
     draft,

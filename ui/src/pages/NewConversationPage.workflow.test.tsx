@@ -222,7 +222,7 @@ describe('/new workflow modes', () => {
     fireEvent.change(modelSelect, { target: { value: 'gpt-5' } });
 
     await waitFor(() => {
-      expect(screen.getAllByText('Model default')).not.toHaveLength(0);
+      expect(screen.queryAllByText('Effort')).toHaveLength(0);
       expect(screen.queryAllByRole('option', { name: 'Low' })).toHaveLength(0);
     });
   });

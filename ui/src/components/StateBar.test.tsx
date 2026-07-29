@@ -1286,7 +1286,37 @@ describe('StateBar mobile layout', () => {
     expect(onUpgradeModel).toHaveBeenCalledWith('claude-sonnet-5', 'high');
   });
 
-  it('resets effort to model default when switching models', () => {
+  it('preserves compatible effort when switching models', () => {
+    const onUpgradeModel = vi.fn();
+    const models: ModelInfo[] = [
+      ...pickerModels,
+      {
+        id: 'claude-opus-compatible',
+        provider: 'anthropic',
+        description: '',
+        context_window: 1_000_000,
+        recommended: true,
+        effort_capabilities: {
+          support: 'supported',
+          levels: ['low', 'medium', 'high'],
+          native_default: { known: 'high' },
+        },
+      },
+    ];
+    renderStateBar({
+      availableModels: models,
+      onUpgradeModel,
+      conversation: makeConversation({ effort: 'high' }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
+    fireEvent.click(screen.getByRole('option', { name: /claude-opus-compatible/i }));
+
+    expect(onUpgradeModel).toHaveBeenCalledWith('claude-opus-compatible', 'high');
+  });
+
+  it('resets incompatible effort to model default when switching models', () => {
     const onUpgradeModel = vi.fn();
     renderStateBar({
       availableModels: pickerModels,
