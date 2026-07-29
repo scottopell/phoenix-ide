@@ -3258,6 +3258,12 @@ impl BrowserLifecycleFixture {
         )
         .await
         .expect("restricted-owner selective cascade");
+        assert!(
+            !self
+                .manager
+                .is_active_for_actor(&self.restricted_scope, &owner)
+                .await
+        );
         assert!(self.manager.is_active(&self.restricted_scope).await);
         let surviving_sibling = self
             .manager
@@ -3265,6 +3271,18 @@ impl BrowserLifecycleFixture {
             .await
             .expect("surviving restricted sibling");
         assert!(Arc::ptr_eq(&restricted_sibling, &surviving_sibling));
+
+        let replacement_owner = self
+            .manager
+            .get_session_for_actor(&self.restricted_scope, &owner)
+            .await
+            .expect("replacement restricted owner");
+        assert!(!Arc::ptr_eq(&replacement_owner, &restricted_owner));
+        assert!(
+            self.manager
+                .is_active_for_actor(&self.restricted_scope, &owner)
+                .await
+        );
 
         crate::browser::session::cascade_browser_on_delete(
             &self.manager,
