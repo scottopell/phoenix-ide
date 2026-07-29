@@ -122,6 +122,8 @@ class CheckWorkProfile:
         run_id = uuid.uuid4().hex
         artifact_dir = artifact_dir or ROOT / "target" / "check-profile" / run_id
         artifact_dir = artifact_dir.resolve()
+        if artifact_dir.exists() and any(artifact_dir.iterdir()):
+            raise ValueError(f"profile artifact directory must be empty: {artifact_dir}")
         artifact_dir.mkdir(parents=True, exist_ok=True)
         return cls(
             run_id=run_id,
@@ -215,6 +217,12 @@ def _profile_record_attributes(record: dict, source: Path) -> dict | None:
             ("process_role", "process.role"),
             ("returncode", "process.exit_code"),
             ("tree_closure", "cpu.tree_closure"),
+            ("attempt", "check.test.attempt"),
+            ("pid", "process.pid"),
+            ("worker_id", "check.test.worker_id"),
+            ("test_id", "check.test.runner_id"),
+            ("binary_id", "check.test.binary_id"),
+            ("concurrent", "check.test.concurrent"),
         ):
             value = record.get(source_key)
             if value is not None:
@@ -4937,16 +4945,32 @@ def cmd_check(
             return
         t0 = time.monotonic()
         reporter.step_start("allium", "allium specs")
+        span = _begin_dev_span("dev.check.step", {
+            "check.lane": "allium", "check.step": "allium specs",
+        })
+        command = ["allium", "analyse", *[str(p) for p in spec_files]]
+        measurement_path = None
+        if profile_work and _CHECK_PROFILE is not None:
+            measurement_path = _CHECK_PROFILE.measurement_path("allium", "allium specs")
+            measurement_path.parent.mkdir(parents=True, exist_ok=True)
+            command = [
+                sys.executable, str(ROOT / "scripts" / "check_profile_command.py"),
+                "--output", str(measurement_path),
+                "--identity", "step:allium:allium specs", "--", *command,
+            ]
         try:
             proc = subprocess.run(
-                ["allium", "analyse", *[str(p) for p in spec_files]],
-                capture_output=True, text=True, timeout=60,
+                command, capture_output=True, text=True, timeout=60,
             )
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - t0
             with results_lock:
                 results.append(("allium specs", 1, elapsed, "allium analyse timed out after 60s"))
             reporter.step_done("allium", "allium specs", 1, elapsed)
+            _finish_check_step_span(
+                span, elapsed=elapsed, timed_out=True, lock_wait=0.0,
+                returncode=1, cpu_attributes=None,
+            )
             return
         # Parse the concatenated JSON-doc stream that allium-cli emits
         # (one {...} per file passed). Use raw_decode to walk the stream
@@ -5089,6 +5113,15 @@ def cmd_check(
             with results_lock:
                 results.append(("allium specs", 0, elapsed, ""))
             reporter.step_done("allium", "allium specs", 0, elapsed)
+        semantic_rc = 1 if gate_problems or failures or new_findings else 0
+        _finish_check_step_span(
+            span, elapsed=elapsed, timed_out=False, lock_wait=0.0,
+            returncode=semantic_rc,
+            cpu_attributes=(
+                _read_cpu_measurement(measurement_path)
+                if measurement_path is not None else None
+            ),
+        )
 
     def check_spec_anchors():
         """REQ-* anchor cross-validator. Fails on orphan code anchors —
@@ -9446,7 +9479,11 @@ def main():
     if args.command == "check" and getattr(args, "profile_work_dir", None):
         args.profile_work = True
     if args.command == "check" and getattr(args, "profile_work", False):
-        _CHECK_PROFILE = CheckWorkProfile.start(getattr(args, "profile_work_dir", None))
+        try:
+            _CHECK_PROFILE = CheckWorkProfile.start(getattr(args, "profile_work_dir", None))
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            sys.exit(2)
     _bootstrap_dev_tracing()
     _start_dev_command_tracing(args.command)
     if _CHECK_PROFILE is not None and _DEV_TRACING is None:

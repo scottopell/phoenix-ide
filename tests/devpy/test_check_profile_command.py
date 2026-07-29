@@ -56,6 +56,21 @@ class CheckProfileCommandTests(unittest.TestCase):
         self.assertEqual(os.getpgrp(), int(result.stdout.strip()))
         self.assertGreater(measurement["pid"], 0)
 
+    def test_long_identity_uses_bounded_hashed_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identity = "rust:test:" + "very_long_test_name_" * 30
+            result = subprocess.run([
+                sys.executable, str(WRAPPER), "--output-dir", directory,
+                "--identity", identity, "--", sys.executable, "-c", "pass",
+            ])
+            records = list(Path(directory).glob("*.json"))
+            record = json.loads(records[0].read_text())
+
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(1, len(records))
+        self.assertLess(len(records[0].name.encode()), 180)
+        self.assertEqual(identity, record["identity"])
+
     def test_includes_short_lived_waited_grandchild(self):
         baseline_result, baseline = self.run_wrapper([sys.executable, "-c", "pass"])
         self.assertEqual(0, baseline_result.returncode)

@@ -36,7 +36,17 @@ def _normalize(path: Path, value: dict) -> dict:
     cpu_ms = value.get("total_cpu_ms", value.get("cpu_ms"))
     if cpu_ms is None and "cpu_user_us" in value and "cpu_system_us" in value:
         cpu_ms = (value["cpu_user_us"] + value["cpu_system_us"]) / 1000.0
-    identity = value.get("identity") or value.get("full_test_name") or value.get("test_name") or path.stem
+    identity = (
+        value.get("identity")
+        or value.get("full_name")
+        or (
+            f'{value["file"]}::{value["full_test_name"]}'
+            if value.get("file") and value.get("full_test_name") else None
+        )
+        or value.get("full_test_name")
+        or value.get("test_name")
+        or path.stem
+    )
     return {
         "identity": str(identity),
         "cpu_ms": float(cpu_ms) if cpu_ms is not None else None,

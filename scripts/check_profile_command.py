@@ -8,6 +8,7 @@ JSONL records when explicitly asked.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -48,8 +49,9 @@ def _identity_suffix(identity: str) -> str:
     safe = []
     for char in identity:
         safe.append(char if char.isalnum() or char in "._-" else "-")
-    suffix = "".join(safe).strip("-")
-    return suffix or "record"
+    suffix = "".join(safe).strip("-") or "record"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return f"{suffix[:96]}-{digest}"
 
 
 def _record(

@@ -41,6 +41,19 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertIn("inclusive", markdown)
         self.assertIn("dev.check.test", summary["traceql"]["tests"])
 
+    def test_vitest_identity_prefers_file_qualified_full_name(self):
+        report = load_report()
+        row = report._normalize(Path("vitest-cpu-worker.jsonl"), {
+            "full_name": "src/a.test.ts > suite > works",
+            "full_test_name": "suite > works",
+            "file": "src/a.test.ts",
+            "cpu_user_us": 1,
+            "cpu_system_us": 0,
+            "provenance": "windowed_process",
+        })
+
+        self.assertEqual("src/a.test.ts > suite > works", row["identity"])
+
     def test_reconciles_inclusive_parent_with_child_records(self):
         report = load_report()
         with tempfile.TemporaryDirectory() as directory:

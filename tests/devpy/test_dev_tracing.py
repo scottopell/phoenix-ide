@@ -137,6 +137,20 @@ class DevTracingTests(unittest.TestCase):
         self.assertIsInstance(child, FakeSpan)
         self.assertIs(parent, tracing.started[0][3])
 
+    def test_profile_rejects_nonempty_explicit_artifact_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stale.jsonl").write_text("stale\n")
+            with self.assertRaisesRegex(ValueError, "must be empty"):
+                self.dev.CheckWorkProfile.start(root)
+
+    def test_profile_accepts_empty_explicit_artifact_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "new-profile"
+            profile = self.dev.CheckWorkProfile.start(root)
+
+        self.assertEqual(root.resolve(), profile.artifact_dir)
+
     def test_external_profile_paths_remain_absolute_labels(self):
         external = Path(tempfile.gettempdir()) / "outside-phoenix" / "record.json"
         self.assertEqual(str(external), self.dev._display_path(external))
@@ -188,6 +202,22 @@ class DevTracingTests(unittest.TestCase):
         self.assertEqual(1, emitted)
         self.assertEqual(1_000_000_000, tracing.started[0][4])
         self.assertEqual(1_002_500_000, tracing.finished[0][3])
+
+    def test_runner_metadata_is_threaded_into_profile_attributes(self):
+        source = self.dev.ROOT / "target" / "record.jsonl"
+        attributes = self.dev._profile_record_attributes({
+            "identity": "rust:test", "provenance": "exact_waited_descendants",
+            "started_unix_ns": 1_000_000_000, "wall_ms": 2.0,
+            "user_cpu_ms": 1, "system_cpu_ms": 0,
+            "attempt": "2", "pid": 42, "worker_id": "3",
+            "test_id": "stable-id", "binary_id": "crate::bin", "concurrent": True,
+        }, source)
+
+        self.assertEqual("2", attributes["check.test.attempt"])
+        self.assertEqual(42, attributes["process.pid"])
+        self.assertEqual("3", attributes["check.test.worker_id"])
+        self.assertEqual("stable-id", attributes["check.test.runner_id"])
+        self.assertTrue(attributes["check.test.concurrent"])
 
     def test_truncated_jsonl_keeps_valid_records_and_emits_error_span(self):
         tracing = FakeTracing()
