@@ -140,9 +140,21 @@ class CheckWorkProfile:
             ["git", "status", "--porcelain"], cwd=ROOT,
             capture_output=True, text=True, check=False,
         ).stdout.strip())
-        if artifact_dir.exists() and any(artifact_dir.iterdir()):
-            raise ValueError(f"profile artifact directory must be empty: {artifact_dir}")
         artifact_dir.mkdir(parents=True, exist_ok=True)
+        claim_path = artifact_dir / ".phoenix-profile-claim"
+        try:
+            claim_fd = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as error:
+            raise ValueError(f"profile artifact directory is already claimed: {artifact_dir}") from error
+        try:
+            if any(entry != claim_path for entry in artifact_dir.iterdir()):
+                raise ValueError(f"profile artifact directory must be empty: {artifact_dir}")
+            os.write(claim_fd, f"pid={os.getpid()}\n".encode())
+        except Exception:
+            os.close(claim_fd)
+            claim_path.unlink(missing_ok=True)
+            raise
+        os.close(claim_fd)
         return cls(
             run_id=run_id,
             artifact_dir=artifact_dir,
@@ -5053,6 +5065,8 @@ def cmd_check(
             'fi'
         )])
 
+    skipped_lane_reasons: dict[str, str] = {}
+
     def check_ast_grep():
         """Run every structural lint rule in a single ast-grep pass.
 
@@ -5067,6 +5081,7 @@ def cmd_check(
         if not shutil.which("ast-grep"):
             with results_lock:
                 results.append(("ast-grep", 0, 0.0, ""))
+            skipped_lane_reasons["ast-grep"] = "not installed"
             reporter.step_skipped("ast-grep", "ast-grep", "not installed")
             return
         rules_dir = ROOT / "ast-grep-rules"
@@ -5102,6 +5117,7 @@ def cmd_check(
         if not shutil.which("allium"):
             with results_lock:
                 results.append(("allium specs", 0, 0.0, ""))
+            skipped_lane_reasons["allium"] = "install via 'cargo install allium-cli'"
             reporter.step_skipped("allium", "allium specs",
                                   "install via 'cargo install allium-cli'")
             return
@@ -5109,6 +5125,7 @@ def cmd_check(
         if not spec_files:
             with results_lock:
                 results.append(("allium specs", 0, 0.0, ""))
+            skipped_lane_reasons["allium"] = "no .allium files"
             reporter.step_skipped("allium", "allium specs", "no .allium files")
             return
         t0 = time.monotonic()
@@ -5634,7 +5651,6 @@ def cmd_check(
                 "task": "task validation",
                 "spec-shape": "spec shape",
                 "spec-anchors": "spec anchors",
-                "pkglock": "pkglock-clean",
             }
             step_name = in_process_steps.get(lane)
             span = _begin_dev_span(
@@ -5654,12 +5670,17 @@ def cmd_check(
             finally:
                 with results_lock:
                     failed = failed or lane in failed_lanes
+                skip_reason = skipped_lane_reasons.get(lane)
                 attributes = {}
                 if profile_work:
                     thread_cpu_ms = (time.thread_time_ns() - started_thread_ns) / 1_000_000.0
                     attributes = {
                         "orchestration.cpu.total_ms": thread_cpu_ms,
                         "orchestration.cpu.provenance": "exact_thread",
+                        "check.status": (
+                            "skipped" if skip_reason else "failed" if failed else "passed"
+                        ),
+                        **({"check.skip_reason": skip_reason} if skip_reason else {}),
                     }
                     record_dir = "processes" if step_name else "lanes"
                     record_name = f"{lane}-{step_name}.json" if step_name else f"{lane}.json"
@@ -5673,8 +5694,11 @@ def cmd_check(
                         "started_unix_ns": started_wall_ns,
                         "wall_ms": (time.monotonic_ns() - started_monotonic_ns) / 1_000_000.0,
                         "total_cpu_ms": thread_cpu_ms,
-                        "status": "failed" if failed else "passed",
-                        "returncode": 1 if failed else 0,
+                        "status": (
+                            "skipped" if skip_reason else "failed" if failed else "passed"
+                        ),
+                        "returncode": None if skip_reason else 1 if failed else 0,
+                        **({"skip_reason": skip_reason} if skip_reason else {}),
                     }, sort_keys=True) + "\n")
                 _finish_dev_span(span, attributes, failed=failed)
                 reporter.lane_done(lane)

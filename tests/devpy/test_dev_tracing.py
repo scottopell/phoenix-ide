@@ -226,6 +226,16 @@ class DevTracingTests(unittest.TestCase):
 
         self.assertEqual(root.resolve(), profile.artifact_dir)
 
+    def test_profile_atomically_claims_explicit_artifact_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "claimed-profile"
+            first = self.dev.CheckWorkProfile.start(root)
+
+            with self.assertRaisesRegex(ValueError, "already claimed"):
+                self.dev.CheckWorkProfile.start(root)
+
+        self.assertEqual(root.resolve(), first.artifact_dir)
+
     def test_external_profile_paths_remain_absolute_labels(self):
         external = Path(tempfile.gettempdir()) / "outside-phoenix" / "record.json"
         self.assertEqual(str(external), self.dev._display_path(external))
