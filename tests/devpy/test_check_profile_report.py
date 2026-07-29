@@ -155,7 +155,7 @@ class CheckProfileReportTests(unittest.TestCase):
                 "total_cpu_ms": 100, "wall_ms": 50,
             }))
             (root / "vitest-cpu-worker.jsonl").write_text("\n".join([
-                json.dumps({"full_test_name": "one", "provenance": "windowed_process", "cpu_user_us": 30000, "cpu_system_us": 0}),
+                json.dumps({"full_test_name": "one", "provenance": "windowed_process", "cpu_user_us": 30000, "cpu_system_us": 0, "concurrent": True}),
                 json.dumps({"full_test_name": "two", "provenance": "windowed_process", "cpu_user_us": 20000, "cpu_system_us": 0}),
             ]) + "\n")
 
@@ -166,6 +166,17 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertEqual(50, item["attributed_child_cpu_ms"])
         self.assertEqual(50, item["shared_unattributed_cpu_ms"])
         self.assertTrue(item["children_may_overlap"])
+
+    def test_sequential_windowed_children_do_not_claim_overlap(self):
+        report = load_report()
+        rows = [
+            {"source": "vitest-cpu-worker.jsonl", "cpu_ms": 1,
+             "provenance": "windowed_process", "concurrent": False},
+            {"source": "processes/vitest-vitest.json", "cpu_ms": 2,
+             "provenance": "exact_waited_descendants"},
+        ]
+        item = report._reconciliation(rows)[0]
+        self.assertFalse(item["children_may_overlap"])
 
     def test_unavailable_cpu_is_not_ranked_as_zero(self):
         report = load_report()

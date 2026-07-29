@@ -451,6 +451,8 @@ def _init_dev_tracing(environ: dict[str, str] | None = None):
             exporter,
             schedule_delay_millis=60_000,
             export_timeout_millis=1_000,
+            max_queue_size=16_384,
+            max_export_batch_size=16_384,
         ))
         return _DevTracing(provider, provider.get_tracer("phoenix-dev"), trace, status)
     except Exception as error:
@@ -460,7 +462,8 @@ def _init_dev_tracing(environ: dict[str, str] | None = None):
 
 def _start_dev_command_tracing(command: str) -> None:
     global _DEV_TRACING
-    _DEV_TRACING = _init_dev_tracing()
+    if _DEV_TRACING is None:
+        _DEV_TRACING = _init_dev_tracing()
     if _DEV_TRACING is None:
         return
     _DEV_TRACING.command_started_at = (
@@ -5033,7 +5036,10 @@ def cmd_check(
             try:
                 stdout, stderr = proc.communicate(timeout=60)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 stdout, stderr = proc.communicate()
                 raise subprocess.TimeoutExpired(command, 60, stdout, stderr)
         except subprocess.TimeoutExpired:

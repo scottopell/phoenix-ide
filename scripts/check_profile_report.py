@@ -104,7 +104,7 @@ def _reconciliation(rows: list[dict]) -> list[dict]:
             "reconciliation_error_ms": min(0.0, remainder),
             "child_count": len(children),
             "children_may_overlap": any(
-                row["provenance"].startswith("windowed_process") for row in children
+                row.get("concurrent") is True for row in children
             ),
         })
     return result
