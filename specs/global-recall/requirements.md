@@ -196,6 +196,11 @@ THE integrity boundary SHALL apply at SQLite authorization time so views, common
 
 THE SYSTEM SHALL enforce bounded SQL input, columns, rows, serialized output, and execution work or duration
 
+IF SQLite rejects a query for a reason other than authorization policy or execution-budget exhaustion
+THE SYSTEM SHALL return an actionable engine diagnostic containing the operation phase, primary and extended SQLite result codes, symbolic result-code name, SQLite diagnostic message, and parse-error offset when SQLite provides one
+
+THE SYSTEM SHALL preserve authorization-policy and execution-budget errors as distinct outcomes rather than replacing them with SQLite engine diagnostics
+
 ---
 
 ### REQ-GR-012: Commit and Report One Message Outcome
