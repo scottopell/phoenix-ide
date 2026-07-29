@@ -733,12 +733,13 @@ mod epoch_tests {
                 .await
             }
         });
-        // test-timing-allow: channel receipt is the causal request-start signal
-        http_started.recv().await.expect("first HTTP call started");
-        // test-timing-allow: second receipt proves concurrent HTTP dispatch
-        http_started
-            .recv()
+        let _ = tokio::time::timeout(Duration::from_secs(5), http_started.recv())
             .await
+            .expect("first HTTP call starts in time")
+            .expect("first HTTP call started");
+        let _ = tokio::time::timeout(Duration::from_secs(5), http_started.recv())
+            .await
+            .expect("second HTTP call starts in time")
             .expect("second HTTP call starts concurrently");
         http_releases.add_permits(2);
         first.await.expect("first task").expect("first call");
@@ -770,20 +771,18 @@ mod epoch_tests {
                     .await
             }
         });
-        // test-timing-allow: receipt is the causal stdio request-start signal
-        stdio_started
-            .recv()
+        let _ = tokio::time::timeout(Duration::from_secs(5), stdio_started.recv())
             .await
+            .expect("first stdio call starts in time")
             .expect("first stdio call started");
         assert!(
             stdio_started.try_recv().is_err(),
             "the actor queues stdio calls sequentially"
         );
         stdio_releases.add_permits(1);
-        // test-timing-allow: release permit causally enables the second queued call
-        stdio_started
-            .recv()
+        let _ = tokio::time::timeout(Duration::from_secs(5), stdio_started.recv())
             .await
+            .expect("second stdio call starts in time")
             .expect("second stdio call started");
         stdio_releases.add_permits(1);
         first.await.expect("first task").expect("first call");
@@ -882,8 +881,10 @@ mod epoch_tests {
                     .await
             }
         });
-        // test-timing-allow: channel receipt is the causal call-start signal
-        started.recv().await.expect("HTTP call started");
+        let _ = tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .expect("HTTP call starts in time")
+            .expect("HTTP call started");
 
         let RecoveryClaim::Leader(permit) = handle.claim_recovery(0).await else {
             panic!("recovery advances the actor epoch");
