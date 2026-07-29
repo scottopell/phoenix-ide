@@ -1989,14 +1989,13 @@ impl McpClientManager {
         }
     }
 
-    async fn bind_pending_flow_owner(
+    fn bind_pending_flow_owner(
         &self,
         name: &str,
         handle: &SupervisorHandle,
         epoch: u64,
     ) -> Result<(), String> {
         if handle.snapshot().epoch != epoch {
-            self.cancel_pending_oauth_flow(name).await;
             return Err("MCP OAuth flow was superseded before publication".to_string());
         }
         let mut pending = self.oauth.pending.lock().unwrap();
@@ -2535,6 +2534,7 @@ impl McpClientManager {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // One ordered lifecycle: claim, refresh or step-up, publish/fail.
     async fn recover_oauth(
         &self,
         server_name: &str,
@@ -2586,19 +2586,21 @@ impl McpClientManager {
                         }
                     }
                     RefreshServerOutcome::Transient(error) => {
-                        handle.fail(permit.epoch, error.clone()).await;
+                        let reconnect_epoch = handle
+                            .reconfigure(permit.config.clone())
+                            .await
+                            .map_err(McpToolCallError::Failed)?;
                         let reconnect = self.begin_actor_connect_at_epoch(
                             server_name.to_string(),
                             &permit.config,
                             handle.clone(),
-                            permit.epoch,
+                            reconnect_epoch,
                         );
                         self.track_background_task(reconnect);
                         Err(McpToolCallError::Failed(error))
                     }
                     RefreshServerOutcome::Reprompt(error) => {
                         self.bind_pending_flow_owner(server_name, handle, permit.epoch)
-                            .await
                             .map_err(McpToolCallError::Failed)?;
                         let url = self
                             .pending_oauth_urls
@@ -2621,7 +2623,6 @@ impl McpClientManager {
                     return Err(McpToolCallError::Failed(error));
                 }
                 self.bind_pending_flow_owner(server_name, handle, permit.epoch)
-                    .await
                     .map_err(McpToolCallError::Failed)?;
                 let url = self
                     .pending_oauth_urls
