@@ -8,8 +8,9 @@
 --
 -- The JSON-RPC protocol (initialize, tools/list, tools/call, notifications)
 -- is identical across transports; this spec models the lifecycle states a
--- server moves through, not the protocol framing. Code: McpClientManager /
--- McpServer / McpTool in crates/phoenix-tools/src/mcp.rs.
+-- server moves through, not the protocol framing. Code: McpClientManager and
+-- the per-server supervisor in crates/phoenix-mcp/src/, with the thin McpTool
+-- adapter in crates/phoenix-tools/src/mcp.rs.
 
 ------------------------------------------------------------
 -- Config
@@ -952,15 +953,37 @@ invariant OneTokenPerServer {
 --   The error recorded when a static-credential server is rejected with 401.
 
 ------------------------------------------------------------
+-- Supervisor lifecycle invariants
+------------------------------------------------------------
+
+invariant OneLifecycleOwnerPerServer {
+    -- Each configured server name resolves to one bounded-mailbox supervisor.
+    -- Connect, recovery, OAuth, reload, and removal completions may change its
+    -- lifecycle only when their epoch equals the supervisor's current epoch.
+}
+
+invariant SingleRecoveryLeaderPerEpoch {
+    -- The first recoverable failure for a serving epoch becomes leader; later
+    -- callers follow the published lifecycle snapshot and never start a second
+    -- recovery for that epoch.
+}
+
+invariant SupersededCompletionCannotPublish {
+    -- Reconfigure and remove advance the epoch before asynchronous work settles,
+    -- so a late connect or recovery completion is discarded and cannot resurrect
+    -- removed state or overwrite newer config.
+}
+
+------------------------------------------------------------
 -- Deferred
 ------------------------------------------------------------
 
 deferred ToolCallCancellationSafety    -- see: crates/phoenix-tools/src/mcp.rs
     -- REQ-MCP-017. Cancellation safety and tool-error surfacing are executor
     -- mechanics, not connection-lifecycle states: McpTool::run passes the
-    -- cancellation token into the manager; cancellation exclusively extracts
-    -- the serving connection and re-establishes its transport before returning,
-    -- so a partial or abandoned stdio exchange is never reused. A server isError
+    -- cancellation token into the manager; the per-server supervisor fences
+    -- cancellation by epoch and requires stdio recovery before accepting the
+    -- next call, so a partial or abandoned exchange is never reused. A server isError
     -- result becomes a ToolOutput::Error rather than a Success. This
     -- is emergent from the tool-execution path and the ToolOutput enum, below
     -- the granularity of the ConnState machine modeled here.

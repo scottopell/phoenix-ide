@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 /// stdin/stdout (REQ-MCP-003).
 pub struct StdioTransport {
     name: String,
-    child: Child,
+    child: Mutex<Child>,
     /// Locked together with `stdout` for request-response serialization.
     stdin: Mutex<BufWriter<ChildStdin>>,
     stdout: Mutex<BufReader<ChildStdout>>,
@@ -26,7 +26,7 @@ pub struct StdioTransport {
     /// stream until the manager replaces the transport.
     invalidated: AtomicBool,
     /// Handle to the stderr drain task -- aborted on shutdown.
-    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl StdioTransport {
@@ -101,12 +101,12 @@ impl StdioTransport {
 
         Ok(Self {
             name: name.to_string(),
-            child,
+            child: Mutex::new(child),
             stdin: Mutex::new(BufWriter::new(child_stdin)),
             stdout: Mutex::new(BufReader::new(child_stdout)),
             next_id: AtomicU64::new(1),
             invalidated: AtomicBool::new(false),
-            stderr_task,
+            stderr_task: Mutex::new(stderr_task),
         })
     }
 }
@@ -278,9 +278,11 @@ impl McpTransport for StdioTransport {
         "2024-11-05"
     }
 
-    fn is_alive(&mut self) -> bool {
+    fn is_alive(&self) -> bool {
         // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running.
-        matches!(self.child.try_wait(), Ok(None))
+        self.child
+            .try_lock()
+            .is_ok_and(|mut child| matches!(child.try_wait(), Ok(None)))
     }
 
     fn requires_reestablish_after_cancel(&self) -> bool {
@@ -291,10 +293,10 @@ impl McpTransport for StdioTransport {
         self.invalidated.store(true, Ordering::Release);
     }
 
-    async fn shutdown(&mut self) {
-        if let Some(handle) = self.stderr_task.take() {
+    async fn shutdown(&self) {
+        if let Some(handle) = self.stderr_task.lock().await.take() {
             handle.abort();
         }
-        let _ = self.child.kill().await;
+        let _ = self.child.lock().await.kill().await;
     }
 }
