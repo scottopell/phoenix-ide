@@ -385,7 +385,7 @@ fn sqlite_diagnostic(
     } else {
         unsafe { c_string(ffi::sqlite3_errmsg(db)) }
     };
-    let error_offset = if db.is_null() || !matches!(phase, CoordinatorSqlitePhase::Prepare) {
+    let error_offset = if db.is_null() {
         None
     } else {
         let offset = unsafe { ffi::sqlite3_error_offset(db) };
@@ -401,13 +401,89 @@ fn sqlite_diagnostic(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn sqlite_symbolic_code(code: c_int) -> &'static str {
     match code {
+        ffi::SQLITE_ERROR_MISSING_COLLSEQ => "SQLITE_ERROR_MISSING_COLLSEQ",
+        ffi::SQLITE_ERROR_RETRY => "SQLITE_ERROR_RETRY",
+        ffi::SQLITE_ERROR_SNAPSHOT => "SQLITE_ERROR_SNAPSHOT",
+        ffi::SQLITE_ERROR_RESERVESIZE => "SQLITE_ERROR_RESERVESIZE",
+        ffi::SQLITE_ERROR_KEY => "SQLITE_ERROR_KEY",
+        ffi::SQLITE_ERROR_UNABLE => "SQLITE_ERROR_UNABLE",
         ffi::SQLITE_BUSY_RECOVERY => "SQLITE_BUSY_RECOVERY",
         ffi::SQLITE_BUSY_SNAPSHOT => "SQLITE_BUSY_SNAPSHOT",
         ffi::SQLITE_BUSY_TIMEOUT => "SQLITE_BUSY_TIMEOUT",
         ffi::SQLITE_LOCKED_SHAREDCACHE => "SQLITE_LOCKED_SHAREDCACHE",
         ffi::SQLITE_LOCKED_VTAB => "SQLITE_LOCKED_VTAB",
+        ffi::SQLITE_READONLY_RECOVERY => "SQLITE_READONLY_RECOVERY",
+        ffi::SQLITE_READONLY_CANTLOCK => "SQLITE_READONLY_CANTLOCK",
+        ffi::SQLITE_READONLY_ROLLBACK => "SQLITE_READONLY_ROLLBACK",
+        ffi::SQLITE_READONLY_DBMOVED => "SQLITE_READONLY_DBMOVED",
+        ffi::SQLITE_READONLY_CANTINIT => "SQLITE_READONLY_CANTINIT",
+        ffi::SQLITE_READONLY_DIRECTORY => "SQLITE_READONLY_DIRECTORY",
+        ffi::SQLITE_ABORT_ROLLBACK => "SQLITE_ABORT_ROLLBACK",
+        ffi::SQLITE_IOERR_READ => "SQLITE_IOERR_READ",
+        ffi::SQLITE_IOERR_SHORT_READ => "SQLITE_IOERR_SHORT_READ",
+        ffi::SQLITE_IOERR_WRITE => "SQLITE_IOERR_WRITE",
+        ffi::SQLITE_IOERR_FSYNC => "SQLITE_IOERR_FSYNC",
+        ffi::SQLITE_IOERR_DIR_FSYNC => "SQLITE_IOERR_DIR_FSYNC",
+        ffi::SQLITE_IOERR_TRUNCATE => "SQLITE_IOERR_TRUNCATE",
+        ffi::SQLITE_IOERR_FSTAT => "SQLITE_IOERR_FSTAT",
+        ffi::SQLITE_IOERR_UNLOCK => "SQLITE_IOERR_UNLOCK",
+        ffi::SQLITE_IOERR_RDLOCK => "SQLITE_IOERR_RDLOCK",
+        ffi::SQLITE_IOERR_DELETE => "SQLITE_IOERR_DELETE",
+        ffi::SQLITE_IOERR_BLOCKED => "SQLITE_IOERR_BLOCKED",
+        ffi::SQLITE_IOERR_NOMEM => "SQLITE_IOERR_NOMEM",
+        ffi::SQLITE_IOERR_ACCESS => "SQLITE_IOERR_ACCESS",
+        ffi::SQLITE_IOERR_CHECKRESERVEDLOCK => "SQLITE_IOERR_CHECKRESERVEDLOCK",
+        ffi::SQLITE_IOERR_LOCK => "SQLITE_IOERR_LOCK",
+        ffi::SQLITE_IOERR_CLOSE => "SQLITE_IOERR_CLOSE",
+        ffi::SQLITE_IOERR_DIR_CLOSE => "SQLITE_IOERR_DIR_CLOSE",
+        ffi::SQLITE_IOERR_SHMOPEN => "SQLITE_IOERR_SHMOPEN",
+        ffi::SQLITE_IOERR_SHMSIZE => "SQLITE_IOERR_SHMSIZE",
+        ffi::SQLITE_IOERR_SHMLOCK => "SQLITE_IOERR_SHMLOCK",
+        ffi::SQLITE_IOERR_SHMMAP => "SQLITE_IOERR_SHMMAP",
+        ffi::SQLITE_IOERR_SEEK => "SQLITE_IOERR_SEEK",
+        ffi::SQLITE_IOERR_DELETE_NOENT => "SQLITE_IOERR_DELETE_NOENT",
+        ffi::SQLITE_IOERR_MMAP => "SQLITE_IOERR_MMAP",
+        ffi::SQLITE_IOERR_GETTEMPPATH => "SQLITE_IOERR_GETTEMPPATH",
+        ffi::SQLITE_IOERR_CONVPATH => "SQLITE_IOERR_CONVPATH",
+        ffi::SQLITE_IOERR_VNODE => "SQLITE_IOERR_VNODE",
+        ffi::SQLITE_IOERR_AUTH => "SQLITE_IOERR_AUTH",
+        ffi::SQLITE_IOERR_BEGIN_ATOMIC => "SQLITE_IOERR_BEGIN_ATOMIC",
+        ffi::SQLITE_IOERR_COMMIT_ATOMIC => "SQLITE_IOERR_COMMIT_ATOMIC",
+        ffi::SQLITE_IOERR_ROLLBACK_ATOMIC => "SQLITE_IOERR_ROLLBACK_ATOMIC",
+        ffi::SQLITE_IOERR_DATA => "SQLITE_IOERR_DATA",
+        ffi::SQLITE_IOERR_CORRUPTFS => "SQLITE_IOERR_CORRUPTFS",
+        ffi::SQLITE_IOERR_IN_PAGE => "SQLITE_IOERR_IN_PAGE",
+        ffi::SQLITE_IOERR_BADKEY => "SQLITE_IOERR_BADKEY",
+        ffi::SQLITE_IOERR_CODEC => "SQLITE_IOERR_CODEC",
+        ffi::SQLITE_CANTOPEN_NOTEMPDIR => "SQLITE_CANTOPEN_NOTEMPDIR",
+        ffi::SQLITE_CANTOPEN_ISDIR => "SQLITE_CANTOPEN_ISDIR",
+        ffi::SQLITE_CANTOPEN_FULLPATH => "SQLITE_CANTOPEN_FULLPATH",
+        ffi::SQLITE_CANTOPEN_CONVPATH => "SQLITE_CANTOPEN_CONVPATH",
+        ffi::SQLITE_CANTOPEN_DIRTYWAL => "SQLITE_CANTOPEN_DIRTYWAL",
+        ffi::SQLITE_CANTOPEN_SYMLINK => "SQLITE_CANTOPEN_SYMLINK",
+        ffi::SQLITE_CORRUPT_VTAB => "SQLITE_CORRUPT_VTAB",
+        ffi::SQLITE_CORRUPT_SEQUENCE => "SQLITE_CORRUPT_SEQUENCE",
+        ffi::SQLITE_CORRUPT_INDEX => "SQLITE_CORRUPT_INDEX",
+        ffi::SQLITE_CONSTRAINT_CHECK => "SQLITE_CONSTRAINT_CHECK",
+        ffi::SQLITE_CONSTRAINT_COMMITHOOK => "SQLITE_CONSTRAINT_COMMITHOOK",
+        ffi::SQLITE_CONSTRAINT_FOREIGNKEY => "SQLITE_CONSTRAINT_FOREIGNKEY",
+        ffi::SQLITE_CONSTRAINT_FUNCTION => "SQLITE_CONSTRAINT_FUNCTION",
+        ffi::SQLITE_CONSTRAINT_NOTNULL => "SQLITE_CONSTRAINT_NOTNULL",
+        ffi::SQLITE_CONSTRAINT_PRIMARYKEY => "SQLITE_CONSTRAINT_PRIMARYKEY",
+        ffi::SQLITE_CONSTRAINT_TRIGGER => "SQLITE_CONSTRAINT_TRIGGER",
+        ffi::SQLITE_CONSTRAINT_UNIQUE => "SQLITE_CONSTRAINT_UNIQUE",
+        ffi::SQLITE_CONSTRAINT_VTAB => "SQLITE_CONSTRAINT_VTAB",
+        ffi::SQLITE_CONSTRAINT_ROWID => "SQLITE_CONSTRAINT_ROWID",
+        ffi::SQLITE_CONSTRAINT_PINNED => "SQLITE_CONSTRAINT_PINNED",
+        ffi::SQLITE_CONSTRAINT_DATATYPE => "SQLITE_CONSTRAINT_DATATYPE",
+        ffi::SQLITE_NOTICE_RECOVER_WAL => "SQLITE_NOTICE_RECOVER_WAL",
+        ffi::SQLITE_NOTICE_RECOVER_ROLLBACK => "SQLITE_NOTICE_RECOVER_ROLLBACK",
+        ffi::SQLITE_NOTICE_RBU => "SQLITE_NOTICE_RBU",
+        ffi::SQLITE_WARNING_AUTOINDEX => "SQLITE_WARNING_AUTOINDEX",
+        ffi::SQLITE_AUTH_USER => "SQLITE_AUTH_USER",
         _ => match code & 0xff {
             ffi::SQLITE_ERROR => "SQLITE_ERROR",
             ffi::SQLITE_INTERNAL => "SQLITE_INTERNAL",
@@ -637,6 +713,44 @@ mod tests {
         assert_eq!(diagnostic.message, "database is locked");
         assert_eq!(diagnostic.error_offset, None);
         assert!(diagnostic.to_string().contains("extended_code=517"));
+    }
+
+    #[test]
+    fn preserves_non_locking_extended_symbolic_codes() {
+        for (code, expected) in [
+            (ffi::SQLITE_IOERR_READ, "SQLITE_IOERR_READ"),
+            (ffi::SQLITE_CANTOPEN_ISDIR, "SQLITE_CANTOPEN_ISDIR"),
+            (ffi::SQLITE_CORRUPT_VTAB, "SQLITE_CORRUPT_VTAB"),
+            (
+                ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+                "SQLITE_CONSTRAINT_FOREIGNKEY",
+            ),
+            (
+                ffi::SQLITE_ERROR_MISSING_COLLSEQ,
+                "SQLITE_ERROR_MISSING_COLLSEQ",
+            ),
+        ] {
+            assert_eq!(sqlite_symbolic_code(code), expected);
+        }
+    }
+
+    #[test]
+    fn preserves_error_offset_for_execute_phase_diagnostics() {
+        let (_dir, path) = fixture();
+        let db = rusqlite_for_test(&path);
+        let sql = CString::new("SELEC 1").unwrap();
+        let mut statement = ptr::null_mut();
+        let rc = unsafe {
+            ffi::sqlite3_prepare_v2(db.0, sql.as_ptr(), -1, &raw mut statement, ptr::null_mut())
+        };
+        assert_ne!(rc, ffi::SQLITE_OK);
+
+        let diagnostic = sqlite_diagnostic(db.0, rc, CoordinatorSqlitePhase::Execute);
+
+        assert_eq!(diagnostic.error_offset, Some(0));
+        if !statement.is_null() {
+            unsafe { ffi::sqlite3_finalize(statement) };
+        }
     }
 
     #[test]
