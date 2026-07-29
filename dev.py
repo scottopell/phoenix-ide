@@ -189,7 +189,16 @@ def _profile_record_attributes(record: dict, source: Path) -> dict | None:
             user_value = record["cpu_user_us"] / 1000.0
         if system_value is None and "cpu_system_us" in record:
             system_value = record["cpu_system_us"] / 1000.0
-        identity = str(record.get("identity") or record.get("full_test_name") or record["test_name"])
+        identity = str(
+            record.get("identity")
+            or record.get("full_name")
+            or (
+                f'{record["file"]}::{record["full_test_name"]}'
+                if record.get("file") and record.get("full_test_name") else None
+            )
+            or record.get("full_test_name")
+            or record["test_name"]
+        )
         if user_value is not None and system_value is not None:
             attributes = _cpu_attributes(float(user_value), float(system_value), provenance)
         elif total_value is not None:

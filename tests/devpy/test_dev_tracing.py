@@ -203,6 +203,19 @@ class DevTracingTests(unittest.TestCase):
         self.assertEqual(1_000_000_000, tracing.started[0][4])
         self.assertEqual(1_002_500_000, tracing.finished[0][3])
 
+    def test_vitest_trace_identity_is_file_qualified(self):
+        source = self.dev.ROOT / "target" / "record.jsonl"
+        attributes = self.dev._profile_record_attributes({
+            "full_name": "src/a.test.ts > suite > works",
+            "full_test_name": "suite > works", "file": "src/a.test.ts",
+            "provenance": "windowed_process", "started_unix_ns": 1_000_000_000,
+            "wall_ms": 2.0, "cpu_user_us": 1, "cpu_system_us": 0,
+        }, source)
+
+        self.assertEqual(
+            "src/a.test.ts > suite > works", attributes["check.test.identity"]
+        )
+
     def test_runner_metadata_is_threaded_into_profile_attributes(self):
         source = self.dev.ROOT / "target" / "record.jsonl"
         attributes = self.dev._profile_record_attributes({

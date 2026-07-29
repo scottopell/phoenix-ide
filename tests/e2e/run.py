@@ -411,12 +411,50 @@ def _server():
     try:
         yield base_url, log_path, proc.pid, profile_dir
     finally:
+        teardown_started_wall_ns = time.time_ns()
+        teardown_started_monotonic_ns = time.monotonic_ns()
+        teardown_harness_cpu = (
+            _process_cpu_times(os.getpid()) if profile_dir is not None else None
+        )
+        teardown_server_cpu = (
+            _process_cpu_times(proc.pid) if profile_dir is not None else None
+        )
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+        teardown_finished_monotonic_ns = time.monotonic_ns()
+        teardown_finished_harness_cpu = (
+            _process_cpu_times(os.getpid()) if profile_dir is not None else None
+        )
+        _write_cpu_window(
+            profile_dir,
+            identity="e2e:teardown:harness",
+            started_wall_ns=teardown_started_wall_ns,
+            started_monotonic_ns=teardown_started_monotonic_ns,
+            finished_monotonic_ns=teardown_finished_monotonic_ns,
+            start_cpu=teardown_harness_cpu,
+            finish_cpu=teardown_finished_harness_cpu,
+            extra={"kind": "e2e_teardown", "process_role": "harness"},
+        )
+        # The exited server can no longer be sampled. Its last cumulative sample
+        # is still emitted explicitly, with honest incomplete provenance.
+        if profile_dir is not None and teardown_server_cpu is not None:
+            _write_cpu_window(
+                profile_dir,
+                identity="e2e:teardown:server",
+                started_wall_ns=teardown_started_wall_ns,
+                started_monotonic_ns=teardown_started_monotonic_ns,
+                finished_monotonic_ns=teardown_finished_monotonic_ns,
+                start_cpu=teardown_server_cpu,
+                finish_cpu=None,
+                extra={
+                    "kind": "e2e_teardown", "process_role": "server",
+                    "measurement_note": "server exited before final cumulative sample",
+                },
+            )
         log_file.close()
         # Clean up the per-run tempdir (DB + logs). Without this, repeated
         # local / CI runs leak /tmp/phoenix-e2e-* directories.
