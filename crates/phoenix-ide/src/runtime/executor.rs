@@ -2826,6 +2826,8 @@ where
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         if matches!(self.state, ConvState::Idle)
+            && self.registered_wake_workflows.is_empty()
+            && self.wake_cancellations_owed.is_empty()
             && matches!(
                 &event,
                 Event::UserCancel {
