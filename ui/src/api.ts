@@ -81,6 +81,7 @@ import type { BashHandleInspection as BashHandleInspectionType } from './generat
 
 export type { ModelEffort } from './generated/ModelEffort';
 import type { ModelEffort } from './generated/ModelEffort';
+import type { EffortSource } from './generated/EffortSource';
 
 export type NativeDefaultCapability =
   | { known: ModelEffort }
@@ -1160,6 +1161,7 @@ export interface AnalyticsFidelity {
 export interface AnalyticsTokenTotals {
   input_tokens: number;
   output_tokens: number;
+  reasoning_tokens: number | null;
   cache_creation_tokens: number;
   cache_read_tokens: number;
 }
@@ -1169,6 +1171,8 @@ export interface AnalyticsUsageTurn {
   conversation_id: string;
   root_conversation_id: string;
   model: string;
+  effort_source: EffortSource;
+  effort_level: ModelEffort | null;
   created_at: string;
   first_byte_at: string | null;
   first_byte_latency_ms: number | null;

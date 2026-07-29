@@ -5651,6 +5651,11 @@ where
         let request_id = uuid::Uuid::new_v4().to_string();
         let context_window = self.context.context_window;
         let continuation_limits = self.llm_client.continuation_request_limits();
+        let model_id = self.context.model_id.clone();
+        let explicit_effort = self.context.effort;
+        let effective_effort = self
+            .llm_registry
+            .effective_effort(&model_id, explicit_effort);
 
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
@@ -5730,15 +5735,14 @@ where
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
                 max_tokens: Some(4096),
-                effort: None,
+                effort: effective_effort.level(),
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id,
                     request_id,
                     retry_attempt,
                     attempt_capture: attempt_capture.clone(),
-                    effective_effort:
-                        phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+                    effective_effort,
                 }),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the

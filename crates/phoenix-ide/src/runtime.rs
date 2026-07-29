@@ -2867,6 +2867,7 @@ impl RuntimeManager {
         };
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
+        context.effective_effort = self.llm_registry.effective_effort(&model_id, conv.effort);
         context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         context.desired_base_branch = conv.desired_base_branch.clone();
         context.mode = match &conv.conv_mode {

@@ -929,7 +929,10 @@ export function StateBar({
   const currentModel = conversation?.model ?? "";
   const currentModelInfo = availableModels?.find((model) => model.id === currentModel);
   const currentEffortCapabilities = currentModelInfo?.effort_capabilities;
-  const currentEffort = effortCompatible(currentEffortCapabilities, conversation?.effort) ? (conversation?.effort ?? null) : null;
+  const persistedEffort = conversation?.effort ?? null;
+  const currentEffort = effortCompatible(currentEffortCapabilities, persistedEffort)
+    ? persistedEffort
+    : null;
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
@@ -960,8 +963,8 @@ export function StateBar({
     if (!onUpgradeModel) return;
     if (modelId === currentModel) return;
     const targetCapabilities = availableModels?.find((model) => model.id === modelId)?.effort_capabilities;
-    const compatibleEffort = effortCompatible(targetCapabilities, currentEffort)
-      ? currentEffort
+    const compatibleEffort = effortCompatible(targetCapabilities, persistedEffort)
+      ? persistedEffort
       : null;
     onUpgradeModel(modelId, compatibleEffort);
   };
@@ -1049,7 +1052,7 @@ export function StateBar({
             ? (conversation?.model ?? "default")
             : modelAbbrev}
           {currentEffortCapabilities?.support === 'supported' && (
-            <span className="conv-model-effort"> · {currentEffort ? effortLabel(currentEffort) : 'default'}</span>
+            <span className="conv-model-effort"> · {currentEffort ? effortLabel(currentEffort) : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
           )}
           <span className="conv-model-caret" aria-hidden="true">
             &#9662;
@@ -1064,7 +1067,7 @@ export function StateBar({
             ? (conversation?.model ?? "default")
             : modelAbbrev}
           {currentEffortCapabilities?.support === 'supported' && (
-            <span className="conv-model-effort"> · {currentEffort ? effortLabel(currentEffort) : 'default'}</span>
+            <span className="conv-model-effort"> · {currentEffort ? effortLabel(currentEffort) : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
           )}
         </span>
       )}

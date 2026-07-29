@@ -1773,6 +1773,10 @@ async fn create_conversation_with_id(
         }
     }
 
+    if req.model.as_deref() == Some("gpt-5.3-codex") {
+        req.model = Some("gpt-5.4".to_string());
+    }
+
     // Validate requested model exists in the registry
     if let Some(ref model) = req.model {
         if state.llm_registry.get(model).is_none() {

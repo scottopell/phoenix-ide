@@ -415,14 +415,19 @@ function AnalyticsExportPreview({ id }: { id: string }) {
               <div className="usage-card__hint">Turns</div>
               <div className="usage-mini-table usage-mini-table--turns">
                 <div className="usage-mini-table__row usage-mini-table__head">
-                  <span>#</span><span>Conversation</span><span>Model</span><span>Tokens</span><span>Cost</span><span>First byte</span>
+                  <span>#</span><span>Conversation</span><span>Model / effort</span><span>Tokens</span><span>Cost</span><span>First byte</span>
                 </div>
                 {payload.session.turns.slice(0, 8).map((turn, idx) => (
                   <div key={turn.turn_usage_id} className="usage-mini-table__row">
                     <span>{idx + 1}</span>
                     <span title={turn.conversation_id}>{turn.conversation_id === payload.session.session_id ? 'root' : turn.conversation_id}</span>
-                    <span title={turn.model}>{turn.model}</span>
-                    <span className="num">{fmtTokens(totalAnalyticsTokens(turn.tokens))}</span>
+                    <span title={`${turn.model} · ${turn.effort_source}${turn.effort_level ? ` (${turn.effort_level})` : ''}`}>
+                      {turn.model} · {turn.effort_level ?? turn.effort_source.replaceAll('_', ' ')}
+                    </span>
+                    <span className="num" title={turn.tokens.reasoning_tokens == null ? 'Reasoning tokens unreported' : `${fmtTokens(turn.tokens.reasoning_tokens)} reasoning tokens`}>
+                      {fmtTokens(totalAnalyticsTokens(turn.tokens))}
+                      {turn.tokens.reasoning_tokens != null ? ` (${fmtTokens(turn.tokens.reasoning_tokens)} reasoning)` : ''}
+                    </span>
                     <span className="num">{turn.cost.pricing_known ? fmtUsd(turn.cost.total_usd ?? 0) : 'unknown'}</span>
                     <span className="num">{fmtLatency(turn.first_byte_latency_ms)}</span>
                   </div>

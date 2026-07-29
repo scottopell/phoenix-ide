@@ -2438,8 +2438,11 @@ pub fn transition_parent(
                 // below) parks into awaiting_continuation instead, replaying the
                 // propose_task call after continuation. Without this guard a fork
                 // would be recorded while the origin is over-budget.
-                if should_trigger_continuation(&usage_data, context.context_window, context.effort)
-                {
+                if should_trigger_continuation(
+                    &usage_data,
+                    context.context_window,
+                    context.effective_effort.level(),
+                ) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -2591,8 +2594,11 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                if should_trigger_continuation(&usage_data, context.context_window, context.effort)
-                {
+                if should_trigger_continuation(
+                    &usage_data,
+                    context.context_window,
+                    context.effective_effort.level(),
+                ) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -2762,7 +2768,11 @@ pub fn transition_parent(
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
-            if should_trigger_continuation(&usage_data, context.context_window, context.effort) {
+            if should_trigger_continuation(
+                &usage_data,
+                context.context_window,
+                context.effective_effort.level(),
+            ) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3181,7 +3191,11 @@ pub fn transition_sub_agent(
         ) => {
             let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(&usage_data, context.context_window, context.effort) {
+            if should_trigger_continuation(
+                &usage_data,
+                context.context_window,
+                context.effective_effort.level(),
+            ) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -4758,6 +4772,7 @@ mod tests {
                 },
             model_id: "test-model".to_string(),
             effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             is_sub_agent: true,
             context_window: 100_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
@@ -4837,6 +4852,7 @@ mod tests {
                 },
             model_id: "test-model".to_string(),
             effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             is_sub_agent: true,
             context_window: 100_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
@@ -5172,6 +5188,7 @@ mod tests {
                 },
             model_id: "test-model".to_string(),
             effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             is_sub_agent: true,
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
@@ -5373,6 +5390,7 @@ mod tests {
                 },
             model_id: "test-model".to_string(),
             effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             is_sub_agent: true,
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
@@ -5437,6 +5455,7 @@ mod tests {
                 },
             model_id: "test-model".to_string(),
             effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             is_sub_agent: true,
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
@@ -5508,6 +5527,7 @@ mod tests {
                 },
             model_id: "test-model".to_string(),
             effort: None,
+            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
             is_sub_agent: true,
             context_window: 200_000,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
