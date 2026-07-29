@@ -41,6 +41,21 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertIn("inclusive", markdown)
         self.assertIn("dev.check.test", summary["traceql"]["tests"])
 
+    def test_portable_rows_preserve_retry_outcome_and_overlap_metadata(self):
+        report = load_report()
+        row = report._normalize(Path("rust-tests/test.json"), {
+            "identity": "rust:test", "kind": "rust_test",
+            "provenance": "exact_waited_descendants", "total_cpu_ms": 1,
+            "attempt": "2", "returncode": 1, "concurrent": True,
+            "pid": 42, "binary_id": "crate::bin",
+        })
+
+        self.assertEqual("2", row["attempt"])
+        self.assertEqual(1, row["returncode"])
+        self.assertTrue(row["concurrent"])
+        self.assertEqual(42, row["pid"])
+        self.assertEqual("crate::bin", row["binary_id"])
+
     def test_malformed_jsonl_is_reported_without_losing_valid_rows(self):
         report = load_report()
         with tempfile.TemporaryDirectory() as directory:

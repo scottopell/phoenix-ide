@@ -61,6 +61,14 @@ def _normalize(path: Path, value: dict) -> dict:
         "kind": value.get("kind", "step" if path.parent.name == "processes" else "test"),
         "source": str(path),
         "tree_closure": value.get("tree_closure"),
+        "status": value.get("status"),
+        "returncode": value.get("returncode"),
+        "attempt": value.get("attempt"),
+        "concurrent": value.get("concurrent"),
+        "pid": value.get("pid"),
+        "worker_id": value.get("worker_id"),
+        "test_id": value.get("test_id"),
+        "binary_id": value.get("binary_id"),
     }
 
 
@@ -142,13 +150,26 @@ def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
     lines = [
         "# Check CPU work profile", "",
         f"Records: {len(rows)}", "",
-        "| CPU ms | Wall ms | Provenance | Closure | Kind | Identity |",
-        "| ---: | ---: | --- | --- | --- | --- |",
+        "| CPU ms | Wall ms | Provenance | Outcome | Attempt | Concurrent | Closure | Kind | Identity |",
+        "| ---: | ---: | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in ranked_rows[:limit]:
         identity = row["identity"].replace("|", "\\|")
         closure = row.get("tree_closure") or "n/a"
-        lines.append(f'| {row["cpu_ms"]:.1f} | {row["wall_ms"]:.1f} | {row["provenance"]} | {closure} | {row["kind"]} | `{identity}` |')
+        outcome = row.get("status") or (
+            f'exit {row["returncode"]}' if row.get("returncode") is not None else "n/a"
+        )
+        attempt = row.get("attempt") or "n/a"
+        concurrent = (
+            "yes" if row.get("concurrent") is True
+            else "no" if row.get("concurrent") is False
+            else "n/a"
+        )
+        lines.append(
+            f'| {row["cpu_ms"]:.1f} | {row["wall_ms"]:.1f} | '
+            f'{row["provenance"]} | {outcome} | {attempt} | {concurrent} | '
+            f'{closure} | {row["kind"]} | `{identity}` |'
+        )
     if profile_errors:
         lines += ["", "## Profile record errors", ""]
         for error in profile_errors:
