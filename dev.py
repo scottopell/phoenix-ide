@@ -123,6 +123,8 @@ class CheckWorkProfile:
     finalized_cpu: dict | None = None
     finalized_wall_ns: int | None = None
     finalized_monotonic_ns: int | None = None
+    metadata: dict = dataclasses.field(default_factory=dict)
+    artifacts_finalized: bool = False
 
     @classmethod
     def start(cls, artifact_dir: Path | None = None):
@@ -176,6 +178,73 @@ class CheckWorkProfile:
     def measurement_path(self, lane: str, step: str) -> Path:
         safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", f"{lane}-{step}").strip("-")
         return self.artifact_dir / "processes" / f"{safe}.json"
+
+
+def _profile_failed(error: BaseException | None) -> bool:
+    if isinstance(error, SystemExit):
+        return error.code not in (None, 0)
+    return error is not None
+
+
+def _finalize_check_profile(error: BaseException | None) -> None:
+    profile = _CHECK_PROFILE
+    if profile is None or profile.artifacts_finalized:
+        return
+    profile.artifacts_finalized = True
+    failed = _profile_failed(error)
+    try:
+        command_cpu = profile.finalize_cpu()
+        assert profile.finalized_wall_ns is not None
+        assert profile.finalized_monotonic_ns is not None
+        wall_ms = (
+            profile.finalized_monotonic_ns - profile.started_monotonic_ns
+        ) / 1_000_000.0
+        if _DEV_TRACING is not None and _DEV_TRACING.command_span is not None:
+            _finish_dev_span(
+                _DEV_TRACING.command_span,
+                {
+                    "dev.elapsed_seconds": wall_ms / 1000.0,
+                    "dev.success": not failed,
+                    **command_cpu,
+                },
+                failed=failed,
+                end_time=profile.finalized_wall_ns,
+            )
+            _DEV_TRACING.command_span = None
+        (profile.artifact_dir / "command.json").write_text(json.dumps({
+            "schema_version": 1,
+            "identity": "command:dev.py check",
+            "kind": "command",
+            "provenance": "exact_process_plus_waited_children",
+            "user_cpu_ms": command_cpu["cpu.user_ms"],
+            "system_cpu_ms": command_cpu["cpu.system_ms"],
+            "total_cpu_ms": command_cpu["cpu.total_ms"],
+            "started_unix_ns": profile.started_wall_ns,
+            "wall_ms": wall_ms,
+            "tree_closure": "command_reaped_descendants_unverified",
+            "status": "failed" if failed else "passed",
+            "returncode": 1 if failed else 0,
+            "metadata": {
+                "git_sha": profile.initial_git_sha,
+                "git_dirty": profile.initial_git_dirty,
+                "host_platform": sys.platform,
+                "host_machine": platform.machine(),
+                "python_version": platform.python_version(),
+                "profile_artifact_dir": str(profile.artifact_dir),
+                **profile.metadata,
+            },
+        }, sort_keys=True) + "\n")
+        report = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "check_profile_report.py"),
+             str(profile.artifact_dir), "--run-id", profile.run_id],
+            capture_output=True, text=True, check=False,
+        )
+        if report.returncode == 0:
+            print(f"  i  CPU work profile: {_display_path(profile.artifact_dir / 'summary.md')}")
+        else:
+            print(f"  i  CPU work report failed: {report.stderr.strip()}")
+    except Exception as finalize_error:
+        print(f"  ⚠ CPU work profile finalization failed: {finalize_error}", file=sys.stderr)
 
 
 def _cpu_attributes(user_ms: float, system_ms: float, provenance: str, **extra) -> dict:
@@ -4550,6 +4619,7 @@ def _finish_check_step_span(
     lock_wait: float,
     returncode: int,
     cpu_attributes: dict | None = None,
+    end_time: int | None = None,
 ) -> None:
     attributes = {
         "check.elapsed_seconds": elapsed,
@@ -4561,7 +4631,7 @@ def _finish_check_step_span(
         attributes.update(cpu_attributes)
     elif _CHECK_PROFILE is not None:
         attributes.update({"cpu.provenance": "unavailable"})
-    _finish_dev_span(span, attributes, failed=returncode != 0)
+    _finish_dev_span(span, attributes, failed=returncode != 0, end_time=end_time)
 
 
 def cmd_check(
@@ -4602,6 +4672,8 @@ def cmd_check(
     # working cargo toolchain to be present. --all / PHOENIX_CHECK_ALL=1
     # (handled in _gate_lanes) forces every lane.
     active, skipped = _resolve_check_lanes(gate=gate, lanes=lanes)
+    if _CHECK_PROFILE is not None:
+        _CHECK_PROFILE.metadata["active_lanes"] = sorted(active)
     if lanes is not None and not active:
         print("  i  no requested lane is active for this change set")
 
@@ -4747,6 +4819,7 @@ def cmd_check(
         # Reader exits when stdout closes (proc termination drops the pipe).
         rt.join(timeout=5)
         finished_at = time.monotonic()
+        finished_wall_ns = time.time_ns()
         elapsed = finished_at - t0
         lock_wait = lock_timer.finish(finished_at)
         if lock_wait >= 1.0:
@@ -4779,19 +4852,6 @@ def cmd_check(
             _read_cpu_measurement(measurement_path)
             if measurement_path is not None else None
         )
-        child_span_count = 0
-        if profile_work and _CHECK_PROFILE is not None:
-            patterns = {
-                "cargo test": ("rust-tests/*.json",),
-                "vitest": ("vitest-cpu-*.jsonl",),
-                "dev.py unit tests": ("python-test-cpu.jsonl",),
-                "e2e": ("e2e-scenario-cpu.jsonl",),
-            }.get(name, ())
-            child_span_count = _emit_profile_record_spans(
-                _CHECK_PROFILE.artifact_dir, span, patterns
-            )
-            if cpu_attributes is not None:
-                cpu_attributes["check.profile_child_spans"] = child_span_count
         _finish_check_step_span(
             span,
             elapsed=elapsed,
@@ -4799,7 +4859,16 @@ def cmd_check(
             lock_wait=lock_wait,
             returncode=rc,
             cpu_attributes=cpu_attributes,
+            end_time=finished_wall_ns,
         )
+        if profile_work and _CHECK_PROFILE is not None:
+            patterns = {
+                "cargo test": ("rust-tests/*.json",),
+                "vitest": ("vitest-cpu-*.jsonl",),
+                "dev.py unit tests": ("python-test-cpu.jsonl",),
+                "e2e": ("e2e-scenario-cpu.jsonl",),
+            }.get(name, ())
+            _emit_profile_record_spans(_CHECK_PROFILE.artifact_dir, span, patterns)
         return rc
 
     def lane_rust():
@@ -5325,6 +5394,8 @@ def cmd_check(
     selected_compiler_cache = None
     if cargo_active:
         selected_compiler_cache = _configure_compiler_cache(compiler_cache)
+    if _CHECK_PROFILE is not None:
+        _CHECK_PROFILE.metadata["compiler_cache"] = selected_compiler_cache
     if _CHECK_PROFILE is not None and _DEV_TRACING is not None:
         profile_metadata = {
             "check.profile.git_sha": _CHECK_PROFILE.initial_git_sha,
@@ -5632,65 +5703,11 @@ def cmd_check(
     failures = [(n, out) for n, rc, _, out in results if rc != 0]
 
     if profile_work and _CHECK_PROFILE is not None:
-        command_cpu = _CHECK_PROFILE.finalize_cpu()
-        assert _CHECK_PROFILE.finalized_wall_ns is not None
-        assert _CHECK_PROFILE.finalized_monotonic_ns is not None
-        if _DEV_TRACING is not None and _DEV_TRACING.command_span is not None:
-            trace_attributes = {
-                "dev.elapsed_seconds": (
-                    _CHECK_PROFILE.finalized_monotonic_ns
-                    - _CHECK_PROFILE.started_monotonic_ns
-                ) / 1_000_000_000.0,
-                "dev.success": not failures,
-                **command_cpu,
-            }
-            _DEV_TRACING.finish_span(
-                _DEV_TRACING.command_span, trace_attributes,
-                failed=bool(failures), end_time=_CHECK_PROFILE.finalized_wall_ns,
-            )
-            _DEV_TRACING.command_span = None
-        command_path = _CHECK_PROFILE.artifact_dir / "command.json"
-        command_path.write_text(json.dumps({
-            "schema_version": 1,
-            "identity": "command:dev.py check",
-            "kind": "command",
-            "provenance": "exact_process_plus_waited_children",
-            "user_cpu_ms": command_cpu["cpu.user_ms"],
-            "system_cpu_ms": command_cpu["cpu.system_ms"],
-            "total_cpu_ms": command_cpu["cpu.total_ms"],
-            "started_unix_ns": _CHECK_PROFILE.started_wall_ns,
-            "wall_ms": (
-                _CHECK_PROFILE.finalized_monotonic_ns
-                - _CHECK_PROFILE.started_monotonic_ns
-            ) / 1_000_000.0,
-            "tree_closure": "command_reaped_descendants_unverified",
-            "status": "failed" if failures else "passed",
-            "returncode": 1 if failures else 0,
-            "metadata": {
-                "git_sha": _CHECK_PROFILE.initial_git_sha,
-                "git_dirty": _CHECK_PROFILE.initial_git_dirty,
-                "host_platform": sys.platform,
-                "host_machine": platform.machine(),
-                "python_version": platform.python_version(),
-                "active_lanes": sorted(active),
-                "compiler_cache": selected_compiler_cache,
-                "rust_test_threads": test_threads if "rust" in active else None,
-                "profile_artifact_dir": str(_CHECK_PROFILE.artifact_dir),
-            },
-        }, sort_keys=True) + "\n")
-
-    if profile_work and _CHECK_PROFILE is not None:
-        report = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "check_profile_report.py"),
-             str(_CHECK_PROFILE.artifact_dir), "--run-id", _CHECK_PROFILE.run_id],
-            capture_output=True, text=True, check=False,
-        )
-        if report.returncode == 0:
-            profile_messages.append(
-                f"CPU work profile: {_display_path(_CHECK_PROFILE.artifact_dir / 'summary.md')}"
-            )
-        else:
-            profile_messages.append(f"CPU work report failed: {report.stderr.strip()}")
+        _CHECK_PROFILE.metadata.update({
+            "active_lanes": sorted(active),
+            "compiler_cache": selected_compiler_cache,
+            "rust_test_threads": test_threads if "rust" in active else None,
+        })
     for message in profile_messages:
         print(f"  i  {message}")
 
@@ -9813,6 +9830,7 @@ if __name__ == "__main__":
         failure = error
         raise
     finally:
+        _finalize_check_profile(failure)
         _shutdown_dev_tracing(failure)
     if failed_command_exit is not None:
         sys.exit(failed_command_exit)

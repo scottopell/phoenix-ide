@@ -147,6 +147,19 @@ def _harness_with_waited_children_cpu_times() -> tuple[float | None, float | Non
     return user, system, user + system
 
 
+def _linux_proc_cpu_times(stat: str, hz: float) -> tuple[float, float, float] | None:
+    rparen = stat.rfind(")")
+    if rparen < 0:
+        return None
+    fields = stat[rparen + 2 :].split()
+    try:
+        user = (int(fields[11]) + int(fields[13])) / hz
+        system = (int(fields[12]) + int(fields[14])) / hz
+    except (IndexError, ValueError, ZeroDivisionError):
+        return None
+    return user, system, user + system
+
+
 def _process_cpu_times(
     pid: int,
 ) -> tuple[float | None, float | None, float] | None:
@@ -162,14 +175,8 @@ def _process_cpu_times(
                 stat = stat_file.read()
         except FileNotFoundError:
             return None
-        rparen = stat.rfind(")")
-        if rparen < 0:
-            return None
-        fields = stat[rparen + 2 :].split()
         hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-        user = int(fields[11]) / hz
-        system = int(fields[12]) / hz
-        return user, system, user + system
+        return _linux_proc_cpu_times(stat, hz)
     if sys.platform == "darwin":
         sample = subprocess.run(
             ["ps", "-o", "time=", "-p", str(pid)],
@@ -1212,6 +1219,18 @@ class HarnessIsolationTests(unittest.TestCase):
 
 
 class CpuProfilingTests(unittest.TestCase):
+    def test_linux_process_cpu_includes_waited_children(self):
+        # fields after comm begin at proc field 3; indexes 11..14 are
+        # utime, stime, cutime, and cstime respectively.
+        fields = ["S", *(["0"] * 10), "100", "25", "40", "10"]
+        sample = _linux_proc_cpu_times(f"42 (phoenix worker) {' '.join(fields)}", 100)
+
+        self.assertEqual((1.4, 0.35, 1.75), sample)
+
+    def test_linux_process_cpu_rejects_malformed_stat(self):
+        self.assertIsNone(_linux_proc_cpu_times("42 malformed", 100))
+        self.assertIsNone(_linux_proc_cpu_times("42 (short) S 1", 100))
+
     def test_cpu_window_record_has_required_fields(self):
         started_monotonic_ns = 1_000_000
         finished_monotonic_ns = 3_500_000

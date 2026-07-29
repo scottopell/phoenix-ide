@@ -149,6 +149,50 @@ class DevTracingTests(unittest.TestCase):
         self.assertIsNotNone(profile.finalized_wall_ns)
         self.assertIsNotNone(profile.finalized_monotonic_ns)
 
+    def test_exceptional_profile_cleanup_writes_failed_command_and_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.dev.CheckWorkProfile.start(Path(directory))
+            profile.metadata["active_lanes"] = ["tsc"]
+            self.dev._CHECK_PROFILE = profile
+            report = mock.Mock(returncode=0, stderr="")
+            with (
+                mock.patch.object(self.dev.subprocess, "run", return_value=report) as run,
+                mock.patch("builtins.print"),
+            ):
+                self.dev._finalize_check_profile(RuntimeError("setup failed"))
+                self.dev._finalize_check_profile(RuntimeError("setup failed"))
+
+            command = json.loads((Path(directory) / "command.json").read_text())
+
+        self.assertEqual("failed", command["status"])
+        self.assertEqual(1, command["returncode"])
+        self.assertEqual(["tsc"], command["metadata"]["active_lanes"])
+        self.assertEqual(1, run.call_count)
+
+    def test_profile_cleanup_uses_shared_trace_and_artifact_boundary(self):
+        class CommandTracing(FakeTracing):
+            def __init__(self):
+                super().__init__()
+                self.command_span = FakeSpan()
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.dev.CheckWorkProfile.start(Path(directory))
+            tracing = CommandTracing()
+            self.dev._CHECK_PROFILE = profile
+            self.dev._DEV_TRACING = tracing
+            with (
+                mock.patch.object(
+                    self.dev.subprocess, "run", return_value=mock.Mock(returncode=0, stderr="")
+                ),
+                mock.patch("builtins.print"),
+            ):
+                self.dev._finalize_check_profile(None)
+            command = json.loads((Path(directory) / "command.json").read_text())
+
+        self.assertEqual(profile.finalized_wall_ns, tracing.finished[0][3])
+        self.assertEqual(command["wall_ms"] / 1000.0, tracing.finished[0][1]["dev.elapsed_seconds"])
+        self.assertFalse(tracing.finished[0][2])
+
     def test_profile_start_captures_wall_and_monotonic_boundaries(self):
         profile = self.dev.CheckWorkProfile.start()
         self.assertGreater(profile.started_wall_ns, 0)
@@ -408,6 +452,7 @@ class DevTracingTests(unittest.TestCase):
             timed_out=True,
             lock_wait=2.25,
             returncode=1,
+            end_time=123_000_000,
         )
 
         self.assertEqual(span, tracing.finished[0][0])
@@ -418,6 +463,7 @@ class DevTracingTests(unittest.TestCase):
             "process.exit_code": 1,
         }, tracing.finished[0][1])
         self.assertTrue(tracing.finished[0][2])
+        self.assertEqual(123_000_000, tracing.finished[0][3])
 
     def test_span_recording_failure_does_not_mask_command_result(self):
         class BrokenTracing:
