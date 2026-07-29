@@ -204,7 +204,7 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
       expanded={expanded}
       attention={summary.attention}
       onToggle={() => setExpanded(!expanded)}
-      action={!readOnly && (servers.length > 0 || pendingOAuth.length > 0) ? (
+      action={!readOnly ? (
         <button
           type="button"
           className={`mcp-panel-reload ${reloading ? 'reloading' : ''}`}
