@@ -1,0 +1,1 @@
+Raise the MCP tools/call response deadline from 30 seconds to five minutes so long-running coding tools can complete. Keep connection, reload, and notification deadlines unchanged; add regression coverage for the tool-call-specific timeout.

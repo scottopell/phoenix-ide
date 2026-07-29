@@ -33,8 +33,8 @@ use tokio::sync::RwLock;
 /// token exists.
 pub type SharedBearer = Arc<std::sync::RwLock<Option<String>>>;
 
-/// Timeout for a single JSON-RPC request-response round trip.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for a single MCP tool call request-response round trip.
+const TOOL_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Longer timeout for initialize + tools/list during server connection.
 /// Five minutes gives OAuth flows (mcp-remote prompts, browser redirect) time to complete.
@@ -735,7 +735,7 @@ impl McpServer {
         });
 
         let resp = self
-            .request("tools/call", params, REQUEST_TIMEOUT)
+            .request("tools/call", params, TOOL_CALL_TIMEOUT)
             .await
             .map_err(McpRequestError::Transport)?;
 
@@ -4237,7 +4237,7 @@ mod tests {
 
     struct FakeTransport {
         script: std::sync::Mutex<std::collections::VecDeque<ScriptedExchange>>,
-        requests: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        requests: Arc<std::sync::Mutex<Vec<(String, Value, Duration)>>>,
         notifications: Arc<std::sync::Mutex<Vec<Value>>>,
     }
 
@@ -4247,13 +4247,13 @@ mod tests {
             &self,
             method: &str,
             params: Value,
-            _timeout: Duration,
+            timeout: Duration,
             sink: &dyn ServerMessageSink,
         ) -> Result<Value, TransportError> {
             self.requests
                 .lock()
                 .unwrap()
-                .push((method.to_string(), params));
+                .push((method.to_string(), params, timeout));
             let mut exchange = self
                 .script
                 .lock()
@@ -4292,7 +4292,7 @@ mod tests {
         async fn shutdown(&mut self) {}
     }
 
-    type RequestLog = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+    type RequestLog = Arc<std::sync::Mutex<Vec<(String, Value, Duration)>>>;
     type NotificationLog = Arc<std::sync::Mutex<Vec<Value>>>;
 
     fn fake_server_with_config(
@@ -4392,6 +4392,23 @@ mod tests {
 
         assert!(!server.should_reestablish(&err));
         assert_eq!(err.into_message("fake"), "boom");
+    }
+
+    #[tokio::test]
+    async fn call_tool_allows_five_minutes_for_response() {
+        let (server, requests, _) = fake_server(vec![exchange(Ok(serde_json::json!({
+            "content": [],
+        })))]);
+
+        server
+            .call_tool("report", serde_json::json!({}))
+            .await
+            .expect("call_tool");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "tools/call");
+        assert_eq!(requests[0].2, Duration::from_mins(5));
     }
 
     #[tokio::test]
