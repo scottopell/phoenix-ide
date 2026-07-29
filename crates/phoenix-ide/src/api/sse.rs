@@ -38,6 +38,7 @@ impl SseInitTrace {
                 "stream.broadcaster_reservation_ms" = tracing::field::Empty,
                 "stream.transcript_read_ms" = tracing::field::Empty,
                 "stream.metadata_hydration_ms" = tracing::field::Empty,
+                "stream.pr_cache_lookup_ms" = tracing::field::Empty,
                 "stream.serialization_ms" = tracing::field::Empty,
                 "stream.time_to_init_ms" = tracing::field::Empty,
                 "stream.message_count" = tracing::field::Empty,

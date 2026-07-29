@@ -3382,9 +3382,24 @@ async fn read_stream_init_messages_with_tail(
     let messages = match db_message_selection {
         StreamDbMessageSelection::None => Vec::new(),
         StreamDbMessageSelection::Latest => {
-            get_latest_aligned_messages(db, conversation_id, DEFAULT_MESSAGE_HISTORY_LIMIT)
-                .await?
-                .0
+            match get_latest_aligned_messages(db, conversation_id, DEFAULT_MESSAGE_HISTORY_LIMIT)
+                .await
+            {
+                Ok((messages, _has_older_messages)) => messages,
+                Err(AppError::TypedBadRequest { error_type, .. })
+                    if error_type == "message_slice_render_unit_ceiling_exceeded" =>
+                {
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        limit = DEFAULT_MESSAGE_HISTORY_LIMIT,
+                        "Using bounded unaligned SSE init because the current render unit exceeds the response ceiling"
+                    );
+                    db.get_latest_messages(conversation_id, DEFAULT_MESSAGE_HISTORY_LIMIT)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?
+                }
+                Err(error) => return Err(error),
+            }
         }
         StreamDbMessageSelection::AfterFloor(after_floor) => db
             .get_messages_after(conversation_id, after_floor)
@@ -3509,9 +3524,11 @@ async fn stream_conversation(
     };
 
     let mut init_conversation = enrich_conversation_with_seed(&state, &conversation, false).await?;
-    // Cached PR information is enrichment, not connection readiness. The live
-    // PR-status hook starts from this init metadata and fills the rail after
-    // the usable transcript is connected.
+    let pr_cache_started = std::time::Instant::now();
+    init_conversation.cached_pr = cached_pr_summary_for_conversation(&state, &conversation).await?;
+    init_trace.record_ms("stream.pr_cache_lookup_ms", pr_cache_started.elapsed());
+    // The persisted PR association remains the offline/failure seed while the
+    // live PR-status hook refreshes after init.
     if matches!(
         conversation.state,
         ConvState::Provisioning { .. }
@@ -9053,7 +9070,7 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn latest_message_slice_fails_when_render_unit_backfill_exceeds_ceiling() {
+    async fn oversized_render_unit_rejects_rest_slice_but_not_sse_init() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
         let state = make_test_state().await;
@@ -9103,7 +9120,7 @@ pub(crate) mod hard_delete_cascade_tests {
         }
 
         let err = get_conversation_messages_latest(
-            State(state),
+            State(state.clone()),
             Path("conv-history-over-ceiling-turn".to_string()),
             Query(LatestMessagesQuery { limit: Some(1) }),
         )
@@ -9120,6 +9137,22 @@ pub(crate) mod hard_delete_cascade_tests {
             }
             other => panic!("expected typed bad request, got {other:?}"),
         }
+
+        let (_last_sequence_id, selection, stream_messages) = read_stream_init_messages_with_tail(
+            state.runtime.db(),
+            "conv-history-over-ceiling-turn",
+            &StreamConversationQuery::default(),
+            false,
+            1,
+            get_stream_last_sequence_id(state.runtime.db(), "conv-history-over-ceiling-turn").await,
+        )
+        .await
+        .expect("SSE init falls back to a bounded unaligned suffix");
+        assert_eq!(selection, StreamDbMessageSelection::Latest);
+        assert_eq!(
+            stream_messages.len(),
+            usize::try_from(DEFAULT_MESSAGE_HISTORY_LIMIT).unwrap()
+        );
     }
 
     #[allow(clippy::too_many_lines)]

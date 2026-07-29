@@ -188,6 +188,8 @@ pub struct RuntimeManager {
     runtime_creations: AsyncMutex<HashMap<String, RuntimeMaterializationSender>>,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
+    #[cfg(test)]
+    runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     /// Serializes legacy steering admission until the normalized queue row is visible.
     steering_acceptance_receipts: AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
@@ -1370,6 +1372,8 @@ impl RuntimeManager {
             runtime_creations: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
+            #[cfg(test)]
+            runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             steering_acceptance_receipts: AsyncMutex::new(HashMap::new()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
@@ -2728,6 +2732,33 @@ impl RuntimeManager {
         }
     }
 
+    async fn persist_and_broadcast_system_message(
+        &self,
+        broadcaster: &SseBroadcaster,
+        conversation_id: &str,
+        text: String,
+    ) -> Result<(), String> {
+        use crate::db::SystemContent;
+
+        let (reserved_range, reserved_sequences) =
+            broadcaster.reserve_next_persisted_message_range(1);
+        let message = self
+            .db
+            .add_message_with_seq(
+                &uuid::Uuid::new_v4().to_string(),
+                conversation_id,
+                reserved_sequences[0],
+                &crate::db::MessageContent::System(SystemContent { text }),
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let _ = broadcaster.send_persisted_message(message);
+        drop(reserved_range);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn materialize_runtime(
         self: &Arc<Self>,
@@ -2751,6 +2782,17 @@ impl RuntimeManager {
         // subscribers and the eventual runtime therefore share one channel even
         // when they arrive while materialization is in flight.
         let broadcaster = self.conversation_broadcaster(conversation_id).await;
+
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .remove(conversation_id)
+        {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
 
         let conv = self
             .db
@@ -2861,10 +2903,6 @@ impl RuntimeManager {
         }
 
         let (event_tx, event_rx) = mpsc::channel(32);
-        self.evicted_broadcasters
-            .write()
-            .await
-            .remove(conversation_id);
         tracing::debug!(
             conv_id = %conversation_id,
             receivers = broadcaster.receiver_count(),
@@ -3108,7 +3146,6 @@ impl RuntimeManager {
         // happened. This also serves as the restart loop counter — recovery.rs
         // counts consecutive restart system messages at the tail of the history.
         if needs_auto_continue {
-            use crate::db::SystemContent;
             use crate::runtime::recovery::RESTART_SYSTEM_MESSAGE_MARKER;
 
             // Keep the marker prefix regardless of cause: recovery.rs counts
@@ -3130,19 +3167,11 @@ impl RuntimeManager {
                      next. Do NOT re-execute the same command that was just running."
                 )
             };
-            let msg_id = uuid::Uuid::new_v4().to_string();
-            if let Err(e) = self
-                .db
-                .add_message(
-                    &msg_id,
-                    conversation_id,
-                    &crate::db::MessageContent::System(SystemContent { text: restart_msg }),
-                    None,
-                    None,
-                )
+            if let Err(error) = self
+                .persist_and_broadcast_system_message(&broadcaster, conversation_id, restart_msg)
                 .await
             {
-                tracing::warn!(conv_id = %conversation_id, error = %e,
+                tracing::warn!(conv_id = %conversation_id, error = %error,
                     "Failed to inject restart system message");
             }
             tracing::info!(conv_id = %conversation_id, "Will auto-continue interrupted conversation");
@@ -3172,13 +3201,13 @@ impl RuntimeManager {
         {
             let mut runtimes = self.runtimes.write().await;
             if let Some(existing) = runtimes.get(conversation_id) {
-                return Ok(ConversationHandle {
-                    event_tx: existing.event_tx.clone(),
-                    turn_trigger: existing.turn_trigger.clone(),
-                    broadcast_tx: existing.broadcast_tx.clone(),
-                    identity: existing.identity.clone(),
-                    state_rx: existing.state_rx.clone(),
-                });
+                let existing = existing.clone();
+                drop(runtimes);
+                self.evicted_broadcasters
+                    .write()
+                    .await
+                    .remove(conversation_id);
+                return Ok(existing);
             }
             runtimes.insert(
                 conversation_id.to_string(),
@@ -3191,6 +3220,15 @@ impl RuntimeManager {
                 },
             );
         }
+
+        // The live handle is now reachable, so remove the manager-owned
+        // reservation. Stream arrivals during materialization could find the
+        // reservation; arrivals after this point find the same broadcaster on
+        // the runtime handle.
+        self.evicted_broadcasters
+            .write()
+            .await
+            .remove(conversation_id);
 
         tokio::spawn(async move {
             runtime.run().await;
@@ -4656,6 +4694,71 @@ mod scope_liveness_tests {
         mgr.get_or_create(conversation_id)
             .await
             .expect("subsequent caller can retry materialization");
+    }
+
+    #[tokio::test]
+    async fn recovery_system_marker_is_persisted_and_broadcast_with_one_sequence() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "recovery-marker-broadcast";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let broadcaster = mgr.conversation_broadcaster(conversation_id).await;
+        let mut receiver = broadcaster.subscribe();
+
+        mgr.persist_and_broadcast_system_message(
+            &broadcaster,
+            conversation_id,
+            "recovery marker".to_string(),
+        )
+        .await
+        .expect("persist and broadcast marker");
+
+        let SseEvent::Message { message } = receiver.try_recv().expect("message broadcast") else {
+            panic!("expected persisted message event");
+        };
+        let persisted = mgr
+            .db()
+            .get_messages(conversation_id)
+            .await
+            .expect("messages");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].message_id, message.message_id);
+        assert_eq!(persisted[0].sequence_id, message.sequence_id);
+        let next_sequence = broadcaster.next_seq();
+        assert!(next_sequence > message.sequence_id);
+    }
+
+    #[tokio::test]
+    async fn reserved_broadcaster_stays_reachable_during_materialization() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "materialization-reachable-broadcaster";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+
+        let materialization = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
+        };
+        barrier.wait().await;
+        let first = mgr.conversation_broadcaster(conversation_id).await;
+        let second = mgr.conversation_broadcaster(conversation_id).await;
+        assert!(first.same_channel(&second));
+        barrier.wait().await;
+
+        let handle = materialization
+            .await
+            .expect("materialization joins")
+            .expect("materialization succeeds");
+        assert!(first.same_channel(&handle.broadcast_tx));
     }
 
     #[tokio::test]
