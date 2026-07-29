@@ -40,6 +40,18 @@ describe('Codex quota store', () => {
     expect(getCodexQuotaSnapshot()?.secondary?.used_percent).toBe(5);
   });
 
+  it('clears terminal depletion when a successful turn snapshot follows it', () => {
+    replaceCodexQuota(quota({
+      rate_limit_reached_type: 'workspace_member_credits_depleted',
+    }));
+
+    mergeCodexQuota(quota({
+      secondary: { used_percent: 4, window_minutes: 10_080, resets_at: 1_800_500_000 },
+    }));
+
+    expect(getCodexQuotaSnapshot()?.rate_limit_reached_type).toBeNull();
+  });
+
   it('lets an authoritative snapshot clear stale quota and depletion fields', () => {
     replaceCodexQuota(quota({
       primary: { used_percent: 100, window_minutes: 300, resets_at: 1_800_000_000 },

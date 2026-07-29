@@ -39,7 +39,7 @@ export function mergeCodexQuota(next: QuotaDetails): void {
     credits: next.credits ?? snapshot.credits,
     individual_limit: next.individual_limit ?? snapshot.individual_limit,
     promo_message: next.promo_message ?? snapshot.promo_message,
-    rate_limit_reached_type: next.rate_limit_reached_type ?? snapshot.rate_limit_reached_type,
+    rate_limit_reached_type: next.rate_limit_reached_type,
   };
   notify();
 }

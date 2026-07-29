@@ -274,15 +274,18 @@ function CodexSection({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const quotaRequestGenerationRef = useRef(0);
   const quota = useCodexQuota();
   useEffect(() => {
-    let cancelled = false;
+    const generation = ++quotaRequestGenerationRef.current;
     api.codexQuota()
       .then((next) => {
-        if (!cancelled && next) replaceCodexQuota(next);
+        if (quotaRequestGenerationRef.current === generation && next) replaceCodexQuota(next);
       })
       .catch(() => undefined);
-    return () => { cancelled = true; };
+    return () => {
+      quotaRequestGenerationRef.current = Math.max(quotaRequestGenerationRef.current, generation + 1);
+    };
   }, [preflight.account_id]);
   useEffect(() => {
     mountedRef.current = true;
@@ -294,6 +297,7 @@ function CodexSection({
   const handleSignOut = useCallback(async () => {
     if (busy) return;
     setBusy(true);
+    quotaRequestGenerationRef.current++;
     setError(null);
     try {
       await api.codexSignout();
