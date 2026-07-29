@@ -179,6 +179,24 @@ def _read_cpu_measurement(path: Path) -> dict | None:
         return None
 
 
+def _write_unavailable_measurement(
+    path: Path, *, identity: str, duration_ms: float, returncode: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "identity": identity,
+        "provenance": "unavailable",
+        "started_unix_ns": time.time_ns() - int(duration_ms * 1_000_000),
+        "wall_ms": duration_ms,
+        "user_cpu_ms": None,
+        "system_cpu_ms": None,
+        "total_cpu_ms": None,
+        "tree_closure": "measurement_process_terminated",
+        "returncode": returncode,
+    }, sort_keys=True) + "\n")
+
+
 def _profile_record_attributes(record: dict, source: Path) -> dict | None:
     try:
         provenance = str(record["provenance"])
@@ -4714,6 +4732,13 @@ def cmd_check(
         with results_lock:
             results.append((name, rc, elapsed, output))
         reporter.step_done(lane, name, rc, elapsed)
+        if measurement_path is not None and not measurement_path.exists():
+            _write_unavailable_measurement(
+                measurement_path,
+                identity=f"step:{lane}:{name}",
+                duration_ms=elapsed * 1000.0,
+                returncode=rc,
+            )
         cpu_attributes = (
             _read_cpu_measurement(measurement_path)
             if measurement_path is not None else None
@@ -5529,6 +5554,28 @@ def cmd_check(
             f"--no-prompt --launch -- {ROOT / 'dev.py'} check --all --profile-work "
             "--profile-work-dir DIR`"
         )
+
+    if profile_work and _CHECK_PROFILE is not None:
+        self_usage = resource.getrusage(resource.RUSAGE_SELF)
+        child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        self_cpu = _rusage_delta_attributes(
+            _CHECK_PROFILE.started_self, self_usage, "exact_process"
+        )
+        child_cpu = _rusage_delta_attributes(
+            _CHECK_PROFILE.started_children, child_usage, "exact_waited_children"
+        )
+        command_path = _CHECK_PROFILE.artifact_dir / "command.json"
+        command_path.write_text(json.dumps({
+            "schema_version": 1,
+            "identity": "command:dev.py check",
+            "kind": "command",
+            "provenance": "exact_process_plus_waited_children",
+            "user_cpu_ms": self_cpu["cpu.user_ms"] + child_cpu["cpu.user_ms"],
+            "system_cpu_ms": self_cpu["cpu.system_ms"] + child_cpu["cpu.system_ms"],
+            "total_cpu_ms": self_cpu["cpu.total_ms"] + child_cpu["cpu.total_ms"],
+            "wall_ms": (time.monotonic() - t_start) * 1000.0,
+            "tree_closure": "command_reaped_descendants_unverified",
+        }, sort_keys=True) + "\n")
 
     if profile_work and _CHECK_PROFILE is not None:
         report = subprocess.run(

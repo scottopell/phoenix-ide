@@ -54,6 +54,7 @@ def _normalize(path: Path, value: dict) -> dict:
         "provenance": value.get("provenance", "unavailable"),
         "kind": value.get("kind", "step" if path.parent.name == "processes" else "test"),
         "source": str(path),
+        "tree_closure": value.get("tree_closure"),
     }
 
 
@@ -118,6 +119,10 @@ def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
             "steps": f'{{ name = "dev.check.step" && span.check.profile_run_id = "{run_id}" }}',
             "tests": f'{{ name = "dev.check.test" && span.check.profile_run_id = "{run_id}" }}',
         },
+        "command": next((row for row in rows if row["kind"] == "command"), None),
+        "incomplete_tree_records": [
+            row for row in rows if row.get("tree_closure") not in (None, "verified")
+        ],
         "methodology": [
             "CPU milliseconds are additive work; wall time is secondary.",
             "Step process-tree totals are inclusive; do not add child test rows to them.",
@@ -129,12 +134,13 @@ def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
     lines = [
         "# Check CPU work profile", "",
         f"Records: {len(rows)}", "",
-        "| CPU ms | Wall ms | Provenance | Kind | Identity |",
-        "| ---: | ---: | --- | --- | --- |",
+        "| CPU ms | Wall ms | Provenance | Closure | Kind | Identity |",
+        "| ---: | ---: | --- | --- | --- | --- |",
     ]
     for row in ranked_rows[:limit]:
         identity = row["identity"].replace("|", "\\|")
-        lines.append(f'| {row["cpu_ms"]:.1f} | {row["wall_ms"]:.1f} | {row["provenance"]} | {row["kind"]} | `{identity}` |')
+        closure = row.get("tree_closure") or "n/a"
+        lines.append(f'| {row["cpu_ms"]:.1f} | {row["wall_ms"]:.1f} | {row["provenance"]} | {closure} | {row["kind"]} | `{identity}` |')
     if summary["reconciliation"]:
         lines += [
             "", "## Parent-child reconciliation", "",

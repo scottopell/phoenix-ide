@@ -130,13 +130,20 @@ def _append_jsonl(path: Path, value: dict) -> None:
 def _harness_cpu_times() -> tuple[float | None, float | None, float]:
     if resource is not None:
         own = resource.getrusage(resource.RUSAGE_SELF)
-        children = resource.getrusage(resource.RUSAGE_CHILDREN)
-        user = own.ru_utime + children.ru_utime
-        system = own.ru_stime + children.ru_stime
-        return user, system, user + system
+        return own.ru_utime, own.ru_stime, own.ru_utime + own.ru_stime
     process = os.times()
     user = process.user + process.children_user
     system = process.system + process.children_system
+    return user, system, user + system
+
+
+def _harness_with_waited_children_cpu_times() -> tuple[float | None, float | None, float]:
+    own = _harness_cpu_times()
+    if resource is None:
+        return own
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    user = own[0] + children.ru_utime
+    system = own[1] + children.ru_stime
     return user, system, user + system
 
 
@@ -379,7 +386,7 @@ def _server():
     startup_started_wall_ns = time.time_ns()
     startup_started_monotonic_ns = time.monotonic_ns()
     startup_started_cpu = (
-        _harness_cpu_times() if profile_dir is not None else None
+        _harness_with_waited_children_cpu_times() if profile_dir is not None else None
     )
 
     try:
@@ -393,7 +400,10 @@ def _server():
             started_monotonic_ns=startup_started_monotonic_ns,
             finished_monotonic_ns=startup_finished_monotonic_ns,
             start_cpu=startup_started_cpu,
-            finish_cpu=_harness_cpu_times() if profile_dir is not None else None,
+            finish_cpu=(
+                _harness_with_waited_children_cpu_times()
+                if profile_dir is not None else None
+            ),
             extra={
                 "kind": "e2e_startup", "process_role": "harness",
                 "status": "failed",
@@ -404,7 +414,7 @@ def _server():
 
     startup_finished_monotonic_ns = time.monotonic_ns()
     startup_finished_cpu = (
-        _harness_cpu_times() if profile_dir is not None else None
+        _harness_with_waited_children_cpu_times() if profile_dir is not None else None
     )
     _write_cpu_window(
         profile_dir,

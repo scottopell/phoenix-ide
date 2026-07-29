@@ -41,6 +41,23 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertIn("inclusive", markdown)
         self.assertIn("dev.check.test", summary["traceql"]["tests"])
 
+    def test_command_total_and_closure_are_exposed(self):
+        report = load_report()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "command.json").write_text(json.dumps({
+                "identity": "command:dev.py check", "kind": "command",
+                "provenance": "exact_process_plus_waited_children",
+                "total_cpu_ms": 100, "wall_ms": 50,
+                "tree_closure": "command_reaped_descendants_unverified",
+            }))
+            summary = report.render(root, 20, "run")
+            markdown = (root / "summary.md").read_text()
+
+        self.assertEqual(100, summary["command"]["cpu_ms"])
+        self.assertEqual(1, len(summary["incomplete_tree_records"]))
+        self.assertIn("command_reaped_descendants_unverified", markdown)
+
     def test_traceql_queries_are_scoped_to_profile_run(self):
         report = load_report()
         with tempfile.TemporaryDirectory() as directory:
