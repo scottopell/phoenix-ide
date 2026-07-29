@@ -183,6 +183,7 @@ mod tests {
             updated_at: Utc::now(),
             archived: false,
             model: None,
+            effort: None,
             project_id: None,
             conv_mode: phoenix_core::domain::db_schema::ConvMode::Work {
                 branch_name: phoenix_core::domain::db_schema::NonEmptyString::new("owner").unwrap(),
