@@ -6097,6 +6097,29 @@ mod tests {
         }
     }
 
+    async fn assert_one_pending_terminal(
+        repo: &WakeRepository,
+        workflow_id: WorkflowId,
+        expected: fn(&WakeTerminalPayload) -> bool,
+    ) {
+        let pending = repo.list_pending("conv-1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(expected(&pending[0].receipt.terminal));
+        let deliveries = repo
+            .workflow_repo
+            .list_deliveries(workflow_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|delivery| delivery.status == phoenix_workflow::DeliveryStatus::Pending)
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn cancel_vs_terminal_ordered_matrix_has_typed_loser_and_one_terminal() {
         for cancel_first in [false, true] {
@@ -6146,15 +6169,17 @@ mod tests {
                     WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. }
                 ));
             }
-            let pending = repo.list_pending("conv-1").await.unwrap();
-            assert_eq!(pending.len(), 1);
-            assert_eq!(
-                matches!(
-                    pending[0].receipt.terminal,
-                    WakeTerminalPayload::Cancelled { .. }
-                ),
-                cancel_first
-            );
+            if cancel_first {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Cancelled { .. })
+                })
+                .await;
+            } else {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Fired { .. })
+                })
+                .await;
+            }
         }
     }
 
@@ -6265,15 +6290,17 @@ mod tests {
                         | WakeExpireIfUnresolvedOutcome::Replayed { .. }
                 ));
             }
-            let pending = repo.list_pending("conv-1").await.unwrap();
-            assert_eq!(pending.len(), 1);
-            assert_eq!(
-                matches!(
-                    pending[0].receipt.terminal,
-                    WakeTerminalPayload::Expired { .. }
-                ),
-                expiry_first
-            );
+            if expiry_first {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Expired { .. })
+                })
+                .await;
+            } else {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Fired { .. })
+                })
+                .await;
+            }
         }
     }
 
@@ -6362,15 +6389,17 @@ mod tests {
                         | WakeExpireIfUnresolvedOutcome::Replayed { .. }
                 ));
             }
-            let pending = repo.list_pending("conv-1").await.unwrap();
-            assert_eq!(pending.len(), 1);
-            assert_eq!(
-                matches!(
-                    pending[0].receipt.terminal,
-                    WakeTerminalPayload::Expired { .. }
-                ),
-                expiry_first
-            );
+            if expiry_first {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Expired { .. })
+                })
+                .await;
+            } else {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Cancelled { .. })
+                })
+                .await;
+            }
         }
     }
 
