@@ -2574,6 +2574,8 @@ where
             }
         };
 
+        self.classify_active_direct_turn_outcome_terminal(&result.new_state);
+
         // Apply transition result and process any generated events
         let mut events_to_process = self.apply_transition_result(result).await?;
 
@@ -3972,6 +3974,34 @@ where
             };
             self.pending_direct_turn_terminal = Some(Box::new(
                 crate::runtime::traits::ActiveDirectTurnTerminal::Failed { reason },
+            ));
+            return;
+        }
+        if new_state.is_terminal() {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            ));
+        }
+    }
+
+    fn classify_active_direct_turn_outcome_terminal(&mut self, new_state: &ConvState) {
+        if self.active_direct_turn.is_none() {
+            return;
+        }
+        if matches!(new_state, ConvState::Idle) {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            ));
+            return;
+        }
+        if matches!(
+            new_state,
+            ConvState::Error { .. } | ConvState::ContextExhausted { .. }
+        ) {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: "conversation outcome entered terminal error state".to_string(),
+                },
             ));
             return;
         }
@@ -8706,6 +8736,39 @@ mod authoritative_user_message_effect_tests {
         );
         assert_eq!(rt.active_direct_turn, None);
         assert_eq!(rt.pending_direct_turn_terminal, None);
+    }
+
+    #[tokio::test]
+    async fn active_direct_turn_completes_after_final_llm_outcome() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let active = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(11),
+            generation: 0,
+        };
+        rt = rt.with_active_direct_turn(Some(active.clone()));
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+
+        rt.process_outcome(EffectOutcome::Llm(LlmOutcome::Response {
+            content: vec![ContentBlock::text("done")],
+            tool_calls: Vec::new(),
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "response".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            storage.recorded_terminate_active_direct_turn_calls(),
+            vec![(
+                active,
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            )]
+        );
+        assert_eq!(rt.active_direct_turn, None);
     }
 
     #[tokio::test]
