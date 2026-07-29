@@ -1177,6 +1177,7 @@ mod tests {
             backend: ModelBackend::Anthropic,
             description: "test".into(),
             context_window: 200_000,
+            max_output_tokens: None,
             recommended: false,
             supports_tool_search,
             source: crate::models::ModelSource::BuiltIn,

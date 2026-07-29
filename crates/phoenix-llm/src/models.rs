@@ -278,6 +278,7 @@ pub struct ModelSpec {
     /// (which know whether they're on a bridge route) can still read it
     /// directly when needed; external callers must go through the method.
     pub(super) context_window: usize,
+    pub(super) max_output_tokens: Option<u32>,
     /// Recommended for most users (shown by default in UI)
     pub recommended: bool,
     /// Whether this model supports Anthropic's tool search feature
@@ -307,6 +308,11 @@ impl ModelSpec {
         } else {
             self.context_window
         }
+    }
+
+    #[must_use]
+    pub const fn output_token_limit(&self) -> Option<u32> {
+        self.max_output_tokens
     }
 
     #[must_use]
@@ -430,6 +436,7 @@ fn external_model_spec_from_config(
         backend: spec.backend.into(),
         description,
         context_window: spec.context_window,
+        max_output_tokens: spec.max_output_tokens,
         recommended: spec.recommended,
         supports_tool_search: spec.supports_tool_search,
         source: ModelSource::External,
@@ -474,6 +481,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::Anthropic,
             description: "Claude Opus 4.8 (most capable, slower)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -485,6 +493,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::Anthropic,
             description: "Claude Opus 4.7 (legacy)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -496,6 +505,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::Anthropic,
             description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -507,6 +517,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::Anthropic,
             description: "Claude Sonnet 5 (balanced performance)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -518,6 +529,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::Anthropic,
             description: "Claude Sonnet 4.6 (legacy)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -529,6 +541,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::Anthropic,
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
+            max_output_tokens: None,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -546,6 +559,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.6 Sol (frontier, 1M context)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -557,6 +571,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.6 Luna (frontier, 1M context)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -568,6 +583,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.6 Terra (frontier, 1M context)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -579,6 +595,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.5 (frontier, 1M context)".into(),
             context_window: 1_000_000,
+            max_output_tokens: None,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -590,6 +607,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.4 (frontier, native computer use)".into(),
             context_window: 400_000,
+            max_output_tokens: None,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -601,6 +619,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::OpenAIResponses,
             description: "GPT-5.4 Mini (fast, efficient)".into(),
             context_window: 400_000,
+            max_output_tokens: None,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -613,6 +632,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             backend: ModelBackend::Mock,
             description: "Mock (lorem ipsum for UI dev)".into(),
             context_window: 200_000,
+            max_output_tokens: None,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,

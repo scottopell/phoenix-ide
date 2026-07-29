@@ -913,6 +913,18 @@ impl ModelRegistry {
         }
     }
 
+    /// Return an operator-declared output ceiling for a registered route.
+    ///
+    /// # Panics
+    /// Panics if the internal specs lock is poisoned.
+    pub fn output_token_limit(&self, model_id: &str) -> Option<u32> {
+        self.specs
+            .read()
+            .expect("specs lock poisoned")
+            .get(model_id)
+            .and_then(super::ModelSpec::output_token_limit)
+    }
+
     /// List all available model IDs
     ///
     /// # Panics

@@ -4725,6 +4725,7 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
+        let route_output_limit = self.llm_registry.output_token_limit(&model_id);
         let working_dir = self
             .context
             .execution_environment
@@ -4910,7 +4911,7 @@ where
                 system,
                 messages,
                 tools,
-                max_tokens: Some(16_384),
+                max_tokens: Some(route_output_limit.unwrap_or(16_384)),
                 effective_effort,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
@@ -4923,6 +4924,30 @@ where
                 // (system prompt + earlier turns), so all turns share one key.
                 cache_key: PromptCacheKey::stable(&conv_id),
             };
+
+            let estimated_system_tokens: usize = request
+                .system
+                .iter()
+                .map(|segment| estimate_text_tokens(&segment.text))
+                .sum();
+            let estimated_tool_tokens: usize = request
+                .tools
+                .iter()
+                .map(|tool| {
+                    estimate_text_tokens(&tool.name)
+                        + estimate_text_tokens(&tool.description)
+                        + estimate_text_tokens(&tool.input_schema.to_string())
+                })
+                .sum();
+            let estimated_input_tokens = estimated_system_tokens
+                + estimate_messages_tokens(&request.messages)
+                + estimated_tool_tokens;
+            let reserved_output_tokens = usize::try_from(request.reserved_output_tokens())
+                .unwrap_or(usize::MAX);
+            if estimated_input_tokens.saturating_add(reserved_output_tokens) > context_window {
+                let _ = llm_tx.send(LlmOutcome::TokenBudgetExceeded);
+                return;
+            }
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {

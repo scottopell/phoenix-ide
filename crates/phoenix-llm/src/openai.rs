@@ -532,9 +532,11 @@ impl ResponsesStreamAccumulator {
                     cached_tokens: self.cached_tokens,
                     cache_write_tokens: self.cache_write_tokens,
                 },
-                output_tokens_details: self
-                    .reasoning_tokens
-                    .map(|reasoning_tokens| ResponsesApiOutputTokensDetails { reasoning_tokens }),
+                output_tokens_details: self.reasoning_tokens.map(|reasoning_tokens| {
+                    ResponsesApiOutputTokensDetails {
+                        reasoning_tokens: Some(reasoning_tokens),
+                    }
+                }),
             },
         })?;
         telemetry.attach_success(&mut response);
@@ -1785,7 +1787,7 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
         let reasoning = resp
             .usage
             .output_tokens_details
-            .map(|details| u64::from(details.reasoning_tokens));
+            .and_then(|details| details.reasoning_tokens.map(u64::from));
         Usage {
             input_tokens: u64::from(resp.usage.input_tokens)
                 .saturating_sub(cached.saturating_add(written)),
@@ -2286,7 +2288,7 @@ pub(crate) struct ResponsesApiInputTokensDetails {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiOutputTokensDetails {
-    pub(crate) reasoning_tokens: u32,
+    pub(crate) reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2479,6 +2481,7 @@ mod tests {
             backend: ModelBackend::OpenAIResponses,
             description: String::new(),
             context_window: 100_000,
+            max_output_tokens: None,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -3136,6 +3139,28 @@ mod tests {
 
         assert_eq!(json["reasoning"]["context"], "all_turns");
         assert_eq!(json["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn present_output_details_may_omit_reasoning_tokens() {
+        let response: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "output_tokens_details": {}
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            response
+                .usage
+                .output_tokens_details
+                .unwrap()
+                .reasoning_tokens,
+            None
+        );
     }
 
     #[test]
