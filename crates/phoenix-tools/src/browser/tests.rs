@@ -3141,175 +3141,163 @@ setTimeout(function () {
     shutdown_test(manager, server).await;
 }
 
-/// Sessions are shared across continuations in one durable work scope: two
-/// `get_session` calls with the same key return the same
-/// `Arc<RwLock<BrowserSession>>`. This is the structural backing
-/// for REQ-BROWSER-WS-002 inheritance — agents driving a continuation
-/// see the predecessor's tabs and cookies because they're literally the
-/// same Chrome instance.
-#[tokio::test]
-async fn worktree_scope_shared_across_continuations() {
-    require_chrome!();
-
-    let manager = Arc::new(BrowserSessionManager::default());
-    let scope = scope("shared-continuation");
-
-    let first = manager
-        .get_session(&scope)
-        .await
-        .expect("first get_session");
-    let second = manager
-        .get_session(&scope)
-        .await
-        .expect("second get_session on same scope");
-
-    assert!(
-        Arc::ptr_eq(&first, &second),
-        "sessions in one durable work scope must share the same Arc — \
-         continuation inheritance depends on it"
-    );
-
-    manager.shutdown_all().await.expect("browser shutdown");
+struct BrowserLifecycleFixture {
+    manager: Arc<BrowserSessionManager>,
+    shared_scope: phoenix_core::work_scope::ResourceScopeKey,
+    isolated_scope: phoenix_core::work_scope::ResourceScopeKey,
+    restricted_scope: phoenix_core::work_scope::ResourceScopeKey,
 }
 
-/// Distinct durable work scopes resolve to different Chrome instances.
-#[tokio::test]
-async fn conversation_scope_isolated_per_id() {
-    require_chrome!();
+impl BrowserLifecycleFixture {
+    fn new() -> Self {
+        Self {
+            manager: Arc::new(BrowserSessionManager::default()),
+            shared_scope: scope("lifecycle-shared-work"),
+            isolated_scope: scope("lifecycle-isolated-work"),
+            restricted_scope: scope("lifecycle-restricted"),
+        }
+    }
 
-    let manager = Arc::new(BrowserSessionManager::default());
-    let scope_a = scope("ws-conv-a");
-    let scope_b = scope("ws-conv-b");
+    async fn assert_worktree_scope_shared_across_continuations(&self) {
+        let shared = self
+            .manager
+            .get_session(&self.shared_scope)
+            .await
+            .expect("shared session");
+        let continuation = self
+            .manager
+            .get_session(&self.shared_scope)
+            .await
+            .expect("continuation session");
+        assert!(Arc::ptr_eq(&shared, &continuation));
+    }
 
-    let a = manager.get_session(&scope_a).await.expect("session a");
-    let b = manager.get_session(&scope_b).await.expect("session b");
-
-    assert!(
-        !Arc::ptr_eq(&a, &b),
-        "different durable work scopes must produce isolated sessions"
-    );
-
-    manager.shutdown_all().await.expect("browser shutdown");
-}
-
-/// Cleanup-cascade preservation: when the inheritor's scope equals the
-/// torn-down conversation's scope (the worktree continuation case), the
-/// session survives and remains addressable by the same scope.
-#[tokio::test]
-async fn cascade_preserves_when_inheritor_scope_matches() {
-    require_chrome!();
-
-    let manager = Arc::new(BrowserSessionManager::default());
-    let scope = scope("cascade-preserve");
-
-    let original = manager.get_session(&scope).await.expect("create");
-    assert!(manager.is_active(&scope).await);
-
-    // Continuation inherits the same scope.
-    crate::browser::session::cascade_browser_on_delete(
-        &manager,
-        &scope,
-        &work_actor("owner"),
-        Some(&scope),
-    )
-    .await
-    .expect("browser cascade");
-
-    assert!(
-        manager.is_active(&scope).await,
-        "preservation must keep the session live for the inheritor"
-    );
-    let still_there = manager.get_session(&scope).await.expect("still live");
-    assert!(
-        Arc::ptr_eq(&original, &still_there),
-        "the inheritor must observe the same Arc — cascade must not \
-         have torn down and relaunched"
-    );
-
-    manager.shutdown_all().await.expect("browser shutdown");
-}
-
-/// Cleanup-cascade teardown: no inheritor (or different inheritor scope)
-/// tears the session down so the Chrome process is released. Mirrors
-/// `cascade_on_delete_direct_continuation_does_not_preserve` in
-/// `tmux/registry.rs` — same scope-equality rule.
-#[tokio::test]
-async fn cascade_tears_down_when_no_inheritor() {
-    require_chrome!();
-
-    let manager = Arc::new(BrowserSessionManager::default());
-    let scope = scope("ws-cascade-teardown");
-
-    let _ = manager.get_session(&scope).await.expect("create");
-    assert!(manager.is_active(&scope).await);
-
-    crate::browser::session::cascade_browser_on_delete(
-        &manager,
-        &scope,
-        &work_actor("owner"),
-        None,
-    )
-    .await
-    .expect("browser cascade");
-
-    assert!(
-        !manager.is_active(&scope).await,
-        "no-inheritor cascade must tear the session down"
-    );
-}
-
-#[tokio::test]
-async fn cascade_last_restricted_owner_tears_down_every_scope_session() {
-    require_chrome!();
-
-    let manager = Arc::new(BrowserSessionManager::default());
-    let scope = scope("cascade-restricted-last-owner");
-    let owner = restricted_actor("owner");
-    let sibling = restricted_actor("finished-sub-agent");
-
-    let _ = manager
-        .get_session_for_actor(&scope, &owner)
+    async fn assert_same_scope_inheritor_preserves_exact_session(&self) {
+        let original = self
+            .manager
+            .get_session(&self.shared_scope)
+            .await
+            .expect("original session");
+        crate::browser::session::cascade_browser_on_delete(
+            &self.manager,
+            &self.shared_scope,
+            &work_actor("parent"),
+            Some(&self.shared_scope),
+        )
         .await
-        .expect("owner session");
-    let _ = manager
-        .get_session_for_actor(&scope, &sibling)
-        .await
-        .expect("sibling session");
+        .expect("same-scope cascade");
+        assert!(self.manager.is_active(&self.shared_scope).await);
+        let preserved = self
+            .manager
+            .get_session(&self.shared_scope)
+            .await
+            .expect("preserved session");
+        assert!(Arc::ptr_eq(&original, &preserved));
+    }
 
-    crate::browser::session::cascade_browser_on_delete(&manager, &scope, &owner, None)
-        .await
-        .expect("browser cascade");
+    async fn assert_distinct_scopes_are_isolated(&self) {
+        let shared = self
+            .manager
+            .get_session(&self.shared_scope)
+            .await
+            .expect("shared session");
+        let isolated = self
+            .manager
+            .get_session(&self.isolated_scope)
+            .await
+            .expect("isolated session");
+        assert!(!Arc::ptr_eq(&shared, &isolated));
+    }
 
-    assert!(!manager.is_active(&scope).await);
+    async fn assert_different_scope_inheritor_tears_down_parent(&self) {
+        crate::browser::session::cascade_browser_on_delete(
+            &self.manager,
+            &self.isolated_scope,
+            &work_actor("parent"),
+            Some(&self.shared_scope),
+        )
+        .await
+        .expect("different-scope cascade");
+        assert!(!self.manager.is_active(&self.isolated_scope).await);
+        assert!(self.manager.is_active(&self.shared_scope).await);
+    }
+
+    async fn assert_no_inheritor_tears_down_scope(&self) {
+        crate::browser::session::cascade_browser_on_delete(
+            &self.manager,
+            &self.shared_scope,
+            &work_actor("parent"),
+            None,
+        )
+        .await
+        .expect("no-inheritor cascade");
+        assert!(!self.manager.is_active(&self.shared_scope).await);
+    }
+
+    async fn assert_restricted_owner_teardown_is_selective_then_complete(&self) {
+        let owner = restricted_actor("owner");
+        let sibling = restricted_actor("finished-sub-agent");
+        let restricted_owner = self
+            .manager
+            .get_session_for_actor(&self.restricted_scope, &owner)
+            .await
+            .expect("restricted owner session");
+        let restricted_sibling = self
+            .manager
+            .get_session_for_actor(&self.restricted_scope, &sibling)
+            .await
+            .expect("restricted sibling session");
+        assert!(!Arc::ptr_eq(&restricted_owner, &restricted_sibling));
+
+        crate::browser::session::cascade_browser_on_delete(
+            &self.manager,
+            &self.restricted_scope,
+            &owner,
+            Some(&self.restricted_scope),
+        )
+        .await
+        .expect("restricted-owner selective cascade");
+        assert!(self.manager.is_active(&self.restricted_scope).await);
+        let surviving_sibling = self
+            .manager
+            .get_session_for_actor(&self.restricted_scope, &sibling)
+            .await
+            .expect("surviving restricted sibling");
+        assert!(Arc::ptr_eq(&restricted_sibling, &surviving_sibling));
+
+        crate::browser::session::cascade_browser_on_delete(
+            &self.manager,
+            &self.restricted_scope,
+            &sibling,
+            None,
+        )
+        .await
+        .expect("last restricted-owner cascade");
+        assert!(!self.manager.is_active(&self.restricted_scope).await);
+    }
 }
 
-/// Direct continuations resolve to a *different* `Conversation` scope
-/// (their own id, not the parent's), so the scope-equality rule fires
-/// the kill path automatically. This is the structural reason Direct
-/// continuations cannot inherit — proven here without case-analysis on
-/// scope kind.
 #[tokio::test]
-async fn cascade_tears_down_when_inheritor_scope_differs() {
+async fn browser_lifecycle_ownership_topologies_share_serialized_fixture() {
     require_chrome!();
-
-    let manager = Arc::new(BrowserSessionManager::default());
-    let parent = scope("ws-cascade-parent");
-    let child = scope("ws-cascade-child");
-
-    let _ = manager.get_session(&parent).await.expect("create parent");
-    assert!(manager.is_active(&parent).await);
-
-    crate::browser::session::cascade_browser_on_delete(
-        &manager,
-        &parent,
-        &work_actor("owner"),
-        Some(&child),
-    )
-    .await
-    .expect("browser cascade");
-
-    assert!(
-        !manager.is_active(&parent).await,
-        "different-scope inheritor must not preserve the parent's session"
-    );
+    let fixture = BrowserLifecycleFixture::new();
+    fixture
+        .assert_worktree_scope_shared_across_continuations()
+        .await;
+    fixture
+        .assert_same_scope_inheritor_preserves_exact_session()
+        .await;
+    fixture.assert_distinct_scopes_are_isolated().await;
+    fixture
+        .assert_different_scope_inheritor_tears_down_parent()
+        .await;
+    fixture.assert_no_inheritor_tears_down_scope().await;
+    fixture
+        .assert_restricted_owner_teardown_is_selective_then_complete()
+        .await;
+    fixture
+        .manager
+        .shutdown_all()
+        .await
+        .expect("browser shutdown");
 }
