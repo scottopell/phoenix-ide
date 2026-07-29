@@ -167,6 +167,8 @@ impl McpTransport for StdioTransport {
             )));
         }
 
+        let deadline = tokio::time::Instant::now() + timeout;
+
         // Write request.
         let write_fut = async {
             stdin
@@ -179,7 +181,7 @@ impl McpTransport for StdioTransport {
                 .map_err(|e| TransportError::Disconnected(format!("stdin flush failed: {e}")))
         };
 
-        tokio::time::timeout(timeout, write_fut)
+        tokio::time::timeout_at(deadline, write_fut)
             .await
             .map_err(|_| {
                 TransportError::Timeout(format!("timed out writing request for '{method}'"))
@@ -246,9 +248,11 @@ impl McpTransport for StdioTransport {
             }
         };
 
-        tokio::time::timeout(timeout, read_fut).await.map_err(|_| {
-            TransportError::Timeout(format!("timed out reading response for '{method}'"))
-        })?
+        tokio::time::timeout_at(deadline, read_fut)
+            .await
+            .map_err(|_| {
+                TransportError::Timeout(format!("timed out reading response for '{method}'"))
+            })?
     }
 
     async fn notify(&self, notification: &Value) -> Result<(), TransportError> {
@@ -277,6 +281,10 @@ impl McpTransport for StdioTransport {
     fn is_alive(&mut self) -> bool {
         // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running.
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn requires_reestablish_after_cancel(&self) -> bool {
+        true
     }
 
     fn invalidate(&self) {

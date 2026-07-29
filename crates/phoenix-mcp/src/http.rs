@@ -868,7 +868,9 @@ impl SseFramer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{server_handle, McpClientManager, McpConnState, McpServerConfig};
+    use crate::{
+        server_handle, McpClientManager, McpConnState, McpServerConfig, DEFAULT_TOOL_CALL_TIMEOUT,
+    };
     use std::collections::VecDeque;
     use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
@@ -1300,6 +1302,7 @@ mod tests {
             url: url.to_string(),
             headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
             auth,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }
 
@@ -2215,6 +2218,7 @@ mod tests {
             url: "http://127.0.0.1:1/mcp".to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let result = manager
             .reload_from_configs(vec![("remote".to_string(), unreachable)])
@@ -3845,6 +3849,7 @@ mod tests {
                 }),
                 scopes: Vec::new(),
             }),
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let mcp = McpClientManager::connect_one(
             "remote",
@@ -3912,6 +3917,7 @@ mod tests {
                 client: None,
                 scopes: vec![scope.to_string()],
             }),
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let mcp = McpClientManager::connect_one(
             "remote",
@@ -4033,6 +4039,7 @@ mod tests {
             url: format!("{}/v2", server.url),
             headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
             auth: HttpAuth::None,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let result = manager
             .reload_from_configs(vec![("remote".to_string(), repointed)])
@@ -4123,6 +4130,7 @@ mod tests {
             url: server.url.clone(),
             headers: HashMap::from([("x-org".to_string(), "other".to_string())]),
             auth: HttpAuth::None,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let mut publications = manager.oauth.pending_publications.subscribe();
         manager

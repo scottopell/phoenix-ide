@@ -162,7 +162,8 @@ rule ServerDiscovered {
 
     @guidance
         -- read_all_configs classifies each mcpServers entry into a transport
-        -- (command -> stdio, type:http + url -> http) and an auth_scheme.
+        -- (command -> stdio, type:http + url -> http), an auth_scheme, and a
+        -- positive per-server timeoutSeconds (default five minutes).
         -- auth_scheme = static ONLY when an explicit auth credential (bearer
         -- token or auth header) is configured; generic per-request headers (org
         -- id, beta flag) do NOT imply static and must not preempt OAuth -- they

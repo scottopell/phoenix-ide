@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 pub type SharedBearer = Arc<std::sync::RwLock<Option<String>>>;
 
 /// Timeout for a single MCP tool call request-response round trip.
-const TOOL_CALL_TIMEOUT: Duration = Duration::from_mins(5);
+const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Longer timeout for initialize + tools/list during server connection.
 /// Five minutes gives OAuth flows (mcp-remote prompts, browser redirect) time to complete.
@@ -141,6 +141,11 @@ pub trait McpTransport: Send + Sync {
     /// manager can acquire exclusive ownership and rebuild the process.
     fn invalidate(&self) {}
 
+    /// Whether abandoning a request makes the connection unsafe to reuse.
+    fn requires_reestablish_after_cancel(&self) -> bool {
+        false
+    }
+
     /// Tear down the transport (stdio: kill the child process).
     async fn shutdown(&mut self);
 }
@@ -163,10 +168,14 @@ async fn connect_transport(
     sink: Arc<dyn ServerMessageSink>,
 ) -> Result<Box<dyn McpTransport>, String> {
     match config {
-        McpServerConfig::Stdio { command, args, env } => Ok(Box::new(
+        McpServerConfig::Stdio {
+            command, args, env, ..
+        } => Ok(Box::new(
             StdioTransport::spawn(name, command, args, env, pending_oauth_urls).await?,
         )),
-        McpServerConfig::Http { url, headers, auth } => Ok(Box::new(HttpTransport::connect(
+        McpServerConfig::Http {
+            url, headers, auth, ..
+        } => Ok(Box::new(HttpTransport::connect(
             name,
             url,
             headers,
@@ -775,7 +784,7 @@ impl McpServer {
                 self.transport.invalidate();
                 return Err(McpRequestError::Cancelled);
             },
-            result = self.request("tools/call", params, TOOL_CALL_TIMEOUT) => result,
+            result = self.request("tools/call", params, self.config.tool_call_timeout()) => result,
         }
         .map_err(McpRequestError::Transport)?;
 
@@ -836,6 +845,9 @@ impl McpServer {
     /// Check whether the underlying transport is still usable.
     pub fn is_alive(&mut self) -> bool {
         self.transport.is_alive()
+    }
+    fn requires_reestablish_after_cancel(&self) -> bool {
+        self.transport.requires_reestablish_after_cancel()
     }
 
     /// The recovery verb for this server's transport: stdio respawns a
@@ -2402,8 +2414,6 @@ impl McpClientManager {
             .iter()
             .map(|(name, handle)| (name.clone(), Arc::clone(handle)))
             .collect();
-        let connected_names: std::collections::HashSet<String> =
-            servers.iter().map(|(name, _)| name.clone()).collect();
         let disabled = self.disabled_servers.read().await;
         let pending = self.pending_oauth_urls.read().await;
         let failed = self.failed_servers.read().await;
@@ -2413,11 +2423,13 @@ impl McpClientManager {
 
         // Connected servers are ready.
         let mut result = Vec::new();
+        let mut connected_names = std::collections::HashSet::new();
         for (name, handle) in &servers {
             let server = handle.read().await;
             let Some(server) = server.as_ref() else {
                 continue;
             };
+            connected_names.insert(name.clone());
             result.push(McpServerStatus {
                 name: name.clone(),
                 state: McpConnState::Ready,
@@ -2513,13 +2525,15 @@ impl McpClientManager {
                     .read()
                     .await
                     .as_ref()
-                    .is_some_and(|s| s.tools_changed.swap(false, Ordering::AcqRel)),
+                    .is_some_and(|s| s.tools_changed.load(Ordering::Acquire)),
                 None => false,
             };
             let extracted = if let (true, Some(handle)) = (refresh, handle.as_ref()) {
                 match self.claim_serving_slot(&name, handle).await {
                     ServingSlot::Take(handle, claim) => {
-                        Some((Self::take_claimed_server(handle).await, claim))
+                        let server = Self::take_claimed_server(handle).await;
+                        server.tools_changed.store(false, Ordering::Release);
+                        Some((server, claim))
                     }
                     ServingSlot::Stale | ServingSlot::Follow(_) | ServingSlot::Missing => None,
                 }
@@ -2754,6 +2768,9 @@ impl McpClientManager {
         server_name: &str,
         attempt: CallAttempt,
     ) -> Result<String, McpToolCallError> {
+        if !attempt.cancellation_requires_reestablish {
+            return Err(McpToolCallError::Cancelled);
+        }
         let ServingSlot::Take(handle, claim) =
             self.claim_serving_slot(server_name, &attempt.server).await
         else {
@@ -3229,6 +3246,19 @@ impl McpClientManager {
     /// field selects stdio. Returns `None` (the entry is skipped) when
     /// neither is usable, with the reason at `debug` level.
     fn classify_config_entry(name: &str, cfg: &Value) -> Option<McpServerConfig> {
+        let tool_call_timeout = match cfg.get("timeoutSeconds") {
+            None => DEFAULT_TOOL_CALL_TIMEOUT,
+            Some(value) => {
+                let Some(seconds) = value.as_u64().filter(|seconds| *seconds > 0) else {
+                    tracing::debug!(
+                        server = %name,
+                        "'timeoutSeconds' must be a positive integer; skipping server"
+                    );
+                    return None;
+                };
+                Duration::from_secs(seconds)
+            }
+        };
         if cfg.get("type").and_then(|v| v.as_str()) == Some("http") {
             let Some(url) = cfg.get("url").and_then(|v| v.as_str()) else {
                 tracing::debug!(server = %name, "HTTP MCP server without 'url' field");
@@ -3248,6 +3278,7 @@ impl McpClientManager {
                 url: url.to_string(),
                 headers: string_map(cfg.get("headers")),
                 auth,
+                tool_call_timeout,
             });
         }
 
@@ -3271,6 +3302,7 @@ impl McpClientManager {
             command: command.to_string(),
             args,
             env: string_map(cfg.get("env")),
+            tool_call_timeout,
         })
     }
 
@@ -3960,6 +3992,7 @@ struct CallAttempt {
     result: Result<String, McpRequestError>,
     server: ServerHandle,
     recoverable: bool,
+    cancellation_requires_reestablish: bool,
 }
 
 impl CallAttempt {
@@ -3978,11 +4011,13 @@ impl CallAttempt {
             .as_ref()
             .err()
             .is_some_and(|e| serving.should_reestablish(e));
+        let cancellation_requires_reestablish = serving.requires_reestablish_after_cancel();
         drop(guard);
         Self {
             result,
             server,
             recoverable,
+            cancellation_requires_reestablish,
         }
     }
 }
@@ -4017,6 +4052,7 @@ pub enum McpServerConfig {
         command: String,
         args: Vec<String>,
         env: HashMap<String, String>,
+        tool_call_timeout: Duration,
     },
     Http {
         url: String,
@@ -4025,7 +4061,21 @@ pub enum McpServerConfig {
         /// preempt OAuth (REQ-MCP-008).
         headers: HashMap<String, String>,
         auth: HttpAuth,
+        tool_call_timeout: Duration,
     },
+}
+
+impl McpServerConfig {
+    fn tool_call_timeout(&self) -> Duration {
+        match self {
+            Self::Stdio {
+                tool_call_timeout, ..
+            }
+            | Self::Http {
+                tool_call_timeout, ..
+            } => *tool_call_timeout,
+        }
+    }
 }
 
 impl McpServerConfig {
@@ -4150,8 +4200,37 @@ mod tests {
                 command: "uvx".to_string(),
                 args: vec!["server".to_string()],
                 env: HashMap::from([("KEY".to_string(), "v".to_string())]),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             }
         );
+    }
+
+    #[test]
+    fn classify_entry_parses_and_validates_timeout_seconds() {
+        let configured = serde_json::json!({
+            "command": "uvx",
+            "timeoutSeconds": 900,
+        });
+        let config =
+            McpClientManager::classify_config_entry("s", &configured).expect("configured timeout");
+        assert_eq!(config.tool_call_timeout(), Duration::from_secs(900));
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("300"),
+        ] {
+            let cfg = serde_json::json!({
+                "command": "uvx",
+                "timeoutSeconds": invalid,
+            });
+            assert_eq!(
+                McpClientManager::classify_config_entry("s", &cfg),
+                None,
+                "invalid timeout must skip server: {cfg}"
+            );
+        }
     }
 
     #[test]
@@ -4168,6 +4247,7 @@ mod tests {
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::from([("X-Org".to_string(), "acme".to_string())]),
                 auth: HttpAuth::None,
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             }
         );
     }
@@ -4185,6 +4265,7 @@ mod tests {
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             })
         );
 
@@ -4202,11 +4283,13 @@ mod tests {
                     "X-Api-Key".to_string(),
                     "k".to_string()
                 )]))),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             })
         );
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One table-driven assertion over all supported OAuth config shapes.
     fn classify_entry_parses_oauth_shapes() {
         // Bare OAuth (Claude Code's shape): client identity acquired
         // dynamically. An object without `clientId` (here, only callbackPort)
@@ -4227,6 +4310,7 @@ mod tests {
                     url: "https://example.com/mcp".to_string(),
                     headers: HashMap::new(),
                     auth: HttpAuth::OAuth(OAuthConfig::default()),
+                    tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
                 }),
                 "oauth = {oauth_value} must select dynamic-client OAuth"
             );
@@ -4252,6 +4336,7 @@ mod tests {
                     }),
                     scopes: Vec::new(),
                 }),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             })
         );
 
@@ -4280,6 +4365,7 @@ mod tests {
                         "chat:write".to_string(),
                     ],
                 }),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             })
         );
 
@@ -4297,6 +4383,7 @@ mod tests {
                     client: None,
                     scopes: vec!["read".to_string(), "write".to_string()],
                 }),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             })
         );
 
@@ -4313,6 +4400,7 @@ mod tests {
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             })
         );
     }
@@ -4562,6 +4650,7 @@ mod tests {
                 command: "unused".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             },
         )
     }
@@ -4645,6 +4734,44 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, "tools/call");
         assert_eq!(requests[0].2, Duration::from_mins(5));
+    }
+
+    #[tokio::test]
+    async fn call_tool_uses_per_server_timeout_override() {
+        let (server, requests, _) = fake_server_with_config(
+            vec![exchange(Ok(serde_json::json!({"content": []})))],
+            McpServerConfig::Stdio {
+                command: "unused".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                tool_call_timeout: Duration::from_secs(900),
+            },
+        );
+
+        server
+            .call_tool("report", serde_json::json!({}), &CancellationToken::new())
+            .await
+            .expect("call_tool");
+
+        assert_eq!(requests.lock().unwrap()[0].2, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn timeout_change_participates_in_reload_comparison() {
+        let base = McpServerConfig::Stdio {
+            command: "unused".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
+        };
+        let mut changed = base.clone();
+        if let McpServerConfig::Stdio {
+            tool_call_timeout, ..
+        } = &mut changed
+        {
+            *tool_call_timeout = Duration::from_secs(900);
+        }
+        assert_ne!(base, changed);
     }
 
     #[tokio::test]
@@ -4740,6 +4867,97 @@ mod tests {
         );
         drop(handle);
         drop(claim);
+    }
+
+    #[tokio::test]
+    async fn cancelled_http_attempt_does_not_wait_for_exclusive_cleanup() {
+        let (server, _, _) = fake_server_with_config(
+            Vec::new(),
+            McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuth::None,
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
+            },
+        );
+        let handle = server_handle(server);
+        let manager = McpClientManager::new();
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".to_string(), Arc::clone(&handle));
+        let attempt = CallAttempt {
+            result: Err(McpRequestError::Cancelled),
+            server: Arc::clone(&handle),
+            recoverable: false,
+            cancellation_requires_reestablish: false,
+        };
+
+        assert_eq!(
+            manager.finish_cancelled_attempt("fake", attempt).await,
+            Err(McpToolCallError::Cancelled)
+        );
+        assert!(Arc::ptr_eq(
+            manager
+                .servers
+                .read()
+                .await
+                .get("fake")
+                .expect("still mapped"),
+            &handle
+        ));
+    }
+
+    #[tokio::test]
+    async fn lost_refresh_ownership_preserves_stale_marker() {
+        let (server, _, _) = fake_server(Vec::new());
+        server.tools_changed.store(true, Ordering::Release);
+        let old_handle = server_handle(server);
+        let (replacement, _, _) = fake_server(Vec::new());
+        let manager = McpClientManager::new();
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".to_string(), server_handle(replacement));
+
+        assert!(matches!(
+            manager.claim_serving_slot("fake", &old_handle).await,
+            ServingSlot::Stale
+        ));
+        assert!(old_handle
+            .read()
+            .await
+            .as_ref()
+            .expect("old server")
+            .tools_changed
+            .load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn status_does_not_treat_empty_handle_as_connected() {
+        let (server, _, _) = fake_server(Vec::new());
+        let handle = server_handle(server);
+        handle.write().await.take();
+        let manager = McpClientManager::new();
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".to_string(), handle);
+        manager.failed_servers.write().await.insert(
+            "fake".to_string(),
+            FailureRecord {
+                error: "failed".to_string(),
+                transport: McpTransportKind::Stdio,
+                auth: McpAuthKind::None,
+            },
+        );
+
+        let status = manager.status().await;
+        assert_eq!(status.len(), 1);
+        assert!(matches!(status[0].state, McpConnState::Failed));
     }
 
     #[tokio::test]
@@ -4863,6 +5081,7 @@ mod tests {
             url: url.to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }
 
@@ -5044,6 +5263,7 @@ mod tests {
             url: "https://example.com/mcp".to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let (server, _, _) = fake_server_with_config(Vec::new(), http_config);
 
@@ -5078,6 +5298,7 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             env: HashMap::new(),
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }
 
@@ -5097,6 +5318,7 @@ mod tests {
                 url: "http://127.0.0.1:1/mcp".to_string(),
                 headers: HashMap::new(),
                 auth: HttpAuth::None,
+                tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             },
         );
         manager
@@ -5271,6 +5493,7 @@ for line in sys.stdin:
                 label.to_string(),
             ],
             env: HashMap::from([("MCP_TEST_VALUE".to_string(), env_value.to_string())]),
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
     }
 
@@ -5279,7 +5502,9 @@ for line in sys.stdin:
         config: &mut McpServerConfig,
     ) -> (&mut String, &mut Vec<String>, &mut HashMap<String, String>) {
         match config {
-            McpServerConfig::Stdio { command, args, env } => (command, args, env),
+            McpServerConfig::Stdio {
+                command, args, env, ..
+            } => (command, args, env),
             McpServerConfig::Http { .. } => panic!("expected stdio config"),
         }
     }
@@ -5582,6 +5807,7 @@ for line in sys.stdin:
             url: "http://127.0.0.1:1/mcp".to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,
+            tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         };
         let result = manager
             .reload_from_configs(vec![("fixture".to_string(), changed)])

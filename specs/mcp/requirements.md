@@ -53,6 +53,10 @@ For each `mcpServers` entry THE SYSTEM SHALL select a transport:
 - an entry with a `command` field is a **stdio** server
 - an entry with `"type": "http"` and a `url` field is an **HTTP** server
 
+Each entry MAY set `timeoutSeconds` to a positive integer to override the
+five-minute `tools/call` deadline for that server. A changed timeout SHALL take
+effect through config reload reconciliation like any other server config change.
+
 WHERE an entry declares neither a usable `command` nor an HTTP `url`
 THE SYSTEM SHALL skip it and record the reason at `debug` level.
 
@@ -408,14 +412,16 @@ re-authorizing on re-enable.
 ### REQ-MCP-017: Tool Call Cancellation and Error Surfacing
 
 WHEN a `tools/call` is cancelled
-THE SYSTEM SHALL not corrupt the transport: an in-flight stdio write must
-complete rather than be dropped mid-message.
+THE SYSTEM SHALL not reuse a potentially partial or abandoned stdio exchange:
+the stdio transport SHALL reject queued requests and be replaced before serving
+another call.
 
 WHEN a server reports a tool error or the call fails
 THE SYSTEM SHALL surface it as a tool error to the conversation, not a success.
 
-**Rationale:** Dropping a partial JSON-RPC write mid-frame desynchronizes a
-stdio server's input stream. Reporting a failed call as success is the
+**Rationale:** Reusing a stream after dropping a partial JSON-RPC write or
+abandoning its response desynchronizes request/response framing. Discarding the
+transport makes the incomplete stream unreachable. Reporting a failed call as success is the
 wrong-state bug class the `ToolOutput` enum exists to prevent.
 
 ---

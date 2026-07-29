@@ -16,7 +16,7 @@ natively, without the `mcp-remote` subprocess bridge.
 
 | Requirement | Title | Status | Notes |
 |---|---|---|---|
-| REQ-MCP-001 | Transport-Tagged Config Discovery | Complete | `read_all_configs` merges entries first-seen-wins; `classify_config_entry` tags each as `Stdio` (a `command`) or `Http` (`type: "http"` + `url`, with generic `headers` and an optional `auth` credential), skipping unusable entries at `debug`. |
+| REQ-MCP-001 | Transport-Tagged Config Discovery | Complete | `read_all_configs` merges entries first-seen-wins; `classify_config_entry` tags each as `Stdio` (a `command`) or `Http` (`type: "http"` + `url`, with generic `headers` and an optional `auth` credential), validates an optional positive `timeoutSeconds`, and defaults `tools/call` to five minutes. Reload restarts a server when this config value changes. |
 | REQ-MCP-002 | Transport-Agnostic JSON-RPC Protocol | Complete | Protocol (initialize / paginated `tools/list` / `tools/call` / notification handling via `ServerMessageSink`) lives on `McpServer` over the `McpTransport` trait; failures are the typed `TransportError`. `StdioTransport` is the sole impl until M2. |
 | REQ-MCP-003 | Stdio Transport | Complete | `StdioTransport::spawn` / `McpServer::initialize` / `list_tools`; crash detection (`is_alive`, `TransportError::Disconnected` classification) + `respawn` in `mcp.rs`. |
 | REQ-MCP-004 | Streamable HTTP Transport | Complete | `HttpTransport` (`mcp/http.rs`): POST with the dual `Accept` pair, unary-JSON and SSE-stream response handling (`SseFramer`), `MCP-Protocol-Version` echoed after `initialize`, 202-with-empty-body accepted for notifications. |
