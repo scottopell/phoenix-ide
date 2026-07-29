@@ -180,10 +180,18 @@ class CheckWorkProfile:
         return self.artifact_dir / "processes" / f"{safe}.json"
 
 
-def _profile_failed(error: BaseException | None) -> bool:
+def _profile_returncode(error: BaseException | None) -> int:
+    if error is None:
+        return 0
+    if isinstance(error, subprocess.CalledProcessError):
+        return error.returncode
     if isinstance(error, SystemExit):
-        return error.code not in (None, 0)
-    return error is not None
+        return error.code if isinstance(error.code, int) else 0 if error.code is None else 1
+    return 1
+
+
+def _profile_failed(error: BaseException | None) -> bool:
+    return _profile_returncode(error) != 0
 
 
 def _finalize_check_profile(error: BaseException | None) -> None:
@@ -191,7 +199,8 @@ def _finalize_check_profile(error: BaseException | None) -> None:
     if profile is None or profile.artifacts_finalized:
         return
     profile.artifacts_finalized = True
-    failed = _profile_failed(error)
+    returncode = _profile_returncode(error)
+    failed = returncode != 0
     try:
         command_cpu = profile.finalize_cpu()
         assert profile.finalized_wall_ns is not None
@@ -223,7 +232,7 @@ def _finalize_check_profile(error: BaseException | None) -> None:
             "wall_ms": wall_ms,
             "tree_closure": "command_reaped_descendants_unverified",
             "status": "failed" if failed else "passed",
-            "returncode": 1 if failed else 0,
+            "returncode": returncode,
             "metadata": {
                 "git_sha": profile.initial_git_sha,
                 "git_dirty": profile.initial_git_dirty,

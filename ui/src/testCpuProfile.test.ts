@@ -69,11 +69,11 @@ describe('testCpuProfile', () => {
     const task = {
       id: 'file_0_1',
       name: 'captures profile',
-      fullName: '/repo/ui/src/example.test.ts > outer suite > captures profile',
+      fullName: `${join(process.cwd(), 'src/example.test.ts')} > outer suite > captures profile`,
       fullTestName: 'outer suite > captures profile',
       concurrent: false,
       file: {
-        filepath: '/repo/ui/src/example.test.ts',
+        filepath: join(process.cwd(), 'src/example.test.ts'),
         projectName: 'ui',
       },
       suite: {
@@ -90,13 +90,13 @@ describe('testCpuProfile', () => {
     expect(record).toMatchObject({
       provenance: 'windowed_process',
       pid: process.pid,
-      file: '/repo/ui/src/example.test.ts',
+      file: 'src/example.test.ts',
       project_name: 'ui',
       test_id: 'file_0_1',
       suite_id: 'file_0',
       test_name: 'captures profile',
       suite_name: 'outer suite',
-      full_name: '/repo/ui/src/example.test.ts > outer suite > captures profile',
+      full_name: 'src/example.test.ts > outer suite > captures profile',
       full_test_name: 'outer suite > captures profile',
       status: 'pass',
       concurrent: false,

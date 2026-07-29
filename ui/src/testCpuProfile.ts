@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative, sep } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import type { TestContext } from 'vitest'
 
@@ -69,24 +69,31 @@ export function startCpuProfileWindow(): TestCpuProfileWindow {
   }
 }
 
+function stableTestFile(filepath: string): string {
+  return relative(process.cwd(), filepath).split(sep).join('/')
+}
+
+
 export function buildCpuProfileRecord(
   task: TestTaskLike,
   window: TestCpuProfileWindow,
 ): TestCpuProfileRecord {
   const cpuUsage = process.cpuUsage(window.cpuStart)
   const suite = task.suite
+  const file = stableTestFile(task.file.filepath)
+  const fullTestName = task.fullTestName ?? task.name
 
   return {
     provenance: 'windowed_process',
     pid: process.pid,
-    file: task.file.filepath,
+    file,
     project_name: task.file.projectName || null,
     test_id: task.id,
     suite_id: suite?.id ?? null,
     test_name: task.name,
     suite_name: suite?.fullTestName ?? null,
-    full_name: task.fullName,
-    full_test_name: task.fullTestName ?? task.fullName,
+    full_name: `${file} > ${fullTestName}`,
+    full_test_name: fullTestName,
     status: task.result?.state ?? null,
     concurrent: Boolean(task.concurrent),
     started_unix_ns: Number(window.startedUnixNs),

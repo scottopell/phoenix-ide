@@ -159,15 +159,29 @@ class DevTracingTests(unittest.TestCase):
                 mock.patch.object(self.dev.subprocess, "run", return_value=report) as run,
                 mock.patch("builtins.print"),
             ):
-                self.dev._finalize_check_profile(RuntimeError("setup failed"))
-                self.dev._finalize_check_profile(RuntimeError("setup failed"))
+                error = subprocess.CalledProcessError(7, ["pnpm", "install"])
+                self.dev._finalize_check_profile(error)
+                self.dev._finalize_check_profile(error)
 
             command = json.loads((Path(directory) / "command.json").read_text())
 
         self.assertEqual("failed", command["status"])
-        self.assertEqual(1, command["returncode"])
+        self.assertEqual(7, command["returncode"])
         self.assertEqual(["tsc"], command["metadata"]["active_lanes"])
         self.assertEqual(1, run.call_count)
+
+    def test_profile_returncode_matches_process_exit_semantics(self):
+        cases = (
+            (None, 0),
+            (SystemExit(), 0),
+            (SystemExit(4), 4),
+            (SystemExit("invalid arguments"), 1),
+            (subprocess.CalledProcessError(9, ["tool"]), 9),
+            (RuntimeError("broken"), 1),
+        )
+        for error, expected in cases:
+            with self.subTest(error=error):
+                self.assertEqual(expected, self.dev._profile_returncode(error))
 
     def test_profile_cleanup_uses_shared_trace_and_artifact_boundary(self):
         class CommandTracing(FakeTracing):
