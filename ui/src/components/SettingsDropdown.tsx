@@ -278,6 +278,7 @@ function CodexSection({
   const quota = useCodexQuota();
   useEffect(() => {
     const generation = ++quotaRequestGenerationRef.current;
+    clearCodexQuota();
     api.codexQuota()
       .then((next) => {
         if (quotaRequestGenerationRef.current === generation && next) replaceCodexQuota(next);

@@ -424,7 +424,7 @@ impl CodexCredential {
     /// `force_refresh` is only cleared after a successful refresh, so a
     /// transient refresh failure (network blip) does not silently demote the
     /// next call back to "JWT looks fine, return cached token."
-    async fn fetch(&self) -> Result<String, CodexAuthError> {
+    async fn fetch(&self) -> Result<(String, Option<String>), CodexAuthError> {
         let mut state = self.inner.lock().await;
         let forced = state.force_refresh;
         let current_mtime = file_mtime(&self.auth_path);
@@ -438,7 +438,7 @@ impl CodexCredential {
                 if c.file_mtime == current_mtime {
                     if let Some(exp) = c.exp {
                         if now_unix() < exp - REFRESH_SKEW_SECS {
-                            return Ok(c.access_token.clone());
+                            return Ok((c.access_token.clone(), self.account_id()));
                         }
                     }
                 }
@@ -474,7 +474,7 @@ impl CodexCredential {
                         exp: Some(exp_unix),
                         file_mtime: post_read_mtime,
                     });
-                    return Ok(token);
+                    return Ok((token, tokens.account_id.clone()));
                 }
             }
         }
@@ -503,7 +503,30 @@ impl CodexCredential {
         });
         // Successful refresh — clear the force_refresh flag set by invalidate().
         state.force_refresh = false;
-        Ok(new_token)
+        let account_id = auth
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.account_id.clone());
+        Ok((new_token, account_id))
+    }
+
+    pub async fn get_with_account_id(&self) -> Option<(String, Option<String>)> {
+        match self.fetch().await {
+            Ok(snapshot) => {
+                if let Ok(mut guard) = self.last_error.lock() {
+                    *guard = None;
+                }
+                Some(snapshot)
+            }
+            Err(error) => {
+                let hint = error_hint(&error);
+                tracing::warn!(%error, "codex_credential: get() failed");
+                if let Ok(mut guard) = self.last_error.lock() {
+                    *guard = Some(hint);
+                }
+                None
+            }
+        }
     }
 }
 
@@ -560,22 +583,7 @@ fn error_hint(err: &CodexAuthError) -> String {
 #[async_trait::async_trait]
 impl CredentialSource for CodexCredential {
     async fn get(&self) -> Option<String> {
-        match self.fetch().await {
-            Ok(token) => {
-                if let Ok(mut guard) = self.last_error.lock() {
-                    *guard = None;
-                }
-                Some(token)
-            }
-            Err(e) => {
-                let hint = error_hint(&e);
-                tracing::warn!(error = %e, "codex_credential: get() failed");
-                if let Ok(mut guard) = self.last_error.lock() {
-                    *guard = Some(hint);
-                }
-                None
-            }
-        }
+        self.get_with_account_id().await.map(|(token, _)| token)
     }
 
     async fn invalidate(&self) -> bool {

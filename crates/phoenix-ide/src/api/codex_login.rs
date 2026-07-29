@@ -874,8 +874,7 @@ async fn fetch_codex_quota(
         .ok()?;
     let mut attempts = 0;
     let response = loop {
-        let token = credential.get().await?;
-        let account_id = credential.account_id();
+        let (token, account_id) = credential.get_with_account_id().await?;
         let mut request = client
             .get(phoenix_llm::CODEX_USAGE_URL)
             .bearer_auth(token)
