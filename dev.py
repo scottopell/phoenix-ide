@@ -154,6 +154,13 @@ def _rusage_delta_attributes(before, after, provenance: str) -> dict:
     )
 
 
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _read_cpu_measurement(path: Path) -> dict | None:
     try:
         value = json.loads(path.read_text())
@@ -163,7 +170,7 @@ def _read_cpu_measurement(path: Path) -> dict | None:
             str(value["provenance"]),
             **{
                 "cpu.tree_closure": str(value["tree_closure"]),
-                "cpu.measurement_path": str(path.relative_to(ROOT)),
+                "cpu.measurement_path": _display_path(path),
             },
         )
     except (OSError, ValueError, KeyError, TypeError):
@@ -192,10 +199,7 @@ def _profile_record_attributes(record: dict, source: Path) -> dict | None:
             attributes = {"cpu.provenance": "unavailable"}
         started_unix_ns = int(record["started_unix_ns"])
         wall_ms = float(record.get("wall_ms", record.get("wall_time_ms", 0.0)))
-        try:
-            source_label = str(source.relative_to(ROOT))
-        except ValueError:
-            source_label = str(source)
+        source_label = _display_path(source)
         attributes.update({
             "check.test.identity": identity,
             "check.profile_record": source_label,
@@ -390,7 +394,7 @@ def _start_dev_command_tracing(command: str) -> None:
         attributes.update({
             "check.profile_work": True,
             "check.profile_run_id": _CHECK_PROFILE.run_id,
-            "check.profile_artifact_dir": str(_CHECK_PROFILE.artifact_dir.relative_to(ROOT)),
+            "check.profile_artifact_dir": _display_path(_CHECK_PROFILE.artifact_dir),
         })
     _DEV_TRACING.command_span = _DEV_TRACING.tracer.start_span(
         "dev.command", attributes=attributes
@@ -5472,7 +5476,7 @@ def cmd_check(
         )
         if report.returncode == 0:
             profile_messages.append(
-                f"CPU work profile: {_CHECK_PROFILE.artifact_dir.relative_to(ROOT)}/summary.md"
+                f"CPU work profile: {_display_path(_CHECK_PROFILE.artifact_dir / 'summary.md')}"
             )
         else:
             profile_messages.append(f"CPU work report failed: {report.stderr.strip()}")
@@ -9444,13 +9448,13 @@ def main():
     if args.command == "check" and getattr(args, "profile_work", False):
         _CHECK_PROFILE = CheckWorkProfile.start(getattr(args, "profile_work_dir", None))
     _bootstrap_dev_tracing()
+    _start_dev_command_tracing(args.command)
     if _CHECK_PROFILE is not None and _DEV_TRACING is None:
         print(
             "  ⚠ CPU artifacts will be recorded, but dev tracing is unavailable; "
             "TraceQL queries will not find this run",
             file=sys.stderr,
         )
-    _start_dev_command_tracing(args.command)
 
     if args.command == "up":
         cmd_up(

@@ -137,6 +137,23 @@ class DevTracingTests(unittest.TestCase):
         self.assertIsInstance(child, FakeSpan)
         self.assertIs(parent, tracing.started[0][3])
 
+    def test_external_profile_paths_remain_absolute_labels(self):
+        external = Path(tempfile.gettempdir()) / "outside-phoenix" / "record.json"
+        self.assertEqual(str(external), self.dev._display_path(external))
+
+    def test_external_cpu_measurement_is_read_without_repo_relative_assumption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "measurement.json"
+            path.write_text(json.dumps({
+                "user_cpu_ms": 1, "system_cpu_ms": 2,
+                "provenance": "exact_waited_descendants",
+                "tree_closure": "waited_descendants_only_survivors_unverified",
+            }))
+            attributes = self.dev._read_cpu_measurement(path)
+
+        self.assertEqual(str(path), attributes["cpu.measurement_path"])
+        self.assertEqual(3, attributes["cpu.total_ms"])
+
     def test_profile_record_attributes_normalize_runner_units(self):
         source = self.dev.ROOT / "target" / "record.jsonl"
         attributes = self.dev._profile_record_attributes({
