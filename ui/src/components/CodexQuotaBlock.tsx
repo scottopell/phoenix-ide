@@ -57,6 +57,15 @@ function creditsAreDepleted(type: QuotaDetails['rate_limit_reached_type']): bool
   );
 }
 
+function SpendControlRow({ limit }: { limit: NonNullable<QuotaDetails['individual_limit']> }) {
+  return (
+    <div className="settings-codex-quota__credits">
+      Individual limit: {limit.used} / {limit.limit} · {limit.remaining_percent}% remaining
+      {formatReset(limit.resets_at) ? ` · ${formatReset(limit.resets_at)}` : null}
+    </div>
+  );
+}
+
 function CreditsRow({ credits }: { credits: NonNullable<QuotaDetails['credits']> }) {
   if (credits.unlimited) {
     return <div className="settings-codex-quota__credits">Credits: Unlimited</div>;
@@ -80,7 +89,7 @@ export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
   const credits = quota.credits;
   const creditsDepleted = creditsAreDepleted(quota.rate_limit_reached_type);
   const hasCreditsRow = creditsDepleted || (credits && (credits.unlimited || credits.has_credits));
-  if (!quota.primary && !quota.secondary && !hasCreditsRow) return null;
+  if (!quota.primary && !quota.secondary && !hasCreditsRow && !quota.individual_limit) return null;
   return (
     <div className="settings-codex-quota">
       {quota.primary && (
@@ -89,6 +98,7 @@ export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
       {quota.secondary && (
         <QuotaRow label={windowLabel(quota.secondary.window_minutes)} window={quota.secondary} />
       )}
+      {quota.individual_limit ? <SpendControlRow limit={quota.individual_limit} /> : null}
       {creditsDepleted ? (
         <div className="settings-codex-quota__credits">No credits remaining</div>
       ) : credits ? (

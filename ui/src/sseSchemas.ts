@@ -394,6 +394,13 @@ const CreditsSnapshotSchema = v.looseObject({
   balance: v.nullable(v.string()),
 }) satisfies v.GenericSchema<unknown, WireCreditsSnapshot>;
 
+const SpendControlLimitSnapshotSchema = v.looseObject({
+  limit: v.string(),
+  used: v.string(),
+  remaining_percent: v.number(),
+  resets_at: v.number(),
+});
+
 const RateLimitReachedTypeSchema = v.picklist([
   'rate_limit_reached',
   'workspace_owner_credits_depleted',
@@ -415,6 +422,7 @@ const QuotaDetailsSchema = v.looseObject({
   primary: v.nullable(RateLimitWindowSchema),
   secondary: v.nullable(RateLimitWindowSchema),
   credits: v.nullable(CreditsSnapshotSchema),
+  individual_limit: v.nullable(SpendControlLimitSnapshotSchema),
   promo_message: v.nullable(v.string()),
   rate_limit_reached_type: v.nullable(RateLimitReachedTypeSchema),
 }) satisfies v.GenericSchema<unknown, WireQuotaDetails>;

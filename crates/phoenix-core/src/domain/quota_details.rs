@@ -16,12 +16,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Structured quota state extracted from the codex backend on 429 (header path)
-/// or from a mid-stream `codex.rate_limits` SSE event.
-///
-/// All fields are optional: the codex backend populates a subset depending on
-/// which limit was hit (per-model vs global), the user's plan, and whether
-/// credits are tracked. Consumers must handle every field being `None`.
+/// Explicit reason supplied by Codex when an account can no longer consume quota.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
@@ -33,6 +28,12 @@ pub enum RateLimitReachedType {
     WorkspaceMemberUsageLimitReached,
 }
 
+/// Structured quota state extracted from the codex backend on 429 (header path),
+/// from a mid-stream `codex.rate_limits` event, or from account-wide usage.
+///
+/// All fields are optional: the codex backend populates a subset depending on
+/// which limit was hit, the user's plan, and whether credits or spend controls
+/// apply. Consumers must handle every field being `None`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct QuotaDetails {
@@ -43,6 +44,7 @@ pub struct QuotaDetails {
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
+    pub individual_limit: Option<Box<SpendControlLimitSnapshot>>,
     pub promo_message: Option<String>,
     pub rate_limit_reached_type: Option<RateLimitReachedType>,
 }
@@ -53,6 +55,15 @@ pub struct RateLimitWindow {
     pub used_percent: f64,
     pub window_minutes: Option<i64>,
     pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SpendControlLimitSnapshot {
+    pub limit: String,
+    pub used: String,
+    pub remaining_percent: i64,
+    pub resets_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]

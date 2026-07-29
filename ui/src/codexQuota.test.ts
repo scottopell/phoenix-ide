@@ -16,6 +16,7 @@ function quota(overrides: Partial<QuotaDetails>): QuotaDetails {
     primary: null,
     secondary: null,
     credits: null,
+    individual_limit: null,
     promo_message: null,
     rate_limit_reached_type: null,
     ...overrides,

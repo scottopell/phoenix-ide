@@ -12,6 +12,7 @@ function quota(overrides: Partial<QuotaDetails>): QuotaDetails {
     primary: null,
     secondary: null,
     credits: null,
+    individual_limit: null,
     promo_message: null,
     rate_limit_reached_type: null,
     ...overrides,
@@ -34,6 +35,24 @@ describe('CodexQuotaBlock', () => {
 
     expect(screen.getByText('5-hour')).toBeInTheDocument();
     expect(screen.getByText('3%')).toBeInTheDocument();
+  });
+
+  it('shows an individual spend-control limit without standard windows', () => {
+    render(
+      <CodexQuotaBlock
+        quota={quota({
+          individual_limit: {
+            limit: '100.00',
+            used: '25.00',
+            remaining_percent: 75,
+            resets_at: 1_800_000_000,
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/Individual limit: 25\.00 \/ 100\.00/)).toBeInTheDocument();
+    expect(screen.getByText(/75% remaining/)).toBeInTheDocument();
   });
 
   it('shows weekly quota without claiming unavailable credits are depleted', () => {

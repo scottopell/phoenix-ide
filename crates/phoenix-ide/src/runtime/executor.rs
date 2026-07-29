@@ -4780,7 +4780,7 @@ where
                         let _ =
                             broadcast_tx_for_tokens.send_seq(|seq| SseEvent::RateLimitSnapshot {
                                 sequence_id: seq,
-                                snapshot: snapshot.clone(),
+                                snapshot: (*snapshot).clone(),
                             });
                     }
                     None => break,
@@ -4970,7 +4970,7 @@ where
             // same store to render reset/credits/promo alongside the
             // plan-aware message.
             if let LlmOutcome::UsageLimitReached { ref details, .. } = llm_outcome {
-                let _ = chunk_tx.send(phoenix_llm::TokenChunk::RateLimitSnapshot(details.clone())).await;
+                let _ = chunk_tx.send(phoenix_llm::TokenChunk::RateLimitSnapshot(Box::new(details.clone()))).await;
             }
 
             // Happens-before barrier for task 24683: close the chunk
@@ -8219,6 +8219,7 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
                     primary: None,
                     secondary: None,
                     credits: None,
+                    individual_limit: None,
                     promo_message: None,
                     rate_limit_reached_type: None,
                 },

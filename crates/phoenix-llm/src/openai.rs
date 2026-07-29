@@ -166,6 +166,7 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
             primary: None,
             secondary: None,
             credits: None,
+            individual_limit: None,
             promo_message: None,
             rate_limit_reached_type: None,
         });
@@ -1056,7 +1057,7 @@ async fn complete_codex_websocket(
             if event_type == "codex.rate_limits" {
                 if let Some(snapshot) = parse_codex_rate_limits(&value) {
                     let _ = chunk_tx
-                        .send(super::TokenChunk::RateLimitSnapshot(snapshot))
+                        .send(super::TokenChunk::RateLimitSnapshot(Box::new(snapshot)))
                         .await;
                 }
                 continue;
@@ -1313,7 +1314,7 @@ pub async fn complete_streaming(
             super::rate_limit::quota_from_codex_response_headers(response.headers())
         {
             let _ = chunk_tx
-                .send(super::TokenChunk::RateLimitSnapshot(snapshot))
+                .send(super::TokenChunk::RateLimitSnapshot(Box::new(snapshot)))
                 .await;
         }
     }
@@ -1814,6 +1815,7 @@ fn parse_codex_error(status: u16, headers: &HeaderMap, body: &str) -> Option<Llm
                         secondary,
                         credits,
                         promo_message,
+                        individual_limit: None,
                         rate_limit_reached_type: parse_rate_limit_reached_type(headers),
                     }))
                 }

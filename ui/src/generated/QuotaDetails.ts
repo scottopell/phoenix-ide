@@ -2,5 +2,14 @@
 import type { CreditsSnapshot } from "./CreditsSnapshot";
 import type { RateLimitReachedType } from "./RateLimitReachedType";
 import type { RateLimitWindow } from "./RateLimitWindow";
+import type { SpendControlLimitSnapshot } from "./SpendControlLimitSnapshot";
 
-export type QuotaDetails = { plan_type: string | null, resets_at: string | null, limit_id: string | null, limit_name: string | null, primary: RateLimitWindow | null, secondary: RateLimitWindow | null, credits: CreditsSnapshot | null, promo_message: string | null, rate_limit_reached_type: RateLimitReachedType | null, };
+/**
+ * Structured quota state extracted from the codex backend on 429 (header path),
+ * from a mid-stream `codex.rate_limits` event, or from account-wide usage.
+ *
+ * All fields are optional: the codex backend populates a subset depending on
+ * which limit was hit, the user's plan, and whether credits or spend controls
+ * apply. Consumers must handle every field being `None`.
+ */
+export type QuotaDetails = { plan_type: string | null, resets_at: string | null, limit_id: string | null, limit_name: string | null, primary: RateLimitWindow | null, secondary: RateLimitWindow | null, credits: CreditsSnapshot | null, individual_limit: SpendControlLimitSnapshot | null, promo_message: string | null, rate_limit_reached_type: RateLimitReachedType | null, };

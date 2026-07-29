@@ -23,7 +23,7 @@
 //! re-exported here; the `reqwest`-dependent header-parsing functions stay.
 
 pub use phoenix_core::domain::quota_details::{
-    CreditsSnapshot, QuotaDetails, RateLimitReachedType, RateLimitWindow,
+    CreditsSnapshot, QuotaDetails, RateLimitReachedType, RateLimitWindow, SpendControlLimitSnapshot,
 };
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
@@ -83,11 +83,25 @@ struct CodexUsageReachedType {
 }
 
 #[derive(Debug, Deserialize)]
+struct CodexUsageIndividualLimit {
+    limit: String,
+    used: String,
+    remaining_percent: i64,
+    reset_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageSpendControl {
+    individual_limit: Option<CodexUsageIndividualLimit>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CodexUsagePayload {
     plan_type: Option<String>,
     rate_limit: Option<CodexUsageRateLimit>,
     credits: Option<CodexRateLimitEventCredits>,
     rate_limit_reached_type: Option<CodexUsageReachedType>,
+    spend_control: Option<CodexUsageSpendControl>,
 }
 
 /// Normalize the account-wide payload returned by Codex's authenticated usage endpoint.
@@ -110,12 +124,24 @@ pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<Quota
         unlimited: credits.unlimited,
         balance: credits.balance,
     });
+    let individual_limit = payload
+        .spend_control
+        .and_then(|control| control.individual_limit)
+        .map(|limit| {
+            Box::new(SpendControlLimitSnapshot {
+                limit: limit.limit,
+                used: limit.used,
+                remaining_percent: limit.remaining_percent,
+                resets_at: limit.reset_at,
+            })
+        });
     let rate_limit_reached_type = payload
         .rate_limit_reached_type
         .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind));
     if primary.is_none()
         && secondary.is_none()
         && credits.is_none()
+        && individual_limit.is_none()
         && rate_limit_reached_type.is_none()
         && payload.plan_type.is_none()
     {
@@ -129,6 +155,7 @@ pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<Quota
         primary,
         secondary,
         credits,
+        individual_limit,
         promo_message: None,
         rate_limit_reached_type,
     })
@@ -184,6 +211,7 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         primary,
         secondary,
         credits,
+        individual_limit: None,
         promo_message: None,
         rate_limit_reached_type: None,
     })
@@ -234,6 +262,7 @@ pub fn quota_from_codex_response_headers(headers: &HeaderMap) -> Option<QuotaDet
         primary,
         secondary,
         credits,
+        individual_limit: None,
         promo_message,
         rate_limit_reached_type: None,
     })
@@ -307,7 +336,13 @@ fn parse_rate_limit_reached_type_value(value: &str) -> Option<RateLimitReachedTy
         "workspace_member_usage_limit_reached" => {
             Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached)
         }
-        _ => None,
+        unknown => {
+            tracing::debug!(
+                variant = unknown,
+                "unsupported Codex rate-limit-reached type"
+            );
+            None
+        }
     }
 }
 
@@ -411,6 +446,27 @@ mod tests {
             Some(10_080)
         );
         assert!(!quota.credits.as_ref().unwrap().has_credits);
+    }
+
+    #[test]
+    fn preserves_spend_control_without_standard_rate_windows() {
+        let payload = serde_json::json!({
+            "spend_control": {
+                "individual_limit": {
+                    "limit": "100.00",
+                    "used": "25.00",
+                    "remaining_percent": 75,
+                    "reset_at": 1_800_000_000
+                }
+            }
+        });
+
+        let quota = quota_from_codex_usage_payload(&payload).expect("spend-control payload");
+        let limit = quota.individual_limit.expect("individual limit");
+        assert_eq!(limit.limit, "100.00");
+        assert_eq!(limit.used, "25.00");
+        assert_eq!(limit.remaining_percent, 75);
+        assert_eq!(limit.resets_at, 1_800_000_000);
     }
 
     #[test]

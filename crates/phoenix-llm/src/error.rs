@@ -242,6 +242,7 @@ mod tests {
             primary: None,
             secondary: None,
             credits: None,
+            individual_limit: None,
             promo_message: None,
             rate_limit_reached_type: None,
         }
