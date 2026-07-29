@@ -3141,6 +3141,7 @@ setTimeout(function () {
     shutdown_test(manager, server).await;
 }
 
+#[derive(Clone)]
 struct BrowserLifecycleFixture {
     manager: Arc<BrowserSessionManager>,
     shared_scope: phoenix_core::work_scope::ResourceScopeKey,
@@ -3281,23 +3282,28 @@ impl BrowserLifecycleFixture {
 async fn browser_lifecycle_ownership_topologies_share_serialized_fixture() {
     require_chrome!();
     let fixture = BrowserLifecycleFixture::new();
-    fixture
-        .assert_worktree_scope_shared_across_continuations()
-        .await;
-    fixture
-        .assert_same_scope_inheritor_preserves_exact_session()
-        .await;
-    fixture.assert_distinct_scopes_are_isolated().await;
-    fixture
-        .assert_different_scope_inheritor_tears_down_parent()
-        .await;
-    fixture.assert_no_inheritor_tears_down_scope().await;
-    fixture
-        .assert_restricted_owner_teardown_is_selective_then_complete()
-        .await;
+    let scenarios = fixture.clone();
+    let outcome = tokio::spawn(async move {
+        scenarios
+            .assert_worktree_scope_shared_across_continuations()
+            .await;
+        scenarios
+            .assert_same_scope_inheritor_preserves_exact_session()
+            .await;
+        scenarios.assert_distinct_scopes_are_isolated().await;
+        scenarios
+            .assert_different_scope_inheritor_tears_down_parent()
+            .await;
+        scenarios.assert_no_inheritor_tears_down_scope().await;
+        scenarios
+            .assert_restricted_owner_teardown_is_selective_then_complete()
+            .await;
+    })
+    .await;
     fixture
         .manager
         .shutdown_all()
         .await
         .expect("browser shutdown");
+    outcome.expect("browser lifecycle scenario");
 }
