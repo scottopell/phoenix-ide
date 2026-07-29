@@ -394,6 +394,14 @@ const CreditsSnapshotSchema = v.looseObject({
   balance: v.nullable(v.string()),
 }) satisfies v.GenericSchema<unknown, WireCreditsSnapshot>;
 
+const RateLimitReachedTypeSchema = v.picklist([
+  'rate_limit_reached',
+  'workspace_owner_credits_depleted',
+  'workspace_member_credits_depleted',
+  'workspace_owner_usage_limit_reached',
+  'workspace_member_usage_limit_reached',
+]);
+
 /** Structured quota state — every field is nullable per the Rust spec
  *  (`crates/phoenix-ide/src/llm/rate_limit.rs`). The SSE-event path
  *  (task 67003) populates `primary` / `secondary` / `credits` /
@@ -408,6 +416,7 @@ const QuotaDetailsSchema = v.looseObject({
   secondary: v.nullable(RateLimitWindowSchema),
   credits: v.nullable(CreditsSnapshotSchema),
   promo_message: v.nullable(v.string()),
+  rate_limit_reached_type: v.nullable(RateLimitReachedTypeSchema),
 }) satisfies v.GenericSchema<unknown, WireQuotaDetails>;
 
 /** `rate_limit_snapshot`: mid-stream quota update from the codex backend

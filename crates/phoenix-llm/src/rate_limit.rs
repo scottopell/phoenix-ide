@@ -22,7 +22,9 @@
 //! `CreditsSnapshot`) live in `phoenix_core::domain::quota_details` and are
 //! re-exported here; the `reqwest`-dependent header-parsing functions stay.
 
-pub use phoenix_core::domain::quota_details::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
+pub use phoenix_core::domain::quota_details::{
+    CreditsSnapshot, QuotaDetails, RateLimitReachedType, RateLimitWindow,
+};
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 
@@ -112,12 +114,14 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         secondary,
         credits,
         promo_message: None,
+        rate_limit_reached_type: None,
     })
 }
 
 const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";
 const PROMO_MESSAGE_HEADER: &str = "x-codex-promo-message";
 const PLAN_TYPE_HEADER: &str = "x-codex-plan-type";
+const RATE_LIMIT_REACHED_TYPE_HEADER: &str = "x-codex-rate-limit-reached-type";
 
 /// Build a complete `QuotaDetails` snapshot from a successful codex-bridge
 /// response's headers. Returns `None` only when the response carries no
@@ -160,6 +164,7 @@ pub fn quota_from_codex_response_headers(headers: &HeaderMap) -> Option<QuotaDet
         secondary,
         credits,
         promo_message,
+        rate_limit_reached_type: None,
     })
 }
 
@@ -214,6 +219,26 @@ pub fn parse_promo_message(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+#[must_use]
+pub fn parse_rate_limit_reached_type(headers: &HeaderMap) -> Option<RateLimitReachedType> {
+    match parse_header_str(headers, RATE_LIMIT_REACHED_TYPE_HEADER)?.trim() {
+        "rate_limit_reached" => Some(RateLimitReachedType::RateLimitReached),
+        "workspace_owner_credits_depleted" => {
+            Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted)
+        }
+        "workspace_member_credits_depleted" => {
+            Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted)
+        }
+        "workspace_owner_usage_limit_reached" => {
+            Some(RateLimitReachedType::WorkspaceOwnerUsageLimitReached)
+        }
+        "workspace_member_usage_limit_reached" => {
+            Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached)
+        }
+        _ => None,
+    }
 }
 
 pub fn parse_credits_snapshot(headers: &HeaderMap) -> Option<CreditsSnapshot> {
@@ -306,6 +331,46 @@ mod tests {
         assert_eq!(primary.resets_at, Some(1_704_069_000));
         assert!(secondary.is_none());
         assert!(name.is_none());
+    }
+
+    #[test]
+    fn parses_explicit_rate_limit_reached_types() {
+        for (raw, expected) in [
+            (
+                "workspace_owner_credits_depleted",
+                RateLimitReachedType::WorkspaceOwnerCreditsDepleted,
+            ),
+            (
+                "workspace_member_credits_depleted",
+                RateLimitReachedType::WorkspaceMemberCreditsDepleted,
+            ),
+            (
+                "workspace_owner_usage_limit_reached",
+                RateLimitReachedType::WorkspaceOwnerUsageLimitReached,
+            ),
+            (
+                "workspace_member_usage_limit_reached",
+                RateLimitReachedType::WorkspaceMemberUsageLimitReached,
+            ),
+            ("rate_limit_reached", RateLimitReachedType::RateLimitReached),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                RATE_LIMIT_REACHED_TYPE_HEADER,
+                HeaderValue::from_str(raw).expect("header value"),
+            );
+            assert_eq!(parse_rate_limit_reached_type(&headers), Some(expected));
+        }
+    }
+
+    #[test]
+    fn ignores_unknown_rate_limit_reached_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RATE_LIMIT_REACHED_TYPE_HEADER,
+            HeaderValue::from_static("future_limit_type"),
+        );
+        assert_eq!(parse_rate_limit_reached_type(&headers), None);
     }
 
     #[test]

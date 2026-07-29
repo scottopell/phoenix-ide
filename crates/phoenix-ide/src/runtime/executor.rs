@@ -8220,6 +8220,7 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
                     secondary: None,
                     credits: None,
                     promo_message: None,
+                    rate_limit_reached_type: None,
                 },
                 |boxed| *boxed,
             );

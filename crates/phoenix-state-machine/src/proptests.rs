@@ -2001,6 +2001,7 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                     secondary: None,
                     credits: None,
                     promo_message: None,
+                    rate_limit_reached_type: None,
                 },
                 message: msg,
             },

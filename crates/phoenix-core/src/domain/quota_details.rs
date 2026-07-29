@@ -22,6 +22,17 @@ use serde::{Deserialize, Serialize};
 /// All fields are optional: the codex backend populates a subset depending on
 /// which limit was hit (per-model vs global), the user's plan, and whether
 /// credits are tracked. Consumers must handle every field being `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum RateLimitReachedType {
+    RateLimitReached,
+    WorkspaceOwnerCreditsDepleted,
+    WorkspaceMemberCreditsDepleted,
+    WorkspaceOwnerUsageLimitReached,
+    WorkspaceMemberUsageLimitReached,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct QuotaDetails {
@@ -33,6 +44,7 @@ pub struct QuotaDetails {
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
     pub promo_message: Option<String>,
+    pub rate_limit_reached_type: Option<RateLimitReachedType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]

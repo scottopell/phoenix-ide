@@ -4,7 +4,7 @@ use super::headers::apply_source_header;
 use super::models::ModelSpec;
 use super::rate_limit::{
     parse_active_limit, parse_credits_snapshot, parse_promo_message, parse_rate_limit_for_limit,
-    QuotaDetails,
+    parse_rate_limit_reached_type, QuotaDetails,
 };
 use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
 use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage};
@@ -167,6 +167,7 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
             secondary: None,
             credits: None,
             promo_message: None,
+            rate_limit_reached_type: None,
         });
     }
     if lower == "usage_not_included" {
@@ -1813,6 +1814,7 @@ fn parse_codex_error(status: u16, headers: &HeaderMap, body: &str) -> Option<Llm
                         secondary,
                         credits,
                         promo_message,
+                        rate_limit_reached_type: parse_rate_limit_reached_type(headers),
                     }))
                 }
                 Some("usage_not_included") => Some(LlmError::auth(
@@ -3281,6 +3283,21 @@ mod tests {
             assert_eq!(
                 err.quota.as_ref().unwrap().promo_message.as_deref(),
                 Some("Upgrade to Pro at chatgpt.com/explore/pro")
+            );
+        }
+
+        #[test]
+        fn usage_limit_reached_threads_explicit_credits_depletion_type() {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-codex-rate-limit-reached-type",
+                HeaderValue::from_static("workspace_member_credits_depleted"),
+            );
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"team"}}"#;
+            let err = parse_codex_error(429, &headers, body).expect("parsed");
+            assert_eq!(
+                err.quota.as_ref().unwrap().rate_limit_reached_type,
+                Some(crate::rate_limit::RateLimitReachedType::WorkspaceMemberCreditsDepleted)
             );
         }
 

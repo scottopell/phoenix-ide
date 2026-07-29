@@ -49,6 +49,26 @@ function QuotaRow({ label, window }: { label: string; window: RateLimitWindow })
   );
 }
 
+function creditsAreDepleted(type: QuotaDetails['rate_limit_reached_type']): boolean {
+  return (
+    type === 'workspace_owner_credits_depleted' ||
+    type === 'workspace_member_credits_depleted'
+  );
+}
+
+function CreditsRow({ credits }: { credits: NonNullable<QuotaDetails['credits']> }) {
+  if (credits.unlimited) {
+    return <div className="settings-codex-quota__credits">Credits: Unlimited</div>;
+  }
+  if (!credits.has_credits) return null;
+  const balance = credits.balance?.trim();
+  return (
+    <div className="settings-codex-quota__credits">
+      Credits: {balance || 'Available'}
+    </div>
+  );
+}
+
 /// Renders the structured codex quota snapshot — per-window usage bars,
 /// credits state. Returns `null` when the snapshot has no displayable
 /// data so callers can render unconditionally.
@@ -57,7 +77,9 @@ function QuotaRow({ label, window }: { label: string; window: RateLimitWindow })
 /// the conversation hits a terminal `usage_limit_reached` state).
 export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
   const credits = quota.credits;
-  if (!quota.primary && !quota.secondary && !credits) return null;
+  const creditsDepleted = creditsAreDepleted(quota.rate_limit_reached_type);
+  const hasCreditsRow = creditsDepleted || (credits && (credits.unlimited || credits.has_credits));
+  if (!quota.primary && !quota.secondary && !hasCreditsRow) return null;
   return (
     <div className="settings-codex-quota">
       {quota.primary && (
@@ -66,14 +88,11 @@ export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
       {quota.secondary && (
         <QuotaRow label={windowLabel(quota.secondary.window_minutes)} window={quota.secondary} />
       )}
-      {credits && credits.has_credits && credits.balance && (
-        <div className="settings-codex-quota__credits">
-          Credits: {credits.balance}{credits.unlimited ? ' (unlimited)' : ''}
-        </div>
-      )}
-      {credits && !credits.has_credits && (
+      {creditsDepleted ? (
         <div className="settings-codex-quota__credits">No credits remaining</div>
-      )}
+      ) : credits ? (
+        <CreditsRow credits={credits} />
+      ) : null}
     </div>
   );
 }
