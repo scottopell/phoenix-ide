@@ -4725,7 +4725,19 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
-        let route_output_limit = self.llm_registry.output_token_limit(&model_id);
+        let desired_output_tokens = if effective_effort.level().is_some_and(
+            phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
+        ) {
+            64_000
+        } else {
+            16_384
+        };
+        let request_output_tokens = self
+            .llm_registry
+            .output_token_limit(&model_id)
+            .map_or(desired_output_tokens, |limit| {
+                limit.min(desired_output_tokens)
+            });
         let working_dir = self
             .context
             .execution_environment
@@ -4911,7 +4923,7 @@ where
                 system,
                 messages,
                 tools,
-                max_tokens: Some(route_output_limit.unwrap_or(16_384)),
+                max_tokens: Some(request_output_tokens),
                 effective_effort,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
@@ -5691,13 +5703,21 @@ where
         let effective_effort = self
             .llm_registry
             .effective_effort(&model_id, explicit_effort);
-        let continuation_output_reserve = if effective_effort.level().is_some_and(
+        let desired_continuation_output = if effective_effort.level().is_some_and(
             phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom,
         ) {
             64_000
         } else {
             CONTINUATION_OUTPUT_RESERVE_TOKENS
         };
+        let continuation_output_reserve = self.llm_registry.output_token_limit(&model_id).map_or(
+            desired_continuation_output,
+            |limit| {
+                usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .min(desired_continuation_output)
+            },
+        );
 
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
@@ -5776,7 +5796,7 @@ where
                 tools: vec![], // No tools for continuation
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
-                max_tokens: Some(4096),
+                max_tokens: Some(u32::try_from(continuation_output_reserve).unwrap_or(u32::MAX)),
                 effective_effort,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
