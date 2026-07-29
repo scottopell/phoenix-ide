@@ -916,11 +916,13 @@ impl ModelRegistry {
                 source: EffortSource::NativeKnown,
                 level: Some(level),
             },
-            Some(super::EffortCapabilities::Unknown)
-            | Some(super::EffortCapabilities::Supported {
-                native_default: super::NativeDefault::Unknown,
-                ..
-            })
+            Some(
+                super::EffortCapabilities::Unknown
+                | super::EffortCapabilities::Supported {
+                    native_default: super::NativeDefault::Unknown,
+                    ..
+                },
+            )
             | None => EffectiveEffort {
                 source: EffortSource::NativeUnknown,
                 level: None,

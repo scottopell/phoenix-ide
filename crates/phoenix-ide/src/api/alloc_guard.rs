@@ -157,7 +157,7 @@ mod tests {
             usage_data: Some(UsageData {
                 input_tokens: 1200,
                 output_tokens: 800,
-                reasoning_tokens: 0,
+                reasoning_tokens: None,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 4096,
             }),

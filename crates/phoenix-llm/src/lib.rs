@@ -366,7 +366,9 @@ impl LoggingService {
             Ok(response) => {
                 span.record("input_tokens", response.usage.input_tokens);
                 span.record("output_tokens", response.usage.output_tokens);
-                span.record("reasoning_tokens", response.usage.reasoning_tokens);
+                if let Some(reasoning_tokens) = response.usage.reasoning_tokens {
+                    span.record("reasoning_tokens", reasoning_tokens);
+                }
                 span.record("cache_read_tokens", response.usage.cache_read_tokens);
                 span.record(
                     "cache_creation_tokens",

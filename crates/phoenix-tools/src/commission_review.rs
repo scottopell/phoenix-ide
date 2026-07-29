@@ -427,7 +427,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                     usage: phoenix_core::domain::llm_types::Usage {
                         input_tokens,
                         output_tokens,
-                        reasoning_tokens: 0,
+                        reasoning_tokens: None,
                         cache_creation_tokens,
                         cache_read_tokens,
                     },
@@ -485,7 +485,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                         usage: phoenix_core::domain::llm_types::Usage {
                             input_tokens,
                             output_tokens,
-                            reasoning_tokens: 0,
+                            reasoning_tokens: None,
                             cache_creation_tokens,
                             cache_read_tokens,
                         },
@@ -510,7 +510,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                             usage: phoenix_core::domain::llm_types::Usage {
                                 input_tokens,
                                 output_tokens,
-                                reasoning_tokens: 0,
+                                reasoning_tokens: None,
                                 cache_creation_tokens,
                                 cache_read_tokens,
                             },
@@ -546,7 +546,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         usage: phoenix_core::domain::llm_types::Usage {
             input_tokens,
             output_tokens,
-            reasoning_tokens: 0,
+            reasoning_tokens: None,
             cache_creation_tokens,
             cache_read_tokens,
         },
@@ -3140,7 +3140,7 @@ mod tests {
                 usage: phoenix_core::domain::llm_types::Usage {
                     input_tokens: 10,
                     output_tokens: 20,
-                    reasoning_tokens: 0,
+                    reasoning_tokens: None,
                     cache_creation_tokens: 30,
                     cache_read_tokens: 40,
                 },

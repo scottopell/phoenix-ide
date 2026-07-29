@@ -61,7 +61,7 @@ impl AnalyticsFidelity {
 pub struct TokenTotals {
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub reasoning_tokens: i64,
+    pub reasoning_tokens: Option<i64>,
     pub cache_creation_tokens: i64,
     pub cache_read_tokens: i64,
 }

@@ -613,7 +613,7 @@ proptest! {
             super::types::Usage {
                 input_tokens: 0,
                 output_tokens: 0,
-                reasoning_tokens: 0,
+                reasoning_tokens: None,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },

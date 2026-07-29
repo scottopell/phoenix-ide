@@ -631,7 +631,7 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },
-        output_config: request.effort.and_then(explicit_anthropic_effort),
+        output_config: request.effort.map(explicit_anthropic_effort),
         stream: None,
         tags: None,
     }
@@ -967,7 +967,7 @@ fn normalize_response_with_diagnostics(
         Usage {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
-            reasoning_tokens: 0,
+            reasoning_tokens: None,
             cache_creation_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0),
             cache_read_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
         },
@@ -982,8 +982,8 @@ fn default_output_headroom(effort: Option<ModelEffort>) -> u32 {
     }
 }
 
-fn explicit_anthropic_effort(effort: ModelEffort) -> Option<AnthropicOutputConfig> {
-    Some(AnthropicOutputConfig { effort })
+fn explicit_anthropic_effort(effort: ModelEffort) -> AnthropicOutputConfig {
+    AnthropicOutputConfig { effort }
 }
 
 // Anthropic API types

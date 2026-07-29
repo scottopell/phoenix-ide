@@ -776,8 +776,7 @@ impl LlmResponse {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    #[serde(default)]
-    pub reasoning_tokens: u64,
+    pub reasoning_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation_tokens: u64,
     #[serde(default)]
@@ -830,6 +829,10 @@ mod attempt_capture_tests {
             request_id: "request".to_string(),
             retry_attempt: 2,
             attempt_capture: capture.clone(),
+            effective_effort: EffectiveEffort {
+                source: EffortSource::NativeUnknown,
+                level: None,
+            },
         };
         capture.begin(&telemetry, "openai", "gpt-test", LlmTransport::HttpSse);
         capture.set_transport(LlmTransport::Websocket);

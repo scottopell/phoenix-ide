@@ -4650,7 +4650,7 @@ mod tests {
         let usage = UsageData {
             input_tokens: 89_900,
             output_tokens: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens: None,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
@@ -4666,7 +4666,7 @@ mod tests {
         let usage = UsageData {
             input_tokens: 90_000,
             output_tokens: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens: None,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
@@ -4682,7 +4682,7 @@ mod tests {
         let usage = UsageData {
             input_tokens: 90_100,
             output_tokens: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens: None,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
@@ -4698,7 +4698,7 @@ mod tests {
         let usage = UsageData {
             input_tokens: 45_000,
             output_tokens: 45_000,
-            reasoning_tokens: 0,
+            reasoning_tokens: None,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
@@ -4750,7 +4750,7 @@ mod tests {
             UsageData {
                 input_tokens: 95_000,
                 output_tokens: 0,
-                reasoning_tokens: 0,
+                reasoning_tokens: None,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
             },
@@ -5088,7 +5088,7 @@ mod tests {
             UsageData {
                 input_tokens: 95_000,
                 output_tokens: 0,
-                reasoning_tokens: 0,
+                reasoning_tokens: None,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
             },
@@ -5167,7 +5167,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 5000,
                     output_tokens: 500,
-                    reasoning_tokens: 0,
+                    reasoning_tokens: None,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                 },
@@ -5299,7 +5299,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 5000,
                     output_tokens: 500,
-                    reasoning_tokens: 0,
+                    reasoning_tokens: None,
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                 },

@@ -107,6 +107,7 @@ export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBac
         '', // empty — server accepts empty text when seed_parent_id is set
         messageId,
         parentConversation.model ?? undefined,
+        null,
         [],
         'auto',
         null,

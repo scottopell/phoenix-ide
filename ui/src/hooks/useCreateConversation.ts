@@ -19,6 +19,24 @@ function effortSupportedByModel(models: ModelsResponse | null, modelId: string |
   return capabilities?.support === 'supported' && capabilities.levels.includes(effort);
 }
 
+export function reconcileSubscribedModelSelection(
+  modelsData: ModelsResponse,
+  previousModel: string | null,
+  previousEffort: ModelEffort | null,
+): { selectedModel: string | null; selectedEffort: ModelEffort | null } {
+  const selectedModel = modelsData.models.length === 0
+    ? null
+    : previousModel && modelsData.models.some((model) => model.id === previousModel)
+      ? previousModel
+      : modelsData.default;
+  return {
+    selectedModel,
+    selectedEffort: effortSupportedByModel(modelsData, selectedModel, previousEffort)
+      ? previousEffort
+      : null,
+  };
+}
+
 
 function readNewConversationDraft(): string {
   try {
@@ -196,8 +214,17 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const metadataRequestSeqRef = useRef(0);
   const taskAvailabilityRequestSeqRef = useRef(0);
   const taskListRequestSeqRef = useRef(0);
+  const selectedModelRef = useRef(selectedModel);
+  const selectedEffortRef = useRef(selectedEffort);
 
   const workflow = effectiveWorkflow(workflowOverride, isGitDir, defaultBranch ?? currentBranch, branchUnavailable);
+
+  useEffect(() => {
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
+  useEffect(() => {
+    selectedEffortRef.current = selectedEffort;
+  }, [selectedEffort]);
 
   // Subscribe to the shared models poller so credential transitions
   // (Codex sign-in/sign-out, gateway flips) reach this page without a
@@ -205,19 +232,13 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => {
     const unsub = subscribeModels(modelsData => {
       setModels(modelsData);
-      // Honor saved preference only if it's still a registered model. Without
-      // this, a stale localStorage entry (e.g. a model that was the only
-      // option at a previous deploy and has since been superseded) silently
-      // sticks and the user submits against an unintended model. After a
-      // sign-out the registered set may drop to empty — null out the
-      // selection so the UI doesn't pin a now-invalid id.
-      setSelectedModel(prev => {
-        if (modelsData.models.length === 0) return null;
-        return prev && modelsData.models.some(m => m.id === prev)
-          ? prev
-          : modelsData.default;
-      });
-      setSelectedEffort(prev => effortSupportedByModel(modelsData, selectedModel, prev) ? prev : null);
+      const next = reconcileSubscribedModelSelection(
+        modelsData,
+        selectedModelRef.current,
+        selectedEffortRef.current,
+      );
+      setSelectedModel(next.selectedModel);
+      setSelectedEffort(next.selectedEffort);
     });
     api.getEnv().then(env => {
       setHomeDir(env.home_dir);

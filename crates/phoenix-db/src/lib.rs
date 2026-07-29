@@ -2783,18 +2783,28 @@ impl Database {
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
-        let inherited_scope = if let Some(parent_id) = parent_id {
-            sqlx::query_scalar::<_, String>(
-                "SELECT work_scope_id FROM conversations WHERE id = ?1 AND work_scope_id IS NOT NULL",
+        let (inherited_scope, inherited_effort) = if let Some(parent_id) = parent_id {
+            let row = sqlx::query(
+                "SELECT work_scope_id, effort FROM conversations WHERE id = ?1 AND work_scope_id IS NOT NULL",
             )
             .bind(parent_id)
             .fetch_optional(&self.pool)
-            .await?
-            .map(WorkScopeId::parse)
-            .transpose()
-            .map_err(|error| DbError::Serialization(error.to_string()))?
+            .await?;
+            match row {
+                Some(row) => {
+                    let scope = WorkScopeId::parse(row.try_get::<String, _>("work_scope_id")?)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?;
+                    let effort = row
+                        .try_get::<Option<String>, _>("effort")?
+                        .map(|value| ModelEffort::from_str(&value))
+                        .transpose()
+                        .map_err(|error| DbError::Serialization(error.clone()))?;
+                    (Some(scope), effort)
+                }
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         let runtime_role = if parent_id.is_some() {
             RuntimeRole::SubAgent
@@ -2828,7 +2838,7 @@ impl Database {
             }
             let result = sqlx::query(
                 "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -2838,7 +2848,7 @@ impl Database {
             .bind(&idle_state)
             .bind(&now_str)
             .bind(model)
-            .bind(Option::<&str>::None)
+            .bind(inherited_effort.map(ModelEffort::as_wire_name))
             .bind(project_id)
             .bind(desired_base_branch)
             .bind(seed_parent_id)
@@ -2900,7 +2910,7 @@ impl Database {
             archived: false,
             model: model.map(String::from),
             project_id: project_id.map(String::from),
-            effort: None,
+            effort: inherited_effort,
             conv_mode: conv_mode.clone(),
             runtime_role,
             work_scope_id: Some(created_work_scope_id),
@@ -3041,7 +3051,7 @@ impl Database {
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3070,7 +3080,7 @@ impl Database {
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3099,7 +3109,7 @@ impl Database {
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3229,7 +3239,7 @@ impl Database {
     pub async fn managed_worktree_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3256,7 +3266,7 @@ impl Database {
     pub async fn list_all_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3280,7 +3290,7 @@ impl Database {
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -4936,7 +4946,7 @@ impl Database {
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -4966,7 +4976,7 @@ impl Database {
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -5664,7 +5674,7 @@ impl Database {
                 JOIN chain ON c.id = chain.next_id
             )
             SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                   c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                   c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -6590,7 +6600,7 @@ impl Database {
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -7912,7 +7922,7 @@ impl Database {
         .bind(effective_effort.level.map(ModelEffort::as_wire_name))
         .bind(usage.input_tokens.cast_signed())
         .bind(usage.output_tokens.cast_signed())
-        .bind(usage.reasoning_tokens.cast_signed())
+        .bind(usage.reasoning_tokens.map(u64::cast_signed))
         .bind(usage.cache_creation_tokens.cast_signed())
         .bind(usage.cache_read_tokens.cast_signed())
         .bind(&now_str)
@@ -12009,7 +12019,7 @@ mod tests {
         let usage = phoenix_core::domain::llm_types::Usage {
             input_tokens: 10,
             output_tokens: 20,
-            reasoning_tokens: 0,
+            reasoning_tokens: None,
             cache_creation_tokens: 0,
             cache_read_tokens: 5,
         };
@@ -12047,6 +12057,26 @@ mod tests {
         assert_eq!(
             rows[1].first_byte_at.as_deref(),
             Some(observed.to_rfc3339().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn list_conversations_preserves_effort_projection() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-effort", "slug-effort", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_model_and_effort("conv-effort", "gpt-5.4", Some(ModelEffort::Low))
+            .await
+            .unwrap();
+
+        let listed = db.list_conversations().await.unwrap();
+        assert_eq!(
+            listed
+                .into_iter()
+                .find(|conversation| conversation.id == "conv-effort")
+                .and_then(|conversation| conversation.effort),
+            Some(ModelEffort::Low)
         );
     }
 
@@ -14203,6 +14233,44 @@ mod tests {
             );
             assert_eq!(msgs[0].message_type, MessageType::Agent);
         }
+    }
+
+    #[tokio::test]
+    async fn conversation_effort_round_trips_and_sub_agents_inherit_explicit_override() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "effort-parent",
+            "effort-parent",
+            "/tmp",
+            true,
+            None,
+            Some("gpt-5.4"),
+        )
+        .await
+        .unwrap();
+        db.update_conversation_model_and_effort(
+            "effort-parent",
+            "gpt-5.4",
+            Some(ModelEffort::High),
+        )
+        .await
+        .unwrap();
+
+        let parent = db.get_conversation("effort-parent").await.unwrap();
+        assert_eq!(parent.effort, Some(ModelEffort::High));
+
+        db.create_conversation(
+            "effort-child",
+            "effort-child",
+            "/tmp",
+            false,
+            Some("effort-parent"),
+            Some("gpt-5.4"),
+        )
+        .await
+        .unwrap();
+        let child = db.get_conversation("effort-child").await.unwrap();
+        assert_eq!(child.effort, Some(ModelEffort::High));
     }
 
     #[tokio::test]

@@ -1782,12 +1782,14 @@ async fn create_conversation_with_id(
             )));
         }
     }
-    let selected_model = req
-        .model
-        .as_deref()
-        .unwrap_or_else(|| state.llm_registry.default_model_id());
+    let selected_model = crate::runtime::creation_worker::resolve_creation_model(
+        &state.llm_registry,
+        req.model.as_deref(),
+        req.mode.as_deref().unwrap_or("direct"),
+        phoenix_core::git::detect_git_repo_root(std::path::Path::new(&req.cwd)).is_some(),
+    );
     if let Some(effort) = req.effort {
-        if !state.llm_registry.supports_effort(selected_model, effort) {
+        if !state.llm_registry.supports_effort(&selected_model, effort) {
             return Err(AppError::BadRequest(format!(
                 "Effort '{effort}' is not supported by model '{selected_model}'"
             )));
@@ -1879,11 +1881,7 @@ async fn create_conversation_with_id(
     let conv_mode = crate::db::ConvMode::Direct;
     let effective_cwd = req.cwd.clone();
     let desired_base_branch = req.base_branch.as_deref();
-    let registry_default_model = state.llm_registry.default_model_id();
-    let shell_model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| registry_default_model.clone());
+let shell_model = selected_model.clone();
     let intent_model = req.model.clone();
     let resolved_mode_for_intent = match requested_mode {
         "direct" => None,

@@ -1624,7 +1624,7 @@ pub struct UsageTurnRow {
     pub first_byte_at: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub reasoning_tokens: i64,
+    pub reasoning_tokens: Option<i64>,
     pub effort_source: crate::domain::llm_types::EffortSource,
     pub effort_level: Option<crate::domain::llm_types::ModelEffort>,
     pub cache_creation_tokens: i64,

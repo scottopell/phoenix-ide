@@ -4907,7 +4907,7 @@ where
                 messages,
                 tools,
                 max_tokens: Some(16_384),
-                effort: explicit_effort,
+                effort: effective_effort.level,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id.clone(),
@@ -10753,7 +10753,7 @@ mod steer_drain_detector_tests {
             usage: phoenix_llm::Usage {
                 input_tokens: 0,
                 output_tokens: 0,
-                reasoning_tokens: 0,
+                reasoning_tokens: None,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             },

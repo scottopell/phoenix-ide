@@ -33,6 +33,10 @@ impl EffortCapabilities {
         Self::Unknown
     }
 
+    /// # Panics
+    ///
+    /// Panics when `levels` is empty or a known native default is not one of the
+    /// supported levels.
     #[must_use]
     pub fn supported(levels: &[ModelEffort], native_default: NativeDefault) -> Self {
         assert!(

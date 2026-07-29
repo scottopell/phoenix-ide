@@ -205,56 +205,6 @@ function effortCompatible(capabilities: EffortCapabilities | undefined, effort: 
   return capabilities?.support === 'supported' && capabilities.levels.includes(effort);
 }
 
-/** Extract project name from cwd, project_name field, or worktree path */
-function getProjectName(conversation: Conversation): string | null {
-  // Prefer explicit project_name from backend
-  if (conversation.project_name) return conversation.project_name;
-
-  // For non-work modes, extract from cwd
-  const cwd = conversation.cwd;
-  if (!cwd) return null;
-
-  // Skip worktree UUIDs -- they're meaningless
-  if (cwd.includes(".phoenix/worktrees/")) return null;
-
-  const parts = cwd.replace(/\/$/, "").split("/");
-  return parts[parts.length - 1] || null;
-}
-
-function summarizePath(path: string | null | undefined): string {
-  if (!path) return "—";
-  const trimmed = path.replace(/\/$/, "");
-  const parts = trimmed.split("/").filter(Boolean);
-  if (parts.length <= 2) return path;
-  return `…/${parts.slice(-2).join("/")}`;
-}
-
-function modeTitle(
-  mode: string | undefined,
-  isExplore: boolean,
-  isWork: boolean,
-  isBranchMode: boolean,
-): string {
-  if (isExplore) return "Explore mode: read-only git project";
-  if (isWork) return "Work mode: task branch";
-  if (isBranchMode) return "Branch mode: existing branch";
-  if (mode === "direct") return "Direct mode: full access";
-  return "Full access";
-}
-
-function modeMeaning(
-  mode: string | undefined,
-  isExplore: boolean,
-  isWork: boolean,
-  isBranchMode: boolean,
-): string {
-  if (isExplore) return "Read-only git project";
-  if (isWork) return "Task branch";
-  if (isBranchMode) return "Existing branch";
-  if (mode === "direct") return "Full access";
-  return "Full access";
-}
-
 function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
   if (!pr.url) return null;
   const stopPropagation = (event: ReactMouseEvent<HTMLAnchorElement>) => {

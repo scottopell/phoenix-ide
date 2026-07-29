@@ -210,6 +210,7 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
 struct ResponsesStreamAccumulator {
     input_tokens: u32,
     output_tokens: u32,
+    reasoning_tokens: Option<u32>,
     /// Cached-read subset of `input_tokens`.
     cached_tokens: u32,
     /// Cache-write subset of `input_tokens` on GPT-5.6-era models.
@@ -232,6 +233,7 @@ impl ResponsesStreamAccumulator {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: None,
             cached_tokens: 0,
             cache_write_tokens: 0,
             output_items: Vec::new(),
@@ -425,6 +427,10 @@ impl ResponsesStreamAccumulator {
                             .unwrap_or(0),
                     )
                     .unwrap_or(0);
+                    self.reasoning_tokens = usage
+                        .pointer("/output_tokens_details/reasoning_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok());
                     self.cached_tokens = u32::try_from(
                         usage
                             .pointer("/input_tokens_details/cached_tokens")
@@ -526,7 +532,9 @@ impl ResponsesStreamAccumulator {
                     cached_tokens: self.cached_tokens,
                     cache_write_tokens: self.cache_write_tokens,
                 },
-                output_tokens_details: ResponsesApiOutputTokensDetails::default(),
+                output_tokens_details: self
+                    .reasoning_tokens
+                    .map(|reasoning_tokens| ResponsesApiOutputTokensDetails { reasoning_tokens }),
             },
         })?;
         telemetry.attach_success(&mut response);
@@ -1771,7 +1779,10 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
         // preserves the provider-reported context total.
         let cached = u64::from(resp.usage.input_tokens_details.cached_tokens);
         let written = u64::from(resp.usage.input_tokens_details.cache_write_tokens);
-        let reasoning = u64::from(resp.usage.output_tokens_details.reasoning_tokens);
+        let reasoning = resp
+            .usage
+            .output_tokens_details
+            .map(|details| u64::from(details.reasoning_tokens));
         Usage {
             input_tokens: u64::from(resp.usage.input_tokens)
                 .saturating_sub(cached.saturating_add(written)),
@@ -2270,9 +2281,8 @@ pub(crate) struct ResponsesApiInputTokensDetails {
     pub(crate) cache_write_tokens: u32,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiOutputTokensDetails {
-    #[serde(default)]
     pub(crate) reasoning_tokens: u32,
 }
 
@@ -2287,7 +2297,7 @@ pub(crate) struct ResponsesApiUsage {
     #[serde(default)]
     pub(crate) input_tokens_details: ResponsesApiInputTokensDetails,
     #[serde(default)]
-    pub(crate) output_tokens_details: ResponsesApiOutputTokensDetails,
+    pub(crate) output_tokens_details: Option<ResponsesApiOutputTokensDetails>,
 }
 
 #[cfg(test)]
@@ -3128,7 +3138,23 @@ mod tests {
 
         let normalized = normalize_responses_api_response(response).unwrap();
         assert_eq!(normalized.usage.output_tokens, 25);
-        assert_eq!(normalized.usage.reasoning_tokens, 20);
+        assert_eq!(normalized.usage.reasoning_tokens, Some(20));
+    }
+
+    #[test]
+    fn missing_reasoning_tokens_stays_absent() {
+        let response: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "output": [{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 25
+            }
+        }))
+        .unwrap();
+
+        let normalized = normalize_responses_api_response(response).unwrap();
+        assert_eq!(normalized.usage.reasoning_tokens, None);
     }
 
     #[tokio::test]
@@ -3794,6 +3820,32 @@ mod tests {
         assert_eq!(acc.output_tokens, 5);
     }
 
+    #[tokio::test]
+    async fn streamed_reasoning_tokens_are_preserved_when_reported() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new(Instant::now(), &empty_request());
+        let data = r#"{
+            "type":"response.completed",
+            "response":{
+                "usage":{
+                    "input_tokens":10,
+                    "output_tokens":25,
+                    "output_tokens_details":{"reasoning_tokens":20}
+                },
+                "output":[{"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"answer"}
+                ]}]
+            }
+        }"#;
+
+        acc.process_event("response.completed", data, &tx)
+            .await
+            .expect("handler should preserve terminal usage");
+        let response = acc.into_response().expect("stream should normalize");
+
+        assert_eq!(response.usage.reasoning_tokens, Some(20));
+    }
+
     /// `OpenAI`'s cached-read and cache-write details are both subsets of
     /// `input_tokens`; normalization splits both without changing context usage.
     #[tokio::test]
@@ -3831,7 +3883,7 @@ mod tests {
                     cached_tokens: acc.cached_tokens,
                     cache_write_tokens: acc.cache_write_tokens,
                 },
-                output_tokens_details: ResponsesApiOutputTokensDetails::default(),
+                output_tokens_details: None,
             },
         })
         .expect("a response with a message item normalizes");
@@ -4000,7 +4052,7 @@ mod tests {
                     cached_tokens: 0,
                     cache_write_tokens: 0,
                 },
-                output_tokens_details: ResponsesApiOutputTokensDetails::default(),
+                output_tokens_details: None,
             },
         })
         .expect_err("empty content with billed output tokens must fail");
@@ -4036,7 +4088,7 @@ mod tests {
                     cached_tokens: 0,
                     cache_write_tokens: 0,
                 },
-                output_tokens_details: ResponsesApiOutputTokensDetails::default(),
+                output_tokens_details: None,
             },
         })
         .expect("a refusal is valid content, not a billed-but-empty failure");

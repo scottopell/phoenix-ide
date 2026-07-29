@@ -311,11 +311,16 @@ const MIGRATIONS: &[Migration] = &[
 const MIGRATION_058: &str = r"
 ALTER TABLE conversations ADD COLUMN effort TEXT
 CHECK (effort IS NULL OR effort IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
-ALTER TABLE turn_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turn_usage ADD COLUMN reasoning_tokens INTEGER;
 ALTER TABLE turn_usage ADD COLUMN effort_source TEXT NOT NULL DEFAULT 'native_unknown'
 CHECK (effort_source IN ('native_known', 'native_unknown', 'explicit', 'unsupported'));
 ALTER TABLE turn_usage ADD COLUMN effort_level TEXT
 CHECK (effort_level IS NULL OR effort_level IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
+UPDATE conversations SET model = 'gpt-5.4' WHERE model = 'gpt-5.3-codex';
+UPDATE turn_usage SET model = 'gpt-5.4' WHERE model = 'gpt-5.3-codex';
+UPDATE conversation_creation_jobs
+SET intent_json = json_set(intent_json, '$.model', 'gpt-5.4')
+WHERE json_extract(intent_json, '$.model') = 'gpt-5.3-codex';
 ";
 
 const MIGRATION_057: &str = r"
@@ -2986,8 +2991,12 @@ mod tests {
     async fn migration_058_adds_typed_effort_and_usage_columns() {
         let pool = test_pool().await;
         sqlx::raw_sql(
-            "CREATE TABLE conversations (id TEXT PRIMARY KEY);\
-             CREATE TABLE turn_usage (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, model TEXT);\
+             INSERT INTO conversations (id, model) VALUES ('legacy', 'gpt-5.3-codex');\
+             CREATE TABLE turn_usage (id INTEGER PRIMARY KEY, model TEXT);\
+             INSERT INTO turn_usage (id, model) VALUES (9, 'gpt-5.3-codex');\
+             CREATE TABLE conversation_creation_jobs (id TEXT PRIMARY KEY, intent_json TEXT NOT NULL);\
+             INSERT INTO conversation_creation_jobs (id, intent_json) VALUES ('job', '{\"model\":\"gpt-5.3-codex\"}');",
         )
         .execute(&pool)
         .await
@@ -3015,7 +3024,7 @@ mod tests {
             assert!(usage_columns.iter().any(|column| column == expected));
         }
 
-        sqlx::query("INSERT INTO turn_usage (id) VALUES (1)")
+        sqlx::query("INSERT INTO turn_usage (id, model) VALUES (1, 'gpt-5.4')")
             .execute(&pool)
             .await
             .unwrap();
@@ -3025,9 +3034,28 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(row.get::<i64, _>("reasoning_tokens"), 0);
+        assert_eq!(row.get::<Option<i64>, _>("reasoning_tokens"), None);
         assert_eq!(row.get::<String, _>("effort_source"), "native_unknown");
         assert_eq!(row.get::<Option<String>, _>("effort_level"), None);
+        let migrated_model: String =
+            sqlx::query_scalar("SELECT model FROM conversations WHERE id = 'legacy'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(migrated_model, "gpt-5.4");
+        let migrated_turn_usage_model: String =
+            sqlx::query_scalar("SELECT model FROM turn_usage WHERE id = 9")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(migrated_turn_usage_model, "gpt-5.4");
+        let migrated_job_model: String = sqlx::query_scalar(
+            "SELECT json_extract(intent_json, '$.model') FROM conversation_creation_jobs WHERE id = 'job'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(migrated_job_model, "gpt-5.4");
 
         sqlx::query("INSERT INTO conversations (id) VALUES ('c')")
             .execute(&pool)

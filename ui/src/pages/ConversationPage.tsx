@@ -1663,6 +1663,7 @@ function ConversationPageContent({
         '', // empty — server accepts empty text when seed_parent_id is set
         messageId,
         conversation.model ?? undefined,
+        null,
         [],
         'direct',
         null,
