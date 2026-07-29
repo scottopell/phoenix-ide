@@ -136,6 +136,10 @@ def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
             "tests": f'{{ name = "dev.check.test" && span.check.profile_run_id = "{run_id}" }}',
         },
         "command": next((row for row in rows if row["kind"] == "command"), None),
+        "run_metadata": next((
+            value.get("metadata") for path, value in _records(profile_dir, [])
+            if value.get("kind") == "command"
+        ), None),
         "incomplete_tree_records": [
             row for row in rows if row.get("tree_closure") not in (None, "verified")
         ],
@@ -170,6 +174,8 @@ def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
             f'{row["provenance"]} | {outcome} | {attempt} | {concurrent} | '
             f'{closure} | {row["kind"]} | `{identity}` |'
         )
+    if summary["run_metadata"]:
+        lines += ["", "## Run metadata", "", "```json", json.dumps(summary["run_metadata"], indent=2, sort_keys=True), "```"]
     if profile_errors:
         lines += ["", "## Profile record errors", ""]
         for error in profile_errors:

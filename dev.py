@@ -18,6 +18,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import platform
 import plistlib
 import re
 import resource
@@ -5280,8 +5281,9 @@ def cmd_check(
 
     # Share compiler outputs across worktrees and independent target dirs.
     # The selected wrapper is inherited by every cargo subprocess below.
+    selected_compiler_cache = None
     if cargo_active:
-        _configure_compiler_cache(compiler_cache)
+        selected_compiler_cache = _configure_compiler_cache(compiler_cache)
 
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
@@ -5585,6 +5587,23 @@ def cmd_check(
             "total_cpu_ms": command_cpu["cpu.total_ms"],
             "wall_ms": (time.monotonic() - t_start) * 1000.0,
             "tree_closure": "command_reaped_descendants_unverified",
+            "metadata": {
+                "git_sha": subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=ROOT,
+                    capture_output=True, text=True, check=False,
+                ).stdout.strip(),
+                "git_dirty": bool(subprocess.run(
+                    ["git", "status", "--porcelain"], cwd=ROOT,
+                    capture_output=True, text=True, check=False,
+                ).stdout.strip()),
+                "host_platform": sys.platform,
+                "host_machine": platform.machine(),
+                "python_version": platform.python_version(),
+                "active_lanes": sorted(active),
+                "compiler_cache": selected_compiler_cache,
+                "rust_test_threads": test_threads if "rust" in active else None,
+                "profile_artifact_dir": str(_CHECK_PROFILE.artifact_dir),
+            },
         }, sort_keys=True) + "\n")
 
     if profile_work and _CHECK_PROFILE is not None:

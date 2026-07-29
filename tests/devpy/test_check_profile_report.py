@@ -41,6 +41,22 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertIn("inclusive", markdown)
         self.assertIn("dev.check.test", summary["traceql"]["tests"])
 
+    def test_portable_report_embeds_run_metadata(self):
+        report = load_report()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "command.json").write_text(json.dumps({
+                "identity": "command:dev.py check", "kind": "command",
+                "provenance": "exact_process_plus_waited_children",
+                "total_cpu_ms": 1, "wall_ms": 2,
+                "metadata": {"git_sha": "abc", "active_lanes": ["rust"]},
+            }))
+            summary = report.render(root, 20, "run")
+            markdown = (root / "summary.md").read_text()
+
+        self.assertEqual("abc", summary["run_metadata"]["git_sha"])
+        self.assertIn("Run metadata", markdown)
+
     def test_portable_rows_preserve_retry_outcome_and_overlap_metadata(self):
         report = load_report()
         row = report._normalize(Path("rust-tests/test.json"), {
