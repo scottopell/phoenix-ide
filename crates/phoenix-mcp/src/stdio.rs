@@ -5,7 +5,7 @@ use crate::{McpTransport, ServerMessageSink, TransportError};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -21,6 +21,10 @@ pub struct StdioTransport {
     stdin: Mutex<BufWriter<ChildStdin>>,
     stdout: Mutex<BufReader<ChildStdout>>,
     next_id: AtomicU64,
+    /// Set synchronously when a request future is abandoned. Queued requests
+    /// check this after acquiring serialization locks and refuse to touch the
+    /// stream until the manager replaces the transport.
+    invalidated: AtomicBool,
     /// Handle to the stderr drain task -- aborted on shutdown.
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -101,6 +105,7 @@ impl StdioTransport {
             stdin: Mutex::new(BufWriter::new(child_stdin)),
             stdout: Mutex::new(BufReader::new(child_stdout)),
             next_id: AtomicU64::new(1),
+            invalidated: AtomicBool::new(false),
             stderr_task,
         })
     }
@@ -155,6 +160,12 @@ impl McpTransport for StdioTransport {
         // above for why we don't multiplex.
         let mut stdin = self.stdin.lock().await;
         let mut stdout = self.stdout.lock().await;
+
+        if self.invalidated.load(Ordering::Acquire) {
+            return Err(TransportError::Disconnected(format!(
+                "transport invalidated while waiting to send '{method}'"
+            )));
+        }
 
         // Write request.
         let write_fut = async {
@@ -266,6 +277,10 @@ impl McpTransport for StdioTransport {
     fn is_alive(&mut self) -> bool {
         // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running.
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
     }
 
     async fn shutdown(&mut self) {

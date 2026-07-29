@@ -136,6 +136,11 @@ pub trait McpTransport: Send + Sync {
     /// (stdio: the child process is running).
     fn is_alive(&mut self) -> bool;
 
+    /// Mark this transport unsafe for another request after an abandoned
+    /// exchange. Stdio uses this to fence already-queued writers before the
+    /// manager can acquire exclusive ownership and rebuild the process.
+    fn invalidate(&self) {}
+
     /// Tear down the transport (stdio: kill the child process).
     async fn shutdown(&mut self);
 }
@@ -766,7 +771,10 @@ impl McpServer {
 
         let resp = tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err(McpRequestError::Cancelled),
+            () = cancel.cancelled() => {
+                self.transport.invalidate();
+                return Err(McpRequestError::Cancelled);
+            },
             result = self.request("tools/call", params, TOOL_CALL_TIMEOUT) => result,
         }
         .map_err(McpRequestError::Transport)?;
@@ -2642,10 +2650,15 @@ impl McpClientManager {
                 }
                 drop(guard);
             }
-            let receiver = self
-                .recovering_map()
-                .get(server_name)
-                .map(tokio::sync::watch::Sender::subscribe);
+            let receiver = {
+                let servers = self.servers.read().await;
+                if servers.contains_key(server_name) {
+                    continue;
+                }
+                self.recovering_map()
+                    .get(server_name)
+                    .map(tokio::sync::watch::Sender::subscribe)
+            };
             match receiver {
                 Some(mut receiver) => {
                     tokio::select! {
@@ -2768,6 +2781,18 @@ impl McpClientManager {
                     "MCP server '{server_name}' cancellation cleanup failed: {error}"
                 )))
             }
+        }
+    }
+
+    async fn await_recovery(
+        &self,
+        mut receiver: tokio::sync::watch::Receiver<()>,
+        cancel: &CancellationToken,
+    ) -> Result<(), McpToolCallError> {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(McpToolCallError::Cancelled),
+            _ = receiver.changed() => Ok(()),
         }
     }
 
@@ -2946,8 +2971,8 @@ impl McpClientManager {
                     // (including unwind), and each re-establish stage is
                     // itself deadline-bounded, so a slow-but-successful
                     // recovery is never misreported as a failure here.
-                    ToolCallRecovery::Follow(mut receiver) => {
-                        let _ = receiver.changed().await;
+                    ToolCallRecovery::Follow(receiver) => {
+                        self.await_recovery(receiver, &cancel).await?;
                     }
                     ToolCallRecovery::Retry => {}
                 }
@@ -4678,6 +4703,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_failure_follower_honors_cancellation() {
+        let (server, _, _) = fake_server(Vec::new());
+        let handle = server_handle(server);
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fake".to_string(), Arc::clone(&handle));
+        let claim = {
+            let mut servers = manager.servers.write().await;
+            let claim = manager.claim_server("fake");
+            servers.remove("fake");
+            claim
+        };
+        let receiver = manager
+            .recovering_map()
+            .get("fake")
+            .expect("claim parked")
+            .subscribe();
+        let cancel = CancellationToken::new();
+        let waiter = Arc::clone(&manager);
+        let waiter_cancel = cancel.clone();
+        let follow =
+            tokio::spawn(async move { waiter.await_recovery(receiver, &waiter_cancel).await });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), follow)
+                .await
+                .expect("follower cancellation settles")
+                .expect("follow task"),
+            Err(McpToolCallError::Cancelled)
+        );
+        drop(handle);
+        drop(claim);
+    }
+
+    #[tokio::test]
     async fn cancellation_cleanup_does_not_hold_global_map_lock() {
         let (first, first_started) =
             witnessed_delayed_exchange(Ok(serde_json::json!({"content": []})), 200);
@@ -5156,6 +5221,13 @@ for line in sys.stdin:
     elif method == "tools/list":
         send(req_id, {"tools": [{"name": "report", "description": "Report config", "inputSchema": {"type": "object"}}]})
     elif method == "tools/call":
+        append_marker("call")
+        block_once = os.environ.get("MCP_BLOCK_ONCE_FILE")
+        if block_once and os.path.exists(block_once):
+            os.remove(block_once)
+            append_marker("block-start")
+            import time
+            time.sleep(60)
         crash_then_block = os.environ.get("MCP_CRASH_THEN_BLOCK_FILE")
         if crash_then_block:
             if os.path.exists(crash_then_block):
@@ -5234,6 +5306,75 @@ for line in sys.stdin:
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn queued_stdio_call_is_fenced_from_cancelled_transport() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let block_once = tmp.path().join("block-once");
+        std::fs::write(&block_once, "block").expect("write block marker");
+        let manager = Arc::new(McpClientManager::new());
+        let mut config = fixture_config(&script, &marker, "v1", "env1");
+        as_stdio_mut(&mut config).2.insert(
+            "MCP_BLOCK_ONCE_FILE".to_string(),
+            block_once.display().to_string(),
+        );
+        connect_fixture(&manager, &config).await;
+
+        let cancel = CancellationToken::new();
+        let first_manager = Arc::clone(&manager);
+        let first_cancel = cancel.clone();
+        let first = tokio::spawn(async move {
+            first_manager
+                .call_tool_cancellable("fixture", "report", serde_json::json!({}), first_cancel)
+                .await
+        });
+        while !marker_lines(&marker)
+            .iter()
+            .any(|line| line.starts_with("block-start|"))
+        {
+            tokio::task::yield_now().await;
+        }
+        let second_manager = Arc::clone(&manager);
+        let second = tokio::spawn(async move {
+            second_manager
+                .call_tool("fixture", "report", serde_json::json!({}))
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), first)
+                .await
+                .expect("cancelled call settles")
+                .expect("first task"),
+            Err(McpToolCallError::Cancelled)
+        );
+        let output = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("queued call settles after respawn")
+            .expect("second task")
+            .expect("queued call succeeds");
+        assert_eq!(output, "label=v1;env=env1");
+
+        let lines = marker_lines(&marker);
+        let first_pid = lines
+            .iter()
+            .find(|line| line.starts_with("block-start|"))
+            .and_then(|line| line.split('|').find(|part| part.starts_with("pid=")))
+            .expect("blocked process pid");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("call|") && line.contains(first_pid))
+                .count(),
+            1,
+            "queued call never writes to the invalidated process"
+        );
+        manager.shutdown().await;
     }
 
     #[tokio::test]
@@ -5356,7 +5497,13 @@ for line in sys.stdin:
         assert_eq!(result.unchanged, vec!["fixture"]);
         assert!(result.restarted.is_empty());
         assert!(result.failed.is_empty());
-        assert_eq!(marker_lines(&marker).len(), 1);
+        assert_eq!(
+            marker_lines(&marker)
+                .iter()
+                .filter(|line| line.starts_with("start|"))
+                .count(),
+            1
+        );
         manager.shutdown().await;
     }
 
@@ -5377,7 +5524,13 @@ for line in sys.stdin:
         assert_eq!(result.restarted, vec!["fixture"]);
         assert!(result.unchanged.is_empty());
         assert!(result.failed.is_empty());
-        assert_eq!(marker_lines(&marker).len(), 2);
+        assert_eq!(
+            marker_lines(&marker)
+                .iter()
+                .filter(|line| line.starts_with("start|"))
+                .count(),
+            2
+        );
         let output = manager
             .call_tool("fixture", "report", serde_json::json!({}))
             .await
@@ -5537,7 +5690,13 @@ for line in sys.stdin:
             .expect("respawn and retry report");
 
         assert_eq!(output, "label=v2;env=env2");
-        assert_eq!(marker_lines(&marker).len(), 3);
+        assert_eq!(
+            marker_lines(&marker)
+                .iter()
+                .filter(|line| line.starts_with("start|"))
+                .count(),
+            3
+        );
         manager.shutdown().await;
     }
 
