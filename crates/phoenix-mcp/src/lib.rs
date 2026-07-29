@@ -2471,6 +2471,7 @@ impl McpClientManager {
     /// Return (`server_name`, `tool_def`) pairs for all currently connected servers.
     /// Disabled servers are excluded. May return an empty list if background
     /// discovery hasn't finished yet.
+    #[allow(clippy::too_many_lines)] // One refresh lifecycle plus the resulting definition snapshot.
     pub async fn tool_definitions(&self) -> Vec<(String, McpToolDef)> {
         // Check if any server signaled tools/list_changed. If so, refresh
         // under a write lock before reading. This adds latency on the first
@@ -2508,21 +2509,18 @@ impl McpClientManager {
                         .is_some_and(|s| s.tools_changed.swap(false, Ordering::AcqRel)),
                     None => false,
                 };
-                match refresh {
-                    true => {
-                        // Claim the hold under the same lock that removes the
-                        // entry, so a tool call landing mid-refresh (or
-                        // mid-refresh-recovery) waits for the outcome instead
-                        // of failing with "not connected".
-                        let claim = self.claim_server(&name);
-                        match servers.remove(&name) {
-                            Some(handle) => {
-                                handle.write().await.take().map(|server| (server, claim))
-                            }
-                            None => None,
-                        }
+                if refresh {
+                    // Claim the hold under the same lock that removes the
+                    // entry, so a tool call landing mid-refresh (or
+                    // mid-refresh-recovery) waits for the outcome instead
+                    // of failing with "not connected".
+                    let claim = self.claim_server(&name);
+                    match servers.remove(&name) {
+                        Some(handle) => handle.write().await.take().map(|server| (server, claim)),
+                        None => None,
                     }
-                    false => None,
+                } else {
+                    None
                 }
             };
             // Lock dropped -- list_tools() runs with no lock held.
@@ -2689,6 +2687,10 @@ impl McpClientManager {
     /// Route a tool call with caller-driven cancellation. A cancelled stdio
     /// call re-establishes its transport before returning so an abandoned
     /// response can never corrupt the next request-response exchange.
+    ///
+    /// # Errors
+    /// Returns `Cancelled` after the serving transport is safe to reuse, or
+    /// `Failed` when lookup, invocation, or recovery fails.
     pub async fn call_tool_cancellable(
         &self,
         server_name: &str,
@@ -2700,6 +2702,7 @@ impl McpClientManager {
             .await
     }
 
+    #[allow(clippy::too_many_lines)] // One ordered lifecycle: attempt, classify, recover (transport or OAuth), retry.
     async fn call_tool_with_cancel(
         &self,
         server_name: &str,
@@ -2724,46 +2727,13 @@ impl McpClientManager {
                 let cancelled = matches!(&e, McpRequestError::Cancelled);
                 // One concurrent failing call leads the recovery; the others
                 // follow by waiting for it to finish, then retrying.
-                enum Recovery {
-                    Lead {
-                        server: Box<McpServer>,
-                        action: &'static str,
-                        claim: ServerClaim,
-                    },
-                    /// A 401 on an OAuth-authorized server: silently refresh
-                    /// the token, then retry (`TokenRefreshNeeded`).
-                    OAuthRefresh {
-                        server: Box<McpServer>,
-                        claim: ServerClaim,
-                        www_authenticate: Option<String>,
-                    },
-                    /// A 403 `insufficient_scope` on an OAuth-authorized
-                    /// server: re-authorize with the scope union, holding the
-                    /// claim so this call replays once the operator acts
-                    /// (`InsufficientScopeStepUp`).
-                    OAuthStepUp {
-                        server: Box<McpServer>,
-                        claim: ServerClaim,
-                        www_authenticate: String,
-                    },
-                    Follow(tokio::sync::watch::Receiver<()>),
-                    /// The failing transport was already replaced; go
-                    /// straight to the retry.
-                    Retry,
-                }
-
                 // Brief write lock: classify the failure and either claim the
                 // recovery (extracting the server for out-of-lock work) or
                 // join one already in flight.
                 let recovery = {
                     let mut servers = self.servers.write().await;
                     if let Some(current_handle) = servers.get(server_name).cloned() {
-                        if !Arc::ptr_eq(&current_handle, &attempt.server) {
-                            if !attempt.recoverable {
-                                return Err(McpToolCallError::Failed(e.into_message(server_name)));
-                            }
-                            Recovery::Retry
-                        } else {
+                        if Arc::ptr_eq(&current_handle, &attempt.server) {
                             let removed = servers
                                 .remove(server_name)
                                 .expect("serving handle remains in map");
@@ -2782,14 +2752,14 @@ impl McpClientManager {
                             if server.is_alive() && !attempt.recoverable && !cancelled {
                                 match oauth_recovery_kind(&server, &e) {
                                     Some(OAuthRecoveryKind::Refresh { www_authenticate }) => {
-                                        Recovery::OAuthRefresh {
+                                        ToolCallRecovery::OAuthRefresh {
                                             server: Box::new(server),
                                             claim: self.claim_server(server_name),
                                             www_authenticate,
                                         }
                                     }
                                     Some(OAuthRecoveryKind::StepUp { www_authenticate }) => {
-                                        Recovery::OAuthStepUp {
+                                        ToolCallRecovery::OAuthStepUp {
                                             server: Box::new(server),
                                             claim: self.claim_server(server_name),
                                             www_authenticate,
@@ -2818,12 +2788,17 @@ impl McpClientManager {
                                 // servers lock, so a concurrent failing call
                                 // cannot observe the server absent without also
                                 // seeing the claim.
-                                Recovery::Lead {
+                                ToolCallRecovery::Lead {
                                     server: Box::new(server),
                                     action,
                                     claim: self.claim_server(server_name),
                                 }
                             }
+                        } else {
+                            if !attempt.recoverable {
+                                return Err(McpToolCallError::Failed(e.into_message(server_name)));
+                            }
+                            ToolCallRecovery::Retry
                         }
                     } else {
                         // Absent with a claim parked: a concurrent call is
@@ -2838,7 +2813,7 @@ impl McpClientManager {
                                 "MCP server '{server_name}' is not connected"
                             )));
                         };
-                        Recovery::Follow(receiver)
+                        ToolCallRecovery::Follow(receiver)
                     }
                 };
                 // Write lock is dropped here.
@@ -2848,7 +2823,7 @@ impl McpClientManager {
                     // blocked. The claim guard is dropped (waking followers)
                     // only after the server is back in the map -- and on the
                     // error path, only after the drop decision is final.
-                    Recovery::Lead {
+                    ToolCallRecovery::Lead {
                         mut server,
                         action,
                         claim,
@@ -2883,7 +2858,7 @@ impl McpClientManager {
                     // server rejoins the map with the rotated bearer and the
                     // call retries below, so a routine expiry never surfaces
                     // as a tool failure.
-                    Recovery::OAuthRefresh {
+                    ToolCallRecovery::OAuthRefresh {
                         mut server,
                         claim,
                         www_authenticate,
@@ -2919,7 +2894,7 @@ impl McpClientManager {
                     // pending flow, so the retry below parks until the
                     // operator re-authorizes and the server is republished --
                     // then the call replays with the upgraded token.
-                    Recovery::OAuthStepUp {
+                    ToolCallRecovery::OAuthStepUp {
                         server,
                         claim,
                         www_authenticate,
@@ -2932,10 +2907,10 @@ impl McpClientManager {
                     // (including unwind), and each re-establish stage is
                     // itself deadline-bounded, so a slow-but-successful
                     // recovery is never misreported as a failure here.
-                    Recovery::Follow(mut receiver) => {
+                    ToolCallRecovery::Follow(mut receiver) => {
                         let _ = receiver.changed().await;
                     }
-                    Recovery::Retry => {}
+                    ToolCallRecovery::Retry => {}
                 }
             }
         }
@@ -3872,6 +3847,26 @@ impl Drop for ServerClaim {
     fn drop(&mut self) {
         self.recovering.lock().unwrap().remove(&self.name);
     }
+}
+
+enum ToolCallRecovery {
+    Lead {
+        server: Box<McpServer>,
+        action: &'static str,
+        claim: ServerClaim,
+    },
+    OAuthRefresh {
+        server: Box<McpServer>,
+        claim: ServerClaim,
+        www_authenticate: Option<String>,
+    },
+    OAuthStepUp {
+        server: Box<McpServer>,
+        claim: ServerClaim,
+        www_authenticate: String,
+    },
+    Follow(tokio::sync::watch::Receiver<()>),
+    Retry,
 }
 
 /// Outcome of one `tools/call` attempt: the result, the generation of the
