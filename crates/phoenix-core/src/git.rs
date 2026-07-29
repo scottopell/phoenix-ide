@@ -181,36 +181,30 @@ pub fn resolve_remote_default_branch(path: &Path) -> Option<String> {
     Some(branch.to_string())
 }
 
-/// Observe the authoritative local Git HEAD state for a repository worktree.
-///
-/// Distinguishes a named branch from detached HEAD, unborn HEAD, and
-/// unavailable/error states without parsing shell command intent.
-#[must_use]
-pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
-    const MAX_ATTEMPTS: usize = 6;
+const LOCAL_HEAD_MAX_ATTEMPTS: usize = 6;
 
-    let repo_root = detect_git_repo_root(path);
-    let Some(repository_identity) = repo_root else {
-        return LocalGitHeadObservation::Unavailable {
-            repository_identity: None,
-            error: "not a git repository".to_string(),
-        };
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalHeadQuery {
+    SymbolicHead,
+    RefCommit(String),
+    HeadCommit,
+    VerifyHead,
+}
 
+fn resolve_local_git_head(
+    repository_identity: String,
+    mut read: impl FnMut(LocalHeadQuery) -> Option<String>,
+) -> LocalGitHeadObservation {
     let mut known_unborn_branch_name = None;
-    for _ in 0..MAX_ATTEMPTS {
-        if let Some(full_ref) =
-            git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).filter(|name| !name.is_empty())
-        {
+    for _ in 0..LOCAL_HEAD_MAX_ATTEMPTS {
+        if let Some(full_ref) = read(LocalHeadQuery::SymbolicHead).filter(|name| !name.is_empty()) {
             let branch_name = full_ref
                 .strip_prefix("refs/heads/")
                 .unwrap_or(&full_ref)
                 .to_string();
             known_unborn_branch_name = Some(branch_name.clone());
-            let ref_commit = git_capture(path, &["rev-parse", &format!("{full_ref}^{{commit}}")]);
-            if git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).as_deref()
-                != Some(full_ref.as_str())
-            {
+            let ref_commit = read(LocalHeadQuery::RefCommit(full_ref.clone()));
+            if read(LocalHeadQuery::SymbolicHead).as_deref() != Some(full_ref.as_str()) {
                 continue;
             }
             if let Some(head_oid) = ref_commit.filter(|oid| !oid.is_empty()) {
@@ -220,7 +214,7 @@ pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
                     head_oid,
                 };
             }
-            if git_capture(path, &["rev-parse", "--verify", "HEAD"]).is_none() {
+            if read(LocalHeadQuery::VerifyHead).is_none() {
                 return LocalGitHeadObservation::Unborn {
                     repository_identity,
                     branch_name: Some(branch_name),
@@ -229,9 +223,9 @@ pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
             continue;
         }
 
-        let first_oid = git_capture(path, &["rev-parse", "HEAD^{commit}"]);
-        let second_oid = git_capture(path, &["rev-parse", "HEAD^{commit}"]);
-        if git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).is_none() {
+        let first_oid = read(LocalHeadQuery::HeadCommit);
+        let second_oid = read(LocalHeadQuery::HeadCommit);
+        if read(LocalHeadQuery::SymbolicHead).is_none() {
             if let Some(head_oid) = first_oid.filter(|oid| Some(oid) == second_oid.as_ref()) {
                 return LocalGitHeadObservation::Detached {
                     repository_identity,
@@ -241,11 +235,10 @@ pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
         }
     }
 
-    let branch_name = known_unborn_branch_name;
-    if git_capture(path, &["rev-parse", "--verify", "HEAD"]).is_none() {
+    if read(LocalHeadQuery::VerifyHead).is_none() {
         return LocalGitHeadObservation::Unborn {
             repository_identity,
-            branch_name,
+            branch_name: known_unborn_branch_name,
         };
     }
 
@@ -253,6 +246,29 @@ pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
         repository_identity: Some(repository_identity),
         error: "unable to resolve HEAD state".to_string(),
     }
+}
+
+/// Observe the authoritative local Git HEAD state for a repository worktree.
+///
+/// Distinguishes a named branch from detached HEAD, unborn HEAD, and
+/// unavailable/error states without parsing shell command intent.
+#[must_use]
+pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
+    let Some(repository_identity) = detect_git_repo_root(path) else {
+        return LocalGitHeadObservation::Unavailable {
+            repository_identity: None,
+            error: "not a git repository".to_string(),
+        };
+    };
+
+    resolve_local_git_head(repository_identity, |query| match query {
+        LocalHeadQuery::SymbolicHead => git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]),
+        LocalHeadQuery::RefCommit(full_ref) => {
+            git_capture(path, &["rev-parse", &format!("{full_ref}^{{commit}}")])
+        }
+        LocalHeadQuery::HeadCommit => git_capture(path, &["rev-parse", "HEAD^{commit}"]),
+        LocalHeadQuery::VerifyHead => git_capture(path, &["rev-parse", "--verify", "HEAD"]),
+    })
 }
 
 /// Run `git <args>` in `path`, returning trimmed stdout on success.
@@ -437,6 +453,45 @@ mod command_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    fn resolve_script(
+        script: impl IntoIterator<Item = (LocalHeadQuery, Option<&'static str>)>,
+    ) -> LocalGitHeadObservation {
+        let mut script: VecDeque<_> = script.into_iter().collect();
+        let observed = resolve_local_git_head("repo".to_string(), |query| {
+            let (expected, value) = script.pop_front().expect("unexpected HEAD query");
+            assert_eq!(expected, query);
+            value.map(str::to_string)
+        });
+        assert!(script.is_empty(), "unconsumed HEAD queries: {script:?}");
+        observed
+    }
+
+    fn named_attempt(
+        first_ref: &'static str,
+        oid: Option<&'static str>,
+        second_ref: Option<&'static str>,
+    ) -> [(LocalHeadQuery, Option<&'static str>); 3] {
+        [
+            (LocalHeadQuery::SymbolicHead, Some(first_ref)),
+            (LocalHeadQuery::RefCommit(first_ref.to_string()), oid),
+            (LocalHeadQuery::SymbolicHead, second_ref),
+        ]
+    }
+
+    fn detached_attempt(
+        first_oid: Option<&'static str>,
+        second_oid: Option<&'static str>,
+        symbolic_head: Option<&'static str>,
+    ) -> [(LocalHeadQuery, Option<&'static str>); 4] {
+        [
+            (LocalHeadQuery::SymbolicHead, None),
+            (LocalHeadQuery::HeadCommit, first_oid),
+            (LocalHeadQuery::HeadCommit, second_oid),
+            (LocalHeadQuery::SymbolicHead, symbolic_head),
+        ]
+    }
 
     fn git(path: &std::path::Path, args: &[&str]) {
         let status = command()
@@ -474,6 +529,121 @@ mod tests {
         git(path, &["add", name]);
         git(path, &["commit", "-m", "commit"]);
         git_out(path, &["rev-parse", "HEAD^{commit}"])
+    }
+
+    #[test]
+    fn deterministic_snapshot_accepts_stable_named_branch() {
+        assert_eq!(
+            resolve_script(named_attempt(
+                "refs/heads/main",
+                Some("main-oid"),
+                Some("refs/heads/main")
+            )),
+            LocalGitHeadObservation::NamedBranch {
+                repository_identity: "repo".to_string(),
+                branch_name: "main".to_string(),
+                head_oid: "main-oid".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn deterministic_snapshot_retries_branch_change_without_cross_pairing() {
+        let script = named_attempt(
+            "refs/heads/main",
+            Some("main-oid"),
+            Some("refs/heads/feature"),
+        )
+        .into_iter()
+        .chain(named_attempt(
+            "refs/heads/feature",
+            Some("feature-oid"),
+            Some("refs/heads/feature"),
+        ));
+
+        assert_eq!(
+            resolve_script(script),
+            LocalGitHeadObservation::NamedBranch {
+                repository_identity: "repo".to_string(),
+                branch_name: "feature".to_string(),
+                head_oid: "feature-oid".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn deterministic_snapshot_accepts_only_stable_detached_oid() {
+        assert_eq!(
+            resolve_script(detached_attempt(Some("oid"), Some("oid"), None)),
+            LocalGitHeadObservation::Detached {
+                repository_identity: "repo".to_string(),
+                head_oid: "oid".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn deterministic_snapshot_recognizes_unborn_named_head() {
+        let script = named_attempt("refs/heads/topic", None, Some("refs/heads/topic"))
+            .into_iter()
+            .chain([(LocalHeadQuery::VerifyHead, None)]);
+        assert_eq!(
+            resolve_script(script),
+            LocalGitHeadObservation::Unborn {
+                repository_identity: "repo".to_string(),
+                branch_name: Some("topic".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn deterministic_snapshot_retries_transient_failures() {
+        let script = detached_attempt(None, None, None)
+            .into_iter()
+            .chain(named_attempt(
+                "refs/heads/main",
+                Some("oid"),
+                Some("refs/heads/main"),
+            ));
+        assert_eq!(
+            resolve_script(script),
+            LocalGitHeadObservation::NamedBranch {
+                repository_identity: "repo".to_string(),
+                branch_name: "main".to_string(),
+                head_oid: "oid".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn deterministic_snapshot_exhausts_six_attempts_before_unavailable() {
+        let script = (0..LOCAL_HEAD_MAX_ATTEMPTS)
+            .flat_map(|_| detached_attempt(Some("old"), Some("new"), None))
+            .chain([(LocalHeadQuery::VerifyHead, Some("new"))]);
+        assert_eq!(
+            resolve_script(script),
+            LocalGitHeadObservation::Unavailable {
+                repository_identity: Some("repo".to_string()),
+                error: "unable to resolve HEAD state".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn deterministic_snapshot_preserves_known_branch_after_retry_exhaustion_to_unborn() {
+        let first = named_attempt("refs/heads/topic", Some("oid"), Some("refs/heads/other"));
+        let rest = (1..LOCAL_HEAD_MAX_ATTEMPTS).flat_map(|_| detached_attempt(None, None, None));
+        let script = first
+            .into_iter()
+            .chain(rest)
+            .chain([(LocalHeadQuery::VerifyHead, None)]);
+        assert_eq!(
+            resolve_script(script),
+            LocalGitHeadObservation::Unborn {
+                repository_identity: "repo".to_string(),
+                branch_name: Some("topic".to_string()),
+            }
+        );
     }
 
     #[test]
@@ -575,13 +745,13 @@ mod tests {
 
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                for _ in 0..200 {
+                for _ in 0..3 {
                     git(repo.path(), &["checkout", "feature"]);
                     git(repo.path(), &["checkout", "main"]);
                 }
             });
 
-            for _ in 0..200 {
+            for _ in 0..6 {
                 match observe_local_git_head(repo.path()) {
                     LocalGitHeadObservation::NamedBranch {
                         branch_name,
