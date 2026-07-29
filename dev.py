@@ -118,7 +118,11 @@ class CheckWorkProfile:
     started_thread_ns: int
     started_wall_ns: int
     started_monotonic_ns: int
+    initial_git_sha: str
+    initial_git_dirty: bool
     finalized_cpu: dict | None = None
+    finalized_wall_ns: int | None = None
+    finalized_monotonic_ns: int | None = None
 
     @classmethod
     def start(cls, artifact_dir: Path | None = None):
@@ -126,6 +130,14 @@ class CheckWorkProfile:
         run_id = uuid.uuid4().hex
         artifact_dir = artifact_dir or ROOT / "target" / "check-profile" / run_id
         artifact_dir = artifact_dir.resolve()
+        initial_git_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT,
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        initial_git_dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT,
+            capture_output=True, text=True, check=False,
+        ).stdout.strip())
         if artifact_dir.exists() and any(artifact_dir.iterdir()):
             raise ValueError(f"profile artifact directory must be empty: {artifact_dir}")
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -137,10 +149,14 @@ class CheckWorkProfile:
             started_thread_ns=time.thread_time_ns(),
             started_wall_ns=time.time_ns(),
             started_monotonic_ns=time.monotonic_ns(),
+            initial_git_sha=initial_git_sha,
+            initial_git_dirty=initial_git_dirty,
         )
 
     def finalize_cpu(self) -> dict:
         if self.finalized_cpu is None:
+            self.finalized_wall_ns = time.time_ns()
+            self.finalized_monotonic_ns = time.monotonic_ns()
             self_usage = resource.getrusage(resource.RUSAGE_SELF)
             child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
             self_cpu = _rusage_delta_attributes(
@@ -447,7 +463,10 @@ def _start_dev_command_tracing(command: str) -> None:
     _DEV_TRACING = _init_dev_tracing()
     if _DEV_TRACING is None:
         return
-    _DEV_TRACING.command_started_at = time.monotonic()
+    _DEV_TRACING.command_started_at = (
+        _CHECK_PROFILE.started_monotonic_ns / 1_000_000_000.0
+        if _CHECK_PROFILE is not None else time.monotonic()
+    )
     attributes = {"dev.command": command}
     if _CHECK_PROFILE is not None:
         attributes.update({
@@ -456,7 +475,10 @@ def _start_dev_command_tracing(command: str) -> None:
             "check.profile_artifact_dir": _display_path(_CHECK_PROFILE.artifact_dir),
         })
     _DEV_TRACING.command_span = _DEV_TRACING.tracer.start_span(
-        "dev.command", attributes=attributes
+        "dev.command", attributes=attributes,
+        start_time=(
+            _CHECK_PROFILE.started_wall_ns if _CHECK_PROFILE is not None else None
+        ),
     )
 
 
@@ -5299,14 +5321,8 @@ def cmd_check(
         selected_compiler_cache = _configure_compiler_cache(compiler_cache)
     if _CHECK_PROFILE is not None and _DEV_TRACING is not None:
         profile_metadata = {
-            "check.profile.git_sha": subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=ROOT,
-                capture_output=True, text=True, check=False,
-            ).stdout.strip(),
-            "check.profile.git_dirty": bool(subprocess.run(
-                ["git", "status", "--porcelain"], cwd=ROOT,
-                capture_output=True, text=True, check=False,
-            ).stdout.strip()),
+            "check.profile.git_sha": _CHECK_PROFILE.initial_git_sha,
+            "check.profile.git_dirty": _CHECK_PROFILE.initial_git_dirty,
             "check.profile.host_platform": sys.platform,
             "check.profile.host_machine": platform.machine(),
             "check.profile.python_version": platform.python_version(),
@@ -5611,6 +5627,22 @@ def cmd_check(
 
     if profile_work and _CHECK_PROFILE is not None:
         command_cpu = _CHECK_PROFILE.finalize_cpu()
+        assert _CHECK_PROFILE.finalized_wall_ns is not None
+        assert _CHECK_PROFILE.finalized_monotonic_ns is not None
+        if _DEV_TRACING is not None and _DEV_TRACING.command_span is not None:
+            trace_attributes = {
+                "dev.elapsed_seconds": (
+                    _CHECK_PROFILE.finalized_monotonic_ns
+                    - _CHECK_PROFILE.started_monotonic_ns
+                ) / 1_000_000_000.0,
+                "dev.success": not failures,
+                **command_cpu,
+            }
+            _DEV_TRACING.finish_span(
+                _DEV_TRACING.command_span, trace_attributes,
+                failed=bool(failures), end_time=_CHECK_PROFILE.finalized_wall_ns,
+            )
+            _DEV_TRACING.command_span = None
         command_path = _CHECK_PROFILE.artifact_dir / "command.json"
         command_path.write_text(json.dumps({
             "schema_version": 1,
@@ -5621,19 +5653,16 @@ def cmd_check(
             "system_cpu_ms": command_cpu["cpu.system_ms"],
             "total_cpu_ms": command_cpu["cpu.total_ms"],
             "started_unix_ns": _CHECK_PROFILE.started_wall_ns,
-            "wall_ms": (time.monotonic_ns() - _CHECK_PROFILE.started_monotonic_ns) / 1_000_000.0,
+            "wall_ms": (
+                _CHECK_PROFILE.finalized_monotonic_ns
+                - _CHECK_PROFILE.started_monotonic_ns
+            ) / 1_000_000.0,
             "tree_closure": "command_reaped_descendants_unverified",
             "status": "failed" if failures else "passed",
             "returncode": 1 if failures else 0,
             "metadata": {
-                "git_sha": subprocess.run(
-                    ["git", "rev-parse", "HEAD"], cwd=ROOT,
-                    capture_output=True, text=True, check=False,
-                ).stdout.strip(),
-                "git_dirty": bool(subprocess.run(
-                    ["git", "status", "--porcelain"], cwd=ROOT,
-                    capture_output=True, text=True, check=False,
-                ).stdout.strip()),
+                "git_sha": _CHECK_PROFILE.initial_git_sha,
+                "git_dirty": _CHECK_PROFILE.initial_git_dirty,
                 "host_platform": sys.platform,
                 "host_machine": platform.machine(),
                 "python_version": platform.python_version(),
@@ -9621,6 +9650,8 @@ def main():
         args.profile_work = True
     _bootstrap_dev_tracing()
     if args.command == "check" and getattr(args, "profile_work", False):
+        # Provider imports/initialization are outside the measured check interval.
+        _init_dev_tracing()
         try:
             # CPU, wall, and trace intervals intentionally begin after the
             # optional tracing dependency bootstrap has completed.

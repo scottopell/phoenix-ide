@@ -146,6 +146,8 @@ class DevTracingTests(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(first["cpu.total_ms"], second["cpu.total_ms"])
+        self.assertIsNotNone(profile.finalized_wall_ns)
+        self.assertIsNotNone(profile.finalized_monotonic_ns)
 
     def test_profile_start_captures_wall_and_monotonic_boundaries(self):
         profile = self.dev.CheckWorkProfile.start()
@@ -299,6 +301,7 @@ class DevTracingTests(unittest.TestCase):
                 run_id="run", artifact_dir=Path(directory),
                 started_self=mock.Mock(), started_children=mock.Mock(),
                 started_thread_ns=0, started_wall_ns=0, started_monotonic_ns=0,
+                initial_git_sha="abc", initial_git_dirty=False,
             )
             config = self.dev._write_nextest_profile_config(profile).read_text()
 
