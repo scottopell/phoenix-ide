@@ -105,6 +105,7 @@ impl SupervisorHandle {
                 state,
                 epoch: 0,
                 recovery_from: None,
+                next_call_id: 1,
                 stdio_active: false,
                 stdio_queue: VecDeque::new(),
             }
@@ -281,6 +282,7 @@ pub(crate) enum RecoveryClaim {
 struct QueuedCall {
     epoch: u64,
     context: CallContext,
+    call_id: u64,
     tool: String,
     arguments: Value,
     cancel: CancellationToken,
@@ -306,6 +308,9 @@ enum Command {
         context: CallContext,
         result: Result<String, McpRequestError>,
         reply: oneshot::Sender<Result<CallOutcome, String>>,
+    },
+    CancelQueued {
+        call_id: u64,
     },
     Inspect {
         reply: oneshot::Sender<Result<DefinitionsOutcome, String>>,
@@ -346,6 +351,7 @@ struct Actor {
     state: SupervisorState,
     epoch: u64,
     recovery_from: Option<u64>,
+    next_call_id: u64,
     stdio_active: bool,
     stdio_queue: VecDeque<QueuedCall>,
 }
@@ -408,9 +414,18 @@ impl Actor {
                         }
                     });
                 } else {
+                    let call_id = self.next_call_id;
+                    self.next_call_id = self.next_call_id.wrapping_add(1);
+                    let cancellation = cancel.clone();
+                    let mailbox = self.mailbox.clone();
+                    tokio::spawn(async move {
+                        cancellation.cancelled().await;
+                        let _ = mailbox.send(Command::CancelQueued { call_id }).await;
+                    });
                     self.stdio_queue.push_back(QueuedCall {
                         epoch,
                         context,
+                        call_id,
                         tool,
                         arguments,
                         cancel,
@@ -435,20 +450,40 @@ impl Actor {
                     self.start_next_stdio_call();
                 }
             }
+            Command::CancelQueued { call_id } => {
+                if let Some(position) = self
+                    .stdio_queue
+                    .iter()
+                    .position(|queued| queued.call_id == call_id)
+                {
+                    let queued = self
+                        .stdio_queue
+                        .remove(position)
+                        .expect("queued call exists");
+                    let _ = queued.reply.send(Ok(queued
+                        .context
+                        .outcome(queued.epoch, Err(McpRequestError::Cancelled))));
+                }
+            }
             Command::Inspect { reply } => {
                 let SupervisorState::Ready(server) = &self.state else {
                     let _ = reply.send(Err(self.not_ready_message()));
                     return;
                 };
                 let epoch = self.epoch;
-                let result = if server
+                let stale = server
                     .tools_changed
-                    .swap(false, std::sync::atomic::Ordering::AcqRel)
-                {
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let result = if stale {
                     server.list_tools().await
                 } else {
                     Ok(server.tools())
                 };
+                if result.is_ok() {
+                    server
+                        .tools_changed
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
                 let recoverable = result
                     .as_ref()
                     .err()

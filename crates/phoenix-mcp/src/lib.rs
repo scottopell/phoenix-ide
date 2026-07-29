@@ -2447,35 +2447,41 @@ impl McpClientManager {
         }
         match handle.claim_recovery(observed_epoch).await {
             RecoveryClaim::Leader(permit) => {
-                let result = Self::connect_one(
-                    server_name,
-                    &permit.config,
-                    Arc::clone(&self.pending_oauth_urls),
-                    Arc::clone(&self.oauth),
-                )
-                .await;
-                match result {
-                    Ok(server) => {
-                        if handle.publish(permit.epoch, server).await {
-                            Ok(())
-                        } else {
-                            Err("MCP recovery was superseded".to_string())
+                let pending = Arc::clone(&self.pending_oauth_urls);
+                let oauth = Arc::clone(&self.oauth);
+                let name = server_name.to_string();
+                let leader = handle.clone();
+                let mut task = tokio::spawn(async move {
+                    let result =
+                        Self::connect_one(&name, &permit.config, Arc::clone(&pending), oauth).await;
+                    match result {
+                        Ok(server) => {
+                            if leader.publish(permit.epoch, server).await {
+                                pending.write().await.remove(&name);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(url) = pending.read().await.get(&name).cloned() {
+                                leader.unauthorized(permit.epoch, url, error).await;
+                            } else {
+                                leader.fail(permit.epoch, error).await;
+                            }
                         }
                     }
-                    Err(error) => {
-                        if let Some(url) = self
-                            .pending_oauth_urls
-                            .read()
-                            .await
-                            .get(server_name)
-                            .cloned()
-                        {
-                            handle.unauthorized(permit.epoch, url, error.clone()).await;
-                        } else {
-                            handle.fail(permit.epoch, error.clone()).await;
+                });
+                if let Some(cancel) = cancel {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            self.track_background_task(task);
+                            Err(format!("MCP server '{server_name}': tool call cancelled"))
                         }
-                        Err(error)
+                        result = &mut task => result
+                            .map_err(|error| format!("MCP recovery task failed: {error}")),
                     }
+                } else {
+                    task.await
+                        .map_err(|error| format!("MCP recovery task failed: {error}"))
                 }
             }
             RecoveryClaim::Follow(mut snapshots) => loop {
