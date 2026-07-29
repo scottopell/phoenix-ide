@@ -3365,7 +3365,6 @@ impl Database {
         cwd: &str,
         user_initiated: bool,
         model: Option<&str>,
-        effort: Option<ModelEffort>,
         conv_mode: &ConvMode,
         desired_base_branch: Option<&str>,
         seed_parent_id: Option<&str>,
@@ -3410,7 +3409,7 @@ impl Database {
             .bind(&creation_state_json)
             .bind(&now_str)
             .bind(model)
-            .bind(effort.map(ModelEffort::as_wire_name))
+            .bind(job.intent.effort.map(ModelEffort::as_wire_name))
             .bind(desired_base_branch)
             .bind(seed_parent_id)
             .bind(seed_label)
@@ -3481,7 +3480,7 @@ impl Database {
             project_id: None,
             conv_mode: conv_mode.clone(),
             runtime_role: RuntimeRole::User,
-            effort,
+            effort: job.intent.effort,
             work_scope_id: Some(created_work_scope_id),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,

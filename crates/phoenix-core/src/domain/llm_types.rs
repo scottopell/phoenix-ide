@@ -840,6 +840,8 @@ impl LlmResponse {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    // owned: pre-feature persisted usage blobs had no reasoning token count.
+    #[serde(default)]
     pub reasoning_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation_tokens: u64,
@@ -861,6 +863,18 @@ impl Usage {
 #[cfg(test)]
 mod attempt_capture_tests {
     use super::*;
+
+    #[test]
+    fn historical_usage_without_reasoning_tokens_deserializes_losslessly() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 5
+        }))
+        .unwrap();
+        assert_eq!(usage.reasoning_tokens, None);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+    }
 
     #[test]
     fn pre_dispatch_cancellation_is_not_a_provider_attempt() {

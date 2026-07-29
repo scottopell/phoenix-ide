@@ -1982,7 +1982,6 @@ let shell_model = selected_model.clone();
             &effective_cwd,
             true,
             Some(shell_model.as_str()),
-            req.effort,
             &conv_mode,
             desired_base_branch,
             req.seed_parent_id.as_deref(),
