@@ -39,6 +39,14 @@ pub enum ActiveDirectTurnTerminal {
     Failed { reason: String },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveDirectTurnSettlement {
+    pub turn: ActiveDirectTurn,
+    pub terminal: ActiveDirectTurnTerminal,
+    pub state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthoritativeUserMessageAdoptionInput {
     pub authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
@@ -153,10 +161,9 @@ pub trait MessageStore: Send + Sync {
         conversation_id: &str,
     ) -> Result<Option<LoadedActiveDirectTurn>, String>;
 
-    async fn terminate_active_direct_turn(
+    async fn settle_active_direct_turn(
         &self,
-        turn: &ActiveDirectTurn,
-        terminal: ActiveDirectTurnTerminal,
+        settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String>;
 
     /// Update `display_data` for an existing message
@@ -482,12 +489,11 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).load_active_direct_turn(conversation_id).await
     }
 
-    async fn terminate_active_direct_turn(
+    async fn settle_active_direct_turn(
         &self,
-        turn: &ActiveDirectTurn,
-        terminal: ActiveDirectTurnTerminal,
+        settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String> {
-        (**self).terminate_active_direct_turn(turn, terminal).await
+        (**self).settle_active_direct_turn(settlement).await
     }
 
     async fn update_message_display_data(
@@ -715,6 +721,27 @@ impl DatabaseStorage {
     }
 }
 
+fn direct_turn_terminal_command(
+    turn: &ActiveDirectTurn,
+    terminal: ActiveDirectTurnTerminal,
+) -> phoenix_workflow::TurnCommand {
+    match terminal {
+        ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
+            turn_id: turn.turn_id,
+            expected_generation: turn.generation,
+        },
+        ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnCommand::Cancel {
+            turn_id: turn.turn_id,
+            expected_generation: turn.generation,
+        },
+        ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnCommand::Fail {
+            turn_id: turn.turn_id,
+            expected_generation: turn.generation,
+            reason,
+        },
+    }
+}
+
 #[async_trait]
 impl MessageStore for DatabaseStorage {
     async fn add_message(
@@ -899,31 +926,26 @@ impl MessageStore for DatabaseStorage {
         .map_err(|error| error.to_string())
     }
 
-    async fn terminate_active_direct_turn(
+    async fn settle_active_direct_turn(
         &self,
-        turn: &ActiveDirectTurn,
-        terminal: ActiveDirectTurnTerminal,
+        settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String> {
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-        let command = match terminal {
-            ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
-                turn_id: turn.turn_id,
-                expected_generation: turn.generation,
+        repo.terminalize_authoritative_turn(
+            &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                command: direct_turn_terminal_command(
+                    &settlement.turn,
+                    settlement.terminal.clone(),
+                ),
+                projection: Some(phoenix_db::workflow::PersistedConversationProjection {
+                    state: settlement.state.clone(),
+                    state_updated_at: settlement.state_updated_at,
+                }),
             },
-            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnCommand::Cancel {
-                turn_id: turn.turn_id,
-                expected_generation: turn.generation,
-            },
-            ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnCommand::Fail {
-                turn_id: turn.turn_id,
-                expected_generation: turn.generation,
-                reason,
-            },
-        };
-        repo.terminate_authoritative_turn(command)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     async fn update_message_display_data(

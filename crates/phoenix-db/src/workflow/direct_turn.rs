@@ -165,6 +165,18 @@ pub struct MaterializeAuthoritativeTurnResult {
     pub message: Option<Message>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedConversationProjection {
+    pub state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalizeAuthoritativeTurnInput {
+    pub command: TurnCommand,
+    pub projection: Option<PersistedConversationProjection>,
+}
+
 fn authority_event(
     authority: &super::LocalAttemptAuthority,
     turn_id: TurnAuthorityId,
@@ -965,15 +977,43 @@ impl WorkflowRepository {
     }
 
     pub async fn terminate_authoritative_turn(&self, command: TurnCommand) -> DbResult<TurnStep> {
-        self.terminate_authoritative_turn_at_cut(command, TransactionCut::None)
+        self.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command,
+            projection: None,
+        })
+        .await
+    }
+
+    pub async fn terminalize_authoritative_turn(
+        &self,
+        input: &TerminalizeAuthoritativeTurnInput,
+    ) -> DbResult<TurnStep> {
+        self.terminalize_authoritative_turn_at_cut(input, TransactionCut::None)
             .await
     }
 
+    #[cfg(test)]
     async fn terminate_authoritative_turn_at_cut(
         &self,
         command: TurnCommand,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
+        self.terminalize_authoritative_turn_at_cut(
+            &TerminalizeAuthoritativeTurnInput {
+                command,
+                projection: None,
+            },
+            cut,
+        )
+        .await
+    }
+
+    async fn terminalize_authoritative_turn_at_cut(
+        &self,
+        input: &TerminalizeAuthoritativeTurnInput,
+        cut: TransactionCut,
+    ) -> DbResult<TurnStep> {
+        let command = input.command.clone();
         let (turn_id, expected_generation, terminal) = match &command {
             TurnCommand::Complete {
                 turn_id,
@@ -1071,6 +1111,9 @@ impl WorkflowRepository {
             return Err(conflict(TurnConflict::StaleGeneration {
                 actual: turn.generation,
             }));
+        }
+        if let Some(projection) = &input.projection {
+            update_conversation_projection_tx(&mut tx, &turn.conversation, projection).await?;
         }
         mark_active_attempts_authority_lost_tx(&mut tx, workflow_id).await?;
         delete_reclaimable_leases_tx(&mut tx, workflow_id).await?;
@@ -1513,6 +1556,28 @@ async fn insert_prepared_turn_attachments_tx(
         .bind(&file.stored_path)
         .execute(&mut **tx)
         .await?;
+    }
+    Ok(())
+}
+
+async fn update_conversation_projection_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    conversation: &ConversationAuthority,
+    projection: &PersistedConversationProjection,
+) -> DbResult<()> {
+    let state_json = serde_json::to_string(&projection.state)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let updated = sqlx::query(
+        "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+    )
+    .bind(state_json)
+    .bind(projection.state_updated_at.to_rfc3339())
+    .bind(&conversation.0)
+    .execute(&mut *tx.tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(DbError::ConversationNotFound(conversation.0.clone()));
     }
     Ok(())
 }
@@ -2681,6 +2746,73 @@ mod tests {
             }
         ));
         assert_eq!(persisted.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_projection_and_owner_release_commit_atomically() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "terminal-projection", 7))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-a'")
+            .bind(serde_json::to_string(&ConvState::LlmRequesting { attempt: 0 }).unwrap())
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let projection = PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+        };
+        let input = TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(projection.clone()),
+        };
+
+        assert!(repo
+            .terminalize_authoritative_turn_at_cut(&input, TransactionCut::BeforeCommit)
+            .await
+            .is_err());
+        let after_cut = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_cut.generation, 0);
+        assert!(after_cut.owns_conversation());
+        let state_after_cut: String =
+            sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ConvState>(&state_after_cut).unwrap(),
+            ConvState::LlmRequesting { .. }
+        ));
+
+        repo.terminalize_authoritative_turn(&input).await.unwrap();
+        let committed = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.generation, 1);
+        assert!(!committed.owns_conversation());
+        let state_after_commit: String =
+            sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConvState>(&state_after_commit).unwrap(),
+            projection.state
+        );
     }
 
     #[tokio::test]

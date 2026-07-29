@@ -2872,7 +2872,9 @@ where
             let will_drain_from_idle = matches!(self.state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
-            if !will_drain_from_idle {
+            let will_settle_active_direct_turn =
+                self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
+            if !will_drain_from_idle && !will_settle_active_direct_turn {
                 if let Some(tx) = &self.state_watcher {
                     let _ = tx.send(self.state.clone());
                 }
@@ -3015,7 +3017,11 @@ where
             return Ok(Vec::new());
         }
 
-        self.terminate_pending_direct_turn().await?;
+        if self.pending_direct_turn_terminal.is_some() {
+            return Err(
+                "terminal direct-turn transition omitted atomic state settlement".to_string(),
+            );
+        }
 
         // Publish the final state to any live-state observer after all effects
         // (including any inline steering drain) have completed. Publishing here
@@ -3122,13 +3128,31 @@ where
     /// `broadcast = false` to suppress an intermediate Idle flicker (task
     /// 60004) since the drain emits its own authoritative state-change.
     async fn persist_state_effect(&mut self, broadcast: bool) -> Result<Option<Event>, String> {
-        self.storage
-            .update_state(
-                &self.context.conversation_id,
-                &self.state,
-                self.state_updated_at,
-            )
-            .await?;
+        if let (Some(turn), Some(terminal)) = (
+            self.active_direct_turn.as_deref().cloned(),
+            self.pending_direct_turn_terminal.take(),
+        ) {
+            let settlement = crate::runtime::traits::ActiveDirectTurnSettlement {
+                turn,
+                terminal: terminal.as_ref().clone(),
+                state: self.state.clone(),
+                state_updated_at: self.state_updated_at,
+            };
+            if let Err(error) = self.storage.settle_active_direct_turn(&settlement).await {
+                self.pending_direct_turn_terminal = Some(terminal);
+                return Err(error);
+            }
+            self.active_direct_turn = None;
+            self.direct_turn_cancellation_initiated = false;
+        } else {
+            self.storage
+                .update_state(
+                    &self.context.conversation_id,
+                    &self.state,
+                    self.state_updated_at,
+                )
+                .await?;
+        }
         if broadcast {
             let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                 sequence_id: seq,
@@ -4010,26 +4034,6 @@ where
                 crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
             ));
         }
-    }
-
-    async fn terminate_pending_direct_turn(&mut self) -> Result<(), String> {
-        let (Some(active), Some(terminal)) = (
-            self.active_direct_turn.as_deref().cloned(),
-            self.pending_direct_turn_terminal.take(),
-        ) else {
-            return Ok(());
-        };
-        if let Err(error) = self
-            .storage
-            .terminate_active_direct_turn(&active, terminal.as_ref().clone())
-            .await
-        {
-            self.pending_direct_turn_terminal = Some(terminal);
-            return Err(error);
-        }
-        self.active_direct_turn = None;
-        self.direct_turn_cancellation_initiated = false;
-        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8711,6 +8715,9 @@ mod authoritative_user_message_effect_tests {
             DirectTurnMaterializationEligibility::StaleAuthority,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
         );
+        let (watch_tx, mut watch_rx) =
+            tokio::sync::watch::channel(ConvState::LlmRequesting { attempt: 1 });
+        rt = rt.with_state_watcher(watch_tx);
         let active = crate::runtime::traits::ActiveDirectTurn {
             turn_id: phoenix_workflow::TurnAuthorityId(8),
             generation: 0,
@@ -8718,23 +8725,39 @@ mod authoritative_user_message_effect_tests {
         rt = rt.with_active_direct_turn(Some(active.clone()));
         rt.state = ConvState::LlmRequesting { attempt: 1 };
 
-        rt.process_event(Event::LlmResponse {
-            content: Vec::new(),
-            tool_calls: Vec::new(),
-            end_turn: true,
-            usage: phoenix_llm::Usage::default(),
-            request_id: "response".to_string(),
-        })
-        .await
-        .unwrap();
+        let (settlement_started, release_settlement) = storage.gate_active_direct_turn_settlement();
+        {
+            let transition = rt.process_event(Event::LlmResponse {
+                content: Vec::new(),
+                tool_calls: Vec::new(),
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                request_id: "response".to_string(),
+            });
+            tokio::pin!(transition);
+            tokio::select! {
+                result = settlement_started => result.expect("settlement started signal"),
+                result = &mut transition => panic!("settlement completed before gate: {result:?}"),
+            }
+            assert!(matches!(
+                *watch_rx.borrow(),
+                ConvState::LlmRequesting { .. }
+            ));
+            assert!(!watch_rx.has_changed().unwrap());
+            release_settlement.send(()).unwrap();
+            transition.as_mut().await.unwrap();
+        }
+        watch_rx.changed().await.unwrap();
+        assert!(matches!(*watch_rx.borrow(), ConvState::Idle));
 
+        let settlements = storage.recorded_settle_active_direct_turn_calls();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].turn, active);
         assert_eq!(
-            storage.recorded_terminate_active_direct_turn_calls(),
-            vec![(
-                active,
-                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
-            )]
+            settlements[0].terminal,
+            crate::runtime::traits::ActiveDirectTurnTerminal::Completed
         );
+        assert!(matches!(settlements[0].state, ConvState::Idle));
         assert_eq!(rt.active_direct_turn, None);
         assert_eq!(rt.pending_direct_turn_terminal, None);
     }
@@ -8762,13 +8785,14 @@ mod authoritative_user_message_effect_tests {
         .await
         .unwrap();
 
+        let settlements = storage.recorded_settle_active_direct_turn_calls();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].turn, active);
         assert_eq!(
-            storage.recorded_terminate_active_direct_turn_calls(),
-            vec![(
-                active,
-                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
-            )]
+            settlements[0].terminal,
+            crate::runtime::traits::ActiveDirectTurnTerminal::Completed
         );
+        assert!(matches!(settlements[0].state, ConvState::Idle));
         assert_eq!(rt.active_direct_turn, None);
     }
 
@@ -8793,7 +8817,7 @@ mod authoritative_user_message_effect_tests {
 
         assert!(matches!(rt.state, ConvState::Idle));
         assert!(storage
-            .recorded_terminate_active_direct_turn_calls()
+            .recorded_settle_active_direct_turn_calls()
             .is_empty());
         assert!(matches!(
             broadcast_rx.try_recv(),
@@ -8846,13 +8870,14 @@ mod authoritative_user_message_effect_tests {
         .await
         .unwrap();
 
+        let settlements = storage.recorded_settle_active_direct_turn_calls();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].turn, active);
         assert_eq!(
-            storage.recorded_terminate_active_direct_turn_calls(),
-            vec![(
-                active,
-                crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
-            )]
+            settlements[0].terminal,
+            crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled
         );
+        assert!(matches!(settlements[0].state, ConvState::Idle));
         assert_eq!(rt.active_direct_turn, None);
     }
 
@@ -8876,15 +8901,19 @@ mod authoritative_user_message_effect_tests {
         .await
         .unwrap();
 
+        let settlements = storage.recorded_settle_active_direct_turn_calls();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].turn, active);
         assert_eq!(
-            storage.recorded_terminate_active_direct_turn_calls(),
-            vec![(
-                active,
-                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
-                    reason: reason.to_string(),
-                },
-            )]
+            settlements[0].terminal,
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                reason: reason.to_string(),
+            }
         );
+        assert!(matches!(
+            &settlements[0].state,
+            ConvState::Error { message, .. } if message == reason
+        ));
         assert_eq!(rt.active_direct_turn, None);
     }
 
@@ -8950,18 +8979,20 @@ mod authoritative_user_message_effect_tests {
                 generation: 0,
             }));
             rt.classify_active_direct_turn_terminal(&event, &new_state);
-            rt.terminate_pending_direct_turn().await.unwrap();
-            rt.terminate_pending_direct_turn().await.unwrap();
+            rt.state = new_state.clone();
+            rt.persist_state_effect(false).await.unwrap();
+            rt.persist_state_effect(false).await.unwrap();
+            let settlements = storage.recorded_settle_active_direct_turn_calls();
+            assert_eq!(settlements.len(), 1);
             assert_eq!(
-                storage.recorded_terminate_active_direct_turn_calls(),
-                vec![(
-                    crate::runtime::traits::ActiveDirectTurn {
-                        turn_id: phoenix_workflow::TurnAuthorityId(9),
-                        generation: 0,
-                    },
-                    expected,
-                )]
+                settlements[0].turn,
+                crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(9),
+                    generation: 0,
+                }
             );
+            assert_eq!(settlements[0].terminal, expected);
+            assert_eq!(settlements[0].state, new_state);
         }
     }
 
@@ -8988,15 +9019,17 @@ mod authoritative_user_message_effect_tests {
             },
             &ConvState::Idle,
         );
-        rt.terminate_pending_direct_turn().await.unwrap();
+        rt.state = ConvState::Idle;
+        rt.persist_state_effect(false).await.unwrap();
         assert!(matches!(
             storage
-                .recorded_terminate_active_direct_turn_calls()
+                .recorded_settle_active_direct_turn_calls()
                 .as_slice(),
-            [(
-                _,
-                crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled
-            )]
+            [crate::runtime::traits::ActiveDirectTurnSettlement {
+                terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
+                state: ConvState::Idle,
+                ..
+            }]
         ));
     }
 

@@ -3074,10 +3074,14 @@ impl RuntimeManager {
                 None
             };
             if let Some(terminal) = recovered_terminal {
-                crate::runtime::traits::MessageStore::terminate_active_direct_turn(
+                crate::runtime::traits::MessageStore::settle_active_direct_turn(
                     &storage,
-                    &loaded.active,
-                    terminal,
+                    &crate::runtime::traits::ActiveDirectTurnSettlement {
+                        turn: loaded.active,
+                        terminal,
+                        state: initial_state.clone(),
+                        state_updated_at: initial_state_updated_at,
+                    },
                 )
                 .await?;
                 None

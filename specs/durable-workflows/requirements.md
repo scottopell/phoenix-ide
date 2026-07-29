@@ -464,6 +464,13 @@ collapsing independently claimable LLM or tool effects into one scalar turn phas
 A terminal command SHALL atomically advance generation, release live conversation
 ownership, and interrupt or suppress every nonterminal child effect.
 
+WHEN a materialized runtime direct turn reaches a terminal or rest reducer state
+THE SYSTEM SHALL persist that reducer projection in the same transaction as the terminal command
+AND SHALL NOT publish the terminal or rest state to live observers before that transaction commits.
+
+WHEN recovery derives a terminal or rest reducer state for a materialized turn that still owns the conversation
+THE SYSTEM SHALL use the same atomic settlement transaction to repair the projection and release ownership.
+
 ### REQ-DWF-CHAT-014: Deterministic Crash and Interleaving Verification
 
 WHEN direct-turn behavior is verified

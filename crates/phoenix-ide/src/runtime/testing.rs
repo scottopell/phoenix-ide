@@ -533,12 +533,9 @@ pub struct InMemoryStorage {
     materialize_authoritative_user_message_calls:
         Mutex<Vec<MaterializeAuthoritativeUserMessageCall>>,
     active_direct_turn: Mutex<Option<crate::runtime::traits::ActiveDirectTurn>>,
-    terminate_active_direct_turn_calls: Mutex<
-        Vec<(
-            crate::runtime::traits::ActiveDirectTurn,
-            crate::runtime::traits::ActiveDirectTurnTerminal,
-        )>,
-    >,
+    settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
+    settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -562,7 +559,9 @@ impl InMemoryStorage {
             preflight_authoritative_user_message_calls: Mutex::new(Vec::new()),
             materialize_authoritative_user_message_calls: Mutex::new(Vec::new()),
             active_direct_turn: Mutex::new(None),
-            terminate_active_direct_turn_calls: Mutex::new(Vec::new()),
+            settle_active_direct_turn_calls: Mutex::new(Vec::new()),
+            settle_active_direct_turn_started: Mutex::new(None),
+            settle_active_direct_turn_release: Mutex::new(None),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -668,16 +667,23 @@ impl InMemoryStorage {
         *self.active_direct_turn.lock().unwrap() = active;
     }
 
-    pub fn recorded_terminate_active_direct_turn_calls(
+    pub fn recorded_settle_active_direct_turn_calls(
         &self,
-    ) -> Vec<(
-        crate::runtime::traits::ActiveDirectTurn,
-        crate::runtime::traits::ActiveDirectTurnTerminal,
-    )> {
-        self.terminate_active_direct_turn_calls
-            .lock()
-            .unwrap()
-            .clone()
+    ) -> Vec<crate::runtime::traits::ActiveDirectTurnSettlement> {
+        self.settle_active_direct_turn_calls.lock().unwrap().clone()
+    }
+
+    pub fn gate_active_direct_turn_settlement(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.settle_active_direct_turn_started.lock().unwrap() = Some(started_tx);
+        *self.settle_active_direct_turn_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
     }
 
     pub fn recorded_materialize_authoritative_user_message_calls(
@@ -901,15 +907,30 @@ impl MessageStore for InMemoryStorage {
             }))
     }
 
-    async fn terminate_active_direct_turn(
+    async fn settle_active_direct_turn(
         &self,
-        turn: &crate::runtime::traits::ActiveDirectTurn,
-        terminal: crate::runtime::traits::ActiveDirectTurnTerminal,
+        settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
     ) -> Result<(), String> {
-        self.terminate_active_direct_turn_calls
+        self.settle_active_direct_turn_calls
             .lock()
             .unwrap()
-            .push((turn.clone(), terminal));
+            .push(settlement.clone());
+        if let Some(started) = self
+            .settle_active_direct_turn_started
+            .lock()
+            .unwrap()
+            .take()
+        {
+            let _ = started.send(());
+        }
+        let release = self
+            .settle_active_direct_turn_release
+            .lock()
+            .unwrap()
+            .take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         *self.active_direct_turn.lock().unwrap() = None;
         Ok(())
     }
