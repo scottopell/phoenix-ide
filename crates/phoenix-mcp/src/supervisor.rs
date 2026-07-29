@@ -473,16 +473,16 @@ impl Actor {
                 let epoch = self.epoch;
                 let stale = server
                     .tools_changed
-                    .load(std::sync::atomic::Ordering::Acquire);
+                    .swap(false, std::sync::atomic::Ordering::AcqRel);
                 let result = if stale {
                     server.list_tools().await
                 } else {
                     Ok(server.tools())
                 };
-                if result.is_ok() {
+                if result.is_err() {
                     server
                         .tools_changed
-                        .store(false, std::sync::atomic::Ordering::Release);
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
                 let recoverable = result
                     .as_ref()

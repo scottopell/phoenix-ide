@@ -1918,7 +1918,14 @@ impl McpClientManager {
                 .find(|(_, flow)| flow.state_nonce == state_nonce)
                 .map(|(name, _)| name.clone())
         }?;
-        let config = self.cancel_pending_oauth_flow(&name).await;
+        let flow = {
+            let mut pending = self.oauth.pending.lock().unwrap();
+            pending.remove(&name)
+        };
+        if let Some(handle) = self.oauth.loopback_listeners.lock().unwrap().remove(&name) {
+            handle.abort();
+        }
+        self.pending_oauth_urls.write().await.remove(&name);
         tracing::warn!(
             server = %name,
             error = %error,
@@ -1927,13 +1934,10 @@ impl McpClientManager {
         // Retain the denial as a failure rather than letting the server vanish
         // from status (REQ-MCP-018). The pending URL is already cleared, so
         // this records `failed`, not `unauthorized`.
-        if config.is_some() {
-            if let Some(handle) = self.servers.read().await.get(&name).cloned() {
-                let snapshot = handle.snapshot();
-                handle
-                    .fail(snapshot.epoch, format!("authorization failed: {error}"))
-                    .await;
-            }
+        if let Some((handle, epoch)) = flow.and_then(|flow| flow.owner) {
+            handle
+                .fail(epoch, format!("authorization failed: {error}"))
+                .await;
         }
         Some(name)
     }
@@ -2109,20 +2113,18 @@ impl McpClientManager {
         self.disabled_servers.write().await.remove(name);
     }
 
-    async fn begin_actor_connect(
+    fn begin_actor_connect_at_epoch(
         &self,
         name: String,
-        config: McpServerConfig,
+        config: &McpServerConfig,
         handle: SupervisorHandle,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+        epoch: u64,
+    ) -> tokio::task::JoinHandle<()> {
         let connect_name = name.clone();
         let connect_config = config.clone();
         let pending = Arc::clone(&self.pending_oauth_urls);
         let oauth = Arc::clone(&self.oauth);
-        let Ok(epoch) = handle.reconfigure(config).await else {
-            return None;
-        };
-        Some(tokio::spawn(async move {
+        tokio::spawn(async move {
             match Self::connect_one(&connect_name, &connect_config, Arc::clone(&pending), oauth)
                 .await
             {
@@ -2139,7 +2141,17 @@ impl McpClientManager {
                     }
                 }
             }
-        }))
+        })
+    }
+
+    async fn begin_actor_connect(
+        &self,
+        name: String,
+        config: McpServerConfig,
+        handle: SupervisorHandle,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let epoch = handle.reconfigure(config.clone()).await.ok()?;
+        Some(self.begin_actor_connect_at_epoch(name, &config, handle, epoch))
     }
 
     async fn configure_actor(
@@ -2568,6 +2580,13 @@ impl McpClientManager {
                     }
                     RefreshServerOutcome::Transient(error) => {
                         handle.fail(permit.epoch, error.clone()).await;
+                        let reconnect = self.begin_actor_connect_at_epoch(
+                            server_name.to_string(),
+                            &permit.config,
+                            handle.clone(),
+                            permit.epoch,
+                        );
+                        self.track_background_task(reconnect);
                         Err(McpToolCallError::Failed(error))
                     }
                     RefreshServerOutcome::Reprompt(error) => {
@@ -2671,9 +2690,17 @@ impl McpClientManager {
         for name in removed_names {
             if let Some(handle) = self.servers.write().await.remove(&name) {
                 self.cancel_pending_oauth_flow(&name).await;
-                let _ = self.oauth.store().delete_token(&name).await;
-                handle.remove().await;
-                removed.push(name);
+                self.pending_oauth_urls.write().await.remove(&name);
+                match self.oauth.store().delete_token(&name).await {
+                    Ok(()) => {
+                        handle.remove().await;
+                        removed.push(name);
+                    }
+                    Err(error) => {
+                        self.servers.write().await.insert(name.clone(), handle);
+                        tracing::warn!(server = %name, error = %error, "MCP token deletion failed; server removal aborted");
+                    }
+                }
             }
         }
 
