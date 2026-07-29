@@ -25,6 +25,7 @@ describe('testCpuProfile', () => {
       expect(writer).not.toBeNull()
 
       const record: TestCpuProfileRecord = {
+        schema_version: 1,
         provenance: 'windowed_process',
         pid: 123,
         file: '/tmp/example.test.ts',
@@ -88,6 +89,7 @@ describe('testCpuProfile', () => {
     const record = buildCpuProfileRecord(task as never, window)
 
     expect(record).toMatchObject({
+      schema_version: 1,
       provenance: 'windowed_process',
       pid: process.pid,
       file: 'src/example.test.ts',

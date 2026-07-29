@@ -8,6 +8,7 @@ type CpuUsage = NodeJS.CpuUsage
 type TestTaskLike = TestContext['task']
 
 export interface TestCpuProfileRecord {
+  schema_version: 1
   provenance: 'windowed_process'
   pid: number
   file: string
@@ -85,6 +86,7 @@ export function buildCpuProfileRecord(
 
   return {
     provenance: 'windowed_process',
+    schema_version: 1,
     pid: process.pid,
     file,
     project_name: task.file.projectName || null,
