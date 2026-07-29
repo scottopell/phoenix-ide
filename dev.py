@@ -5632,7 +5632,9 @@ def cmd_check(
             reporter.lane_start(lane)
             in_process_steps = {
                 "task": "task validation",
+                "spec-shape": "spec shape",
                 "spec-anchors": "spec anchors",
+                "pkglock": "pkglock-clean",
             }
             step_name = in_process_steps.get(lane)
             span = _begin_dev_span(
