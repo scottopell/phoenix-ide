@@ -309,11 +309,12 @@ variant Parent : Conversation {
     parent_status: awaiting_recovery | awaiting_task_approval
                   | awaiting_user_response | context_exhausted | handed_off
 
-    -- Provenance breadcrumb for approved-task "Start in new conversation".
-    -- Points at the source product conversation rather than a continuation predecessor.
-    -- The new conversation remains a top-level Parent with its own lifecycle; this raw id
-    -- is purely for the visible "Derived from" link and does not participate in row
-    -- ownership, continuation routing, delete cascades, or sub-agent topology.
+    -- Legacy migration input only for pre-source-relation rows.
+    -- Non-authoritative: current provenance, deleted-source truth, and visible
+    -- breadcrumbs come only from the typed source relation owned by the target
+    -- ProductConversation. This raw id may be read only to backfill or interpret
+    -- legacy rows that predate typed source relations; current writers and current
+    -- readers must not treat it as live provenance authority.
     spawned_from_conversation_id: String?
 
     proposal_snapshot: TaskProposalSnapshot when parent_status = awaiting_task_approval
@@ -1367,10 +1368,12 @@ rule ContinuationBoundaryPersistenceSignature {
     )
 
     @guidance
-        -- Downstream consumers use the typed persisted boundary signature as the
-        -- sole event-shape authority for the predecessor/successor join. The
-        -- summary is the exact durable continuation text, not a synthesized or
-        -- display-only derivative.
+        -- Persistence owns only the durable continuation boundary fact: root identity,
+        -- predecessor/successor join, and exact stored summary. It does not mint a
+        -- root-stream sequence id itself. Live SSE projection must bridge this
+        -- persisted boundary through the RootStreamLedger before broadcast so the
+        -- producer signature stays identical for bedrock, replay projection, and
+        -- connected root subscribers.
 }
 
 rule ProductConversationRouteResolvesLegacyMemberLinks {
@@ -1654,8 +1657,16 @@ rule CloseRetirementFailureLeavesOpenNeedsRepair {
 rule CloseNeedsRepairCanRetryRetirement {
     when: CloseRetirementRetryRequested(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
+    requires: CloseNeedsRepairVisible(product_conversation, attempt_id)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
     ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- Retry is exposed on the same visible needs-repair attempt the user sees.
+        -- It carries the exact attempt_id and requests retirement again without any
+        -- local project-surface lifecycle mutation. Automatic operator repair may also
+        -- complete by driving the same exact-attempt retirement request path, but no
+        -- hidden synthetic attempt or phase change bypasses this authority.
 }
 
 ------------------------------------------------------------

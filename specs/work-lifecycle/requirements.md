@@ -157,6 +157,24 @@ AND SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or
 
 ---
 
+### REQ-WL-002c: Needs-Repair Retry Reuses the Same Exact Close Attempt
+
+WHEN resource retirement for one exact Close attempt fails and leaves the product conversation in a visible needs-repair state
+THE SYSTEM SHALL expose a retry affordance bound to that same exact `attempt_id`
+AND SHALL issue `CloseRetirementRetryRequested(product_conversation, attempt_id)` from that visible needs-repair state rather than from a fresh local lifecycle mutation
+
+WHEN the user invokes retry from needs-repair
+THE SYSTEM SHALL request retirement again for that same exact Close attempt
+AND SHALL preserve the attempt-bound retirement evidence and residual state already recorded for prior steps
+AND SHALL NOT mint a new Close attempt, silently complete the Close obligation, or mutate project-surface lifecycle state outside the typed Close retry command
+
+WHEN repair completes automatically through operator action or an idempotent external precondition change
+THE SYSTEM SHALL converge by driving the same exact-attempt retry/completion authority rather than by fabricating an unbound success path that bypasses the visible needs-repair attempt
+
+**Rationale:** A transient retirement failure should stay user-retryable on the exact visible Close attempt. Reusing the same attempt preserves evidence continuity and avoids hidden local lifecycle drift.
+
+---
+
 ### REQ-WL-003: Pull Request State Guides Close but Never Triggers It
 
 WHEN a Git-backed conversation has one or more associated pull requests

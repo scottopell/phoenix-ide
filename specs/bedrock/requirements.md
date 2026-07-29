@@ -673,7 +673,9 @@ Start in new conversation policy
 THE SYSTEM SHALL perform the same task-approval artifact persistence
 AND create a fresh Open conversation with a fresh attached `WorkScope`
   and worktree
-AND record one visible source relation of kind `approved_task` on the new conversation that points to the source conversation
+AND record exactly one visible typed source relation of kind `approved_task` on the new conversation that points to the source conversation
+AND SHALL treat that typed source relation as the sole current authority for visible provenance, deleted-source status, and source breadcrumb derivation for the spawned conversation
+AND SHALL NOT treat any legacy raw source-conversation-id field as current writer or reader authority for approved-task provenance
 AND keep the source conversation Open rather than linking it through `continued_in_conv_id`
 AND dispatch the next LLM request only in the spawned conversation
 AND SHALL gate that dispatch on successful durable typed provisioning completion for the spawned ProductConversation and its attached `WorkScope`/worktree
@@ -833,7 +835,8 @@ AND SHALL provision a fresh detached-default-branch disposable worktree when the
 AND SHALL treat that follow-up as an independent ProductConversation rather than as a sub-agent or continuation attachment to the source `WorkScope`
 AND SHALL set the new conversation's user objective from the follow-up request rather than from the historical transcript
 AND SHALL NOT inject, copy, or summarize the source transcript into the new conversation's starting transcript
-AND SHALL record exactly one visible source relation of kind `follow_up` on the new conversation that points to the source conversation
+AND SHALL record exactly one visible typed source relation of kind `follow_up` on the new conversation that points to the source conversation
+AND SHALL derive any visible source breadcrumb or deleted-source state for that follow-up from the typed source relation rather than from continuation topology or any raw source-conversation-id field
 AND SHALL render that Follow-up relationship visibly from the source conversation
 
 **Rationale:** A follow-up from History is new work that benefits from a clean objective and a clean environment, while retaining explicit navigable provenance back to the source conversation.

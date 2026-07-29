@@ -844,7 +844,15 @@ rule ProductConversationLifecycleClaimsRootSequence {
 }
 
 rule ContinuationBoundaryClaimsRootSequence {
-    when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, summary, seq)
+    when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, summary)
+    let seq = RootStreamLedger{root_conversation_id: root_conversation_id}.last_allocated_root_sequence_id
+
+    requires: exists AggregateBoundRootNativeEventProduced(
+        root_conversation_id,
+        "continuation_boundary",
+        ContinuationBoundaryIdentity(predecessor_conversation_id, successor_conversation_id),
+        seq
+    )
 
     ensures: RootProjectedEventCommitted(
         root_conversation_id: root_conversation_id,
@@ -854,8 +862,11 @@ rule ContinuationBoundaryClaimsRootSequence {
     )
 
     @guidance
-        -- Continuation boundaries are concrete replayable root-stream carriers, not
-        -- inferred client-side joins.
+        -- ContinuationBoundaryPersisted is the durable fact without a sequence id.
+        -- The root-stream allocation happens in the explicit RootStreamLedger bridge
+        -- that materializes the aggregate-bound continuation_boundary carrier. That
+        -- bridge keeps the persisted producer signature aligned with bedrock while
+        -- still giving connected root subscribers one sequenced live boundary.
 }
 
 rule WorkScopeUpdateClaimsRootSequence {
@@ -944,8 +955,15 @@ rule AggregateBoundMemberLiveCarrierClaimsRootSequence {
 }
 
 rule ContinuationBoundaryBroadcast {
-    when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, summary, seq)
+    when: ContinuationBoundaryPersisted(root_conversation_id, predecessor_conversation_id, successor_conversation_id, summary)
+    let seq = RootStreamLedger{root_conversation_id: root_conversation_id}.last_allocated_root_sequence_id
 
+    requires: exists AggregateBoundRootNativeEventProduced(
+        root_conversation_id,
+        "continuation_boundary",
+        ContinuationBoundaryIdentity(predecessor_conversation_id, successor_conversation_id),
+        seq
+    )
     requires: seq > 0
     requires: ContinuationBoundaryPayloadParses(
         ContinuationBoundaryPayload{
@@ -973,10 +991,10 @@ rule ContinuationBoundaryBroadcast {
         -- not an ordinary message clone on either transcript side.
         --
         -- The same durable boundary appears exactly once in the init snapshot's
-        -- aggregate projection. Live persistence emits the typed carrier and advances
-        -- the ProductConversation-boundary RootStreamLedger only after the payload is
-        -- parseable, so replay and fresh snapshot agree on a single boundary fact with
-        -- no duplicate synthesis.
+        -- aggregate projection. The explicit RootStreamLedger bridge allocates and
+        -- records the continuation_boundary carrier before live delivery, so replay,
+        -- fresh snapshot, and already-connected root subscribers agree on one typed
+        -- sequenced boundary fact with no duplicate synthesis.
 }
 
 rule AggregateLifecycleProjectionBroadcast {
