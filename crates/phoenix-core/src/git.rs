@@ -744,20 +744,27 @@ mod tests {
         let main_oid = git_out(repo.path(), &["rev-parse", "HEAD^{commit}"]);
 
         std::thread::scope(|scope| {
-            let handle = scope.spawn(|| {
-                for _ in 0..3 {
-                    git(repo.path(), &["checkout", "feature"]);
-                    git(repo.path(), &["checkout", "main"]);
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let checkout_start = std::sync::Arc::clone(&start);
+            let repo_path = repo.path();
+            let handle = scope.spawn(move || {
+                checkout_start.wait();
+                for _ in 0..8 {
+                    git(repo_path, &["checkout", "feature"]);
+                    git(repo_path, &["checkout", "main"]);
                 }
             });
 
-            for _ in 0..6 {
+            start.wait();
+            let mut authoritative_snapshots = 0;
+            for _ in 0..20 {
                 match observe_local_git_head(repo.path()) {
                     LocalGitHeadObservation::NamedBranch {
                         branch_name,
                         head_oid,
                         ..
                     } => {
+                        authoritative_snapshots += 1;
                         if branch_name == "main" {
                             assert_eq!(head_oid, main_oid);
                         } else if branch_name == "feature" {
@@ -767,6 +774,7 @@ mod tests {
                         }
                     }
                     LocalGitHeadObservation::Detached { head_oid, .. } => {
+                        authoritative_snapshots += 1;
                         assert!(head_oid == main_oid || head_oid == feature_oid);
                     }
                     LocalGitHeadObservation::Unborn { .. }
@@ -774,6 +782,10 @@ mod tests {
                 }
             }
 
+            assert!(
+                authoritative_snapshots > 0,
+                "concurrent real-Git wiring produced no authoritative snapshot"
+            );
             handle.join().unwrap();
         });
     }
