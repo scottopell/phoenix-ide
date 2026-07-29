@@ -9,6 +9,7 @@ import socket
 import socketserver
 import sys
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 DEFAULT_VERSION = "2.0.0"
@@ -122,10 +123,13 @@ def main():
     signal.signal(signal.SIGINT, stop)
     server.timeout = 0.1
     if args.ready_file:
-        with open(args.ready_file, "w", encoding="utf-8") as stream:
+        ready_file = Path(args.ready_file)
+        temporary_ready_file = ready_file.with_name(f".{ready_file.name}.{os.getpid()}.tmp")
+        with open(temporary_ready_file, "w", encoding="utf-8") as stream:
             stream.write(f"{server.server_address[1]}\n")
             stream.flush()
             os.fsync(stream.fileno())
+        os.replace(temporary_ready_file, ready_file)
     else:
         print(server.server_address[1], flush=True)
     while not stopping:
