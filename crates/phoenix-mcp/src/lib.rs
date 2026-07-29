@@ -913,6 +913,7 @@ fn oauth_resource_url(config: &McpServerConfig) -> Option<&str> {
 /// name in `OAuthRuntime::pending`; the `state_nonce` binds the callback to
 /// exactly this flow.
 struct PendingAuthFlow {
+    owner: Option<(SupervisorHandle, u64)>,
     config: McpServerConfig,
     state_nonce: String,
     pkce_verifier: String,
@@ -1440,6 +1441,7 @@ async fn begin_oauth_flow(
     )?;
 
     let flow = PendingAuthFlow {
+        owner: None,
         config: entry.clone(),
         state_nonce,
         pkce_verifier: pkce.verifier,
@@ -1854,20 +1856,48 @@ impl McpClientManager {
             handle.abort();
         }
         let config = resolved.config;
+        let owner = resolved.owner;
 
         let manager = Arc::clone(self);
         let reconnect_name = name.clone();
         self.spawn_background(async move {
-            let handle = {
-                let mut servers = manager.servers.write().await;
-                servers
-                    .entry(reconnect_name.clone())
-                    .or_insert_with(|| SupervisorHandle::connecting(config.clone()))
-                    .clone()
-            };
-            manager
-                .configure_actor(reconnect_name, config, handle)
-                .await;
+            if let Some((handle, epoch)) = owner {
+                if handle.snapshot().epoch != epoch {
+                    return;
+                }
+                match Self::connect_one(
+                    &reconnect_name,
+                    &config,
+                    Arc::clone(&manager.pending_oauth_urls),
+                    Arc::clone(&manager.oauth),
+                )
+                .await
+                {
+                    Ok(server) => {
+                        if handle.publish(epoch, server).await {
+                            manager
+                                .pending_oauth_urls
+                                .write()
+                                .await
+                                .remove(&reconnect_name);
+                        }
+                    }
+                    Err(error) => {
+                        handle.fail(epoch, error).await;
+                    }
+                }
+            } else {
+                let handle = {
+                    let mut servers = manager.servers.write().await;
+                    servers
+                        .entry(reconnect_name.clone())
+                        .or_insert_with(|| SupervisorHandle::connecting(config.clone()))
+                        .clone()
+                };
+                manager
+                    .configure_actor(reconnect_name, config, handle)
+                    .await;
+            }
         });
 
         Ok(name)
@@ -1953,6 +1983,24 @@ impl McpClientManager {
                     .await
             }
         }
+    }
+
+    async fn bind_pending_flow_owner(
+        &self,
+        name: &str,
+        handle: &SupervisorHandle,
+        epoch: u64,
+    ) -> Result<(), String> {
+        if handle.snapshot().epoch != epoch {
+            self.cancel_pending_oauth_flow(name).await;
+            return Err("MCP OAuth flow was superseded before publication".to_string());
+        }
+        let mut pending = self.oauth.pending.lock().unwrap();
+        let Some(flow) = pending.get_mut(name) else {
+            return Err("MCP OAuth flow disappeared before publication".to_string());
+        };
+        flow.owner = Some((handle.clone(), epoch));
+        Ok(())
     }
 
     /// `TokenRefreshFailed`: discard the dead token and surface a fresh
@@ -2079,7 +2127,9 @@ impl McpClientManager {
                 .await
             {
                 Ok(server) => {
-                    handle.publish(epoch, server).await;
+                    if handle.publish(epoch, server).await {
+                        pending.write().await.remove(&connect_name);
+                    }
                 }
                 Err(error) => {
                     if let Some(url) = pending.read().await.get(&name).cloned() {
@@ -2515,6 +2565,9 @@ impl McpClientManager {
                         Err(McpToolCallError::Failed(error))
                     }
                     RefreshServerOutcome::Reprompt(error) => {
+                        self.bind_pending_flow_owner(server_name, handle, permit.epoch)
+                            .await
+                            .map_err(McpToolCallError::Failed)?;
                         let url = self
                             .pending_oauth_urls
                             .read()
@@ -2535,6 +2588,9 @@ impl McpClientManager {
                     handle.fail(permit.epoch, error.clone()).await;
                     return Err(McpToolCallError::Failed(error));
                 }
+                self.bind_pending_flow_owner(server_name, handle, permit.epoch)
+                    .await
+                    .map_err(McpToolCallError::Failed)?;
                 let url = self
                     .pending_oauth_urls
                     .read()
