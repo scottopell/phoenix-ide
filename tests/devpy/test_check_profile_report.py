@@ -41,6 +41,23 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertIn("inclusive", markdown)
         self.assertIn("dev.check.test", summary["traceql"]["tests"])
 
+    def test_malformed_jsonl_is_reported_without_losing_valid_rows(self):
+        report = load_report()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "python-test-cpu.jsonl").write_text(
+                json.dumps({
+                    "identity": "valid", "provenance": "windowed_process",
+                    "total_cpu_ms": 1, "wall_ms": 2,
+                }) + "\n{truncated\n"
+            )
+            summary = report.render(root, 20, "run")
+            markdown = (root / "summary.md").read_text()
+
+        self.assertEqual("valid", summary["top_cpu_records"][0]["identity"])
+        self.assertEqual(2, summary["profile_errors"][0]["line"])
+        self.assertIn("Profile record errors", markdown)
+
     def test_command_total_and_closure_are_exposed(self):
         report = load_report()
         with tempfile.TemporaryDirectory() as directory:

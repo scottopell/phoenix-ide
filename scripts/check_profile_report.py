@@ -8,13 +8,14 @@ import json
 from pathlib import Path
 
 
-def _records(root: Path):
+def _records(root: Path, errors: list[dict]):
     for path in root.rglob("*.json"):
         if path.name == "summary.json":
             continue
         try:
             value = json.loads(path.read_text())
-        except (OSError, ValueError):
+        except (OSError, ValueError) as error:
+            errors.append({"source": str(path.relative_to(root)), "line": None, "error": str(error)})
             continue
         if "total_cpu_ms" in value or "cpu_ms" in value:
             yield path, value
@@ -23,10 +24,15 @@ def _records(root: Path):
             lines = path.read_text().splitlines()
         except OSError:
             continue
-        for line in lines:
+        for line_number, line in enumerate(lines, 1):
             try:
                 value = json.loads(line)
-            except ValueError:
+            except ValueError as error:
+                errors.append({
+                    "source": str(path.relative_to(root)),
+                    "line": line_number,
+                    "error": str(error),
+                })
                 continue
             if "total_cpu_ms" in value or "cpu_user_us" in value:
                 yield path, value
@@ -97,9 +103,10 @@ def _reconciliation(rows: list[dict]) -> list[dict]:
 
 
 def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
+    profile_errors: list[dict] = []
     rows = [
         _normalize(path.relative_to(profile_dir), value)
-        for path, value in _records(profile_dir)
+        for path, value in _records(profile_dir, profile_errors)
     ]
     ranked_rows = sorted(
         (row for row in rows if row["cpu_ms"] is not None),
@@ -114,6 +121,7 @@ def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
         "top_cpu_records": ranked_rows[:limit],
         "unavailable_cpu_records": unavailable_rows,
         "reconciliation": _reconciliation(rows),
+        "profile_errors": profile_errors,
         "traceql": {
             "command": f'{{ name = "dev.command" && span.check.profile_run_id = "{run_id}" }}',
             "steps": f'{{ name = "dev.check.step" && span.check.profile_run_id = "{run_id}" }}',
@@ -141,6 +149,13 @@ def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
         identity = row["identity"].replace("|", "\\|")
         closure = row.get("tree_closure") or "n/a"
         lines.append(f'| {row["cpu_ms"]:.1f} | {row["wall_ms"]:.1f} | {row["provenance"]} | {closure} | {row["kind"]} | `{identity}` |')
+    if profile_errors:
+        lines += ["", "## Profile record errors", ""]
+        for error in profile_errors:
+            location = error["source"]
+            if error["line"] is not None:
+                location += f':{error["line"]}'
+            lines.append(f'- `{location}`: {error["error"]}')
     if summary["reconciliation"]:
         lines += [
             "", "## Parent-child reconciliation", "",

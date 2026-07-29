@@ -44,6 +44,19 @@ class CheckProfileCommandTests(unittest.TestCase):
         self.assertIn("identity", measurement)
         self.assertIn("wall_ms", measurement)
 
+    def test_explicit_step_identity_classifies_record_as_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "record.json"
+            result = subprocess.run([
+                sys.executable, str(WRAPPER), "--output", str(output),
+                "--identity", "step:rust:cargo test", "--",
+                sys.executable, "-c", "pass",
+            ])
+            record = json.loads(output.read_text())
+
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("step", record["kind"])
+
     @unittest.skipUnless(hasattr(os, "getpgid"), "requires POSIX process groups")
     def test_wrapped_command_remains_in_wrapper_process_group(self):
         result, measurement = self.run_wrapper([

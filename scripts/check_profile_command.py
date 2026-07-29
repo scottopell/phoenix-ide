@@ -173,7 +173,11 @@ def measure(
             "command": command,
             "pid": child_pid,
             "returncode": returncode,
-            "kind": "rust_test" if nextest_name else "command",
+            "kind": (
+                "rust_test" if nextest_name
+                else "step" if (identity or "").startswith("step:")
+                else "command"
+            ),
             "test_name": nextest_name,
             "binary_id": nextest_binary,
             "attempt": os.environ.get("NEXTEST_ATTEMPT"),
