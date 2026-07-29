@@ -116,6 +116,8 @@ class CheckWorkProfile:
     started_self: resource.struct_rusage
     started_children: resource.struct_rusage
     started_thread_ns: int
+    started_wall_ns: int
+    started_monotonic_ns: int
     finalized_cpu: dict | None = None
 
     @classmethod
@@ -133,6 +135,8 @@ class CheckWorkProfile:
             started_self=resource.getrusage(resource.RUSAGE_SELF),
             started_children=resource.getrusage(resource.RUSAGE_CHILDREN),
             started_thread_ns=time.thread_time_ns(),
+            started_wall_ns=time.time_ns(),
+            started_monotonic_ns=time.monotonic_ns(),
         )
 
     def finalize_cpu(self) -> dict:
@@ -5531,6 +5535,8 @@ def cmd_check(
                         "started_unix_ns": started_wall_ns,
                         "wall_ms": (time.monotonic_ns() - started_monotonic_ns) / 1_000_000.0,
                         "total_cpu_ms": thread_cpu_ms,
+                        "status": "failed" if failed else "passed",
+                        "returncode": 1 if failed else 0,
                     }, sort_keys=True) + "\n")
                 _finish_dev_span(span, attributes, failed=failed)
                 reporter.lane_done(lane)
@@ -5614,7 +5620,8 @@ def cmd_check(
             "user_cpu_ms": command_cpu["cpu.user_ms"],
             "system_cpu_ms": command_cpu["cpu.system_ms"],
             "total_cpu_ms": command_cpu["cpu.total_ms"],
-            "wall_ms": (time.monotonic() - t_start) * 1000.0,
+            "started_unix_ns": _CHECK_PROFILE.started_wall_ns,
+            "wall_ms": (time.monotonic_ns() - _CHECK_PROFILE.started_monotonic_ns) / 1_000_000.0,
             "tree_closure": "command_reaped_descendants_unverified",
             "status": "failed" if failures else "passed",
             "returncode": 1 if failures else 0,
@@ -9612,13 +9619,15 @@ def main():
     global _CHECK_PROFILE
     if args.command == "check" and getattr(args, "profile_work_dir", None):
         args.profile_work = True
+    _bootstrap_dev_tracing()
     if args.command == "check" and getattr(args, "profile_work", False):
         try:
+            # CPU, wall, and trace intervals intentionally begin after the
+            # optional tracing dependency bootstrap has completed.
             _CHECK_PROFILE = CheckWorkProfile.start(getattr(args, "profile_work_dir", None))
         except ValueError as error:
             print(f"error: {error}", file=sys.stderr)
             sys.exit(2)
-    _bootstrap_dev_tracing()
     _start_dev_command_tracing(args.command)
     if _CHECK_PROFILE is not None and _DEV_TRACING is None:
         print(

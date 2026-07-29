@@ -147,6 +147,11 @@ class DevTracingTests(unittest.TestCase):
         self.assertIs(first, second)
         self.assertEqual(first["cpu.total_ms"], second["cpu.total_ms"])
 
+    def test_profile_start_captures_wall_and_monotonic_boundaries(self):
+        profile = self.dev.CheckWorkProfile.start()
+        self.assertGreater(profile.started_wall_ns, 0)
+        self.assertGreater(profile.started_monotonic_ns, 0)
+
     def test_profile_rejects_nonempty_explicit_artifact_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -293,7 +298,7 @@ class DevTracingTests(unittest.TestCase):
             profile = self.dev.CheckWorkProfile(
                 run_id="run", artifact_dir=Path(directory),
                 started_self=mock.Mock(), started_children=mock.Mock(),
-                started_thread_ns=0,
+                started_thread_ns=0, started_wall_ns=0, started_monotonic_ns=0,
             )
             config = self.dev._write_nextest_profile_config(profile).read_text()
 
