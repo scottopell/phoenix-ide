@@ -680,7 +680,9 @@ mod epoch_tests {
                 .await
             }
         });
+        // test-timing-allow: channel receipt is the causal request-start signal
         http_started.recv().await.expect("first HTTP call started");
+        // test-timing-allow: second receipt proves concurrent HTTP dispatch
         http_started
             .recv()
             .await
@@ -715,6 +717,7 @@ mod epoch_tests {
                     .await
             }
         });
+        // test-timing-allow: receipt is the causal stdio request-start signal
         stdio_started
             .recv()
             .await
@@ -724,6 +727,7 @@ mod epoch_tests {
             "the actor queues stdio calls sequentially"
         );
         stdio_releases.add_permits(1);
+        // test-timing-allow: release permit causally enables the second queued call
         stdio_started
             .recv()
             .await
@@ -825,6 +829,7 @@ mod epoch_tests {
                     .await
             }
         });
+        // test-timing-allow: channel receipt is the causal call-start signal
         started.recv().await.expect("HTTP call started");
 
         let RecoveryClaim::Leader(permit) = handle.claim_recovery(0).await else {
