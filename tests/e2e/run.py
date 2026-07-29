@@ -160,6 +160,49 @@ def _linux_proc_cpu_times(stat: str, hz: float) -> tuple[float, float, float] | 
     return user, system, user + system
 
 
+def _darwin_rusage_cpu_times(info) -> tuple[float, float, float]:
+    nanoseconds_per_second = 1_000_000_000
+    user = (info.ri_user_time + info.ri_child_user_time) / nanoseconds_per_second
+    system = (info.ri_system_time + info.ri_child_system_time) / nanoseconds_per_second
+    return user, system, user + system
+
+
+def _darwin_process_cpu_times(pid: int) -> tuple[float, float, float] | None:
+    import ctypes
+
+    class RusageInfoV2(ctypes.Structure):
+        _fields_ = [
+            ("ri_uuid", ctypes.c_uint8 * 16),
+            ("ri_user_time", ctypes.c_uint64),
+            ("ri_system_time", ctypes.c_uint64),
+            ("ri_pkg_idle_wkups", ctypes.c_uint64),
+            ("ri_interrupt_wkups", ctypes.c_uint64),
+            ("ri_pageins", ctypes.c_uint64),
+            ("ri_wired_size", ctypes.c_uint64),
+            ("ri_resident_size", ctypes.c_uint64),
+            ("ri_phys_footprint", ctypes.c_uint64),
+            ("ri_proc_start_abstime", ctypes.c_uint64),
+            ("ri_proc_exit_abstime", ctypes.c_uint64),
+            ("ri_child_user_time", ctypes.c_uint64),
+            ("ri_child_system_time", ctypes.c_uint64),
+            ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+            ("ri_child_interrupt_wkups", ctypes.c_uint64),
+            ("ri_child_pageins", ctypes.c_uint64),
+            ("ri_child_elapsed_abstime", ctypes.c_uint64),
+            ("ri_diskio_bytesread", ctypes.c_uint64),
+            ("ri_diskio_byteswritten", ctypes.c_uint64),
+        ]
+
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    proc_pid_rusage = libproc.proc_pid_rusage
+    proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    proc_pid_rusage.restype = ctypes.c_int
+    info = RusageInfoV2()
+    if proc_pid_rusage(pid, 2, ctypes.byref(info)) != 0:
+        return None
+    return _darwin_rusage_cpu_times(info)
+
+
 def _process_cpu_times(
     pid: int,
 ) -> tuple[float | None, float | None, float] | None:
@@ -178,17 +221,7 @@ def _process_cpu_times(
         hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
         return _linux_proc_cpu_times(stat, hz)
     if sys.platform == "darwin":
-        sample = subprocess.run(
-            ["ps", "-o", "time=", "-p", str(pid)],
-            capture_output=True, text=True, check=False,
-        )
-        text = sample.stdout.strip()
-        if sample.returncode != 0 or not text:
-            return None
-        parts = text.replace("-", ":").split(":")
-        factors = (86400, 3600, 60, 1)[-len(parts):]
-        total = sum(float(value) * factor for value, factor in zip(parts, factors))
-        return None, None, total
+        return _darwin_process_cpu_times(pid)
     return None
 
 
@@ -1230,6 +1263,23 @@ class CpuProfilingTests(unittest.TestCase):
     def test_linux_process_cpu_rejects_malformed_stat(self):
         self.assertIsNone(_linux_proc_cpu_times("42 malformed", 100))
         self.assertIsNone(_linux_proc_cpu_times("42 (short) S 1", 100))
+
+    def test_darwin_process_cpu_includes_waited_children(self):
+        info = type("Rusage", (), {
+            "ri_user_time": 1_000_000_000,
+            "ri_system_time": 250_000_000,
+            "ri_child_user_time": 400_000_000,
+            "ri_child_system_time": 100_000_000,
+        })()
+
+        self.assertEqual((1.4, 0.35, 1.75), _darwin_rusage_cpu_times(info))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS proc_pid_rusage only")
+    def test_darwin_process_cpu_samples_live_process(self):
+        sample = _darwin_process_cpu_times(os.getpid())
+
+        self.assertIsNotNone(sample)
+        self.assertGreater(sample[2], 0)
 
     def test_cpu_window_record_has_required_fields(self):
         started_monotonic_ns = 1_000_000
