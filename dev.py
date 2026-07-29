@@ -5173,6 +5173,15 @@ def cmd_check(
                 results.append(("allium specs", 0, elapsed, ""))
             reporter.step_done("allium", "allium specs", 0, elapsed)
         semantic_rc = 1 if gate_problems or failures or new_findings else 0
+        if measurement_path is not None and measurement_path.exists():
+            try:
+                measurement = json.loads(measurement_path.read_text())
+                measurement["raw_returncode"] = measurement.get("returncode")
+                measurement["returncode"] = semantic_rc
+                measurement["status"] = "passed" if semantic_rc == 0 else "failed"
+                measurement_path.write_text(json.dumps(measurement, sort_keys=True) + "\n")
+            except (OSError, ValueError, TypeError):
+                pass
         _finish_check_step_span(
             span, elapsed=elapsed, timed_out=False, lock_wait=0.0,
             returncode=semantic_rc,
@@ -5284,6 +5293,24 @@ def cmd_check(
     selected_compiler_cache = None
     if cargo_active:
         selected_compiler_cache = _configure_compiler_cache(compiler_cache)
+    if _CHECK_PROFILE is not None and _DEV_TRACING is not None:
+        profile_metadata = {
+            "check.profile.git_sha": subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=ROOT,
+                capture_output=True, text=True, check=False,
+            ).stdout.strip(),
+            "check.profile.git_dirty": bool(subprocess.run(
+                ["git", "status", "--porcelain"], cwd=ROOT,
+                capture_output=True, text=True, check=False,
+            ).stdout.strip()),
+            "check.profile.host_platform": sys.platform,
+            "check.profile.host_machine": platform.machine(),
+            "check.profile.python_version": platform.python_version(),
+            "check.profile.active_lanes": sorted(active),
+            "check.profile.compiler_cache": selected_compiler_cache or "none",
+        }
+        for key, value in profile_metadata.items():
+            _DEV_TRACING.command_span.set_attribute(key, value)
 
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
@@ -5574,6 +5601,8 @@ def cmd_check(
             "--profile-work-dir DIR`"
         )
 
+    failures = [(n, out) for n, rc, _, out in results if rc != 0]
+
     if profile_work and _CHECK_PROFILE is not None:
         command_cpu = _CHECK_PROFILE.finalize_cpu()
         command_path = _CHECK_PROFILE.artifact_dir / "command.json"
@@ -5587,6 +5616,8 @@ def cmd_check(
             "total_cpu_ms": command_cpu["cpu.total_ms"],
             "wall_ms": (time.monotonic() - t_start) * 1000.0,
             "tree_closure": "command_reaped_descendants_unverified",
+            "status": "failed" if failures else "passed",
+            "returncode": 1 if failures else 0,
             "metadata": {
                 "git_sha": subprocess.run(
                     ["git", "rev-parse", "HEAD"], cwd=ROOT,
@@ -5622,8 +5653,6 @@ def cmd_check(
         print(f"  i  {message}")
 
     total_elapsed = time.monotonic() - t_start
-    failures = [(n, out) for n, rc, _, out in results if rc != 0]
-
     if failures:
         print()
         for name, output in failures:
