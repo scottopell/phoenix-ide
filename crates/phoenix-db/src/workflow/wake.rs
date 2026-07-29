@@ -6097,162 +6097,354 @@ mod tests {
         }
     }
 
+    async fn assert_one_pending_terminal(
+        repo: &WakeRepository,
+        workflow_id: WorkflowId,
+        expected: fn(&WakeTerminalPayload) -> bool,
+    ) {
+        let pending = repo.list_pending("conv-1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(expected(&pending[0].receipt.terminal));
+        let deliveries = repo
+            .workflow_repo
+            .list_deliveries(workflow_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|delivery| delivery.status == phoenix_workflow::DeliveryStatus::Pending)
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
-    async fn cancel_vs_terminal_race_repeated_has_single_winner() {
-        for run in 0..10 {
-            let (_dir, first, second) = open_repo_pair().await;
-            let workflow_id = WorkflowId(300 + run);
-            let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
+    async fn cancel_vs_terminal_ordered_matrix_has_typed_loser_and_one_terminal() {
+        for cancel_first in [false, true] {
+            let (_dir, repo, _) = open_repo_pair().await;
+            let workflow_id = WorkflowId(if cancel_first { 302 } else { 301 });
+            let canonical = unwrap_started(register_and_begin(&repo, workflow_id).await);
             let authority = canonical.authority.unwrap();
             let evidence = bash_evidence(19);
             let cancel = cancel_input(workflow_id);
-            let (left, right) = tokio::join!(
-                first.record_terminal_evidence(
-                    workflow_id,
-                    &authority,
-                    1,
-                    ReceiptId(1),
-                    DeliveryId(1),
-                    Timestamp(20),
-                    &evidence
-                ),
-                second.cancel(&cancel)
-            );
-            let pending = first.list_pending("conv-1").await.unwrap();
-            assert_eq!(pending.len(), 1);
-            let terminal = &pending[0].receipt.terminal;
-            match (left.unwrap(), right.unwrap(), terminal) {
-                (
-                    WakeTerminalEvidenceOutcome::Recorded { .. }
-                    | WakeTerminalEvidenceOutcome::Replayed { .. },
-                    WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. },
-                    WakeTerminalPayload::Fired { .. },
-                )
-                | (
-                    WakeTerminalEvidenceOutcome::StaleAttempt
-                    | WakeTerminalEvidenceOutcome::Replayed { .. },
+            if cancel_first {
+                assert!(matches!(
+                    repo.cancel(&cancel).await.unwrap(),
                     WakeCancellationOutcome::Cancelled { .. }
-                    | WakeCancellationOutcome::Replayed { .. },
-                    WakeTerminalPayload::Cancelled { .. },
-                ) => {}
-                other => panic!("unexpected race outcome: {other:?}"),
+                ));
+                assert!(matches!(
+                    repo.record_terminal_evidence(
+                        workflow_id,
+                        &authority,
+                        1,
+                        ReceiptId(1),
+                        DeliveryId(1),
+                        Timestamp(20),
+                        &evidence
+                    )
+                    .await
+                    .unwrap(),
+                    WakeTerminalEvidenceOutcome::StaleAttempt
+                        | WakeTerminalEvidenceOutcome::Replayed { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    repo.record_terminal_evidence(
+                        workflow_id,
+                        &authority,
+                        1,
+                        ReceiptId(1),
+                        DeliveryId(1),
+                        Timestamp(20),
+                        &evidence
+                    )
+                    .await
+                    .unwrap(),
+                    WakeTerminalEvidenceOutcome::Recorded { .. }
+                ));
+                assert!(matches!(
+                    repo.cancel(&cancel).await.unwrap(),
+                    WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. }
+                ));
             }
-            let deliveries = first
-                .workflow_repo
-                .list_deliveries(workflow_id)
-                .await
-                .unwrap();
-            assert_eq!(deliveries.len(), 1);
-            assert_eq!(
-                deliveries
-                    .iter()
-                    .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
-                    .count(),
-                1
-            );
+            if cancel_first {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Cancelled { .. })
+                })
+                .await;
+            } else {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Fired { .. })
+                })
+                .await;
+            }
         }
     }
 
     #[tokio::test]
-    async fn expiry_vs_terminal_race_repeated_has_single_winner_with_typed_losers() {
-        for run in 0..10 {
-            let (_dir, first, second) = open_repo_pair().await;
-            let workflow_id = WorkflowId(800 + run);
-            let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
+    async fn cancel_vs_terminal_concurrent_has_single_winner() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let workflow_id = WorkflowId(300);
+        let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
+        let authority = canonical.authority.unwrap();
+        let evidence = bash_evidence(19);
+        let cancel = cancel_input(workflow_id);
+        let (left, right) = tokio::join!(
+            first.record_terminal_evidence(
+                workflow_id,
+                &authority,
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &evidence
+            ),
+            second.cancel(&cancel)
+        );
+        let pending = first.list_pending("conv-1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let terminal = &pending[0].receipt.terminal;
+        match (left.unwrap(), right.unwrap(), terminal) {
+            (
+                WakeTerminalEvidenceOutcome::Recorded { .. }
+                | WakeTerminalEvidenceOutcome::Replayed { .. },
+                WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. },
+                WakeTerminalPayload::Fired { .. },
+            )
+            | (
+                WakeTerminalEvidenceOutcome::StaleAttempt
+                | WakeTerminalEvidenceOutcome::Replayed { .. },
+                WakeCancellationOutcome::Cancelled { .. }
+                | WakeCancellationOutcome::Replayed { .. },
+                WakeTerminalPayload::Cancelled { .. },
+            ) => {}
+            other => panic!("unexpected race outcome: {other:?}"),
+        }
+        let deliveries = first
+            .workflow_repo
+            .list_deliveries(workflow_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_vs_terminal_ordered_matrix_has_typed_loser_and_one_terminal() {
+        for expiry_first in [false, true] {
+            let (_dir, repo, _) = open_repo_pair().await;
+            let workflow_id = WorkflowId(if expiry_first { 802 } else { 801 });
+            let canonical = unwrap_started(register_and_begin(&repo, workflow_id).await);
             let authority = canonical.authority.unwrap();
             let evidence = bash_evidence(19);
-            let (left, right) = tokio::join!(
-                first.record_terminal_evidence(
-                    workflow_id,
-                    &authority,
-                    1,
-                    ReceiptId(1),
-                    DeliveryId(1),
-                    Timestamp(20),
-                    &evidence
-                ),
-                second.expire_if_unresolved(workflow_id, Timestamp(100))
-            );
-            let pending = first.list_pending("conv-1").await.unwrap();
-            assert_eq!(pending.len(), 1);
-            let terminal = &pending[0].receipt.terminal;
-            match (left.unwrap(), right.unwrap(), terminal) {
-                (
-                    WakeTerminalEvidenceOutcome::Recorded { .. }
-                    | WakeTerminalEvidenceOutcome::Replayed { .. },
-                    WakeExpireIfUnresolvedOutcome::Stale
-                    | WakeExpireIfUnresolvedOutcome::Replayed { .. },
-                    WakeTerminalPayload::Fired { .. },
-                )
-                | (
-                    WakeTerminalEvidenceOutcome::StaleAttempt
-                    | WakeTerminalEvidenceOutcome::Replayed { .. },
+            if expiry_first {
+                assert!(matches!(
+                    repo.expire_if_unresolved(workflow_id, Timestamp(100))
+                        .await
+                        .unwrap(),
                     WakeExpireIfUnresolvedOutcome::Expired { .. }
-                    | WakeExpireIfUnresolvedOutcome::Replayed { .. },
-                    WakeTerminalPayload::Expired { .. },
-                ) => {}
-                other => panic!("unexpected expiry race outcome: {other:?}"),
+                ));
+                assert!(matches!(
+                    repo.record_terminal_evidence(
+                        workflow_id,
+                        &authority,
+                        1,
+                        ReceiptId(1),
+                        DeliveryId(1),
+                        Timestamp(20),
+                        &evidence
+                    )
+                    .await
+                    .unwrap(),
+                    WakeTerminalEvidenceOutcome::StaleAttempt
+                        | WakeTerminalEvidenceOutcome::Replayed { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    repo.record_terminal_evidence(
+                        workflow_id,
+                        &authority,
+                        1,
+                        ReceiptId(1),
+                        DeliveryId(1),
+                        Timestamp(20),
+                        &evidence
+                    )
+                    .await
+                    .unwrap(),
+                    WakeTerminalEvidenceOutcome::Recorded { .. }
+                ));
+                assert!(matches!(
+                    repo.expire_if_unresolved(workflow_id, Timestamp(100))
+                        .await
+                        .unwrap(),
+                    WakeExpireIfUnresolvedOutcome::Stale
+                        | WakeExpireIfUnresolvedOutcome::Replayed { .. }
+                ));
             }
-            let deliveries = first
-                .workflow_repo
-                .list_deliveries(workflow_id)
-                .await
-                .unwrap();
-            assert_eq!(deliveries.len(), 1);
-            assert_eq!(
-                deliveries
-                    .iter()
-                    .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
-                    .count(),
-                1
-            );
+            if expiry_first {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Expired { .. })
+                })
+                .await;
+            } else {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Fired { .. })
+                })
+                .await;
+            }
         }
     }
 
     #[tokio::test]
-    async fn expiry_vs_cancel_race_repeated_has_single_winner_with_typed_losers() {
-        for run in 0..10 {
-            let (_dir, first, second) = open_repo_pair().await;
-            let workflow_id = WorkflowId(900 + run);
-            register_and_begin(&first, workflow_id).await;
-            let cancel = cancel_input(workflow_id);
-            let (left, right) = tokio::join!(
-                first.expire_if_unresolved(workflow_id, Timestamp(100)),
-                second.cancel(&cancel)
-            );
-            let pending = first.list_pending("conv-1").await.unwrap();
-            assert_eq!(pending.len(), 1);
-            let terminal = &pending[0].receipt.terminal;
-            match (left.unwrap(), right.unwrap(), terminal) {
-                (
-                    WakeExpireIfUnresolvedOutcome::Expired { .. }
-                    | WakeExpireIfUnresolvedOutcome::Replayed { .. },
-                    WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. },
-                    WakeTerminalPayload::Expired { .. },
-                )
-                | (
-                    WakeExpireIfUnresolvedOutcome::Stale
-                    | WakeExpireIfUnresolvedOutcome::Replayed { .. },
-                    WakeCancellationOutcome::Cancelled { .. }
-                    | WakeCancellationOutcome::Replayed { .. },
-                    WakeTerminalPayload::Cancelled { .. },
-                ) => {}
-                other => panic!("unexpected cancel/expiry race outcome: {other:?}"),
-            }
-            let deliveries = first
-                .workflow_repo
-                .list_deliveries(workflow_id)
-                .await
-                .unwrap();
-            assert_eq!(deliveries.len(), 1);
-            assert_eq!(
-                deliveries
-                    .iter()
-                    .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
-                    .count(),
-                1
-            );
+    async fn expiry_vs_terminal_concurrent_has_single_winner_with_typed_losers() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let workflow_id = WorkflowId(800);
+        let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
+        let authority = canonical.authority.unwrap();
+        let evidence = bash_evidence(19);
+        let (left, right) = tokio::join!(
+            first.record_terminal_evidence(
+                workflow_id,
+                &authority,
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &evidence
+            ),
+            second.expire_if_unresolved(workflow_id, Timestamp(100))
+        );
+        let pending = first.list_pending("conv-1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let terminal = &pending[0].receipt.terminal;
+        match (left.unwrap(), right.unwrap(), terminal) {
+            (
+                WakeTerminalEvidenceOutcome::Recorded { .. }
+                | WakeTerminalEvidenceOutcome::Replayed { .. },
+                WakeExpireIfUnresolvedOutcome::Stale
+                | WakeExpireIfUnresolvedOutcome::Replayed { .. },
+                WakeTerminalPayload::Fired { .. },
+            )
+            | (
+                WakeTerminalEvidenceOutcome::StaleAttempt
+                | WakeTerminalEvidenceOutcome::Replayed { .. },
+                WakeExpireIfUnresolvedOutcome::Expired { .. }
+                | WakeExpireIfUnresolvedOutcome::Replayed { .. },
+                WakeTerminalPayload::Expired { .. },
+            ) => {}
+            other => panic!("unexpected expiry race outcome: {other:?}"),
         }
+        let deliveries = first
+            .workflow_repo
+            .list_deliveries(workflow_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_vs_cancel_ordered_matrix_has_typed_loser_and_one_terminal() {
+        for expiry_first in [false, true] {
+            let (_dir, repo, _) = open_repo_pair().await;
+            let workflow_id = WorkflowId(if expiry_first { 902 } else { 901 });
+            register_and_begin(&repo, workflow_id).await;
+            let cancel = cancel_input(workflow_id);
+            if expiry_first {
+                assert!(matches!(
+                    repo.expire_if_unresolved(workflow_id, Timestamp(100))
+                        .await
+                        .unwrap(),
+                    WakeExpireIfUnresolvedOutcome::Expired { .. }
+                ));
+                assert!(matches!(
+                    repo.cancel(&cancel).await.unwrap(),
+                    WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    repo.cancel(&cancel).await.unwrap(),
+                    WakeCancellationOutcome::Cancelled { .. }
+                ));
+                assert!(matches!(
+                    repo.expire_if_unresolved(workflow_id, Timestamp(100))
+                        .await
+                        .unwrap(),
+                    WakeExpireIfUnresolvedOutcome::Stale
+                        | WakeExpireIfUnresolvedOutcome::Replayed { .. }
+                ));
+            }
+            if expiry_first {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Expired { .. })
+                })
+                .await;
+            } else {
+                assert_one_pending_terminal(&repo, workflow_id, |terminal| {
+                    matches!(terminal, WakeTerminalPayload::Cancelled { .. })
+                })
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_vs_cancel_concurrent_has_single_winner_with_typed_losers() {
+        let (_dir, first, second) = open_repo_pair().await;
+        let workflow_id = WorkflowId(900);
+        register_and_begin(&first, workflow_id).await;
+        let cancel = cancel_input(workflow_id);
+        let (left, right) = tokio::join!(
+            first.expire_if_unresolved(workflow_id, Timestamp(100)),
+            second.cancel(&cancel)
+        );
+        let pending = first.list_pending("conv-1").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let terminal = &pending[0].receipt.terminal;
+        match (left.unwrap(), right.unwrap(), terminal) {
+            (
+                WakeExpireIfUnresolvedOutcome::Expired { .. }
+                | WakeExpireIfUnresolvedOutcome::Replayed { .. },
+                WakeCancellationOutcome::Stale | WakeCancellationOutcome::Replayed { .. },
+                WakeTerminalPayload::Expired { .. },
+            )
+            | (
+                WakeExpireIfUnresolvedOutcome::Stale
+                | WakeExpireIfUnresolvedOutcome::Replayed { .. },
+                WakeCancellationOutcome::Cancelled { .. }
+                | WakeCancellationOutcome::Replayed { .. },
+                WakeTerminalPayload::Cancelled { .. },
+            ) => {}
+            other => panic!("unexpected cancel/expiry race outcome: {other:?}"),
+        }
+        let deliveries = first
+            .workflow_repo
+            .list_deliveries(workflow_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|d| d.status == phoenix_workflow::DeliveryStatus::Pending)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6825,136 +7017,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_vs_terminal_race_repeated_has_one_coherent_owner() {
-        for run in 0..10 {
-            let (_dir, first, second) = open_repo_pair().await;
-            insert_conversation(&first.workflow_repo.pool, "conv-2").await;
-            let workflow_id = WorkflowId(400 + run);
-            let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
-            let authority = canonical.authority.unwrap();
-            let transfer = transfer_input(
+    async fn transfer_vs_terminal_concurrent_has_one_coherent_owner() {
+        let (_dir, first, second) = open_repo_pair().await;
+        insert_conversation(&first.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(400);
+        let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
+        let authority = canonical.authority.unwrap();
+        let transfer = transfer_input(
+            workflow_id,
+            "conv-1",
+            "conv-2",
+            Version(1),
+            vec![],
+            TransitionId(2),
+        );
+        let evidence = bash_evidence(19);
+        let (left, right) = tokio::join!(
+            first.transfer(&transfer),
+            second.record_terminal_evidence(
                 workflow_id,
-                "conv-1",
-                "conv-2",
-                Version(1),
-                vec![],
-                TransitionId(2),
-            );
-            let evidence = bash_evidence(19);
-            let (left, right) = tokio::join!(
-                first.transfer(&transfer),
-                second.record_terminal_evidence(
-                    workflow_id,
-                    &authority,
-                    1,
-                    ReceiptId(1),
-                    DeliveryId(1),
-                    Timestamp(20),
-                    &evidence
-                )
-            );
-            match left.unwrap() {
-                WakeTransferOutcome::Transferred
-                | WakeTransferOutcome::VersionConflict
-                | WakeTransferOutcome::SetMismatch => {}
-                other @ WakeTransferOutcome::OwnerMismatch => {
-                    panic!("unexpected transfer race outcome: {other:?}")
+                &authority,
+                1,
+                ReceiptId(1),
+                DeliveryId(1),
+                Timestamp(20),
+                &evidence
+            )
+        );
+        match left.unwrap() {
+            WakeTransferOutcome::Transferred
+            | WakeTransferOutcome::VersionConflict
+            | WakeTransferOutcome::SetMismatch => {}
+            other @ WakeTransferOutcome::OwnerMismatch => {
+                panic!("unexpected transfer race outcome: {other:?}")
+            }
+        }
+        match right.unwrap() {
+            WakeTerminalEvidenceOutcome::Recorded { .. }
+            | WakeTerminalEvidenceOutcome::Replayed { .. } => {
+                let binding_owner = first
+                    .fetch_binding(workflow_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .conversation_id;
+                let old_pending = first.list_pending("conv-1").await.unwrap();
+                let new_pending = first.list_pending("conv-2").await.unwrap();
+                assert!(old_pending.len() + new_pending.len() <= 1);
+                if let Some(item) = old_pending.first() {
+                    assert_eq!(binding_owner, item.conversation_id);
+                }
+                if let Some(item) = new_pending.first() {
+                    assert_eq!(binding_owner, item.conversation_id);
                 }
             }
-            match right.unwrap() {
-                WakeTerminalEvidenceOutcome::Recorded { .. }
-                | WakeTerminalEvidenceOutcome::Replayed { .. } => {
-                    let binding_owner = first
-                        .fetch_binding(workflow_id)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .conversation_id;
-                    let old_pending = first.list_pending("conv-1").await.unwrap();
-                    let new_pending = first.list_pending("conv-2").await.unwrap();
-                    assert!(old_pending.len() + new_pending.len() <= 1);
-                    if let Some(item) = old_pending.first() {
-                        assert_eq!(binding_owner, item.conversation_id);
-                    }
-                    if let Some(item) = new_pending.first() {
-                        assert_eq!(binding_owner, item.conversation_id);
-                    }
-                }
-                WakeTerminalEvidenceOutcome::StaleAttempt => {
-                    let binding_owner = first
-                        .fetch_binding(workflow_id)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .conversation_id;
-                    assert_eq!(binding_owner, "conv-2");
-                    assert!(first.list_pending("conv-1").await.unwrap().is_empty());
-                    assert!(first.list_pending("conv-2").await.unwrap().is_empty());
-                }
-                other @ (WakeTerminalEvidenceOutcome::WrongResource
-                | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
-                | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
-                    panic!("unexpected terminal race outcome: {other:?}")
-                }
+            WakeTerminalEvidenceOutcome::StaleAttempt => {
+                let binding_owner = first
+                    .fetch_binding(workflow_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .conversation_id;
+                assert_eq!(binding_owner, "conv-2");
+                assert!(first.list_pending("conv-1").await.unwrap().is_empty());
+                assert!(first.list_pending("conv-2").await.unwrap().is_empty());
+            }
+            other @ (WakeTerminalEvidenceOutcome::WrongResource
+            | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
+            | WakeTerminalEvidenceOutcome::EvidenceAfterExpiry) => {
+                panic!("unexpected terminal race outcome: {other:?}")
             }
         }
     }
 
     #[tokio::test]
-    async fn transfer_vs_cancel_race_repeated_has_one_coherent_owner() {
-        for run in 0..10 {
-            let (_dir, first, second) = open_repo_pair().await;
-            insert_conversation(&first.workflow_repo.pool, "conv-2").await;
-            let workflow_id = WorkflowId(500 + run);
-            register_and_begin(&first, workflow_id).await;
-            let transfer = transfer_input(
-                workflow_id,
-                "conv-1",
-                "conv-2",
-                Version(1),
-                vec![],
-                TransitionId(2),
-            );
-            let cancel = cancel_input(workflow_id);
-            let (left, right) = tokio::join!(first.transfer(&transfer), second.cancel(&cancel));
-            match left.unwrap() {
-                WakeTransferOutcome::Transferred
-                | WakeTransferOutcome::VersionConflict
-                | WakeTransferOutcome::SetMismatch => {}
-                other @ WakeTransferOutcome::OwnerMismatch => {
-                    panic!("unexpected transfer race outcome: {other:?}")
+    async fn transfer_vs_cancel_concurrent_has_one_coherent_owner() {
+        let (_dir, first, second) = open_repo_pair().await;
+        insert_conversation(&first.workflow_repo.pool, "conv-2").await;
+        let workflow_id = WorkflowId(500);
+        register_and_begin(&first, workflow_id).await;
+        let transfer = transfer_input(
+            workflow_id,
+            "conv-1",
+            "conv-2",
+            Version(1),
+            vec![],
+            TransitionId(2),
+        );
+        let cancel = cancel_input(workflow_id);
+        let (left, right) = tokio::join!(first.transfer(&transfer), second.cancel(&cancel));
+        match left.unwrap() {
+            WakeTransferOutcome::Transferred
+            | WakeTransferOutcome::VersionConflict
+            | WakeTransferOutcome::SetMismatch => {}
+            other @ WakeTransferOutcome::OwnerMismatch => {
+                panic!("unexpected transfer race outcome: {other:?}")
+            }
+        }
+        match right.unwrap() {
+            WakeCancellationOutcome::Cancelled { .. }
+            | WakeCancellationOutcome::Replayed { .. } => {
+                let binding_owner = first
+                    .fetch_binding(workflow_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .conversation_id;
+                let old_pending = first.list_pending("conv-1").await.unwrap();
+                let new_pending = first.list_pending("conv-2").await.unwrap();
+                assert!(old_pending.len() + new_pending.len() <= 1);
+                if let Some(item) = old_pending.first() {
+                    assert_eq!(binding_owner, item.conversation_id);
+                }
+                if let Some(item) = new_pending.first() {
+                    assert_eq!(binding_owner, item.conversation_id);
                 }
             }
-            match right.unwrap() {
-                WakeCancellationOutcome::Cancelled { .. }
-                | WakeCancellationOutcome::Replayed { .. } => {
-                    let binding_owner = first
-                        .fetch_binding(workflow_id)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .conversation_id;
-                    let old_pending = first.list_pending("conv-1").await.unwrap();
-                    let new_pending = first.list_pending("conv-2").await.unwrap();
-                    assert!(old_pending.len() + new_pending.len() <= 1);
-                    if let Some(item) = old_pending.first() {
-                        assert_eq!(binding_owner, item.conversation_id);
-                    }
-                    if let Some(item) = new_pending.first() {
-                        assert_eq!(binding_owner, item.conversation_id);
-                    }
-                }
-                WakeCancellationOutcome::Stale => {
-                    let binding_owner = first
-                        .fetch_binding(workflow_id)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .conversation_id;
-                    assert_eq!(binding_owner, "conv-2");
-                    assert!(first.list_pending("conv-1").await.unwrap().is_empty());
-                    assert!(first.list_pending("conv-2").await.unwrap().is_empty());
-                }
+            WakeCancellationOutcome::Stale => {
+                let binding_owner = first
+                    .fetch_binding(workflow_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .conversation_id;
+                assert_eq!(binding_owner, "conv-2");
+                assert!(first.list_pending("conv-1").await.unwrap().is_empty());
+                assert!(first.list_pending("conv-2").await.unwrap().is_empty());
             }
         }
     }
