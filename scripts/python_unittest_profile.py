@@ -8,6 +8,10 @@ import importlib.util
 import json
 import os
 import sys
+try:
+    import resource
+except ImportError:
+    resource = None
 import time
 import unittest
 from pathlib import Path
@@ -45,6 +49,15 @@ def _test_identity(test: unittest.case.TestCase) -> str:
     return f"python_unittest:{test.id()}"
 
 
+def _cpu_times() -> tuple[float, float]:
+    if resource is not None:
+        own = resource.getrusage(resource.RUSAGE_SELF)
+        children = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return own.ru_utime + children.ru_utime, own.ru_stime + children.ru_stime
+    times = os.times()
+    return times.user + times.children_user, times.system + times.children_system
+
+
 class _ProfilingTextTestResult(unittest.TextTestResult):
     def __init__(self, stream, descriptions, verbosity, *, profile_jsonl: Path | None):
         super().__init__(stream, descriptions, verbosity)
@@ -58,8 +71,7 @@ class _ProfilingTextTestResult(unittest.TextTestResult):
         self._started_wall_ns = time.time_ns()
         self._started_monotonic_ns = time.monotonic_ns()
         self._outcome = "running"
-        cpu = os.times()
-        self._started_cpu = (cpu.user + cpu.children_user, cpu.system + cpu.children_system)
+        self._started_cpu = _cpu_times()
         super().startTest(test)
 
     def addSuccess(self, test):
@@ -96,9 +108,7 @@ class _ProfilingTextTestResult(unittest.TextTestResult):
         try:
             if self._profile_jsonl is not None and self._started_cpu is not None:
                 finished_monotonic_ns = time.monotonic_ns()
-                cpu = os.times()
-                user_total = cpu.user + cpu.children_user
-                system_total = cpu.system + cpu.children_system
+                user_total, system_total = _cpu_times()
                 user_cpu_ms = (user_total - self._started_cpu[0]) * 1000.0
                 system_cpu_ms = (system_total - self._started_cpu[1]) * 1000.0
                 record = _PROFILE._record(

@@ -127,6 +127,19 @@ def _append_jsonl(path: Path, value: dict) -> None:
         output.write("\n")
 
 
+def _harness_cpu_times() -> tuple[float | None, float | None, float]:
+    if resource is not None:
+        own = resource.getrusage(resource.RUSAGE_SELF)
+        children = resource.getrusage(resource.RUSAGE_CHILDREN)
+        user = own.ru_utime + children.ru_utime
+        system = own.ru_stime + children.ru_stime
+        return user, system, user + system
+    process = os.times()
+    user = process.user + process.children_user
+    system = process.system + process.children_system
+    return user, system, user + system
+
+
 def _process_cpu_times(
     pid: int,
 ) -> tuple[float | None, float | None, float] | None:
@@ -366,18 +379,32 @@ def _server():
     startup_started_wall_ns = time.time_ns()
     startup_started_monotonic_ns = time.monotonic_ns()
     startup_started_cpu = (
-        _process_cpu_times(os.getpid()) if profile_dir is not None else None
+        _harness_cpu_times() if profile_dir is not None else None
     )
 
     try:
         proc, base_url, log_path, log_file = _start_server_with_retries(env, tmpdir)
     except Exception:
+        startup_finished_monotonic_ns = time.monotonic_ns()
+        _write_cpu_window(
+            profile_dir,
+            identity="e2e:startup:harness",
+            started_wall_ns=startup_started_wall_ns,
+            started_monotonic_ns=startup_started_monotonic_ns,
+            finished_monotonic_ns=startup_finished_monotonic_ns,
+            start_cpu=startup_started_cpu,
+            finish_cpu=_harness_cpu_times() if profile_dir is not None else None,
+            extra={
+                "kind": "e2e_startup", "process_role": "harness",
+                "status": "failed",
+            },
+        )
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
 
     startup_finished_monotonic_ns = time.monotonic_ns()
     startup_finished_cpu = (
-        _process_cpu_times(os.getpid()) if profile_dir is not None else None
+        _harness_cpu_times() if profile_dir is not None else None
     )
     _write_cpu_window(
         profile_dir,
@@ -414,7 +441,7 @@ def _server():
         teardown_started_wall_ns = time.time_ns()
         teardown_started_monotonic_ns = time.monotonic_ns()
         teardown_harness_cpu = (
-            _process_cpu_times(os.getpid()) if profile_dir is not None else None
+            _harness_cpu_times() if profile_dir is not None else None
         )
         teardown_server_cpu = (
             _process_cpu_times(proc.pid) if profile_dir is not None else None
@@ -427,7 +454,7 @@ def _server():
             proc.wait(timeout=5)
         teardown_finished_monotonic_ns = time.monotonic_ns()
         teardown_finished_harness_cpu = (
-            _process_cpu_times(os.getpid()) if profile_dir is not None else None
+            _harness_cpu_times() if profile_dir is not None else None
         )
         _write_cpu_window(
             profile_dir,
@@ -1297,7 +1324,7 @@ def main() -> int:
             started_wall_ns = time.time_ns()
             started_monotonic_ns = time.monotonic_ns()
             started_harness_cpu = (
-                _process_cpu_times(os.getpid()) if profile_dir is not None else None
+                _harness_cpu_times() if profile_dir is not None else None
             )
             started_server_cpu = (
                 _process_cpu_times(server_pid) if profile_dir is not None else None
@@ -1318,7 +1345,7 @@ def main() -> int:
             finally:
                 finished_monotonic_ns = time.monotonic_ns()
                 finished_harness_cpu = (
-                    _process_cpu_times(os.getpid()) if profile_dir is not None else None
+                    _harness_cpu_times() if profile_dir is not None else None
                 )
                 finished_server_cpu = (
                     _process_cpu_times(server_pid) if profile_dir is not None else None

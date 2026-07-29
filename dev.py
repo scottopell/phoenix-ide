@@ -4968,9 +4968,16 @@ def cmd_check(
                 "--identity", "step:allium:allium specs", "--", *command,
             ]
         try:
-            proc = subprocess.run(
-                command, capture_output=True, text=True, timeout=60,
+            proc = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True,
             )
+            try:
+                stdout, stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                stdout, stderr = proc.communicate()
+                raise subprocess.TimeoutExpired(command, 60, stdout, stderr)
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - t0
             with results_lock:
@@ -4985,7 +4992,7 @@ def cmd_check(
         # (one {...} per file passed). Use raw_decode to walk the stream
         # without depending on whitespace conventions.
         decoder = json.JSONDecoder()
-        text = proc.stdout
+        text = stdout
         idx = 0
         failures = []
         all_findings = []          # (spec_file, trigger) tuples
@@ -5077,8 +5084,8 @@ def cmd_check(
                 lines.append("allium analyse gate failure:")
                 for p in gate_problems:
                     lines.append(f"  {p}")
-                if proc.stderr.strip():
-                    lines.append(f"stderr (first 500 chars):\n{proc.stderr[:500]}")
+                if stderr.strip():
+                    lines.append(f"stderr (first 500 chars):\n{stderr[:500]}")
                 if text.strip() and not failures and not new_findings:
                     lines.append(f"stdout (first 500 chars):\n{text[:500]}")
                 if failures or new_findings:
@@ -5424,6 +5431,8 @@ def cmd_check(
             reporter.lane_start(lane)
             span = _begin_dev_span("dev.check.lane", {"check.lane": lane})
             started_thread_ns = time.thread_time_ns()
+            started_wall_ns = time.time_ns()
+            started_monotonic_ns = time.monotonic_ns()
             failed = False
             try:
                 with _DevSpanScope(span):
@@ -5441,6 +5450,17 @@ def cmd_check(
                         "orchestration.cpu.total_ms": thread_cpu_ms,
                         "orchestration.cpu.provenance": "exact_thread",
                     }
+                    lane_record = _CHECK_PROFILE.artifact_dir / "lanes" / f"{lane}.json"
+                    lane_record.parent.mkdir(parents=True, exist_ok=True)
+                    lane_record.write_text(json.dumps({
+                        "schema_version": 1,
+                        "identity": f"lane:{lane}:in_process_orchestration",
+                        "kind": "lane_orchestration",
+                        "provenance": "exact_thread",
+                        "started_unix_ns": started_wall_ns,
+                        "wall_ms": (time.monotonic_ns() - started_monotonic_ns) / 1_000_000.0,
+                        "total_cpu_ms": thread_cpu_ms,
+                    }, sort_keys=True) + "\n")
                 _finish_dev_span(span, attributes, failed=failed)
                 reporter.lane_done(lane)
         return wrapped
@@ -5513,7 +5533,7 @@ def cmd_check(
     if profile_work and _CHECK_PROFILE is not None:
         report = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "check_profile_report.py"),
-             str(_CHECK_PROFILE.artifact_dir)],
+             str(_CHECK_PROFILE.artifact_dir), "--run-id", _CHECK_PROFILE.run_id],
             capture_output=True, text=True, check=False,
         )
         if report.returncode == 0:

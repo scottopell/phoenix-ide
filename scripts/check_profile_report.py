@@ -95,7 +95,7 @@ def _reconciliation(rows: list[dict]) -> list[dict]:
     return result
 
 
-def render(profile_dir: Path, limit: int) -> dict:
+def render(profile_dir: Path, limit: int, run_id: str = "unknown") -> dict:
     rows = [
         _normalize(path.relative_to(profile_dir), value)
         for path, value in _records(profile_dir)
@@ -108,14 +108,15 @@ def render(profile_dir: Path, limit: int) -> dict:
     summary = {
         "schema_version": 1,
         "profile_dir": str(profile_dir),
+        "profile_run_id": run_id,
         "record_count": len(rows),
         "top_cpu_records": ranked_rows[:limit],
         "unavailable_cpu_records": unavailable_rows,
         "reconciliation": _reconciliation(rows),
         "traceql": {
-            "command": '{ name = "dev.command" && span.check.profile_work = true }',
-            "steps": '{ name = "dev.check.step" && span.check.profile_run_id != nil }',
-            "tests": '{ name = "dev.check.test" && span.check.profile_run_id != nil }',
+            "command": f'{{ name = "dev.command" && span.check.profile_run_id = "{run_id}" }}',
+            "steps": f'{{ name = "dev.check.step" && span.check.profile_run_id = "{run_id}" }}',
+            "tests": f'{{ name = "dev.check.test" && span.check.profile_run_id = "{run_id}" }}',
         },
         "methodology": [
             "CPU milliseconds are additive work; wall time is secondary.",
@@ -160,8 +161,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("profile_dir", type=Path)
     parser.add_argument("--limit", type=int, default=30)
+    parser.add_argument("--run-id", default="unknown")
     args = parser.parse_args()
-    summary = render(args.profile_dir.resolve(), max(1, args.limit))
+    summary = render(args.profile_dir.resolve(), max(1, args.limit), args.run_id)
     print(args.profile_dir / "summary.md")
     print(f"ranked {summary['record_count']} CPU records")
     return 0

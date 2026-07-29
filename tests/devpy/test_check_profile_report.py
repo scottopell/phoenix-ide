@@ -41,6 +41,32 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertIn("inclusive", markdown)
         self.assertIn("dev.check.test", summary["traceql"]["tests"])
 
+    def test_traceql_queries_are_scoped_to_profile_run(self):
+        report = load_report()
+        with tempfile.TemporaryDirectory() as directory:
+            summary = report.render(Path(directory), 20, "run-123")
+
+        self.assertEqual("run-123", summary["profile_run_id"])
+        for query in summary["traceql"].values():
+            self.assertIn('span.check.profile_run_id = "run-123"', query)
+
+    def test_lane_orchestration_record_is_ranked(self):
+        report = load_report()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lanes").mkdir()
+            (root / "lanes" / "task.json").write_text(json.dumps({
+                "identity": "lane:task:in_process_orchestration",
+                "kind": "lane_orchestration", "provenance": "exact_thread",
+                "total_cpu_ms": 5, "wall_ms": 7,
+            }))
+            summary = report.render(root, 20, "run")
+
+        self.assertEqual(
+            "lane:task:in_process_orchestration",
+            summary["top_cpu_records"][0]["identity"],
+        )
+
     def test_vitest_identity_prefers_file_qualified_full_name(self):
         report = load_report()
         row = report._normalize(Path("vitest-cpu-worker.jsonl"), {
