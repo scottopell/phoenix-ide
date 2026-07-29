@@ -2125,8 +2125,13 @@ impl McpClientManager {
         let pending = Arc::clone(&self.pending_oauth_urls);
         let oauth = Arc::clone(&self.oauth);
         tokio::spawn(async move {
-            match Self::connect_one(&connect_name, &connect_config, Arc::clone(&pending), oauth)
-                .await
+            match Self::connect_one(
+                &connect_name,
+                &connect_config,
+                Arc::clone(&pending),
+                Arc::clone(&oauth),
+            )
+            .await
             {
                 Ok(server) => {
                     if handle.publish(epoch, server).await {
@@ -2136,6 +2141,10 @@ impl McpClientManager {
                 Err(error) => {
                     if let Some(url) = pending.read().await.get(&name).cloned() {
                         handle.unauthorized(epoch, url, error).await;
+                        let mut flows = oauth.pending.lock().unwrap();
+                        if let Some(flow) = flows.get_mut(&name) {
+                            flow.owner = Some((handle.clone(), epoch));
+                        }
                     } else {
                         handle.fail(epoch, error).await;
                     }
