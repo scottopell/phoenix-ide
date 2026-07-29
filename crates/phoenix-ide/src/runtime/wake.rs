@@ -403,12 +403,22 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         else {
             return Ok(Duration::ZERO);
         };
-        match self
-            .inspector
-            .inspect(&binding, &authority, now)
-            .await
-            .map_err(|error| error.clone())?
-        {
+        let inspection = match self.inspector.inspect(&binding, &authority, now).await {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                if let Err(release_error) =
+                    self.repo.release_observation_authority(&authority).await
+                {
+                    tracing::warn!(
+                        %release_error,
+                        workflow_id = candidate.workflow_id.0,
+                        "failed to release wake observation authority after inspection error"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        match inspection {
             InspectionOutcome::LiveRetry => {
                 let _ = self
                     .repo
@@ -493,6 +503,15 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                 Ok(Duration::ZERO)
             }
             InspectionOutcome::Forgotten(reason) => {
+                let conversation_guard = if let Some(manager) = manager {
+                    Some(
+                        manager
+                            .lock_conversation_acceptance(&binding.conversation_id)
+                            .await,
+                    )
+                } else {
+                    None
+                };
                 let _ = self
                     .repo
                     .forget_if_unresolved_allocated(&WakeForgetIfUnresolvedInput {
@@ -502,6 +521,16 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                     })
                     .await
                     .map_err(|e| e.to_string())?;
+                if let Some(manager) = manager {
+                    deliver_pending(
+                        manager,
+                        &self.repo,
+                        self.clock.now(),
+                        Some(&binding.conversation_id),
+                    )
+                    .await?;
+                }
+                drop(conversation_guard);
                 Ok(Duration::ZERO)
             }
         }
@@ -1903,7 +1932,6 @@ mod tests {
             Arc::new(TestClock::new(10)),
             ProcessIncarnation(99),
         );
-        worker.run_once().await.unwrap();
 
         let manager = Arc::new(crate::runtime::RuntimeManager::new(
             db.clone(),
@@ -1916,9 +1944,7 @@ mod tests {
         ));
         let handle = manager.get_or_create("conv").await.unwrap();
 
-        deliver_pending(&manager, &repo, Timestamp(20), None)
-            .await
-            .unwrap();
+        worker.run_once_with_manager(Some(&manager)).await.unwrap();
         let messages_after_first_delivery = db.get_messages("conv").await.unwrap();
         let interruption = messages_after_first_delivery
             .last()
@@ -2366,6 +2392,29 @@ mod tests {
             phoenix_workflow::wake_profile::WakeTerminalPayload::Fired { .. }
         ));
     }
+    #[tokio::test]
+    async fn inspection_error_releases_authority_for_immediate_retry() {
+        let (_db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
+        let worker = WakeWorker::new(
+            repo.clone(),
+            Arc::new(FlakyInspector::new(1)),
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+
+        worker.run_once().await.unwrap();
+        let candidates = repo
+            .list_observation_candidates(Timestamp(10), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].workflow_id,
+            phoenix_workflow::WorkflowId(workflow_id)
+        );
+    }
+
     #[tokio::test]
     async fn worker_retries_after_transient_inspection_error() {
         let (_db, repo, scope) = open_repo().await;
