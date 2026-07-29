@@ -524,6 +524,37 @@ def _send_chat_and_stream(
         ) from error
 
 
+def _assert_next_chat_is_accepted(base_url: str, conv_id: str) -> None:
+    message_id = str(uuid.uuid4())
+    response = httpx.post(
+        f"{base_url}/api/conversations/{conv_id}/chat",
+        json={
+            "text": "[[scenario:long]] ownership release probe",
+            "images": [],
+            "message_id": message_id,
+        },
+        timeout=10.0,
+    )
+    assert response.status_code == 200, (
+        "completed direct turn did not release the next acceptance: "
+        f"status={response.status_code}, body={response.text[:500]!r}"
+    )
+
+    # Acceptance is the regression boundary. Cancel only after runtime work is
+    # visible; if the mock finishes first, no cleanup is needed.
+    for _ in range(50):
+        snapshot = _get_conv(base_url, conv_id)
+        state = _state_str(snapshot["conversation"]["state"])
+        if state == "idle" and _has_agent_after_message(
+            snapshot.get("messages") or [], message_id
+        ):
+            return
+        if state not in ("idle", "provisioning"):
+            _cancel(base_url, conv_id)
+            return
+        time.sleep(0.01)
+
+
 def _poll_to_idle_with_messages(
     base_url: str,
     conv_id: str,
@@ -686,6 +717,7 @@ def scenario_continuation(base_url: str) -> None:
     text = _agent_text(final["messages"])
     assert "analyzed the situation" in text, "first turn's assistant text missing"
     assert "## Analysis" in text, "second turn's assistant text missing"
+    _assert_next_chat_is_accepted(base_url, conv["id"])
 
 
 def scenario_mid_stream_cancel(base_url: str) -> None:
