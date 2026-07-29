@@ -117,10 +117,11 @@ class CheckWorkProfile:
     started_thread_ns: int
 
     @classmethod
-    def start(cls):
+    def start(cls, artifact_dir: Path | None = None):
         import uuid
         run_id = uuid.uuid4().hex
-        artifact_dir = ROOT / "target" / "check-profile" / run_id
+        artifact_dir = artifact_dir or ROOT / "target" / "check-profile" / run_id
+        artifact_dir = artifact_dir.resolve()
         artifact_dir.mkdir(parents=True, exist_ok=True)
         return cls(
             run_id=run_id,
@@ -174,16 +175,21 @@ def _profile_record_attributes(record: dict, source: Path) -> dict | None:
         provenance = str(record["provenance"])
         user_value = record.get("user_cpu_ms")
         system_value = record.get("system_cpu_ms")
+        total_value = record.get("total_cpu_ms")
         if user_value is None and "cpu_user_us" in record:
             user_value = record["cpu_user_us"] / 1000.0
         if system_value is None and "cpu_system_us" in record:
             system_value = record["cpu_system_us"] / 1000.0
         identity = str(record.get("identity") or record.get("full_test_name") or record["test_name"])
-        attributes = (
-            _cpu_attributes(float(user_value), float(system_value), provenance)
-            if user_value is not None and system_value is not None
-            else {"cpu.provenance": "unavailable"}
-        )
+        if user_value is not None and system_value is not None:
+            attributes = _cpu_attributes(float(user_value), float(system_value), provenance)
+        elif total_value is not None:
+            attributes = {
+                "cpu.total_ms": float(total_value),
+                "cpu.provenance": provenance,
+            }
+        else:
+            attributes = {"cpu.provenance": "unavailable"}
         started_unix_ns = int(record["started_unix_ns"])
         wall_ms = float(record.get("wall_ms", record.get("wall_time_ms", 0.0)))
         try:
@@ -222,10 +228,24 @@ def _emit_profile_record_spans(profile_dir: Path, parent, patterns: tuple[str, .
     for pattern in patterns:
         for path in sorted(profile_dir.glob(pattern)):
             try:
-                records = (
-                    [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-                    if path.suffix == ".jsonl" else [json.loads(path.read_text())]
-                )
+                if path.suffix == ".jsonl":
+                    records = []
+                    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+                        if not line.strip():
+                            continue
+                        try:
+                            records.append(json.loads(line))
+                        except (ValueError, TypeError) as error:
+                            error_span = _begin_dev_span(
+                                "dev.check.profile_error", {
+                                    "check.profile_record": str(path),
+                                    "check.profile_line": line_number,
+                                    "error.message": str(error),
+                                }, parent=parent,
+                            )
+                            _finish_dev_span(error_span, {}, failed=True)
+                else:
+                    records = [json.loads(path.read_text())]
             except (OSError, ValueError, TypeError):
                 continue
             for record in records:
@@ -4600,7 +4620,8 @@ def cmd_check(
             measurement_path.parent.mkdir(parents=True, exist_ok=True)
             launched_cmd = [
                 sys.executable, str(ROOT / "scripts" / "check_profile_command.py"),
-                "--output", str(measurement_path), "--", *cmd,
+                "--output", str(measurement_path),
+                "--identity", f"step:{lane}:{name}", "--", *cmd,
             ]
             env["PHOENIX_CHECK_PROFILE_DIR"] = str(_CHECK_PROFILE.artifact_dir)
             env["PHOENIX_CHECK_PROFILE_LANE"] = lane
@@ -5437,9 +5458,10 @@ def cmd_check(
     profile_messages = []
     if profile_work and _CHECK_PROFILE is not None and sys.platform == "darwin":
         profile_messages.append(
-            "sampled stacks: run `xctrace record --template 'Time Profiler' "
-            f"--output {_CHECK_PROFILE.artifact_dir / 'full-check.trace'} --no-prompt "
-            f"--launch -- {ROOT / 'dev.py'} check --all --profile-work`"
+            "sampled stacks for a new correlated run: choose an empty DIR, then run "
+            "`xctrace record --template 'Time Profiler' --output DIR/full-check.trace "
+            f"--no-prompt --launch -- {ROOT / 'dev.py'} check --all --profile-work "
+            "--profile-work-dir DIR`"
         )
 
     if profile_work and _CHECK_PROFILE is not None:
@@ -9240,6 +9262,10 @@ def main():
         "--profile-work", action="store_true", default=False,
         help="Record hierarchical CPU work in the dev trace and target/check-profile/",
     )
+    check_parser.add_argument(
+        "--profile-work-dir", type=Path, default=None,
+        help="Use this empty artifact directory for a correlated profiling run",
+    )
 
     check_plan_parser = sub.add_parser(
         "check-plan",
@@ -9413,9 +9439,17 @@ def main():
         _bootstrap_rich()
 
     global _CHECK_PROFILE
+    if args.command == "check" and getattr(args, "profile_work_dir", None):
+        args.profile_work = True
     if args.command == "check" and getattr(args, "profile_work", False):
-        _CHECK_PROFILE = CheckWorkProfile.start()
+        _CHECK_PROFILE = CheckWorkProfile.start(getattr(args, "profile_work_dir", None))
     _bootstrap_dev_tracing()
+    if _CHECK_PROFILE is not None and _DEV_TRACING is None:
+        print(
+            "  ⚠ CPU artifacts will be recorded, but dev tracing is unavailable; "
+            "TraceQL queries will not find this run",
+            file=sys.stderr,
+        )
     _start_dev_command_tracing(args.command)
 
     if args.command == "up":

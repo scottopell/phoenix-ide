@@ -127,13 +127,15 @@ def _append_jsonl(path: Path, value: dict) -> None:
         output.write("\n")
 
 
-def _process_cpu_times(pid: int) -> tuple[float, float] | None:
+def _process_cpu_times(
+    pid: int,
+) -> tuple[float | None, float | None, float] | None:
     if pid == os.getpid():
         if resource is not None:
             usage = resource.getrusage(resource.RUSAGE_SELF)
-            return usage.ru_utime, usage.ru_stime
+            return usage.ru_utime, usage.ru_stime, usage.ru_utime + usage.ru_stime
         process = os.times()
-        return process.user, process.system
+        return process.user, process.system, process.user + process.system
     if sys.platform == "linux":
         try:
             with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as stat_file:
@@ -145,7 +147,9 @@ def _process_cpu_times(pid: int) -> tuple[float, float] | None:
             return None
         fields = stat[rparen + 2 :].split()
         hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-        return int(fields[11]) / hz, int(fields[12]) / hz
+        user = int(fields[11]) / hz
+        system = int(fields[12]) / hz
+        return user, system, user + system
     if sys.platform == "darwin":
         sample = subprocess.run(
             ["ps", "-o", "time=", "-p", str(pid)],
@@ -157,7 +161,7 @@ def _process_cpu_times(pid: int) -> tuple[float, float] | None:
         parts = text.replace("-", ":").split(":")
         factors = (86400, 3600, 60, 1)[-len(parts):]
         total = sum(float(value) * factor for value, factor in zip(parts, factors))
-        return total, 0.0
+        return None, None, total
     return None
 
 
@@ -173,26 +177,40 @@ def _cpu_window_record(
     started_wall_ns: int,
     started_monotonic_ns: int,
     finished_monotonic_ns: int,
-    start_cpu: tuple[float, float] | None,
-    finish_cpu: tuple[float, float] | None,
+    start_cpu: tuple[float | None, float | None, float] | None,
+    finish_cpu: tuple[float | None, float | None, float] | None,
     extra: dict | None = None,
 ) -> dict:
     available = start_cpu is not None and finish_cpu is not None
+    components_available = (
+        available
+        and start_cpu[0] is not None and finish_cpu[0] is not None
+        and start_cpu[1] is not None and finish_cpu[1] is not None
+    )
     user_cpu_ms = (
-        max(0.0, (finish_cpu[0] - start_cpu[0]) * 1000.0) if available else None
+        max(0.0, (finish_cpu[0] - start_cpu[0]) * 1000.0)
+        if components_available else None
     )
     system_cpu_ms = (
-        max(0.0, (finish_cpu[1] - start_cpu[1]) * 1000.0) if available else None
+        max(0.0, (finish_cpu[1] - start_cpu[1]) * 1000.0)
+        if components_available else None
+    )
+    total_cpu_ms = (
+        max(0.0, (finish_cpu[2] - start_cpu[2]) * 1000.0) if available else None
     )
     record = {
         "schema_version": SCHEMA_VERSION,
-        "provenance": PROVENANCE if available else "unavailable",
+        "provenance": (
+            PROVENANCE if components_available
+            else "windowed_process_total_only" if available
+            else "unavailable"
+        ),
         "identity": identity,
         "started_unix_ns": started_wall_ns,
         "wall_ms": (finished_monotonic_ns - started_monotonic_ns) / 1_000_000.0,
         "user_cpu_ms": user_cpu_ms,
         "system_cpu_ms": system_cpu_ms,
-        "total_cpu_ms": user_cpu_ms + system_cpu_ms if available else None,
+        "total_cpu_ms": total_cpu_ms,
     }
     if extra:
         record.update(extra)
@@ -206,8 +224,8 @@ def _write_cpu_window(
     started_wall_ns: int,
     started_monotonic_ns: int,
     finished_monotonic_ns: int,
-    start_cpu: tuple[float, float] | None,
-    finish_cpu: tuple[float, float] | None,
+    start_cpu: tuple[float | None, float | None, float] | None,
+    finish_cpu: tuple[float | None, float | None, float] | None,
     extra: dict | None = None,
 ) -> None:
     destination = _profile_writer(profile_dir)
@@ -371,6 +389,24 @@ def _server():
         finish_cpu=startup_finished_cpu,
         extra={"kind": "e2e_startup", "process_role": "harness"},
     )
+    if profile_dir is not None:
+        startup_server_cpu = _process_cpu_times(proc.pid)
+        if startup_server_cpu is not None:
+            startup_server_zero = (
+                0.0 if startup_server_cpu[0] is not None else None,
+                0.0 if startup_server_cpu[1] is not None else None,
+                0.0,
+            )
+            _write_cpu_window(
+                profile_dir,
+                identity="e2e:startup:server",
+                started_wall_ns=startup_started_wall_ns,
+                started_monotonic_ns=startup_started_monotonic_ns,
+                finished_monotonic_ns=startup_finished_monotonic_ns,
+                start_cpu=startup_server_zero,
+                finish_cpu=startup_server_cpu,
+                extra={"kind": "e2e_startup", "process_role": "server"},
+            )
 
     try:
         yield base_url, log_path, proc.pid, profile_dir
@@ -1109,8 +1145,8 @@ class CpuProfilingTests(unittest.TestCase):
             started_wall_ns=123,
             started_monotonic_ns=started_monotonic_ns,
             finished_monotonic_ns=finished_monotonic_ns,
-            start_cpu=(1.0, 2.0),
-            finish_cpu=(1.25, 2.5),
+            start_cpu=(1.0, 2.0, 3.0),
+            finish_cpu=(1.25, 2.5, 3.75),
             extra={"kind": "e2e_scenario", "process_role": "harness"},
         )
 
@@ -1123,6 +1159,21 @@ class CpuProfilingTests(unittest.TestCase):
         self.assertEqual(750.0, record["total_cpu_ms"])
         self.assertEqual("harness", record["process_role"])
 
+    def test_total_only_cpu_window_does_not_fabricate_components(self):
+        record = _cpu_window_record(
+            identity="e2e:server",
+            started_wall_ns=123,
+            started_monotonic_ns=1_000_000,
+            finished_monotonic_ns=2_000_000,
+            start_cpu=(None, None, 1.0),
+            finish_cpu=(None, None, 1.5),
+        )
+
+        self.assertEqual("windowed_process_total_only", record["provenance"])
+        self.assertIsNone(record["user_cpu_ms"])
+        self.assertIsNone(record["system_cpu_ms"])
+        self.assertEqual(500.0, record["total_cpu_ms"])
+
     def test_write_cpu_window_appends_jsonl(self):
         with tempfile.TemporaryDirectory() as directory:
             profile_dir = Path(directory)
@@ -1132,8 +1183,8 @@ class CpuProfilingTests(unittest.TestCase):
                 started_wall_ns=100,
                 started_monotonic_ns=0,
                 finished_monotonic_ns=2_000_000,
-                start_cpu=(0.0, 0.0),
-                finish_cpu=(0.1, 0.2),
+                start_cpu=(0.0, 0.0, 0.0),
+                finish_cpu=(0.1, 0.2, 0.3),
                 extra={"kind": "e2e_startup", "process_role": "harness"},
             )
             lines = (profile_dir / "e2e-scenario-cpu.jsonl").read_text().splitlines()

@@ -41,6 +41,28 @@ class CheckProfileReportTests(unittest.TestCase):
         self.assertIn("inclusive", markdown)
         self.assertIn("dev.check.test", summary["traceql"]["tests"])
 
+    def test_reconciles_inclusive_parent_with_child_records(self):
+        report = load_report()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "processes").mkdir()
+            (root / "processes" / "vitest-vitest.json").write_text(json.dumps({
+                "identity": "step:vitest:vitest", "provenance": "exact_waited_descendants",
+                "total_cpu_ms": 100, "wall_ms": 50,
+            }))
+            (root / "vitest-cpu-worker.jsonl").write_text("\n".join([
+                json.dumps({"full_test_name": "one", "provenance": "windowed_process", "cpu_user_us": 30000, "cpu_system_us": 0}),
+                json.dumps({"full_test_name": "two", "provenance": "windowed_process", "cpu_user_us": 20000, "cpu_system_us": 0}),
+            ]) + "\n")
+
+            summary = report.render(root, 20)
+
+        item = summary["reconciliation"][0]
+        self.assertEqual(100, item["parent_cpu_ms"])
+        self.assertEqual(50, item["attributed_child_cpu_ms"])
+        self.assertEqual(50, item["shared_unattributed_cpu_ms"])
+        self.assertTrue(item["children_may_overlap"])
+
     def test_unavailable_cpu_is_not_ranked_as_zero(self):
         report = load_report()
         with tempfile.TemporaryDirectory() as directory:

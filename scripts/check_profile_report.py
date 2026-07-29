@@ -47,6 +47,44 @@ def _normalize(path: Path, value: dict) -> dict:
     }
 
 
+def _reconciliation(rows: list[dict]) -> list[dict]:
+    parent_names = {
+        "rust": "rust-cargo-test.json",
+        "vitest": "vitest-vitest.json",
+        "python": "spec-shape-dev.py-unit-tests.json",
+        "e2e": "e2e-e2e.json",
+    }
+    child_match = {
+        "rust": lambda row: row["source"].startswith("rust-tests/"),
+        "vitest": lambda row: row["source"].startswith("vitest-cpu-"),
+        "python": lambda row: row["source"] == "python-test-cpu.jsonl",
+        "e2e": lambda row: row["source"] == "e2e-scenario-cpu.jsonl",
+    }
+    result = []
+    for name, parent_source in parent_names.items():
+        parent = next((row for row in rows if row["source"] == f"processes/{parent_source}"), None)
+        if parent is None or parent["cpu_ms"] is None:
+            continue
+        children = [
+            row for row in rows
+            if child_match[name](row) and row["cpu_ms"] is not None
+        ]
+        attributed = sum(row["cpu_ms"] for row in children)
+        remainder = parent["cpu_ms"] - attributed
+        result.append({
+            "parent": name,
+            "parent_cpu_ms": parent["cpu_ms"],
+            "attributed_child_cpu_ms": attributed,
+            "shared_unattributed_cpu_ms": max(0.0, remainder),
+            "reconciliation_error_ms": min(0.0, remainder),
+            "child_count": len(children),
+            "children_may_overlap": any(
+                row["provenance"].startswith("windowed_process") for row in children
+            ),
+        })
+    return result
+
+
 def render(profile_dir: Path, limit: int) -> dict:
     rows = [
         _normalize(path.relative_to(profile_dir), value)
@@ -63,6 +101,7 @@ def render(profile_dir: Path, limit: int) -> dict:
         "record_count": len(rows),
         "top_cpu_records": ranked_rows[:limit],
         "unavailable_cpu_records": unavailable_rows,
+        "reconciliation": _reconciliation(rows),
         "traceql": {
             "command": '{ name = "dev.command" && span.check.profile_work = true }',
             "steps": '{ name = "dev.check.step" && span.check.profile_run_id != nil }',
@@ -85,6 +124,20 @@ def render(profile_dir: Path, limit: int) -> dict:
     for row in ranked_rows[:limit]:
         identity = row["identity"].replace("|", "\\|")
         lines.append(f'| {row["cpu_ms"]:.1f} | {row["wall_ms"]:.1f} | {row["provenance"]} | {row["kind"]} | `{identity}` |')
+    if summary["reconciliation"]:
+        lines += [
+            "", "## Parent-child reconciliation", "",
+            "| Parent | Inclusive CPU ms | Child CPU ms | Shared/unattributed ms | Error ms | Overlap risk |",
+            "| --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+        for item in summary["reconciliation"]:
+            lines.append(
+                f'| {item["parent"]} | {item["parent_cpu_ms"]:.1f} | '
+                f'{item["attributed_child_cpu_ms"]:.1f} | '
+                f'{item["shared_unattributed_cpu_ms"]:.1f} | '
+                f'{item["reconciliation_error_ms"]:.1f} | '
+                f'{"yes" if item["children_may_overlap"] else "no"} |'
+            )
     if unavailable_rows:
         lines += ["", "## Unavailable CPU measurements", ""]
         lines += [f'- `{row["identity"]}` ({row["provenance"]})' for row in unavailable_rows]
