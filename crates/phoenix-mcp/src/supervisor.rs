@@ -733,11 +733,11 @@ mod epoch_tests {
                 .await
             }
         });
-        let _ = tokio::time::timeout(Duration::from_secs(5), http_started.recv())
+        () = tokio::time::timeout(Duration::from_secs(5), http_started.recv())
             .await
             .expect("first HTTP call starts in time")
             .expect("first HTTP call started");
-        let _ = tokio::time::timeout(Duration::from_secs(5), http_started.recv())
+        () = tokio::time::timeout(Duration::from_secs(5), http_started.recv())
             .await
             .expect("second HTTP call starts in time")
             .expect("second HTTP call starts concurrently");
@@ -771,7 +771,7 @@ mod epoch_tests {
                     .await
             }
         });
-        let _ = tokio::time::timeout(Duration::from_secs(5), stdio_started.recv())
+        () = tokio::time::timeout(Duration::from_secs(5), stdio_started.recv())
             .await
             .expect("first stdio call starts in time")
             .expect("first stdio call started");
@@ -780,7 +780,7 @@ mod epoch_tests {
             "the actor queues stdio calls sequentially"
         );
         stdio_releases.add_permits(1);
-        let _ = tokio::time::timeout(Duration::from_secs(5), stdio_started.recv())
+        () = tokio::time::timeout(Duration::from_secs(5), stdio_started.recv())
             .await
             .expect("second stdio call starts in time")
             .expect("second stdio call started");
@@ -881,7 +881,7 @@ mod epoch_tests {
                     .await
             }
         });
-        let _ = tokio::time::timeout(Duration::from_secs(5), started.recv())
+        () = tokio::time::timeout(Duration::from_secs(5), started.recv())
             .await
             .expect("HTTP call starts in time")
             .expect("HTTP call started");
