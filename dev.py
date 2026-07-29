@@ -284,7 +284,7 @@ def _display_path(path: Path) -> str:
 def _read_cpu_measurement(path: Path) -> dict | None:
     try:
         value = json.loads(path.read_text())
-        return _cpu_attributes(
+        attributes = _cpu_attributes(
             float(value["user_cpu_ms"]),
             float(value["system_cpu_ms"]),
             str(value["provenance"]),
@@ -293,6 +293,12 @@ def _read_cpu_measurement(path: Path) -> dict | None:
                 "cpu.measurement_path": _display_path(path),
             },
         )
+        reader_cpu_ms = float(value.get("reader_thread_cpu_ms", 0.0))
+        attributes["cpu.reader_thread_ms"] = reader_cpu_ms
+        attributes["cpu.total_ms"] = float(value.get(
+            "total_cpu_ms", attributes["cpu.total_ms"] + reader_cpu_ms
+        ))
+        return attributes
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -4788,22 +4794,28 @@ def cmd_check(
             text=True, env=env, start_new_session=True, bufsize=1,
         )
 
+        reader_cpu_ms = 0.0
+
         def reader():
-            nonlocal truncated
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                now = time.monotonic()
-                if len(buf) == buf.maxlen:
-                    truncated = True
-                # Strip terminal control sequences before buffering. The env
-                # above disables color for tools that honour it, but rustfmt's
-                # --check diff colours via the `term` crate keyed on $TERM and
-                # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
-                # tool-agnostic backstop so the reprinted buffer stays clean.
-                clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
-                lock_timer.observe_line(clean, now)
-                buf.append(clean)
-            proc.stdout.close()
+            nonlocal truncated, reader_cpu_ms
+            started_reader_ns = time.thread_time_ns()
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    now = time.monotonic()
+                    if len(buf) == buf.maxlen:
+                        truncated = True
+                    # Strip terminal control sequences before buffering. The env
+                    # above disables color for tools that honour it, but rustfmt's
+                    # --check diff colours via the `term` crate keyed on $TERM and
+                    # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
+                    # tool-agnostic backstop so the reprinted buffer stays clean.
+                    clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
+                    lock_timer.observe_line(clean, now)
+                    buf.append(clean)
+                proc.stdout.close()
+            finally:
+                reader_cpu_ms = (time.thread_time_ns() - started_reader_ns) / 1_000_000.0
 
         rt = threading.Thread(target=reader, daemon=True)
         rt.start()
@@ -4857,6 +4869,14 @@ def cmd_check(
                 duration_ms=elapsed * 1000.0,
                 returncode=rc,
             )
+        if measurement_path is not None and measurement_path.exists():
+            try:
+                measurement = json.loads(measurement_path.read_text())
+                measurement["reader_thread_cpu_ms"] = reader_cpu_ms
+                measurement["total_cpu_ms"] = float(measurement["total_cpu_ms"]) + reader_cpu_ms
+                measurement_path.write_text(json.dumps(measurement, sort_keys=True) + "\n")
+            except (OSError, ValueError, TypeError):
+                pass
         cpu_attributes = (
             _read_cpu_measurement(measurement_path)
             if measurement_path is not None else None
@@ -5465,11 +5485,15 @@ def cmd_check(
             has_nextest = False
         if not has_nextest:
             reporter.info("cargo nextest unavailable — using plain `cargo test`")
+            if _CHECK_PROFILE is not None:
+                _CHECK_PROFILE.metadata["rust_per_test_attribution"] = "unavailable_without_nextest"
             if profile_work:
                 reporter.info(
                     "Rust per-test CPU attribution unavailable without cargo-nextest; "
                     "the Rust step remains measured as a whole"
                 )
+        elif _CHECK_PROFILE is not None:
+            _CHECK_PROFILE.metadata["rust_per_test_attribution"] = "available"
         # nextest defaults to available_parallelism (= num_cpus). On low-RAM
         # boxes, num_cpus parallel test threads can swap and stall sensitive
         # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
@@ -5606,7 +5630,15 @@ def cmd_check(
         def wrapped():
             lane = threading.current_thread().name
             reporter.lane_start(lane)
-            span = _begin_dev_span("dev.check.lane", {"check.lane": lane})
+            in_process_steps = {
+                "task": "task validation",
+                "spec-anchors": "spec anchors",
+            }
+            step_name = in_process_steps.get(lane)
+            span = _begin_dev_span(
+                "dev.check.step" if step_name else "dev.check.lane",
+                {"check.lane": lane, **({"check.step": step_name} if step_name else {})},
+            )
             started_thread_ns = time.thread_time_ns()
             started_wall_ns = time.time_ns()
             started_monotonic_ns = time.monotonic_ns()
@@ -5627,12 +5659,14 @@ def cmd_check(
                         "orchestration.cpu.total_ms": thread_cpu_ms,
                         "orchestration.cpu.provenance": "exact_thread",
                     }
-                    lane_record = _CHECK_PROFILE.artifact_dir / "lanes" / f"{lane}.json"
+                    record_dir = "processes" if step_name else "lanes"
+                    record_name = f"{lane}-{step_name}.json" if step_name else f"{lane}.json"
+                    lane_record = _CHECK_PROFILE.artifact_dir / record_dir / record_name
                     lane_record.parent.mkdir(parents=True, exist_ok=True)
                     lane_record.write_text(json.dumps({
                         "schema_version": 1,
-                        "identity": f"lane:{lane}:in_process_orchestration",
-                        "kind": "lane_orchestration",
+                        "identity": f"step:{lane}:{step_name}" if step_name else f"lane:{lane}:in_process_orchestration",
+                        "kind": "step" if step_name else "lane_orchestration",
                         "provenance": "exact_thread",
                         "started_unix_ns": started_wall_ns,
                         "wall_ms": (time.monotonic_ns() - started_monotonic_ns) / 1_000_000.0,

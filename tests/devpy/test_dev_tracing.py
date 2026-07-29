@@ -235,13 +235,16 @@ class DevTracingTests(unittest.TestCase):
             path = Path(directory) / "measurement.json"
             path.write_text(json.dumps({
                 "user_cpu_ms": 1, "system_cpu_ms": 2,
+                "total_cpu_ms": 7,
                 "provenance": "exact_waited_descendants",
                 "tree_closure": "waited_descendants_only_survivors_unverified",
+                "reader_thread_cpu_ms": 4,
             }))
             attributes = self.dev._read_cpu_measurement(path)
 
         self.assertEqual(str(path), attributes["cpu.measurement_path"])
-        self.assertEqual(3, attributes["cpu.total_ms"])
+        self.assertEqual(7, attributes["cpu.total_ms"])
+        self.assertEqual(4, attributes["cpu.reader_thread_ms"])
 
     def test_profile_record_attributes_normalize_runner_units(self):
         source = self.dev.ROOT / "target" / "record.jsonl"
