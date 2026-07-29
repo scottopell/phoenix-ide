@@ -1422,7 +1422,7 @@ mod tests {
     #[tokio::test]
     async fn http_session_expired_404_reinitializes_and_retries() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
@@ -1475,7 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn http_session_expiry_during_tool_refresh_reestablishes() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
@@ -1937,7 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn http_failed_refresh_recovery_drops_the_server() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
@@ -2080,7 +2080,7 @@ mod tests {
     #[tokio::test]
     async fn http_unauthorized_401_is_surfaced_not_retried() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");

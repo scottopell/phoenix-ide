@@ -2294,7 +2294,7 @@ impl McpClientManager {
     /// # Errors
     /// Returns an error when the server is unavailable or the tool call fails.
     pub async fn call_tool(
-        &self,
+        self: &Arc<Self>,
         server_name: &str,
         tool_name: &str,
         arguments: Value,
@@ -2312,7 +2312,7 @@ impl McpClientManager {
     /// # Errors
     /// Returns cancellation or the serving/recovery failure.
     pub async fn call_tool_cancellable(
-        &self,
+        self: &Arc<Self>,
         server_name: &str,
         tool_name: &str,
         arguments: Value,
@@ -2352,12 +2352,26 @@ impl McpClientManager {
             }
             Err(_) => match recovery {
                 CallRecovery::OAuth(kind) => {
-                    let recovery = self.recover_oauth(server_name, &handle, first.epoch, kind);
-                    tokio::pin!(recovery);
+                    let manager = Arc::clone(self);
+                    let name = server_name.to_string();
+                    let recovery_handle = handle.clone();
+                    let mut recovery = tokio::spawn(async move {
+                        manager
+                            .recover_oauth(&name, &recovery_handle, first.epoch, kind)
+                            .await
+                    });
                     tokio::select! {
                         biased;
-                        () = cancel.cancelled() => return Err(McpToolCallError::Cancelled),
-                        result = &mut recovery => result?,
+                        () = cancel.cancelled() => {
+                            self.track_background_task(tokio::spawn(async move {
+                                let _ = recovery.await;
+                            }));
+                            return Err(McpToolCallError::Cancelled);
+                        }
+                        result = &mut recovery => {
+                            result
+                                .map_err(|error| McpToolCallError::Failed(format!("MCP OAuth recovery task failed: {error}")))??;
+                        }
                     }
                 }
                 CallRecovery::Transport | CallRecovery::CancelledTransport => {
@@ -2772,13 +2786,15 @@ impl McpClientManager {
                         .await
                         .is_err()
                     {
+                        let error = format!(
+                            "timed out after {}s restarting changed MCP server",
+                            RELOAD_RESTART_TIMEOUT.as_secs()
+                        );
+                        handle.fail(handle.snapshot().epoch, error.clone()).await;
                         failed.push(McpReloadFailure {
                             server: name,
                             action: "restart".to_string(),
-                            error: format!(
-                                "timed out after {}s restarting changed MCP server",
-                                RELOAD_RESTART_TIMEOUT.as_secs()
-                            ),
+                            error,
                         });
                         continue;
                     }
@@ -3064,7 +3080,10 @@ impl McpClientManager {
         let tool_call_timeout = match cfg.get("timeoutSeconds") {
             None => DEFAULT_TOOL_CALL_TIMEOUT,
             Some(value) => {
-                let Some(seconds) = value.as_u64().filter(|seconds| *seconds > 0) else {
+                let Some(seconds) = value
+                    .as_u64()
+                    .filter(|seconds| *seconds > 0 && *seconds <= 31_536_000)
+                else {
                     tracing::debug!(
                         server = %name,
                         "'timeoutSeconds' must be a positive integer; skipping server"
@@ -4120,7 +4139,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_retains_failed_server_with_cause_and_clears_on_reconnect() {
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let config = http_none_config("https://remote.example/mcp");
         let handle = SupervisorHandle::connecting(config.clone());
         manager
@@ -4152,7 +4171,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_sweeps_failed_only_servers_dropped_from_config() {
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let handle = SupervisorHandle::connecting(http_none_config("https://gone.example/mcp"));
         manager
             .servers
@@ -4168,7 +4187,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_entry_reflects_disabled_state() {
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let handle = SupervisorHandle::connecting(http_none_config("https://remote.example/mcp"));
         manager
             .servers
@@ -4193,7 +4212,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_entry_carries_the_redirect_warning() {
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         manager.set_oauth_redirect_warning(Some("callback unreachable".to_string()));
         let handle = SupervisorHandle::connecting(http_none_config("https://remote.example/mcp"));
         manager
@@ -4225,7 +4244,7 @@ mod tests {
 
     #[tokio::test]
     async fn awaiting_authorization_is_unauthorized_not_failed() {
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let handle = SupervisorHandle::connecting(http_none_config("https://remote.example/mcp"));
         manager
             .servers
@@ -4258,7 +4277,7 @@ mod tests {
     async fn pending_authorization_takes_precedence_over_a_stale_failure() {
         // A server can hold a stale failure and then enter an OAuth flow on
         // retry; the status shows it as unauthorized, not failed.
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let handle = SupervisorHandle::connecting(http_none_config("https://remote.example/mcp"));
         manager
             .servers
@@ -4773,7 +4792,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
         let marker = tmp.path().join("marker.log");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let config = fixture_config(&script, &marker, "v1", "env1");
         connect_fixture(&manager, &config).await;
 
@@ -4799,7 +4818,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
         let marker = tmp.path().join("marker.log");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let initial = fixture_config(&script, &marker, "v1", "env1");
         connect_fixture(&manager, &initial).await;
 
@@ -4831,7 +4850,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
         let marker = tmp.path().join("marker.log");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let initial = fixture_config(&script, &marker, "v1", "env1");
         connect_fixture(&manager, &initial).await;
 
@@ -4860,7 +4879,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
         let marker = tmp.path().join("marker.log");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let initial = fixture_config(&script, &marker, "v1", "env1");
         connect_fixture(&manager, &initial).await;
 
@@ -4890,7 +4909,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
         let marker = tmp.path().join("marker.log");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let initial = fixture_config(&script, &marker, "v1", "env1");
         connect_fixture(&manager, &initial).await;
 
@@ -4914,7 +4933,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
         let marker = tmp.path().join("marker.log");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let config = fixture_config(&script, &marker, "v1", "env1");
         connect_fixture(&manager, &config).await;
 
@@ -4933,7 +4952,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
         let marker = tmp.path().join("marker.log");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let config = fixture_config(&script, &marker, "v1", "env1");
 
         let result = manager
@@ -4958,7 +4977,7 @@ for line in sys.stdin:
         let marker = tmp.path().join("marker.log");
         let crash_once = tmp.path().join("crash-once");
         std::fs::write(&crash_once, "crash").expect("write crash marker");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let initial = fixture_config(&script, &marker, "v1", "env1");
         connect_fixture(&manager, &initial).await;
 
@@ -4993,7 +5012,7 @@ for line in sys.stdin:
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
         let marker = tmp.path().join("marker.log");
-        let manager = McpClientManager::new();
+        let manager = Arc::new(McpClientManager::new());
         let mut config = fixture_config(&script, &marker, "v1", "env1");
         as_stdio_mut(&mut config)
             .2
