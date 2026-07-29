@@ -64,6 +64,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -425,9 +426,7 @@ def _server():
     profile_dir = _profile_dir_from_env()
     startup_started_wall_ns = time.time_ns()
     startup_started_monotonic_ns = time.monotonic_ns()
-    startup_started_cpu = (
-        _harness_with_waited_children_cpu_times() if profile_dir is not None else None
-    )
+    startup_started_cpu = _harness_cpu_times() if profile_dir is not None else None
 
     try:
         proc, base_url, log_path, log_file = _start_server_with_retries(env, tmpdir)
@@ -440,10 +439,7 @@ def _server():
             started_monotonic_ns=startup_started_monotonic_ns,
             finished_monotonic_ns=startup_finished_monotonic_ns,
             start_cpu=startup_started_cpu,
-            finish_cpu=(
-                _harness_with_waited_children_cpu_times()
-                if profile_dir is not None else None
-            ),
+            finish_cpu=_harness_cpu_times() if profile_dir is not None else None,
             extra={
                 "kind": "e2e_startup", "process_role": "harness",
                 "status": "failed",
@@ -453,9 +449,7 @@ def _server():
         raise
 
     startup_finished_monotonic_ns = time.monotonic_ns()
-    startup_finished_cpu = (
-        _harness_with_waited_children_cpu_times() if profile_dir is not None else None
-    )
+    startup_finished_cpu = _harness_cpu_times() if profile_dir is not None else None
     _write_cpu_window(
         profile_dir,
         identity="e2e:startup:harness",
@@ -1317,6 +1311,18 @@ class CpuProfilingTests(unittest.TestCase):
         self.assertIsNone(record["user_cpu_ms"])
         self.assertIsNone(record["system_cpu_ms"])
         self.assertEqual(500.0, record["total_cpu_ms"])
+
+    @unittest.skipIf(resource is None, "resource module unavailable")
+    def test_harness_cpu_excludes_waited_children(self):
+        own = type("Rusage", (), {"ru_utime": 1.0, "ru_stime": 0.25})()
+        children = type("Rusage", (), {"ru_utime": 4.0, "ru_stime": 2.0})()
+
+        with mock.patch.object(resource, "getrusage", side_effect=[own, own, children]):
+            harness = _harness_cpu_times()
+            combined = _harness_with_waited_children_cpu_times()
+
+        self.assertEqual((1.0, 0.25, 1.25), harness)
+        self.assertEqual((5.0, 2.25, 7.25), combined)
 
     def test_write_cpu_window_appends_jsonl(self):
         with tempfile.TemporaryDirectory() as directory:
