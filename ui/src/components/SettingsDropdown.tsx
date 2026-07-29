@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from
 import { useNavigate } from 'react-router-dom';
 import { api, type CodexLoginPreflight, type LlmLanguageSetting, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
-import { clearCodexQuota, useCodexQuota } from '../codexQuota';
+import { clearCodexQuota, setCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
 import {
   getBrowserNotificationPermission,
@@ -275,6 +275,15 @@ function CodexSection({
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const quota = useCodexQuota();
+  useEffect(() => {
+    let cancelled = false;
+    api.codexQuota()
+      .then((next) => {
+        if (!cancelled && next) setCodexQuota(next);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [preflight.account_id]);
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };

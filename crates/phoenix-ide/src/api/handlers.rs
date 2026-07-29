@@ -458,6 +458,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/codex/login/preflight",
             get(super::codex_login::login_preflight),
         )
+        .route("/api/codex/quota", get(super::codex_login::codex_quota))
         .route(
             "/api/codex/login/pkce/start",
             post(super::codex_login::pkce_start),

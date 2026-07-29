@@ -10,6 +10,7 @@ import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpd
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
+import type { QuotaDetails } from './generated/QuotaDetails';
 // Phoenix API Client
 
 export class ApiResponseError extends Error {
@@ -1418,6 +1419,12 @@ export const api = {
   async codexLoginPreflight(): Promise<CodexLoginPreflight> {
     const resp = await fetch('/api/codex/login/preflight');
     if (!resp.ok) throw new Error('Failed to check codex login preflight');
+    return resp.json();
+  },
+
+  async codexQuota(): Promise<QuotaDetails | null> {
+    const resp = await fetch('/api/codex/quota');
+    if (!resp.ok) throw new Error('Failed to load Codex quota');
     return resp.json();
   },
 

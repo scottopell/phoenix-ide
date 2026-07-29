@@ -26,6 +26,7 @@ const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_SKEW_SECS: i64 = 30;
 pub const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 /// Context-window cap enforced by the ChatGPT-backend codex bridge,
 /// regardless of the model's platform-API ceiling. Sourced from

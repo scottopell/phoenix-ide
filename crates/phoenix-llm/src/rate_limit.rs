@@ -63,6 +63,62 @@ struct CodexRateLimitEvent {
     limit_name: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CodexUsageWindow {
+    used_percent: f64,
+    limit_window_seconds: i64,
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageRateLimit {
+    primary_window: Option<CodexUsageWindow>,
+    secondary_window: Option<CodexUsageWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageReachedType {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsagePayload {
+    plan_type: Option<String>,
+    rate_limit: Option<CodexUsageRateLimit>,
+    credits: Option<CodexRateLimitEventCredits>,
+    rate_limit_reached_type: Option<CodexUsageReachedType>,
+}
+
+/// Normalize the account-wide payload returned by Codex's authenticated usage endpoint.
+#[must_use]
+pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<QuotaDetails> {
+    let payload: CodexUsagePayload = serde_json::from_value(value.clone()).ok()?;
+    let rate_limit = payload.rate_limit?;
+    let map_window = |window: CodexUsageWindow| RateLimitWindow {
+        used_percent: window.used_percent,
+        window_minutes: Some(window.limit_window_seconds / 60),
+        resets_at: window.reset_at,
+    };
+    Some(QuotaDetails {
+        plan_type: payload.plan_type,
+        resets_at: None,
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: rate_limit.primary_window.map(map_window),
+        secondary: rate_limit.secondary_window.map(map_window),
+        credits: payload.credits.map(|credits| CreditsSnapshot {
+            has_credits: credits.has_credits,
+            unlimited: credits.unlimited,
+            balance: credits.balance,
+        }),
+        promo_message: None,
+        rate_limit_reached_type: payload
+            .rate_limit_reached_type
+            .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind)),
+    })
+}
+
 /// Normalize the complete `codex.rate_limits` WebSocket event. Its plan,
 /// credits, and active limit live beside the nested window details.
 #[must_use]
@@ -221,9 +277,8 @@ pub fn parse_promo_message(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-#[must_use]
-pub fn parse_rate_limit_reached_type(headers: &HeaderMap) -> Option<RateLimitReachedType> {
-    match parse_header_str(headers, RATE_LIMIT_REACHED_TYPE_HEADER)?.trim() {
+fn parse_rate_limit_reached_type_value(value: &str) -> Option<RateLimitReachedType> {
+    match value.trim() {
         "rate_limit_reached" => Some(RateLimitReachedType::RateLimitReached),
         "workspace_owner_credits_depleted" => {
             Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted)
@@ -239,6 +294,11 @@ pub fn parse_rate_limit_reached_type(headers: &HeaderMap) -> Option<RateLimitRea
         }
         _ => None,
     }
+}
+
+#[must_use]
+pub fn parse_rate_limit_reached_type(headers: &HeaderMap) -> Option<RateLimitReachedType> {
+    parse_rate_limit_reached_type_value(parse_header_str(headers, RATE_LIMIT_REACHED_TYPE_HEADER)?)
 }
 
 pub fn parse_credits_snapshot(headers: &HeaderMap) -> Option<CreditsSnapshot> {
@@ -305,6 +365,38 @@ fn parse_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
+
+    #[test]
+    fn parses_current_and_weekly_windows_from_upstream_usage_payload() {
+        #![allow(clippy::float_cmp)]
+        let payload = serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 3,
+                    "limit_window_seconds": 18_000,
+                    "reset_at": 1_800_000_000
+                },
+                "secondary_window": {
+                    "used_percent": 4,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": 1_800_500_000
+                }
+            },
+            "credits": { "has_credits": false, "unlimited": false, "balance": null },
+            "rate_limit_reached_type": null
+        });
+
+        let quota = quota_from_codex_usage_payload(&payload).expect("usage payload");
+        assert_eq!(quota.primary.as_ref().unwrap().used_percent, 3.0);
+        assert_eq!(quota.primary.as_ref().unwrap().window_minutes, Some(300));
+        assert_eq!(quota.secondary.as_ref().unwrap().used_percent, 4.0);
+        assert_eq!(
+            quota.secondary.as_ref().unwrap().window_minutes,
+            Some(10_080)
+        );
+        assert!(!quota.credits.as_ref().unwrap().has_credits);
+    }
 
     #[test]
     // Parsed percentages are exact, representable values from the fixture header.

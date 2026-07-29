@@ -6,6 +6,7 @@ import type { SidebarFixtureData } from './types';
 export function installSidebarFixtureApi(data: SidebarFixtureData) {
   const original = {
     codexLoginPreflight: api.codexLoginPreflight,
+    codexQuota: api.codexQuota,
     deploymentInfo: api.deploymentInfo,
     getLocalServices: api.getLocalServices,
     getProjects: api.getProjects,
@@ -22,6 +23,7 @@ export function installSidebarFixtureApi(data: SidebarFixtureData) {
     account_id: null,
     account_email: null,
   });
+  api.codexQuota = async () => null;
   api.deploymentInfo = async (): Promise<DeploymentInfo> => ({ local_access: true } as unknown as DeploymentInfo);
   api.getLocalServices = async () => ({ services: [] });
   api.getProjects = async () => data.projects;
@@ -34,6 +36,7 @@ export function installSidebarFixtureApi(data: SidebarFixtureData) {
 
   return () => {
     api.codexLoginPreflight = original.codexLoginPreflight;
+    api.codexQuota = original.codexQuota;
     api.deploymentInfo = original.deploymentInfo;
     api.getLocalServices = original.getLocalServices;
     api.getProjects = original.getProjects;

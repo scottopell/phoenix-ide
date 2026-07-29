@@ -24,7 +24,17 @@ function notify(): void {
 }
 
 export function setCodexQuota(next: QuotaDetails): void {
-  snapshot = next;
+  snapshot = snapshot === null ? next : {
+    plan_type: next.plan_type ?? snapshot.plan_type,
+    resets_at: next.resets_at ?? snapshot.resets_at,
+    limit_id: next.limit_id ?? snapshot.limit_id,
+    limit_name: next.limit_name ?? snapshot.limit_name,
+    primary: next.primary ?? snapshot.primary,
+    secondary: next.secondary ?? snapshot.secondary,
+    credits: next.credits ?? snapshot.credits,
+    promo_message: next.promo_message ?? snapshot.promo_message,
+    rate_limit_reached_type: next.rate_limit_reached_type ?? snapshot.rate_limit_reached_type,
+  };
   notify();
 }
 

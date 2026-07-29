@@ -76,3 +76,10 @@ Snapshots are ephemeral and account-global; they are not persisted across proces
 - Upstream treats `has_credits` as credit tracking/availability, hides the row when false, displays `Available` for an enabled hidden balance, and uses `x-codex-rate-limit-reached-type` to distinguish actual workspace credit depletion.
 - Focused Phoenix Rust parser/error tests and `CodexQuotaBlock` Vitest regressions pass.
 - `./dev.py check`: all 19 applicable lanes pass.
+
+### Current-period follow-up
+
+- Verified against the live authenticated `GET /backend-api/wham/usage` response that Codex can return both its primary/current and secondary/weekly windows independently of turn response headers.
+- Added an authenticated Phoenix quota endpoint and upstream-shaped parser so opening settings obtains the authoritative account snapshot without requiring a completed turn.
+- Partial per-turn snapshots now merge into the account snapshot instead of erasing an omitted current or weekly window.
+- Live dev endpoint verification returned the account quota successfully; focused parser/store/component tests and all 19 `./dev.py check` lanes pass.
