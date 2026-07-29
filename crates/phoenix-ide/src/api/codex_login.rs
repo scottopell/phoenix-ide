@@ -904,12 +904,12 @@ async fn fetch_codex_quota(
 }
 
 pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_llm::QuotaDetails>> {
-    let auth_path = state.runtime_env.codex_auth_path();
-    let quota = match codex_credential::CodexCredential::load(auth_path) {
-        Ok((credential, account_id)) => {
+    let quota = match state.llm_registry.current_codex_credential() {
+        Some(credential) => {
+            let account_id = credential.account_id();
             fetch_codex_quota(credential.as_ref(), account_id.as_deref()).await
         }
-        Err(_) => None,
+        None => None,
     };
     Json(quota)
 }

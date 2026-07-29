@@ -504,6 +504,7 @@ pub struct ModelRegistry {
     /// when no credential is active. Updated by `reload_codex_credential`
     /// in lockstep with the `OpenAI` bridge services.
     current_codex_loaded_path: std::sync::RwLock<Option<std::path::PathBuf>>,
+    current_codex_credential: std::sync::RwLock<Option<Arc<CodexCredential>>>,
     /// Config template kept for rebuilding bridge services on reload. The
     /// `codex_credential` / `codex_credential_path` fields are ignored on
     /// reload — we always re-resolve those from the filesystem.
@@ -521,6 +522,7 @@ impl ModelRegistry {
             default_model: "test-model".to_string(),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
+            current_codex_credential: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
         }
     }
@@ -546,6 +548,7 @@ impl ModelRegistry {
             default_model,
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
+            current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
             config: Arc::new(config.clone()),
         }
     }
@@ -654,6 +657,7 @@ impl ModelRegistry {
             default_model,
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
+            current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
             config: Arc::new(config.clone()),
         }
     }
@@ -973,6 +977,7 @@ impl ModelRegistry {
             default_model: "claude-sonnet-5".to_string(),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
+            current_codex_credential: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
         }
     }
@@ -1050,6 +1055,13 @@ impl ModelRegistry {
                 || parent_model_id.to_string(),
                 std::string::ToString::to_string,
             )
+    }
+
+    pub fn current_codex_credential(&self) -> Option<Arc<CodexCredential>> {
+        self.current_codex_credential
+            .read()
+            .ok()
+            .and_then(|credential| credential.clone())
     }
 
     /// Re-resolve the active Codex/ChatGPT credential and rebuild the `OpenAI`
@@ -1160,6 +1172,10 @@ impl ModelRegistry {
                 .current_codex_loaded_path
                 .write()
                 .expect("loaded-path lock poisoned");
+            let mut current_credential = self
+                .current_codex_credential
+                .write()
+                .expect("codex credential lock poisoned");
 
             // Remove existing OpenAI entries before inserting the new ones,
             // so deregister-on-logout (cred=None) and switch-account both
@@ -1184,6 +1200,9 @@ impl ModelRegistry {
 
             let prev = current_path.clone();
             current_path.clone_from(&new_path);
+            *current_credential = cred_with_account
+                .as_ref()
+                .map(|(credential, _)| Arc::clone(credential));
             prev
         };
 
@@ -1828,6 +1847,7 @@ mod tests {
             "no OpenAI bridge before reload"
         );
         assert_eq!(registry.current_codex_loaded_path(), None);
+        assert!(registry.current_codex_credential().is_none());
 
         // Drop a fresh auth file, simulate the login handler's reload call.
         let dir = tempfile::tempdir().unwrap();
@@ -1843,6 +1863,14 @@ mod tests {
         assert_eq!(outcome.current_path.as_deref(), Some(auth_path.as_path()));
         assert!(outcome.credential_loaded);
 
+        assert_eq!(
+            registry
+                .current_codex_credential()
+                .unwrap()
+                .account_id()
+                .as_deref(),
+            Some("acc-1")
+        );
         assert!(
             registry.get("gpt-5.5").is_some(),
             "reload must register the OpenAI bridge"
@@ -1898,6 +1926,14 @@ mod tests {
             Some(path2.as_path())
         );
         assert!(registry.get("gpt-5.5").is_some());
+        assert_eq!(
+            registry
+                .current_codex_credential()
+                .unwrap()
+                .account_id()
+                .as_deref(),
+            Some("acc-new")
+        );
     }
 
     /// Reload to None (e.g. file deleted) deregisters the `OpenAI` bridge.
@@ -1916,6 +1952,7 @@ mod tests {
 
         let outcome = registry.reload_codex_credential_with(None);
         assert!(!outcome.credential_loaded);
+        assert!(registry.current_codex_credential().is_none());
         assert!(
             registry.get("gpt-5.5").is_none(),
             "OpenAI bridge must be removed when reload resolves to None"

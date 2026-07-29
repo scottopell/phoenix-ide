@@ -4,7 +4,7 @@ import type { SseInitData } from '../api';
 import type { SSEAction, InitPayload } from '../conversation/atom';
 import { parseConversationState } from '../utils';
 import { notifyConversationStateChange } from '../notifications';
-import { setCodexQuota } from '../codexQuota';
+import { mergeCodexQuota } from '../codexQuota';
 import {
   SseInitDataSchema,
   SseMessageDataSchema,
@@ -612,7 +612,7 @@ export function useConnection({
               stampedDispatch,
             );
             if (!res.ok) return;
-            setCodexQuota(res.data.snapshot);
+            mergeCodexQuota(res.data.snapshot);
             stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 

@@ -94,28 +94,43 @@ struct CodexUsagePayload {
 #[must_use]
 pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<QuotaDetails> {
     let payload: CodexUsagePayload = serde_json::from_value(value.clone()).ok()?;
-    let rate_limit = payload.rate_limit?;
     let map_window = |window: CodexUsageWindow| RateLimitWindow {
         used_percent: window.used_percent,
         window_minutes: Some(window.limit_window_seconds / 60),
         resets_at: window.reset_at,
     };
+    let (primary, secondary) = payload.rate_limit.map_or((None, None), |rate_limit| {
+        (
+            rate_limit.primary_window.map(map_window),
+            rate_limit.secondary_window.map(map_window),
+        )
+    });
+    let credits = payload.credits.map(|credits| CreditsSnapshot {
+        has_credits: credits.has_credits,
+        unlimited: credits.unlimited,
+        balance: credits.balance,
+    });
+    let rate_limit_reached_type = payload
+        .rate_limit_reached_type
+        .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind));
+    if primary.is_none()
+        && secondary.is_none()
+        && credits.is_none()
+        && rate_limit_reached_type.is_none()
+        && payload.plan_type.is_none()
+    {
+        return None;
+    }
     Some(QuotaDetails {
         plan_type: payload.plan_type,
         resets_at: None,
         limit_id: Some("codex".to_string()),
         limit_name: None,
-        primary: rate_limit.primary_window.map(map_window),
-        secondary: rate_limit.secondary_window.map(map_window),
-        credits: payload.credits.map(|credits| CreditsSnapshot {
-            has_credits: credits.has_credits,
-            unlimited: credits.unlimited,
-            balance: credits.balance,
-        }),
+        primary,
+        secondary,
+        credits,
         promo_message: None,
-        rate_limit_reached_type: payload
-            .rate_limit_reached_type
-            .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind)),
+        rate_limit_reached_type,
     })
 }
 
@@ -396,6 +411,32 @@ mod tests {
             Some(10_080)
         );
         assert!(!quota.credits.as_ref().unwrap().has_credits);
+    }
+
+    #[test]
+    fn preserves_credit_only_usage_payload() {
+        let payload = serde_json::json!({
+            "plan_type": null,
+            "rate_limit": null,
+            "credits": { "has_credits": true, "unlimited": true, "balance": null },
+            "rate_limit_reached_type": {
+                "type": "workspace_member_credits_depleted"
+            }
+        });
+
+        let quota = quota_from_codex_usage_payload(&payload).expect("credit-only usage payload");
+        assert!(quota.primary.is_none());
+        assert!(quota.secondary.is_none());
+        assert!(quota.credits.as_ref().unwrap().unlimited);
+        assert_eq!(
+            quota.rate_limit_reached_type,
+            Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted)
+        );
+    }
+
+    #[test]
+    fn rejects_usage_payload_without_quota_data() {
+        assert!(quota_from_codex_usage_payload(&serde_json::json!({})).is_none());
     }
 
     #[test]

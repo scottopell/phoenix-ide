@@ -1,10 +1,11 @@
 import type { QuotaDetails, RateLimitWindow } from '../sseSchemas';
 
-// Window-minutes → human label. Codex uses 60 (hourly), 1440 (daily),
-// 10080 (weekly); fall back to "Window" for anything unrecognized so a
+// Window-minutes → human label. Codex uses 60 (hourly), 300 (five-hour),
+// 1440 (daily), and 10080 (weekly); fall back to "Window" for anything unrecognized so a
 // future limit type doesn't render an empty cell.
 function windowLabel(windowMinutes: number | null): string {
   if (windowMinutes === 60) return 'Hourly';
+  if (windowMinutes === 300) return '5-hour';
   if (windowMinutes === 1440) return 'Daily';
   if (windowMinutes === 10080) return 'Weekly';
   return 'Window';

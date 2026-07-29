@@ -19,6 +19,23 @@ function quota(overrides: Partial<QuotaDetails>): QuotaDetails {
 }
 
 describe('CodexQuotaBlock', () => {
+  it('labels the current five-hour quota window', () => {
+    render(
+      <CodexQuotaBlock
+        quota={quota({
+          primary: {
+            used_percent: 3,
+            window_minutes: 300,
+            resets_at: 1_800_000_000,
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByText('5-hour')).toBeInTheDocument();
+    expect(screen.getByText('3%')).toBeInTheDocument();
+  });
+
   it('shows weekly quota without claiming unavailable credits are depleted', () => {
     const { container } = render(
       <CodexQuotaBlock

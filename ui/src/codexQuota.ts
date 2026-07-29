@@ -23,7 +23,12 @@ function notify(): void {
   for (const fn of listeners) fn();
 }
 
-export function setCodexQuota(next: QuotaDetails): void {
+export function replaceCodexQuota(next: QuotaDetails): void {
+  snapshot = next;
+  notify();
+}
+
+export function mergeCodexQuota(next: QuotaDetails): void {
   snapshot = snapshot === null ? next : {
     plan_type: next.plan_type ?? snapshot.plan_type,
     resets_at: next.resets_at ?? snapshot.resets_at,
