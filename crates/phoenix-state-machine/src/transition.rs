@@ -3608,16 +3608,16 @@ fn should_trigger_continuation(
 ) -> bool {
     let used = usage.context_window_used();
     let proportional_threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
-    let reserved_output = if effort
+    let threshold = if effort
         .is_some_and(phoenix_core::domain::llm_types::ModelEffort::needs_extended_output_headroom)
     {
-        64_000
+        let reservation_threshold =
+            u64::try_from(context_window.saturating_sub(64_000)).unwrap_or(u64::MAX);
+        proportional_threshold.min(reservation_threshold)
     } else {
-        16_384
+        proportional_threshold
     };
-    let reservation_threshold =
-        u64::try_from(context_window.saturating_sub(reserved_output)).unwrap_or(u64::MAX);
-    used >= proportional_threshold.min(reservation_threshold)
+    used >= threshold
 }
 
 /// Handle context exhaustion based on conversation type (REQ-BED-019, REQ-BED-024)
