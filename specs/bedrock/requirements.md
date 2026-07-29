@@ -99,6 +99,13 @@ WHEN cancellation is requested
 THE SYSTEM SHALL NOT queue the cancel behind completion of current operation
 AND SHALL process cancel with higher priority than operation completion
 
+WHEN a cancellation request is routed
+THE SYSTEM SHALL use live runtime state when a runtime exists and SHALL use the persisted conversation state only when no live runtime owns transient state
+
+WHEN user-requested cancellation is accepted while work is active but delivered after that work has already reached idle
+THE SYSTEM SHALL treat the delivered request as an idempotent boundary no-op
+AND SHALL NOT emit a user-facing internal error
+
 WHEN cancellation completes
 THE SYSTEM SHALL preserve all conversation history including synthetic results
 

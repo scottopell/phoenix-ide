@@ -3791,13 +3791,8 @@ async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<CancelResponse>, AppError> {
-    // Task 24682: guard against cancelling a conversation that's already
-    // idle or in a terminal state. Before this guard, the state machine
-    // would reject `UserCancel` from `Idle` with an `InvalidTransition`
-    // error, which then leaked as a raw `Debug`-formatted toast in the UI.
-    // Doing nothing is the right answer — there's nothing to cancel —
-    // and the response's `no_op: true` lets callers distinguish this
-    // from the "we stopped something in flight" case.
+    // Provisioning cancellation is DB-owned because no conversation runtime
+    // owns that lifecycle yet.
     let conversation = state
         .runtime
         .db()
@@ -3838,27 +3833,13 @@ async fn cancel_conversation(
         }));
     }
 
-    if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
-        let effective_state = state.runtime.effective_conversation_state(&id).await;
-        if effective_state.is_some_and(|state| state.is_busy()) {
-            let handle = state.runtime.get_or_create(&id).await.map_err(|error| {
-                AppError::Internal(format!("failed to get conversation runtime: {error}"))
-            })?;
-            handle
-                .event_tx
-                .send(Event::UserCancel {
-                    reason: None,
-                    cause: crate::state_machine::event::CancelCause::UserRequested,
-                })
-                .await
-                .map_err(|error| {
-                    AppError::Internal(format!("failed to send cancel event: {error}"))
-                })?;
-            return Ok(Json(CancelResponse {
-                ok: true,
-                no_op: false,
-            }));
-        }
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or_else(|| conversation.state.clone());
+
+    if matches!(effective_state, ConvState::Idle) || effective_state.is_terminal() {
         let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
         if state
             .runtime
@@ -3887,7 +3868,7 @@ async fn cancel_conversation(
         if !cancelled_direct_turn {
             tracing::debug!(
                 conv_id = %id,
-                state = conversation.state.variant_name(),
+                state = effective_state.variant_name(),
                 "cancel no-op: conversation has nothing in flight"
             );
         }
@@ -3897,11 +3878,11 @@ async fn cancel_conversation(
         }));
     }
 
-    if !conversation.state.allows_user_cancel() {
+    if !effective_state.allows_user_cancel() {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             format!(
                 "Conversation cannot be cancelled while in {} state",
-                conversation.state.variant_name()
+                effective_state.variant_name()
             ),
             "cannot_cancel_state",
         ))));
@@ -11053,6 +11034,37 @@ pub(crate) mod hard_delete_cascade_tests {
             )
             .await
             .expect("accept direct turn");
+    }
+
+    #[tokio::test]
+    async fn cancel_uses_live_idle_state_over_stale_busy_database_projection() {
+        let state = make_test_state().await;
+        let conversation_id = "c-stale-busy-projection";
+        state
+            .db
+            .create_conversation(conversation_id, "stale", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let handle = state
+            .runtime
+            .get_or_create(conversation_id)
+            .await
+            .expect("materialize idle runtime");
+        assert!(matches!(*handle.state_rx.borrow(), ConvState::Idle));
+        state
+            .db
+            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .expect("install stale database projection");
+
+        let Json(response) =
+            cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
+                .await
+                .expect("cancel against live idle runtime");
+
+        assert!(response.ok);
+        assert!(response.no_op);
+        assert!(matches!(*handle.state_rx.borrow(), ConvState::Idle));
     }
 
     #[tokio::test]

@@ -2621,6 +2621,22 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        if matches!(self.state, ConvState::Idle)
+            && matches!(
+                &event,
+                Event::UserCancel {
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                    ..
+                }
+            )
+        {
+            tracing::debug!(
+                conv_id = %self.context.conversation_id,
+                "absorbing user cancellation delivered after runtime became idle"
+            );
+            return Ok(());
+        }
+
         if matches!(event, Event::UserMessage { .. }) {
             self.parent_tool_cycle_count = 0;
         }
@@ -8754,6 +8770,35 @@ mod authoritative_user_message_effect_tests {
             )]
         );
         assert_eq!(rt.active_direct_turn, None);
+    }
+
+    #[tokio::test]
+    async fn late_user_cancel_is_absorbed_after_runtime_becomes_idle() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let active = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(13),
+            generation: 0,
+        };
+        rt = rt.with_active_direct_turn(Some(active));
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("late cancel is a benign delivery race");
+
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert!(storage
+            .recorded_terminate_active_direct_turn_calls()
+            .is_empty());
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
