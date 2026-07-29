@@ -9082,6 +9082,7 @@ mod authoritative_user_message_effect_tests {
             remaining_tools: Vec::new(),
             completed_results: Vec::new(),
             pending_sub_agents: Vec::new(),
+            park_after_tool_round: false,
             assistant_message: AssistantMessage::new(
                 "assistant".to_string(),
                 vec![ContentBlock::ToolUse {
@@ -9526,7 +9527,7 @@ mod context_exhausted_preserves_worktree_tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-2",
-                ToolInput::Bash(crate::tools::BashToolInput::run("sleep 10")),
+                crate::tools::BashToolInput::run("sleep 10").into(),
             ),
             remaining_tools: vec![],
             completed_results: vec![],

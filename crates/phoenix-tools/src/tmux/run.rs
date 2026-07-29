@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::invoke::{truncate_pair, TMUX_TOOL_MAX_WAIT_SECONDS};
 use super::TmuxError;
-use crate::{work_scope_identity, Tool, ToolContext, ToolOutput};
+use crate::{Tool, ToolContext, ToolOutput};
 
 use super::parse_last_exit_marker;
 
@@ -150,12 +150,6 @@ impl Tool for TmuxRunTool {
         let cmd = parsed.cmd.trim();
         if cmd.is_empty() {
             return error_envelope("empty_command", "cmd must be non-empty after trimming");
-        }
-
-        if ctx.wake_registrar().is_some() {
-            if let Err(error) = work_scope_identity(&ctx.work_scope) {
-                return ToolOutput::error(error);
-            }
         }
 
         let readiness = match validate_readiness(parsed.readiness) {

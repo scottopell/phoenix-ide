@@ -4622,7 +4622,7 @@ mod tests {
 
     #[test]
     fn test_cancellation_produces_synthetic_results() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
         use phoenix_core::domain::llm_types::ContentBlock;
 
         // Build an AssistantMessage with 3 tool_use blocks matching the 3 tools
@@ -4901,7 +4901,7 @@ mod tests {
     /// sub-agent stopped while the tool task is still mid-flight.
     #[test]
     fn test_subagent_cancel_during_tool_execution_routes_through_cancelling_tool() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
         use phoenix_core::domain::llm_types::ContentBlock;
 
         let assistant_message = AssistantMessage::new(
@@ -5353,7 +5353,7 @@ mod tests {
 
     #[test]
     fn tool_complete_and_park_last_tool_settles_idle_without_request_llm() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
         use phoenix_core::domain::{db_schema::ToolResult, llm_types::ContentBlock};
 
         let assistant_message = AssistantMessage::new(
@@ -5369,9 +5369,7 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
-                    "echo park",
-                )),
+                phoenix_core::domain::bash_types::BashToolInput::run("echo park").into(),
             ),
             remaining_tools: vec![],
             completed_results: vec![],
@@ -5418,7 +5416,7 @@ mod tests {
 
     #[test]
     fn tool_complete_and_park_survives_sub_agent_fan_in() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
         use phoenix_core::domain::{
             db_schema::ToolResult,
             llm_types::ContentBlock,
@@ -5438,9 +5436,7 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
-                    "echo park",
-                )),
+                phoenix_core::domain::bash_types::BashToolInput::run("echo park").into(),
             ),
             remaining_tools: vec![],
             completed_results: vec![],
@@ -5599,7 +5595,7 @@ mod tests {
 
     #[test]
     fn failed_park_result_does_not_park_after_successful_sibling() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
         use phoenix_core::domain::{db_schema::ToolResult, llm_types::ContentBlock};
 
         let assistant_message = AssistantMessage::new(
@@ -5621,7 +5617,7 @@ mod tests {
             ),
             remaining_tools: vec![ToolCall::new(
                 "tool-2",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("true")),
+                phoenix_core::domain::bash_types::BashToolInput::run("true").into(),
             )],
             completed_results: vec![],
             pending_sub_agents: vec![],
@@ -5648,7 +5644,7 @@ mod tests {
 
     #[test]
     fn failed_sibling_clears_accumulated_park_intent() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
         use phoenix_core::domain::{db_schema::ToolResult, llm_types::ContentBlock};
 
         let assistant_message = AssistantMessage::new(
@@ -5670,9 +5666,7 @@ mod tests {
             ),
             remaining_tools: vec![ToolCall::new(
                 "sibling",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
-                    "false",
-                )),
+                phoenix_core::domain::bash_types::BashToolInput::run("false").into(),
             )],
             completed_results: vec![],
             pending_sub_agents: vec![],
@@ -5712,7 +5706,7 @@ mod tests {
 
     #[test]
     fn tool_complete_and_park_accumulates_across_serial_siblings() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
         use phoenix_core::domain::{db_schema::ToolResult, llm_types::ContentBlock};
 
         let assistant_message = AssistantMessage::new(
@@ -5735,15 +5729,11 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
-                    "echo one",
-                )),
+                phoenix_core::domain::bash_types::BashToolInput::run("echo one").into(),
             ),
             remaining_tools: vec![ToolCall::new(
                 "tool-2",
-                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
-                    "echo two",
-                )),
+                phoenix_core::domain::bash_types::BashToolInput::run("echo two").into(),
             )],
             completed_results: vec![],
             pending_sub_agents: vec![],
@@ -6682,7 +6672,7 @@ mod tests {
 
     #[test]
     fn user_trigger_continuation_in_tool_executing_is_absorbed() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
 
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
@@ -6962,7 +6952,7 @@ mod tests {
 
     #[test]
     fn steer_drained_from_tool_executing_rejected() {
-        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall};
 
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(

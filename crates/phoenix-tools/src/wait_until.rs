@@ -246,7 +246,7 @@ fn registration_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bash::handle::Handle;
+    use crate::bash::handle::{Handle, HandleId};
     use crate::bash::ring::RING_BUFFER_BYTES;
     use crate::{
         BashHandleRegistry, BrowserSessionManager, RegisteredWake, TmuxRegistry, WakeRegistrar,
@@ -289,16 +289,6 @@ mod tests {
         }
 
         fn notify_activation_committed(&self) {}
-
-        async fn rekey_work_scope(
-            &self,
-            _conversation_id: &str,
-            _old_scope: &WorkScopeIdentity,
-            _new_scope: &WorkScopeIdentity,
-            _resources: crate::WakeScopeRekeyResources,
-        ) -> Result<u64, String> {
-            Ok(0)
-        }
     }
 
     fn ctx(registrar: Option<Arc<dyn WakeRegistrar>>) -> ToolContext {

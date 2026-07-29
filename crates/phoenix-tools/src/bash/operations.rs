@@ -2024,16 +2024,6 @@ mod tests {
         }
 
         fn notify_activation_committed(&self) {}
-
-        async fn rekey_work_scope(
-            &self,
-            _conversation_id: &str,
-            _old_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-            _new_scope: &phoenix_workflow::wake_profile::WorkScopeIdentity,
-            _resources: crate::WakeScopeRekeyResources,
-        ) -> Result<u64, String> {
-            Ok(0)
-        }
     }
 
     fn ctx_with_registrar(
