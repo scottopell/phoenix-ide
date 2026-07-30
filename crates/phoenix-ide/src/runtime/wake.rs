@@ -835,38 +835,43 @@ fn wake_bash_window(
     const WAKE_TAIL_BYTES: usize = 80 * 1024;
     let mut remaining = WAKE_TAIL_BYTES;
     let mut truncated = evidence.final_tail_truncated_before;
-    let lines = evidence
+    let mut lines: Vec<_> = evidence
         .final_tail
         .iter()
         .enumerate()
+        .rev()
         .filter_map(|(ordinal, bytes)| {
             if remaining == 0 {
                 truncated = true;
                 return None;
             }
             let requested = bytes.len().min(remaining);
-            let keep = if requested == bytes.len() {
-                requested
+            let start = if requested == bytes.len() {
+                0
             } else {
                 bytes
                     .char_indices()
                     .map(|(index, _)| index)
-                    .take_while(|index| *index <= requested)
-                    .last()
-                    .unwrap_or_default()
+                    .find(|index| *index >= bytes.len().saturating_sub(requested))
+                    .unwrap_or(bytes.len())
             };
+            let keep = bytes.len().saturating_sub(start);
             remaining -= keep;
-            truncated |= keep < bytes.len();
+            truncated |= start > 0;
             Some(phoenix_core::domain::tool_wire::BashRingLine {
                 offset: evidence
                     .final_tail_start_offset
                     .saturating_add(u64::try_from(ordinal).unwrap_or(u64::MAX)),
-                bytes: bytes.get(..keep).unwrap_or_default().to_string(),
+                bytes: bytes.get(start..).unwrap_or_default().to_string(),
             })
         })
         .collect();
+    lines.reverse();
+    let start_offset = lines
+        .first()
+        .map_or(evidence.final_tail_end_offset, |line| line.offset);
     phoenix_core::domain::tool_wire::BashRingWindow {
-        start_offset: evidence.final_tail_start_offset,
+        start_offset,
         end_offset: evidence.final_tail_end_offset,
         truncated_before: truncated,
         lines,
@@ -1571,6 +1576,10 @@ mod tests {
         assert!(rendered.len() <= 100 * 1024);
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(parsed["truncated_before"], true);
+        assert_eq!(parsed["start_offset"], 159);
+        assert_eq!(parsed["end_offset"], 200);
+        assert_eq!(parsed["lines"].as_array().unwrap().len(), 41);
+        assert_eq!(parsed["lines"][40]["offset"], 199);
     }
 
     #[test]

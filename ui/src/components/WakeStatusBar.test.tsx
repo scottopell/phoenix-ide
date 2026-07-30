@@ -70,6 +70,30 @@ describe('WakeStatusBar', () => {
     expect(screen.queryByText(/showing last known/)).not.toBeInTheDocument();
   });
 
+  it('ignores a stale poll response after a newer wake lifecycle refresh', async () => {
+    let resolvePoll!: (status: WakeStatus) => void;
+    const stalePoll = new Promise<WakeStatus>((resolve) => {
+      resolvePoll = resolve;
+    });
+    vi.mocked(api.getWakeStatus)
+      .mockReturnValueOnce(stalePoll)
+      .mockResolvedValueOnce(active);
+
+    render(<WakeStatusBar conversationId="conv" />);
+    await act(async () => {
+      notifyWakeStatusChanged('conv');
+      await Promise.resolve();
+    });
+    expect(screen.getByText('⏰ 1 pending wake')).toBeInTheDocument();
+
+    await act(async () => {
+      resolvePoll({ pending_count: 0, soonest_expires_at: null, contracts: [] });
+      await stalePoll;
+    });
+
+    expect(screen.getByText('⏰ 1 pending wake')).toBeInTheDocument();
+  });
+
   it('refreshes immediately when wake lifecycle SSE invalidates this conversation', async () => {
     vi.useFakeTimers();
     vi.mocked(api.getWakeStatus)

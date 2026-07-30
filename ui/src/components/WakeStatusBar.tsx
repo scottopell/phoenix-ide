@@ -29,18 +29,22 @@ export function WakeStatusBar({ conversationId }: { conversationId: string }) {
   const [cancellingContractId, setCancellingContractId] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState<WakeAnnouncement | null>(null);
   const requestGeneration = useRef(0);
+  const latestRequest = useRef(0);
 
   const refresh = useCallback(async (expectedGeneration = requestGeneration.current): Promise<WakeStatus | undefined> => {
     const generation = expectedGeneration;
+    const request = ++latestRequest.current;
     try {
       const next = await api.getWakeStatus(conversationId);
-      if (generation === requestGeneration.current) {
+      if (generation === requestGeneration.current && request === latestRequest.current) {
         setStatus(next);
         setFetchFailed(false);
       }
       return next;
     } catch {
-      if (generation === requestGeneration.current) setFetchFailed(true);
+      if (generation === requestGeneration.current && request === latestRequest.current) {
+        setFetchFailed(true);
+      }
       return undefined;
     }
   }, [conversationId]);
