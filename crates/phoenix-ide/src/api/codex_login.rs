@@ -981,6 +981,11 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
 /// Idempotent — missing file is treated as success.
 pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
     let auth_path = state.runtime_env.codex_auth_path();
+    // Sweep half-open sign-in flows so an in-progress PKCE driver can't race
+    // against the registry reload below and re-install a credential the user
+    // just asked us to delete.
+    let drained = drain_active_pkce(&state.codex_login).await;
+    let drained_device = drain_active_device_sessions(&state.codex_login).await;
     let removed = match std::fs::remove_file(&auth_path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -993,11 +998,6 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
             }));
         }
     };
-    // Sweep half-open sign-in flows so an in-progress PKCE driver can't race
-    // against the registry reload below and re-install a credential the user
-    // just asked us to delete.
-    let drained = drain_active_pkce(&state.codex_login).await;
-    let drained_device = drain_active_device_sessions(&state.codex_login).await;
     let registry = state.llm_registry.clone();
     let outcome = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
         .await
