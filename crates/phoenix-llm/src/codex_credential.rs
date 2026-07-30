@@ -299,6 +299,7 @@ struct InnerState {
     /// the "JWT exp still in the future" shortcut and rotate via the refresh
     /// token, so a server-side revocation actually replaces the token.
     force_refresh: bool,
+    revoked: bool,
 }
 
 /// Return the file mtime, or `None` if it can't be read (the caller treats
@@ -308,7 +309,7 @@ fn file_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
-/// `CredentialSource` impl for `ChatGPT` `OAuth` tokens borrowed from the `Codex` CLI.
+/// Credential source for Phoenix's native ChatGPT OAuth session.
 pub struct CodexCredential {
     auth_path: PathBuf,
     inner: Mutex<InnerState>,
@@ -399,6 +400,11 @@ impl CodexCredential {
     /// next call back to "JWT looks fine, return cached token."
     async fn fetch(&self) -> Result<(String, Option<String>), CodexAuthError> {
         let mut state = self.inner.lock().await;
+        if state.revoked {
+            return Err(CodexAuthError::RefreshFailed(
+                "credential signed out".to_string(),
+            ));
+        }
         let forced = state.force_refresh;
         let current_mtime = file_mtime(&self.auth_path);
 
@@ -481,6 +487,12 @@ impl CodexCredential {
             .as_ref()
             .and_then(|tokens| tokens.account_id.clone());
         Ok((new_token, account_id))
+    }
+
+    pub async fn revoke(&self) {
+        let mut state = self.inner.lock().await;
+        state.revoked = true;
+        state.cached = None;
     }
 
     pub async fn get_with_account_id(&self) -> Option<(String, Option<String>)> {

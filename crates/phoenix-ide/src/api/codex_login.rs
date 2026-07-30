@@ -147,6 +147,7 @@ struct DeviceSession {
 pub struct CodexLoginManager {
     pkce: Mutex<HashMap<String, Arc<PkceSession>>>,
     device: Mutex<HashMap<String, Arc<DeviceSession>>>,
+    lifecycle: Mutex<()>,
 }
 
 impl CodexLoginManager {
@@ -300,6 +301,7 @@ async fn bind_loopback_with_retry(
 pub async fn pkce_start(
     State(state): State<AppState>,
 ) -> Result<Json<PkceStartResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle = state.codex_login.lifecycle.lock().await;
     let mgr = state.codex_login.clone();
     let session = build_pkce_session();
     let session_id = new_session_id();
@@ -705,6 +707,7 @@ pub struct DeviceStartResponse {
 pub async fn device_start(
     State(state): State<AppState>,
 ) -> Result<Json<DeviceStartResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle = state.codex_login.lifecycle.lock().await;
     let mgr = state.codex_login.clone();
     let device = request_device_code().await.map_err(|e| match e {
         LoginError::DeviceCodeNotEnabled => (
@@ -1004,12 +1007,16 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
 ///
 /// Idempotent — missing file is treated as success.
 pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let _lifecycle = state.codex_login.lifecycle.lock().await;
     let auth_path = state.runtime_env.codex_auth_path();
     // Sweep half-open sign-in flows so an in-progress PKCE driver can't race
     // against the registry reload below and re-install a credential the user
     // just asked us to delete.
     let drained = drain_active_pkce(&state.codex_login).await;
     let drained_device = drain_active_device_sessions(&state.codex_login).await;
+    if let Some(credential) = state.llm_registry.current_codex_credential() {
+        credential.revoke().await;
+    }
     let removed = match std::fs::remove_file(&auth_path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
