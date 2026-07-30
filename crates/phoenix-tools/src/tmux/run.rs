@@ -478,7 +478,7 @@ fn spawn_completion_cleanup(
                     let _ = registry
                         .kill_exact_window(&work_scope, &server_token, &window_id)
                         .await;
-                    return;
+                    tokio::time::sleep(READINESS_POLL_INTERVAL).await;
                 }
                 Ok(None) => return,
                 Err(error) => {

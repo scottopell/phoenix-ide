@@ -123,6 +123,7 @@ pub enum BashTerminalStatus {
     Exited,
     Killed,
     KillPendingKernel,
+    WaiterPanicked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

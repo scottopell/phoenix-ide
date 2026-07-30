@@ -4076,6 +4076,7 @@ fn projection_parts(
                     wake_types::BashTerminalStatus::Exited => "Exited",
                     wake_types::BashTerminalStatus::Killed => "Killed",
                     wake_types::BashTerminalStatus::KillPendingKernel => "KillPendingKernel",
+                    wake_types::BashTerminalStatus::WaiterPanicked => "WaiterPanicked",
                 }),
                 None,
                 Some(ev.occurred_at),
@@ -4726,6 +4727,7 @@ fn evidence_from_projection_row(
                 "Exited" => wake_types::BashTerminalStatus::Exited,
                 "Killed" => wake_types::BashTerminalStatus::Killed,
                 "KillPendingKernel" => wake_types::BashTerminalStatus::KillPendingKernel,
+                "WaiterPanicked" => wake_types::BashTerminalStatus::WaiterPanicked,
                 other => {
                     return Err(DbError::Serialization(format!(
                         "unknown bash status: {other}"

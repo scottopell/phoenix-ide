@@ -922,6 +922,7 @@ fn render_materialized_terminal_result(pending: &WakePendingDelivery) -> String 
     render_terminal_result(pending)
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_terminal_result(pending: &WakePendingDelivery) -> String {
     let rendered = match &pending.receipt.terminal {
         phoenix_workflow::wake_profile::WakeTerminalPayload::Fired {
@@ -940,7 +941,8 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
                         final_cause: match evidence.status {
                             BashTerminalStatus::Exited => "exited".to_string(),
                             BashTerminalStatus::Killed => "killed".to_string(),
-                            BashTerminalStatus::KillPendingKernel => unreachable!(),
+                            BashTerminalStatus::KillPendingKernel
+                            | BashTerminalStatus::WaiterPanicked => unreachable!(),
                         },
                         exit_code: evidence.exit_code,
                         signal_number: evidence.signal_number,
@@ -954,6 +956,19 @@ fn render_terminal_result(pending: &WakePendingDelivery) -> String {
                     },
                 })
             }
+            BashTerminalStatus::WaiterPanicked => serde_json::to_string(
+                &phoenix_core::domain::tool_wire::BashResponse::WaiterPanicked(
+                    phoenix_core::domain::tool_wire::BashWaiterPanickedPayload {
+                        handle: evidence.identity.handle_id.clone(),
+                        cmd: evidence.cmd.clone(),
+                        label: evidence.label.clone(),
+                        error_message: evidence
+                            .final_tail_partial
+                            .clone()
+                            .unwrap_or_else(|| "bash waiter task panicked".to_string()),
+                    },
+                ),
+            ),
             BashTerminalStatus::KillPendingKernel => {
                 serde_json::to_string(&BashKillPendingWakeObservation {
                     contract_id,
@@ -1108,7 +1123,23 @@ async fn inspect_bash_handle(
                 *handle.exit_observer().borrow(),
                 Some(phoenix_tools::bash::handle::ExitState::WaiterPanicked)
             ) {
-                InspectionOutcome::Forgotten(WakeForgottenReason::BashWaiterPanicked)
+                InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                    identity: identity.clone(),
+                    cmd: handle.cmd.clone(),
+                    label: handle.label.clone(),
+                    status: BashTerminalStatus::WaiterPanicked,
+                    occurred_at: Timestamp(0),
+                    exit_code: None,
+                    duration_ms: None,
+                    signal_number: None,
+                    kill_signal_sent: None,
+                    kill_attempted_at: None,
+                    final_tail_start_offset: 0,
+                    final_tail_end_offset: 0,
+                    final_tail_truncated_before: false,
+                    final_tail: vec![],
+                    final_tail_partial: Some("bash waiter task panicked".to_string()),
+                }))
             } else {
                 inspect_live_bash(handle, identity, live)
             }
@@ -1780,7 +1811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiter_panicked_bash_resolves_as_forgotten_without_polling_to_expiry() {
+    async fn waiter_panicked_bash_preserves_typed_wait_evidence() {
         use phoenix_tools::bash::handle::{ExitState, Handle, HandleId};
         use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
 
@@ -1805,10 +1836,15 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            outcome,
-            InspectionOutcome::Forgotten(WakeForgottenReason::BashWaiterPanicked)
-        ));
+        let InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(evidence)) = outcome else {
+            panic!("waiter panic must preserve Bash terminal evidence");
+        };
+        assert_eq!(evidence.status, BashTerminalStatus::WaiterPanicked);
+        assert_eq!(evidence.cmd, "test command");
+        assert_eq!(
+            evidence.final_tail_partial.as_deref(),
+            Some("bash waiter task panicked")
+        );
     }
 
     #[tokio::test]
