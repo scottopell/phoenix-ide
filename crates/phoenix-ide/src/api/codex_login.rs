@@ -126,6 +126,8 @@ struct PkceSession {
     /// against this; a late callback after cancel must NOT proceed to
     /// `finalize_login` and write `~/.phoenix-ide/codex-auth.json`.
     cancel: CancellationToken,
+    settled: tokio::sync::Notify,
+    is_settled: std::sync::atomic::AtomicBool,
 }
 
 struct DeviceSession {
@@ -193,8 +195,23 @@ async fn drain_active_pkce(mgr: &CodexLoginManager) -> usize {
         sessions.drain().map(|(_, v)| v).collect()
     };
     let n = stale.len();
-    for s in stale {
-        s.cancel.cancel();
+    for session in &stale {
+        session.cancel.cancel();
+    }
+    for session in stale {
+        while !session
+            .is_settled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let notified = session.settled.notified();
+            if session
+                .is_settled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            notified.await;
+        }
     }
     n
 }
@@ -296,6 +313,8 @@ pub async fn pkce_start(
             status: LoginStatus::default(),
         }),
         cancel: cancel.clone(),
+        settled: tokio::sync::Notify::new(),
+        is_settled: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Cancel any prior in-flight PKCE session before binding. Without this,
@@ -309,7 +328,7 @@ pub async fn pkce_start(
 
     {
         let mut sessions = mgr.pkce.lock().await;
-        sessions.insert(session_id.clone(), pkce_session);
+        sessions.insert(session_id.clone(), pkce_session.clone());
     }
 
     // Spawn the background driver. Sequence: race loopback callback against
@@ -327,6 +346,7 @@ pub async fn pkce_start(
         // Codex CLI's). Resolve it here where the runtime environment is in
         // scope, then hand the destination to the background driver.
         let login_target = state.runtime_env.codex_auth_path();
+        let session_for_task = pkce_session.clone();
         tokio::spawn(async move {
             let outcome = drive_pkce(
                 cancel_for_task,
@@ -345,6 +365,10 @@ pub async fn pkce_start(
                 outcome,
             )
             .await;
+            session_for_task
+                .is_settled
+                .store(true, std::sync::atomic::Ordering::Release);
+            session_for_task.settled.notify_waiters();
         });
     }
 
