@@ -197,6 +197,18 @@ async fn drain_active_pkce(mgr: &CodexLoginManager) -> usize {
     n
 }
 
+async fn drain_active_device_sessions(mgr: &CodexLoginManager) -> usize {
+    let stale: Vec<Arc<DeviceSession>> = {
+        let mut sessions = mgr.device.lock().await;
+        sessions.drain().map(|(_, session)| session).collect()
+    };
+    let count = stale.len();
+    for session in stale {
+        session.cancel.cancel();
+    }
+    count
+}
+
 /// Bind the loopback callback server, retrying briefly on `PortInUse` when
 /// we just drained a previous session. The retry covers the gap between
 /// firing a `CancellationToken` and the previous driver task dropping its
@@ -955,6 +967,7 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
     // against the registry reload below and re-install a credential the user
     // just asked us to delete.
     let drained = drain_active_pkce(&state.codex_login).await;
+    let drained_device = drain_active_device_sessions(&state.codex_login).await;
     let registry = state.llm_registry.clone();
     let outcome = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
         .await
@@ -962,6 +975,7 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
     tracing::info!(
         removed,
         drained_pkce_sessions = drained,
+        drained_device_sessions = drained_device,
         bridge_path = ?outcome.as_ref().and_then(|o| o.current_path.as_ref()),
         "codex_login: signed out"
     );

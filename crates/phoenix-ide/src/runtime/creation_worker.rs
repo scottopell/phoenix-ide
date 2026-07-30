@@ -319,9 +319,9 @@ async fn provision_conversation(
         if requested_mode == "managed" {
             manager
                 .llm_registry
-                .cheap_model_id_for_provider(registry_default)
+                .cheap_model_id_for_provider(&registry_default)
         } else {
-            registry_default.to_string()
+            registry_default.clone()
         }
     });
 
@@ -544,7 +544,7 @@ async fn provision_conversation(
             resolved_model = intent.model.clone().unwrap_or_else(|| {
                 manager
                     .llm_registry
-                    .cheap_model_id_for_provider(registry_default)
+                    .cheap_model_id_for_provider(&registry_default)
             });
         }
         other => {

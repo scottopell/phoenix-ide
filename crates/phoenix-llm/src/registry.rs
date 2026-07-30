@@ -475,7 +475,7 @@ fn derive_models_url(base_url: &str) -> Option<String> {
 pub struct ModelRegistry {
     services: std::sync::RwLock<HashMap<String, Arc<dyn LlmService>>>,
     specs: std::sync::RwLock<HashMap<String, super::ModelSpec>>,
-    default_model: String,
+    default_model: std::sync::RwLock<String>,
     /// Whether the Codex/ChatGPT credential was loaded into the registry at
     /// process startup. **Frozen** at construction time and **not updated**
     /// when [`Self::reload_codex_credential`] runs — this is "was the bridge
@@ -504,7 +504,7 @@ impl ModelRegistry {
         Self {
             services: std::sync::RwLock::new(HashMap::new()),
             specs: std::sync::RwLock::new(HashMap::new()),
-            default_model: "test-model".to_string(),
+            default_model: std::sync::RwLock::new("test-model".to_string()),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             current_codex_credential: std::sync::RwLock::new(None),
@@ -530,7 +530,7 @@ impl ModelRegistry {
         Self {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(specs),
-            default_model,
+            default_model: std::sync::RwLock::new(default_model),
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
@@ -639,7 +639,7 @@ impl ModelRegistry {
         Self {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(specs),
-            default_model,
+            default_model: std::sync::RwLock::new(default_model),
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
@@ -847,12 +847,14 @@ impl ModelRegistry {
 
     /// Get the default model
     pub fn default(&self) -> Option<Arc<dyn LlmService>> {
-        self.get(&self.default_model)
+        self.get(&self.default_model_id())
     }
 
     /// Get the default model ID
-    pub fn default_model_id(&self) -> &str {
-        &self.default_model
+    pub fn default_model_id(&self) -> String {
+        self.default_model
+            .read()
+            .map_or_else(|_| "gpt-5.6-sol".to_string(), |model| model.clone())
     }
 
     /// Get the context window size for a model (REQ-BED-022)
@@ -958,7 +960,7 @@ impl ModelRegistry {
         Self {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(HashMap::new()),
-            default_model: "claude-sonnet-5".to_string(),
+            default_model: std::sync::RwLock::new("claude-sonnet-5".to_string()),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             current_codex_credential: std::sync::RwLock::new(None),
@@ -987,7 +989,7 @@ impl ModelRegistry {
                 return Some(((*id).to_string(), service));
             }
         }
-        self.default().map(|s| (self.default_model.clone(), s))
+        self.default().map(|s| (self.default_model_id(), s))
     }
 
     /// Get a cheap/fast model for auxiliary tasks like title generation.
@@ -1187,6 +1189,9 @@ impl ModelRegistry {
             *current_credential = cred_with_account
                 .as_ref()
                 .map(|(credential, _)| Arc::clone(credential));
+            if let Ok(mut default_model) = self.default_model.write() {
+                *default_model = Self::pick_default_model(&services, &self.config);
+            }
             prev
         };
 
@@ -2012,7 +2017,7 @@ mod tests {
         // gpt-5.5 isn't registered (no OpenAI auth), so default must fall
         // back to a model that actually exists.
         assert_ne!(registry.default_model_id(), "gpt-5.5");
-        assert!(registry.get(registry.default_model_id()).is_some());
+        assert!(registry.get(&registry.default_model_id()).is_some());
     }
 
     #[test]

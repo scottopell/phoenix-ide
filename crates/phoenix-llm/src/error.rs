@@ -134,6 +134,16 @@ fn render_usage_limit_message(quota: &QuotaDetails) -> String {
         );
     }
 
+    if matches!(
+        quota.rate_limit_reached_type,
+        Some(crate::rate_limit::RateLimitReachedType::WorkspaceOwnerUsageLimitReached)
+    ) {
+        return format!(
+            "Your workspace usage limit has been reached. Visit https://chatgpt.com/codex/settings/usage to manage the limit{}",
+            retry_suffix_after_or(quota.resets_at.as_ref())
+        );
+    }
+
     // 2. Backend-provided promo message wins over plan-specific defaults.
     if let Some(promo) = quota.promo_message.as_deref() {
         return format!(

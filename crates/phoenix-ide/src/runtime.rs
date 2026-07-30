@@ -2824,7 +2824,7 @@ impl RuntimeManager {
         let model_id = conv
             .model
             .clone()
-            .unwrap_or_else(|| self.llm_registry.default_model_id().to_string());
+            .unwrap_or_else(|| self.llm_registry.default_model_id());
         let context_window = self.llm_registry.context_window(&model_id);
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
