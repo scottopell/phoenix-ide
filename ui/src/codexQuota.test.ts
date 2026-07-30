@@ -58,6 +58,7 @@ describe('Codex quota store', () => {
   });
 
   it('does not let an older account fetch overwrite a newer turn snapshot', () => {
+    replaceCodexQuota(quota({}));
     const fetchVersion = getCodexQuotaVersion();
     mergeCodexQuota(quota({
       rate_limit_reached_type: 'workspace_member_credits_depleted',
@@ -73,6 +74,7 @@ describe('Codex quota store', () => {
   });
 
   it('replaces rather than mixes windows when quota families change', () => {
+    replaceCodexQuota(quota({}));
     mergeCodexQuota(quota({
       limit_id: 'family-a',
       primary: { used_percent: 3, window_minutes: 300, resets_at: 1_800_000_000 },
@@ -89,6 +91,19 @@ describe('Codex quota store', () => {
     expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(8);
     expect(getCodexQuotaSnapshot()?.secondary).toBeNull();
     expect(getCodexQuotaSnapshot()?.individual_limit?.remaining_percent).toBe(75);
+  });
+
+  it('rejects stale turn snapshots after sign-out', () => {
+    replaceCodexQuota(quota({
+      secondary: { used_percent: 4, window_minutes: 10_080, resets_at: 1_800_500_000 },
+    }));
+    clearCodexQuota();
+
+    mergeCodexQuota(quota({
+      secondary: { used_percent: 99, window_minutes: 10_080, resets_at: 1_800_500_000 },
+    }));
+
+    expect(getCodexQuotaSnapshot()).toBeNull();
   });
 
   it('clears terminal depletion when a successful turn snapshot follows it', () => {

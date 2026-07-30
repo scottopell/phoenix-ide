@@ -20,6 +20,7 @@ let snapshot: QuotaDetails | null = null;
 let accountId: string | null = null;
 let version = 0;
 let activeTurnFamilyId: string | null = null;
+let acceptsTurnSnapshots = true;
 const listeners = new Set<() => void>();
 
 function notify(): void {
@@ -39,12 +40,14 @@ export function selectCodexQuotaAccount(nextAccountId: string | null): void {
   accountId = nextAccountId;
   snapshot = null;
   activeTurnFamilyId = null;
+  acceptsTurnSnapshots = false;
   version++;
   notify();
 }
 
 export function replaceCodexQuota(next: QuotaDetails): void {
   snapshot = next;
+  acceptsTurnSnapshots = true;
   activeTurnFamilyId = null;
   version++;
   notify();
@@ -55,6 +58,7 @@ export function replaceCodexQuotaIfVersion(next: QuotaDetails, expectedVersion: 
 }
 
 export function mergeCodexQuota(next: QuotaDetails): void {
+  if (!acceptsTurnSnapshots) return;
   if (activeTurnFamilyId && next.limit_id && activeTurnFamilyId !== next.limit_id) {
     snapshot = snapshot === null ? next : {
       ...next,
@@ -92,6 +96,7 @@ export function mergeCodexQuota(next: QuotaDetails): void {
 export function clearCodexQuota(): void {
   accountId = null;
   activeTurnFamilyId = null;
+  acceptsTurnSnapshots = false;
   version++;
   if (snapshot === null) return;
   snapshot = null;
