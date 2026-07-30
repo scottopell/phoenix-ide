@@ -63,8 +63,8 @@ export function mergeCodexQuota(next: QuotaDetails): void {
     snapshot = snapshot === null ? next : {
       ...next,
       additional_limits: snapshot.additional_limits,
-      credits: snapshot.credits,
-      individual_limit: snapshot.individual_limit,
+      credits: next.credits ?? snapshot.credits,
+      individual_limit: next.individual_limit ?? snapshot.individual_limit,
       promo_message: next.promo_message ?? snapshot.promo_message,
     };
   } else {

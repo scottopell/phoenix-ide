@@ -61,6 +61,7 @@ struct CodexRateLimitEvent {
     credits: Option<CodexRateLimitEventCredits>,
     metered_limit_name: Option<String>,
     limit_name: Option<String>,
+    rate_limit_reached_type: Option<CodexUsageReachedType>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,7 +247,9 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         credits,
         individual_limit: None,
         promo_message: None,
-        rate_limit_reached_type: None,
+        rate_limit_reached_type: event
+            .rate_limit_reached_type
+            .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind)),
     })
 }
 
@@ -512,6 +515,23 @@ mod tests {
                 .unwrap()
                 .window_minutes,
             Some(300)
+        );
+    }
+
+    #[test]
+    fn websocket_event_preserves_explicit_depletion_reason() {
+        let event = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": null,
+            "credits": null,
+            "rate_limit_reached_type": {
+                "type": "workspace_owner_credits_depleted"
+            }
+        });
+        let quota = quota_from_codex_rate_limit_event(&event).expect("websocket quota");
+        assert_eq!(
+            quota.rate_limit_reached_type,
+            Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted)
         );
     }
 
