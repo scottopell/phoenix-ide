@@ -2665,6 +2665,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_outcome(&mut self, mut outcome: EffectOutcome) -> Result<(), String> {
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
@@ -2742,18 +2743,38 @@ where
 
         let state_before_transition = self.state.clone();
         let state_updated_at_before_transition = self.state_updated_at;
-        let mut events_to_process = match self.apply_transition_result(result).await {
-            Ok(events) => events,
-            Err(error) => {
-                if let Some(registration) = &wake_registration {
-                    self.roll_back_failed_wake_transition(
-                        registration,
-                        state_before_transition,
-                        state_updated_at_before_transition,
-                    )
-                    .await;
+        let retry_result = result.clone();
+        let mut transition_attempt = 0;
+        let mut events_to_process = loop {
+            match self.apply_transition_result(retry_result.clone()).await {
+                Ok(events) => break events,
+                Err(_error) if wake_registration.is_some() && transition_attempt < 2 => {
+                    transition_attempt += 1;
+                    self.state = state_before_transition.clone();
+                    self.state_updated_at = state_updated_at_before_transition;
+                    tokio::time::sleep(Duration::from_millis(25 * transition_attempt)).await;
                 }
-                return Err(error);
+                Err(error) => {
+                    if let Some(registration) = &wake_registration {
+                        self.roll_back_failed_wake_transition(
+                            registration,
+                            state_before_transition,
+                            state_updated_at_before_transition,
+                        )
+                        .await;
+                    }
+                    self.state = ConvState::Error {
+                        message: format!("failed to persist completed wait: {error}"),
+                        error_kind: crate::db::ErrorKind::ServerError,
+                        resets_at: None,
+                    };
+                    self.state_updated_at = Utc::now();
+                    let _ = self.persist_state_effect(false).await;
+                    if let Some(state_watcher) = &self.state_watcher {
+                        let _ = state_watcher.send(self.state.clone());
+                    }
+                    return Err(error);
+                }
             }
         };
 
@@ -9522,6 +9543,76 @@ mod context_exhausted_preserves_worktree_tests {
     }
 
     #[tokio::test]
+    async fn transient_park_checkpoint_failure_retries_consumed_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.fail_next_persist_tool_round();
+        let assistant_message = phoenix_core::domain::sm_state::AssistantMessage::new(
+            "round-retry".to_string(),
+            vec![phoenix_llm::ContentBlock::ToolUse {
+                id: "wait-retry".to_string(),
+                name: "wait_until".to_string(),
+                input: serde_json::json!({}),
+            }],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "wait-retry",
+                ToolInput::from_name_and_value(
+                    "wait_until",
+                    serde_json::json!({ "handle": "b-retry" }),
+                ),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            park_after_tool_round: true,
+            pending_sub_agents: vec![],
+            assistant_message,
+        };
+        let (mut runtime, _) = build_runtime_with_state(
+            storage,
+            "retry-park-checkpoint",
+            temp.path().to_path_buf(),
+            state,
+        );
+        let registrar = Arc::new(RecordingWakeRegistrar {
+            cancelled: std::sync::Mutex::new(vec![]),
+            activation_notifications: std::sync::atomic::AtomicUsize::new(0),
+        });
+        runtime.wake_registrar = Some(registrar.clone());
+
+        runtime
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark {
+                result: phoenix_core::domain::db_schema::ToolResult::success(
+                    "wait-retry".to_string(),
+                    "registered".to_string(),
+                ),
+                registration: WakeRegistrationNotice {
+                    workflow_id: 32,
+                    contract_id: "wake-32".to_string(),
+                    resource_kind: "BashHandle".to_string(),
+                    handle_id: "b-retry".to_string(),
+                    condition: "handle_terminal".to_string(),
+                    expires_at: 600,
+                },
+            }))
+            .await
+            .unwrap();
+
+        assert!(matches!(runtime.state, ConvState::Idle));
+        assert_eq!(
+            registrar
+                .activation_notifications
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(registrar.cancelled.lock().unwrap().is_empty());
+        assert!(runtime.registered_wake_workflows.is_empty());
+    }
+
+    #[tokio::test]
     async fn failed_park_checkpoint_cancels_registration_and_restores_live_state() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(InMemoryStorage::new());
@@ -9582,7 +9673,8 @@ mod context_exhausted_preserves_worktree_tests {
             .unwrap_err();
 
         assert_eq!(error, "injected tool-round persistence failure");
-        assert_eq!(runtime.state, state_before);
+        assert!(matches!(runtime.state, ConvState::Error { .. }));
+        assert_ne!(runtime.state, state_before);
         assert_eq!(
             *registrar.cancelled.lock().unwrap(),
             vec![phoenix_workflow::WorkflowId(31)]

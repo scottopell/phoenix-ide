@@ -318,7 +318,7 @@ fn commission_review_scope_from_context(
 }
 
 /// Result of a state transition
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TransitionResult {
     pub new_state: ConvState,
     pub effects: Vec<Effect>,
