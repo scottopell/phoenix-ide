@@ -14,16 +14,13 @@
 //!   requests a device code from `OpenAI` and returns the verification URL
 //!   plus the user-visible code. A background task polls and finalises.
 //!
-//! Both flows write **Phoenix's own** `~/.phoenix-ide/codex-auth.json` on
-//! success — never Codex CLI's `~/.codex/auth.json`, even if the user happens
-//! to be in piggyback mode. Two distinct sources, two distinct lifecycles.
+//! Both flows write Phoenix's native `~/.phoenix-ide/codex-auth.json`.
 //!
 //! Status is read via `GET /api/codex/login/{kind}/{id}/status`. The Codex
 //! credential ([`phoenix_llm::codex_credential::CodexCredential`]) mtime-watches
 //! its file, so an *already-loaded* credential picks up new tokens on next use.
-//! On a first-time login (no credential constructed at startup), or when
-//! switching accounts from a piggyback-loaded credential to a Phoenix-own
-//! one, the `settle_*` handlers call
+//! On a first-time login (no credential constructed at startup), the
+//! `settle_*` handlers call
 //! [`phoenix_llm::ModelRegistry::reload_codex_credential`] *before* publishing
 //! the success status. That hot-reload swaps the `OpenAI` bridge services in
 //! atomically, so the next `OpenAI` request after login uses the new credential
@@ -823,34 +820,15 @@ pub async fn device_cancel(
 pub struct LoginPreflight {
     /// Path the in-app login will write to (Phoenix's own auth file).
     pub auth_path: String,
-    /// Path Phoenix will piggyback off when `OPENAI_USE_CODEX_AUTH=1` is set
-    /// and Phoenix's own file is absent. Surfaced for diagnostic clarity.
-    pub piggyback_path: String,
     /// Whether Phoenix's own auth file exists and parses as a valid
     /// chatgpt-mode token.
     pub already_signed_in: bool,
-    /// Whether a Codex credential was constructed at startup (any path).
-    /// Informational only — the UI should drive restart messaging from
-    /// `restart_required_after_login` instead, since piggyback-loaded
-    /// credentials still require restart when the user signs in via Phoenix.
+    /// Whether a native Codex credential was constructed at startup.
     pub bridge_loaded_at_startup: bool,
     /// Whether the user must restart Phoenix before an in-app login takes
-    /// effect. True when:
-    ///  - no credential was loaded at startup (registry has nothing to
-    ///    refresh), OR
-    ///  - a credential was loaded but from a different path than the in-app
-    ///    login writes to (e.g. piggyback mode loaded `~/.codex/auth.json`,
-    ///    but the new login writes `~/.phoenix-ide/codex-auth.json` — the
-    ///    in-memory credential keeps watching the old path).
-    ///
-    /// False only when the loaded credential's path matches the destination
-    /// of the in-app login, i.e. its `mtime` watch will pick up new tokens
-    /// without a restart.
+    /// effect. Native login completion normally hot-reloads the credential,
+    /// so this is false after a successful sign-in.
     pub restart_required_after_login: bool,
-    /// Whether `OPENAI_USE_CODEX_AUTH=1` is set in the current environment.
-    /// Informational; the env-var only governs piggyback mode, not whether
-    /// in-app login works.
-    pub piggyback_env_set: bool,
     /// `account_id` from the loaded `ChatGPT` credential, when one is loaded.
     /// Surfaced so the UI can display account identity in the sidebar account
     /// chip / sign-out menu without making a second request. `None` when no
@@ -912,25 +890,18 @@ async fn fetch_codex_quota(
         .map(|quota| (account_id, quota))
 }
 
-#[derive(Serialize)]
-pub struct CodexQuotaResponse {
-    account_id: Option<String>,
-    quota: phoenix_llm::QuotaDetails,
-}
-
-pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<CodexQuotaResponse>> {
-    let response = match state.llm_registry.current_codex_credential() {
+pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_llm::QuotaDetails>> {
+    let quota = match state.llm_registry.current_codex_credential() {
         Some(credential) => fetch_codex_quota(credential.as_ref())
             .await
-            .map(|(account_id, quota)| CodexQuotaResponse { account_id, quota }),
+            .map(|(_, quota)| quota),
         None => None,
     };
-    Json(response)
+    Json(quota)
 }
 
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
     let auth_path = state.runtime_env.codex_auth_path();
-    let piggyback_path = state.runtime_env.codex_cli_auth_path();
     let active_path = state.llm_registry.current_codex_loaded_path();
     let already_signed_in = state.llm_registry.current_codex_credential().is_some();
     let account_id = state
@@ -952,16 +923,11 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
     // after a successful sign-in, current_codex_loaded_path == auth_path.
     let restart_required_after_login =
         state.llm_registry.current_codex_loaded_path().as_deref() != Some(auth_path.as_path());
-    let piggyback_env_set = std::env::var("OPENAI_USE_CODEX_AUTH")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
     Json(LoginPreflight {
         auth_path: auth_path.display().to_string(),
-        piggyback_path: piggyback_path.display().to_string(),
         already_signed_in,
         bridge_loaded_at_startup,
         restart_required_after_login,
-        piggyback_env_set,
         account_id,
         account_email,
     })
@@ -970,9 +936,7 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
 /// Sign out of the in-app `ChatGPT` login: delete `~/.phoenix-ide/codex-auth.json`
 /// and hot-reload the registry to deregister `OpenAI`/Codex bridge models.
 ///
-/// Idempotent — missing file is treated as success. Piggyback mode (loaded from
-/// `~/.codex/auth.json` via `OPENAI_USE_CODEX_AUTH=1`) is left alone: this
-/// endpoint only manages Phoenix's own auth file.
+/// Idempotent — missing file is treated as success.
 pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
     let auth_path = state.runtime_env.codex_auth_path();
     let removed = match std::fs::remove_file(&auth_path) {

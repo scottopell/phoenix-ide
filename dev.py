@@ -7683,19 +7683,11 @@ def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: b
 def _detect_codex_auth(env: dict[str, str]) -> str | None:
     """Return a human-readable summary if the server will find a ChatGPT/Codex
     bridge auth file at startup, else None. Mirrors
-    `codex_credential::resolve_active_auth_path` in the Rust binary: prefer
-    Phoenix's own `~/.phoenix-ide/codex-auth.json` (written by the in-app
-    `/codex/login` flow), then Codex CLI's `~/.codex/auth.json` when piggyback
-    mode (`OPENAI_USE_CODEX_AUTH=1`) is enabled."""
+    `codex_credential::resolve_active_auth_path` in the Rust binary: Phoenix's
+    native `~/.phoenix-ide/codex-auth.json`, written by the in-app login flow."""
     phoenix_auth = Path.home() / ".phoenix-ide" / "codex-auth.json"
     if phoenix_auth.exists():
         return f"chatgpt bridge ({phoenix_auth})"
-    piggyback_raw = env.get("OPENAI_USE_CODEX_AUTH") or os.environ.get("OPENAI_USE_CODEX_AUTH", "")
-    if piggyback_raw.lower() in ("1", "true", "yes", "on"):
-        codex_home = env.get("CODEX_HOME") or os.environ.get("CODEX_HOME")
-        codex_auth = Path(codex_home) / "auth.json" if codex_home else Path.home() / ".codex" / "auth.json"
-        if codex_auth.exists():
-            return f"chatgpt bridge ({codex_auth}, OPENAI_USE_CODEX_AUTH=1)"
     return None
 
 
@@ -7719,7 +7711,7 @@ def _configure_llm_env(env: dict[str, str]) -> str:
     Priority:
     1. .phoenix-ide.env overrides (LLM_API_KEY_HELPER, API keys, Codex auth, etc.)
     2. ANTHROPIC_API_KEY / OPENAI_API_KEY from shell environment
-    3. Codex auth from Phoenix or Codex CLI
+    3. Native Codex auth from Phoenix
     """
     # If env file provided LLM config, respect it — skip auto-detection
     if env.get("LLM_API_KEY_HELPER"):
@@ -7741,7 +7733,7 @@ def _configure_llm_env(env: dict[str, str]) -> str:
     print("ERROR: No LLM configuration found.", file=sys.stderr)
     print("  Options:", file=sys.stderr)
     print("    1. Create .phoenix-ide.env with LLM_API_KEY_HELPER, ANTHROPIC_API_KEY, or OPENAI_API_KEY", file=sys.stderr)
-    print("    2. Sign in with Codex or set OPENAI_USE_CODEX_AUTH=1 with Codex CLI auth", file=sys.stderr)
+    print("    2. Sign in with Codex from Phoenix", file=sys.stderr)
     sys.exit(1)
 
 

@@ -783,10 +783,7 @@ fn pr_context_entry_from_paths<'a>(
     }
 }
 
-/// The codex credential location the process loads from right now: Phoenix's own
-/// `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` under
-/// `OPENAI_USE_CODEX_AUTH` piggyback mode; falls back to the canonical Phoenix
-/// path (reported absent) when no credentials are present.
+/// Phoenix's native Codex credential location, reported absent before login.
 fn active_codex_credentials_location(
     runtime_env: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
 ) -> DiskLocation {

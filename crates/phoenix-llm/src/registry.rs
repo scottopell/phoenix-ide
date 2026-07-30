@@ -173,21 +173,17 @@ pub struct LlmConfig {
     /// These are additive only; duplicate IDs are ignored when merged with
     /// built-ins.
     pub external_models: Vec<super::ModelSpec>,
-    /// User has signalled intent to use the `ChatGPT` bridge. True when
-    /// Phoenix's own login file (`~/.phoenix-ide/codex-auth.json`) exists at
-    /// startup OR when `OPENAI_USE_CODEX_AUTH=1` is set (piggyback mode).
+    /// User has signed into the native `ChatGPT` bridge.
     /// When true, `OpenAI` models route through the bridge; when true but
     /// `codex_credential` is `None` (load failed), `OpenAI` models are
     /// unavailable rather than silently falling back to `OPENAI_API_KEY`.
     pub use_codex_auth: bool,
     /// When populated, `OpenAI` models are routed through the
     /// `ChatGPT` backend (`https://chatgpt.com/backend-api/codex`) using
-    /// `OAuth` tokens borrowed from the local `Codex` CLI's `~/.codex/auth.json`.
+    /// Phoenix's native OAuth credential.
     /// `Anthropic` and `Mock` providers are unaffected.
     pub codex_credential: Option<Arc<CodexCredential>>,
-    /// Filesystem path the loaded `codex_credential` was constructed from
-    /// (Phoenix's own auth file or Codex CLI's, depending on which won the
-    /// startup-time priority dance — see `codex_credential::resolve_active_auth_path`).
+    /// Filesystem path of Phoenix's native Codex credential.
     /// `None` whenever `codex_credential` is `None`. Surfaced so the login
     /// preflight can answer "do you need to restart after signing in?": if
     /// the loaded path equals the path the in-app login writes to, the mtime
@@ -336,10 +332,7 @@ impl LlmConfig {
             })
             .unwrap_or_default();
 
-        // Resolve which file (if any) holds ChatGPT credentials at startup.
-        // Phoenix's own ~/.phoenix-ide/codex-auth.json wins; OPENAI_USE_CODEX_AUTH=1
-        // opts into reading Codex CLI's ~/.codex/auth.json instead. See
-        // [`codex_credential::resolve_active_auth_path`].
+        // Resolve Phoenix's native ChatGPT credential at startup.
         let active_auth_path = codex_credential::resolve_active_auth_path(&runtime_env);
         let (codex_credential, codex_credential_path) = match active_auth_path.as_ref() {
             Some(path) => match CodexCredential::load(path.clone()) {
@@ -359,15 +352,7 @@ impl LlmConfig {
             },
             None => (None, None),
         };
-        // `use_codex_auth` is the bridge-intent flag (see field docs). True
-        // whenever the user has done something that signals "I want OpenAI
-        // models routed through ChatGPT" — either logging in via Phoenix or
-        // setting the piggyback env-var. The credential's actual presence is
-        // checked separately at call sites.
-        let use_codex_auth = active_auth_path.is_some()
-            || std::env::var("OPENAI_USE_CODEX_AUTH")
-                .ok()
-                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+        let use_codex_auth = active_auth_path.is_some();
 
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
@@ -774,7 +759,6 @@ impl ModelRegistry {
         // ChatGPT bridge: when the user has signalled intent to use the
         // bridge — either by logging in via Phoenix's `/codex/login` flow
         // (which writes ~/.phoenix-ide/codex-auth.json) or by setting
-        // OPENAI_USE_CODEX_AUTH=1 to piggyback Codex CLI's file — OpenAI
         // models route through the ChatGPT backend. If intent was signalled
         // but the credential failed to load, OpenAI models are unavailable
         // rather than silently falling through to OPENAI_API_KEY (which
@@ -1891,7 +1875,7 @@ mod tests {
     #[test]
     fn reload_swaps_active_auth_path_for_account_switch() {
         let dir1 = tempfile::tempdir().unwrap();
-        let path1 = dir1.path().join("piggyback.json");
+        let path1 = dir1.path().join("account-one.json");
         std::fs::write(
             &path1,
             br#"{"auth_mode":"chatgpt","tokens":{"access_token":"a","refresh_token":"r","account_id":"acc-old"}}"#,

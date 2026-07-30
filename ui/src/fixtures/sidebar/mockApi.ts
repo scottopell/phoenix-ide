@@ -15,11 +15,9 @@ export function installSidebarFixtureApi(data: SidebarFixtureData) {
 
   api.codexLoginPreflight = async (): Promise<CodexLoginPreflight> => ({
     auth_path: '/tmp/sidebar-fixture/auth.json',
-    piggyback_path: '/tmp/sidebar-fixture/piggyback.json',
     already_signed_in: false,
     bridge_loaded_at_startup: false,
     restart_required_after_login: false,
-    piggyback_env_set: false,
     account_id: null,
     account_email: null,
   });

@@ -83,3 +83,10 @@ Snapshots are ephemeral and account-global; they are not persisted across proces
 - Added an authenticated Phoenix quota endpoint and upstream-shaped parser so opening settings obtains the authoritative account snapshot without requiring a completed turn.
 - Partial per-turn snapshots now merge into the account snapshot instead of erasing an omitted current or weekly window.
 - Live dev endpoint verification returned the account quota successfully; focused parser/store/component tests and all 19 `./dev.py check` lanes pass.
+
+### Native-auth simplification
+
+- Removed Codex CLI piggyback authentication and the `OPENAI_USE_CODEX_AUTH` behavior flag; Phoenix's native OAuth credential is now the sole Codex bridge identity.
+- Simplified settings quota state to a complete ephemeral snapshot from the authoritative account usage endpoint. Per-turn quota events remain available to runtime/error handling but no longer merge into the settings store.
+- Sign-out clears the same credential and quota snapshot that own model access; quota snapshots remain non-persistent.
+- Focused native-auth/quota tests pass and `./dev.py check` passes all 20 checks.

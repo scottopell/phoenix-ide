@@ -212,3 +212,16 @@ WHEN streaming connection is interrupted mid-response
 THE SYSTEM SHALL treat it as a retryable network error
 
 **Rationale:** Token-by-token streaming enables progressive display of LLM output (REQ-BED-025). The provider layer must deliver partial content while still producing the same final response type for the state machine.
+
+---
+
+### REQ-LLM-010: Native Codex Authentication
+
+WHEN the Codex bridge authenticates with ChatGPT
+THE SYSTEM SHALL use only the credential created by Phoenix's native Codex login flow
+AND SHALL NOT read or modify Codex CLI authentication state
+
+WHEN the user signs out of Codex in Phoenix
+THE SYSTEM SHALL invalidate the same credential that owns Codex model access and quota status
+
+**Rationale:** A single credential owner keeps model availability, quota identity, account switching, and sign-out behavior consistent.

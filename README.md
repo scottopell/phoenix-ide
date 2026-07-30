@@ -184,8 +184,6 @@ you (prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy
 | `LLM_CUSTOM_HEADERS` | Extra request headers — newline-separated `Key: value` (literal `\n` accepted); a `provider` header is auto-injected | — |
 | `LLM_REQUEST_TAGS` | Comma-separated `key=value` request tags | — |
 | `LLM_AUTH_HEADER` | `bearer` → send the key as `Authorization: Bearer …`; anything else → provider's native API-key header | api-key style |
-| `OPENAI_USE_CODEX_AUTH` | `1`/`true`/`yes`/`on` → route OpenAI models through ChatGPT/Codex credentials instead of `OPENAI_API_KEY` | off |
-| `CODEX_HOME` | Where the Codex CLI keeps `auth.json` (read when the ChatGPT bridge is active) | `$HOME/.codex` |
 | `PHOENIX_ENABLE_MOCK_MODEL` | `1` → register the deterministic mock provider (testing only) | off |
 
 If none of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LLM_API_KEY_HELPER`,
