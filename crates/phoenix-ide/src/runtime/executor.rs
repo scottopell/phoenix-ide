@@ -2759,38 +2759,28 @@ where
 
         let state_before_transition = self.state.clone();
         let state_updated_at_before_transition = self.state_updated_at;
-        let retry_result = result.clone();
-        let mut transition_attempt = 0;
-        let mut events_to_process = loop {
-            match self.apply_transition_result(retry_result.clone()).await {
-                Ok(events) => break events,
-                Err(_error) if wake_registration.is_some() && transition_attempt < 2 => {
-                    transition_attempt += 1;
-                    self.state = state_before_transition.clone();
-                    self.state_updated_at = state_updated_at_before_transition;
-                    tokio::time::sleep(Duration::from_millis(25 * transition_attempt)).await;
+        let mut events_to_process = match self.apply_transition_result(result).await {
+            Ok(events) => events,
+            Err(error) => {
+                if let Some(registration) = &wake_registration {
+                    self.roll_back_failed_wake_transition(
+                        registration,
+                        state_before_transition,
+                        state_updated_at_before_transition,
+                    )
+                    .await;
                 }
-                Err(error) => {
-                    if let Some(registration) = &wake_registration {
-                        self.roll_back_failed_wake_transition(
-                            registration,
-                            state_before_transition,
-                            state_updated_at_before_transition,
-                        )
-                        .await;
-                    }
-                    self.state = ConvState::Error {
-                        message: format!("failed to persist completed wait: {error}"),
-                        error_kind: crate::db::ErrorKind::ServerError,
-                        resets_at: None,
-                    };
-                    self.state_updated_at = Utc::now();
-                    let _ = self.persist_state_effect(false).await;
-                    if let Some(state_watcher) = &self.state_watcher {
-                        let _ = state_watcher.send(self.state.clone());
-                    }
-                    return Err(error);
+                self.state = ConvState::Error {
+                    message: format!("failed to persist completed wait: {error}"),
+                    error_kind: crate::db::ErrorKind::ServerError,
+                    resets_at: None,
+                };
+                self.state_updated_at = Utc::now();
+                let _ = self.persist_state_effect(false).await;
+                if let Some(state_watcher) = &self.state_watcher {
+                    let _ = state_watcher.send(self.state.clone());
                 }
+                return Err(error);
             }
         };
 
@@ -4543,7 +4533,19 @@ where
                 Ok(None)
             }
 
-            Effect::PersistCheckpoint { data } => self.persist_checkpoint(data).await,
+            Effect::PersistCheckpoint { data } => {
+                let mut attempt = 0;
+                loop {
+                    match self.persist_checkpoint(data.clone()).await {
+                        Ok(outcome) => break Ok(outcome),
+                        Err(_error) if attempt < 2 => {
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_millis(25 * attempt)).await;
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+            }
 
             Effect::BroadcastAssistantMessage { message } => {
                 // Broadcast-only: no DB write here. The atomic
