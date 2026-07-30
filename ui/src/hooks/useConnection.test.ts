@@ -116,6 +116,47 @@ function makeInitPayload(convId: string, slug: string) {
 // Tests
 // ---------------------------------------------------------------------------
 
+describe('useConnection wake status invalidation', () => {
+  it.each([
+    [
+      'wake_contract_registered',
+      {
+        sequence_id: 1,
+        workflow_id: 1,
+        contract_id: 'wake-1',
+        resource_kind: 'BashHandle',
+        handle_id: 'b-1',
+        condition: 'handle_terminal',
+        expires_at: 600,
+      },
+    ],
+    [
+      'wake_contract_terminal',
+      {
+        sequence_id: 2,
+        workflow_id: 1,
+        contract_id: 'wake-1',
+        receipt_id: 1,
+        delivery_id: 1,
+        terminal_kind: 'fired',
+      },
+    ],
+  ])('notifies wake status immediately for %s', (eventType, payload) => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const changed = vi.fn();
+    window.addEventListener('phoenix:wake-status-changed', changed);
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+
+    act(() => FakeEventSource.instances[0]!.emit(eventType, payload));
+
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect((changed.mock.calls[0]![0] as CustomEvent).detail).toEqual({
+      conversationId: 'conv-A',
+    });
+    window.removeEventListener('phoenix:wake-status-changed', changed);
+  });
+});
+
 describe('useConnection epoch stamping (task 08683)', () => {
   it('opens the legacy stream URL when no replay cursor is available', () => {
     const dispatch = vi.fn<(a: SSEAction) => void>();

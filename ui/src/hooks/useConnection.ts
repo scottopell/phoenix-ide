@@ -5,6 +5,7 @@ import type { SSEAction, InitPayload } from '../conversation/atom';
 import { parseConversationState } from '../utils';
 import { notifyConversationStateChange } from '../notifications';
 import { setCodexQuota } from '../codexQuota';
+import { notifyWakeStatusChanged } from '../wakeStatusEvents';
 import {
   SseInitDataSchema,
   SseMessageDataSchema,
@@ -431,6 +432,7 @@ export function useConnection({
                 type: 'sse_sequence_consumed',
                 sequenceId: res.data.sequence_id,
               });
+              notifyWakeStatusChanged(conversationIdRef.current);
             }
           });
 
@@ -461,6 +463,7 @@ export function useConnection({
                 type: 'sse_sequence_consumed',
                 sequenceId: res.data.sequence_id,
               });
+              notifyWakeStatusChanged(conversationIdRef.current);
             }
           });
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type WakeStatus } from '../api';
+import { WAKE_STATUS_CHANGED_EVENT } from '../wakeStatusEvents';
 import './WakeStatusBar.css';
 
 type WakeAnnouncement = {
@@ -51,11 +52,20 @@ export function WakeStatusBar({ conversationId }: { conversationId: string }) {
     setAnnouncement(null);
     setCancellingContractId(null);
     void refresh();
+    const refreshForWakeChange = (event: Event) => {
+      const changedConversationId = (event as CustomEvent<{ conversationId: string }>).detail
+        .conversationId;
+      if (changedConversationId === conversationId) void refresh();
+    };
+    window.addEventListener(WAKE_STATUS_CHANGED_EVENT, refreshForWakeChange);
     const timer = window.setInterval(() => {
       void refresh();
     }, 5000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+    return () => {
+      window.removeEventListener(WAKE_STATUS_CHANGED_EVENT, refreshForWakeChange);
+      window.clearInterval(timer);
+    };
+  }, [conversationId, refresh]);
 
   const visibleStatus = status;
   const soonestExpiry = useMemo(() => {

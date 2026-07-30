@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type WakeStatus } from '../api';
 import { WakeStatusBar } from './WakeStatusBar';
+import { notifyWakeStatusChanged } from '../wakeStatusEvents';
 
 vi.mock('../api', () => ({
   api: {
@@ -67,6 +68,35 @@ describe('WakeStatusBar', () => {
     expect(await screen.findByText('status unavailable')).toBeInTheDocument();
     expect(screen.queryByText('⏰ 1 pending wake')).not.toBeInTheDocument();
     expect(screen.queryByText(/showing last known/)).not.toBeInTheDocument();
+  });
+
+  it('refreshes immediately when wake lifecycle SSE invalidates this conversation', async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.getWakeStatus)
+      .mockResolvedValueOnce({
+        pending_count: 0,
+        soonest_expires_at: null,
+        contracts: [],
+      })
+      .mockResolvedValueOnce(active);
+
+    render(<WakeStatusBar conversationId="conv" />);
+    await act(async () => {});
+    expect(api.getWakeStatus).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      notifyWakeStatusChanged('other-conversation');
+      await Promise.resolve();
+    });
+    expect(api.getWakeStatus).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      notifyWakeStatusChanged('conv');
+      await Promise.resolve();
+    });
+
+    expect(api.getWakeStatus).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('⏰ 1 pending wake')).toBeInTheDocument();
   });
 
   it('announces successful cancellation after refresh removes the contract', async () => {

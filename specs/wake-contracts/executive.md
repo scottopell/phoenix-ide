@@ -49,9 +49,9 @@ conv waiting on something." The existing `Awaiting*` family of states
 in this codebase exclusively encodes "waiting on the user"
 (`AwaitingTaskApproval`, `AwaitingContinuation`); wake is "waiting on
 the runtime," which is a different category and should not block
-user interaction. `is_busy()` is augmented to return true when the
-conv has at least one pending contract (one extra SQLite count per
-evaluation; lifecycle endpoints already do at least one read).
+user interaction. Pending contracts leave `is_busy()` unchanged. Wake-specific
+presentation, capability guards, and destructive-lifecycle checks query durable
+wake obligations directly instead of creating a second busy-state authority.
 
 The synthetic tool result delivered on fire is byte-shape-identical to the tool
 result the equivalent synchronous wait would have returned when such a
@@ -115,7 +115,7 @@ remain explicit runtime errors until their end-to-end lifecycle is implemented.
 | REQ-WAKE-001 Registration | Complete | `wait_until` provides explicit durable Bash registration, typed park disposition, and immediate receipt; unsupported handle kinds remain outside the Bash slice |
 | REQ-WAKE-002 Persistence | Partial | Durable Bash bindings, receipts, exactly-once restart reconciliation, and terminal delivery are implemented |
 | REQ-WAKE-003 Router Service | Partial | Background observation and replay-safe delivery are active for explicit Bash waits; no ordinary tool implicitly enrolls a handle |
-| REQ-WAKE-004 `is_busy()` Derivation | Proposed | Reads contract table; no new state machine variant |
+| REQ-WAKE-004 Pending-Wake Lifecycle Guard | Complete | `is_busy()` remains unchanged; wake-specific lifecycle guards query durable pending and owed obligations directly |
 | REQ-WAKE-005 V1 Condition Kinds | Partial | `HandleTerminal` is agent-accessible for Bash; tmux and sub-agent registration remain unsupported |
 | REQ-WAKE-006 Wake Event Delivery | Partial | Bash Fired / Expired / Forgotten results use durable materialization and exactly-once auto-resume |
 | REQ-WAKE-007 Mandatory Timeout | Partial | Bash registration defaults to 600s and is capped at 1800s |
@@ -142,7 +142,7 @@ surfaces are not implemented.
 - `specs/tmux-integration/` — TmuxPane handle condition kind
 - `specs/subagents/` — SubAgent handle condition kind
 - `specs/bedrock/` REQ-BED-032 (hard-delete cascade) — REQ-WAKE-004
-  is_busy() augmentation joins the cascade's busy-check
+  adds wake-specific owed-obligation checks to destructive lifecycle admission
 
 ## Related Work
 
