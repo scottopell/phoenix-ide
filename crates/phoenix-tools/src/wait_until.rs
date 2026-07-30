@@ -288,7 +288,7 @@ mod tests {
             Ok(RegisteredWake::CancelStale)
         }
 
-        fn notify_activation_committed(&self) {}
+        fn notify_activation_committed(&self, _workflow_id: phoenix_workflow::WorkflowId) {}
     }
 
     fn ctx(registrar: Option<Arc<dyn WakeRegistrar>>) -> ToolContext {

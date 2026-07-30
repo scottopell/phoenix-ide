@@ -218,6 +218,8 @@ pub struct RuntimeManager {
     steering_acceptance_receipts:
         Arc<AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>>,
     steering_acceptance_locks: ConversationAcceptanceLocks,
+    pub(crate) pending_wake_activation:
+        Arc<std::sync::Mutex<HashSet<phoenix_workflow::WorkflowId>>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1419,12 +1421,14 @@ impl RuntimeManager {
         let steering_acceptance_receipts = Arc::new(AsyncMutex::new(HashMap::new()));
         let steering_acceptance_locks: ConversationAcceptanceLocks =
             Arc::new(AsyncMutex::new(HashMap::new()));
+        let pending_wake_activation = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
                 wake_kick_tx.clone(),
                 Arc::clone(&steering_acceptance_receipts),
                 Arc::clone(&steering_acceptance_locks),
+                Arc::clone(&pending_wake_activation),
             ));
         Self {
             db,
@@ -1448,6 +1452,7 @@ impl RuntimeManager {
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             steering_acceptance_receipts,
             steering_acceptance_locks,
+            pending_wake_activation,
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,

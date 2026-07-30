@@ -4166,10 +4166,10 @@ fn projection_parts(
             ..
         } => {
             let reason = match reason {
-                WakeForgottenReason::PhoenixRestart => "PhoenixRestart",
-                WakeForgottenReason::CascadeDestroyedHandle => "CascadeDestroyedHandle",
-                WakeForgottenReason::BashWaiterPanicked => "BashWaiterPanicked",
-                WakeForgottenReason::TmuxHandleMissing => "TmuxHandleMissing",
+                WakeForgottenReason::PhoenixRestart => "phoenix_restart",
+                WakeForgottenReason::CascadeDestroyedHandle => "cascade_destroyed_handle",
+                WakeForgottenReason::BashWaiterPanicked => "bash_waiter_panicked",
+                WakeForgottenReason::TmuxHandleMissing => "tmux_handle_missing",
                 WakeForgottenReason::SubagentHandleMissing => {
                     unreachable!("subagent wake bindings not implemented")
                 }
@@ -4643,10 +4643,10 @@ fn projection_from_row(
             contract_id: contract_id.clone(),
             resource: resource.clone(),
             reason: match row.get::<String, _>("forgotten_reason").as_str() {
-                "PhoenixRestart" => WakeForgottenReason::PhoenixRestart,
-                "CascadeDestroyedHandle" => WakeForgottenReason::CascadeDestroyedHandle,
-                "BashWaiterPanicked" => WakeForgottenReason::BashWaiterPanicked,
-                "TmuxHandleMissing" => WakeForgottenReason::TmuxHandleMissing,
+                "phoenix_restart" => WakeForgottenReason::PhoenixRestart,
+                "cascade_destroyed_handle" => WakeForgottenReason::CascadeDestroyedHandle,
+                "bash_waiter_panicked" => WakeForgottenReason::BashWaiterPanicked,
+                "tmux_handle_missing" => WakeForgottenReason::TmuxHandleMissing,
                 other => {
                     return Err(DbError::Serialization(format!(
                         "unknown forgotten reason: {other}"

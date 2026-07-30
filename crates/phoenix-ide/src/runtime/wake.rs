@@ -51,6 +51,8 @@ pub(crate) struct ProductionWakeRegistrar {
         >,
     >,
     conversation_acceptance_locks: crate::runtime::ConversationAcceptanceLocks,
+    pending_activation:
+        Arc<std::sync::Mutex<std::collections::HashSet<phoenix_workflow::WorkflowId>>>,
 }
 
 impl ProductionWakeRegistrar {
@@ -66,12 +68,16 @@ impl ProductionWakeRegistrar {
             >,
         >,
         conversation_acceptance_locks: crate::runtime::ConversationAcceptanceLocks,
+        pending_activation: Arc<
+            std::sync::Mutex<std::collections::HashSet<phoenix_workflow::WorkflowId>>,
+        >,
     ) -> Self {
         Self {
             repo,
             kick_tx,
             acceptance_lock,
             conversation_acceptance_locks,
+            pending_activation,
         }
     }
 
@@ -108,10 +114,13 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             WakeRegistrationOutcome::Registered {
                 workflow_id,
                 receipt,
-            } => RegisteredWake::Registered {
-                workflow_id,
-                expires_at: receipt.expires_at,
-            },
+            } => {
+                self.pending_activation.lock().unwrap().insert(workflow_id);
+                RegisteredWake::Registered {
+                    workflow_id,
+                    expires_at: receipt.expires_at,
+                }
+            }
             WakeRegistrationOutcome::Replayed {
                 workflow_id,
                 receipt,
@@ -143,7 +152,8 @@ impl WakeRegistrar for ProductionWakeRegistrar {
         })
     }
 
-    fn notify_activation_committed(&self) {
+    fn notify_activation_committed(&self, workflow_id: phoenix_workflow::WorkflowId) {
+        self.pending_activation.lock().unwrap().remove(&workflow_id);
         self.kick();
     }
 }
@@ -287,6 +297,15 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             .await
             .map_err(|e| e.to_string())?;
         for row in expired {
+            if manager.is_some_and(|manager| {
+                manager
+                    .pending_wake_activation
+                    .lock()
+                    .unwrap()
+                    .contains(&row.workflow_id)
+            }) {
+                continue;
+            }
             let conversation_guard = if let Some(manager) = manager {
                 Some(
                     manager
@@ -330,6 +349,15 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             let page_len = candidates.len();
             for candidate in candidates {
                 cursor = Some(candidate.workflow_id);
+                if manager.is_some_and(|manager| {
+                    manager
+                        .pending_wake_activation
+                        .lock()
+                        .unwrap()
+                        .contains(&candidate.workflow_id)
+                }) {
+                    continue;
+                }
                 saw_candidate = true;
                 let claim_until = LeaseExpiry(if candidate.expires_at.0 <= now.0 {
                     now.0.saturating_add(LEASE_DURATION.as_secs())
@@ -512,7 +540,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                 } else {
                     None
                 };
-                let _ = self
+                if let Err(error) = self
                     .repo
                     .forget_if_unresolved_allocated(&WakeForgetIfUnresolvedInput {
                         workflow_id: candidate.workflow_id,
@@ -520,7 +548,18 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                         reason,
                     })
                     .await
-                    .map_err(|e| e.to_string())?;
+                {
+                    if let Err(release_error) =
+                        self.repo.release_observation_authority(&authority).await
+                    {
+                        tracing::warn!(
+                            %release_error,
+                            workflow_id = candidate.workflow_id.0,
+                            "failed to release forgotten wake observation authority after persistence error"
+                        );
+                    }
+                    return Err(error.to_string());
+                }
                 if let Some(manager) = manager {
                     deliver_pending(
                         manager,
@@ -2132,6 +2171,7 @@ mod tests {
             kick_tx,
             Arc::clone(&acceptance_lock),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         );
         let registration = tokio::spawn(async move {
             registrar
@@ -2153,11 +2193,13 @@ mod tests {
     async fn production_registrar_replays_and_conflicts_exactly() {
         let (_db, repo, scope) = open_repo().await;
         let (kick_tx, kick_rx) = watch::channel(0u64);
+        let pending_activation = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let registrar = ProductionWakeRegistrar::new(
             repo,
             kick_tx,
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            Arc::clone(&pending_activation),
         );
 
         let before_registration = Timestamp(
@@ -2195,9 +2237,11 @@ mod tests {
             }
         );
         assert_eq!(conflict, RegisteredWake::Conflict);
+        assert!(pending_activation.lock().unwrap().contains(&first_id));
         assert_eq!(*kick_rx.borrow(), 0);
-        registrar.notify_activation_committed();
+        registrar.notify_activation_committed(first_id);
         assert_eq!(*kick_rx.borrow(), 1);
+        assert!(!pending_activation.lock().unwrap().contains(&first_id));
     }
 
     #[tokio::test]
@@ -2210,6 +2254,7 @@ mod tests {
             kick_tx,
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         );
 
         let cancelled = registrar
@@ -2392,6 +2437,43 @@ mod tests {
             phoenix_workflow::wake_profile::WakeTerminalPayload::Fired { .. }
         ));
     }
+    #[tokio::test]
+    async fn forgotten_persistence_error_releases_authority_for_immediate_retry() {
+        let (db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-1", 50).await;
+        sqlx::query(
+            "CREATE TRIGGER reject_forgotten_receipt BEFORE INSERT ON wake_terminal_receipts
+             WHEN NEW.terminal_kind = 'Forgotten'
+             BEGIN SELECT RAISE(ABORT, 'injected forgotten persistence failure'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Forgotten(WakeForgottenReason::PhoenixRestart),
+        );
+        let worker = WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        );
+
+        worker.run_once().await.unwrap();
+
+        let candidates = repo
+            .list_observation_candidates(Timestamp(10), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].workflow_id,
+            phoenix_workflow::WorkflowId(workflow_id)
+        );
+    }
+
     #[tokio::test]
     async fn inspection_error_releases_authority_for_immediate_retry() {
         let (_db, repo, scope) = open_repo().await;
@@ -2663,6 +2745,7 @@ mod tests {
             kick_tx,
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         )
         .cancel(CancelWakeInput {
             workflow_id: phoenix_workflow::WorkflowId(cancelled_id),

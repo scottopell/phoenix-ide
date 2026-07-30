@@ -2023,7 +2023,7 @@ mod tests {
             Ok(RegisteredWake::CancelStale)
         }
 
-        fn notify_activation_committed(&self) {}
+        fn notify_activation_committed(&self, _workflow_id: phoenix_workflow::WorkflowId) {}
     }
 
     fn ctx_with_registrar(

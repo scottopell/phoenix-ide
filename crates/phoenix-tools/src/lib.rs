@@ -183,7 +183,7 @@ impl RegisteredWake {
 pub trait WakeRegistrar: Send + Sync {
     async fn register(&self, input: RegisterWakeInput) -> Result<RegisteredWake, String>;
     async fn cancel(&self, input: CancelWakeInput) -> Result<RegisteredWake, String>;
-    fn notify_activation_committed(&self);
+    fn notify_activation_committed(&self, workflow_id: phoenix_workflow::WorkflowId);
 }
 
 /// Converts a resource scope to the persisted identity that may own a durable wake.
@@ -1695,7 +1695,7 @@ mod wake_registrar_seam_tests {
             Ok(RegisteredWake::CancelStale)
         }
 
-        fn notify_activation_committed(&self) {}
+        fn notify_activation_committed(&self, _workflow_id: phoenix_workflow::WorkflowId) {}
     }
 
     fn test_context() -> ToolContext {

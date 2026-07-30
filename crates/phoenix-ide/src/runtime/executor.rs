@@ -2758,9 +2758,10 @@ where
         };
 
         if let Some(registration) = wake_registration {
+            let workflow_id = phoenix_workflow::WorkflowId(registration.workflow_id);
             self.publish_wake_registration(registration);
             if let Some(registrar) = &self.wake_registrar {
-                registrar.notify_activation_committed();
+                registrar.notify_activation_committed(workflow_id);
             }
         }
 
@@ -9431,7 +9432,7 @@ mod context_exhausted_preserves_worktree_tests {
             }
         }
 
-        fn notify_activation_committed(&self) {}
+        fn notify_activation_committed(&self, _workflow_id: phoenix_workflow::WorkflowId) {}
     }
 
     #[async_trait::async_trait]
@@ -9451,7 +9452,7 @@ mod context_exhausted_preserves_worktree_tests {
             Ok(crate::tools::RegisteredWake::Cancelled)
         }
 
-        fn notify_activation_committed(&self) {
+        fn notify_activation_committed(&self, _workflow_id: phoenix_workflow::WorkflowId) {
             self.activation_notifications
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
