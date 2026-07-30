@@ -280,6 +280,15 @@ impl SendChatApplicationService {
             .runtime
             .lock_conversation_acceptance(&req.conversation_id)
             .await;
+        let wake_repo = phoenix_db::workflow::wake::WakeRepository::new(self.db.pool().clone());
+        crate::runtime::wake::deliver_pending(
+            &self.runtime,
+            &wake_repo,
+            phoenix_workflow::Timestamp(now_timestamp().0),
+            Some(&req.conversation_id),
+        )
+        .await
+        .map_err(SendChatServiceError::Internal)?;
         let step = match repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 client_key: client_key.clone(),

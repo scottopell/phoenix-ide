@@ -210,9 +210,9 @@ THE SYSTEM SHALL support the following condition kind in v1:
 - `HandleTerminal { handle_kind: Bash | TmuxPane | SubAgent, handle_id }`
   — fires when the named handle reaches a terminal state.
 
-For `Bash`, fired payloads SHALL include the terminal statuses reported by the
-synchronous wait surface for an observed handle, including exited, killed (with
-signal metadata when relevant), and `kill_pending_kernel`. A bash handle that is
+For `Bash`, fired payloads SHALL include terminal exited and killed statuses,
+including signal metadata when relevant. `kill_pending_kernel` remains live and
+unresolved until the process reaches a true terminal state. A bash handle that is
 lost across restart or teardown resolves through the wake contract's `Forgotten`
 cause, not through a fired bash payload.
 
@@ -264,7 +264,7 @@ wake delivery SHALL enter the conversation only through the durable observation 
 owed-acceptance path rather than an immediate direct-to-LLM wake-up.
 
 For `HandleTerminal/Bash`, the observation MUST carry the handle's terminal
-status (`exited` / `killed` / `kill_pending_kernel` / `forgotten` and any other
+status (`exited` / `killed` / `forgotten` and any other
 status exposed by `bash op=wait`), `exit_code`, `duration_ms`, and a final tail
 window per REQ-BASH-004. The final tail is reconstructed from normalized
 wake-tail child rows, not from `terminal_payload`.

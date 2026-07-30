@@ -342,6 +342,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
 
       source.addEventListener('conversation_became_terminal', (event) => {
         consumeSequencedEvent(event, SseConversationBecameTerminalDataSchema, dispatch);
+        closeSource();
       });
 
       source.addEventListener('conversation_hard_deleted', (event) => {
