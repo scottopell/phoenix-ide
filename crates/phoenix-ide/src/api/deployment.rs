@@ -676,6 +676,9 @@ fn conv_state_name(state: &phoenix_core::domain::sm_state::ConvState) -> &'stati
         phoenix_core::domain::sm_state::ConvState::AwaitingContinuation { .. } => {
             "AwaitingContinuation"
         }
+        phoenix_core::domain::sm_state::ConvState::RecoverableContinuationFailure { .. } => {
+            "RecoverableContinuationFailure"
+        }
         phoenix_core::domain::sm_state::ConvState::AwaitingTaskApproval { .. } => {
             "AwaitingTaskApproval"
         }

@@ -516,7 +516,8 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
         | ConvState::CancellingSubAgents { .. }
         | ConvState::Completed { .. }
         | ConvState::Failed { .. }
-        | ConvState::AwaitingContinuation { .. } => None,
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::RecoverableContinuationFailure { .. } => None,
     }
 }
 

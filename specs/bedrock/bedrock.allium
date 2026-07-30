@@ -106,7 +106,7 @@ entity Conversation {
     -- Core status (shared by both variants)
     core_status: idle | llm_requesting | executing_tools
                 | cancelling_tool | awaiting_sub_agents | cancelling_sub_agents
-                | error | awaiting_continuation
+                | error | awaiting_continuation | recoverable_continuation_failure
 
     -- Mode (orthogonal to status)
     mode: explore | direct | work | branch
@@ -147,6 +147,8 @@ entity Conversation {
         awaiting_sub_agents -> cancelling_sub_agents
         cancelling_sub_agents -> idle
         idle -> awaiting_continuation
+        awaiting_continuation -> recoverable_continuation_failure
+        recoverable_continuation_failure -> awaiting_continuation
     }
 
     -- Mode transitions (REQ-BED-027)
@@ -157,7 +159,7 @@ entity Conversation {
     }
 
     -- Core state-dependent fields
-    retry_attempt: Integer when core_status = llm_requesting | awaiting_continuation
+    retry_attempt: Integer when core_status = llm_requesting | awaiting_continuation | recoverable_continuation_failure
     tool_queue: List<ToolCall> when core_status = executing_tools
     tool_results: List<ToolResult> when core_status = executing_tools | cancelling_tool
     accumulated_sub_agents: Set<Conversation> when core_status = executing_tools
@@ -166,7 +168,10 @@ entity Conversation {
         when core_status = awaiting_sub_agents | cancelling_sub_agents
     sub_agents_completed: List<SubAgentResult>
         when core_status = awaiting_sub_agents | cancelling_sub_agents
-    rejected_tool_calls: List<ToolCall> when core_status = awaiting_continuation
+    rejected_tool_calls: List<ToolCall> when core_status = awaiting_continuation | recoverable_continuation_failure
+    continuation_operation_id: String when core_status = awaiting_continuation | recoverable_continuation_failure
+    continuation_error_message: String when core_status = recoverable_continuation_failure
+    continuation_error_class: ErrorClass when core_status = recoverable_continuation_failure
     error_message: String when core_status = error
     error_class: ErrorClass when core_status = error
 
@@ -1012,27 +1017,48 @@ rule UserDismissesQuestion {
 -- Manual continuation is user-gated only by idle status. The UI warning
 -- threshold changes indicator styling; it does not hide this action.
 rule UserTriggersContinuation {
-    when: UserTriggersContinuation(conversation)
+    when: UserTriggersContinuation(conversation, operation_id)
     requires: conversation.core_status = idle
     ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.continuation_operation_id = operation_id
     ensures: conversation.rejected_tool_calls = {}
     ensures: conversation.retry_attempt = 1
-    ensures: ContinuationRequested(conversation, {})
+    ensures: ContinuationOperationPersisted(conversation, operation_id)
+    ensures: ContinuationRequested(conversation, operation_id, {})
 }
 
 rule ContinuationSummaryReceived {
-    when: ContinuationSummaryReady(conversation, summary)
+    when: ContinuationSummaryReady(conversation, operation_id, summary)
     requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
     ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary = summary
+    ensures: ContinuationCommitted(conversation, operation_id)
+    @guidance
+        -- Persist the summary message and context-exhausted state atomically.
+        -- Derive the summary message identity from operation_id so replay cannot
+        -- create a second committed summary.
 }
 
-rule ContinuationFailed {
-    when: ContinuationRequestFailed(conversation, error)
+rule ContinuationFailureBecomesRecoverable {
+    when: ContinuationRequestFailed(conversation, operation_id, error, error_class)
     requires: conversation.core_status = awaiting_continuation
-    ensures: conversation.parent_status = context_exhausted
-    ensures: conversation.continuation_summary =
-        "Continuation summary unavailable. Context was exhausted."
+    requires: conversation.continuation_operation_id = operation_id
+    ensures: conversation.core_status = recoverable_continuation_failure
+    ensures: conversation.continuation_operation_id = operation_id
+    ensures: conversation.continuation_error_message = error
+    ensures: conversation.continuation_error_class = error_class
+    ensures: ContinuationRetryOffered(conversation, operation_id)
+}
+
+rule UserRetriesContinuation {
+    when: UserTriggersContinuation(conversation, operation_id)
+    requires: conversation.core_status = recoverable_continuation_failure
+    requires: conversation.continuation_operation_id = operation_id
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: conversation.continuation_operation_id = operation_id
+    ensures: conversation.retry_attempt = previous(conversation.retry_attempt) + 1
+    ensures: ContinuationRequested(conversation, operation_id, conversation.rejected_tool_calls)
 }
 
 -- Continuation summary generation is not user-cancellable. The UserConversation
@@ -1056,6 +1082,7 @@ rule ContinuationRetryableError {
     requires: error_class = retryable
     requires: attempt < config.max_retry_attempts
     ensures: conversation.retry_attempt = attempt + 1
+    ensures: conversation.continuation_operation_id = previous(conversation.continuation_operation_id)
     ensures: RetryScheduled(conversation, delay: 2.seconds * attempt)
 }
 
@@ -1063,9 +1090,29 @@ rule ContinuationNonRecoverableError {
     when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = awaiting_continuation
     requires: error_class = non_retryable or attempt >= config.max_retry_attempts
-    ensures: conversation.parent_status = context_exhausted
-    ensures: conversation.continuation_summary =
-        "Continuation summary unavailable. Context was exhausted."
+    ensures: conversation.core_status = recoverable_continuation_failure
+    ensures: conversation.continuation_operation_id = previous(conversation.continuation_operation_id)
+    ensures: conversation.continuation_error_message = message
+    ensures: conversation.continuation_error_class = error_class
+    ensures: ContinuationRetryOffered(conversation, conversation.continuation_operation_id)
+}
+
+rule ResumeInterruptedContinuation {
+    when: RuntimeStarts(conversation)
+    requires: conversation.core_status = awaiting_continuation
+    ensures: ContinuationRequested(
+        conversation,
+        conversation.continuation_operation_id,
+        conversation.rejected_tool_calls
+    )
+}
+
+rule IgnoreStaleOrDuplicateContinuationResult {
+    when: ContinuationSummaryReady(conversation, operation_id, summary)
+    requires: conversation.core_status != awaiting_continuation
+        or conversation.continuation_operation_id != operation_id
+    ensures: conversation.core_status = previous(conversation.core_status)
+    ensures: ContinuationResultIgnored(conversation, operation_id)
 }
 
 -- ===========================================================

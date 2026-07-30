@@ -838,6 +838,10 @@ export function StateBar({
             dotClass += " error";
             stateText = "error";
             break;
+          case "recoverable_continuation_failure":
+            dotClass += " error";
+            stateText = "continuation failed";
+            break;
           case "creation_failed":
             dotClass += " error";
             stateText = "creation failed";

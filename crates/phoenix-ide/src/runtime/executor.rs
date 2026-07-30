@@ -2163,6 +2163,16 @@ where
         }
 
         // REQ-BED-030: crash recovery for AwaitingRecovery.
+
+        if let ConvState::AwaitingContinuation { request } = &self.state {
+            tracing::info!(
+                conv_id = %self.context.conversation_id,
+                operation_id = %request.operation_id,
+                "resuming interrupted continuation summary"
+            );
+            self.request_continuation(request.clone());
+        }
+
         // If the credential helper is still running, the select loop will pick it up.
         // If it already settled, handle it immediately.
         if matches!(self.state, ConvState::AwaitingRecovery { .. }) {
@@ -4167,6 +4177,54 @@ where
                 Ok(None)
             }
 
+            Effect::ContinuationCommit {
+                operation_id,
+                summary,
+            } => {
+                let seq = self.broadcast_tx.next_seq();
+                let content = crate::db::MessageContent::continuation(summary.clone());
+                let message = crate::db::Message {
+                    message_id: format!("continuation-{operation_id}"),
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: seq,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: Some(serde_json::json!({ "summary": summary })),
+                    usage_data: None,
+                    created_at: Utc::now(),
+                };
+                match self
+                    .storage
+                    .commit_continuation(
+                        &self.context.conversation_id,
+                        &operation_id,
+                        &message,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await?
+                {
+                    crate::db::ContinuationCommitOutcome::Applied => {
+                        let _ = self.broadcast_tx.send_message(message);
+                        let _ = self
+                            .broadcast_tx
+                            .send_seq(|sequence_id| SseEvent::StateChange {
+                                sequence_id,
+                                state: self.state.clone(),
+                                presentation_mode: self.state.presentation_mode().to_string(),
+                                state_updated_at: self.state_updated_at,
+                            });
+                    }
+                    crate::db::ContinuationCommitOutcome::Duplicate => {
+                        tracing::debug!(%operation_id, "ignoring duplicate continuation commit");
+                    }
+                    crate::db::ContinuationCommitOutcome::Stale => {
+                        tracing::debug!(%operation_id, "ignoring stale continuation commit");
+                    }
+                }
+                Ok(None)
+            }
+
             Effect::PersistState => self.persist_state_effect(true).await,
 
             Effect::RequestLlm => self.dispatch_llm_request().await,
@@ -4444,7 +4502,7 @@ where
             } => self.persist_sub_agent_results(results, spawn_tool_id).await,
 
             Effect::RequestContinuation { request } => {
-                self.request_continuation(request.rejected_tool_calls, request.attempt);
+                self.request_continuation(request);
                 Ok(None)
             }
 
@@ -5664,7 +5722,13 @@ where
 
     /// Request continuation summary from LLM (REQ-BED-020)
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
-    fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>, retry_attempt: u32) {
+    fn request_continuation(
+        &mut self,
+        request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
+    ) {
+        let operation_id = request.operation_id;
+        let rejected_tool_calls = request.rejected_tool_calls;
+        let retry_attempt = request.attempt;
         let llm_client = Arc::clone(&self.llm_client);
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
@@ -5714,7 +5778,12 @@ where
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build messages for continuation");
-                    let _ = event_tx.send(Event::ContinuationFailed { error: e }).await;
+                    let _ = event_tx
+                        .send(Event::ContinuationFailed {
+                            operation_id,
+                            error: e,
+                        })
+                        .await;
                     return;
                 }
             };
@@ -5831,27 +5900,38 @@ where
                         );
                         let _ = event_tx
                             .send(Event::ContinuationFailed {
+                                operation_id,
                                 error: "the model returned an empty summary".to_string(),
                             })
                             .await;
                         return;
                     }
 
-                    let _ = event_tx.send(Event::ContinuationResponse { summary }).await;
+                    let _ = event_tx
+                        .send(Event::ContinuationResponse {
+                            operation_id,
+                            summary,
+                        })
+                        .await;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Continuation LLM request failed");
-                    // Send LlmError so the state machine's AwaitingContinuation retry logic fires.
-                    // The attempt field is ignored by that arm (tracked in state), so 0 is fine.
-                    let _ = event_tx
-                        .send(Event::LlmError {
+                    let event = if e.recovery_in_progress {
+                        Event::LlmError {
                             message: e.message.clone(),
                             error_kind: llm_error_to_db_error(e.kind),
-                            attempt: 0,
-                            recovery_in_progress: e.recovery_in_progress,
-                            resets_at: e.quota.as_ref().and_then(|q| q.resets_at),
-                        })
-                        .await;
+                            attempt: retry_attempt,
+                            recovery_in_progress: true,
+                            resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
+                        }
+                    } else {
+                        Event::ContinuationError {
+                            operation_id,
+                            message: e.message.clone(),
+                            error_kind: llm_error_to_db_error(e.kind),
+                        }
+                    };
+                    let _ = event_tx.send(event).await;
                 }
             }
         });
@@ -9125,6 +9205,7 @@ mod authoritative_user_message_effect_tests {
             ),
             (
                 Event::ContinuationFailed {
+                    operation_id: "direct-turn-continuation-op".to_string(),
                     error: "continuation failed".to_string(),
                 },
                 ConvState::ContextExhausted {
@@ -10814,9 +10895,11 @@ mod steer_drain_detector_tests {
             build_runtime_with_state_and_queue("conv-manual-continuation", ConvState::Idle, vec![]);
         let mut rx = rt.broadcast_tx.subscribe();
 
-        rt.process_event(Event::UserTriggerContinuation)
-            .await
-            .expect("manual continuation trigger must be accepted from idle");
+        rt.process_event(Event::UserTriggerContinuation {
+            operation_id: "manual-continuation-op".to_string(),
+        })
+        .await
+        .expect("manual continuation trigger must be accepted from idle");
 
         let persisted = storage
             .get_state("conv-manual-continuation")
@@ -10825,12 +10908,12 @@ mod steer_drain_detector_tests {
         assert!(
             matches!(
                 persisted,
-                ConvState::AwaitingContinuation { attempt: 1, .. }
+                ConvState::AwaitingContinuation { ref request } if request.attempt == 1
             ),
             "manual continuation must persist AwaitingContinuation, got {persisted:?}"
         );
         assert!(
-            matches!(rt.state, ConvState::AwaitingContinuation { attempt: 1, .. }),
+            matches!(rt.state, ConvState::AwaitingContinuation { ref request } if request.attempt == 1),
             "manual continuation must enter AwaitingContinuation, got {:?}",
             rt.state
         );
@@ -10838,7 +10921,8 @@ mod steer_drain_detector_tests {
         let mut saw_awaiting_continuation = false;
         while let Ok(ev) = rx.try_recv() {
             if let SseEvent::StateChange { state, .. } = ev {
-                if matches!(state, ConvState::AwaitingContinuation { attempt: 1, .. }) {
+                if matches!(state, ConvState::AwaitingContinuation { ref request } if request.attempt == 1)
+                {
                     saw_awaiting_continuation = true;
                     break;
                 }

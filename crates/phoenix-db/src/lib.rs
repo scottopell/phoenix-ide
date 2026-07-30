@@ -862,6 +862,13 @@ fn row_work_scope_id(row: &SqliteRow) -> phoenix_core::work_scope::WorkScopeId {
 }
 
 /// Thread-safe database handle
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationCommitOutcome {
+    Applied,
+    Duplicate,
+    Stale,
+}
+
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
@@ -4577,6 +4584,88 @@ impl Database {
         Ok(CreationCasOutcome::Applied)
     }
 
+    /// Atomically commit a generated continuation summary when the persisted
+    /// continuation operation still matches `operation_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the conversation is missing, persisted state cannot
+    /// be decoded, or the transactional message/state write fails.
+    pub async fn commit_continuation(
+        &self,
+        conversation_id: &str,
+        operation_id: &str,
+        message: &Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<ContinuationCommitOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT state FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+        let persisted_json: String = row.get("state");
+        let persisted: ConvState = serde_json::from_str(&persisted_json)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+
+        let ConvState::ContextExhausted {
+            summary: completed_summary,
+        } = completed_state
+        else {
+            return Err(DbError::Serialization(
+                "continuation commit requires context exhausted state".to_string(),
+            ));
+        };
+        if matches!(
+            &persisted,
+            ConvState::ContextExhausted { summary } if summary == completed_summary
+        ) {
+            let exists = sqlx::query("SELECT 1 FROM messages WHERE message_id = ?1")
+                .bind(&message.message_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+            tx.rollback().await?;
+            return Ok(if exists {
+                ContinuationCommitOutcome::Duplicate
+            } else {
+                ContinuationCommitOutcome::Stale
+            });
+        }
+
+        if !matches!(
+            &persisted,
+            ConvState::AwaitingContinuation { request }
+                if request.operation_id == operation_id
+        ) {
+            tx.rollback().await?;
+            return Ok(ContinuationCommitOutcome::Stale);
+        }
+
+        insert_message_tx(&mut tx, message).await?;
+        let completed_json = serde_json::to_string(completed_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let updated = sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_updated_at = ?2, updated_at = ?3
+             WHERE id = ?4 AND state = ?5",
+        )
+        .bind(completed_json)
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .bind(persisted_json)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(ContinuationCommitOutcome::Stale);
+        }
+        tx.commit().await?;
+        Ok(ContinuationCommitOutcome::Applied)
+    }
+
     /// Update conversation state, stamping `state_updated_at = now()`.
     /// Callers that own the authoritative entry timestamp (the runtime
     /// executor) should use [`Self::update_conversation_state_at`] so the
@@ -6750,7 +6839,7 @@ impl Database {
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
                AND NOT (
                    json_extract(state, '$.type') = 'llm_requesting'
                    AND (
@@ -12396,6 +12485,107 @@ mod tests {
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+    }
+
+    #[tokio::test]
+    async fn continuation_commit_is_atomic_idempotent_and_rejects_stale_operations() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "continuation-commit",
+            "continuation",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let operation_id = "operation-1";
+        db.update_conversation_state(
+            "continuation-commit",
+            &ConvState::AwaitingContinuation {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let completed = ConvState::ContextExhausted {
+            summary: "durable summary".to_string(),
+        };
+        let content = MessageContent::continuation("durable summary");
+        let message = Message {
+            message_id: format!("continuation-{operation_id}"),
+            conversation_id: "continuation-commit".to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            db.commit_continuation(
+                "continuation-commit",
+                operation_id,
+                &message,
+                &completed,
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            db.commit_continuation(
+                "continuation-commit",
+                operation_id,
+                &message,
+                &completed,
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Duplicate
+        );
+        assert_eq!(
+            db.get_messages("continuation-commit").await.unwrap().len(),
+            1
+        );
+
+        let stale_content = MessageContent::continuation("stale summary");
+        let stale = Message {
+            message_id: "continuation-operation-2".to_string(),
+            conversation_id: "continuation-commit".to_string(),
+            sequence_id: 2,
+            message_type: stale_content.message_type(),
+            content: stale_content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        assert_eq!(
+            db.commit_continuation(
+                "continuation-commit",
+                "operation-2",
+                &stale,
+                &ConvState::ContextExhausted {
+                    summary: "stale summary".to_string(),
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Stale
+        );
+        assert_eq!(
+            db.get_messages("continuation-commit").await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

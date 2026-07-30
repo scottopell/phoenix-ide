@@ -4241,9 +4241,13 @@ async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let operation_id = match state.runtime.effective_conversation_state(&id).await {
+        Some(ConvState::RecoverableContinuationFailure { failure }) => failure.request.operation_id,
+        _ => uuid::Uuid::new_v4().to_string(),
+    };
     state
         .runtime
-        .send_event(&id, Event::UserTriggerContinuation)
+        .send_event(&id, Event::UserTriggerContinuation { operation_id })
         .await
         .map_err(AppError::BadRequest)?;
 
@@ -11461,8 +11465,11 @@ pub(crate) mod hard_delete_cascade_tests {
             .update_conversation_state(
                 "c-continuation",
                 &ConvState::AwaitingContinuation {
-                    rejected_tool_calls: vec![],
-                    attempt: 1,
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "cancel-test-op".to_string(),
+                        rejected_tool_calls: vec![],
+                        attempt: 1,
+                    },
                 },
             )
             .await
@@ -11484,7 +11491,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("conversation still exists");
         assert!(matches!(
             conv.state,
-            ConvState::AwaitingContinuation { attempt: 1, .. }
+            ConvState::AwaitingContinuation { request } if request.attempt == 1
         ));
     }
 

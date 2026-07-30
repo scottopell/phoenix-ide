@@ -173,8 +173,11 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
 fn arb_awaiting_continuation_state() -> impl Strategy<Value = ConvState> {
     (proptest::collection::vec(arb_tool_call(), 0..3), 1u32..5).prop_map(
         |(rejected_tool_calls, attempt)| ConvState::AwaitingContinuation {
-            rejected_tool_calls,
-            attempt,
+            request: crate::state::ContinuationSummaryRequest {
+                operation_id: "proptest-continuation-op".to_string(),
+                rejected_tool_calls,
+                attempt,
+            },
         },
     )
 }
@@ -2351,8 +2354,11 @@ fn is_terminal_excludes_non_terminal_states() {
     let non_terminal: &[ConvState] = &[
         ConvState::Idle,
         ConvState::AwaitingContinuation {
-            rejected_tool_calls: vec![],
-            attempt: 0,
+            request: crate::state::ContinuationSummaryRequest {
+                operation_id: "proptest-continuation-op".to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 0,
+            },
         },
     ];
 

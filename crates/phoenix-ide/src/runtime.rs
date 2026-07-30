@@ -3605,6 +3605,8 @@ impl RuntimeManager {
 
         match &conv.state {
             ConvState::Provisioning { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::RecoverableContinuationFailure { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }

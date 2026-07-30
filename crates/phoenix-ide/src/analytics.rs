@@ -450,6 +450,7 @@ fn terminal_status(conv: &Conversation) -> Option<String> {
         | crate::state_machine::ConvState::CancellingSubAgents { .. }
         | crate::state_machine::ConvState::AwaitingRecovery { .. }
         | crate::state_machine::ConvState::AwaitingContinuation { .. }
+        | crate::state_machine::ConvState::RecoverableContinuationFailure { .. }
         | crate::state_machine::ConvState::AwaitingTaskApproval { .. }
         | crate::state_machine::ConvState::AwaitingUserResponse { .. }
         | crate::state_machine::ConvState::AwaitingCommissionReviewApproval { .. } => None,

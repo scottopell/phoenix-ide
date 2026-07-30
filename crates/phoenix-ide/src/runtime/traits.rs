@@ -228,6 +228,15 @@ pub trait StateStore: Send + Sync {
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
 
+    async fn commit_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String>;
+
     /// Atomically update mode, cwd, and normalized environment during promotion.
     async fn update_conversation_mode_and_cwd(
         &self,
@@ -561,6 +570,25 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
+    }
+
+    async fn commit_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        (**self)
+            .commit_continuation(
+                conv_id,
+                operation_id,
+                message,
+                completed_state,
+                state_updated_at,
+            )
+            .await
     }
 
     async fn update_conversation_mode_and_cwd(
@@ -1042,6 +1070,26 @@ impl StateStore for DatabaseStorage {
             .await
             .map_err(|e| e.to_string())?;
         Ok(conv.state)
+    }
+
+    async fn commit_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        self.db
+            .commit_continuation(
+                conv_id,
+                operation_id,
+                message,
+                completed_state,
+                state_updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn update_conversation_mode_and_cwd(

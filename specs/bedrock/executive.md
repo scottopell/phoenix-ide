@@ -31,7 +31,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-017:** Mode Communication | ✅ Complete | Mode-aware tool errors in `crates/phoenix-ide/src/tools.rs:479`; system prompt directs Explore agents to `propose_task` (`system_prompt.rs:578`) |
 | **REQ-BED-018:** Sub-Agent Mode Enforcement | ✅ Complete | Sub-agent tool sets restricted by mode in `crates/phoenix-ide/src/tools.rs:647-677` (tested); sub-agents inherit parent worktree |
 | **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |
-| **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Tool-less LLM request, fallback on failure |
+| **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Durable operation identity, restart resume, transient retry, recoverable failure, atomic idempotent commit |
 | **REQ-BED-021:** Context Exhausted State | ✅ Complete | Read-only terminal state |
 | **REQ-BED-022:** Model-Specific Context Limits | ✅ Complete | Per-model thresholds, conservative default |
 | **REQ-BED-023:** Context Warning Indicator | ✅ Complete | 80% warning, manual trigger option |

@@ -203,6 +203,12 @@ pub enum Effect {
     /// Request continuation summary from LLM (no tools) - REQ-BED-020
     RequestContinuation { request: ContinuationSummaryRequest },
 
+    /// Atomically persist the accepted continuation summary for an operation.
+    ContinuationCommit {
+        operation_id: String,
+        summary: String,
+    },
+
     /// Notify client of context exhaustion - REQ-BED-021
     NotifyContextExhausted { summary: String },
 
@@ -394,7 +400,8 @@ impl Effect {
         Effect::ExecuteTool { tool }
     }
 
-    /// Create a continuation message effect
+    /// Persist a fallback summary when an ordinary turn is rejected for context
+    /// exhaustion before a continuation operation exists.
     pub fn persist_continuation_message(summary: impl Into<String>) -> Self {
         let summary = summary.into();
         Effect::PersistMessage {
@@ -403,6 +410,17 @@ impl Effect {
             usage_data: None,
             message_id: uuid::Uuid::new_v4().to_string(),
             idempotent: false,
+        }
+    }
+
+    /// Create an atomic continuation commit effect.
+    pub fn continuation_commit(
+        operation_id: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Effect::ContinuationCommit {
+            operation_id: operation_id.into(),
+            summary: summary.into(),
         }
     }
 }

@@ -1034,6 +1034,53 @@ impl StateStore for InMemoryStorage {
             .unwrap_or_default())
     }
 
+    async fn commit_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &Message,
+        completed_state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        let mut states = self.states.lock().unwrap();
+        let persisted = states.get(conv_id).cloned().unwrap_or_default();
+        if matches!(
+            &persisted,
+            ConvState::ContextExhausted { summary }
+                if matches!(completed_state, ConvState::ContextExhausted { summary: completed } if summary == completed)
+        ) {
+            let duplicate = self
+                .messages
+                .lock()
+                .unwrap()
+                .get(conv_id)
+                .is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|item| item.message_id == message.message_id)
+                });
+            return Ok(if duplicate {
+                crate::db::ContinuationCommitOutcome::Duplicate
+            } else {
+                crate::db::ContinuationCommitOutcome::Stale
+            });
+        }
+        if !matches!(
+            &persisted,
+            ConvState::AwaitingContinuation { request } if request.operation_id == operation_id
+        ) {
+            return Ok(crate::db::ContinuationCommitOutcome::Stale);
+        }
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(message.clone());
+        states.insert(conv_id.to_string(), completed_state.clone());
+        Ok(crate::db::ContinuationCommitOutcome::Applied)
+    }
+
     async fn update_conversation_mode_and_cwd(
         &self,
         conv_id: &str,
