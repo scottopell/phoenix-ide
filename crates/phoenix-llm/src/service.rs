@@ -180,7 +180,7 @@ impl LlmServiceImpl {
     /// Build the custom headers for a request, auto-injecting `provider` based on the model spec.
     /// When the codex bridge is in use, the live `chatgpt-account-id` is read
     /// from the credential at every request so a mid-session account switch
-    /// (re-running `codex login`) reaches the wire.
+    /// (signing in with Codex from Phoenix) reaches the wire.
     fn headers_for_provider(&self) -> Vec<(String, String)> {
         let mut headers = self.custom_headers.clone();
         if !headers.is_empty()

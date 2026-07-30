@@ -1,6 +1,6 @@
 //! `ChatGPT` `OAuth` credential source bridged from the local `Codex` CLI.
 //!
-//! Reads `~/.codex/auth.json` (written by `codex login` against a `ChatGPT`
+//! Reads `~/.phoenix-ide/codex-auth.json` (written by `codex login` against a `ChatGPT`
 //! Plus/Pro/Team/Enterprise account), returns the access token for use with
 //! the `ChatGPT`-backend Responses API at `https://chatgpt.com/backend-api/codex`,
 //! and refreshes the token via the `OpenAI` `OAuth` endpoint when it nears expiry.
@@ -39,7 +39,7 @@ pub const CODEX_BRIDGE_CONTEXT_WINDOW: usize = 272_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodexAuthError {
-    #[error("codex auth file not found at {0:?} — run `codex login` first")]
+    #[error("codex auth file not found at {0:?} — sign in with Codex from Phoenix first")]
     NotFound(PathBuf),
     #[error("expected auth_mode 'chatgpt' in {path:?}, got {found:?} — this provider only supports ChatGPT OAuth tokens")]
     WrongAuthMode {
@@ -48,9 +48,11 @@ pub enum CodexAuthError {
     },
     #[error("no access_token in {0:?}")]
     NoAccessToken(PathBuf),
-    #[error("no refresh_token in {0:?} — run `codex login` again")]
+    #[error("no refresh_token in {0:?} — sign in with Codex from Phoenix again")]
     NoRefreshToken(PathBuf),
-    #[error("refresh token rejected ({reason}) — run `codex login` to re-authenticate")]
+    #[error(
+        "refresh token rejected ({reason}) — sign in with Codex from Phoenix to re-authenticate"
+    )]
     RefreshTokenInvalid { reason: String },
     #[error("token refresh failed: {0}")]
     RefreshFailed(String),
@@ -312,11 +314,11 @@ pub struct CodexCredential {
     inner: Mutex<InnerState>,
     /// `account_id` mirrored from the most recent file read. Updated by
     /// `fetch()` so per-request callers (`account_id()`) see the current
-    /// account after a `codex login` mid-session.
+    /// account after a native Codex login mid-session.
     account_id: StdMutex<Option<String>>,
     /// Most recent fetch failure message, surfaced via the `CredentialSource`
     /// `last_error_hint()` trait method so the UI shows actionable recovery
-    /// guidance ("run `codex login`") instead of the generic auth-failure
+    /// guidance ("sign in with Codex from Phoenix") instead of the generic auth-failure
     /// message.
     last_error: StdMutex<Option<String>>,
 }
@@ -525,28 +527,28 @@ fn apply_refresh_response(auth: &mut AuthFile, response: RefreshResponse) {
 fn error_hint(err: &CodexAuthError) -> String {
     match err {
         CodexAuthError::NotFound(_) => {
-            "ChatGPT credentials not found at ~/.codex/auth.json — run `codex login`".to_string()
+            "ChatGPT credentials not found at ~/.phoenix-ide/codex-auth.json — sign in with Codex from Phoenix".to_string()
         }
         CodexAuthError::WrongAuthMode { .. } => {
-            "~/.codex/auth.json is in API-key mode, not ChatGPT — run `codex login` to switch"
+            "~/.phoenix-ide/codex-auth.json is in API-key mode, not ChatGPT — sign in with Codex from Phoenix to switch"
                 .to_string()
         }
         CodexAuthError::NoAccessToken(_) | CodexAuthError::NoRefreshToken(_) => {
-            "Codex credentials are missing fields — run `codex login` to refresh".to_string()
+            "Codex credentials are missing fields — sign in with Codex from Phoenix to refresh".to_string()
         }
         CodexAuthError::RefreshTokenInvalid { reason } => {
             format!(
-                "ChatGPT refresh token rejected ({reason}) — run `codex login` to re-authenticate"
+                "ChatGPT refresh token rejected ({reason}) — sign in with Codex from Phoenix to re-authenticate"
             )
         }
         CodexAuthError::RefreshFailed(msg) => {
             format!("ChatGPT token refresh failed: {msg}")
         }
         CodexAuthError::Io { err, .. } => {
-            format!("Could not read ~/.codex/auth.json: {err}")
+            format!("Could not read ~/.phoenix-ide/codex-auth.json: {err}")
         }
         CodexAuthError::ParseAuthFile { err, .. } => {
-            format!("~/.codex/auth.json is malformed: {err}")
+            format!("~/.phoenix-ide/codex-auth.json is malformed: {err}")
         }
     }
 }

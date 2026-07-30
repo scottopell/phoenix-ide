@@ -29,7 +29,7 @@ pub trait CredentialSource: Send + Sync + std::fmt::Debug {
     async fn invalidate(&self) -> bool;
     /// Optional source-specific hint to surface on auth failures, used by
     /// `LlmAuth::resolve()` to enrich the generic "credential unavailable"
-    /// message with actionable recovery guidance (e.g. "run `codex login`").
+    /// message with actionable recovery guidance (e.g. "sign in with Codex from Phoenix").
     /// Returns `None` to fall back to the generic message. Default-impl `None`
     /// keeps existing implementations unchanged.
     async fn last_error_hint(&self) -> Option<String> {
@@ -99,7 +99,7 @@ impl LlmAuth {
             });
         }
         let recovering = self.source.is_recovering().await;
-        // Prefer the source's own hint (e.g. "run `codex login`") over the
+        // Prefer the source's own hint (e.g. "sign in with Codex from Phoenix") over the
         // generic message; fall back to the recovery / generic text.
         let message = if let Some(hint) = self.source.last_error_hint().await {
             hint

@@ -161,13 +161,24 @@ export function SettingsDropdown({
           <h2 id={titleId} className="settings-dropdown-title">Settings</h2>
           <ThemeSection theme={theme} onToggle={onToggleTheme} />
           <DensitySection />
-          {codexPreflight?.already_signed_in && (
+          {codexPreflight?.already_signed_in ? (
             <CodexSection
               preflight={codexPreflight}
               onPreflightInvalidated={onPreflightInvalidated}
               onCloseMenu={() => setOpen(false)}
             />
-          )}
+          ) : codexPreflight ? (
+            <section className="settings-section">
+              <div className="settings-section-label">LLM Provider</div>
+              <button
+                type="button"
+                className="settings-inline-btn"
+                onClick={() => { setOpen(false); navigate('/codex/login'); }}
+              >
+                Sign in with Codex
+              </button>
+            </section>
+          ) : null}
           <NotificationsSection />
           <LlmLanguageSection onCloseMenu={() => setOpen(false)} />
           <section className="settings-section">
