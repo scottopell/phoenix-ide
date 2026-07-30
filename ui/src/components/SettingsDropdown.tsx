@@ -282,8 +282,12 @@ function CodexSection({
     const quotaVersion = getCodexQuotaVersion();
     api.codexQuota()
       .then((next) => {
-        if (quotaRequestGenerationRef.current === generation && next) {
-          replaceCodexQuotaIfVersion(next, quotaVersion);
+        if (
+          quotaRequestGenerationRef.current === generation &&
+          next &&
+          next.account_id === preflight.account_id
+        ) {
+          replaceCodexQuotaIfVersion(next.quota, quotaVersion);
         }
       })
       .catch(() => undefined);

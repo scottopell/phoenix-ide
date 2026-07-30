@@ -219,9 +219,7 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         .or(event.limit_name)
         .or_else(|| details.as_ref()?.metered_limit_name.clone())
         .or_else(|| details.as_ref()?.limit_name.clone())
-        .unwrap_or_else(|| "codex".to_string())
-        .to_ascii_lowercase()
-        .replace('_', "-");
+        .map_or_else(|| "codex".to_string(), |value| canonical_limit_id(&value));
     Some(QuotaDetails {
         plan_type,
         resets_at: None,
@@ -328,11 +326,15 @@ pub fn parse_rate_limit_for_limit(
     (primary, secondary, limit_name)
 }
 
+fn canonical_limit_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
+}
+
 pub fn parse_active_limit(headers: &HeaderMap) -> Option<String> {
     parse_header_str(headers, ACTIVE_LIMIT_HEADER)
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(str::to_string)
+        .map(canonical_limit_id)
 }
 
 pub fn parse_promo_message(headers: &HeaderMap) -> Option<String> {
@@ -610,6 +612,13 @@ mod tests {
             HeaderValue::from_static("future_limit_type"),
         );
         assert_eq!(parse_rate_limit_reached_type(&headers), None);
+    }
+
+    #[test]
+    fn canonicalizes_active_limit_family() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACTIVE_LIMIT_HEADER, HeaderValue::from_static("CODEX_OTHER"));
+        assert_eq!(parse_active_limit(&headers).as_deref(), Some("codex-other"));
     }
 
     #[test]

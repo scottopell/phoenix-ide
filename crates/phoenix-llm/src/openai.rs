@@ -3319,7 +3319,7 @@ mod tests {
             let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"pro"}}"#;
             let err = parse_codex_error(429, &headers, body).expect("parsed");
             let quota = err.quota.as_ref().expect("quota");
-            assert_eq!(quota.limit_id.as_deref(), Some("codex_other"));
+            assert_eq!(quota.limit_id.as_deref(), Some("codex-other"));
             assert_eq!(quota.limit_name.as_deref(), Some("gpt-5.2-codex-sonic"));
             // The non-codex limit_name branch wins over the plan wording.
             assert!(

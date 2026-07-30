@@ -1055,6 +1055,11 @@ export interface CodexLoginPreflight {
   account_email: string | null;
 }
 
+export interface CodexQuotaResponse {
+  account_id: string | null;
+  quota: QuotaDetails;
+}
+
 export interface CodexManualCodeRequest {
   /// Either the full post-callback URL (preferred — backend extracts code+state),
   /// or both `code` and `state` if the UI parsed them itself.
@@ -1422,7 +1427,7 @@ export const api = {
     return resp.json();
   },
 
-  async codexQuota(): Promise<QuotaDetails | null> {
+  async codexQuota(): Promise<CodexQuotaResponse | null> {
     const resp = await fetch('/api/codex/quota');
     if (!resp.ok) throw new Error('Failed to load Codex quota');
     return resp.json();

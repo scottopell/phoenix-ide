@@ -865,7 +865,7 @@ pub struct LoginPreflight {
 
 async fn fetch_codex_quota(
     credential: &codex_credential::CodexCredential,
-) -> Option<phoenix_llm::QuotaDetails> {
+) -> Option<(Option<String>, phoenix_llm::QuotaDetails)> {
     use phoenix_llm::CredentialSource;
 
     let client = reqwest::Client::builder()
@@ -873,14 +873,14 @@ async fn fetch_codex_quota(
         .build()
         .ok()?;
     let mut attempts = 0;
-    let response = loop {
+    let (response, account_id) = loop {
         let (token, account_id) = credential.get_with_account_id().await?;
         let mut request = client
             .get(phoenix_llm::CODEX_USAGE_URL)
             .bearer_auth(token)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::USER_AGENT, "phoenix-ide");
-        if let Some(account_id) = account_id {
+        if let Some(account_id) = account_id.as_ref() {
             request = request.header("chatgpt-account-id", account_id);
         }
         let response = match request.send().await {
@@ -895,7 +895,7 @@ async fn fetch_codex_quota(
             credential.invalidate().await;
             continue;
         }
-        break response;
+        break (response, account_id);
     };
     if !response.status().is_success() {
         tracing::debug!(status = %response.status(), "Codex quota endpoint rejected request");
@@ -909,14 +909,23 @@ async fn fetch_codex_quota(
         }
     };
     phoenix_llm::rate_limit::quota_from_codex_usage_payload(&payload)
+        .map(|quota| (account_id, quota))
 }
 
-pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_llm::QuotaDetails>> {
-    let quota = match state.llm_registry.current_codex_credential() {
-        Some(credential) => fetch_codex_quota(credential.as_ref()).await,
+#[derive(Serialize)]
+pub struct CodexQuotaResponse {
+    account_id: Option<String>,
+    quota: phoenix_llm::QuotaDetails,
+}
+
+pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<CodexQuotaResponse>> {
+    let response = match state.llm_registry.current_codex_credential() {
+        Some(credential) => fetch_codex_quota(credential.as_ref())
+            .await
+            .map(|(account_id, quota)| CodexQuotaResponse { account_id, quota }),
         None => None,
     };
-    Json(quota)
+    Json(response)
 }
 
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
