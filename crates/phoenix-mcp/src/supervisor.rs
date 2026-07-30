@@ -152,19 +152,25 @@ impl SupervisorHandle {
     ) -> Result<CallOutcome, String> {
         let (reply, receive) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + self.snapshot().config.tool_call_timeout();
-        self.mailbox
-            .send(Command::Call {
-                tool,
-                arguments,
-                cancel: cancel.clone(),
-                reply,
-            })
-            .await
-            .map_err(|_| stopped())?;
+        let call_cancel = cancel.child_token();
+        let command = Command::Call {
+            tool,
+            arguments,
+            cancel: call_cancel.clone(),
+            reply,
+        };
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err("MCP tool call cancelled".to_string()),
+            () = tokio::time::sleep_until(deadline) => {
+                return Err("MCP tool call timed out while enqueueing".to_string());
+            }
+            result = self.mailbox.send(command) => result.map_err(|_| stopped())?,
+        }
         if let Ok(result) = tokio::time::timeout_at(deadline, receive).await {
             result.unwrap_or_else(|_| Err(stopped()))
         } else {
-            cancel.cancel();
+            call_cancel.cancel();
             Err("MCP tool call timed out while queued".to_string())
         }
     }
@@ -472,9 +478,11 @@ impl Actor {
                         .stdio_queue
                         .remove(position)
                         .expect("queued call exists");
-                    let _ = queued.reply.send(Ok(queued
-                        .context
-                        .outcome(queued.epoch, Err(McpRequestError::Cancelled))));
+                    let _ = queued.reply.send(Ok(CallOutcome {
+                        result: Err(McpRequestError::Cancelled),
+                        epoch: queued.epoch,
+                        recovery: CallRecovery::None,
+                    }));
                 }
             }
             Command::Inspect { reply } => {
@@ -601,9 +609,11 @@ impl Actor {
         }
         while let Some(call) = self.stdio_queue.pop_front() {
             if call.cancel.is_cancelled() {
-                let _ = call.reply.send(Ok(call
-                    .context
-                    .outcome(call.epoch, Err(McpRequestError::Cancelled))));
+                let _ = call.reply.send(Ok(CallOutcome {
+                    result: Err(McpRequestError::Cancelled),
+                    epoch: call.epoch,
+                    recovery: CallRecovery::None,
+                }));
                 continue;
             }
             self.stdio_active = true;
