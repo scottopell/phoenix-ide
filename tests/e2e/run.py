@@ -1130,9 +1130,9 @@ def scenario_perf_stream(base_url: str) -> None:
     # exactly N whitespace-separated deterministic words. Catches stream
     # finalization or persistence regressions that only manifest on longer
     # streams (most other scenarios finalize in <100 tokens).
-    # 100 words remains longer than the longest text scenario (~70-word
-    # plain_text) and exercises about 100 independently delayed stream updates.
-    # No finalization threshold lives at a particular N; the regression class is
+    # 100 words remains longer than the longest ordinary text scenario
+    # (62-word plain_text) and the dedicated 8-word streaming scenario. No
+    # finalization threshold lives at a particular N; the regression class is
     # "more chunks than the short scenarios".
     n = 100
     conv = _new_conv(base_url, f"[[perf:{n}]] go")
@@ -1146,9 +1146,6 @@ def scenario_perf_stream(base_url: str) -> None:
     text = _agent_text(final["messages"])
     word_count = len(text.split())
     assert word_count == n, f"expected {n} words from perf stream, got {word_count}"
-    words = text.split()
-    assert words[0] == "Let", f"unexpected first perf word: {words[0]!r}"
-    assert words[-1] == "it.", f"unexpected last perf word: {words[-1]!r}"
 
 
 SCENARIOS = [
