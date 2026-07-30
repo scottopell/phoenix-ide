@@ -751,12 +751,11 @@ invariant ForgottenContractsCarryReason {
         c.forgotten_reason != null
 }
 
--- REQ-WAKE-007: every pending contract has expires_at strictly in
--- the future at registration time and bounded by
--- max_max_wait_seconds from registered_at.
+-- REQ-WAKE-007: zero-second waits expire immediately; all expiries are bounded
+-- by max_max_wait_seconds from registered_at.
 invariant ExpiresAtIsBoundedAndFuture {
     for c in Contract:
-        c.expires_at > c.registered_at
+        c.expires_at >= c.registered_at
         and c.expires_at <= c.registered_at + config.max_max_wait_seconds
 }
 

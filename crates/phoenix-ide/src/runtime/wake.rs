@@ -509,6 +509,15 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                         return Err(error.to_string());
                     }
                 };
+                if matches!(
+                    outcome,
+                    WakeTerminalEvidenceOutcome::Recorded { .. }
+                        | WakeTerminalEvidenceOutcome::Replayed { .. }
+                ) {
+                    self.inspector
+                        .cleanup_after_commit(&binding, &evidence)
+                        .await?;
+                }
                 if let Some(manager) = manager {
                     deliver_pending(
                         manager,
@@ -519,15 +528,6 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                     .await?;
                 }
                 drop(conversation_guard);
-                if matches!(
-                    outcome,
-                    WakeTerminalEvidenceOutcome::Recorded { .. }
-                        | WakeTerminalEvidenceOutcome::Replayed { .. }
-                ) {
-                    self.inspector
-                        .cleanup_after_commit(&binding, &evidence)
-                        .await?;
-                }
                 Ok(Duration::ZERO)
             }
             InspectionOutcome::Forgotten(reason) => {
@@ -832,23 +832,44 @@ struct BashKillPendingWakeObservation<'a> {
 fn wake_bash_window(
     evidence: &phoenix_workflow::wake_profile::BashTerminalEvidence,
 ) -> phoenix_core::domain::tool_wire::BashRingWindow {
+    const WAKE_TAIL_BYTES: usize = 80 * 1024;
+    let mut remaining = WAKE_TAIL_BYTES;
+    let mut truncated = evidence.final_tail_truncated_before;
+    let lines = evidence
+        .final_tail
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, bytes)| {
+            if remaining == 0 {
+                truncated = true;
+                return None;
+            }
+            let requested = bytes.len().min(remaining);
+            let keep = if requested == bytes.len() {
+                requested
+            } else {
+                bytes
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .take_while(|index| *index <= requested)
+                    .last()
+                    .unwrap_or_default()
+            };
+            remaining -= keep;
+            truncated |= keep < bytes.len();
+            Some(phoenix_core::domain::tool_wire::BashRingLine {
+                offset: evidence
+                    .final_tail_start_offset
+                    .saturating_add(u64::try_from(ordinal).unwrap_or(u64::MAX)),
+                bytes: bytes.get(..keep).unwrap_or_default().to_string(),
+            })
+        })
+        .collect();
     phoenix_core::domain::tool_wire::BashRingWindow {
         start_offset: evidence.final_tail_start_offset,
         end_offset: evidence.final_tail_end_offset,
-        truncated_before: evidence.final_tail_truncated_before,
-        lines: evidence
-            .final_tail
-            .iter()
-            .enumerate()
-            .map(
-                |(ordinal, bytes)| phoenix_core::domain::tool_wire::BashRingLine {
-                    offset: evidence
-                        .final_tail_start_offset
-                        .saturating_add(u64::try_from(ordinal).unwrap_or(u64::MAX)),
-                    bytes: bytes.clone(),
-                },
-            )
-            .collect(),
+        truncated_before: truncated,
+        lines,
         partial: evidence.final_tail_partial.clone(),
     }
 }
@@ -893,7 +914,7 @@ fn terminal_kind(
 }
 
 fn render_materialized_terminal_result(pending: &WakePendingDelivery) -> String {
-    crate::runtime::executor::cap_tool_output_text(render_terminal_result(pending))
+    render_terminal_result(pending)
 }
 
 fn render_terminal_result(pending: &WakePendingDelivery) -> String {
@@ -1063,39 +1084,12 @@ fn system_time_to_timestamp(time: std::time::SystemTime) -> Timestamp {
     Timestamp(seconds)
 }
 
-async fn inspect_live_bash(
-    handle: &Handle,
-    identity: &BashResourceIdentity,
-    live: &LiveData,
+fn inspect_live_bash(
+    _handle: &Handle,
+    _identity: &BashResourceIdentity,
+    _live: &LiveData,
 ) -> InspectionOutcome {
-    let Some(kill_attempt) = handle.kill_attempt().await else {
-        return InspectionOutcome::LiveRetry;
-    };
-    let ring = live.ring.lock().await;
-    let window = ring.tail(200);
-    let final_tail_partial = ring.partial_str();
-    let final_tail = window
-        .lines
-        .into_iter()
-        .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
-        .collect();
-    InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
-        identity: identity.clone(),
-        cmd: handle.cmd.clone(),
-        label: handle.label.clone(),
-        status: BashTerminalStatus::KillPendingKernel,
-        occurred_at: system_time_to_timestamp(kill_attempt.attempted_at),
-        exit_code: None,
-        duration_ms: None,
-        signal_number: None,
-        kill_signal_sent: Some(kill_attempt.signal_sent.as_str().to_string()),
-        kill_attempted_at: None,
-        final_tail_start_offset: window.start_offset,
-        final_tail_end_offset: window.end_offset,
-        final_tail_truncated_before: window.truncated_before,
-        final_tail_partial,
-        final_tail,
-    }))
+    InspectionOutcome::LiveRetry
 }
 
 async fn inspect_bash_handle(
@@ -1111,7 +1105,7 @@ async fn inspect_bash_handle(
             ) {
                 InspectionOutcome::Forgotten(WakeForgottenReason::BashWaiterPanicked)
             } else {
-                inspect_live_bash(handle, identity, live).await
+                inspect_live_bash(handle, identity, live)
             }
         }
         HandleState::Tombstoned(tomb) => {
@@ -1575,7 +1569,8 @@ mod tests {
         let rendered = render_materialized_terminal_result(&pending[0]);
 
         assert!(rendered.len() <= 100 * 1024);
-        assert!(rendered.contains("…[truncated "));
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["truncated_before"], true);
     }
 
     #[test]
@@ -1808,7 +1803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_pending_bash_projects_terminal_observation() {
+    async fn kill_pending_bash_remains_live_until_true_terminal_exit() {
         use phoenix_core::domain::kill_signal::KillSignal;
         use phoenix_tools::bash::handle::{Handle, HandleId};
         use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
@@ -1854,29 +1849,14 @@ mod tests {
 
         worker.run_once().await.unwrap();
 
-        let pending = repo.list_pending("conv").await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert!(matches!(
-            pending[0].receipt.terminal,
-            phoenix_workflow::wake_profile::WakeTerminalPayload::Fired {
-                evidence: phoenix_workflow::wake_profile::WakeTerminalEvidence::Bash(
-                    BashTerminalEvidence {
-                        status: BashTerminalStatus::KillPendingKernel,
-                        occurred_at: Timestamp(9),
-                        ..
-                    }
-                ),
-                ..
-            }
-        ));
-        let rendered: serde_json::Value =
-            serde_json::from_str(&render_terminal_result(&pending[0])).unwrap();
-        assert_eq!(rendered["status"], "kill_pending_kernel");
-        assert_eq!(rendered["kill_attempted_at"], "9");
-        assert_eq!(rendered["kill_signal_sent"], "TERM");
-        assert_eq!(rendered["partial"], "unterminated");
-        assert!(rendered.get("finished_at").is_none());
-        assert!(rendered.get("final_cause").is_none());
+        assert!(repo.list_pending("conv").await.unwrap().is_empty());
+        assert_eq!(
+            repo.list_observation_candidates(Timestamp(10), None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

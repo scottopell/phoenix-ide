@@ -880,12 +880,28 @@ where
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
+    let wake_registrar = tool_ctx.wake_registrar().cloned();
     let output = tool_executor
         .execute(checked, tool_ctx)
         .instrument(span.clone())
         .await;
 
     if cancel_token_check.is_cancelled() {
+        if let Some(out) = &output {
+            if let Some((workflow_id, ..)) = tool_output_park_registration(out) {
+                if let Some(registrar) = &wake_registrar {
+                    let _ = registrar
+                        .cancel(crate::tools::CancelWakeInput {
+                            workflow_id: phoenix_workflow::WorkflowId(workflow_id),
+                            reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+                            timestamp: phoenix_workflow::Timestamp(
+                                chrono::Utc::now().timestamp().max(0).cast_unsigned(),
+                            ),
+                        })
+                        .await;
+                }
+            }
+        }
         span.record("outcome", "aborted");
         tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Tool cancelled");
         ToolExecOutcome::Aborted {
