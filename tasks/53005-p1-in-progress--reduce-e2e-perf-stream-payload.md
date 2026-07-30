@@ -13,8 +13,10 @@ Profiler artifacts are retained under `target/qa-evidence/53005/`:
 - `after-perf-stream-d280d0d40...`: 100-word scenario-only candidate profile.
 - `before-e2e-lane-9e409c1e5...` / `after-e2e-lane-2ac95047b...`: warmed E2E lane profiles.
 - `fault-persisted-final-word.log`: same-length persisted-content corruption was caught by a temporary lexical oracle; review correctly rejected that oracle as brittle.
+- `fault-persisted-truncation.log`: completed/persisted response truncation was caught by the retained exact-count oracle.
+- `correct-perf-stream.log`: the restored 100-word positive control passed.
 
-The retained behavior-focused fault class is completed/persisted response truncation: emitting the full stream cadence but persisting 99 words makes the unchanged exact-count assertion fail with `expected 100 words ... got 99`. A stream-accumulator-only truncation mutant was rejected as invalid evidence because the runtime correctly persists the completed response body.
+The retained behavior-focused fault class is completed/persisted response truncation: emitting the full 100-word stream cadence but persisting 99 words reaches idle and fails the exact-count assertion with `expected 100 words from perf stream, got 99`. The scenario waits for idle plus a persisted assistant response before applying that assertion, keeping finalization synchronization separate from payload validation. A stream-accumulator-only truncation mutant was rejected as invalid evidence because the runtime correctly persists the completed response body.
 
 | Scope | Before | After | Absolute saving | Saving |
 |---|---:|---:|---:|---:|
