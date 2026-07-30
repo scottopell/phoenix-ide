@@ -2113,12 +2113,11 @@ def cmd_up(
     
     build_rust(release=True)
 
-    # Seed BEFORE Phoenix starts so the seeder runs offline against the DB
-    # (no contention with a live runtime that owns the same conversation rows).
-    # On a fresh DB the seeder bootstraps the schema itself; subsequent ups
-    # just see an idempotent no-op.
+    # Seed before Phoenix starts so the seeder remains the only database writer.
+    # The release binary is already built, so seed can run its canonical
+    # migrate-only path without rebuilding.
     if not no_seed:
-        cmd_seed(quiet_if_populated=True)
+        cmd_seed(quiet_if_populated=True, build=False)
         print()
 
     phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
@@ -2180,107 +2179,6 @@ _SEED_DIFF_REVIEW_TEXT = "Review the seeded Branch-mode diff fixture"
 
 _SEED_CONTEXT_SUMMARY = "Context limit reached after extended session"
 
-# Minimal schema bootstrap for the seeder. Mirrors the idempotent CREATE/ALTER
-# sequence Phoenix runs at startup (see crates/phoenix-ide/src/db/schema.rs and
-# crates/phoenix-ide/src/db.rs::run_migrations). When Phoenix later starts it
-# re-runs everything; CREATE TABLE IF NOT EXISTS and ADD COLUMN are no-ops on
-# an already-bootstrapped DB. If a column the seeder INSERTs into is later
-# renamed/removed, the seeder fails loud with `no such column` on the next run
-# -- that's the canary, not a bug.
-_SEED_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS conversations (
-    id TEXT PRIMARY KEY,
-    slug TEXT UNIQUE,
-    cwd TEXT NOT NULL,
-    parent_conversation_id TEXT,
-    user_initiated BOOLEAN NOT NULL,
-    state TEXT NOT NULL DEFAULT '{"type":"idle"}',
-    state_data TEXT,
-    state_updated_at TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    archived BOOLEAN NOT NULL DEFAULT 0,
-    model TEXT,
-    FOREIGN KEY (parent_conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS messages (
-    message_id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL,
-    sequence_id INTEGER NOT NULL,
-    message_type TEXT NOT NULL,
-    content TEXT NOT NULL,
-    display_data TEXT,
-    usage_data TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY,
-    canonical_path TEXT UNIQUE NOT NULL,
-    main_ref TEXT NOT NULL DEFAULT 'main',
-    created_at TEXT NOT NULL
-);
-"""
-
-# Versioned migrations from crates/phoenix-ide/src/db/migrations.rs that the
-# seeder pre-applies (because the seeder INSERTs into the columns they create).
-# Pre-stamping the `_migrations` row prevents Phoenix's `run_pending_migrations`
-# from re-applying them at next startup, which would fail with "duplicate column
-# name" since the column is already there.
-#
-# Only stamp a versioned migration when the seeder reproduces ALL of its
-# side-effects -- not just the column-add. (Migration 5, for example, adds
-# `conversations.chain_name` AND creates the `chain_qa` table; pre-stamping
-# it would skip the table creation and Phoenix would crash on first
-# `chain_qa` query. So we don't pre-add `chain_name` either; let migration 5
-# run normally on first startup.)
-_SEED_PRESTAMPED_MIGRATIONS = [
-    (3, "add_continued_in_conv_id_column"),
-    # conv_mode-touching migrations: the seed builds clean normalized cm_*
-    # columns and drops the conv_mode blob itself, so these must be skipped on
-    # the next startup (they reference the now-absent conv_mode column, and
-    # their legacy-data cleanups have nothing to do on pristine seed rows).
-    (1, "rewrite_standalone_to_direct"),
-    (2, "backfill_empty_convmode_fields"),
-    (7, "backfill_explore_worktree_path"),
-    (21, "normalize_explore_taskmd_id_hint"),
-    (28, "add_conv_mode_columns"),
-    (29, "drop_conv_mode_blob"),
-]
-
-# Each ALTER TABLE may already be applied by a prior Phoenix startup. We catch
-# OperationalError ("duplicate column name") and continue -- same pattern as the
-# Rust side (`let _ = sqlx::raw_sql(...).await;`).
-#
-# Only list ALTERs that correspond to UNCONDITIONAL idempotent ALTERs in
-# Phoenix's `run_migrations` (the ones using `let _ = sqlx::raw_sql(...).await;`)
-# OR to versioned migrations whose ENTIRE effect we replicate here (currently
-# only migration 3, the single-column add for `continued_in_conv_id`). Adding
-# columns from versioned migrations whose other side-effects we don't reproduce
-# is unsafe -- see `_SEED_PRESTAMPED_MIGRATIONS`.
-_SEED_SCHEMA_ALTERS = [
-    "ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)",
-    "ALTER TABLE conversations ADD COLUMN conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}'",
-    "ALTER TABLE conversations ADD COLUMN title TEXT",
-    "ALTER TABLE conversations ADD COLUMN desired_base_branch TEXT",
-    "ALTER TABLE conversations ADD COLUMN seed_parent_id TEXT",
-    "ALTER TABLE conversations ADD COLUMN seed_label TEXT",
-    "ALTER TABLE conversations ADD COLUMN continued_in_conv_id TEXT",
-    "ALTER TABLE conversations ADD COLUMN steering_queue TEXT NOT NULL DEFAULT '[]'",
-    # Normalized conv_mode columns (migration 028). The seed rows are inserted
-    # with the legacy conv_mode blob (above), then projected into these columns
-    # and the blob is DROPped at the end of seeding — matching the post-migration
-    # production schema (the blob does not exist after migration 029).
-    "ALTER TABLE conversations ADD COLUMN cm_kind TEXT",
-    "ALTER TABLE conversations ADD COLUMN cm_branch_name TEXT",
-    "ALTER TABLE conversations ADD COLUMN cm_worktree_path TEXT",
-    "ALTER TABLE conversations ADD COLUMN cm_base_branch TEXT",
-    "ALTER TABLE conversations ADD COLUMN cm_task_id TEXT",
-    "ALTER TABLE conversations ADD COLUMN cm_task_title TEXT",
-    "ALTER TABLE conversations ADD COLUMN cm_next_taskmd_id_hint TEXT",
-]
-
-
 def _slug_from_text(text: str, max_words: int = 6) -> str:
     """Mirror crates/phoenix-ide/src/api/handlers.rs::slugify_label.
 
@@ -2307,14 +2205,30 @@ def _title_from_slug(slug: str) -> str:
     return " ".join(w[:1].upper() + w[1:] for w in slug.split("-") if w)
 
 
-def cmd_seed(quiet_if_populated: bool = False) -> None:
+def _migrate_seed_database(*, build: bool) -> None:
+    if build:
+        build_rust(release=True)
+    binary = ROOT / "target" / "release" / "phoenix_ide"
+    if not binary.exists():
+        raise RuntimeError(f"Phoenix binary not found after build: {binary}")
+    env = os.environ.copy()
+    env["PHOENIX_DB_PATH"] = str(get_db_path())
+    subprocess.run(
+        [str(binary), "--migrate-only"],
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
+
+
+def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
     """Populate the dev DB with representative conversations.
 
-    Runs OFFLINE -- writes directly to SQLite while Phoenix is not running
-    against this worktree's DB. Refuses if a live Phoenix is detected on
-    the PID file (its in-memory runtime would clobber seed writes).
+    Runs offline after the Phoenix binary applies the canonical Rust migration
+    chain. Refuses if a live Phoenix owns this worktree's database.
 
-    Idempotent: if any active conversations exist the seeder is a no-op.
+    Idempotent: populated databases are unchanged unless a required fixture is
+    missing or stale.
     """
     import sqlite3
     import uuid as _uuid
@@ -2339,33 +2253,6 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-    def _ensure_schema(conn: sqlite3.Connection) -> None:
-        conn.executescript(_SEED_SCHEMA_SQL)
-        for stmt in _SEED_SCHEMA_ALTERS:
-            try:
-                conn.execute(stmt)
-            except sqlite3.OperationalError as e:
-                # "duplicate column name" -- column already exists. Anything
-                # else is a real schema problem worth surfacing.
-                if "duplicate column name" not in str(e):
-                    raise
-        # Stamp the versioned migrations whose columns we pre-added, so
-        # Phoenix's `run_pending_migrations` skips them on next startup
-        # (re-applying would fail with "duplicate column name" because the
-        # versioned migrations don't swallow errors).
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS _migrations ("
-            " version INTEGER PRIMARY KEY,"
-            " name TEXT NOT NULL,"
-            " applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
-        )
-        for version, name in _SEED_PRESTAMPED_MIGRATIONS:
-            conn.execute(
-                "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?, ?)",
-                (version, name),
-            )
-        conn.commit()
 
     def _existing_active_count(conn: sqlite3.Connection) -> int:
         return conn.execute(
@@ -2461,6 +2348,103 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         )
         return fixture
 
+    def _insert_modern_conversation(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        slug: str,
+        title: str,
+        state_json: str,
+        mode: dict,
+        cwd: str | None,
+        project_id: str | None,
+        desired_base_branch: str | None = None,
+        seed_label: str | None = None,
+        work_scope_id: str | None = None,
+    ) -> str:
+        mode_kind = str(mode["mode"]).lower()
+        scope_id = work_scope_id or str(_uuid.uuid4())
+        if work_scope_id is None:
+            authority_kind = (
+                "restricted_explore"
+                if mode_kind in {"direct", "explore"}
+                else "work"
+            )
+            worktree_path = mode.get("worktree_path")
+            if worktree_path:
+                environment_kind = "allocated_worktree"
+                environment_cwd = cwd or worktree_path
+                branch_name = mode.get("branch_name")
+                base_branch = mode.get("base_branch")
+            elif cwd:
+                environment_kind = "unowned_cwd"
+                environment_cwd = cwd
+                worktree_path = None
+                branch_name = None
+                base_branch = None
+            else:
+                environment_kind = "none"
+                environment_cwd = None
+                worktree_path = None
+                branch_name = None
+                base_branch = None
+            conn.execute(
+                "INSERT INTO work_scopes ("
+                " id, authority_kind, lifecycle, created_at, updated_at,"
+                " environment_kind, cwd, worktree_path, branch_name, base_branch"
+                ") VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    scope_id,
+                    authority_kind,
+                    now,
+                    now,
+                    environment_kind,
+                    environment_cwd,
+                    worktree_path,
+                    branch_name,
+                    base_branch,
+                ),
+            )
+
+        conn.execute(
+            "INSERT INTO conversations ("
+            " id, slug, title, parent_conversation_id, user_initiated,"
+            " state, state_updated_at, created_at, updated_at, archived,"
+            " model, project_id, desired_base_branch, seed_parent_id, seed_label,"
+            " cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,"
+            " runtime_role, work_scope_id"
+            ") VALUES (?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, ?,"
+            " ?, ?, ?, ?, 'user', ?)",
+            (
+                conversation_id,
+                slug,
+                title,
+                state_json,
+                now,
+                now,
+                now,
+                project_id,
+                desired_base_branch,
+                seed_label,
+                mode_kind,
+                mode.get("task_id"),
+                mode.get("task_title"),
+                mode.get("next_taskmd_id_hint"),
+                scope_id,
+            ),
+        )
+        return scope_id
+
+    def _delete_fixture_conversation(conn: sqlite3.Connection, conversation_id: str) -> None:
+        row = conn.execute(
+            "SELECT work_scope_id FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        if row is not None and row[0] is not None:
+            conn.execute("DELETE FROM work_scopes WHERE id = ?", (row[0],))
+
     def _ensure_diff_review_fixture(
         conn: sqlite3.Connection,
         *,
@@ -2479,52 +2463,38 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
                 (conv_id,),
             ).fetchone()[0]
-            conv_mode = conn.execute(
-                "SELECT conv_mode FROM conversations WHERE id = ?",
+            environment = conn.execute(
+                "SELECT c.cm_kind, e.worktree_path"
+                " FROM conversations c"
+                " LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id"
+                " WHERE c.id = ?",
                 (conv_id,),
-            ).fetchone()[0]
-            try:
-                parsed_mode = json.loads(conv_mode)
-            except Exception:
-                parsed_mode = {}
+            ).fetchone()
             if (
                 archived == 0
                 and message_count == 1
-                and parsed_mode.get("mode") == "Branch"
-                and parsed_mode.get("worktree_path") == str(worktree)
+                and environment == ("branch", str(worktree))
             ):
                 return False
-            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+            _delete_fixture_conversation(conn, conv_id)
 
         conv_id = str(_uuid.uuid4())
         state_json = json.dumps({"type": "idle"})
-        mode_json = json.dumps({
-            "mode": "Branch",
-            "branch_name": "seed-diff-review",
-            "worktree_path": str(worktree),
-            "base_branch": "main",
-        })
-        conn.execute(
-            "INSERT INTO conversations ("
-            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
-            " state, state_updated_at, created_at, updated_at, archived,"
-            " model, project_id, conv_mode, desired_base_branch,"
-            " seed_parent_id, seed_label"
-            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, ?)",
-            (
-                conv_id,
-                slug,
-                "Fixture Diff Review",
-                str(worktree),
-                state_json,
-                now,
-                now,
-                now,
-                project_id,
-                mode_json,
-                "qa:diff-review",
-            ),
+        _insert_modern_conversation(
+            conn,
+            conversation_id=conv_id,
+            slug=slug,
+            title="Fixture Diff Review",
+            state_json=state_json,
+            mode={
+                "mode": "Branch",
+                "branch_name": "seed-diff-review",
+                "worktree_path": str(worktree),
+                "base_branch": "main",
+            },
+            cwd=str(worktree),
+            project_id=project_id,
+            seed_label="qa:diff-review",
         )
         msg_id = str(_uuid.uuid4())
         conn.execute(
@@ -2625,39 +2595,27 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             ).fetchone()[0]
             if archived == 0 and message_count >= 1:
                 return False
-            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+            _delete_fixture_conversation(conn, conv_id)
 
         conv_id = str(_uuid.uuid4())
         state_json = json.dumps({"type": "idle"})
-        mode_json = json.dumps({
-            "mode": "Work",
-            "branch_name": "task-22001-redesign-conversation-grounding-side-panel",
-            "worktree_path": str(worktree),
-            "base_branch": "main",
-            "task_id": "22001",
-            "task_title": "Redesign conversation grounding side panel",
-        })
-        conn.execute(
-            "INSERT INTO conversations ("
-            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
-            " state, state_updated_at, created_at, updated_at, archived,"
-            " model, project_id, conv_mode, desired_base_branch,"
-            " seed_parent_id, seed_label"
-            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, ?)",
-            (
-                conv_id,
-                slug,
-                "Fixture Grounding Panel QA",
-                str(worktree),
-                state_json,
-                now,
-                now,
-                now,
-                project_id,
-                mode_json,
-                "qa:grounding-panel",
-            ),
+        _insert_modern_conversation(
+            conn,
+            conversation_id=conv_id,
+            slug=slug,
+            title="Fixture Grounding Panel QA",
+            state_json=state_json,
+            mode={
+                "mode": "Work",
+                "branch_name": "task-22001-redesign-conversation-grounding-side-panel",
+                "worktree_path": str(worktree),
+                "base_branch": "main",
+                "task_id": "22001",
+                "task_title": "Redesign conversation grounding side panel",
+            },
+            cwd=str(worktree),
+            project_id=project_id,
+            seed_label="qa:grounding-panel",
         )
         msg_id = str(_uuid.uuid4())
         conn.execute(
@@ -2677,34 +2635,6 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         )
         return True
 
-    def _project_and_drop_conv_mode(conn: sqlite3.Connection) -> None:
-        """Project the seeded conv_mode blob into the normalized cm_* columns
-        (mirrors migration 028, including the empty-string -> NULL clean-up),
-        then drop the blob so the seeded DB matches the post-migration-029
-        production schema. The conv_mode migrations are pre-stamped, so the app
-        will not re-run 028/029 against the dropped column.
-
-        Runs in BOTH the full-seed and repair paths. Fixtures created in the
-        repair branch carry a conv_mode blob too; without this projection their
-        cm_* columns stay NULL and they hydrate as Explore instead of Work — so
-        the very Work-mode grounding (task/branch/worktree) the fixture exists to
-        demonstrate would never appear."""
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
-        if "conv_mode" not in cols:
-            return
-        conn.execute(
-            "UPDATE conversations SET"
-            " cm_kind = lower(json_extract(conv_mode, '$.mode')),"
-            " cm_branch_name = NULLIF(json_extract(conv_mode, '$.branch_name'), ''),"
-            " cm_worktree_path = NULLIF(json_extract(conv_mode, '$.worktree_path'), ''),"
-            " cm_base_branch = NULLIF(json_extract(conv_mode, '$.base_branch'), ''),"
-            " cm_task_id = NULLIF(json_extract(conv_mode, '$.task_id'), ''),"
-            " cm_task_title = NULLIF(json_extract(conv_mode, '$.task_title'), ''),"
-            " cm_next_taskmd_id_hint = NULLIF(json_extract(conv_mode, '$.next_taskmd_id_hint'), '')"
-            " WHERE json_valid(conv_mode) AND json_extract(conv_mode, '$.mode') IS NOT NULL"
-        )
-        conn.execute("ALTER TABLE conversations DROP COLUMN conv_mode")
-
     def _insert_conv(
         conn: sqlite3.Connection,
         *,
@@ -2723,15 +2653,15 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         slug = f"{base_slug}-{conv_id[:4]}"
         title = _title_from_slug(base_slug)
         state_json = json.dumps(state if state is not None else {"type": "idle"})
-        mode_json = json.dumps(conv_mode)
-        conn.execute(
-            "INSERT INTO conversations ("
-            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
-            " state, state_updated_at, created_at, updated_at, archived,"
-            " model, project_id, conv_mode, desired_base_branch,"
-            " seed_parent_id, seed_label"
-            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, NULL)",
-            (conv_id, slug, title, cwd, state_json, now, now, now, project_id, mode_json),
+        _insert_modern_conversation(
+            conn,
+            conversation_id=conv_id,
+            slug=slug,
+            title=title,
+            state_json=state_json,
+            mode=conv_mode,
+            cwd=cwd,
+            project_id=project_id,
         )
         # One user message so the conv looks lived-in (message_count > 0).
         msg_id = str(_uuid.uuid4())
@@ -2770,15 +2700,20 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         new_slug = f"{root_slug}-{chain_index}-{new_id[:4]}"
         new_title = _title_from_slug(root_slug)
         idle_state = json.dumps({"type": "idle"})
-        mode_json = json.dumps(conv_mode)
-        conn.execute(
-            "INSERT INTO conversations ("
-            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
-            " state, state_updated_at, created_at, updated_at, archived,"
-            " model, project_id, conv_mode, desired_base_branch,"
-            " seed_parent_id, seed_label, continued_in_conv_id"
-            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, NULL, NULL)",
-            (new_id, new_slug, new_title, cwd, idle_state, now, now, now, project_id, mode_json),
+        parent_scope = conn.execute(
+            "SELECT work_scope_id FROM conversations WHERE id = ?",
+            (parent_id,),
+        ).fetchone()[0]
+        _insert_modern_conversation(
+            conn,
+            conversation_id=new_id,
+            slug=new_slug,
+            title=new_title,
+            state_json=idle_state,
+            mode=conv_mode,
+            cwd=cwd,
+            project_id=project_id,
+            work_scope_id=parent_scope,
         )
         # Continuation summary message bridges parent -> child in the UI.
         msg_id = str(_uuid.uuid4())
@@ -2836,32 +2771,20 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             ).fetchone()[0]
             if archived == 0 and message_count == 47:
                 return False
-            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+            _delete_fixture_conversation(conn, conv_id)
 
         conv_id = str(_uuid.uuid4())
         state_json = json.dumps({"type": "idle"})
-        mode_json = json.dumps(conv_mode)
-        conn.execute(
-            "INSERT INTO conversations ("
-            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
-            " state, state_updated_at, created_at, updated_at, archived,"
-            " model, project_id, conv_mode, desired_base_branch,"
-            " seed_parent_id, seed_label"
-            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, ?)",
-            (
-                conv_id,
-                slug,
-                "Fixture Turn One",
-                cwd,
-                state_json,
-                now,
-                now,
-                now,
-                project_id,
-                mode_json,
-                "perf:conversation-load",
-            ),
+        _insert_modern_conversation(
+            conn,
+            conversation_id=conv_id,
+            slug=slug,
+            title="Fixture Turn One",
+            state_json=state_json,
+            mode=conv_mode,
+            cwd=cwd,
+            project_id=project_id,
+            seed_label="perf:conversation-load",
         )
 
         for seq in range(47):
@@ -2926,32 +2849,20 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             ).fetchone()[0]
             if archived == 0 and message_count == expected_count:
                 return False
-            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+            _delete_fixture_conversation(conn, conv_id)
 
         conv_id = str(_uuid.uuid4())
         state_json = json.dumps({"type": "idle"})
-        mode_json = json.dumps(conv_mode)
-        conn.execute(
-            "INSERT INTO conversations ("
-            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
-            " state, state_updated_at, created_at, updated_at, archived,"
-            " model, project_id, conv_mode, desired_base_branch,"
-            " seed_parent_id, seed_label"
-            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, ?)",
-            (
-                conv_id,
-                slug,
-                "Fixture Heavy Prod Shape",
-                cwd,
-                state_json,
-                now,
-                now,
-                now,
-                project_id,
-                mode_json,
-                "perf:message-list-heavy-prod-shape",
-            ),
+        _insert_modern_conversation(
+            conn,
+            conversation_id=conv_id,
+            slug=slug,
+            title="Fixture Heavy Prod Shape",
+            state_json=state_json,
+            mode=conv_mode,
+            cwd=cwd,
+            project_id=project_id,
+            seed_label="perf:message-list-heavy-prod-shape",
         )
 
         zero_tool_agents = {5, 17, 41, 68, 93, 119, 151, 188, 229}
@@ -3104,9 +3015,9 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
     direct_mode = {"mode": "Direct"}
     explore_mode = {"mode": "Explore"}
 
+    _migrate_seed_database(build=build)
     with sqlite3.connect(str(db_path), timeout=10) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
-        _ensure_schema(conn)
 
         project_id = _find_or_create_project(conn, str(ROOT))
 
@@ -3128,9 +3039,6 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                 project_id=project_id,
             )
             created_grounding_fixture = _ensure_grounding_panel_qa_fixture(conn)
-            # Repaired fixtures carry a conv_mode blob; project it to cm_* (and
-            # drop the blob) so they hydrate as Work, not Explore.
-            _project_and_drop_conv_mode(conn)
             conn.commit()
             if not quiet_if_populated:
                 count = _existing_active_count(conn)
@@ -3223,9 +3131,6 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             cwd=str(ROOT),
         )
 
-        # Match the post-migration-029 production schema: project conv_mode into
-        # the normalized cm_* columns and drop the blob.
-        _project_and_drop_conv_mode(conn)
 
         conn.commit()
 
