@@ -1119,16 +1119,15 @@ async fn inspect_bash_handle(
     let state = handle.state().await;
     match state.as_ref() {
         HandleState::Live(live) => {
-            if matches!(
-                *handle.exit_observer().borrow(),
-                Some(phoenix_tools::bash::handle::ExitState::WaiterPanicked)
-            ) {
+            if let Some(phoenix_tools::bash::handle::ExitState::WaiterPanicked(panicked_at)) =
+                *handle.exit_observer().borrow()
+            {
                 InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
                     identity: identity.clone(),
                     cmd: handle.cmd.clone(),
                     label: handle.label.clone(),
                     status: BashTerminalStatus::WaiterPanicked,
-                    occurred_at: Timestamp(0),
+                    occurred_at: system_time_to_timestamp(panicked_at),
                     exit_code: None,
                     duration_ms: None,
                     signal_number: None,
@@ -1825,7 +1824,9 @@ mod tests {
             123,
             RING_BUFFER_BYTES,
         );
-        handle.publish_exit(ExitState::WaiterPanicked);
+        handle.publish_exit(ExitState::WaiterPanicked(
+            std::time::UNIX_EPOCH + Duration::from_secs(9),
+        ));
 
         let outcome = inspect_bash_handle(
             &handle,
@@ -1840,6 +1841,7 @@ mod tests {
             panic!("waiter panic must preserve Bash terminal evidence");
         };
         assert_eq!(evidence.status, BashTerminalStatus::WaiterPanicked);
+        assert_eq!(evidence.occurred_at, Timestamp(9));
         assert_eq!(evidence.cmd, "test command");
         assert_eq!(
             evidence.final_tail_partial.as_deref(),

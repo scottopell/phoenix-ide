@@ -162,7 +162,7 @@ impl HandleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitState {
     Exited,
-    WaiterPanicked,
+    WaiterPanicked(SystemTime),
 }
 
 /// A bash handle: identity + lifecycle state + watch-channel for exit notification.
@@ -519,7 +519,9 @@ impl Drop for ExitWatchPanicGuard {
                 handle_id = %handle.handle_id,
                 "bash waiter task dropped without disarm — publishing WaiterPanicked"
             );
-            let _ = handle.exit_signal.send(Some(ExitState::WaiterPanicked));
+            let _ = handle
+                .exit_signal
+                .send(Some(ExitState::WaiterPanicked(SystemTime::now())));
         }
     }
 }
@@ -760,7 +762,7 @@ mod tests {
 
         // The drop must have published WaiterPanicked.
         rx.changed().await.unwrap();
-        assert_eq!(*rx.borrow(), Some(ExitState::WaiterPanicked));
+        assert!(matches!(*rx.borrow(), Some(ExitState::WaiterPanicked(_))));
     }
 
     #[tokio::test]
