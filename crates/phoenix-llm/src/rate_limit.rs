@@ -22,7 +22,8 @@
 //! re-exported here; the `reqwest`-dependent header-parsing functions stay.
 
 pub use phoenix_core::domain::quota_details::{
-    CreditsSnapshot, QuotaDetails, RateLimitReachedType, RateLimitWindow, SpendControlLimitSnapshot,
+    CreditsSnapshot, QuotaDetails, QuotaLimitFamily, RateLimitReachedType, RateLimitWindow,
+    SpendControlLimitSnapshot,
 };
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
@@ -95,12 +96,20 @@ struct CodexUsageSpendControl {
 }
 
 #[derive(Debug, Deserialize)]
+struct CodexUsageAdditionalRateLimit {
+    limit_name: String,
+    rate_limit: CodexUsageRateLimit,
+}
+
+#[derive(Debug, Deserialize)]
 struct CodexUsagePayload {
     plan_type: Option<String>,
     rate_limit: Option<CodexUsageRateLimit>,
     credits: Option<CodexRateLimitEventCredits>,
     rate_limit_reached_type: Option<CodexUsageReachedType>,
     spend_control: Option<CodexUsageSpendControl>,
+    #[serde(default)]
+    additional_rate_limits: Vec<CodexUsageAdditionalRateLimit>,
 }
 
 /// Normalize the account-wide payload returned by Codex's authenticated usage endpoint.
@@ -118,6 +127,15 @@ pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<Quota
             rate_limit.secondary_window.map(map_window),
         )
     });
+    let additional_limits = payload
+        .additional_rate_limits
+        .into_iter()
+        .map(|family| QuotaLimitFamily {
+            limit_name: family.limit_name,
+            primary: family.rate_limit.primary_window.map(map_window),
+            secondary: family.rate_limit.secondary_window.map(map_window),
+        })
+        .collect::<Vec<_>>();
     let credits = payload.credits.map(|credits| CreditsSnapshot {
         has_credits: credits.has_credits,
         unlimited: credits.unlimited,
@@ -141,6 +159,7 @@ pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<Quota
         && secondary.is_none()
         && credits.is_none()
         && individual_limit.is_none()
+        && additional_limits.is_empty()
         && rate_limit_reached_type.is_none()
         && payload.plan_type.is_none()
     {
@@ -155,6 +174,7 @@ pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<Quota
         secondary,
         credits,
         individual_limit,
+        additional_limits,
         promo_message: None,
         rate_limit_reached_type,
     })
@@ -209,6 +229,7 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         limit_name: None,
         primary,
         secondary,
+        additional_limits: Vec::new(),
         credits,
         individual_limit: None,
         promo_message: None,
@@ -260,6 +281,7 @@ pub fn quota_from_codex_response_headers(headers: &HeaderMap) -> Option<QuotaDet
         limit_name,
         primary,
         secondary,
+        additional_limits: Vec::new(),
         credits,
         individual_limit: None,
         promo_message,
@@ -445,6 +467,35 @@ mod tests {
             Some(10_080)
         );
         assert!(!quota.credits.as_ref().unwrap().has_credits);
+    }
+
+    #[test]
+    fn preserves_additional_rate_limit_families() {
+        let payload = serde_json::json!({
+            "additional_rate_limits": [{
+                "limit_name": "review",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 12,
+                        "limit_window_seconds": 18_000,
+                        "reset_at": 1_800_000_000
+                    },
+                    "secondary_window": null
+                }
+            }]
+        });
+
+        let quota = quota_from_codex_usage_payload(&payload).expect("additional quota family");
+        assert_eq!(quota.additional_limits.len(), 1);
+        assert_eq!(quota.additional_limits[0].limit_name, "review");
+        assert_eq!(
+            quota.additional_limits[0]
+                .primary
+                .as_ref()
+                .unwrap()
+                .window_minutes,
+            Some(300)
+        );
     }
 
     #[test]

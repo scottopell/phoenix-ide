@@ -8218,6 +8218,7 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
                     limit_name: None,
                     primary: None,
                     secondary: None,
+                    additional_limits: Vec::new(),
                     credits: None,
                     individual_limit: None,
                     promo_message: None,

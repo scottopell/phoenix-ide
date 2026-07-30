@@ -43,10 +43,19 @@ pub struct QuotaDetails {
     pub limit_name: Option<String>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
+    pub additional_limits: Vec<QuotaLimitFamily>,
     pub credits: Option<CreditsSnapshot>,
     pub individual_limit: Option<Box<SpendControlLimitSnapshot>>,
     pub promo_message: Option<String>,
     pub rate_limit_reached_type: Option<RateLimitReachedType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct QuotaLimitFamily {
+    pub limit_name: String,
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]

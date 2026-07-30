@@ -18,29 +18,46 @@ import type { QuotaDetails } from './sseSchemas';
 
 let snapshot: QuotaDetails | null = null;
 let accountId: string | null = null;
+let version = 0;
+let activeTurnFamilyId: string | null = null;
 const listeners = new Set<() => void>();
 
 function notify(): void {
   for (const fn of listeners) fn();
 }
 
+export function getCodexQuotaVersion(): number {
+  return version;
+}
+
 export function selectCodexQuotaAccount(nextAccountId: string | null): void {
   if (accountId === nextAccountId) return;
+  if (accountId === null && snapshot !== null) {
+    accountId = nextAccountId;
+    return;
+  }
   accountId = nextAccountId;
   snapshot = null;
+  activeTurnFamilyId = null;
+  version++;
   notify();
 }
 
 export function replaceCodexQuota(next: QuotaDetails): void {
   snapshot = next;
+  activeTurnFamilyId = null;
+  version++;
   notify();
 }
 
+export function replaceCodexQuotaIfVersion(next: QuotaDetails, expectedVersion: number): void {
+  if (version === expectedVersion) replaceCodexQuota(next);
+}
+
 export function mergeCodexQuota(next: QuotaDetails): void {
-  if (snapshot?.limit_id && next.limit_id && snapshot.limit_id !== next.limit_id) {
-    replaceCodexQuota(next);
-    return;
-  }
+  if (activeTurnFamilyId && next.limit_id && activeTurnFamilyId !== next.limit_id) {
+    snapshot = next;
+  } else {
   snapshot = snapshot === null ? next : {
     plan_type: next.plan_type ?? snapshot.plan_type,
     resets_at: next.resets_at ?? snapshot.resets_at,
@@ -48,11 +65,17 @@ export function mergeCodexQuota(next: QuotaDetails): void {
     limit_name: next.limit_name ?? snapshot.limit_name,
     primary: next.primary ?? snapshot.primary,
     secondary: next.secondary ?? snapshot.secondary,
+    additional_limits: next.additional_limits.length > 0
+      ? next.additional_limits
+      : snapshot.additional_limits,
     credits: next.credits ?? snapshot.credits,
     individual_limit: next.individual_limit ?? snapshot.individual_limit,
     promo_message: next.promo_message ?? snapshot.promo_message,
     rate_limit_reached_type: next.rate_limit_reached_type,
   };
+  }
+  activeTurnFamilyId = next.limit_id ?? activeTurnFamilyId;
+  version++;
   notify();
 }
 
@@ -62,6 +85,8 @@ export function mergeCodexQuota(next: QuotaDetails): void {
 /// the snapshot — the account is unchanged across reconnects.
 export function clearCodexQuota(): void {
   accountId = null;
+  activeTurnFamilyId = null;
+  version++;
   if (snapshot === null) return;
   snapshot = null;
   notify();

@@ -103,7 +103,7 @@ export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
   const creditsDepleted = creditsAreDepleted(quota.rate_limit_reached_type);
   const reachedMessage = exhaustionMessage(quota.rate_limit_reached_type);
   const hasCreditsRow = creditsDepleted || (credits && (credits.unlimited || credits.has_credits));
-  if (!quota.primary && !quota.secondary && !hasCreditsRow && !quota.individual_limit && !reachedMessage) return null;
+  if (!quota.primary && !quota.secondary && quota.additional_limits.length === 0 && !hasCreditsRow && !quota.individual_limit && !reachedMessage) return null;
   return (
     <div className="settings-codex-quota">
       {quota.primary && (
@@ -112,6 +112,16 @@ export function CodexQuotaBlock({ quota }: { quota: QuotaDetails }) {
       {quota.secondary && (
         <QuotaRow label={windowLabel(quota.secondary.window_minutes)} window={quota.secondary} />
       )}
+      {quota.additional_limits.map((family) => (
+        <div key={family.limit_name}>
+          {family.primary ? (
+            <QuotaRow label={`${family.limit_name} · ${windowLabel(family.primary.window_minutes)}`} window={family.primary} />
+          ) : null}
+          {family.secondary ? (
+            <QuotaRow label={`${family.limit_name} · ${windowLabel(family.secondary.window_minutes)}`} window={family.secondary} />
+          ) : null}
+        </div>
+      ))}
       {quota.individual_limit ? <SpendControlRow limit={quota.individual_limit} /> : null}
       {reachedMessage ? <div className="settings-codex-quota__credits">{reachedMessage}</div> : null}
       {creditsDepleted ? (

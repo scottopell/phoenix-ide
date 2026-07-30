@@ -3,8 +3,10 @@ import type { QuotaDetails } from './sseSchemas';
 import {
   clearCodexQuota,
   getCodexQuotaSnapshot,
+  getCodexQuotaVersion,
   mergeCodexQuota,
   replaceCodexQuota,
+  replaceCodexQuotaIfVersion,
   selectCodexQuotaAccount,
 } from './codexQuota';
 
@@ -16,6 +18,7 @@ function quota(overrides: Partial<QuotaDetails>): QuotaDetails {
     limit_name: null,
     primary: null,
     secondary: null,
+    additional_limits: [],
     credits: null,
     individual_limit: null,
     promo_message: null,
@@ -54,8 +57,23 @@ describe('Codex quota store', () => {
     expect(getCodexQuotaSnapshot()?.secondary?.used_percent).toBe(5);
   });
 
+  it('does not let an older account fetch overwrite a newer turn snapshot', () => {
+    const fetchVersion = getCodexQuotaVersion();
+    mergeCodexQuota(quota({
+      rate_limit_reached_type: 'workspace_member_credits_depleted',
+    }));
+
+    replaceCodexQuotaIfVersion(quota({
+      secondary: { used_percent: 4, window_minutes: 10_080, resets_at: 1_800_500_000 },
+    }), fetchVersion);
+
+    expect(getCodexQuotaSnapshot()?.rate_limit_reached_type).toBe(
+      'workspace_member_credits_depleted',
+    );
+  });
+
   it('replaces rather than mixes windows when quota families change', () => {
-    replaceCodexQuota(quota({
+    mergeCodexQuota(quota({
       limit_id: 'family-a',
       primary: { used_percent: 3, window_minutes: 300, resets_at: 1_800_000_000 },
       secondary: { used_percent: 4, window_minutes: 10_080, resets_at: 1_800_500_000 },

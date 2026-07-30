@@ -388,6 +388,12 @@ const RateLimitWindowSchema = v.looseObject({
   resets_at: v.nullable(v.number()),
 }) satisfies v.GenericSchema<unknown, WireRateLimitWindow>;
 
+const QuotaLimitFamilySchema = v.looseObject({
+  limit_name: v.string(),
+  primary: v.nullable(RateLimitWindowSchema),
+  secondary: v.nullable(RateLimitWindowSchema),
+});
+
 const CreditsSnapshotSchema = v.looseObject({
   has_credits: v.boolean(),
   unlimited: v.boolean(),
@@ -421,6 +427,7 @@ const QuotaDetailsSchema = v.looseObject({
   limit_name: v.nullable(v.string()),
   primary: v.nullable(RateLimitWindowSchema),
   secondary: v.nullable(RateLimitWindowSchema),
+  additional_limits: v.array(QuotaLimitFamilySchema),
   credits: v.nullable(CreditsSnapshotSchema),
   individual_limit: v.nullable(SpendControlLimitSnapshotSchema),
   promo_message: v.nullable(v.string()),

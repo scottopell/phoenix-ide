@@ -11,6 +11,7 @@ function quota(overrides: Partial<QuotaDetails>): QuotaDetails {
     limit_name: null,
     primary: null,
     secondary: null,
+    additional_limits: [],
     credits: null,
     individual_limit: null,
     promo_message: null,
@@ -35,6 +36,23 @@ describe('CodexQuotaBlock', () => {
 
     expect(screen.getByText('5-hour')).toBeInTheDocument();
     expect(screen.getByText('3%')).toBeInTheDocument();
+  });
+
+  it('shows additional named quota families', () => {
+    render(
+      <CodexQuotaBlock
+        quota={quota({
+          additional_limits: [{
+            limit_name: 'Review',
+            primary: { used_percent: 12, window_minutes: 300, resets_at: 1_800_000_000 },
+            secondary: null,
+          }],
+        })}
+      />,
+    );
+
+    expect(screen.getByText('Review · 5-hour')).toBeInTheDocument();
+    expect(screen.getByText('12%')).toBeInTheDocument();
   });
 
   it('shows an individual spend-control limit without standard windows', () => {
