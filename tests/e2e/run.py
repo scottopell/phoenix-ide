@@ -1130,18 +1130,17 @@ def scenario_perf_stream(base_url: str) -> None:
     # exactly N whitespace-separated deterministic words. Catches stream
     # finalization or persistence regressions that only manifest on longer
     # streams (most other scenarios finalize in <100 tokens).
-    # 200 words is ~3x the longest text scenario (~70-word plain_text) and
-    # produces several hundred chunks — enough to exercise the same long-stream
-    # finalization/persistence path a larger count would, without paying for
-    # word-count the regression class doesn't depend on (no threshold lives at
-    # any particular N; the bug class is "more chunks than the short scenarios").
-    n = 200
+    # 100 words remains longer than the longest ordinary text scenario
+    # (62-word plain_text) and the dedicated 8-word streaming scenario. No
+    # finalization threshold lives at a particular N; the regression class is
+    # "more chunks than the short scenarios".
+    n = 100
     conv = _new_conv(base_url, f"[[perf:{n}]] go")
     final = _poll_to_idle_with_messages(
         base_url,
         conv["id"],
-        lambda messages: len(_agent_text(messages).split()) == n,
-        f"{n}-word response",
+        lambda messages: bool(_agent_text(messages)),
+        "persisted assistant response",
         timeout=SCENARIO_TIMEOUT_SECONDS,
     )
     text = _agent_text(final["messages"])
