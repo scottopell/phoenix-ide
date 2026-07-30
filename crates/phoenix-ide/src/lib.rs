@@ -559,6 +559,30 @@ fn build_identity_requested() -> bool {
     matches!(args.next().as_deref(), Some("--build-identity")) && args.next().is_none()
 }
 
+async fn open_database_with_migrations(
+    runtime_env: &PhoenixRuntimeEnvironment,
+) -> Result<Database, Box<dyn std::error::Error>> {
+    let db_path = runtime_env.db_path();
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let db = Database::open(&db_path.to_string_lossy()).await?;
+    db::run_pending_migrations(db.pool()).await?;
+    db.restrict_file_permissions();
+    Ok(db)
+}
+
+/// Open the configured database, apply the standard migration chain, and exit.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be opened or migrated.
+pub async fn migrate_database() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_env = PhoenixRuntimeEnvironment::detect();
+    open_database_with_migrations(&runtime_env).await?;
+    Ok(())
+}
+
 /// Start the Phoenix HTTP server with the production composition root.
 ///
 /// # Errors
@@ -655,11 +679,6 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(8000);
     let tls_source = tls::ConfigSource::from_env(&db_path)?;
 
-    // Ensure database directory exists
-    if let Some(parent) = PathBuf::from(&db_path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     // Extract built-in skills to disk so they participate in normal skill
     // discovery (filesystem-shadows-builtin override, companion-file reads,
     // etc.). Failure is non-fatal — built-ins simply won't appear in the
@@ -674,16 +693,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
-    // Initialize database
     tracing::info!(path = %db_path, "Opening database");
-    let db = Database::open(&db_path).await?;
-
-    // Run pending data migrations before anything reads conversation data
-    db::run_pending_migrations(db.pool()).await?;
-    // The numbered migrations above may have created the `-wal`/`-shm` sidecars
-    // after `open`'s chmod ran. Re-tighten so the sidecars (which hold the same
-    // conversation data) are owner-only on a multi-user host. Best-effort.
-    db.restrict_file_permissions();
+    let db = open_database_with_migrations(&runtime_env).await?;
 
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;
