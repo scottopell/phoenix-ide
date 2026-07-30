@@ -72,7 +72,7 @@ impl Tool for WaitUntilTool {
                 },
                 "max_wait_seconds": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": WAKE_MAX_SECONDS,
                     "description": format!("Maximum lifetime of the wake contract in seconds. Defaults to {WAKE_DEFAULT_SECONDS}; capped at {WAKE_MAX_SECONDS}.")
                 }
@@ -141,9 +141,9 @@ impl Tool for WaitUntilTool {
         };
 
         let max_wait_seconds = parsed.max_wait_seconds.unwrap_or(WAKE_DEFAULT_SECONDS);
-        if max_wait_seconds == 0 || max_wait_seconds > WAKE_MAX_SECONDS {
+        if max_wait_seconds > WAKE_MAX_SECONDS {
             return ToolOutput::error(format!(
-                "max_wait_seconds must be between 1 and {WAKE_MAX_SECONDS}; got {max_wait_seconds}"
+                "max_wait_seconds must be between 0 and {WAKE_MAX_SECONDS}; got {max_wait_seconds}"
             ));
         }
         let Some(tool_round_id) = ctx.tool_round_id() else {
@@ -389,6 +389,7 @@ mod tests {
             schema["properties"]["max_wait_seconds"]["maximum"],
             json!(WAKE_MAX_SECONDS)
         );
+        assert_eq!(schema["properties"]["max_wait_seconds"]["minimum"], 0);
     }
 
     #[tokio::test]
@@ -465,6 +466,37 @@ mod tests {
         assert!(!out.is_success());
         assert!(out.output().contains("was not found in this work scope"));
         assert!(registrar.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_second_deadline_registers_for_immediate_expiry() {
+        let registrar = MockWakeRegistrar::new(Ok(RegisteredWake::Registered {
+            workflow_id: WorkflowId(7),
+            expires_at: Timestamp(0),
+        }));
+        let context = ctx(Some(registrar.clone()));
+        insert_live_handle(&context, "b-zero").await;
+
+        let out = WaitUntilTool
+            .run(
+                json!({
+                    "handle": {"kind": "Bash", "id": "b-zero"},
+                    "condition": CONDITION_HANDLE_TERMINAL,
+                    "max_wait_seconds": 0
+                }),
+                context,
+            )
+            .await;
+
+        assert!(out.is_success(), "{}", out.output());
+        assert!(matches!(
+            out.disposition(),
+            ToolOutputDisposition::ParkAfterWakeRegistration { .. }
+        ));
+        let calls = registrar.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].max_wait_seconds, 0);
+        assert_eq!(parse(&out)["max_wait_seconds"], 0);
     }
 
     #[tokio::test]
