@@ -137,6 +137,8 @@ struct DeviceSession {
     /// completes the verification page anyway — does NOT end up with
     /// silently-written credentials.
     cancel: CancellationToken,
+    settled: tokio::sync::Notify,
+    is_settled: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -203,8 +205,23 @@ async fn drain_active_device_sessions(mgr: &CodexLoginManager) -> usize {
         sessions.drain().map(|(_, session)| session).collect()
     };
     let count = stale.len();
-    for session in stale {
+    for session in &stale {
         session.cancel.cancel();
+    }
+    for session in stale {
+        while !session
+            .is_settled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let notified = session.settled.notified();
+            if session
+                .is_settled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            notified.await;
+        }
     }
     count
 }
@@ -697,6 +714,8 @@ pub async fn device_start(
                 user_code: device.user_code.clone(),
                 status: Mutex::new(LoginStatus::default()),
                 cancel: cancel.clone(),
+                settled: tokio::sync::Notify::new(),
+                is_settled: std::sync::atomic::AtomicBool::new(false),
             }),
         );
     }
@@ -706,6 +725,13 @@ pub async fn device_start(
         let registry_for_task = state.llm_registry.clone();
         let session_id_for_task = session_id.clone();
         let login_target = state.runtime_env.codex_auth_path();
+        let session_for_task = {
+            let sessions = mgr.device.lock().await;
+            sessions
+                .get(&session_id)
+                .cloned()
+                .expect("device session inserted")
+        };
         tokio::spawn(async move {
             let outcome = drive_device_code(cancel, device, login_target).await;
             settle_device(
@@ -715,6 +741,10 @@ pub async fn device_start(
                 outcome,
             )
             .await;
+            session_for_task
+                .is_settled
+                .store(true, std::sync::atomic::Ordering::Release);
+            session_for_task.settled.notify_waiters();
         });
     }
 

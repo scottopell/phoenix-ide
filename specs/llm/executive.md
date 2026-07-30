@@ -20,8 +20,8 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Opportunistic backend-scoped `/v1/models` discovery, falls back to configured models |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
 | **REQ-LLM-005:** Response Handling | ✅ Complete | Normalized to ContentBlock variants |
-| **REQ-LLM-006:** Error Classification | ✅ Complete | Transient throttles, terminal quota exhaustion, model overload, and explicit Codex depletion states are classified separately |
-| **REQ-LLM-006a:** Plan-Aware Quota Messages (Codex Backend) | ✅ Complete | Structured Codex quota normalization, plan-aware terminal messages, and authoritative account quota UI |
+| **REQ-LLM-006:** Error Classification | ✅ Complete | Transient throttles, user-resumable quota exhaustion, model overload, and explicit Codex depletion states are classified separately |
+| **REQ-LLM-006a:** Plan-Aware Quota Messages (Codex Backend) | ✅ Complete | Structured Codex quota normalization, plan-aware resumable messages, and authoritative account quota UI with reset timestamps formatted in the browser's local timezone |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
 | **REQ-LLM-008:** Request Observability | ✅ Complete | Provider-centric TTFT is measured at each request-dispatch boundary through the first generation-bearing provider event across Anthropic SSE and OpenAI SSE/WebSocket transports; content-free per-attempt metrics persist relationally and the usage dashboard reports bounded first-attempt/retry percentiles, threshold rates, trends, and provider/model/transport comparisons |
 | **REQ-LLM-009:** Streaming Responses | ✅ Complete | Task 582. `complete_streaming()` on `LlmClient` trait, Anthropic implemented, OpenAI falls back |
