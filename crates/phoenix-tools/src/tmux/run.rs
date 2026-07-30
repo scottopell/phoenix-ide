@@ -480,7 +480,11 @@ fn spawn_completion_cleanup(
                         .await;
                     return;
                 }
-                Ok(None) | Err(_) => return,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::debug!(%error, %window_id, "retrying tmux completion cleanup inspection");
+                    tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+                }
                 Ok(Some(_)) => tokio::time::sleep(READINESS_POLL_INTERVAL).await,
             }
         }

@@ -523,11 +523,6 @@ UPDATE wake_bindings SET activated_at = created_at;
 ALTER TABLE wake_terminal_receipts ADD COLUMN tail_start_offset INTEGER CHECK (tail_start_offset IS NULL OR tail_start_offset >= 0);
 ALTER TABLE wake_terminal_receipts ADD COLUMN tail_end_offset INTEGER CHECK (tail_end_offset IS NULL OR tail_end_offset >= 0);
 ALTER TABLE wake_terminal_receipts ADD COLUMN tail_truncated_before INTEGER CHECK (tail_truncated_before IS NULL OR tail_truncated_before IN (0, 1));
-UPDATE wake_terminal_receipts
-SET tail_start_offset = 0,
-    tail_end_offset = (SELECT COUNT(*) FROM wake_terminal_receipt_tails t WHERE t.workflow_id = wake_terminal_receipts.workflow_id AND t.receipt_id = wake_terminal_receipts.receipt_id),
-    tail_truncated_before = 0
-WHERE resource_kind = 'Bash' AND terminal_kind = 'Fired';
 ";
 
 const MIGRATION_057: &str = r"
