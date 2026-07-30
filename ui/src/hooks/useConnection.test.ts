@@ -69,11 +69,14 @@ class FakeEventSource {
 // ---------------------------------------------------------------------------
 
 let originalEventSource: typeof EventSource | undefined;
+let originalFetch: typeof fetch | undefined;
 
 beforeEach(() => {
   originalEventSource = (globalThis as { EventSource?: typeof EventSource }).EventSource;
+  originalFetch = globalThis.fetch;
   (globalThis as { EventSource: unknown }).EventSource =
     FakeEventSource as unknown as typeof EventSource;
+  globalThis.fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
   FakeEventSource.instances.length = 0;
 });
 
@@ -81,6 +84,7 @@ afterEach(() => {
   if (originalEventSource) {
     (globalThis as { EventSource: typeof EventSource }).EventSource = originalEventSource;
   }
+  if (originalFetch) globalThis.fetch = originalFetch;
 });
 
 // Minimal valid `init` payload — must satisfy SseInitDataSchema or
@@ -123,7 +127,9 @@ describe('useConnection epoch stamping (task 08683)', () => {
     renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe('/api/conversations/conv-A/stream');
+    expect(FakeEventSource.instances[0]!.url).toMatch(
+      /^\/api\/conversations\/conv-A\/stream\?open_id=[0-9a-f-]{36}$/,
+    );
   });
 
   it('uses after_event_sequence when the atom already has a replay cursor', () => {
@@ -136,8 +142,8 @@ describe('useConnection epoch stamping (task 08683)', () => {
     }));
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      '/api/conversations/conv-A/stream?after_event_sequence=42',
+    expect(FakeEventSource.instances[0]!.url).toMatch(
+      /^\/api\/conversations\/conv-A\/stream\?after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
     );
   });
 
@@ -173,8 +179,8 @@ describe('useConnection epoch stamping (task 08683)', () => {
     }));
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      '/api/conversations/conv-A/stream?init_mode=messages_after_floor&after_message_floor=77&transcript_generation=3',
+    expect(FakeEventSource.instances[0]!.url).toMatch(
+      /^\/api\/conversations\/conv-A\/stream\?init_mode=messages_after_floor&after_message_floor=77&transcript_generation=3&open_id=[0-9a-f-]{36}$/,
     );
   });
 
@@ -189,9 +195,28 @@ describe('useConnection epoch stamping (task 08683)', () => {
     }));
 
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      '/api/conversations/conv-A/stream?after_event_sequence=42',
+    expect(FakeEventSource.instances[0]!.url).toMatch(
+      /^\/api\/conversations\/conv-A\/stream\?after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
     );
+  });
+
+  it('reports one connected measurement correlated to the stream open ID', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+    const stream = FakeEventSource.instances[0]!;
+    const openId = new URL(stream.url, 'http://localhost').searchParams.get('open_id');
+
+    act(() => {
+      stream.emit('init', makeInitPayload('conv-A', 'slug-A'));
+      stream.emit('init', makeInitPayload('conv-A', 'slug-A'));
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(
+      (vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string,
+    ) as { open_id: string; outcome: string };
+    expect(body).toMatchObject({ open_id: openId, outcome: 'connected' });
   });
 
   it('stamps every wire-derived dispatch with the connection epoch', () => {

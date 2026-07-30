@@ -166,6 +166,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
+        .route(
+            "/api/telemetry/conversation-open",
+            post(report_conversation_open),
+        )
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
         .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
         // Global terminal WebSocket — singleton scope, unbound to any
@@ -2259,6 +2263,54 @@ struct StreamConversationQuery {
     init_mode: Option<StreamInitMode>,
     after_message_floor: Option<i64>,
     transcript_generation: Option<i64>,
+    open_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ConversationOpenOutcome {
+    Connected,
+    Error,
+}
+
+impl ConversationOpenOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationOpenTelemetry {
+    open_id: uuid::Uuid,
+    outcome: ConversationOpenOutcome,
+    native_open_ms: Option<f64>,
+    init_received_ms: Option<f64>,
+    handler_ms: Option<f64>,
+    total_ms: f64,
+    retry_attempt: u32,
+    visible: bool,
+    effective_type: Option<String>,
+}
+
+async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>) -> StatusCode {
+    let span = tracing::info_span!(
+        target: "phoenix_ide::otel",
+        "browser.conversation_open",
+        "open.id" = %report.open_id,
+        "browser.outcome" = report.outcome.as_str(),
+        "browser.native_open_ms" = report.native_open_ms,
+        "browser.init_received_ms" = report.init_received_ms,
+        "browser.handler_ms" = report.handler_ms,
+        "browser.total_ms" = report.total_ms,
+        "browser.retry_attempt" = report.retry_attempt,
+        "browser.visible" = report.visible,
+        "network.effective_type" = report.effective_type.as_deref(),
+    );
+    drop(span.enter());
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3417,6 +3469,9 @@ async fn stream_conversation(
     Query(query): Query<StreamConversationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let init_trace = SseInitTrace::new();
+    if let Some(open_id) = query.open_id {
+        init_trace.record_open_id(open_id);
+    }
     let conversation_for_runtime = state
         .runtime
         .db()
@@ -9683,6 +9738,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 init_mode: None,
                 after_message_floor: None,
                 transcript_generation: None,
+                open_id: None,
             },
         );
 
@@ -9720,6 +9776,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: Some(1),
+                    open_id: None,
                 },
                 10,
                 1,
@@ -9735,6 +9792,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: None,
+                    open_id: None,
                 },
                 10,
                 1,
@@ -9751,6 +9809,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: Some(2),
+                    open_id: None,
                 },
                 10,
                 3,
@@ -9767,6 +9826,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: None,
+                    open_id: None,
                 },
                 10,
                 1,
@@ -9782,6 +9842,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: None,
                     after_message_floor: None,
                     transcript_generation: None,
+                    open_id: None,
                 },
                 10,
                 1,
@@ -9954,6 +10015,7 @@ pub(crate) mod hard_delete_cascade_tests {
             init_mode: None,
             after_message_floor: None,
             transcript_generation: Some(1),
+            open_id: None,
         };
 
         bump_generation_after_next_stable_read_value("stream-none-race");
@@ -10013,6 +10075,7 @@ pub(crate) mod hard_delete_cascade_tests {
             init_mode: Some(StreamInitMode::MessagesAfterFloor),
             after_message_floor: Some(2),
             transcript_generation: Some(1),
+            open_id: None,
         };
 
         bump_generation_after_next_stable_read_value("stream-floor-race");
@@ -10082,6 +10145,7 @@ pub(crate) mod hard_delete_cascade_tests {
             init_mode: Some(StreamInitMode::MessagesAfterFloor),
             after_message_floor: Some(99),
             transcript_generation: Some(1),
+            open_id: None,
         };
 
         let stable = stable_transcript_read(
@@ -10197,6 +10261,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 init_mode: Some(StreamInitMode::MessagesAfterFloor),
                 after_message_floor: Some(1),
                 transcript_generation: Some(1),
+                open_id: None,
             },
             true,
             1,
@@ -10230,6 +10295,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: Some(50),
                     transcript_generation: Some(3),
+                    open_id: None,
                 },
                 75,
                 3,
@@ -10245,6 +10311,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: Some(50),
                     transcript_generation: Some(2),
+                    open_id: None,
                 },
                 75,
                 3,
@@ -10260,6 +10327,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: Some(76),
                     transcript_generation: Some(3),
+                    open_id: None,
                 },
                 75,
                 3,
@@ -10275,6 +10343,7 @@ pub(crate) mod hard_delete_cascade_tests {
                     init_mode: Some(StreamInitMode::MessagesAfterFloor),
                     after_message_floor: None,
                     transcript_generation: Some(3),
+                    open_id: None,
                 },
                 75,
                 3,

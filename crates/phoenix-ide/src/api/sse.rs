@@ -42,6 +42,7 @@ impl SseInitTrace {
                 "stream.serialization_ms" = tracing::field::Empty,
                 "stream.time_to_init_ms" = tracing::field::Empty,
                 "stream.message_count" = tracing::field::Empty,
+                "open.id" = tracing::field::Empty,
             ),
         }
     }
@@ -51,6 +52,11 @@ impl SseInitTrace {
             field,
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         );
+    }
+
+    pub(crate) fn record_open_id(&self, open_id: uuid::Uuid) {
+        self.span
+            .record("open.id", tracing::field::display(open_id));
     }
 
     pub(crate) fn record_message_count(&self, count: usize) {

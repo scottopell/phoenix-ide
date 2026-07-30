@@ -156,6 +156,7 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "http"),
     ("phoenix_ide::otel", "pr_status.refresh"),
     ("phoenix_ide::otel", "conversation.stream.init"),
+    ("phoenix_ide::otel", "browser.conversation_open"),
     ("phoenix_ide::otel", "conversation.runtime.materialize"),
     ("phoenix_ide::otel", "conversation.turn"),
     ("phoenix_ide::otel", "tool.execute"),
@@ -438,6 +439,11 @@ mod tests {
                 "conversation.stream.init",
                 stream.time_to_init_ms = 42_u64,
             );
+            let browser_open = tracing::info_span!(
+                target: "phoenix_ide::otel",
+                "browser.conversation_open",
+                browser.total_ms = 120_u64,
+            );
             let runtime_materialize = tracing::info_span!(
                 target: "phoenix_ide::otel",
                 "conversation.runtime.materialize",
@@ -445,6 +451,7 @@ mod tests {
             );
             drop(stream_init);
             drop(runtime_materialize);
+            drop(browser_open);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
                 "llm.request",
@@ -493,7 +500,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 5);
+        assert_eq!(spans.len(), 6);
         assert_eq!(
             spans
                 .iter()
@@ -504,6 +511,7 @@ mod tests {
                 "http",
                 "conversation.stream.init",
                 "conversation.runtime.materialize",
+                "browser.conversation_open",
                 "llm.request"
             ]
         );

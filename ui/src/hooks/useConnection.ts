@@ -133,6 +133,10 @@ function epochStampedDispatch(
 }
 
 export type { ConnectionState } from './connectionMachine';
+import {
+  ConversationOpenMeasurement,
+  reportConversationOpen,
+} from './conversationOpenTelemetry';
 
 export interface ConnectionInfo {
   state: ConnectionState;
@@ -156,7 +160,7 @@ interface UseConnectionOptions {
   getInitialRequestMode?: () => InitialSseRequestMode;
 }
 
-function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, initialRequestMode?: InitialSseRequestMode): string {
+function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, initialRequestMode?: InitialSseRequestMode, openId?: string): string {
   const params = new URLSearchParams();
   if (lastAppliedEventSeq > 0) {
     params.set('after_event_sequence', String(lastAppliedEventSeq));
@@ -165,6 +169,7 @@ function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, ini
     params.set('after_message_floor', String(initialRequestMode.afterMessageFloor));
     params.set('transcript_generation', String(initialRequestMode.transcriptGeneration));
   }
+  if (openId) params.set('open_id', openId);
   const query = params.toString();
   return query.length > 0
     ? `/api/conversations/${conversationId}/stream?${query}`
@@ -293,8 +298,14 @@ export function useConnection({
           const initialRequestMode = lastAppliedEventSeq > 0
             ? undefined
             : getInitialRequestModeRef.current?.();
-          const url = buildStreamUrl(convId, lastAppliedEventSeq, initialRequestMode);
+          const openId = crypto.randomUUID();
+          const measurement = new ConversationOpenMeasurement(
+            openId,
+            machineStateRef.current.attempt,
+          );
+          const url = buildStreamUrl(convId, lastAppliedEventSeq, initialRequestMode, openId);
           const es = new EventSource(url);
+          es.addEventListener('open', () => measurement.nativeOpen());
           eventSourceRef.current = es;
           const isCurrentOwner = () =>
             conversationIdRef.current === convId &&
@@ -325,6 +336,7 @@ export function useConnection({
           });
 
           on('init', (e) => {
+            measurement.initReceived();
             const res = parseEvent(SseInitDataSchema, e, 'init', stampedDispatch);
             if (!res.ok) return;
 
@@ -336,6 +348,8 @@ export function useConnection({
               type: 'sse_init',
               payload,
             });
+            const telemetry = measurement.connected();
+            if (telemetry) reportConversationOpen(telemetry);
           });
 
           on('message', (e) => {
@@ -636,6 +650,8 @@ export function useConnection({
             }
             // Native connection drop — log for diagnosing spinner-forever scenarios.
             // This is the path that triggers SSE reconnect logic.
+            const telemetry = measurement.error();
+            if (telemetry) reportConversationOpen(telemetry);
             if (import.meta.env.DEV) {
               console.warn('[sse] native connection error (no data); scheduling reconnect', {
                 convId,
