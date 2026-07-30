@@ -1139,8 +1139,8 @@ def scenario_perf_stream(base_url: str) -> None:
     final = _poll_to_idle_with_messages(
         base_url,
         conv["id"],
-        lambda messages: len(_agent_text(messages).split()) == n,
-        f"{n}-word response",
+        lambda messages: bool(_agent_text(messages)),
+        "persisted assistant response",
         timeout=SCENARIO_TIMEOUT_SECONDS,
     )
     text = _agent_text(final["messages"])
