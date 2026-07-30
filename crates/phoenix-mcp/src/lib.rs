@@ -723,6 +723,10 @@ pub(crate) struct CallContext {
 }
 
 impl CallContext {
+    pub(crate) fn should_reestablish(&self, error: &McpRequestError) -> bool {
+        should_reestablish(&self.config, error)
+    }
+
     pub(crate) fn is_http(&self) -> bool {
         matches!(self.config, McpServerConfig::Http { .. })
     }

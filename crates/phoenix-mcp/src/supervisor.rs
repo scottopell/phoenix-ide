@@ -327,6 +327,12 @@ enum Command {
     Inspect {
         reply: oneshot::Sender<Result<DefinitionsOutcome, String>>,
     },
+    InspectCompleted {
+        epoch: u64,
+        context: CallContext,
+        result: Result<Vec<McpToolDef>, McpRequestError>,
+        reply: oneshot::Sender<Result<DefinitionsOutcome, String>>,
+    },
     Claim {
         observed_epoch: u64,
         reply: oneshot::Sender<RecoveryClaim>,
@@ -494,23 +500,47 @@ impl Actor {
                 let stale = server
                     .tools_changed
                     .swap(false, std::sync::atomic::Ordering::AcqRel);
-                let result = if stale {
-                    server.list_tools().await
-                } else {
-                    Ok(server.tools())
-                };
-                if result.is_err() {
-                    server
-                        .tools_changed
-                        .store(true, std::sync::atomic::Ordering::Release);
+                if !stale {
+                    let _ = reply.send(Ok(DefinitionsOutcome {
+                        epoch,
+                        result: Ok(server.tools()),
+                        recoverable: false,
+                    }));
+                    return;
                 }
+                let context = server.call_context();
+                let server = Arc::clone(server);
+                let Some(mailbox) = self.mailbox.upgrade() else {
+                    let _ = reply.send(Err(stopped()));
+                    return;
+                };
+                tokio::spawn(async move {
+                    let result = server.list_tools().await;
+                    if result.is_err() {
+                        server
+                            .tools_changed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    let _ = mailbox
+                        .send(Command::InspectCompleted {
+                            epoch,
+                            context,
+                            result,
+                            reply,
+                        })
+                        .await;
+                });
+            }
+            Command::InspectCompleted {
+                epoch,
+                context,
+                result,
+                reply,
+            } => {
                 let recoverable = result
                     .as_ref()
                     .err()
-                    .is_some_and(|error| server.should_reestablish(error));
-                if result.is_ok() {
-                    self.publish_snapshot(None, None);
-                }
+                    .is_some_and(|error| context.should_reestablish(error));
                 let _ = reply.send(Ok(DefinitionsOutcome {
                     epoch,
                     result,
