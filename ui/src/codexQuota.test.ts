@@ -114,7 +114,9 @@ describe('Codex quota store', () => {
     expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(8);
     expect(getCodexQuotaSnapshot()?.secondary).toBeNull();
     expect(getCodexQuotaSnapshot()?.individual_limit?.remaining_percent).toBe(75);
-    expect(getCodexQuotaSnapshot()?.additional_limits).toEqual([]);
+    expect(getCodexQuotaSnapshot()?.additional_limits).toEqual([
+      expect.objectContaining({ limit_name: 'family-a' }),
+    ]);
   });
 
   it('rejects stale turn snapshots after sign-out', () => {

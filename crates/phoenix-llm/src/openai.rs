@@ -3,8 +3,8 @@
 use super::headers::apply_source_header;
 use super::models::ModelSpec;
 use super::rate_limit::{
-    parse_active_limit, parse_credits_snapshot, parse_promo_message, parse_rate_limit_for_limit,
-    parse_rate_limit_reached_type, QuotaDetails,
+    normalize_credit_depletion, parse_active_limit, parse_credits_snapshot, parse_promo_message,
+    parse_rate_limit_for_limit, parse_rate_limit_reached_type, QuotaDetails,
 };
 use super::stream_telemetry::{GenerationKind, StreamTelemetryRecorder};
 use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage};
@@ -1807,6 +1807,10 @@ fn parse_codex_error(status: u16, headers: &HeaderMap, body: &str) -> Option<Llm
                         .error
                         .resets_at
                         .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+                    let rate_limit_reached_type = normalize_credit_depletion(
+                        &credits,
+                        parse_rate_limit_reached_type(headers),
+                    );
                     Some(LlmError::usage_limit_reached(QuotaDetails {
                         plan_type: envelope.error.plan_type,
                         resets_at,
@@ -1818,7 +1822,7 @@ fn parse_codex_error(status: u16, headers: &HeaderMap, body: &str) -> Option<Llm
                         additional_limits: Vec::new(),
                         promo_message,
                         individual_limit: None,
-                        rate_limit_reached_type: parse_rate_limit_reached_type(headers),
+                        rate_limit_reached_type,
                     }))
                 }
                 Some("usage_not_included") => Some(LlmError::auth(

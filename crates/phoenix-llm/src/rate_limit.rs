@@ -113,6 +113,27 @@ struct CodexUsagePayload {
     additional_rate_limits: Vec<CodexUsageAdditionalRateLimit>,
 }
 
+pub fn normalize_credit_depletion(
+    credits: &Option<CreditsSnapshot>,
+    reached_type: Option<RateLimitReachedType>,
+) -> Option<RateLimitReachedType> {
+    match (credits, reached_type) {
+        (
+            Some(CreditsSnapshot {
+                unlimited: true, ..
+            }),
+            Some(
+                RateLimitReachedType::WorkspaceOwnerCreditsDepleted
+                | RateLimitReachedType::WorkspaceMemberCreditsDepleted,
+            ),
+        ) => {
+            tracing::warn!("ignoring contradictory Codex credit depletion for unlimited credits");
+            None
+        }
+        (_, reached_type) => reached_type,
+    }
+}
+
 /// Normalize the account-wide payload returned by Codex's authenticated usage endpoint.
 #[must_use]
 pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<QuotaDetails> {
@@ -156,21 +177,7 @@ pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<Quota
     let rate_limit_reached_type = payload
         .rate_limit_reached_type
         .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind));
-    let rate_limit_reached_type = match (&credits, rate_limit_reached_type) {
-        (
-            Some(CreditsSnapshot {
-                unlimited: true, ..
-            }),
-            Some(
-                RateLimitReachedType::WorkspaceOwnerCreditsDepleted
-                | RateLimitReachedType::WorkspaceMemberCreditsDepleted,
-            ),
-        ) => {
-            tracing::warn!("ignoring contradictory Codex credit depletion for unlimited credits");
-            None
-        }
-        (_, reached_type) => reached_type,
-    };
+    let rate_limit_reached_type = normalize_credit_depletion(&credits, rate_limit_reached_type);
     if primary.is_none()
         && secondary.is_none()
         && credits.is_none()
@@ -236,6 +243,12 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         .or_else(|| details.as_ref()?.metered_limit_name.clone())
         .or_else(|| details.as_ref()?.limit_name.clone())
         .map_or_else(|| "codex".to_string(), |value| canonical_limit_id(&value));
+    let rate_limit_reached_type = normalize_credit_depletion(
+        &credits,
+        event
+            .rate_limit_reached_type
+            .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind)),
+    );
     Some(QuotaDetails {
         plan_type,
         resets_at: None,
@@ -247,9 +260,7 @@ pub fn quota_from_codex_rate_limit_event(value: &serde_json::Value) -> Option<Qu
         credits,
         individual_limit: None,
         promo_message: None,
-        rate_limit_reached_type: event
-            .rate_limit_reached_type
-            .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind)),
+        rate_limit_reached_type,
     })
 }
 
@@ -533,6 +544,20 @@ mod tests {
             quota.rate_limit_reached_type,
             Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted)
         );
+    }
+
+    #[test]
+    fn websocket_event_rejects_depletion_for_unlimited_credits() {
+        let event = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": null,
+            "credits": { "has_credits": true, "unlimited": true, "balance": null },
+            "rate_limit_reached_type": {
+                "type": "workspace_owner_credits_depleted"
+            }
+        });
+        let quota = quota_from_codex_rate_limit_event(&event).expect("websocket quota");
+        assert!(quota.rate_limit_reached_type.is_none());
     }
 
     #[test]

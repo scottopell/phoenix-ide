@@ -931,13 +931,14 @@ pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<CodexQuot
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
     let auth_path = state.runtime_env.codex_auth_path();
     let piggyback_path = state.runtime_env.codex_cli_auth_path();
-    let (already_signed_in, account_id) =
-        match codex_credential::CodexCredential::load(auth_path.clone()) {
-            Ok((_credential, account_id)) => (true, account_id),
-            Err(_) => (false, None),
-        };
-    let account_email = if already_signed_in {
-        codex_credential::CodexCredential::read_id_token(&auth_path)
+    let active_path = state.llm_registry.current_codex_loaded_path();
+    let already_signed_in = state.llm_registry.current_codex_credential().is_some();
+    let account_id = state
+        .llm_registry
+        .current_codex_credential()
+        .and_then(|credential| credential.account_id());
+    let account_email = if let Some(active_path) = active_path.as_ref() {
+        codex_credential::CodexCredential::read_id_token(active_path)
             .as_deref()
             .and_then(phoenix_llm::codex_login::extract_email)
     } else {

@@ -60,10 +60,22 @@ export function replaceCodexQuotaIfVersion(next: QuotaDetails, expectedVersion: 
 export function mergeCodexQuota(next: QuotaDetails): void {
   if (!acceptsTurnSnapshots) return;
   if (activeTurnFamilyId && next.limit_id && activeTurnFamilyId !== next.limit_id) {
+    const previousActive = snapshot && (snapshot.primary || snapshot.secondary)
+      ? [{
+          limit_name: activeTurnFamilyId,
+          primary: snapshot.primary,
+          secondary: snapshot.secondary,
+        }]
+      : [];
     snapshot = snapshot === null ? next : {
       ...next,
-      additional_limits: snapshot.additional_limits.filter(
-        (family) => family.limit_name.toLowerCase().replaceAll('_', '-') !== next.limit_id,
+      additional_limits: [...snapshot.additional_limits, ...previousActive].filter(
+        (family, index, families) =>
+          family.limit_name.toLowerCase().replaceAll('_', '-') !== next.limit_id &&
+          families.findIndex(
+            (candidate) => candidate.limit_name.toLowerCase().replaceAll('_', '-') ===
+              family.limit_name.toLowerCase().replaceAll('_', '-'),
+          ) === index,
       ),
       credits: next.credits ?? snapshot.credits,
       individual_limit: next.individual_limit ?? snapshot.individual_limit,
