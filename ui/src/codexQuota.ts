@@ -86,6 +86,14 @@ export function mergeCodexQuota(next: QuotaDetails): void {
     rate_limit_reached_type: next.rate_limit_reached_type,
   };
   }
+  if (next.limit_id && snapshot) {
+    snapshot = {
+      ...snapshot,
+      additional_limits: snapshot.additional_limits.filter(
+        (family) => family.limit_name.toLowerCase().replaceAll('_', '-') !== next.limit_id,
+      ),
+    };
+  }
   activeTurnFamilyId = next.limit_id ?? activeTurnFamilyId;
   version++;
   notify();

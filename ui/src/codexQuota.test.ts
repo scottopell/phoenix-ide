@@ -73,6 +73,24 @@ describe('Codex quota store', () => {
     );
   });
 
+  it('deduplicates the first active family against the account snapshot', () => {
+    replaceCodexQuota(quota({
+      additional_limits: [{
+        limit_name: 'family_a',
+        primary: { used_percent: 7, window_minutes: 300, resets_at: 1_800_000_000 },
+        secondary: null,
+      }],
+    }));
+
+    mergeCodexQuota(quota({
+      limit_id: 'family-a',
+      primary: { used_percent: 8, window_minutes: 300, resets_at: 1_800_000_000 },
+    }));
+
+    expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(8);
+    expect(getCodexQuotaSnapshot()?.additional_limits).toEqual([]);
+  });
+
   it('replaces rather than mixes windows when quota families change', () => {
     replaceCodexQuota(quota({}));
     mergeCodexQuota(quota({
