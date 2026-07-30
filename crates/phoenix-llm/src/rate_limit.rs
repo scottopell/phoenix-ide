@@ -155,6 +155,21 @@ pub fn quota_from_codex_usage_payload(value: &serde_json::Value) -> Option<Quota
     let rate_limit_reached_type = payload
         .rate_limit_reached_type
         .and_then(|reached| parse_rate_limit_reached_type_value(&reached.kind));
+    let rate_limit_reached_type = match (&credits, rate_limit_reached_type) {
+        (
+            Some(CreditsSnapshot {
+                unlimited: true, ..
+            }),
+            Some(
+                RateLimitReachedType::WorkspaceOwnerCreditsDepleted
+                | RateLimitReachedType::WorkspaceMemberCreditsDepleted,
+            ),
+        ) => {
+            tracing::warn!("ignoring contradictory Codex credit depletion for unlimited credits");
+            None
+        }
+        (_, reached_type) => reached_type,
+    };
     if primary.is_none()
         && secondary.is_none()
         && credits.is_none()
@@ -526,7 +541,7 @@ mod tests {
         let payload = serde_json::json!({
             "plan_type": null,
             "rate_limit": null,
-            "credits": { "has_credits": true, "unlimited": true, "balance": null },
+            "credits": { "has_credits": false, "unlimited": false, "balance": null },
             "rate_limit_reached_type": {
                 "type": "workspace_member_credits_depleted"
             }
@@ -535,11 +550,24 @@ mod tests {
         let quota = quota_from_codex_usage_payload(&payload).expect("credit-only usage payload");
         assert!(quota.primary.is_none());
         assert!(quota.secondary.is_none());
-        assert!(quota.credits.as_ref().unwrap().unlimited);
+        assert!(!quota.credits.as_ref().unwrap().unlimited);
         assert_eq!(
             quota.rate_limit_reached_type,
             Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted)
         );
+    }
+
+    #[test]
+    fn rejects_credit_depletion_that_contradicts_unlimited_credits() {
+        let payload = serde_json::json!({
+            "credits": { "has_credits": true, "unlimited": true, "balance": null },
+            "rate_limit_reached_type": {
+                "type": "workspace_member_credits_depleted"
+            }
+        });
+        let quota = quota_from_codex_usage_payload(&payload).expect("credits payload");
+        assert!(quota.rate_limit_reached_type.is_none());
+        assert!(quota.credits.unwrap().unlimited);
     }
 
     #[test]

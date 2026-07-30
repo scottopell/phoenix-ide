@@ -56,7 +56,13 @@ export function replaceCodexQuotaIfVersion(next: QuotaDetails, expectedVersion: 
 
 export function mergeCodexQuota(next: QuotaDetails): void {
   if (activeTurnFamilyId && next.limit_id && activeTurnFamilyId !== next.limit_id) {
-    snapshot = next;
+    snapshot = snapshot === null ? next : {
+      ...next,
+      additional_limits: snapshot.additional_limits,
+      credits: snapshot.credits,
+      individual_limit: snapshot.individual_limit,
+      promo_message: next.promo_message ?? snapshot.promo_message,
+    };
   } else {
   snapshot = snapshot === null ? next : {
     plan_type: next.plan_type ?? snapshot.plan_type,
