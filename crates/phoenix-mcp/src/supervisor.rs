@@ -98,7 +98,7 @@ impl SupervisorHandle {
         let (snapshots, snapshot) = watch::channel(initial.clone());
         tokio::spawn(
             Actor {
-                mailbox: mailbox.clone(),
+                mailbox: mailbox.downgrade(),
                 commands,
                 snapshots,
                 snapshot: initial,
@@ -350,7 +350,7 @@ enum Command {
 }
 
 struct Actor {
-    mailbox: mpsc::Sender<Command>,
+    mailbox: mpsc::WeakSender<Command>,
     commands: mpsc::Receiver<Command>,
     snapshots: watch::Sender<Snapshot>,
     snapshot: Snapshot,
@@ -402,7 +402,10 @@ impl Actor {
                 let context = server.call_context();
                 let epoch = self.epoch;
                 if context.is_http() {
-                    let mailbox = self.mailbox.clone();
+                    let Some(mailbox) = self.mailbox.upgrade() else {
+                        let _ = reply.send(Err(stopped()));
+                        return;
+                    };
                     tokio::spawn(async move {
                         let result = context.call_tool(&tool, arguments, &cancel).await;
                         if let Err(error) = mailbox
@@ -423,7 +426,10 @@ impl Actor {
                     let call_id = self.next_call_id;
                     self.next_call_id = self.next_call_id.wrapping_add(1);
                     let cancellation = cancel.clone();
-                    let mailbox = self.mailbox.clone();
+                    let Some(mailbox) = self.mailbox.upgrade() else {
+                        let _ = reply.send(Err(stopped()));
+                        return;
+                    };
                     tokio::spawn(async move {
                         cancellation.cancelled().await;
                         let _ = mailbox.send(Command::CancelQueued { call_id }).await;
@@ -601,7 +607,11 @@ impl Actor {
                 continue;
             }
             self.stdio_active = true;
-            let mailbox = self.mailbox.clone();
+            let Some(mailbox) = self.mailbox.upgrade() else {
+                let _ = call.reply.send(Err(stopped()));
+                self.stdio_active = false;
+                continue;
+            };
             tokio::spawn(async move {
                 let result = call
                     .context
