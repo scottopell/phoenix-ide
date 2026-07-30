@@ -2217,6 +2217,9 @@ impl McpClientManager {
                 | SupervisorState::Removed => Vec::new(),
             };
             let (state, last_error) = match &snapshot.state {
+                SupervisorState::Ready(_) if pending_url.is_some() => {
+                    (McpConnState::Unauthorized, None)
+                }
                 SupervisorState::Ready(_) => (McpConnState::Ready, None),
                 SupervisorState::Recovering if snapshot.pending_oauth_url.is_some() => {
                     (McpConnState::Unauthorized, None)
@@ -2269,6 +2272,12 @@ impl McpClientManager {
             let Ok(mut outcome) = handle.inspect().await else {
                 continue;
             };
+            if outcome.epoch != handle.snapshot().epoch {
+                let Ok(current) = handle.inspect().await else {
+                    continue;
+                };
+                outcome = current;
+            }
             if outcome.result.is_err()
                 && outcome.recoverable
                 && self
@@ -2755,11 +2764,8 @@ impl McpClientManager {
                 Some(handle) if handle.snapshot().config == config => {
                     match handle.snapshot().state {
                         SupervisorState::Failed => (handle, true),
-                        SupervisorState::Connecting => {
-                            added.push(name);
-                            continue;
-                        }
                         SupervisorState::Ready(_)
+                        | SupervisorState::Connecting
                         | SupervisorState::Recovering
                         | SupervisorState::Removed => {
                             unchanged.push(name);
