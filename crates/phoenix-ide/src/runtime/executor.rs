@@ -2614,18 +2614,18 @@ where
     }
 
     async fn cancel_parked_wake(&mut self, workflow_id: u64) -> Result<(), String> {
+        let workflow_id = phoenix_workflow::types::WorkflowId(workflow_id);
+        self.wake_cancellations_owed.insert(workflow_id);
         let registrar = self
             .wake_registrar
             .clone()
             .ok_or_else(|| "parked wake completed without a wake registrar".to_string())?;
-        let workflow_id = phoenix_workflow::types::WorkflowId(workflow_id);
         let timestamp = phoenix_workflow::types::Timestamp(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
         );
-        self.wake_cancellations_owed.insert(workflow_id);
         if let Err(error) = registrar
             .cancel(crate::tools::CancelWakeInput {
                 workflow_id,
@@ -2643,6 +2643,26 @@ where
             self.wake_cancellations_owed.remove(&workflow_id);
         }
         Ok(())
+    }
+
+    async fn roll_back_failed_wake_transition(
+        &mut self,
+        registration: &WakeRegistrationNotice,
+        state: ConvState,
+        state_updated_at: chrono::DateTime<Utc>,
+    ) {
+        self.state = state;
+        self.state_updated_at = state_updated_at;
+        if let Some(state_watcher) = &self.state_watcher {
+            let _ = state_watcher.send(self.state.clone());
+        }
+        if let Err(error) = self.cancel_parked_wake(registration.workflow_id).await {
+            tracing::warn!(
+                %error,
+                workflow_id = registration.workflow_id,
+                "uncommitted wake cancellation remains owed after transition failure"
+            );
+        }
     }
 
     async fn process_outcome(&mut self, mut outcome: EffectOutcome) -> Result<(), String> {
@@ -2720,8 +2740,22 @@ where
 
         self.classify_active_direct_turn_outcome_terminal(&result.new_state);
 
-        // Apply transition result and process any generated events
-        let mut events_to_process = self.apply_transition_result(result).await?;
+        let state_before_transition = self.state.clone();
+        let state_updated_at_before_transition = self.state_updated_at;
+        let mut events_to_process = match self.apply_transition_result(result).await {
+            Ok(events) => events,
+            Err(error) => {
+                if let Some(registration) = &wake_registration {
+                    self.roll_back_failed_wake_transition(
+                        registration,
+                        state_before_transition,
+                        state_updated_at_before_transition,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
 
         if let Some(registration) = wake_registration {
             self.publish_wake_registration(registration);
@@ -9478,6 +9512,82 @@ mod context_exhausted_preserves_worktree_tests {
 
         runtime.persist_checkpoint(checkpoint).await.unwrap();
 
+        assert_eq!(
+            registrar
+                .activation_notifications
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_park_checkpoint_cancels_registration_and_restores_live_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_persist_tool_round(true);
+        let assistant_message = phoenix_core::domain::sm_state::AssistantMessage::new(
+            "round-1".to_string(),
+            vec![phoenix_llm::ContentBlock::ToolUse {
+                id: "wait-1".to_string(),
+                name: "wait_until".to_string(),
+                input: serde_json::json!({}),
+            }],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "wait-1",
+                ToolInput::from_name_and_value(
+                    "wait_until",
+                    serde_json::json!({ "handle": "b-1" }),
+                ),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            park_after_tool_round: true,
+            pending_sub_agents: vec![],
+            assistant_message,
+        };
+        let state_before = state.clone();
+        let (mut runtime, _) = build_runtime_with_state(
+            storage,
+            "failed-park-checkpoint",
+            temp.path().to_path_buf(),
+            state,
+        );
+        let registrar = Arc::new(RecordingWakeRegistrar {
+            cancelled: std::sync::Mutex::new(vec![]),
+            activation_notifications: std::sync::atomic::AtomicUsize::new(0),
+        });
+        runtime.wake_registrar = Some(registrar.clone());
+
+        let error = runtime
+            .process_outcome(EffectOutcome::Tool(ToolExecOutcome::CompletedAndPark {
+                result: phoenix_core::domain::db_schema::ToolResult::success(
+                    "wait-1".to_string(),
+                    "registered".to_string(),
+                ),
+                registration: WakeRegistrationNotice {
+                    workflow_id: 31,
+                    contract_id: "wake-31".to_string(),
+                    resource_kind: "BashHandle".to_string(),
+                    handle_id: "b-1".to_string(),
+                    condition: "handle_terminal".to_string(),
+                    expires_at: 600,
+                },
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "injected tool-round persistence failure");
+        assert_eq!(runtime.state, state_before);
+        assert_eq!(
+            *registrar.cancelled.lock().unwrap(),
+            vec![phoenix_workflow::WorkflowId(31)]
+        );
+        assert!(runtime.registered_wake_workflows.is_empty());
+        assert!(runtime.wake_cancellations_owed.is_empty());
         assert_eq!(
             registrar
                 .activation_notifications

@@ -536,6 +536,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    fail_persist_tool_round: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -562,6 +563,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_calls: Mutex::new(Vec::new()),
             settle_active_direct_turn_started: Mutex::new(None),
             settle_active_direct_turn_release: Mutex::new(None),
+            fail_persist_tool_round: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -573,6 +575,10 @@ impl InMemoryStorage {
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), tokens);
+    }
+
+    pub fn set_fail_persist_tool_round(&self, fail: bool) {
+        *self.fail_persist_tool_round.lock().unwrap() = fail;
     }
 
     /// Make `get_clear_watermark` return an error (test the read-failure path).
@@ -997,6 +1003,9 @@ impl MessageStore for InMemoryStorage {
         assistant: &Message,
         tool_results: &[Message],
     ) -> Result<(), String> {
+        if *self.fail_persist_tool_round.lock().unwrap() {
+            return Err("injected tool-round persistence failure".to_string());
+        }
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();
         bucket.push(assistant.clone());

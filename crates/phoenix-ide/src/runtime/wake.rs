@@ -583,7 +583,7 @@ fn sort_pending_for_materialization(pending: &mut [WakePendingDelivery]) {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn deliver_pending(
+pub(crate) async fn deliver_pending(
     manager: &Arc<RuntimeManager>,
     repo: &WakeRepository,
     now: Timestamp,

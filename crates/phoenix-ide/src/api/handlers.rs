@@ -3739,6 +3739,7 @@ async fn cancel_wake(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let _acceptance_guard = state.runtime.lock_conversation_acceptance(&id).await;
     let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
     let row = repo
         .fetch_binding_for_conversation_contract(&id, &contract_id)
@@ -3778,6 +3779,14 @@ async fn cancel_wake(
             ))));
         }
     }
+    crate::runtime::wake::deliver_pending(
+        &state.runtime,
+        &repo,
+        phoenix_workflow::Timestamp(chrono::Utc::now().timestamp().max(0).cast_unsigned()),
+        Some(&id),
+    )
+    .await
+    .map_err(AppError::Internal)?;
     state.runtime.kick_wake_worker();
     Ok(axum::Json(SuccessResponse { success: true }))
 }
@@ -14490,6 +14499,36 @@ mod wake_handler_tests {
             .expect("body bytes");
         let payload: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(payload["error_type"], "wake_already_resolved");
+    }
+
+    #[tokio::test]
+    async fn cancel_wake_materializes_observation_before_releasing_admission() {
+        let state = make_test_state().await;
+        seed_conversation(&state, "conv-cancel-order").await;
+        register_bash_wake(&state, 6150, "conv-cancel-order", "contract-cancel-order").await;
+
+        let response =
+            cancel_via_router(&state, "conv-cancel-order", "contract-cancel-order").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+        let link = repo
+            .get_delivery_message_link(
+                phoenix_workflow::WorkflowId(6150),
+                phoenix_workflow::DeliveryId(1),
+            )
+            .await
+            .expect("load delivery link")
+            .expect("cancelled observation must be materialized before handler returns");
+        assert_eq!(
+            link.linked_message.message.conversation_id,
+            "conv-cancel-order"
+        );
+        let crate::db::MessageContent::User(user) = &link.linked_message.message.content else {
+            panic!("wake cancellation must materialize as a user observation");
+        };
+        assert!(user.is_meta);
+        assert!(user.text.contains("cancelled"));
     }
 
     #[tokio::test]
