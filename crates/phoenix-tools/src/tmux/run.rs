@@ -382,7 +382,7 @@ async fn wait_for_text_response(
     ctx: &ToolContext,
     config_path: &Path,
     socket_path: &Path,
-    _server_token: &str,
+    server_token: &str,
     target: &TmuxRunTarget,
     cwd: &Path,
     cmd: &str,
@@ -423,8 +423,17 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            if close_after_completion && exited {
-                let _ = kill_window(config_path, socket_path, &target.window_id).await;
+            if close_after_completion {
+                if exited {
+                    let _ = kill_window(config_path, socket_path, &target.window_id).await;
+                } else {
+                    spawn_completion_cleanup(
+                        config_path.to_path_buf(),
+                        socket_path.to_path_buf(),
+                        server_token.to_string(),
+                        target.window_id.clone(),
+                    );
+                }
             }
             return response;
         }
@@ -449,6 +458,30 @@ async fn wait_for_text_response(
             () = tokio::time::sleep(READINESS_POLL_INTERVAL) => {}
         }
     }
+}
+
+fn spawn_completion_cleanup(
+    config_path: PathBuf,
+    socket_path: PathBuf,
+    server_token: String,
+    window_id: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            let observation = observe_window(&config_path, &socket_path, &window_id, None).await;
+            match observation {
+                Ok(observation) if observation.exit_code.is_some() => {
+                    let _ = kill_window(&config_path, &socket_path, &window_id).await;
+                    return;
+                }
+                Err(_) => return,
+                Ok(_) => tokio::time::sleep(READINESS_POLL_INTERVAL).await,
+            }
+            if server_token.is_empty() {
+                return;
+            }
+        }
+    });
 }
 
 #[allow(clippy::result_large_err)]
@@ -928,6 +961,32 @@ mod tests {
             capture.success(),
             "running window must remain available after readiness observation"
         );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = tokio::process::Command::new("tmux")
+                    .args([
+                        "-S",
+                        &sock.to_string_lossy(),
+                        "list-windows",
+                        "-F",
+                        "#{window_id}",
+                    ])
+                    .env_remove("TMUX")
+                    .output()
+                    .await
+                    .unwrap();
+                let exists = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|id| id == window_id);
+                if !exists {
+                    break;
+                }
+                // test-timing-allow: external tmux exposes window removal only by observation
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("readiness window must close after command completion");
         owner.shutdown();
     }
 
