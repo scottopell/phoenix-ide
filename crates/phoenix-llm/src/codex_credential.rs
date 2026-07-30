@@ -309,7 +309,7 @@ fn file_mtime(path: &PathBuf) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
-/// Credential source for Phoenix's native ChatGPT OAuth session.
+/// Credential source for Phoenix's native `ChatGPT` OAuth session.
 pub struct CodexCredential {
     auth_path: PathBuf,
     inner: Mutex<InnerState>,
