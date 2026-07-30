@@ -1925,6 +1925,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reload_replaces_a_revoked_credential_from_the_existing_auth_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let access_token = "e30.eyJleHAiOjQxMDI0NDQ4MDB9.";
+        std::fs::write(
+            &auth_path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{access_token}","refresh_token":"r","account_id":"acc-1"}}}}"#
+            ),
+        )
+        .unwrap();
+        let initial = crate::CodexCredential::load(auth_path.clone()).unwrap().0;
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(Arc::clone(&initial)),
+            codex_credential_path: Some(auth_path.clone()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        initial.revoke().await;
+        assert!(initial.get().await.is_none());
+
+        let outcome = registry.reload_codex_credential_with(Some(auth_path));
+        assert!(outcome.credential_loaded);
+        let restored = registry.current_codex_credential().unwrap();
+        assert!(!Arc::ptr_eq(&initial, &restored));
+        assert_eq!(restored.get().await.as_deref(), Some(access_token));
+    }
+
     /// Reload to None (e.g. file deleted) deregisters the `OpenAI` bridge.
     /// Future logout flow will rely on this contract.
     #[test]

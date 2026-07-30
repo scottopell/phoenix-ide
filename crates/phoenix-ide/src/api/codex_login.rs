@@ -1021,7 +1021,12 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
+            let registry = state.llm_registry.clone();
+            let restored = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
+                .await
+                .ok();
             tracing::warn!(error = %e, path = %auth_path.display(),
+                credential_restored = restored.as_ref().is_some_and(|o| o.credential_loaded),
                 "codex_login: signout failed to remove auth file");
             return Json(serde_json::json!({
                 "ok": false,
