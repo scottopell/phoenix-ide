@@ -535,7 +535,9 @@ impl Actor {
                 if epoch == self.epoch
                     && matches!(
                         self.state,
-                        SupervisorState::Connecting | SupervisorState::Recovering
+                        SupervisorState::Connecting
+                            | SupervisorState::Recovering
+                            | SupervisorState::Failed
                     )
                 {
                     self.recovery_from = None;

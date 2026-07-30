@@ -2517,7 +2517,10 @@ impl McpClientManager {
             }
             RecoveryClaim::Follow(mut snapshots) => loop {
                 let snapshot = snapshots.borrow().clone();
-                if !matches!(snapshot.state, SupervisorState::Recovering) {
+                if !matches!(
+                    snapshot.state,
+                    SupervisorState::Recovering | SupervisorState::Connecting
+                ) {
                     return if snapshot.is_ready() {
                         Ok(())
                     } else {
