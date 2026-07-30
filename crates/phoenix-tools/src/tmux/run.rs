@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use super::TmuxError;
 use crate::{Tool, ToolContext, ToolOutput};
 
 use super::parse_last_exit_marker;
+use super::registry::TmuxRegistry;
 
 const TMUX_RUN_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -428,8 +430,8 @@ async fn wait_for_text_response(
                     let _ = kill_window(config_path, socket_path, &target.window_id).await;
                 } else {
                     spawn_completion_cleanup(
-                        config_path.to_path_buf(),
-                        socket_path.to_path_buf(),
+                        ctx.tmux_registry().clone(),
+                        ctx.work_scope.clone(),
                         server_token.to_string(),
                         target.window_id.clone(),
                     );
@@ -461,24 +463,25 @@ async fn wait_for_text_response(
 }
 
 fn spawn_completion_cleanup(
-    config_path: PathBuf,
-    socket_path: PathBuf,
+    registry: Arc<TmuxRegistry>,
+    work_scope: phoenix_core::work_scope::ResourceScopeKey,
     server_token: String,
     window_id: String,
 ) {
     tokio::spawn(async move {
         loop {
-            let observation = observe_window(&config_path, &socket_path, &window_id, None).await;
-            match observation {
-                Ok(observation) if observation.exit_code.is_some() => {
-                    let _ = kill_window(&config_path, &socket_path, &window_id).await;
+            match registry
+                .inspect_existing_window(&work_scope, &server_token, &window_id)
+                .await
+            {
+                Ok(Some(observation)) if observation.exit_code.is_some() => {
+                    let _ = registry
+                        .kill_exact_window(&work_scope, &server_token, &window_id)
+                        .await;
                     return;
                 }
-                Err(_) => return,
-                Ok(_) => tokio::time::sleep(READINESS_POLL_INTERVAL).await,
-            }
-            if server_token.is_empty() {
-                return;
+                Ok(None) | Err(_) => return,
+                Ok(Some(_)) => tokio::time::sleep(READINESS_POLL_INTERVAL).await,
             }
         }
     });
