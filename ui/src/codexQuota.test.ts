@@ -80,6 +80,11 @@ describe('Codex quota store', () => {
       primary: { used_percent: 3, window_minutes: 300, resets_at: 1_800_000_000 },
       secondary: { used_percent: 4, window_minutes: 10_080, resets_at: 1_800_500_000 },
       individual_limit: { limit: '100', used: '25', remaining_percent: 75, resets_at: 1_800_000_000 },
+      additional_limits: [{
+        limit_name: 'family_b',
+        primary: { used_percent: 7, window_minutes: 300, resets_at: 1_800_000_000 },
+        secondary: null,
+      }],
     }));
 
     mergeCodexQuota(quota({
@@ -91,6 +96,7 @@ describe('Codex quota store', () => {
     expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(8);
     expect(getCodexQuotaSnapshot()?.secondary).toBeNull();
     expect(getCodexQuotaSnapshot()?.individual_limit?.remaining_percent).toBe(75);
+    expect(getCodexQuotaSnapshot()?.additional_limits).toEqual([]);
   });
 
   it('rejects stale turn snapshots after sign-out', () => {
