@@ -121,6 +121,13 @@ class ModernSeedTest(unittest.TestCase):
                     )
                     self.assertEqual(
                         conn.execute(
+                            "SELECT work_scope_id FROM conversations"
+                            " WHERE slug = 'fixture-diff-review'"
+                        ).fetchone()[0],
+                        fixture_scope,
+                    )
+                    self.assertEqual(
+                        conn.execute(
                             "SELECT COUNT(*) FROM messages"
                             " WHERE message_type = 'user'"
                             " AND json_type(content, '$.images') IS NOT NULL"

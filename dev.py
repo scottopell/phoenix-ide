@@ -2435,7 +2435,10 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         )
         return scope_id
 
-    def _delete_fixture_conversation(conn: sqlite3.Connection, conversation_id: str) -> None:
+    def _delete_fixture_conversation(
+        conn: sqlite3.Connection,
+        conversation_id: str,
+    ) -> str | None:
         row = conn.execute(
             "SELECT work_scope_id FROM conversations WHERE id = ?",
             (conversation_id,),
@@ -2450,6 +2453,12 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
                 " )",
                 (row[0], row[0]),
             )
+            scope_retained = conn.execute(
+                "SELECT 1 FROM work_scopes WHERE id = ?",
+                (row[0],),
+            ).fetchone()
+            return row[0] if scope_retained is not None else None
+        return None
 
     def _ensure_diff_review_fixture(
         conn: sqlite3.Connection,
@@ -2482,7 +2491,9 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
                 and environment == ("branch", str(worktree))
             ):
                 return False
-            _delete_fixture_conversation(conn, conv_id)
+            retained_scope = _delete_fixture_conversation(conn, conv_id)
+        else:
+            retained_scope = None
 
         conv_id = str(_uuid.uuid4())
         state_json = json.dumps({"type": "idle"})
@@ -2501,6 +2512,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             cwd=str(worktree),
             project_id=project_id,
             seed_label="qa:diff-review",
+            work_scope_id=retained_scope,
         )
         msg_id = str(_uuid.uuid4())
         conn.execute(
