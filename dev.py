@@ -2443,7 +2443,13 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         if row is not None and row[0] is not None:
-            conn.execute("DELETE FROM work_scopes WHERE id = ?", (row[0],))
+            conn.execute(
+                "DELETE FROM work_scopes WHERE id = ?"
+                " AND NOT EXISTS ("
+                " SELECT 1 FROM conversations WHERE work_scope_id = ?"
+                " )",
+                (row[0], row[0]),
+            )
 
     def _ensure_diff_review_fixture(
         conn: sqlite3.Connection,
@@ -2505,7 +2511,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             (
                 msg_id,
                 conv_id,
-                json.dumps({"text": _SEED_DIFF_REVIEW_TEXT, "images": []}),
+                json.dumps({"text": _SEED_DIFF_REVIEW_TEXT}),
                 now,
             ),
         )
@@ -2628,7 +2634,6 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
                 conv_id,
                 json.dumps({
                     "text": "Review the seeded Grounding Panel QA integration conversation",
-                    "images": [],
                 }),
                 now,
             ),
@@ -2665,7 +2670,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         )
         # One user message so the conv looks lived-in (message_count > 0).
         msg_id = str(_uuid.uuid4())
-        user_content = json.dumps({"text": text, "images": []})
+        user_content = json.dumps({"text": text})
         conn.execute(
             "INSERT INTO messages ("
             " message_id, conversation_id, sequence_id, message_type,"
@@ -2792,7 +2797,6 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             if seq % 2 == 0:
                 content = {
                     "text": f"Fixture user turn {seq // 2 + 1}: {_perf_text(80)}",
-                    "images": [],
                 }
                 message_type = "user"
             else:
@@ -2928,7 +2932,6 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
                         f"Heavy fixture user turn {turn + 1}.\n\n"
                         f"{_perf_text(user_words)}"
                     ),
-                    "images": [],
                 },
             )
             seq += 1

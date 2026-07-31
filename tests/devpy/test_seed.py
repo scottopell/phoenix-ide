@@ -22,12 +22,17 @@ class ModernSeedTest(unittest.TestCase):
         cls.dev = load_devpy()
         binary = ROOT / "target" / "release" / "phoenix_ide"
         if not binary.exists():
-            raise unittest.SkipTest("release phoenix_ide binary is required")
+            cls.dev.build_rust(release=True)
+        if not binary.exists():
+            raise AssertionError(f"release phoenix_ide binary was not built: {binary}")
 
     def test_fresh_seed_and_fixture_repair_use_migrated_schema(self):
         with tempfile.TemporaryDirectory(prefix="phoenix-modern-seed-") as directory:
             db_path = Path(directory) / "seed.db"
-            with mock.patch.object(self.dev, "get_db_path", return_value=db_path):
+            with (
+                mock.patch.object(self.dev, "get_db_path", return_value=db_path),
+                mock.patch.object(self.dev, "get_pid", return_value=None),
+            ):
                 self.dev.cmd_seed(build=False)
                 with sqlite3.connect(db_path) as conn:
                     columns = {
@@ -45,6 +50,39 @@ class ModernSeedTest(unittest.TestCase):
                         "SELECT id FROM conversations WHERE slug = 'fixture-diff-review'"
                     ).fetchone()
                     self.assertIsNotNone(fixture)
+                    fixture_id = fixture[0]
+                    fixture_scope = conn.execute(
+                        "SELECT work_scope_id FROM conversations WHERE id = ?",
+                        (fixture_id,),
+                    ).fetchone()[0]
+                    user_content = conn.execute(
+                        "SELECT content FROM messages"
+                        " WHERE conversation_id = ? AND message_type = 'user'",
+                        (fixture_id,),
+                    ).fetchone()[0]
+                    self.assertNotIn('"images"', user_content)
+
+                    columns = [
+                        row[1] for row in conn.execute("PRAGMA table_info(conversations)")
+                    ]
+                    source = conn.execute(
+                        f"SELECT {', '.join(columns)} FROM conversations WHERE id = ?",
+                        (fixture_id,),
+                    ).fetchone()
+                    successor = dict(zip(columns, source, strict=True))
+                    successor.update({
+                        "id": "seed-repair-successor",
+                        "slug": "seed-repair-successor",
+                        "title": "Seed Repair Successor",
+                        "parent_conversation_id": None,
+                        "seed_label": None,
+                        "continued_in_conv_id": None,
+                    })
+                    conn.execute(
+                        f"INSERT INTO conversations ({', '.join(columns)})"
+                        f" VALUES ({', '.join('?' for _ in columns)})",
+                        tuple(successor[column] for column in columns),
+                    )
                     conn.execute(
                         "DELETE FROM messages WHERE conversation_id = ?", fixture
                     )
@@ -60,6 +98,28 @@ class ModernSeedTest(unittest.TestCase):
                             " WHERE c.slug = 'fixture-diff-review'"
                         ).fetchone()[0],
                         1,
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT work_scope_id FROM conversations WHERE id = ?",
+                            ("seed-repair-successor",),
+                        ).fetchone()[0],
+                        fixture_scope,
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM work_scopes WHERE id = ?",
+                            (fixture_scope,),
+                        ).fetchone()[0],
+                        1,
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM messages"
+                            " WHERE message_type = 'user'"
+                            " AND json_type(content, '$.images') IS NOT NULL"
+                        ).fetchone()[0],
+                        0,
                     )
                     self.assertEqual(
                         conn.execute(
