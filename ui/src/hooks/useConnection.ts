@@ -372,7 +372,11 @@ export function useConnection({
 
           on('init', (e) => {
             const res = parseEvent(SseInitDataSchema, e, 'init', stampedDispatch);
-            if (!res.ok) return;
+            if (!res.ok) {
+              const telemetry = measurement.error();
+              if (telemetry) reportConversationOpen(telemetry);
+              return;
+            }
 
             dispatchMachineRef.current({ type: 'SSE_OPEN' });
             const payload = transformInitData(res.data);

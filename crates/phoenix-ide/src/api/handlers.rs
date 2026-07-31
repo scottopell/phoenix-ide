@@ -2267,19 +2267,48 @@ struct StreamConversationQuery {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ConversationOpenOutcome {
-    Connected,
-    Error,
-    Canceled,
+#[serde(tag = "outcome", rename_all = "lowercase")]
+enum ConversationOpenPhases {
+    Connected {
+        native_open_ms: Option<f64>,
+        init_received_ms: f64,
+        handler_ms: f64,
+    },
+    Error {
+        native_open_ms: Option<f64>,
+        init_received_ms: Option<f64>,
+        handler_ms: Option<f64>,
+    },
+    Canceled {
+        native_open_ms: Option<f64>,
+        init_received_ms: Option<f64>,
+        handler_ms: Option<f64>,
+    },
 }
 
-impl ConversationOpenOutcome {
-    fn as_str(&self) -> &'static str {
+impl ConversationOpenPhases {
+    fn values(&self) -> (&'static str, Option<f64>, Option<f64>, Option<f64>) {
         match self {
-            Self::Connected => "connected",
-            Self::Error => "error",
-            Self::Canceled => "canceled",
+            Self::Connected {
+                native_open_ms,
+                init_received_ms,
+                handler_ms,
+            } => (
+                "connected",
+                *native_open_ms,
+                Some(*init_received_ms),
+                Some(*handler_ms),
+            ),
+            Self::Error {
+                native_open_ms,
+                init_received_ms,
+                handler_ms,
+            } => ("error", *native_open_ms, *init_received_ms, *handler_ms),
+            Self::Canceled {
+                native_open_ms,
+                init_received_ms,
+                handler_ms,
+            } => ("canceled", *native_open_ms, *init_received_ms, *handler_ms),
         }
     }
 }
@@ -2310,10 +2339,8 @@ impl NetworkEffectiveType {
 #[derive(Debug, Deserialize)]
 struct ConversationOpenTelemetry {
     open_id: uuid::Uuid,
-    outcome: ConversationOpenOutcome,
-    native_open_ms: Option<f64>,
-    init_received_ms: Option<f64>,
-    handler_ms: Option<f64>,
+    #[serde(flatten)]
+    phases: ConversationOpenPhases,
     total_ms: f64,
     retry_attempt: u32,
     visible: bool,
@@ -2326,9 +2353,10 @@ impl ConversationOpenTelemetry {
         const MAX_RETRY_ATTEMPT: u32 = 10_000;
         let valid_duration =
             |value: f64| value.is_finite() && (0.0..=MAX_DURATION_MS).contains(&value);
-        self.native_open_ms.is_none_or(valid_duration)
-            && self.init_received_ms.is_none_or(valid_duration)
-            && self.handler_ms.is_none_or(valid_duration)
+        let (_, native_open_ms, init_received_ms, handler_ms) = self.phases.values();
+        native_open_ms.is_none_or(valid_duration)
+            && init_received_ms.is_none_or(valid_duration)
+            && handler_ms.is_none_or(valid_duration)
             && valid_duration(self.total_ms)
             && self.retry_attempt <= MAX_RETRY_ATTEMPT
     }
@@ -2352,6 +2380,22 @@ mod conversation_open_telemetry_tests {
             "effective_type":"content-bearing-value"
         }"#;
         assert!(serde_json::from_str::<ConversationOpenTelemetry>(report).is_err());
+    }
+
+    #[test]
+    fn connected_requires_completed_phase_timings() {
+        let report = serde_json::json!({
+            "open_id": "550e8400-e29b-41d4-a716-446655440000",
+            "outcome": "connected",
+            "native_open_ms": 1.0,
+            "init_received_ms": null,
+            "handler_ms": null,
+            "total_ms": 3.0,
+            "retry_attempt": 0,
+            "visible": true,
+            "effective_type": "4g"
+        });
+        assert!(serde_json::from_value::<ConversationOpenTelemetry>(report).is_err());
     }
 
     #[test]
@@ -2385,14 +2429,15 @@ async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>)
     if !report.has_valid_bounds() {
         return StatusCode::BAD_REQUEST;
     }
+    let (outcome, native_open_ms, init_received_ms, handler_ms) = report.phases.values();
     let span = tracing::info_span!(
         target: "phoenix_ide::otel",
         "browser.conversation_open",
         "open.id" = %report.open_id,
-        "browser.outcome" = report.outcome.as_str(),
-        "browser.native_open_ms" = report.native_open_ms,
-        "browser.init_received_ms" = report.init_received_ms,
-        "browser.handler_ms" = report.handler_ms,
+        "browser.outcome" = outcome,
+        "browser.native_open_ms" = native_open_ms,
+        "browser.init_received_ms" = init_received_ms,
+        "browser.handler_ms" = handler_ms,
         "browser.total_ms" = report.total_ms,
         "browser.retry_attempt" = report.retry_attempt,
         "browser.visible" = report.visible,
