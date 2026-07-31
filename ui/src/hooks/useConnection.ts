@@ -306,7 +306,6 @@ export function useConnection({
         clearTimeout(pending.timeout);
         pendingCancellationRef.current = null;
         reportConversationOpen(pending.telemetry);
-        return;
       }
       const telemetry = openMeasurementRef.current?.canceled();
       openMeasurementRef.current = null;
