@@ -29,9 +29,15 @@ class ModernSeedTest(unittest.TestCase):
     def test_fresh_seed_and_fixture_repair_use_migrated_schema(self):
         with tempfile.TemporaryDirectory(prefix="phoenix-modern-seed-") as directory:
             db_path = Path(directory) / "seed.db"
+            seed_worktree_root = Path(directory) / "seed-worktrees"
             with (
                 mock.patch.object(self.dev, "get_db_path", return_value=db_path),
                 mock.patch.object(self.dev, "get_pid", return_value=None),
+                mock.patch.object(
+                    self.dev,
+                    "SEED_WORKTREE_ROOT",
+                    seed_worktree_root,
+                ),
             ):
                 self.dev.cmd_seed(build=False)
                 with sqlite3.connect(db_path) as conn:
@@ -134,7 +140,7 @@ class ModernSeedTest(unittest.TestCase):
                             " WHERE work_scope_id = ?",
                             (repaired_scope,),
                         ).fetchone()[0],
-                        str(ROOT / ".phoenix" / "seed-worktrees" / "diff-review-fixture"),
+                        str(seed_worktree_root / "diff-review-fixture"),
                     )
                     self.assertEqual(
                         conn.execute(

@@ -34,6 +34,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent.resolve()
+SEED_WORKTREE_ROOT = ROOT / ".phoenix" / "seed-worktrees"
 
 UI_DIR = ROOT / "ui"
 PHOENIX_PID_FILE = ROOT / ".phoenix.pid"
@@ -2297,7 +2298,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
 
     def _ensure_seed_diff_worktree() -> Path:
         """Create the deterministic Branch-mode diff fixture worktree."""
-        fixture = ROOT / ".phoenix" / "seed-worktrees" / "diff-review-fixture"
+        fixture = SEED_WORKTREE_ROOT / "diff-review-fixture"
         if fixture.exists():
             shutil.rmtree(fixture)
         fixture.mkdir(parents=True, exist_ok=True)
@@ -2532,7 +2533,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         return True
 
     def _ensure_grounding_panel_fixture_worktree() -> Path:
-        fixture = ROOT / ".phoenix" / "seed-worktrees" / "grounding-panel-qa"
+        fixture = SEED_WORKTREE_ROOT / "grounding-panel-qa"
         # Reuse an already-built worktree: rebuilding on every seed wastes a full
         # git init + commits for no DB change, and clobbers any manual edits a
         # developer made while reviewing. A `.git` dir is the "already built"
@@ -2615,7 +2616,9 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             ).fetchone()[0]
             if archived == 0 and message_count >= 1:
                 return False
-            _delete_fixture_conversation(conn, conv_id)
+            retained_scope = _delete_fixture_conversation(conn, conv_id)
+        else:
+            retained_scope = None
 
         conv_id = str(_uuid.uuid4())
         state_json = json.dumps({"type": "idle"})
@@ -2636,6 +2639,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             cwd=str(worktree),
             project_id=project_id,
             seed_label="qa:grounding-panel",
+            work_scope_id=retained_scope,
         )
         msg_id = str(_uuid.uuid4())
         conn.execute(
