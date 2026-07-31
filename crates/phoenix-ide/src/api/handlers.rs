@@ -2320,6 +2320,20 @@ struct ConversationOpenTelemetry {
     effective_type: Option<NetworkEffectiveType>,
 }
 
+impl ConversationOpenTelemetry {
+    fn has_valid_bounds(&self) -> bool {
+        const MAX_DURATION_MS: f64 = 300_000.0;
+        const MAX_RETRY_ATTEMPT: u32 = 10_000;
+        let valid_duration =
+            |value: f64| value.is_finite() && (0.0..=MAX_DURATION_MS).contains(&value);
+        self.native_open_ms.is_none_or(valid_duration)
+            && self.init_received_ms.is_none_or(valid_duration)
+            && self.handler_ms.is_none_or(valid_duration)
+            && valid_duration(self.total_ms)
+            && self.retry_attempt <= MAX_RETRY_ATTEMPT
+    }
+}
+
 #[cfg(test)]
 mod conversation_open_telemetry_tests {
     use super::ConversationOpenTelemetry;
@@ -2339,9 +2353,38 @@ mod conversation_open_telemetry_tests {
         }"#;
         assert!(serde_json::from_str::<ConversationOpenTelemetry>(report).is_err());
     }
+
+    #[test]
+    fn rejects_out_of_bounds_numbers() {
+        let valid = serde_json::json!({
+            "open_id": "550e8400-e29b-41d4-a716-446655440000",
+            "outcome": "connected",
+            "native_open_ms": 1.0,
+            "init_received_ms": 2.0,
+            "handler_ms": 1.0,
+            "total_ms": 3.0,
+            "retry_attempt": 0,
+            "visible": true,
+            "effective_type": "4g"
+        });
+        for (field, value) in [
+            ("total_ms", serde_json::json!(-1)),
+            ("total_ms", serde_json::json!(300_001)),
+            ("retry_attempt", serde_json::json!(10_001)),
+        ] {
+            let mut report = valid.clone();
+            report[field] = value;
+            assert!(!serde_json::from_value::<ConversationOpenTelemetry>(report)
+                .unwrap()
+                .has_valid_bounds());
+        }
+    }
 }
 
 async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>) -> StatusCode {
+    if !report.has_valid_bounds() {
+        return StatusCode::BAD_REQUEST;
+    }
     let span = tracing::info_span!(
         target: "phoenix_ide::otel",
         "browser.conversation_open",

@@ -13,6 +13,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { useConnection } from './useConnection';
 import type { SSEAction } from '../conversation/atom';
 import { ConversationStore } from '../conversation/ConversationStore';
@@ -220,6 +221,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
   });
 
   it('reports an unfinished open as canceled when the conversation changes', () => {
+    vi.useFakeTimers();
     const dispatch = vi.fn<(a: SSEAction) => void>();
     const { rerender } = renderHook(
       ({ convId }) => useConnection({ conversationId: convId, dispatch }),
@@ -231,6 +233,9 @@ describe('useConnection epoch stamping (task 08683)', () => {
     ).searchParams.get('open_id');
 
     rerender({ convId: 'conv-B' });
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
 
     const reports = vi.mocked(fetch).mock.calls.map((call) =>
       JSON.parse((call[1] as RequestInit).body as string) as {
@@ -249,6 +254,23 @@ describe('useConnection epoch stamping (task 08683)', () => {
       visible: expect.any(Boolean),
       effective_type: null,
     });
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it('does not report StrictMode effect replay as a canceled open', () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }), {
+      wrapper: StrictMode,
+    });
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 
   it('stamps every wire-derived dispatch with the connection epoch', () => {

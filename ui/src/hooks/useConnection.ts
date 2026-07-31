@@ -223,6 +223,10 @@ export function useConnection({
   const eventSourceRef = useRef<EventSource | null>(null);
   const openMeasurementRef = useRef<ConversationOpenMeasurement | null>(null);
   const openAttemptRef = useRef<{ conversationId: string; attempt: number } | null>(null);
+  const pendingCancellationRef = useRef<{
+    conversationId: string;
+    timeout: number;
+  } | null>(null);
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const reconnectedTimeoutRef = useRef<number | null>(null);
@@ -280,6 +284,19 @@ export function useConnection({
     dispatchMachineRef.current = dispatchMachine;
   }, [dispatchMachine]);
 
+  const reportCanceledOpen = useCallback((conversationId: string) => {
+    const telemetry = openMeasurementRef.current?.canceled();
+    openMeasurementRef.current = null;
+    if (!telemetry) return;
+    const timeout = window.setTimeout(() => {
+      if (pendingCancellationRef.current?.timeout === timeout) {
+        pendingCancellationRef.current = null;
+      }
+      reportConversationOpen(telemetry);
+    }, 0);
+    pendingCancellationRef.current = { conversationId, timeout };
+  }, []);
+
   const executeEffects = useCallback((effects: ConnectionEffect[]) => {
     for (const effect of effects) {
       switch (effect.type) {
@@ -287,12 +304,16 @@ export function useConnection({
           const convId = conversationIdRef.current;
           if (!convId) break;
 
+          const pendingCancellation = pendingCancellationRef.current;
+          if (pendingCancellation?.conversationId === convId) {
+            clearTimeout(pendingCancellation.timeout);
+            pendingCancellationRef.current = null;
+            openAttemptRef.current = null;
+          }
           if (eventSourceRef.current) {
-            const telemetry = openMeasurementRef.current?.canceled();
-            if (telemetry) reportConversationOpen(telemetry);
+            reportCanceledOpen(convId);
             eventSourceRef.current.close();
             eventSourceRef.current = null;
-            openMeasurementRef.current = null;
           }
 
           const epoch = effect.epoch;
@@ -320,9 +341,14 @@ export function useConnection({
             conversationIdRef.current === convId &&
             machineStateRef.current.epoch === epoch &&
             eventSourceRef.current === es;
-          const on = (type: string, handler: (e: Event) => void) => {
+          const on = (
+            type: string,
+            handler: (e: Event) => void,
+            beforeObserved?: () => void,
+          ) => {
             es.addEventListener(type, (e) => {
               if (!isCurrentOwner()) return;
+              beforeObserved?.();
               // REQ-WPV-004: bump the heartbeat-watchdog clock before
               // delegating to per-event processing, on EVERY named
               // event (native EventSource has no wildcard so this
@@ -345,7 +371,6 @@ export function useConnection({
           });
 
           on('init', (e) => {
-            measurement.initReceived();
             const res = parseEvent(SseInitDataSchema, e, 'init', stampedDispatch);
             if (!res.ok) return;
 
@@ -359,7 +384,7 @@ export function useConnection({
             });
             const telemetry = measurement.connected();
             if (telemetry) reportConversationOpen(telemetry);
-          });
+          }, () => measurement.initReceived());
 
           on('message', (e) => {
             const res = parseEvent(SseMessageDataSchema, e, 'message', stampedDispatch);
@@ -676,11 +701,9 @@ export function useConnection({
 
         case 'CLOSE_SSE': {
           if (eventSourceRef.current) {
-            const telemetry = openMeasurementRef.current?.canceled();
-            if (telemetry) reportConversationOpen(telemetry);
+            reportCanceledOpen(conversationIdRef.current ?? '');
             eventSourceRef.current.close();
             eventSourceRef.current = null;
-            openMeasurementRef.current = null;
           }
           break;
         }
@@ -772,7 +795,7 @@ export function useConnection({
         }
       }
     }
-  }, []);
+  }, [reportCanceledOpen]);
 
   const executeEffectsRef = useRef(executeEffects);
   useEffect(() => {
