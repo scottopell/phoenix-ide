@@ -997,7 +997,7 @@ export function StateBar({
   const workActionsPrRailOwnsSelection = Boolean(
     workActionsAvailable
     && (isWork || isBranchMode)
-    && ['idle', 'error', 'context_exhausted'].includes(convState.type)
+    && ['idle', 'error', 'recoverable_continuation_failure', 'context_exhausted'].includes(convState.type)
     && prRailAvailability?.shouldRender
   );
 
