@@ -2620,6 +2620,25 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         else:
             retained_scope = None
 
+        if retained_scope is not None:
+            retained_scope_valid = conn.execute(
+                "SELECT 1 FROM work_scopes s"
+                " JOIN work_scope_environments e ON e.work_scope_id = s.id"
+                " WHERE s.id = ? AND s.authority_kind = 'work'"
+                " AND s.lifecycle = 'active'"
+                " AND e.environment_kind = 'allocated_worktree'"
+                " AND e.cwd = ? AND e.worktree_path = ?"
+                " AND e.branch_name = ? AND e.base_branch = 'main'",
+                (
+                    retained_scope,
+                    str(worktree),
+                    str(worktree),
+                    "task-22001-redesign-conversation-grounding-side-panel",
+                ),
+            ).fetchone()
+            if retained_scope_valid is None:
+                retained_scope = None
+
         conv_id = str(_uuid.uuid4())
         state_json = json.dumps({"type": "idle"})
         _insert_modern_conversation(
