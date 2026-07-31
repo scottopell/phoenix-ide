@@ -46,6 +46,12 @@ class ModernSeedTest(unittest.TestCase):
                         ).fetchone()[0],
                         0,
                     )
+                    direct_scope_groups = conn.execute(
+                        "SELECT COUNT(*), COUNT(DISTINCT work_scope_id)"
+                        " FROM conversations"
+                        " WHERE slug GLOB 'refactor-the-database-connection-pool-current*'"
+                    ).fetchone()
+                    self.assertEqual(direct_scope_groups[0], direct_scope_groups[1])
                     fixture = conn.execute(
                         "SELECT id FROM conversations WHERE slug = 'fixture-diff-review'"
                     ).fetchone()

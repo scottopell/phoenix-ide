@@ -2709,6 +2709,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             "SELECT work_scope_id FROM conversations WHERE id = ?",
             (parent_id,),
         ).fetchone()[0]
+        continuation_scope = None if conv_mode["mode"] == "Direct" else parent_scope
         _insert_modern_conversation(
             conn,
             conversation_id=new_id,
@@ -2718,7 +2719,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             mode=conv_mode,
             cwd=cwd,
             project_id=project_id,
-            work_scope_id=parent_scope,
+            work_scope_id=continuation_scope,
         )
         # Continuation summary message bridges parent -> child in the UI.
         msg_id = str(_uuid.uuid4())
