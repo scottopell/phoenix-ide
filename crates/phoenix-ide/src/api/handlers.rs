@@ -2372,6 +2372,7 @@ impl ConversationOpenTelemetry {
                 ..
             } => {
                 *init_received_ms <= self.total_ms
+                    && native_open_ms.is_none_or(|value| value <= *init_received_ms)
                     && (*init_received_ms + *handler_ms - self.total_ms).abs() <= 0.2
             }
             ConversationOpenPhases::Error {
@@ -2379,7 +2380,9 @@ impl ConversationOpenTelemetry {
             }
             | ConversationOpenPhases::Canceled {
                 init_received_ms, ..
-            } => init_received_ms.is_none_or(|value| value <= self.total_ms),
+            } => init_received_ms.is_none_or(|init| {
+                init <= self.total_ms && native_open_ms.is_none_or(|native| native <= init)
+            }),
         };
         native_open_ms.is_none_or(|value| valid_duration(value) && value <= self.total_ms)
             && init_received_ms.is_none_or(valid_duration)

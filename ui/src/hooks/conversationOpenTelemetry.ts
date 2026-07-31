@@ -48,11 +48,15 @@ export class ConversationOpenMeasurement {
     if (this.initReceivedAt === null) return this.finishIncomplete('error');
     const common = this.finishCommon();
     if (!common) return null;
+    const initReceivedMs = Math.min(
+      boundedMs(this.initReceivedAt - this.startedAt),
+      common.payload.total_ms,
+    );
     return {
       ...common.payload,
       outcome: 'connected',
-      init_received_ms: boundedMs(this.initReceivedAt - this.startedAt),
-      handler_ms: boundedMs(common.finishedAt - this.initReceivedAt),
+      init_received_ms: initReceivedMs,
+      handler_ms: boundedMs(common.payload.total_ms - initReceivedMs),
     };
   }
 
@@ -90,7 +94,7 @@ export class ConversationOpenMeasurement {
         open_id: this.openId,
         native_open_ms: elapsed(this.nativeOpenedAt, this.startedAt),
         total_ms: boundedMs(finishedAt - this.startedAt),
-        retry_attempt: this.retryAttempt,
+        retry_attempt: Math.min(this.retryAttempt, 10_000),
         visible: document.visibilityState === 'visible',
         effective_type: networkEffectiveType(),
       },

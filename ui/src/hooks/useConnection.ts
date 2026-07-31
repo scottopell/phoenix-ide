@@ -137,6 +137,7 @@ export type { ConnectionState } from './connectionMachine';
 import {
   ConversationOpenMeasurement,
   reportConversationOpen,
+  type ConversationOpenTelemetryPayload,
 } from './conversationOpenTelemetry';
 
 export interface ConnectionInfo {
@@ -226,6 +227,7 @@ export function useConnection({
   const pendingCancellationRef = useRef<{
     conversationId: string;
     timeout: number;
+    telemetry: ConversationOpenTelemetryPayload;
   } | null>(null);
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
@@ -294,7 +296,19 @@ export function useConnection({
       }
       reportConversationOpen(telemetry);
     }, 0);
-    pendingCancellationRef.current = { conversationId, timeout };
+    pendingCancellationRef.current = { conversationId, timeout, telemetry };
+  }, []);
+
+  useEffect(() => {
+    const flushPendingCancellation = () => {
+      const pending = pendingCancellationRef.current;
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      pendingCancellationRef.current = null;
+      reportConversationOpen(pending.telemetry);
+    };
+    window.addEventListener('pagehide', flushPendingCancellation);
+    return () => window.removeEventListener('pagehide', flushPendingCancellation);
   }, []);
 
   const executeEffects = useCallback((effects: ConnectionEffect[]) => {
@@ -328,7 +342,7 @@ export function useConnection({
           const openId = generateUUID();
           const previousAttempt = openAttemptRef.current;
           const openAttempt = previousAttempt?.conversationId === convId
-            ? previousAttempt.attempt + 1
+            ? Math.min(previousAttempt.attempt + 1, 10_000)
             : 0;
           openAttemptRef.current = { conversationId: convId, attempt: openAttempt };
           const measurement = new ConversationOpenMeasurement(openId, openAttempt);

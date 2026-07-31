@@ -53,6 +53,23 @@ describe('ConversationOpenMeasurement', () => {
     expect(measurement.error()).toBeNull();
   });
 
+  it('preserves additive phases when the shared timeline saturates', () => {
+    const times = [0, 299_999, 400_000];
+    const measurement = new ConversationOpenMeasurement(
+      'open-saturated',
+      20_000,
+      () => times.shift()!,
+    );
+    measurement.initReceived();
+
+    expect(measurement.connected()).toMatchObject({
+      init_received_ms: 299_999,
+      handler_ms: 1,
+      total_ms: 300_000,
+      retry_attempt: 10_000,
+    });
+  });
+
   it('posts a bounded content-free payload with keepalive', () => {
     const payload = {
       open_id: 'open-3',
