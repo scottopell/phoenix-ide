@@ -306,6 +306,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_model_effort",
         sql: MIGRATION_058,
     },
+    Migration {
+        version: 59,
+        name: "add_conversation_state_kind_discriminator",
+        sql: MIGRATION_059,
+    },
 ];
 
 const MIGRATION_058: &str = r"
@@ -354,6 +359,24 @@ WHEN ((NEW.effort_source IN ('explicit', 'native_known')) != (NEW.effort_level I
 BEGIN
     SELECT RAISE(ABORT, 'invalid turn usage effort shape');
 END;
+";
+
+const MIGRATION_059: &str = r"
+ALTER TABLE conversations ADD COLUMN state_kind TEXT NOT NULL DEFAULT 'idle'
+    CHECK (state_kind IN (
+        'idle', 'llm_requesting', 'tool_executing', 'cancelling_tool',
+        'awaiting_sub_agents', 'cancelling_sub_agents', 'error',
+        'awaiting_continuation', 'recoverable_continuation_failure',
+        'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response',
+        'awaiting_commission_review_approval', 'context_exhausted',
+        'handed_off', 'terminal', 'completed', 'failed', 'provisioning',
+        'creation_failed', 'creation_cancelled', 'seeded_llm_requesting'
+    ));
+
+UPDATE conversations
+SET state_kind = json_extract(state, '$.type');
+
+CREATE INDEX IF NOT EXISTS idx_conversations_state_kind ON conversations(state_kind);
 ";
 
 const MIGRATION_057: &str = r"
@@ -2870,6 +2893,32 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         // column) and abort startup.
         let mut tx = pool.begin().await?;
 
+        if migration.version == 58 {
+            let state_kind_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'state_kind'
+                )",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if state_kind_exists {
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS idx_conversations_state_kind
+                     ON conversations(state_kind)",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+                    .bind(migration.version)
+                    .bind(migration.name)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                applied += 1;
+                continue;
+            }
+        }
+
         sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
 
         sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
@@ -3172,6 +3221,70 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    #[tokio::test]
+    async fn migration_058_adds_and_backfills_state_kind() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        sqlx::query("DROP INDEX IF EXISTS idx_conversations_state_kind")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE conversations DROP COLUMN state_kind")
+            .execute(&pool)
+            .await
+            .unwrap();
+        stamp_migrations_except(&pool, 58).await;
+
+        for (id, state_json) in [
+            ("idle", r#"{"type":"idle"}"#),
+            (
+                "awaiting-recovery",
+                r#"{"type":"awaiting_recovery","resume_target":{"kind":"resume"}}"#,
+            ),
+            (
+                "seeded",
+                r#"{"type":"seeded_llm_requesting","seed_message_id":"m1","attempt":1}"#,
+            ),
+            ("terminal", r#"{"type":"terminal"}"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO conversations (id, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, ?2, '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(state_json)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let applied = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(applied, 1);
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, state_kind FROM conversations ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("awaiting-recovery".into(), "awaiting_recovery".into()),
+                ("idle".into(), "idle".into()),
+                ("seeded".into(), "seeded_llm_requesting".into()),
+                ("terminal".into(), "terminal".into()),
+            ]
+        );
+
+        let indexed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_state_kind'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexed, 1);
     }
 
     #[tokio::test]

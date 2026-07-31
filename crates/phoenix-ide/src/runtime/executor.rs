@@ -4184,26 +4184,52 @@ where
                 let seq = self.broadcast_tx.next_seq();
                 let content = crate::db::MessageContent::continuation(summary.clone());
                 let message = crate::db::Message {
-                    message_id: format!("continuation-{operation_id}"),
+                    message_id: format!(
+                        "continuation-{}-{operation_id}",
+                        self.context.conversation_id
+                    ),
                     conversation_id: self.context.conversation_id.clone(),
                     sequence_id: seq,
                     message_type: content.message_type(),
                     content,
-                    display_data: Some(serde_json::json!({ "summary": summary })),
+                    display_data: None,
                     usage_data: None,
                     created_at: Utc::now(),
                 };
-                match self
-                    .storage
-                    .commit_continuation(
-                        &self.context.conversation_id,
-                        &operation_id,
-                        &message,
-                        &self.state,
-                        self.state_updated_at,
-                    )
-                    .await?
-                {
+                let used_direct_turn_settlement = self.active_direct_turn.is_some();
+                let continuation_outcome = if let Some(turn) = self.active_direct_turn.as_ref() {
+                    self.storage
+                        .settle_continuation_direct_turn(
+                            &crate::runtime::traits::ContinuationDirectTurnSettlement {
+                                turn: (**turn).clone(),
+                                terminal: self
+                                    .pending_direct_turn_terminal
+                                    .as_deref()
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                            reason: summary.clone(),
+                                        }
+                                    }),
+                                operation_id: operation_id.clone(),
+                                message: message.clone(),
+                                state: self.state.clone(),
+                                state_updated_at: self.state_updated_at,
+                            },
+                        )
+                        .await?
+                } else {
+                    self.storage
+                        .commit_continuation(
+                            &self.context.conversation_id,
+                            &operation_id,
+                            &message,
+                            &self.state,
+                            self.state_updated_at,
+                        )
+                        .await?
+                };
+                match continuation_outcome {
                     crate::db::ContinuationCommitOutcome::Applied => {
                         let _ = self.broadcast_tx.send_message(message);
                         let _ = self
@@ -4214,9 +4240,17 @@ where
                                 presentation_mode: self.state.presentation_mode().to_string(),
                                 state_updated_at: self.state_updated_at,
                             });
+                        self.active_direct_turn = None;
+                        self.pending_direct_turn_terminal = None;
+                        self.direct_turn_cancellation_initiated = false;
                     }
                     crate::db::ContinuationCommitOutcome::Duplicate => {
                         tracing::debug!(%operation_id, "ignoring duplicate continuation commit");
+                        if used_direct_turn_settlement {
+                            self.active_direct_turn = None;
+                            self.pending_direct_turn_terminal = None;
+                            self.direct_turn_cancellation_initiated = false;
+                        }
                     }
                     crate::db::ContinuationCommitOutcome::Stale => {
                         tracing::debug!(%operation_id, "ignoring stale continuation commit");
@@ -5929,6 +5963,7 @@ where
                             operation_id,
                             message: e.message.clone(),
                             error_kind: llm_error_to_db_error(e.kind),
+                            resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
                         }
                     };
                     let _ = event_tx.send(event).await;
@@ -9160,6 +9195,72 @@ mod authoritative_user_message_effect_tests {
             ConvState::Error { message, .. } if message == reason
         ));
         assert_eq!(rt.active_direct_turn, None);
+    }
+
+    #[tokio::test]
+    async fn continuation_commit_settles_active_direct_turn_atomically_before_broadcast() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let operation_id = "direct-turn-continuation-op".to_string();
+        let summary = "preserved continuation summary".to_string();
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(11),
+            generation: 0,
+        }));
+        rt.state = ConvState::ContextExhausted {
+            summary: summary.clone(),
+        };
+        rt.state_updated_at = Utc::now();
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: operation_id.clone(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            operation_id: operation_id.clone(),
+            summary: summary.clone(),
+        })
+        .await
+        .unwrap();
+
+        let settlements = storage.recorded_settle_continuation_direct_turn_calls();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].operation_id, operation_id);
+        assert_eq!(settlements[0].state, rt.state);
+        assert!(rt.active_direct_turn.is_none());
+        assert!(matches!(
+            storage.get_current_state(&rt.context.conversation_id),
+            Some(ConvState::ContextExhausted { .. })
+        ));
+        assert_eq!(
+            storage.get_all_messages(&rt.context.conversation_id).len(),
+            1
+        );
+
+        let first = rx.try_recv().expect("message broadcasted after commit");
+        assert!(matches!(first, SseEvent::Message { .. }));
+        let second = rx
+            .try_recv()
+            .expect("state change broadcasted after commit");
+        assert!(matches!(
+            second,
+            SseEvent::StateChange {
+                state: ConvState::ContextExhausted { .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

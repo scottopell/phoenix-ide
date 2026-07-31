@@ -2,6 +2,7 @@
 
 use crate::domain::db_schema::{ErrorKind, FileAttachment, ImageData, ToolResult};
 use crate::domain::skill_invocation::SkillInvocation;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,6 +519,7 @@ pub enum Event {
         operation_id: String,
         message: String,
         error_kind: ErrorKind,
+        resets_at: Option<DateTime<Utc>>,
     },
     /// User manually triggered continuation (REQ-BED-023)
     UserTriggerContinuation {
@@ -761,6 +763,7 @@ pub enum CoreEvent {
         operation_id: String,
         message: String,
         error_kind: ErrorKind,
+        resets_at: Option<DateTime<Utc>>,
     },
     UserTriggerContinuation {
         operation_id: String,
@@ -965,10 +968,12 @@ impl TryFrom<Event> for ParentEvent {
                 operation_id,
                 message,
                 error_kind,
+                resets_at,
             } => Ok(ParentEvent::Core(CoreEvent::ContinuationError {
                 operation_id,
                 message,
                 error_kind,
+                resets_at,
             })),
             Event::UserTriggerContinuation { operation_id } => {
                 Ok(ParentEvent::Core(CoreEvent::UserTriggerContinuation {
@@ -1146,10 +1151,12 @@ impl TryFrom<Event> for SubAgentEvent {
                 operation_id,
                 message,
                 error_kind,
+                resets_at,
             } => Ok(SubAgentEvent::Core(CoreEvent::ContinuationError {
                 operation_id,
                 message,
                 error_kind,
+                resets_at,
             })),
             Event::UserTriggerContinuation { operation_id } => {
                 Ok(SubAgentEvent::Core(CoreEvent::UserTriggerContinuation {

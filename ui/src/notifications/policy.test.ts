@@ -145,6 +145,31 @@ describe('notification policy reducer', () => {
     expect(result.effects).toHaveLength(0);
   });
 
+  it('notifies when continuation summary recovery needs attention', () => {
+    const blocked = conversation({
+      state: {
+        type: 'recoverable_continuation_failure',
+        message: 'Selected model is at capacity',
+        error_kind: 'server_overloaded',
+      },
+    });
+    const result = notificationPolicyReducer(
+      loadedState(),
+      {
+        type: 'conversation_state_changed',
+        conversation: blocked,
+        previousState: { type: 'awaiting_continuation', attempt: 3 },
+        nextState: blocked.state!,
+      },
+      env(),
+    );
+    expect(result.effects).toHaveLength(1);
+    expect(result.effects[0]).toMatchObject({
+      type: 'show_browser_notification',
+      title: 'Agent error',
+    });
+  });
+
   it('catch-up dedupes against a prior live delivery for the same blocking state', () => {
     const blocked = conversation({ state: { type: 'awaiting_user_response', questions: [] } });
     const live = notificationPolicyReducer(loadedState(),

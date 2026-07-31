@@ -536,6 +536,8 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    settle_continuation_direct_turn_calls:
+        Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -562,6 +564,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_calls: Mutex::new(Vec::new()),
             settle_active_direct_turn_started: Mutex::new(None),
             settle_active_direct_turn_release: Mutex::new(None),
+            settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -671,6 +674,15 @@ impl InMemoryStorage {
         &self,
     ) -> Vec<crate::runtime::traits::ActiveDirectTurnSettlement> {
         self.settle_active_direct_turn_calls.lock().unwrap().clone()
+    }
+
+    pub fn recorded_settle_continuation_direct_turn_calls(
+        &self,
+    ) -> Vec<crate::runtime::traits::ContinuationDirectTurnSettlement> {
+        self.settle_continuation_direct_turn_calls
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     pub fn gate_active_direct_turn_settlement(
@@ -933,6 +945,61 @@ impl MessageStore for InMemoryStorage {
         }
         *self.active_direct_turn.lock().unwrap() = None;
         Ok(())
+    }
+
+    async fn settle_continuation_direct_turn(
+        &self,
+        settlement: &crate::runtime::traits::ContinuationDirectTurnSettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        self.settle_continuation_direct_turn_calls
+            .lock()
+            .unwrap()
+            .push(settlement.clone());
+        let mut states = self.states.lock().unwrap();
+        let persisted = states
+            .get(&settlement.message.conversation_id)
+            .cloned()
+            .unwrap_or_default();
+        if matches!(
+            &persisted,
+            ConvState::ContextExhausted { summary }
+                if matches!(&settlement.state, ConvState::ContextExhausted { summary: completed } if summary == completed)
+        ) {
+            let duplicate = self
+                .messages
+                .lock()
+                .unwrap()
+                .get(&settlement.message.conversation_id)
+                .is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|item| item.message_id == settlement.message.message_id)
+                });
+            return Ok(if duplicate {
+                crate::db::ContinuationCommitOutcome::Duplicate
+            } else {
+                crate::db::ContinuationCommitOutcome::Stale
+            });
+        }
+        if !matches!(
+            &persisted,
+            ConvState::AwaitingContinuation { request }
+                if request.operation_id == settlement.operation_id
+        ) {
+            return Ok(crate::db::ContinuationCommitOutcome::Stale);
+        }
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(settlement.message.conversation_id.clone())
+            .or_default()
+            .push(settlement.message.clone());
+        states.insert(
+            settlement.message.conversation_id.clone(),
+            settlement.state.clone(),
+        );
+        *self.active_direct_turn.lock().unwrap() = None;
+        Ok(crate::db::ContinuationCommitOutcome::Applied)
     }
 
     async fn update_message_display_data(

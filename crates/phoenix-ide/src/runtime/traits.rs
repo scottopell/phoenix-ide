@@ -47,6 +47,16 @@ pub struct ActiveDirectTurnSettlement {
     pub state_updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ContinuationDirectTurnSettlement {
+    pub turn: ActiveDirectTurn,
+    pub terminal: ActiveDirectTurnTerminal,
+    pub operation_id: String,
+    pub message: Message,
+    pub state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthoritativeUserMessageAdoptionInput {
     pub authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
@@ -165,6 +175,14 @@ pub trait MessageStore: Send + Sync {
         &self,
         settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String>;
+
+    async fn settle_continuation_direct_turn(
+        &self,
+        settlement: &ContinuationDirectTurnSettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        let _ = settlement;
+        Ok(crate::db::ContinuationCommitOutcome::Stale)
+    }
 
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
@@ -504,6 +522,13 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String> {
         (**self).settle_active_direct_turn(settlement).await
+    }
+
+    async fn settle_continuation_direct_turn(
+        &self,
+        settlement: &ContinuationDirectTurnSettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        (**self).settle_continuation_direct_turn(settlement).await
     }
 
     async fn update_message_display_data(
@@ -976,6 +1001,28 @@ impl MessageStore for DatabaseStorage {
         )
         .await
         .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    async fn settle_continuation_direct_turn(
+        &self,
+        settlement: &ContinuationDirectTurnSettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        repo.settle_continuation_direct_turn_atomically(
+            &phoenix_db::workflow::AtomicContinuationSettlementInput {
+                conversation_id: settlement.message.conversation_id.clone(),
+                operation_id: settlement.operation_id.clone(),
+                message: settlement.message.clone(),
+                completed_state: settlement.state.clone(),
+                state_updated_at: settlement.state_updated_at,
+                command: direct_turn_terminal_command(
+                    &settlement.turn,
+                    settlement.terminal.clone(),
+                ),
+            },
+        )
+        .await
         .map_err(|error| error.to_string())
     }
 

@@ -30,7 +30,7 @@ Transient errors retain the same operation identity across bounded automatic ret
 - **Positive:** Capacity and other terminal attempt failures remain actionable without fabricating a continuation summary.
 - **Negative:** Continuation request and response events must carry operation identity, and persistence needs a continuation-specific atomic compare-and-commit operation.
 - **Negative:** External provider requests remain at-least-once; exactly-once applies to Phoenix's logical commit and continuation handoff.
-- **Neutral:** The persisted conversation state remains an indivisible polymorphic aggregate; compare-and-commit decodes and compares that aggregate rather than querying fields inside its JSON encoding.
+- **Neutral:** The persisted conversation state remains an indivisible polymorphic aggregate; compare-and-commit decodes and compares that aggregate rather than querying fields inside its JSON encoding. SQL lifecycle filters use a schema-constrained `state_kind` discriminator written atomically with the aggregate.
 
 ## References
 

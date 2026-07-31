@@ -143,6 +143,77 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+pub(crate) async fn commit_continuation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    operation_id: &str,
+    message: &Message,
+    completed_state: &ConvState,
+    state_updated_at: DateTime<Utc>,
+) -> DbResult<ContinuationCommitOutcome> {
+    let row = sqlx::query("SELECT state FROM conversations WHERE id = ?1")
+        .bind(conversation_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+    let persisted_json: String = row.get("state");
+    let persisted: ConvState = serde_json::from_str(&persisted_json)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+
+    let ConvState::ContextExhausted {
+        summary: completed_summary,
+    } = completed_state
+    else {
+        return Err(DbError::Serialization(
+            "continuation commit requires context exhausted state".to_string(),
+        ));
+    };
+    if matches!(
+        &persisted,
+        ConvState::ContextExhausted { summary } if summary == completed_summary
+    ) {
+        let exists = sqlx::query("SELECT 1 FROM messages WHERE message_id = ?1")
+            .bind(&message.message_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+        return Ok(if exists {
+            ContinuationCommitOutcome::Duplicate
+        } else {
+            ContinuationCommitOutcome::Stale
+        });
+    }
+
+    if !matches!(
+        &persisted,
+        ConvState::AwaitingContinuation { request }
+            if request.operation_id == operation_id
+    ) {
+        return Ok(ContinuationCommitOutcome::Stale);
+    }
+
+    insert_message_tx(tx, message).await?;
+    let completed_json = serde_json::to_string(completed_state)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let updated = sqlx::query(
+        "UPDATE conversations
+         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+         WHERE id = ?5 AND state = ?6",
+    )
+    .bind(completed_json)
+    .bind(conv_state_kind(completed_state))
+    .bind(state_updated_at.to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(conversation_id)
+    .bind(persisted_json)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(ContinuationCommitOutcome::Stale);
+    }
+    Ok(ContinuationCommitOutcome::Applied)
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertConversationCreationJob {
     pub id: String,
@@ -2844,8 +2915,8 @@ impl Database {
                 .await?;
             }
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -2853,6 +2924,7 @@ impl Database {
             .bind(parent_id)
             .bind(user_initiated)
             .bind(&idle_state)
+            .bind(conv_state_kind(&ConvState::Idle))
             .bind(&now_str)
             .bind(model)
             .bind(inherited_effort.map(ModelEffort::as_wire_name))
@@ -2962,12 +3034,13 @@ impl Database {
             let idle = serde_json::to_string(&ConvState::Idle)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_head, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, 'Coordinator', 1, 0, ?3, ?4, ?4, ?4, 0, 1, ?5, ?6, 'explore', 'coordinator', NULL)",
+                "INSERT INTO conversations (id, slug, title, coordinator_head, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, 'Coordinator', 1, 0, ?3, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
             )
             .bind(&id)
             .bind(slug)
             .bind(idle)
+            .bind(conv_state_kind(&ConvState::Idle))
             .bind(now)
             .bind(model)
             .bind(llm_language.as_str())
@@ -3153,7 +3226,7 @@ impl Database {
             "SELECT id, state FROM conversations
              WHERE archived = 0
                AND (user_initiated = 1 OR runtime_role = 'coordinator')
-               AND json_extract(state, '$.type') = 'error'
+               AND state_kind = 'error'
                AND json_extract(state, '$.error_kind') = 'usage_limit_reached'
                AND json_extract(state, '$.resets_at') IS NOT NULL",
         )
@@ -3406,14 +3479,15 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?6, ?6, 0, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'user', ?17)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'user', ?17)",
             )
             .bind(id)
             .bind(&actual_slug)
             .bind(&title_str)
             .bind(user_initiated)
             .bind(&creation_state_json)
+            .bind(conv_state_kind(&creation_state))
             .bind(&now_str)
             .bind(model)
             .bind(job.intent.effort.map(ModelEffort::as_wire_name))
@@ -3793,10 +3867,13 @@ impl Database {
         })
         .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
-            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE id = ?3",
+            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
         )
         .bind(state)
+        .bind(conv_state_kind(&ConvState::CreationCancelled {
+            job_id: job_id.clone(),
+        }))
         .bind(&now)
         .bind(conversation_id)
         .execute(&mut *tx)
@@ -3914,10 +3991,11 @@ impl Database {
             return Ok(CreationCasOutcome::ClaimLost);
         }
         let state_updated = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE id = ?3",
+            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
         )
         .bind(idle)
+        .bind(conv_state_kind(&ConvState::Idle))
         .bind(&now)
         .bind(conversation_id)
         .execute(&mut *tx)
@@ -4503,12 +4581,17 @@ impl Database {
             .await?;
             let conversation_updated = sqlx::query(
                 "UPDATE conversations
-                 SET state = ?1, state_updated_at = ?2, updated_at = ?2
+                 SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
                  WHERE id = (
-                     SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?3
+                     SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?4
                  )",
             )
             .bind(failed_state)
+            .bind(conv_state_kind(&ConvState::CreationFailed {
+                job_id: job_id.to_string(),
+                error: error.to_string(),
+                error_kind: error_kind.clone(),
+            }))
             .bind(&now)
             .bind(job_id)
             .execute(&mut *tx)
@@ -4600,70 +4683,22 @@ impl Database {
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<ContinuationCommitOutcome> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT state FROM conversations WHERE id = ?1")
-            .bind(conversation_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
-        let persisted_json: String = row.get("state");
-        let persisted: ConvState = serde_json::from_str(&persisted_json)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-
-        let ConvState::ContextExhausted {
-            summary: completed_summary,
-        } = completed_state
-        else {
-            return Err(DbError::Serialization(
-                "continuation commit requires context exhausted state".to_string(),
-            ));
-        };
-        if matches!(
-            &persisted,
-            ConvState::ContextExhausted { summary } if summary == completed_summary
-        ) {
-            let exists = sqlx::query("SELECT 1 FROM messages WHERE message_id = ?1")
-                .bind(&message.message_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
-            tx.rollback().await?;
-            return Ok(if exists {
-                ContinuationCommitOutcome::Duplicate
-            } else {
-                ContinuationCommitOutcome::Stale
-            });
-        }
-
-        if !matches!(
-            &persisted,
-            ConvState::AwaitingContinuation { request }
-                if request.operation_id == operation_id
-        ) {
-            tx.rollback().await?;
-            return Ok(ContinuationCommitOutcome::Stale);
-        }
-
-        insert_message_tx(&mut tx, message).await?;
-        let completed_json = serde_json::to_string(completed_state)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let updated = sqlx::query(
-            "UPDATE conversations
-             SET state = ?1, state_updated_at = ?2, updated_at = ?3
-             WHERE id = ?4 AND state = ?5",
+        let outcome = commit_continuation_tx(
+            &mut tx,
+            conversation_id,
+            operation_id,
+            message,
+            completed_state,
+            state_updated_at,
         )
-        .bind(completed_json)
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .bind(persisted_json)
-        .execute(&mut *tx)
         .await?;
-        if updated.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Ok(ContinuationCommitOutcome::Stale);
+        match outcome {
+            ContinuationCommitOutcome::Applied => tx.commit().await?,
+            ContinuationCommitOutcome::Duplicate | ContinuationCommitOutcome::Stale => {
+                tx.rollback().await?;
+            }
         }
-        tx.commit().await?;
-        Ok(ContinuationCommitOutcome::Applied)
+        Ok(outcome)
     }
 
     /// Update conversation state, stamping `state_updated_at = now()`.
@@ -4703,9 +4738,10 @@ impl Database {
         let state_json = serde_json::to_string(state).unwrap();
 
         let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
         )
         .bind(&state_json)
+        .bind(conv_state_kind(state))
         .bind(state_updated_at.to_rfc3339())
         .bind(Utc::now().to_rfc3339())
         .bind(id)
@@ -5252,13 +5288,17 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, 'user', ?15)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, 'user', ?15)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
             .bind(&title_for_insert)
             .bind(&seeded_state)
+            .bind(conv_state_kind(&ConvState::SeededLlmRequesting {
+                seed_message_id: seed_message_id.clone(),
+                attempt: 1,
+            }))
             .bind(&now_str)
             .bind(parent.model.as_deref())
             .bind(parent.effort.map(ModelEffort::as_wire_name))
@@ -5327,11 +5367,14 @@ impl Database {
 
         let updated = sqlx::query(
             "UPDATE conversations
-             SET continued_in_conv_id = ?1, state = ?2, state_updated_at = ?3, updated_at = ?3
-             WHERE id = ?4 AND continued_in_conv_id IS NULL",
+             SET continued_in_conv_id = ?1, state = ?2, state_kind = ?3, state_updated_at = ?4, updated_at = ?4
+             WHERE id = ?5 AND continued_in_conv_id IS NULL",
         )
         .bind(&new_id)
         .bind(&handed_off_state)
+        .bind(conv_state_kind(&ConvState::HandedOff {
+            successor_conv_id: new_id.clone(),
+        }))
         .bind(&now_str)
         .bind(parent_id)
         .execute(&mut *tx)
@@ -5555,14 +5598,15 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
-                 VALUES (?1, ?2, ?3, CASE WHEN ?19 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?18, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15, ?16, ?17, ?19, ?20, ?21)",
+                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
+                 VALUES (?1, ?2, ?3, CASE WHEN ?19 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?18, ?5, ?6, ?7, ?7, ?7, 0, 1, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15, ?16, ?17, ?19, ?20, ?21)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
             .bind(&title_for_insert)
             .bind(&parent.cwd)
             .bind(&idle_state)
+            .bind(conv_state_kind(&ConvState::Idle))
             .bind(&now_str)
             .bind(parent.model.as_deref())
             .bind(parent.effort.map(ModelEffort::as_wire_name))
@@ -6838,10 +6882,10 @@ impl Database {
         //     carries the unpersisted assistant message/tool_use and must survive restart
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
         sqlx::query(
-            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
                AND NOT (
-                   json_extract(state, '$.type') = 'llm_requesting'
+                   state_kind = 'llm_requesting'
                    AND (
                        EXISTS (
                            SELECT 1 FROM conversation_creation_jobs j
@@ -6859,6 +6903,7 @@ impl Database {
                )",
         )
         .bind(&idle_state)
+        .bind(conv_state_kind(&ConvState::Idle))
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -6950,7 +6995,7 @@ impl Database {
         // until abort/complete persists the checkpoint).
         let conv_rows: Vec<(String, String)> = sqlx::query(
             "SELECT id, state FROM conversations
-             WHERE json_extract(state, '$.type') IN ('tool_executing', 'cancelling_tool')",
+             WHERE state_kind IN ('tool_executing', 'cancelling_tool')",
         )
         .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
         .fetch_all(&self.pool)
@@ -7033,13 +7078,17 @@ impl Database {
                 }
                 sqlx::query(
                     "UPDATE conversations
-                     SET state = ?1, state_updated_at = ?2, updated_at = ?2
-                     WHERE id = ?3
-                       AND json_extract(state, '$.type') NOT IN
+                     SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+                     WHERE id = ?4
+                       AND state_kind NOT IN
                            ('completed', 'failed', 'creation_failed', 'creation_cancelled',
                             'context_exhausted', 'handed_off', 'terminal')",
                 )
                 .bind(&interrupted_state)
+                .bind(conv_state_kind(&ConvState::Failed {
+                    error: "Sub-agent interrupted by server restart".to_string(),
+                    error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+                }))
                 .bind(now.to_rfc3339())
                 .bind(&agent.agent_id)
                 .execute(&self.pool)
@@ -7086,7 +7135,7 @@ impl Database {
         // history is frozen and shouldn't be amended with synthetic results.
         let conv_rows: Vec<String> = sqlx::query(
             "SELECT id FROM conversations
-             WHERE json_extract(state, '$.type') NOT IN
+             WHERE state_kind NOT IN
                  ('context_exhausted', 'handed_off', 'terminal',
                   'awaiting_task_approval', 'awaiting_user_response')",
         )
@@ -8873,7 +8922,7 @@ async fn insert_conversation_tx(
     // here. The legacy `steering_queue` column defaults to '[]'.
     sqlx::query(
         "INSERT INTO conversations (
-            id, slug, title, parent_conversation_id, user_initiated, state,
+            id, slug, title, parent_conversation_id, user_initiated, state, state_kind,
             state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id,
             desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, llm_language,
@@ -8890,6 +8939,7 @@ async fn insert_conversation_tx(
     .bind(&conv.parent_conversation_id)
     .bind(conv.user_initiated)
     .bind(&state_json)
+    .bind(conv_state_kind(&conv.state))
     .bind(conv.state_updated_at.to_rfc3339())
     .bind(conv.created_at.to_rfc3339())
     .bind(conv.updated_at.to_rfc3339())
@@ -9507,6 +9557,34 @@ fn parse_message_type(s: &str) -> MessageType {
 
 fn parse_datetime(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
+}
+
+fn conv_state_kind(state: &ConvState) -> &'static str {
+    match state.variant_name() {
+        "Idle" => "idle",
+        "LlmRequesting" => "llm_requesting",
+        "ToolExecuting" => "tool_executing",
+        "CancellingTool" => "cancelling_tool",
+        "AwaitingSubAgents" => "awaiting_sub_agents",
+        "CancellingSubAgents" => "cancelling_sub_agents",
+        "Error" => "error",
+        "AwaitingContinuation" => "awaiting_continuation",
+        "RecoverableContinuationFailure" => "recoverable_continuation_failure",
+        "AwaitingRecovery" => "awaiting_recovery",
+        "AwaitingTaskApproval" => "awaiting_task_approval",
+        "AwaitingUserResponse" => "awaiting_user_response",
+        "AwaitingCommissionReviewApproval" => "awaiting_commission_review_approval",
+        "ContextExhausted" => "context_exhausted",
+        "HandedOff" => "handed_off",
+        "Terminal" => "terminal",
+        "Completed" => "completed",
+        "Failed" => "failed",
+        "Provisioning" => "provisioning",
+        "CreationFailed" => "creation_failed",
+        "CreationCancelled" => "creation_cancelled",
+        "SeededLlmRequesting" => "seeded_llm_requesting",
+        other => panic!("unmapped ConvState variant for state_kind: {other}"),
+    }
 }
 
 #[cfg(test)]
@@ -12627,6 +12705,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conversations_schema_exposes_state_kind_discriminator() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('conversations')")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(columns.iter().any(|column| column == "state_kind"));
+
+        let indexed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_state_kind'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(indexed, 1);
+    }
+
+    #[tokio::test]
     async fn coordinator_creation_handles_slug_collision_and_concurrent_first_access() {
         let path = std::env::temp_dir().join(format!(
             "phoenix-coordinator-race-{}.db",
@@ -12693,6 +12791,41 @@ mod tests {
             db.update_clear_watermark("nope", 10).await,
             Err(DbError::ConversationNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn state_kind_tracks_inserted_and_updated_conversation_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("kind-conv", "kind-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let initial: (String, String) =
+            sqlx::query_as("SELECT state_kind, state FROM conversations WHERE id = 'kind-conv'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(initial.0, "idle");
+        assert!(initial.1.contains("\"type\":\"idle\""));
+
+        let updated_state = ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: "op-1".to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        };
+        db.update_conversation_state("kind-conv", &updated_state)
+            .await
+            .unwrap();
+
+        let updated: (String, String) =
+            sqlx::query_as("SELECT state_kind, state FROM conversations WHERE id = 'kind-conv'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(updated.0, "awaiting_continuation");
+        assert!(updated.1.contains("\"type\":\"awaiting_continuation\""));
     }
 
     #[tokio::test]

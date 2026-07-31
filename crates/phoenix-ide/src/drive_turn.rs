@@ -499,6 +499,10 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
             error_kind: error_kind.clone(),
         }),
         ConvState::AwaitingRecovery { .. } => Some(StableOutcome::AwaitingRecovery),
+        ConvState::RecoverableContinuationFailure { failure } => Some(StableOutcome::Error {
+            message: failure.message.clone(),
+            error_kind: failure.error_kind.clone(),
+        }),
         ConvState::AwaitingTaskApproval { .. } => Some(StableOutcome::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Some(StableOutcome::AwaitingUserResponse),
         ConvState::AwaitingCommissionReviewApproval { .. } => {
@@ -516,8 +520,7 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
         | ConvState::CancellingSubAgents { .. }
         | ConvState::Completed { .. }
         | ConvState::Failed { .. }
-        | ConvState::AwaitingContinuation { .. }
-        | ConvState::RecoverableContinuationFailure { .. } => None,
+        | ConvState::AwaitingContinuation { .. } => None,
     }
 }
 

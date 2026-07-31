@@ -406,7 +406,7 @@ impl Effect {
         let summary = summary.into();
         Effect::PersistMessage {
             content: MessageContent::continuation(summary.clone()),
-            display_data: Some(serde_json::json!({ "summary": summary })),
+            display_data: None,
             usage_data: None,
             message_id: uuid::Uuid::new_v4().to_string(),
             idempotent: false,

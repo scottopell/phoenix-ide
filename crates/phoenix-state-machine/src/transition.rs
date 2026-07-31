@@ -2940,6 +2940,7 @@ pub fn transition_parent(
             ParentEvent::Core(CoreEvent::ContinuationError {
                 operation_id,
                 error_kind,
+                resets_at,
                 ..
             }),
         ) if request.operation_id == operation_id
@@ -2958,7 +2959,7 @@ pub fn transition_parent(
                     delay: retry_delay(attempt),
                     attempt,
                     reason: error_kind_to_attempt_reason(&error_kind),
-                    resets_at: None,
+                    resets_at,
                 })
                 .with_effect(Effect::notify_state_change()),
             )
@@ -2970,6 +2971,7 @@ pub fn transition_parent(
                 operation_id,
                 message,
                 error_kind,
+                ..
             }),
         ) if request.operation_id == operation_id => Ok(ParentTransitionResult::new(
             ParentState::Core(CoreState::RecoverableContinuationFailure {
@@ -4244,6 +4246,7 @@ mod tests {
                 operation_id: request.operation_id.clone(),
                 message: "selected model is at capacity".to_string(),
                 error_kind: ErrorKind::ServerOverloaded,
+                resets_at: None,
             },
         )
         .expect("capacity failure should remain recoverable");
