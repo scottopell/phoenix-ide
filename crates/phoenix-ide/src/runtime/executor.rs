@@ -4205,7 +4205,7 @@ where
                     usage_data: Some(usage_data),
                     created_at: Utc::now(),
                 };
-                let outcome = self
+                let outcome = match self
                     .storage
                     .begin_continuation(
                         &self.context.conversation_id,
@@ -4214,7 +4214,55 @@ where
                         &self.state,
                         self.state_updated_at,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let failure =
+                            phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                                request: request.clone(),
+                                error_kind: crate::db::ErrorKind::ServerError,
+                                message: format!("Failed to start continuation summary: {error}"),
+                            };
+                        self.state = ConvState::RecoverableContinuationFailure { failure };
+                        self.state_updated_at = Utc::now();
+                        if let Some(turn) = self.active_direct_turn.as_deref() {
+                            self.storage
+                                .settle_active_direct_turn(
+                                    &crate::runtime::traits::ActiveDirectTurnSettlement {
+                                        turn: turn.clone(),
+                                        terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                            reason: error,
+                                        },
+                                        state: self.state.clone(),
+                                        state_updated_at: self.state_updated_at,
+                                    },
+                                )
+                                .await?;
+                            self.active_direct_turn = None;
+                            self.pending_direct_turn_terminal = None;
+                            self.direct_turn_cancellation_initiated = false;
+                        } else {
+                            self.storage
+                                .update_state(
+                                    &self.context.conversation_id,
+                                    &self.state,
+                                    self.state_updated_at,
+                                )
+                                .await?;
+                        }
+                        let _ = self
+                            .broadcast_tx
+                            .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
+                                sequence_id,
+                                state: self.state.clone(),
+                                presentation_mode: self.state.presentation_mode().to_string(),
+                                state_updated_at: self.state_updated_at,
+                            });
+                        drop(reserved_range);
+                        return Ok(None);
+                    }
+                };
                 match outcome {
                     crate::db::ContinuationCommitOutcome::Applied => {
                         let _ = self.broadcast_tx.send_message(message);
@@ -9341,6 +9389,47 @@ mod authoritative_user_message_effect_tests {
             ConvState::Error { message, .. } if message == reason
         ));
         assert_eq!(rt.active_direct_turn, None);
+    }
+
+    #[tokio::test]
+    async fn continuation_start_failure_persists_visible_recovery_state() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "start-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+
+        rt.execute_effect(Effect::BeginContinuation {
+            request: request.clone(),
+            content: crate::db::MessageContent::agent(vec![ContentBlock::text("response")]),
+            display_data: None,
+            usage_data: phoenix_core::domain::llm_types::Usage::default(),
+            message_id: request.operation_id.clone(),
+        })
+        .await
+        .expect("start failure should become visible recovery state");
+
+        assert!(matches!(
+            storage.get_state(&rt.context.conversation_id).await.unwrap(),
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.request == request
+        ));
     }
 
     #[tokio::test]

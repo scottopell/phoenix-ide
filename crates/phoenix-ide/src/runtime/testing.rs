@@ -1144,6 +1144,9 @@ impl StateStore for InMemoryStorage {
         awaiting_state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if *self.fail_continuation_commit.lock().unwrap() {
+            return Err("injected continuation start failure".to_string());
+        }
         let mut states = self.states.lock().unwrap();
         if matches!(
             states.get(conv_id),
