@@ -6,9 +6,11 @@ pub mod simulator;
 mod tests;
 pub mod types;
 pub mod validation;
+pub mod wake_contract;
 pub mod wake_profile;
 
 pub use direct_turn::*;
 pub use simulator::*;
 pub use types::*;
 pub use validation::*;
+pub use wake_contract::*;
