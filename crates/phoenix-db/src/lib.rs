@@ -4667,6 +4667,77 @@ impl Database {
         Ok(CreationCasOutcome::Applied)
     }
 
+    /// Atomically persist the threshold-crossing response and continuation
+    /// operation before summary generation begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the conversation or message cannot be read or
+    /// atomically written.
+    pub async fn begin_continuation(
+        &self,
+        conversation_id: &str,
+        operation_id: &str,
+        message: &Message,
+        awaiting_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<ContinuationCommitOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT state FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+        let persisted_json: String = row.get("state");
+        let persisted: ConvState = serde_json::from_str(&persisted_json)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        if matches!(
+            &persisted,
+            ConvState::AwaitingContinuation { request } if request.operation_id == operation_id
+        ) {
+            let exists = sqlx::query("SELECT 1 FROM messages WHERE message_id = ?1")
+                .bind(&message.message_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+            tx.rollback().await?;
+            return Ok(if exists {
+                ContinuationCommitOutcome::Duplicate
+            } else {
+                ContinuationCommitOutcome::Stale
+            });
+        }
+        if !matches!(
+            persisted,
+            ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. }
+        ) {
+            tx.rollback().await?;
+            return Ok(ContinuationCommitOutcome::Stale);
+        }
+        insert_message_tx(&mut tx, message).await?;
+        let awaiting_json = serde_json::to_string(awaiting_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let updated = sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+             WHERE id = ?5 AND state = ?6",
+        )
+        .bind(awaiting_json)
+        .bind(conv_state_kind(awaiting_state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .bind(persisted_json)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(ContinuationCommitOutcome::Stale);
+        }
+        tx.commit().await?;
+        Ok(ContinuationCommitOutcome::Applied)
+    }
+
     /// Return every conversation with continuation work that must be
     /// materialized at startup, including coordinator-owned conversations.
     ///
@@ -12623,6 +12694,84 @@ mod tests {
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+    }
+
+    #[tokio::test]
+    async fn begin_continuation_atomically_persists_response_and_operation() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("begin-continuation", "begin", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            "begin-continuation",
+            &ConvState::LlmRequesting { attempt: 1 },
+        )
+        .await
+        .unwrap();
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "begin-operation".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let awaiting = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        let content =
+            MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "threshold response",
+            )]);
+        let message = Message {
+            message_id: request.operation_id.clone(),
+            conversation_id: "begin-continuation".to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            db.begin_continuation(
+                "begin-continuation",
+                &request.operation_id,
+                &message,
+                &awaiting,
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            db.get_conversation("begin-continuation")
+                .await
+                .unwrap()
+                .state,
+            awaiting
+        );
+        assert_eq!(
+            db.get_messages("begin-continuation").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.begin_continuation(
+                "begin-continuation",
+                &request.operation_id,
+                &message,
+                &ConvState::AwaitingContinuation {
+                    request: request.clone(),
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Duplicate
+        );
+        assert_eq!(
+            db.get_messages("begin-continuation").await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

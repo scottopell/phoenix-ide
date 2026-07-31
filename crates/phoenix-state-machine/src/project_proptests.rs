@@ -889,7 +889,9 @@ mod random_walk {
             let has_atomic_persist = effects.iter().any(|effect| {
                 matches!(
                     effect,
-                    Effect::ResolveTask { .. } | Effect::ContinuationCommit { .. }
+                    Effect::ResolveTask { .. }
+                        | Effect::BeginContinuation { .. }
+                        | Effect::ContinuationCommit { .. }
                 )
             });
             assert!(

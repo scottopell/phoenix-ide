@@ -4185,6 +4185,63 @@ where
                 Ok(None)
             }
 
+            Effect::BeginContinuation {
+                request,
+                content,
+                display_data,
+                usage_data,
+                message_id,
+            } => {
+                let (reserved_range, reserved_sequences) =
+                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let sequence_id = reserved_sequences[0];
+                let message = crate::db::Message {
+                    message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id,
+                    message_type: content.message_type(),
+                    content,
+                    display_data,
+                    usage_data: Some(usage_data),
+                    created_at: Utc::now(),
+                };
+                let outcome = self
+                    .storage
+                    .begin_continuation(
+                        &self.context.conversation_id,
+                        &request.operation_id,
+                        &message,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await?;
+                match outcome {
+                    crate::db::ContinuationCommitOutcome::Applied => {
+                        let _ = self.broadcast_tx.send_message(message);
+                        drop(reserved_range);
+                    }
+                    crate::db::ContinuationCommitOutcome::Duplicate
+                    | crate::db::ContinuationCommitOutcome::Stale => {
+                        let persisted = self
+                            .storage
+                            .get_state_snapshot(&self.context.conversation_id)
+                            .await?;
+                        self.state = persisted.state;
+                        self.state_updated_at = persisted.state_updated_at;
+                        let _ = self
+                            .broadcast_tx
+                            .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
+                                sequence_id,
+                                state: self.state.clone(),
+                                presentation_mode: self.state.presentation_mode().to_string(),
+                                state_updated_at: self.state_updated_at,
+                            });
+                        drop(reserved_range);
+                    }
+                }
+                Ok(None)
+            }
+
             Effect::ContinuationCommit { request, summary } => {
                 let operation_id = request.operation_id.clone();
                 let (reserved_range, reserved_sequences) =
@@ -4614,7 +4671,18 @@ where
             } => self.persist_sub_agent_results(results, spawn_tool_id).await,
 
             Effect::RequestContinuation { request } => {
-                self.request_continuation(request);
+                if matches!(
+                    &self.state,
+                    ConvState::AwaitingContinuation { request: active }
+                        if active.operation_id == request.operation_id
+                ) {
+                    self.request_continuation(request);
+                } else {
+                    tracing::debug!(
+                        operation_id = %request.operation_id,
+                        "skipping continuation request that no longer owns state"
+                    );
+                }
                 Ok(None)
             }
 

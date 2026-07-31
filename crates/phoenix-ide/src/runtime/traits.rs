@@ -254,6 +254,15 @@ pub trait StateStore: Send + Sync {
 
     async fn get_state_snapshot(&self, conv_id: &str) -> Result<PersistedStateSnapshot, String>;
 
+    async fn begin_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        awaiting_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String>;
+
     async fn commit_continuation(
         &self,
         conv_id: &str,
@@ -607,6 +616,25 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn get_state_snapshot(&self, conv_id: &str) -> Result<PersistedStateSnapshot, String> {
         (**self).get_state_snapshot(conv_id).await
+    }
+
+    async fn begin_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        awaiting_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        (**self)
+            .begin_continuation(
+                conv_id,
+                operation_id,
+                message,
+                awaiting_state,
+                state_updated_at,
+            )
+            .await
     }
 
     async fn commit_continuation(
@@ -1141,6 +1169,26 @@ impl StateStore for DatabaseStorage {
             state: conv.state,
             state_updated_at: conv.state_updated_at,
         })
+    }
+
+    async fn begin_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        awaiting_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        self.db
+            .begin_continuation(
+                conv_id,
+                operation_id,
+                message,
+                awaiting_state,
+                state_updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn commit_continuation(

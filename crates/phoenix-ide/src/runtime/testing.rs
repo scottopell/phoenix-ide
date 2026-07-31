@@ -1136,6 +1136,35 @@ impl StateStore for InMemoryStorage {
         })
     }
 
+    async fn begin_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &Message,
+        awaiting_state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        let mut states = self.states.lock().unwrap();
+        if matches!(
+            states.get(conv_id),
+            Some(ConvState::AwaitingContinuation { request }) if request.operation_id == operation_id
+        ) {
+            return Ok(crate::db::ContinuationCommitOutcome::Duplicate);
+        }
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(message.clone());
+        states.insert(conv_id.to_string(), awaiting_state.clone());
+        self.state_updated_ats
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), state_updated_at);
+        Ok(crate::db::ContinuationCommitOutcome::Applied)
+    }
+
     async fn commit_continuation(
         &self,
         conv_id: &str,

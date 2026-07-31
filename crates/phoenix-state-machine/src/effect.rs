@@ -203,6 +203,16 @@ pub enum Effect {
     /// Request continuation summary from LLM (no tools) - REQ-BED-020
     RequestContinuation { request: ContinuationSummaryRequest },
 
+    /// Atomically persist the threshold-crossing assistant response and the
+    /// durable continuation operation before summary generation begins.
+    BeginContinuation {
+        request: ContinuationSummaryRequest,
+        content: MessageContent,
+        display_data: Option<Value>,
+        usage_data: UsageData,
+        message_id: String,
+    },
+
     /// Atomically persist the accepted continuation summary for an operation.
     ContinuationCommit {
         request: ContinuationSummaryRequest,
@@ -410,6 +420,38 @@ impl Effect {
             usage_data: None,
             message_id: uuid::Uuid::new_v4().to_string(),
             idempotent: false,
+        }
+    }
+
+    #[must_use]
+    pub fn begin_continuation(
+        request: ContinuationSummaryRequest,
+        blocks: Vec<ContentBlock>,
+        usage_data: UsageData,
+        cwd: Option<&Path>,
+        message_id: String,
+        final_attempt: u32,
+    ) -> Self {
+        let Effect::PersistMessage {
+            content,
+            display_data,
+            ..
+        } = Self::persist_agent_message(
+            blocks,
+            Some(usage_data.clone()),
+            cwd,
+            message_id.clone(),
+            final_attempt,
+        )
+        else {
+            unreachable!("agent message constructor always persists a message")
+        };
+        Effect::BeginContinuation {
+            request,
+            content,
+            display_data,
+            usage_data,
+            message_id,
         }
     }
 

@@ -1729,6 +1729,7 @@ fn creation_provisioned_transition(
             | Effect::PersistHiddenSystemMarker { .. }
             | Effect::PersistSubAgentResults { .. }
             | Effect::RequestContinuation { .. }
+            | Effect::BeginContinuation { .. }
             | Effect::ContinuationCommit { .. }
             | Effect::NotifyContextExhausted { .. }
             | Effect::ApproveTask { .. }
@@ -3737,29 +3738,24 @@ fn handle_context_exhaustion(
     match ctx.context_exhaustion_behavior {
         ContextExhaustionBehavior::ThresholdBasedContinuation => {
             // Normal conversation: trigger continuation flow
+            let request = ContinuationSummaryRequest {
+                operation_id: request_id.clone(),
+                rejected_tool_calls: tool_calls,
+                attempt: 1,
+            };
             TransitionResult::new(ConvState::AwaitingContinuation {
-                request: ContinuationSummaryRequest {
-                    operation_id: request_id.clone(),
-                    rejected_tool_calls: tool_calls.clone(),
-                    attempt: 1,
-                },
+                request: request.clone(),
             })
-            .with_effect(Effect::persist_agent_message(
+            .with_effect(Effect::begin_continuation(
+                request.clone(),
                 blocks,
-                Some(usage_data),
+                usage_data,
                 ctx.execution_environment.working_dir(),
-                request_id.clone(),
+                request_id,
                 final_attempt,
             ))
-            .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::RequestContinuation {
-                request: ContinuationSummaryRequest {
-                    operation_id: request_id,
-                    rejected_tool_calls: tool_calls,
-                    attempt: 1,
-                },
-            })
+            .with_effect(Effect::RequestContinuation { request })
         }
         ContextExhaustionBehavior::IntentionallyUnhandled => {
             // REQ-BED-024: Sub-agent fails immediately
@@ -5321,6 +5317,16 @@ mod tests {
         );
 
         // Should request continuation with rejected tools
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::BeginContinuation { request, message_id, .. }
+                if request.operation_id == "test-req-id" && message_id == "test-req-id"
+        )));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistMessage { .. } | Effect::PersistState)));
+
         assert!(
             result.effects.iter().any(|e| matches!(
                 e,
@@ -7195,6 +7201,7 @@ mod tests {
                 | Effect::PersistHiddenSystemMarker { .. }
                 | Effect::PersistSubAgentResults { .. }
                 | Effect::RequestContinuation { .. }
+                | Effect::BeginContinuation { .. }
                 | Effect::ContinuationCommit { .. }
                 | Effect::NotifyContextExhausted { .. }
                 | Effect::ApproveTask { .. }
