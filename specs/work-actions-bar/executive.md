@@ -51,7 +51,7 @@ a status display; no button requires a second click to arm.
 
 | ID | Summary |
 |----|---------|
-| REQ-WAB-001 | Bar visibility: Work/Branch mode AND phase ∈ {idle, error, context_exhausted} |
+| REQ-WAB-001 | Bar visibility: Work/Branch mode AND phase ∈ {idle, error, recoverable_continuation_failure} |
 | REQ-WAB-002 | Responsive presentation: stable compact desktop rail; mobile PR rail; hero and supporting action groups; freshness stays an actionability cue, not PR status |
 | REQ-WAB-003 | Exactly one primary (glowing) verb across the bar — or none, in the continuation case |
 | REQ-WAB-004 | WorkDisposition derivation: a single derived state, total over every open-PR and stuck-with-PR case |

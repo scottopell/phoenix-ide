@@ -32,8 +32,8 @@ It does **not** govern:
 ### REQ-WAB-001: Bar Visibility
 
 WHEN a conversation's `conv_mode_label` is `"Work"` or `"Branch"`
-AND the conversation is in a disposable, non-running condition — phase one of `idle`
-  or `error`
+AND the conversation is in a disposable, non-running condition — phase one of `idle`,
+  `error`, or `recoverable_continuation_failure`
 THE SYSTEM SHALL render the work actions bar.
 
 WHEN the conversation is in `context_exhausted`
@@ -43,8 +43,8 @@ AND SHALL reserve the focused handoff surface for continuation actions defined b
 WHEN the conversation is in any other phase, or its mode is not `Work` or `Branch`
 THE SYSTEM SHALL NOT render the work actions bar.
 
-**Design:** `idle` is the ordinary resting state and `error` is a stuck condition where terminal
-resolution remains directly useful. Context exhaustion has a dedicated continuation surface;
+**Design:** `idle` is the ordinary resting state; `error` and
+`recoverable_continuation_failure` are stuck conditions where terminal resolution remains directly useful. Context exhaustion has a dedicated continuation surface;
 placing cleanup beside its handoff controls makes an unrelated destructive action appear to be
 part of continuation. Bedrock REQ-BED-031 continues to govern backend disposability, but the work
 actions bar does not expose it from this focused surface. Any other phase, or a non-Work/Branch

@@ -156,7 +156,7 @@ function hidden(): HiddenDisposition {
   };
 }
 
-const ELIGIBLE_PHASES = new Set(['idle', 'error']);
+const ELIGIBLE_PHASES = new Set(['idle', 'error', 'recoverable_continuation_failure']);
 const ELIGIBLE_MODES = new Set(['Work', 'Branch']);
 
 /**
@@ -181,7 +181,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
 
   const number = prStatus?.number ?? prStatus?.pr?.number;
   const url = prStatus?.url ?? prStatus?.pr?.url;
-  const stuck = phaseType === 'error';
+  const stuck = phaseType === 'error' || phaseType === 'recoverable_continuation_failure';
 
   // Row 1. Continued — no primary, all terminal verbs suppressed (REQ-WAB-009).
   if (continuedInConvId != null && continuedInConvId !== '') {
