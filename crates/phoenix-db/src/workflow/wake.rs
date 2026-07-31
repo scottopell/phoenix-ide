@@ -3122,7 +3122,8 @@ impl WakeRepository {
             let updated_at = timestamp_to_datetime(timestamp).to_rfc3339();
             let updated = sqlx::query(
                 "UPDATE conversations
-                 SET state = ?1, state_updated_at = ?2, updated_at = ?2
+                 SET state = ?1, state_kind = 'llm_requesting',
+                     state_updated_at = ?2, updated_at = ?2
                  WHERE id = ?3 AND state = ?4",
             )
             .bind(next_state)

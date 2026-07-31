@@ -1635,9 +1635,12 @@ async fn update_conversation_projection_tx(
     let state_json = serde_json::to_string(&projection.state)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let updated = sqlx::query(
-        "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+        "UPDATE conversations
+         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+         WHERE id = ?4",
     )
     .bind(state_json)
+    .bind(crate::conv_state_kind(&projection.state))
     .bind(projection.state_updated_at.to_rfc3339())
     .bind(&conversation.0)
     .execute(&mut *tx.tx)
@@ -1657,9 +1660,12 @@ async fn update_conversation_state_for_adoption_tx(
     let state_json = serde_json::to_string(&input.accepted_state)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let updated = sqlx::query(
-        "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+        "UPDATE conversations
+         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+         WHERE id = ?4",
     )
     .bind(state_json)
+    .bind(crate::conv_state_kind(&input.accepted_state))
     .bind(input.state_updated_at.to_rfc3339())
     .bind(&conversation.0)
     .execute(&mut *tx.tx)

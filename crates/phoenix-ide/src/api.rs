@@ -161,6 +161,16 @@ impl AppState {
         }
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
+        let resumed_continuations = runtime
+            .resume_pending_continuations()
+            .await
+            .map_err(std::io::Error::other)?;
+        if resumed_continuations > 0 {
+            tracing::info!(
+                resumed_continuations,
+                "resumed persisted continuation operations"
+            );
+        }
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
         // Retrieval works on existing index rows while this sweep runs and

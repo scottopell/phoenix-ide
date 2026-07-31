@@ -538,6 +538,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     settle_continuation_direct_turn_calls:
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
+    fail_continuation_commit: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -565,9 +566,14 @@ impl InMemoryStorage {
             settle_active_direct_turn_started: Mutex::new(None),
             settle_active_direct_turn_release: Mutex::new(None),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
+            fail_continuation_commit: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
+    }
+
+    pub fn set_fail_continuation_commit(&self, fail: bool) {
+        *self.fail_continuation_commit.lock().unwrap() = fail;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -951,6 +957,9 @@ impl MessageStore for InMemoryStorage {
         &self,
         settlement: &crate::runtime::traits::ContinuationDirectTurnSettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if *self.fail_continuation_commit.lock().unwrap() {
+            return Err("injected continuation commit failure".to_string());
+        }
         self.settle_continuation_direct_turn_calls
             .lock()
             .unwrap()
@@ -1109,6 +1118,9 @@ impl StateStore for InMemoryStorage {
         completed_state: &ConvState,
         _state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if *self.fail_continuation_commit.lock().unwrap() {
+            return Err("injected continuation commit failure".to_string());
+        }
         let mut states = self.states.lock().unwrap();
         let persisted = states.get(conv_id).cloned().unwrap_or_default();
         if matches!(

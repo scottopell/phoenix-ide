@@ -6883,7 +6883,7 @@ impl Database {
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
-             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
                AND NOT (
                    state_kind = 'llm_requesting'
                    AND (
@@ -7124,7 +7124,7 @@ impl Database {
     /// not all `tool_use` IDs have a corresponding `tool_result` in the following messages.
     ///
     /// Skips conversations in preserved (frozen) states — `context_exhausted`,
-    /// `terminal`, `awaiting_task_approval`, `awaiting_user_response`. Those
+    /// `terminal`, continuation/recovery states, and approval states. Those
     /// match the allowlist in `reset_all_to_idle` (the conversation is not
     /// going to make another LLM call, so injecting a synthetic `tool_result`
     /// only adds noise to history).
@@ -7137,7 +7137,8 @@ impl Database {
             "SELECT id FROM conversations
              WHERE state_kind NOT IN
                  ('context_exhausted', 'handed_off', 'terminal',
-                  'awaiting_task_approval', 'awaiting_user_response')",
+                  'awaiting_continuation', 'recoverable_continuation_failure',
+                  'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response')",
         )
         .try_map(|row: SqliteRow| row.try_get("id"))
         .fetch_all(&self.pool)
@@ -9559,7 +9560,7 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
 }
 
-fn conv_state_kind(state: &ConvState) -> &'static str {
+pub(crate) fn conv_state_kind(state: &ConvState) -> &'static str {
     match state.variant_name() {
         "Idle" => "idle",
         "LlmRequesting" => "llm_requesting",
