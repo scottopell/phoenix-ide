@@ -224,11 +224,11 @@ export function useConnection({
   const eventSourceRef = useRef<EventSource | null>(null);
   const openMeasurementRef = useRef<ConversationOpenMeasurement | null>(null);
   const openAttemptRef = useRef<{ conversationId: string; attempt: number } | null>(null);
-  const pendingCancellationRef = useRef<{
+  const pendingCancellationsRef = useRef<Array<{
     conversationId: string;
     timeout: number;
     telemetry: ConversationOpenTelemetryPayload;
-  } | null>(null);
+  }>>([]);
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const reconnectedTimeoutRef = useRef<number | null>(null);
@@ -291,21 +291,21 @@ export function useConnection({
     openMeasurementRef.current = null;
     if (!telemetry) return;
     const timeout = window.setTimeout(() => {
-      if (pendingCancellationRef.current?.timeout === timeout) {
-        pendingCancellationRef.current = null;
-      }
+      pendingCancellationsRef.current = pendingCancellationsRef.current.filter(
+        (pending) => pending.timeout !== timeout,
+      );
       reportConversationOpen(telemetry);
     }, 0);
-    pendingCancellationRef.current = { conversationId, timeout, telemetry };
+    pendingCancellationsRef.current.push({ conversationId, timeout, telemetry });
   }, []);
 
   useEffect(() => {
     const flushPendingCancellation = () => {
-      const pending = pendingCancellationRef.current;
-      if (pending) {
-        clearTimeout(pending.timeout);
-        pendingCancellationRef.current = null;
-        reportConversationOpen(pending.telemetry);
+      const pending = pendingCancellationsRef.current;
+      pendingCancellationsRef.current = [];
+      for (const cancellation of pending) {
+        clearTimeout(cancellation.timeout);
+        reportConversationOpen(cancellation.telemetry);
       }
       const telemetry = openMeasurementRef.current?.canceled();
       openMeasurementRef.current = null;
@@ -322,10 +322,12 @@ export function useConnection({
           const convId = conversationIdRef.current;
           if (!convId) break;
 
-          const pendingCancellation = pendingCancellationRef.current;
-          if (pendingCancellation?.conversationId === convId) {
-            clearTimeout(pendingCancellation.timeout);
-            pendingCancellationRef.current = null;
+          const replayIndex = pendingCancellationsRef.current.findLastIndex(
+            (pending) => pending.conversationId === convId,
+          );
+          if (replayIndex >= 0) {
+            const [replayed] = pendingCancellationsRef.current.splice(replayIndex, 1);
+            clearTimeout(replayed.timeout);
             openAttemptRef.current = null;
           }
           if (eventSourceRef.current) {

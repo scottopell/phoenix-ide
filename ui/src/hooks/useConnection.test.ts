@@ -302,6 +302,25 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect(outcomes).toEqual(['canceled', 'canceled']);
   });
 
+  it('flushes every rapid conversation-switch cancellation on pagehide', () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const { rerender } = renderHook(
+      ({ convId }) => useConnection({ conversationId: convId, dispatch }),
+      { initialProps: { convId: 'conv-A' as string | undefined } },
+    );
+    rerender({ convId: 'conv-B' });
+    rerender({ convId: 'conv-C' });
+
+    act(() => window.dispatchEvent(new Event('pagehide')));
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const outcomes = vi.mocked(fetch).mock.calls.map((call) =>
+      (JSON.parse((call[1] as RequestInit).body as string) as { outcome: string }).outcome,
+    );
+    expect(outcomes).toEqual(['canceled', 'canceled', 'canceled']);
+  });
+
   it('stamps every wire-derived dispatch with the connection epoch', () => {
     const captured: SSEAction[] = [];
     const dispatch = (a: SSEAction) => {
