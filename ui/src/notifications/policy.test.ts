@@ -170,6 +170,48 @@ describe('notification policy reducer', () => {
     });
   });
 
+  it('notifies again when a continuation retry fails again', () => {
+    const failed = conversation({
+      state: {
+        type: 'recoverable_continuation_failure',
+        message: 'Selected model is at capacity',
+        error_kind: 'server_overloaded',
+      },
+    });
+    const first = notificationPolicyReducer(
+      loadedState(),
+      {
+        type: 'conversation_state_changed',
+        conversation: failed,
+        previousState: { type: 'awaiting_continuation', attempt: 1 },
+        nextState: failed.state!,
+      },
+      env(),
+    );
+    const retrying = conversation({ state: { type: 'awaiting_continuation', attempt: 2 } });
+    const retry = notificationPolicyReducer(
+      first.state,
+      {
+        type: 'conversation_state_changed',
+        conversation: retrying,
+        previousState: failed.state,
+        nextState: retrying.state!,
+      },
+      env(),
+    );
+    const failedAgain = notificationPolicyReducer(
+      retry.state,
+      {
+        type: 'conversation_state_changed',
+        conversation: failed,
+        previousState: retrying.state,
+        nextState: failed.state!,
+      },
+      env(),
+    );
+    expect(failedAgain.effects).toHaveLength(1);
+  });
+
   it('catch-up dedupes against a prior live delivery for the same blocking state', () => {
     const blocked = conversation({ state: { type: 'awaiting_user_response', questions: [] } });
     const live = notificationPolicyReducer(loadedState(),

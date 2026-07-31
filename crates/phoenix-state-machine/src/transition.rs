@@ -19,8 +19,8 @@ use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, 
 use super::state::{
     AssistantMessage, CommissionReviewApprovalAvailability, CommissionReviewApprovalOutcome,
     ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
-    RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult, SubAgentState,
-    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    RecoverableContinuationFailure, RecoveryKind, RecoveryResumeTarget, SubAgentOutcome,
+    SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -2113,6 +2113,25 @@ pub fn transition_parent(
         },
 
         (
+            ParentState::AwaitingRecovery {
+                error_kind,
+                resume: RecoveryResumeTarget::ContinuationSummary { request },
+                ..
+            },
+            ParentEvent::Parent(ParentOnlyEvent::CredentialHelperFailed { message }),
+        ) => Ok(ParentTransitionResult::new(ParentState::Core(
+            CoreState::RecoverableContinuationFailure {
+                failure: RecoverableContinuationFailure {
+                    request: request.clone(),
+                    error_kind: error_kind.clone(),
+                    message: message.clone(),
+                },
+            },
+        ))
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())),
+
+        (
             ParentState::AwaitingRecovery { error_kind, .. },
             ParentEvent::Parent(ParentOnlyEvent::CredentialHelperFailed { message }),
         ) => Ok(
@@ -4176,11 +4195,10 @@ mod tests {
 
         assert!(matches!(
             result.new_state,
-            ConvState::Error {
-                message,
-                error_kind: ErrorKind::Auth,
-                ..
-            } if message == "sign-in failed"
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.message == "sign-in failed"
+                    && failure.error_kind == ErrorKind::Auth
+                    && failure.request.operation_id == "continuation-auth-op"
         ));
         assert!(!result
             .effects

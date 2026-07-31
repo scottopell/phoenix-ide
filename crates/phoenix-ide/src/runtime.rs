@@ -2133,24 +2133,11 @@ impl RuntimeManager {
     /// Materialize persisted continuation operations so restart recovery does
     /// not depend on a browser reconnecting to each conversation.
     pub async fn resume_pending_continuations(self: &Arc<Self>) -> Result<usize, String> {
-        let conversation_ids: Vec<String> = self
+        let conversation_ids = self
             .db
-            .list_conversations()
+            .list_pending_continuation_conversation_ids()
             .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .filter_map(|conversation| {
-                matches!(
-                    conversation.state,
-                    ConvState::AwaitingContinuation { .. }
-                        | ConvState::AwaitingRecovery {
-                            resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. },
-                            ..
-                        }
-                )
-                .then_some(conversation.id)
-            })
-            .collect();
+            .map_err(|error| error.to_string())?;
         let mut resumed = 0;
         for conversation_id in &conversation_ids {
             match self.get_or_create(conversation_id).await {
@@ -4646,11 +4633,31 @@ mod scope_liveness_tests {
             .create_conversation("idle", "idle", "/tmp", true, None, None)
             .await
             .unwrap();
+        let coordinator = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                &coordinator.id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "op-coordinator".to_string(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 2);
+        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 3);
         let runtimes = manager.runtimes.read().await;
         assert!(runtimes.contains_key("awaiting-continuation"));
         assert!(runtimes.contains_key("awaiting-continuation-auth"));
+        assert!(runtimes.contains_key(&coordinator.id));
         assert!(!runtimes.contains_key("idle"));
     }
 

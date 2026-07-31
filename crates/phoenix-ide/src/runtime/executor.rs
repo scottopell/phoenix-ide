@@ -4048,6 +4048,14 @@ where
             ));
             return;
         }
+        if let ConvState::RecoverableContinuationFailure { failure } = new_state {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: failure.message.clone(),
+                },
+            ));
+            return;
+        }
         if let ConvState::ContextExhausted { summary } = new_state {
             self.pending_direct_turn_terminal = Some(Box::new(
                 crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
@@ -9410,6 +9418,28 @@ mod authoritative_user_message_effect_tests {
                 },
                 crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
                     reason: "provider failed".to_string(),
+                },
+            ),
+            (
+                Event::ContinuationError {
+                    operation_id: "direct-turn-continuation-op".to_string(),
+                    message: "continuation capacity".to_string(),
+                    error_kind: crate::db::ErrorKind::ServerOverloaded,
+                    resets_at: None,
+                },
+                ConvState::RecoverableContinuationFailure {
+                    failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                        request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                            operation_id: "direct-turn-continuation-op".to_string(),
+                            rejected_tool_calls: Vec::new(),
+                            attempt: 3,
+                        },
+                        error_kind: crate::db::ErrorKind::ServerOverloaded,
+                        message: "continuation capacity".to_string(),
+                    },
+                },
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: "continuation capacity".to_string(),
                 },
             ),
             (

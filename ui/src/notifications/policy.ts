@@ -245,7 +245,10 @@ function reduceConversationStateChanged(
   nextState: ConversationState,
 ): ReduceResult {
   if (isAgentWorking(nextState)) {
-    return { state: rememberBusyState(state, conversation, nextState, env.now), effects: [] };
+    const next = nextState.type === 'awaiting_continuation'
+      ? clearAttentionSeen(state, conversation.id)
+      : state;
+    return { state: rememberBusyState(next, conversation, nextState, env.now), effects: [] };
   }
 
   const stateEvent = eventForState(nextState, conversation);

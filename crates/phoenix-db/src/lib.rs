@@ -4667,6 +4667,39 @@ impl Database {
         Ok(CreationCasOutcome::Applied)
     }
 
+    /// Return every conversation with continuation work that must be
+    /// materialized at startup, including coordinator-owned conversations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when candidate rows cannot be queried or decoded.
+    pub async fn list_pending_continuation_conversation_ids(&self) -> DbResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT id, state FROM conversations
+             WHERE state_kind IN ('awaiting_continuation', 'awaiting_recovery')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let state_json: String = row.try_get("state")?;
+            let state: ConvState = serde_json::from_str(&state_json)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            if matches!(
+                state,
+                ConvState::AwaitingContinuation { .. } | ConvState::AwaitingRecovery {
+                    resume:
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. },
+                    ..
+                }
+            ) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// Atomically commit a generated continuation summary when the persisted
     /// continuation operation still matches `operation_id`.
     ///
