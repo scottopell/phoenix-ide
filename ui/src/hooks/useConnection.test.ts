@@ -273,6 +273,18 @@ describe('useConnection epoch stamping (task 08683)', () => {
     vi.useRealTimers();
   });
 
+  it('reports the active unfinished open synchronously on pagehide', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+
+    act(() => window.dispatchEvent(new Event('pagehide')));
+
+    const body = JSON.parse(
+      (vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string,
+    ) as { outcome: string };
+    expect(body.outcome).toBe('canceled');
+  });
+
   it('stamps every wire-derived dispatch with the connection epoch', () => {
     const captured: SSEAction[] = [];
     const dispatch = (a: SSEAction) => {

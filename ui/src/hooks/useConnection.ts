@@ -302,10 +302,15 @@ export function useConnection({
   useEffect(() => {
     const flushPendingCancellation = () => {
       const pending = pendingCancellationRef.current;
-      if (!pending) return;
-      clearTimeout(pending.timeout);
-      pendingCancellationRef.current = null;
-      reportConversationOpen(pending.telemetry);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        pendingCancellationRef.current = null;
+        reportConversationOpen(pending.telemetry);
+        return;
+      }
+      const telemetry = openMeasurementRef.current?.canceled();
+      openMeasurementRef.current = null;
+      if (telemetry) reportConversationOpen(telemetry);
     };
     window.addEventListener('pagehide', flushPendingCancellation);
     return () => window.removeEventListener('pagehide', flushPendingCancellation);
