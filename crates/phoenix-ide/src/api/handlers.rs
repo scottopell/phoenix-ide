@@ -2277,14 +2277,25 @@ enum ConversationOpenPhases {
     Error {
         native_open_ms: Option<f64>,
         init_received_ms: Option<f64>,
-        handler_ms: Option<f64>,
+        #[expect(
+            dead_code,
+            reason = "presence enforces JSON null during deserialization"
+        )]
+        handler_ms: MustBeNull,
     },
     Canceled {
         native_open_ms: Option<f64>,
         init_received_ms: Option<f64>,
-        handler_ms: Option<f64>,
+        #[expect(
+            dead_code,
+            reason = "presence enforces JSON null during deserialization"
+        )]
+        handler_ms: MustBeNull,
     },
 }
+
+#[derive(Debug, Deserialize)]
+struct MustBeNull;
 
 impl ConversationOpenPhases {
     fn values(&self) -> (&'static str, Option<f64>, Option<f64>, Option<f64>) {
@@ -2302,13 +2313,13 @@ impl ConversationOpenPhases {
             Self::Error {
                 native_open_ms,
                 init_received_ms,
-                handler_ms,
-            } => ("error", *native_open_ms, *init_received_ms, *handler_ms),
+                handler_ms: _,
+            } => ("error", *native_open_ms, *init_received_ms, None),
             Self::Canceled {
                 native_open_ms,
                 init_received_ms,
-                handler_ms,
-            } => ("canceled", *native_open_ms, *init_received_ms, *handler_ms),
+                handler_ms: _,
+            } => ("canceled", *native_open_ms, *init_received_ms, None),
         }
     }
 }
@@ -2354,11 +2365,28 @@ impl ConversationOpenTelemetry {
         let valid_duration =
             |value: f64| value.is_finite() && (0.0..=MAX_DURATION_MS).contains(&value);
         let (_, native_open_ms, init_received_ms, handler_ms) = self.phases.values();
-        native_open_ms.is_none_or(valid_duration)
+        let phase_order_valid = match &self.phases {
+            ConversationOpenPhases::Connected {
+                init_received_ms,
+                handler_ms,
+                ..
+            } => {
+                *init_received_ms <= self.total_ms
+                    && (*init_received_ms + *handler_ms - self.total_ms).abs() <= 0.2
+            }
+            ConversationOpenPhases::Error {
+                init_received_ms, ..
+            }
+            | ConversationOpenPhases::Canceled {
+                init_received_ms, ..
+            } => init_received_ms.is_none_or(|value| value <= self.total_ms),
+        };
+        native_open_ms.is_none_or(|value| valid_duration(value) && value <= self.total_ms)
             && init_received_ms.is_none_or(valid_duration)
             && handler_ms.is_none_or(valid_duration)
             && valid_duration(self.total_ms)
             && self.retry_attempt <= MAX_RETRY_ATTEMPT
+            && phase_order_valid
     }
 }
 
@@ -2396,6 +2424,32 @@ mod conversation_open_telemetry_tests {
             "effective_type": "4g"
         });
         assert!(serde_json::from_value::<ConversationOpenTelemetry>(report).is_err());
+    }
+
+    #[test]
+    fn rejects_contradictory_phase_timings() {
+        let base = serde_json::json!({
+            "open_id": "550e8400-e29b-41d4-a716-446655440000",
+            "outcome": "connected",
+            "native_open_ms": 1.0,
+            "init_received_ms": 2.0,
+            "handler_ms": 1.0,
+            "total_ms": 3.0,
+            "retry_attempt": 0,
+            "visible": true,
+            "effective_type": "4g"
+        });
+        let mut impossible_total = base.clone();
+        impossible_total["total_ms"] = serde_json::json!(1.0);
+        assert!(
+            !serde_json::from_value::<ConversationOpenTelemetry>(impossible_total)
+                .unwrap()
+                .has_valid_bounds()
+        );
+
+        let mut error_with_handler = base;
+        error_with_handler["outcome"] = serde_json::json!("error");
+        assert!(serde_json::from_value::<ConversationOpenTelemetry>(error_with_handler).is_err());
     }
 
     #[test]

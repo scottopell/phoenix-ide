@@ -1,14 +1,24 @@
-export interface ConversationOpenTelemetryPayload {
+interface ConversationOpenTelemetryBase {
   open_id: string;
-  outcome: 'connected' | 'error' | 'canceled';
   native_open_ms: number | null;
-  init_received_ms: number | null;
-  handler_ms: number | null;
   total_ms: number;
   retry_attempt: number;
   visible: boolean;
   effective_type: string | null;
 }
+
+export type ConversationOpenTelemetryPayload = ConversationOpenTelemetryBase & (
+  | {
+      outcome: 'connected';
+      init_received_ms: number;
+      handler_ms: number;
+    }
+  | {
+      outcome: 'error' | 'canceled';
+      init_received_ms: number | null;
+      handler_ms: null;
+    }
+);
 
 type Clock = () => number;
 
@@ -35,31 +45,55 @@ export class ConversationOpenMeasurement {
   }
 
   connected(): ConversationOpenTelemetryPayload | null {
-    return this.finish('connected');
+    if (this.initReceivedAt === null) return this.finishIncomplete('error');
+    const common = this.finishCommon();
+    if (!common) return null;
+    return {
+      ...common.payload,
+      outcome: 'connected',
+      init_received_ms: boundedMs(this.initReceivedAt - this.startedAt),
+      handler_ms: boundedMs(common.finishedAt - this.initReceivedAt),
+    };
   }
 
   error(): ConversationOpenTelemetryPayload | null {
-    return this.finish('error');
+    return this.finishIncomplete('error');
   }
 
   canceled(): ConversationOpenTelemetryPayload | null {
-    return this.finish('canceled');
+    return this.finishIncomplete('canceled');
   }
 
-  private finish(outcome: ConversationOpenTelemetryPayload['outcome']): ConversationOpenTelemetryPayload | null {
+  private finishIncomplete(
+    outcome: 'error' | 'canceled',
+  ): ConversationOpenTelemetryPayload | null {
+    const common = this.finishCommon();
+    if (!common) return null;
+    return {
+      ...common.payload,
+      outcome,
+      init_received_ms: elapsed(this.initReceivedAt, this.startedAt),
+      handler_ms: null,
+    };
+  }
+
+  private finishCommon(): {
+    payload: ConversationOpenTelemetryBase;
+    finishedAt: number;
+  } | null {
     if (this.completed) return null;
     this.completed = true;
     const finishedAt = this.clock();
     return {
-      open_id: this.openId,
-      outcome,
-      native_open_ms: elapsed(this.nativeOpenedAt, this.startedAt),
-      init_received_ms: elapsed(this.initReceivedAt, this.startedAt),
-      handler_ms: elapsed(finishedAt, this.initReceivedAt),
-      total_ms: boundedMs(finishedAt - this.startedAt),
-      retry_attempt: this.retryAttempt,
-      visible: document.visibilityState === 'visible',
-      effective_type: networkEffectiveType(),
+      finishedAt,
+      payload: {
+        open_id: this.openId,
+        native_open_ms: elapsed(this.nativeOpenedAt, this.startedAt),
+        total_ms: boundedMs(finishedAt - this.startedAt),
+        retry_attempt: this.retryAttempt,
+        visible: document.visibilityState === 'visible',
+        effective_type: networkEffectiveType(),
+      },
     };
   }
 }
