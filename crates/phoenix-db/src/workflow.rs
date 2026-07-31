@@ -21,10 +21,12 @@ use std::collections::BTreeSet;
 
 pub mod direct_turn;
 pub mod wake;
+pub mod wake_contract;
 
 pub use direct_turn::*;
 use phoenix_workflow::wake_profile;
 use sqlx::{Sqlite, Transaction};
+pub use wake_contract::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowHead {

@@ -294,6 +294,25 @@ pub struct WakeCommand {
     pub kind: WakeCommandKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WakeResumePolicy {
+    RequestWhenIdle,
+    SuppressAutomaticResume,
+}
+
+impl CanonicalTerminal {
+    #[must_use]
+    pub fn resume_policy(&self) -> WakeResumePolicy {
+        match self {
+            Self::Cancelled { .. } => WakeResumePolicy::SuppressAutomaticResume,
+            Self::Fired { .. }
+            | Self::Expired { .. }
+            | Self::Forgotten { .. }
+            | Self::Failed { .. } => WakeResumePolicy::RequestWhenIdle,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeEventKind {
     Registered {
@@ -313,6 +332,7 @@ pub enum WakeEventKind {
     Terminalized {
         terminal: CanonicalTerminal,
         delivery_owner: WakeOwner,
+        resume_policy: WakeResumePolicy,
     },
 }
 
@@ -716,12 +736,14 @@ fn close(
 ) -> WakeTransition {
     let mut next = advanced(contract, transition_id, command);
     next.lifecycle = WakeLifecycle::Closed(terminal.clone());
+    let resume_policy = terminal.resume_policy();
     let event = event(
         &next,
         transition_id,
         WakeEventKind::Terminalized {
             terminal,
             delivery_owner: next.delivery_owner.clone(),
+            resume_policy,
         },
     );
     applied(
