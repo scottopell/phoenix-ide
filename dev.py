@@ -2632,6 +2632,8 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
                 " JOIN work_scopes s ON s.id = c.work_scope_id"
                 " JOIN work_scope_environments e ON e.work_scope_id = s.id"
                 " WHERE c.id = ? AND c.cm_kind = 'work'"
+                " AND c.cm_task_id = '22001'"
+                " AND c.cm_task_title = 'Redesign conversation grounding side panel'"
                 " AND s.authority_kind = 'work' AND s.lifecycle = 'active'"
                 " AND e.environment_kind = 'allocated_worktree'"
                 " AND e.cwd = ? AND e.worktree_path = ?"
