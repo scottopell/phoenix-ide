@@ -4187,7 +4187,9 @@ where
 
             Effect::ContinuationCommit { request, summary } => {
                 let operation_id = request.operation_id.clone();
-                let seq = self.broadcast_tx.next_seq();
+                let (reserved_range, reserved_sequences) =
+                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let seq = reserved_sequences[0];
                 let content = crate::db::MessageContent::continuation(summary.clone());
                 let message = crate::db::Message {
                     message_id: format!(
@@ -4276,20 +4278,22 @@ where
                                 )
                                 .await?;
                         }
-                        let _ = self
-                            .broadcast_tx
-                            .send_seq(|sequence_id| SseEvent::StateChange {
+                        let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
+                            SseEvent::StateChange {
                                 sequence_id,
                                 state: self.state.clone(),
                                 presentation_mode: self.state.presentation_mode().to_string(),
                                 state_updated_at: self.state_updated_at,
-                            });
+                            }
+                        });
+                        drop(reserved_range);
                         return Ok(None);
                     }
                 };
                 match continuation_outcome {
                     crate::db::ContinuationCommitOutcome::Applied => {
                         let _ = self.broadcast_tx.send_message(message);
+                        drop(reserved_range);
                         let _ = self
                             .broadcast_tx
                             .send_seq(|sequence_id| SseEvent::StateChange {
@@ -4302,16 +4306,31 @@ where
                         self.pending_direct_turn_terminal = None;
                         self.direct_turn_cancellation_initiated = false;
                     }
-                    crate::db::ContinuationCommitOutcome::Duplicate => {
-                        tracing::debug!(%operation_id, "ignoring duplicate continuation commit");
-                        if used_direct_turn_settlement {
+                    crate::db::ContinuationCommitOutcome::Duplicate
+                    | crate::db::ContinuationCommitOutcome::Stale => {
+                        tracing::debug!(%operation_id, ?continuation_outcome, "ignoring rejected continuation commit");
+                        if used_direct_turn_settlement
+                            && continuation_outcome
+                                == crate::db::ContinuationCommitOutcome::Duplicate
+                        {
                             self.active_direct_turn = None;
                             self.pending_direct_turn_terminal = None;
                             self.direct_turn_cancellation_initiated = false;
                         }
-                    }
-                    crate::db::ContinuationCommitOutcome::Stale => {
-                        tracing::debug!(%operation_id, "ignoring stale continuation commit");
+                        self.state = self
+                            .storage
+                            .get_state(&self.context.conversation_id)
+                            .await?;
+                        self.state_updated_at = Utc::now();
+                        let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
+                            SseEvent::StateChange {
+                                sequence_id,
+                                state: self.state.clone(),
+                                presentation_mode: self.state.presentation_mode().to_string(),
+                                state_updated_at: self.state_updated_at,
+                            }
+                        });
+                        drop(reserved_range);
                     }
                 }
                 Ok(None)
@@ -9302,6 +9321,44 @@ mod authoritative_user_message_effect_tests {
                 .unwrap(),
             ConvState::RecoverableContinuationFailure { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_continuation_commit_fills_reserved_sequence_and_restores_state() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        storage
+            .update_state(&rt.context.conversation_id, &ConvState::Idle, Utc::now())
+            .await
+            .unwrap();
+        rt.state = ConvState::ContextExhausted {
+            summary: "stale summary".to_string(),
+        };
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: "stale-operation".to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+            summary: "stale summary".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(rt.state, ConvState::Idle);
+        let event = rx.try_recv().expect("reserved sequence must be filled");
+        assert!(matches!(
+            event,
+            SseEvent::StateChange {
+                sequence_id: 1,
+                state: ConvState::Idle,
+                ..
+            }
+        ));
+        assert_eq!(rt.broadcast_tx.next_seq(), 2);
     }
 
     #[tokio::test]

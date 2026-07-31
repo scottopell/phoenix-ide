@@ -791,6 +791,18 @@ impl SseBroadcaster {
         gate.reserved_until = None;
     }
 
+    /// Emit an ephemeral event at a sequence allocated by
+    /// [`Self::reserve_next_persisted_message_range`]. This fills the reserved
+    /// slot when the persistence operation resolves without a message, so live
+    /// clients never observe an unfillable sequence gap.
+    pub fn send_reserved_seq(
+        &self,
+        sequence_id: i64,
+        build: impl FnOnce(i64) -> SseEvent,
+    ) -> Result<usize, ()> {
+        self.send_with_ring(build(sequence_id), sequence_id, RingOp::Append)
+    }
+
     /// Allocate the next `sequence_id`, pass it to `build`, broadcast the
     /// resulting event, and append it to the `ReplayRing` so reconnects
     /// can replay it. The closure's signature forces the caller to place
