@@ -2285,6 +2285,29 @@ impl ConversationOpenOutcome {
 }
 
 #[derive(Debug, Deserialize)]
+enum NetworkEffectiveType {
+    #[serde(rename = "slow-2g")]
+    Slow2g,
+    #[serde(rename = "2g")]
+    TwoG,
+    #[serde(rename = "3g")]
+    ThreeG,
+    #[serde(rename = "4g")]
+    FourG,
+}
+
+impl NetworkEffectiveType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Slow2g => "slow-2g",
+            Self::TwoG => "2g",
+            Self::ThreeG => "3g",
+            Self::FourG => "4g",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct ConversationOpenTelemetry {
     open_id: uuid::Uuid,
     outcome: ConversationOpenOutcome,
@@ -2294,7 +2317,28 @@ struct ConversationOpenTelemetry {
     total_ms: f64,
     retry_attempt: u32,
     visible: bool,
-    effective_type: Option<String>,
+    effective_type: Option<NetworkEffectiveType>,
+}
+
+#[cfg(test)]
+mod conversation_open_telemetry_tests {
+    use super::ConversationOpenTelemetry;
+
+    #[test]
+    fn rejects_unknown_network_effective_types() {
+        let report = r#"{
+            "open_id":"550e8400-e29b-41d4-a716-446655440000",
+            "outcome":"connected",
+            "native_open_ms":1.0,
+            "init_received_ms":2.0,
+            "handler_ms":1.0,
+            "total_ms":3.0,
+            "retry_attempt":0,
+            "visible":true,
+            "effective_type":"content-bearing-value"
+        }"#;
+        assert!(serde_json::from_str::<ConversationOpenTelemetry>(report).is_err());
+    }
 }
 
 async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>) -> StatusCode {
@@ -2309,7 +2353,7 @@ async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>)
         "browser.total_ms" = report.total_ms,
         "browser.retry_attempt" = report.retry_attempt,
         "browser.visible" = report.visible,
-        "network.effective_type" = report.effective_type.as_deref(),
+        "network.effective_type" = report.effective_type.as_ref().map(NetworkEffectiveType::as_str),
     );
     drop(span.enter());
     StatusCode::NO_CONTENT
