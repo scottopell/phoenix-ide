@@ -2493,8 +2493,20 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             ):
                 return False
             retained_scope = _delete_fixture_conversation(conn, conv_id)
-            if environment != ("branch", str(worktree)):
-                retained_scope = None
+            if retained_scope is not None:
+                retained_scope_valid = conn.execute(
+                    "SELECT 1 FROM work_scopes s"
+                    " JOIN work_scope_environments e ON e.work_scope_id = s.id"
+                    " WHERE s.id = ? AND s.authority_kind = 'work'"
+                    " AND s.lifecycle = 'active'"
+                    " AND e.environment_kind = 'allocated_worktree'"
+                    " AND e.cwd = ? AND e.worktree_path = ?"
+                    " AND e.branch_name = 'seed-diff-review'"
+                    " AND e.base_branch = 'main'",
+                    (retained_scope, str(worktree), str(worktree)),
+                ).fetchone()
+                if retained_scope_valid is None:
+                    retained_scope = None
         else:
             retained_scope = None
 
