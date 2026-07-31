@@ -518,6 +518,7 @@ pub struct MaterializeAuthoritativeUserMessageCall {
 pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
+    state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     cwds: Mutex<HashMap<String, String>>,
     next_msg_id: Mutex<u64>,
@@ -550,6 +551,7 @@ impl InMemoryStorage {
         Self {
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
+            state_updated_ats: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
@@ -1089,10 +1091,12 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
         state: &ConvState,
-        _state_updated_at: chrono::DateTime<chrono::Utc>,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
-        // In-memory test storage tracks only the state value, not its entry
-        // timestamp, so the threaded stamp is intentionally unused here.
+        self.state_updated_ats
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), state_updated_at);
         self.states
             .lock()
             .unwrap()
@@ -1108,6 +1112,28 @@ impl StateStore for InMemoryStorage {
             .get(conv_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn get_state_snapshot(
+        &self,
+        conv_id: &str,
+    ) -> Result<crate::runtime::traits::PersistedStateSnapshot, String> {
+        Ok(crate::runtime::traits::PersistedStateSnapshot {
+            state: self
+                .states
+                .lock()
+                .unwrap()
+                .get(conv_id)
+                .cloned()
+                .unwrap_or_default(),
+            state_updated_at: self
+                .state_updated_ats
+                .lock()
+                .unwrap()
+                .get(conv_id)
+                .copied()
+                .unwrap_or_else(chrono::Utc::now),
+        })
     }
 
     async fn commit_continuation(

@@ -4317,11 +4317,12 @@ where
                             self.pending_direct_turn_terminal = None;
                             self.direct_turn_cancellation_initiated = false;
                         }
-                        self.state = self
+                        let persisted = self
                             .storage
-                            .get_state(&self.context.conversation_id)
+                            .get_state_snapshot(&self.context.conversation_id)
                             .await?;
-                        self.state_updated_at = Utc::now();
+                        self.state = persisted.state;
+                        self.state_updated_at = persisted.state_updated_at;
                         let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
                             SseEvent::StateChange {
                                 sequence_id,

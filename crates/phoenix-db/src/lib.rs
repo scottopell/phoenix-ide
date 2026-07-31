@@ -9620,31 +9620,30 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
 }
 
-pub(crate) fn conv_state_kind(state: &ConvState) -> &'static str {
-    match state.variant_name() {
-        "Idle" => "idle",
-        "LlmRequesting" => "llm_requesting",
-        "ToolExecuting" => "tool_executing",
-        "CancellingTool" => "cancelling_tool",
-        "AwaitingSubAgents" => "awaiting_sub_agents",
-        "CancellingSubAgents" => "cancelling_sub_agents",
-        "Error" => "error",
-        "AwaitingContinuation" => "awaiting_continuation",
-        "RecoverableContinuationFailure" => "recoverable_continuation_failure",
-        "AwaitingRecovery" => "awaiting_recovery",
-        "AwaitingTaskApproval" => "awaiting_task_approval",
-        "AwaitingUserResponse" => "awaiting_user_response",
-        "AwaitingCommissionReviewApproval" => "awaiting_commission_review_approval",
-        "ContextExhausted" => "context_exhausted",
-        "HandedOff" => "handed_off",
-        "Terminal" => "terminal",
-        "Completed" => "completed",
-        "Failed" => "failed",
-        "Provisioning" => "provisioning",
-        "CreationFailed" => "creation_failed",
-        "CreationCancelled" => "creation_cancelled",
-        "SeededLlmRequesting" => "seeded_llm_requesting",
-        other => panic!("unmapped ConvState variant for state_kind: {other}"),
+pub(crate) const fn conv_state_kind(state: &ConvState) -> &'static str {
+    match state {
+        ConvState::Idle => "idle",
+        ConvState::LlmRequesting { .. } => "llm_requesting",
+        ConvState::ToolExecuting { .. } => "tool_executing",
+        ConvState::CancellingTool { .. } => "cancelling_tool",
+        ConvState::AwaitingSubAgents { .. } => "awaiting_sub_agents",
+        ConvState::CancellingSubAgents { .. } => "cancelling_sub_agents",
+        ConvState::Error { .. } => "error",
+        ConvState::AwaitingContinuation { .. } => "awaiting_continuation",
+        ConvState::RecoverableContinuationFailure { .. } => "recoverable_continuation_failure",
+        ConvState::AwaitingRecovery { .. } => "awaiting_recovery",
+        ConvState::AwaitingTaskApproval { .. } => "awaiting_task_approval",
+        ConvState::AwaitingUserResponse { .. } => "awaiting_user_response",
+        ConvState::AwaitingCommissionReviewApproval { .. } => "awaiting_commission_review_approval",
+        ConvState::ContextExhausted { .. } => "context_exhausted",
+        ConvState::HandedOff { .. } => "handed_off",
+        ConvState::Terminal => "terminal",
+        ConvState::Completed { .. } => "completed",
+        ConvState::Failed { .. } => "failed",
+        ConvState::Provisioning { .. } => "provisioning",
+        ConvState::CreationFailed { .. } => "creation_failed",
+        ConvState::CreationCancelled { .. } => "creation_cancelled",
+        ConvState::SeededLlmRequesting { .. } => "seeded_llm_requesting",
     }
 }
 

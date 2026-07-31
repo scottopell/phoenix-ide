@@ -228,6 +228,12 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<(), String>;
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistedStateSnapshot {
+    pub state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+}
+
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
@@ -245,6 +251,8 @@ pub trait StateStore: Send + Sync {
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
+
+    async fn get_state_snapshot(&self, conv_id: &str) -> Result<PersistedStateSnapshot, String>;
 
     async fn commit_continuation(
         &self,
@@ -595,6 +603,10 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
+    }
+
+    async fn get_state_snapshot(&self, conv_id: &str) -> Result<PersistedStateSnapshot, String> {
+        (**self).get_state_snapshot(conv_id).await
     }
 
     async fn commit_continuation(
@@ -1117,6 +1129,18 @@ impl StateStore for DatabaseStorage {
             .await
             .map_err(|e| e.to_string())?;
         Ok(conv.state)
+    }
+
+    async fn get_state_snapshot(&self, conv_id: &str) -> Result<PersistedStateSnapshot, String> {
+        let conv = self
+            .db
+            .get_conversation(conv_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(PersistedStateSnapshot {
+            state: conv.state,
+            state_updated_at: conv.state_updated_at,
+        })
     }
 
     async fn commit_continuation(
