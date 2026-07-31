@@ -2492,6 +2492,8 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             ):
                 return False
             retained_scope = _delete_fixture_conversation(conn, conv_id)
+            if environment != ("branch", str(worktree)):
+                retained_scope = None
         else:
             retained_scope = None
 

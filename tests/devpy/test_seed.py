@@ -92,6 +92,10 @@ class ModernSeedTest(unittest.TestCase):
                     conn.execute(
                         "DELETE FROM messages WHERE conversation_id = ?", fixture
                     )
+                    conn.execute(
+                        "UPDATE work_scopes SET worktree_path = ? WHERE id = ?",
+                        ("/tmp/stale-seed-worktree", fixture_scope),
+                    )
                     conn.commit()
 
                 self.dev.cmd_seed(build=False)
@@ -119,12 +123,18 @@ class ModernSeedTest(unittest.TestCase):
                         ).fetchone()[0],
                         1,
                     )
+                    repaired_scope = conn.execute(
+                        "SELECT work_scope_id FROM conversations"
+                        " WHERE slug = 'fixture-diff-review'"
+                    ).fetchone()[0]
+                    self.assertNotEqual(repaired_scope, fixture_scope)
                     self.assertEqual(
                         conn.execute(
-                            "SELECT work_scope_id FROM conversations"
-                            " WHERE slug = 'fixture-diff-review'"
+                            "SELECT worktree_path FROM work_scope_environments"
+                            " WHERE work_scope_id = ?",
+                            (repaired_scope,),
                         ).fetchone()[0],
-                        fixture_scope,
+                        str(ROOT / ".phoenix" / "seed-worktrees" / "diff-review-fixture"),
                     )
                     self.assertEqual(
                         conn.execute(
