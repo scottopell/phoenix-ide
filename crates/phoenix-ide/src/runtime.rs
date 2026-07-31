@@ -2151,10 +2151,20 @@ impl RuntimeManager {
                 .then_some(conversation.id)
             })
             .collect();
+        let mut resumed = 0;
         for conversation_id in &conversation_ids {
-            self.get_or_create(conversation_id).await?;
+            match self.get_or_create(conversation_id).await {
+                Ok(_) => resumed += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        %conversation_id,
+                        %error,
+                        "failed to materialize persisted continuation operation"
+                    );
+                }
+            }
         }
-        Ok(conversation_ids.len())
+        Ok(resumed)
     }
 
     pub async fn start_creation_worker(self: &Arc<Self>) {
@@ -3634,6 +3644,7 @@ impl RuntimeManager {
             ConvState::Provisioning { .. }
             | ConvState::AwaitingContinuation { .. }
             | ConvState::RecoverableContinuationFailure { .. }
+            | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }

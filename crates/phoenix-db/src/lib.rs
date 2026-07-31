@@ -6871,6 +6871,33 @@ impl Database {
         // backstop for any other orphan shape (e.g. a partial pre-fix write).
         self.repair_orphaned_tool_use(&now).await?;
 
+        // AwaitingRecovery is polymorphic: continuation-summary credential
+        // recovery must survive restart, while an interrupted ordinary turn
+        // resets per REQ-BED-007. Decode the aggregate rather than querying its
+        // JSON fields from SQL.
+        let recovery_rows = sqlx::query(
+            "SELECT id, state FROM conversations WHERE state_kind = 'awaiting_recovery'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in recovery_rows {
+            let id: String = row.try_get("id")?;
+            let state_json: String = row.try_get("state")?;
+            let state: ConvState = serde_json::from_str(&state_json)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            if !matches!(
+                state,
+                ConvState::AwaitingRecovery {
+                    resume:
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. },
+                    ..
+                }
+            ) {
+                self.update_conversation_state_at(&id, &ConvState::Idle, now)
+                    .await?;
+            }
+        }
+
         // Reset non-terminal conversations to idle.
         // Preserved states (NOT reset):
         //   - context_exhausted: completed conversations that cannot accept new messages
@@ -14380,6 +14407,61 @@ mod tests {
             db.get_conversation("failed").await.unwrap().state,
             ConvState::Failed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_continuation_auth_recovery_but_resets_ordinary_recovery() {
+        let db = Database::open_in_memory().await.unwrap();
+        for id in ["continuation-auth", "ordinary-auth"] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "auth-operation".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        db.update_conversation_state(
+            "continuation-auth",
+            &ConvState::AwaitingRecovery {
+                message: "authenticate".to_string(),
+                error_kind: ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary {
+                    request: request.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            "ordinary-auth",
+            &ConvState::AwaitingRecovery {
+                message: "authenticate".to_string(),
+                error_kind: ErrorKind::Auth,
+                recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ConversationTurn,
+            },
+        )
+        .await
+        .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert!(matches!(
+            db.get_conversation("continuation-auth").await.unwrap().state,
+            ConvState::AwaitingRecovery {
+                resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary {
+                    request: persisted,
+                },
+                ..
+            } if persisted == request
+        ));
+        assert_eq!(
+            db.get_conversation("ordinary-auth").await.unwrap().state,
+            ConvState::Idle
+        );
     }
 
     /// A pending sub-agent that ALREADY reached its terminal state in its child
