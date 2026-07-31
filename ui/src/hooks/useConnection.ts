@@ -723,7 +723,13 @@ export function useConnection({
 
         case 'CLOSE_SSE': {
           if (eventSourceRef.current) {
-            reportCanceledOpen(conversationIdRef.current ?? '');
+            if (effect.deferForReplay) {
+              reportCanceledOpen(conversationIdRef.current ?? '');
+            } else {
+              const telemetry = openMeasurementRef.current?.canceled();
+              openMeasurementRef.current = null;
+              if (telemetry) reportConversationOpen(telemetry);
+            }
             eventSourceRef.current.close();
             eventSourceRef.current = null;
           }
@@ -860,7 +866,7 @@ export function useConnection({
     }
 
     return () => {
-      dispatchMachineRef.current({ type: 'DISCONNECT' });
+      dispatchMachineRef.current({ type: 'DISCONNECT', deferCloseForReplay: true });
     };
   }, [conversationId]);
 

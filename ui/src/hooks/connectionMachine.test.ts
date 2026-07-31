@@ -246,7 +246,7 @@ describe('connectionMachine', () => {
       
       expect(result.state.attempt).toBe(1);
       expect(result.state.state).toBe('reconnecting');
-      expect(result.effects).toContainEqual({ type: 'CLOSE_SSE' });
+      expect(result.effects).toContainEqual({ type: 'CLOSE_SSE', deferForReplay: false });
       expect(result.effects.some(e => e.type === 'SCHEDULE_RETRY')).toBe(true);
     });
 
@@ -258,7 +258,7 @@ describe('connectionMachine', () => {
       
       expect(result.state.attempt).toBe(1);
       expect(result.state.state).toBe('offline');
-      expect(result.effects).toContainEqual({ type: 'CLOSE_SSE' });
+      expect(result.effects).toContainEqual({ type: 'CLOSE_SSE', deferForReplay: false });
       expect(result.effects).toContainEqual({ type: 'CANCEL_TIMERS' });
       expect(result.effects.some(e => e.type === 'SCHEDULE_RETRY')).toBe(false);
     });

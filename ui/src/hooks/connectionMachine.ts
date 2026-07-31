@@ -13,7 +13,7 @@ export type ConnectionState =
 
 export type ConnectionInput =
   | { type: 'CONNECT' }                    // User/system wants to connect
-  | { type: 'DISCONNECT' }                 // User/system wants to disconnect
+  | { type: 'DISCONNECT'; deferCloseForReplay?: boolean }                 // User/system wants to disconnect
   | { type: 'SSE_OPEN' }                   // EventSource opened (got init event)
   | { type: 'SSE_ERROR' }                  // EventSource error/closed
   | { type: 'BROWSER_ONLINE' }             // navigator.onLine became true
@@ -30,7 +30,7 @@ export type ConnectionEffect =
   // that produced it; a stale handler firing into a different conversation
   // atom is then rejected by epoch mismatch (task 08683).
   | { type: 'OPEN_SSE'; epoch: number }
-  | { type: 'CLOSE_SSE' }                  // Close EventSource connection
+  | { type: 'CLOSE_SSE'; deferForReplay: boolean } // Close EventSource connection
   | { type: 'SCHEDULE_RETRY'; delayMs: number }  // Schedule retry timer
   | { type: 'SCHEDULE_RECONNECTED_DISPLAY' }     // Schedule "reconnected" display timer
   | { type: 'CANCEL_TIMERS' };             // Cancel all pending timers
@@ -118,7 +118,10 @@ export function transition(
     }
 
     case 'DISCONNECT': {
-      effects.push({ type: 'CLOSE_SSE' });
+      effects.push({
+        type: 'CLOSE_SSE',
+        deferForReplay: input.deferCloseForReplay ?? false,
+      });
       effects.push({ type: 'CANCEL_TIMERS' });
       return {
         state: { state: 'disconnected', attempt: 0, nextRetryMs: null, epoch: current.epoch },
@@ -153,7 +156,7 @@ export function transition(
 
     case 'SSE_ERROR': {
       // Connection failed or lost
-      effects.push({ type: 'CLOSE_SSE' });
+      effects.push({ type: 'CLOSE_SSE', deferForReplay: false });
 
       // If browser is offline, go to offline state without scheduling retry
       // (we'll retry when BROWSER_ONLINE fires)
@@ -195,7 +198,7 @@ export function transition(
     case 'BROWSER_OFFLINE': {
       // Browser went offline
       if (current.state !== 'disconnected') {
-        effects.push({ type: 'CLOSE_SSE' });
+        effects.push({ type: 'CLOSE_SSE', deferForReplay: false });
         effects.push({ type: 'CANCEL_TIMERS' });
         return {
           state: { state: 'offline', attempt: current.attempt, nextRetryMs: null, epoch: current.epoch },
