@@ -2271,6 +2271,7 @@ struct StreamConversationQuery {
 enum ConversationOpenOutcome {
     Connected,
     Error,
+    Canceled,
 }
 
 impl ConversationOpenOutcome {
@@ -2278,6 +2279,7 @@ impl ConversationOpenOutcome {
         match self {
             Self::Connected => "connected",
             Self::Error => "error",
+            Self::Canceled => "canceled",
         }
     }
 }

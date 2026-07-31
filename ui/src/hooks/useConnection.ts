@@ -3,6 +3,7 @@ import * as v from 'valibot';
 import type { SseInitData } from '../api';
 import type { SSEAction, InitPayload } from '../conversation/atom';
 import { parseConversationState } from '../utils';
+import { generateUUID } from '../utils/uuid';
 import { notifyConversationStateChange } from '../notifications';
 import {
   SseInitDataSchema,
@@ -220,6 +221,8 @@ export function useConnection({
 
   // Refs for values that shouldn't trigger effect re-runs
   const eventSourceRef = useRef<EventSource | null>(null);
+  const openMeasurementRef = useRef<ConversationOpenMeasurement | null>(null);
+  const openAttemptRef = useRef<{ conversationId: string; attempt: number } | null>(null);
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
   const reconnectedTimeoutRef = useRef<number | null>(null);
@@ -285,8 +288,11 @@ export function useConnection({
           if (!convId) break;
 
           if (eventSourceRef.current) {
+            const telemetry = openMeasurementRef.current?.canceled();
+            if (telemetry) reportConversationOpen(telemetry);
             eventSourceRef.current.close();
             eventSourceRef.current = null;
+            openMeasurementRef.current = null;
           }
 
           const epoch = effect.epoch;
@@ -298,15 +304,18 @@ export function useConnection({
           const initialRequestMode = lastAppliedEventSeq > 0
             ? undefined
             : getInitialRequestModeRef.current?.();
-          const openId = crypto.randomUUID();
-          const measurement = new ConversationOpenMeasurement(
-            openId,
-            machineStateRef.current.attempt,
-          );
+          const openId = generateUUID();
+          const previousAttempt = openAttemptRef.current;
+          const openAttempt = previousAttempt?.conversationId === convId
+            ? previousAttempt.attempt + 1
+            : 0;
+          openAttemptRef.current = { conversationId: convId, attempt: openAttempt };
+          const measurement = new ConversationOpenMeasurement(openId, openAttempt);
           const url = buildStreamUrl(convId, lastAppliedEventSeq, initialRequestMode, openId);
           const es = new EventSource(url);
           es.addEventListener('open', () => measurement.nativeOpen());
           eventSourceRef.current = es;
+          openMeasurementRef.current = measurement;
           const isCurrentOwner = () =>
             conversationIdRef.current === convId &&
             machineStateRef.current.epoch === epoch &&
@@ -667,8 +676,11 @@ export function useConnection({
 
         case 'CLOSE_SSE': {
           if (eventSourceRef.current) {
+            const telemetry = openMeasurementRef.current?.canceled();
+            if (telemetry) reportConversationOpen(telemetry);
             eventSourceRef.current.close();
             eventSourceRef.current = null;
+            openMeasurementRef.current = null;
           }
           break;
         }

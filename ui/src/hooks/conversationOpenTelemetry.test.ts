@@ -36,6 +36,23 @@ describe('ConversationOpenMeasurement', () => {
     });
   });
 
+  it('reports cancellation once and bounds unknown network types', () => {
+    vi.stubGlobal('navigator', {
+      ...navigator,
+      connection: { effectiveType: 'attacker-controlled-value' },
+    });
+    const times = [10, 25];
+    const measurement = new ConversationOpenMeasurement('open-canceled', 3, () => times.shift()!);
+
+    expect(measurement.canceled()).toMatchObject({
+      outcome: 'canceled',
+      retry_attempt: 3,
+      effective_type: null,
+      total_ms: 15,
+    });
+    expect(measurement.error()).toBeNull();
+  });
+
   it('posts a bounded content-free payload with keepalive', () => {
     const payload = {
       open_id: 'open-3',

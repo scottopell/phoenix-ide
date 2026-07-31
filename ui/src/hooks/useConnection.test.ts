@@ -219,6 +219,38 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect(body).toMatchObject({ open_id: openId, outcome: 'connected' });
   });
 
+  it('reports an unfinished open as canceled when the conversation changes', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const { rerender } = renderHook(
+      ({ convId }) => useConnection({ conversationId: convId, dispatch }),
+      { initialProps: { convId: 'conv-A' as string | undefined } },
+    );
+    const firstOpenId = new URL(
+      FakeEventSource.instances[0]!.url,
+      'http://localhost',
+    ).searchParams.get('open_id');
+
+    rerender({ convId: 'conv-B' });
+
+    const reports = vi.mocked(fetch).mock.calls.map((call) =>
+      JSON.parse((call[1] as RequestInit).body as string) as {
+        open_id: string;
+        outcome: string;
+      },
+    );
+    expect(reports).toContainEqual({
+      open_id: firstOpenId,
+      outcome: 'canceled',
+      native_open_ms: null,
+      init_received_ms: null,
+      handler_ms: null,
+      total_ms: expect.any(Number),
+      retry_attempt: 0,
+      visible: expect.any(Boolean),
+      effective_type: null,
+    });
+  });
+
   it('stamps every wire-derived dispatch with the connection epoch', () => {
     const captured: SSEAction[] = [];
     const dispatch = (a: SSEAction) => {

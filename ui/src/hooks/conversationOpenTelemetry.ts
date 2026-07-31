@@ -1,6 +1,6 @@
 export interface ConversationOpenTelemetryPayload {
   open_id: string;
-  outcome: 'connected' | 'error';
+  outcome: 'connected' | 'error' | 'canceled';
   native_open_ms: number | null;
   init_received_ms: number | null;
   handler_ms: number | null;
@@ -42,7 +42,11 @@ export class ConversationOpenMeasurement {
     return this.finish('error');
   }
 
-  private finish(outcome: 'connected' | 'error'): ConversationOpenTelemetryPayload | null {
+  canceled(): ConversationOpenTelemetryPayload | null {
+    return this.finish('canceled');
+  }
+
+  private finish(outcome: ConversationOpenTelemetryPayload['outcome']): ConversationOpenTelemetryPayload | null {
     if (this.completed) return null;
     this.completed = true;
     const finishedAt = this.clock();
@@ -68,11 +72,14 @@ function boundedMs(value: number): number {
   return Math.max(0, Math.min(300_000, Math.round(value * 10) / 10));
 }
 
+const NETWORK_EFFECTIVE_TYPES = new Set(['slow-2g', '2g', '3g', '4g']);
+
 function networkEffectiveType(): string | null {
   const connection = (navigator as Navigator & {
     connection?: { effectiveType?: string };
   }).connection;
-  return connection?.effectiveType ?? null;
+  const effectiveType = connection?.effectiveType;
+  return effectiveType && NETWORK_EFFECTIVE_TYPES.has(effectiveType) ? effectiveType : null;
 }
 
 export function reportConversationOpen(payload: ConversationOpenTelemetryPayload): void {
