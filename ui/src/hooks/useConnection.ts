@@ -327,7 +327,7 @@ export function useConnection({
           );
           if (replayIndex >= 0) {
             const [replayed] = pendingCancellationsRef.current.splice(replayIndex, 1);
-            clearTimeout(replayed.timeout);
+            if (replayed) clearTimeout(replayed.timeout);
             openAttemptRef.current = null;
           }
           if (eventSourceRef.current) {
