@@ -205,7 +205,7 @@ pub enum Effect {
 
     /// Atomically persist the accepted continuation summary for an operation.
     ContinuationCommit {
-        operation_id: String,
+        request: ContinuationSummaryRequest,
         summary: String,
     },
 
@@ -415,11 +415,11 @@ impl Effect {
 
     /// Create an atomic continuation commit effect.
     pub fn continuation_commit(
-        operation_id: impl Into<String>,
+        request: ContinuationSummaryRequest,
         summary: impl Into<String>,
     ) -> Self {
         Effect::ContinuationCommit {
-            operation_id: operation_id.into(),
+            request,
             summary: summary.into(),
         }
     }

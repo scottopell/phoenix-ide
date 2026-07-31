@@ -4185,10 +4185,8 @@ where
                 Ok(None)
             }
 
-            Effect::ContinuationCommit {
-                operation_id,
-                summary,
-            } => {
+            Effect::ContinuationCommit { request, summary } => {
+                let operation_id = request.operation_id.clone();
                 let seq = self.broadcast_tx.next_seq();
                 let content = crate::db::MessageContent::continuation(summary.clone());
                 let message = crate::db::Message {
@@ -4244,16 +4242,9 @@ where
                 let continuation_outcome = match continuation_result {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        let persisted = self
-                            .storage
-                            .get_state(&self.context.conversation_id)
-                            .await?;
-                        let ConvState::AwaitingContinuation { request } = persisted else {
-                            return Err(error);
-                        };
                         let failure =
                             phoenix_core::domain::sm_state::RecoverableContinuationFailure {
-                                request,
+                                request: request.clone(),
                                 error_kind: crate::db::ErrorKind::ServerError,
                                 message: format!("Failed to commit continuation summary: {error}"),
                             };
@@ -9292,7 +9283,7 @@ mod authoritative_user_message_effect_tests {
         };
 
         rt.execute_effect(Effect::ContinuationCommit {
-            operation_id,
+            request: request.clone(),
             summary: "generated summary".to_string(),
         })
         .await
@@ -9345,7 +9336,11 @@ mod authoritative_user_message_effect_tests {
             .unwrap();
 
         rt.execute_effect(Effect::ContinuationCommit {
-            operation_id: operation_id.clone(),
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: operation_id.clone(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
             summary: summary.clone(),
         })
         .await

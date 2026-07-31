@@ -2896,7 +2896,7 @@ pub fn transition_parent(
             Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
                 summary: summary.clone(),
             })
-            .with_effect(Effect::continuation_commit(operation_id, &summary)))
+            .with_effect(Effect::continuation_commit(request.clone(), &summary)))
         }
 
         (
