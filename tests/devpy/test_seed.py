@@ -21,8 +21,7 @@ class ModernSeedTest(unittest.TestCase):
     def setUpClass(cls):
         cls.dev = load_devpy()
         binary = ROOT / "target" / "release" / "phoenix_ide"
-        if not binary.exists():
-            cls.dev.build_rust(release=True)
+        cls.dev.build_rust(release=True)
         if not binary.exists():
             raise AssertionError(f"release phoenix_ide binary was not built: {binary}")
 

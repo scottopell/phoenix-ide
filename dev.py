@@ -2627,7 +2627,23 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
                 (conv_id,),
             ).fetchone()[0]
-            if archived == 0 and message_count >= 1:
+            scope_valid = conn.execute(
+                "SELECT 1 FROM conversations c"
+                " JOIN work_scopes s ON s.id = c.work_scope_id"
+                " JOIN work_scope_environments e ON e.work_scope_id = s.id"
+                " WHERE c.id = ? AND c.cm_kind = 'work'"
+                " AND s.authority_kind = 'work' AND s.lifecycle = 'active'"
+                " AND e.environment_kind = 'allocated_worktree'"
+                " AND e.cwd = ? AND e.worktree_path = ?"
+                " AND e.branch_name = ? AND e.base_branch = 'main'",
+                (
+                    conv_id,
+                    str(worktree),
+                    str(worktree),
+                    "task-22001-redesign-conversation-grounding-side-panel",
+                ),
+            ).fetchone()
+            if archived == 0 and message_count >= 1 and scope_valid is not None:
                 return False
             retained_scope = _delete_fixture_conversation(conn, conv_id)
         else:
