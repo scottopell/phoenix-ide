@@ -918,20 +918,44 @@ rule ContinuationAuthErrorWithActiveRecovery {
     ensures: conversation.continuation_operation_id = operation_id
 }
 
-rule RecoverySucceeded {
+rule ConversationTurnRecoverySucceeded {
     when: CredentialBecameAvailable(conversation)
     requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = conversation_turn
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
 }
 
-rule RecoveryFailed {
+rule ContinuationRecoverySucceeded {
+    when: CredentialBecameAvailable(conversation)
+    requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = continuation_summary
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: ContinuationRequested(
+        conversation,
+        conversation.continuation_operation_id,
+        conversation.rejected_tool_calls)
+}
+
+rule ConversationTurnRecoveryFailed {
     when: CredentialHelperFailed(conversation, message)
     requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = conversation_turn
     ensures: conversation.core_status = error
     ensures: conversation.error_message = message
     ensures: conversation.error_class = non_retryable
+}
+
+rule ContinuationRecoveryFailed {
+    when: CredentialHelperFailed(conversation, message)
+    requires: conversation.parent_status = awaiting_recovery
+    requires: conversation.recovery_resume_target = continuation_summary
+    ensures: conversation.core_status = recoverable_continuation_failure
+    ensures: conversation.continuation_error_message = message
+    ensures: ContinuationRetryOffered(
+        conversation,
+        conversation.continuation_operation_id)
 }
 
 rule CancelDuringRecovery {

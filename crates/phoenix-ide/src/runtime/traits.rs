@@ -57,6 +57,16 @@ pub struct ContinuationDirectTurnSettlement {
     pub state_updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ContinuationStartRecoverySettlement {
+    pub turn: Option<ActiveDirectTurn>,
+    pub terminal: Option<ActiveDirectTurnTerminal>,
+    pub operation_id: String,
+    pub message: Message,
+    pub state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthoritativeUserMessageAdoptionInput {
     pub authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
@@ -261,6 +271,11 @@ pub trait StateStore: Send + Sync {
         message: &crate::db::Message,
         awaiting_state: &ConvState,
         state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String>;
+
+    async fn recover_continuation_start(
+        &self,
+        settlement: &ContinuationStartRecoverySettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String>;
 
     async fn commit_continuation(
@@ -635,6 +650,13 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
                 state_updated_at,
             )
             .await
+    }
+
+    async fn recover_continuation_start(
+        &self,
+        settlement: &ContinuationStartRecoverySettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        (**self).recover_continuation_start(settlement).await
     }
 
     async fn commit_continuation(
@@ -1189,6 +1211,38 @@ impl StateStore for DatabaseStorage {
             )
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn recover_continuation_start(
+        &self,
+        settlement: &ContinuationStartRecoverySettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if let (Some(turn), Some(terminal)) = (&settlement.turn, &settlement.terminal) {
+            let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+            repo.settle_failed_continuation_start_atomically(
+                &phoenix_db::workflow::AtomicContinuationSettlementInput {
+                    conversation_id: settlement.message.conversation_id.clone(),
+                    operation_id: settlement.operation_id.clone(),
+                    message: settlement.message.clone(),
+                    completed_state: settlement.state.clone(),
+                    state_updated_at: settlement.state_updated_at,
+                    command: direct_turn_terminal_command(turn, terminal.clone()),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+        } else {
+            self.db
+                .recover_continuation_start(
+                    &settlement.message.conversation_id,
+                    &settlement.operation_id,
+                    &settlement.message,
+                    &settlement.state,
+                    settlement.state_updated_at,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        }
     }
 
     async fn commit_continuation(

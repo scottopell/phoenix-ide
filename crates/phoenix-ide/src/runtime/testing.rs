@@ -1177,6 +1177,30 @@ impl StateStore for InMemoryStorage {
         Ok(crate::db::ContinuationCommitOutcome::Applied)
     }
 
+    async fn recover_continuation_start(
+        &self,
+        settlement: &crate::runtime::traits::ContinuationStartRecoverySettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(settlement.message.conversation_id.clone())
+            .or_default()
+            .push(settlement.message.clone());
+        self.states.lock().unwrap().insert(
+            settlement.message.conversation_id.clone(),
+            settlement.state.clone(),
+        );
+        self.state_updated_ats.lock().unwrap().insert(
+            settlement.message.conversation_id.clone(),
+            settlement.state_updated_at,
+        );
+        if settlement.turn.is_some() {
+            *self.active_direct_turn.lock().unwrap() = None;
+        }
+        Ok(crate::db::ContinuationCommitOutcome::Applied)
+    }
+
     async fn commit_continuation(
         &self,
         conv_id: &str,

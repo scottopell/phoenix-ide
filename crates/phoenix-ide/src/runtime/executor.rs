@@ -4254,30 +4254,27 @@ where
                             };
                         self.state = ConvState::RecoverableContinuationFailure { failure };
                         self.state_updated_at = Utc::now();
-                        if let Some(turn) = self.active_direct_turn.as_deref() {
-                            self.storage
-                                .settle_active_direct_turn(
-                                    &crate::runtime::traits::ActiveDirectTurnSettlement {
-                                        turn: turn.clone(),
-                                        terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
-                                            reason: error,
-                                        },
-                                        state: self.state.clone(),
-                                        state_updated_at: self.state_updated_at,
-                                    },
-                                )
-                                .await?;
+                        let terminal = self.active_direct_turn.as_ref().map(|_| {
+                            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                reason: error,
+                            }
+                        });
+                        self.storage
+                            .recover_continuation_start(
+                                &crate::runtime::traits::ContinuationStartRecoverySettlement {
+                                    turn: self.active_direct_turn.as_deref().cloned(),
+                                    terminal,
+                                    operation_id: request.operation_id.clone(),
+                                    message: message.clone(),
+                                    state: self.state.clone(),
+                                    state_updated_at: self.state_updated_at,
+                                },
+                            )
+                            .await?;
+                        if self.active_direct_turn.is_some() {
                             self.active_direct_turn = None;
                             self.pending_direct_turn_terminal = None;
                             self.direct_turn_cancellation_initiated = false;
-                        } else {
-                            self.storage
-                                .update_state(
-                                    &self.context.conversation_id,
-                                    &self.state,
-                                    self.state_updated_at,
-                                )
-                                .await?;
                         }
                         self.continuation_effect_disposition =
                             ContinuationEffectDisposition::AbortRemaining;
@@ -9470,6 +9467,12 @@ mod authoritative_user_message_effect_tests {
             ConvState::RecoverableContinuationFailure { failure }
                 if failure.request == request
         ));
+        let messages = storage.get_all_messages(&rt.context.conversation_id);
+        assert!(messages.iter().any(|message| {
+            message.message_id == request.operation_id
+                && matches!(&message.content, crate::db::MessageContent::Agent(blocks)
+                    if blocks == &vec![ContentBlock::text("response")])
+        }));
     }
 
     #[tokio::test]

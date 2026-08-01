@@ -143,6 +143,70 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+pub(crate) async fn persist_continuation_start_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    operation_id: &str,
+    message: &Message,
+    target_state: &ConvState,
+    state_updated_at: DateTime<Utc>,
+) -> DbResult<ContinuationCommitOutcome> {
+    let row = sqlx::query("SELECT state FROM conversations WHERE id = ?1")
+        .bind(conversation_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+    let persisted_json: String = row.get("state");
+    let persisted: ConvState = serde_json::from_str(&persisted_json)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let owns_operation = matches!(
+        &persisted,
+        ConvState::AwaitingContinuation { request } if request.operation_id == operation_id
+    ) || matches!(
+        &persisted,
+        ConvState::RecoverableContinuationFailure { failure }
+            if failure.request.operation_id == operation_id
+    );
+    if owns_operation {
+        let exists = sqlx::query("SELECT 1 FROM messages WHERE message_id = ?1")
+            .bind(&message.message_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+        return Ok(if exists {
+            ContinuationCommitOutcome::Duplicate
+        } else {
+            ContinuationCommitOutcome::Stale
+        });
+    }
+    if !matches!(
+        persisted,
+        ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. }
+    ) {
+        return Ok(ContinuationCommitOutcome::Stale);
+    }
+    insert_message_tx(tx, message).await?;
+    let target_json = serde_json::to_string(target_state)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let updated = sqlx::query(
+        "UPDATE conversations
+         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+         WHERE id = ?5 AND state = ?6",
+    )
+    .bind(target_json)
+    .bind(conv_state_kind(target_state))
+    .bind(state_updated_at.to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(conversation_id)
+    .bind(persisted_json)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(ContinuationCommitOutcome::Stale);
+    }
+    Ok(ContinuationCommitOutcome::Applied)
+}
+
 pub(crate) async fn commit_continuation_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
@@ -4667,6 +4731,33 @@ impl Database {
         Ok(CreationCasOutcome::Applied)
     }
 
+    async fn persist_continuation_start(
+        &self,
+        conversation_id: &str,
+        operation_id: &str,
+        message: &Message,
+        target_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<ContinuationCommitOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let outcome = persist_continuation_start_tx(
+            &mut tx,
+            conversation_id,
+            operation_id,
+            message,
+            target_state,
+            state_updated_at,
+        )
+        .await?;
+        match outcome {
+            ContinuationCommitOutcome::Applied => tx.commit().await?,
+            ContinuationCommitOutcome::Duplicate | ContinuationCommitOutcome::Stale => {
+                tx.rollback().await?;
+            }
+        }
+        Ok(outcome)
+    }
+
     /// Atomically persist the threshold-crossing response and continuation
     /// operation before summary generation begins.
     ///
@@ -4682,60 +4773,38 @@ impl Database {
         awaiting_state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<ContinuationCommitOutcome> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT state FROM conversations WHERE id = ?1")
-            .bind(conversation_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
-        let persisted_json: String = row.get("state");
-        let persisted: ConvState = serde_json::from_str(&persisted_json)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        if matches!(
-            &persisted,
-            ConvState::AwaitingContinuation { request } if request.operation_id == operation_id
-        ) {
-            let exists = sqlx::query("SELECT 1 FROM messages WHERE message_id = ?1")
-                .bind(&message.message_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
-            tx.rollback().await?;
-            return Ok(if exists {
-                ContinuationCommitOutcome::Duplicate
-            } else {
-                ContinuationCommitOutcome::Stale
-            });
-        }
-        if !matches!(
-            persisted,
-            ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. }
-        ) {
-            tx.rollback().await?;
-            return Ok(ContinuationCommitOutcome::Stale);
-        }
-        insert_message_tx(&mut tx, message).await?;
-        let awaiting_json = serde_json::to_string(awaiting_state)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let updated = sqlx::query(
-            "UPDATE conversations
-             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
-             WHERE id = ?5 AND state = ?6",
+        self.persist_continuation_start(
+            conversation_id,
+            operation_id,
+            message,
+            awaiting_state,
+            state_updated_at,
         )
-        .bind(awaiting_json)
-        .bind(conv_state_kind(awaiting_state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .bind(persisted_json)
-        .execute(&mut *tx)
-        .await?;
-        if updated.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Ok(ContinuationCommitOutcome::Stale);
-        }
-        tx.commit().await?;
-        Ok(ContinuationCommitOutcome::Applied)
+        .await
+    }
+
+    /// Atomically retain the threshold response with a recoverable start failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the conversation or message cannot be read or
+    /// atomically written.
+    pub async fn recover_continuation_start(
+        &self,
+        conversation_id: &str,
+        operation_id: &str,
+        message: &Message,
+        failure_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<ContinuationCommitOutcome> {
+        self.persist_continuation_start(
+            conversation_id,
+            operation_id,
+            message,
+            failure_state,
+            state_updated_at,
+        )
+        .await
     }
 
     /// Return every conversation with continuation work that must be
@@ -12772,6 +12841,82 @@ mod tests {
             db.get_messages("begin-continuation").await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_start_recovery_retains_threshold_response() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("recover-start", "recover", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state("recover-start", &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "recover-operation".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let failure = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: request.clone(),
+                error_kind: ErrorKind::ServerError,
+                message: "start failed".to_string(),
+            },
+        };
+        let content =
+            MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "threshold response",
+            )]);
+        let message = Message {
+            message_id: request.operation_id.clone(),
+            conversation_id: "recover-start".to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content: content.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            db.recover_continuation_start(
+                "recover-start",
+                &request.operation_id,
+                &message,
+                &failure,
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            db.get_conversation("recover-start").await.unwrap().state,
+            failure
+        );
+        let messages = db.get_messages("recover-start").await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, content);
+        assert_eq!(
+            db.recover_continuation_start(
+                "recover-start",
+                &request.operation_id,
+                &message,
+                &ConvState::RecoverableContinuationFailure {
+                    failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                        request: request.clone(),
+                        error_kind: ErrorKind::ServerError,
+                        message: "start failed".to_string(),
+                    },
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap(),
+            ContinuationCommitOutcome::Duplicate
+        );
+        assert_eq!(db.get_messages("recover-start").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

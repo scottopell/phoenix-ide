@@ -243,7 +243,8 @@ entity WorkActionsBar {
 --
 --   phase_is_eligible(conv: bedrock/Conversation) -> Boolean
 --       True when conv.mode in { work, branch } AND the conversation is in a
---       disposable, non-running condition: conv.core_status in { idle, error }.
+--       disposable, non-running condition: conv.core_status in
+--       { idle, error, recoverable_continuation_failure }.
 --       Context exhaustion uses bedrock's focused handoff surface instead.
 --
 --   conv_mode(conv: bedrock/Conversation) -> ConvMode
@@ -251,8 +252,9 @@ entity WorkActionsBar {
 --       called for other modes (the bar is hidden for them).
 --
 --   derive_bar_phase(conv: bedrock/Conversation) -> BarPhase
---       core_status = idle  -> BarPhase.idle
---       core_status = error -> BarPhase.error
+--       core_status = idle                             -> BarPhase.idle
+--       core_status = error                            -> BarPhase.error
+--       core_status = recoverable_continuation_failure -> BarPhase.recoverable_continuation_failure
 --       Only called when phase_is_eligible is true.
 --
 --   resolve_pr_status(conv: bedrock/Conversation) -> pra/PrStatusView?

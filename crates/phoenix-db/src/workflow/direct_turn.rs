@@ -1002,6 +1002,51 @@ impl WorkflowRepository {
             .await
     }
 
+    pub async fn settle_failed_continuation_start_atomically(
+        &self,
+        input: &AtomicContinuationSettlementInput,
+    ) -> DbResult<crate::ContinuationCommitOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let outcome = crate::persist_continuation_start_tx(
+            &mut tx.tx,
+            &input.conversation_id,
+            &input.operation_id,
+            &input.message,
+            &input.completed_state,
+            input.state_updated_at,
+        )
+        .await?;
+        match outcome {
+            crate::ContinuationCommitOutcome::Applied => {
+                self.terminalize_authoritative_turn_in_tx(
+                    &mut tx,
+                    &TerminalizeAuthoritativeTurnInput {
+                        command: input.command.clone(),
+                        projection: Some(PersistedConversationProjection {
+                            state: input.completed_state.clone(),
+                            state_updated_at: input.state_updated_at,
+                        }),
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            crate::ContinuationCommitOutcome::Duplicate => {
+                self.terminalize_authoritative_turn_in_tx(
+                    &mut tx,
+                    &TerminalizeAuthoritativeTurnInput {
+                        command: input.command.clone(),
+                        projection: None,
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            crate::ContinuationCommitOutcome::Stale => tx.rollback().await?,
+        }
+        Ok(outcome)
+    }
+
     pub async fn settle_continuation_direct_turn_atomically(
         &self,
         input: &AtomicContinuationSettlementInput,

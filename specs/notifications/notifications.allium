@@ -366,11 +366,25 @@ rule ClearBlockingDedupeOnResolution {
     @guidance
         -- Any settled non-blocking state clears the key — idle (the dominant
         -- resolution), terminal, handed_off, or a context_exhausted that has
-        -- continued elsewhere. A transition back into a busy state
-        -- intentionally preserves the key (a brief busy blip mid-attention
-        -- must not re-arm a notification). Implementation: clearAttentionSeen
+        -- continued elsewhere. A transition back into a busy state preserves
+        -- the key unless it is the explicit continuation retry modeled by
+        -- ClearBlockingDedupeOnContinuationRetry. A brief busy blip
+        -- mid-attention must not re-arm a notification. Implementation:
+        -- clearAttentionSeen
         -- runs on the idle-from-busy branch and on the settled-else branch of
         -- notifyConversationStateChange.
+}
+
+rule ClearBlockingDedupeOnContinuationRetry {
+    when: conversation: bedrock/Conversation.status
+        transitions_to awaiting_continuation
+
+    requires: conversation.previous_status = recoverable_continuation_failure
+    ensures: not exists AttentionSeen{conversation_id: conversation.id}
+
+    @guidance
+        -- An explicit retry resolves the prior failure occurrence. Clearing its
+        -- key allows a later failed retry to notify as a new actionable event.
 }
 
 rule NotificationClicked {
