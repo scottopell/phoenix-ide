@@ -265,7 +265,9 @@ variant Parent : Conversation {
     --   awaiting_task_approval -> idle            (approval in current exits)
     --   awaiting_task_approval -> handed_off      (approval into fresh Work exits)
     --   awaiting_user_response -> idle            (user question exits)
-    --   awaiting_recovery      -> idle            (recovery exits)
+    --   awaiting_recovery      -> idle            (conversation-turn recovery exits)
+    --   awaiting_recovery      -> awaiting_continuation (continuation recovery succeeds)
+    --   awaiting_recovery      -> recoverable_continuation_failure (continuation recovery fails)
     --   awaiting_continuation  -> context_exhausted (continuation -> terminal)
     --   terminal states: context_exhausted, terminal
     --

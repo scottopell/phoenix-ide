@@ -4259,7 +4259,8 @@ where
                                 reason: error,
                             }
                         });
-                        self.storage
+                        let recovery_outcome = self
+                            .storage
                             .recover_continuation_start(
                                 &crate::runtime::traits::ContinuationStartRecoverySettlement {
                                     turn: self.active_direct_turn.as_deref().cloned(),
@@ -4271,7 +4272,37 @@ where
                                 },
                             )
                             .await?;
-                        if self.active_direct_turn.is_some() {
+                        if recovery_outcome == crate::db::ContinuationCommitOutcome::Duplicate {
+                            let persisted = self
+                                .storage
+                                .get_state_snapshot(&self.context.conversation_id)
+                                .await?;
+                            self.state = persisted.state;
+                            self.state_updated_at = persisted.state_updated_at;
+                            if matches!(
+                                &self.state,
+                                ConvState::AwaitingContinuation { request: persisted_request }
+                                    if persisted_request.operation_id == request.operation_id
+                            ) {
+                                let _ = self.broadcast_tx.send_message(message);
+                                drop(reserved_range);
+                                let _ = self.broadcast_tx.send_seq(|sequence_id| {
+                                    SseEvent::StateChange {
+                                        sequence_id,
+                                        state: self.state.clone(),
+                                        presentation_mode: self
+                                            .state
+                                            .presentation_mode()
+                                            .to_string(),
+                                        state_updated_at: self.state_updated_at,
+                                    }
+                                });
+                                return Ok(None);
+                            }
+                        }
+                        if self.active_direct_turn.is_some()
+                            && recovery_outcome == crate::db::ContinuationCommitOutcome::Applied
+                        {
                             self.active_direct_turn = None;
                             self.pending_direct_turn_terminal = None;
                             self.direct_turn_cancellation_initiated = false;
@@ -9483,6 +9514,58 @@ mod authoritative_user_message_effect_tests {
             rx.try_recv().expect("recoverable state broadcast"),
             SseEvent::StateChange {
                 state: ConvState::RecoverableContinuationFailure { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_continuation_start_commit_resumes_persisted_operation() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "ambiguous-start".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let awaiting = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        storage
+            .update_state(&rt.context.conversation_id, &awaiting, Utc::now())
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+        storage.set_continuation_start_recovery_outcome(
+            crate::db::ContinuationCommitOutcome::Duplicate,
+        );
+        rt.state = awaiting.clone();
+
+        rt.apply_transition_result(
+            crate::state_machine::transition::TransitionResult::new(awaiting.clone())
+                .with_effect(Effect::BeginContinuation {
+                    request: request.clone(),
+                    content: crate::db::MessageContent::agent(vec![ContentBlock::text("response")]),
+                    display_data: None,
+                    usage_data: phoenix_core::domain::llm_types::Usage::default(),
+                    message_id: request.operation_id.clone(),
+                })
+                .with_effect(Effect::RequestContinuation {
+                    request: request.clone(),
+                }),
+        )
+        .await
+        .expect("duplicate recovery should resume the persisted operation");
+
+        assert_eq!(rt.state, awaiting);
+        assert!(rt.llm_task_handle.is_some());
+        assert!(matches!(rx.try_recv().unwrap(), SseEvent::Message { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::AwaitingContinuation { .. },
                 ..
             }
         ));

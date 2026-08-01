@@ -4157,8 +4157,8 @@ async fn cancel_conversation(
 }
 
 /// Upgrade a conversation's model (e.g., from 200k to 1M context).
-/// Allowed from `Idle` or `Error` -- cannot upgrade while an LLM request,
-/// tool execution, or other operation is in flight (see
+/// Allowed from `Idle`, `Error`, or `RecoverableContinuationFailure` -- cannot
+/// upgrade while an LLM request, tool execution, or other operation is in flight (see
 /// `ConvState::allows_model_change`).
 async fn upgrade_conversation_model(
     State(state): State<AppState>,
@@ -4190,10 +4190,15 @@ async fn upgrade_conversation_model(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !conv.state.allows_model_change() {
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or_else(|| conv.state.clone());
+    if !effective_state.allows_model_change() {
         return Err(AppError::BadRequest(format!(
             "Cannot change model while conversation is {} -- finish or cancel the current operation first",
-            conv.state.variant_name()
+            effective_state.variant_name()
         )));
     }
 

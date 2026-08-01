@@ -541,6 +541,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -571,6 +572,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            continuation_start_recovery_outcome: Mutex::new(None),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -582,6 +584,13 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn set_continuation_start_recovery_outcome(
+        &self,
+        outcome: crate::db::ContinuationCommitOutcome,
+    ) {
+        *self.continuation_start_recovery_outcome.lock().unwrap() = Some(outcome);
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -1181,6 +1190,9 @@ impl StateStore for InMemoryStorage {
         &self,
         settlement: &crate::runtime::traits::ContinuationStartRecoverySettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if let Some(outcome) = *self.continuation_start_recovery_outcome.lock().unwrap() {
+            return Ok(outcome);
+        }
         self.messages
             .lock()
             .unwrap()

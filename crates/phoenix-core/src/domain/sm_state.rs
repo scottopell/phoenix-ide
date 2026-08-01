@@ -824,7 +824,7 @@ mod tests {
     // reason: exhaustive per-variant ConvState construction is inherently long;
     // splitting it would scatter the correct-by-construction guard described above.
     #[allow(clippy::too_many_lines)]
-    fn allows_model_change_only_from_idle_and_error() {
+    fn allows_model_change_only_from_settled_recoverable_states() {
         fn err() -> ConvState {
             ConvState::Error {
                 message: "overloaded".into(),
@@ -2030,9 +2030,10 @@ impl ConvState {
         )
     }
 
-    /// True only for `Idle` and `Error` — the states with nothing in
-    /// flight that a model swap would race. Error-state recovery
-    /// ("pick another model") is specified by REQ-LLM-006.
+    /// True only for settled states with nothing in flight that a model swap
+    /// would race. Error-state recovery ("pick another model") is specified by
+    /// REQ-LLM-006; continuation failures also permit choosing another model
+    /// before explicitly retrying the retained operation.
     #[must_use]
     pub fn allows_model_change(&self) -> bool {
         matches!(

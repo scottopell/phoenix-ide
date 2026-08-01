@@ -1031,18 +1031,8 @@ impl WorkflowRepository {
                 .await?;
                 tx.commit().await?;
             }
-            crate::ContinuationCommitOutcome::Duplicate => {
-                self.terminalize_authoritative_turn_in_tx(
-                    &mut tx,
-                    &TerminalizeAuthoritativeTurnInput {
-                        command: input.command.clone(),
-                        projection: None,
-                    },
-                )
-                .await?;
-                tx.commit().await?;
-            }
-            crate::ContinuationCommitOutcome::Stale => tx.rollback().await?,
+            crate::ContinuationCommitOutcome::Duplicate
+            | crate::ContinuationCommitOutcome::Stale => tx.rollback().await?,
         }
         Ok(outcome)
     }
