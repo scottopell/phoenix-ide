@@ -4278,15 +4278,16 @@ where
                         }
                         self.continuation_effect_disposition =
                             ContinuationEffectDisposition::AbortRemaining;
+                        let _ = self.broadcast_tx.send_message(message);
+                        drop(reserved_range);
                         let _ = self
                             .broadcast_tx
-                            .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
+                            .send_seq(|sequence_id| SseEvent::StateChange {
                                 sequence_id,
                                 state: self.state.clone(),
                                 presentation_mode: self.state.presentation_mode().to_string(),
                                 state_updated_at: self.state_updated_at,
                             });
-                        drop(reserved_range);
                         return Ok(None);
                     }
                 };
@@ -9420,7 +9421,7 @@ mod authoritative_user_message_effect_tests {
 
     #[tokio::test]
     async fn continuation_start_failure_persists_visible_recovery_state() {
-        let (mut rt, storage, _rx) = runtime(
+        let (mut rt, storage, mut rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
         );
@@ -9473,6 +9474,18 @@ mod authoritative_user_message_effect_tests {
                 && matches!(&message.content, crate::db::MessageContent::Agent(blocks)
                     if blocks == &vec![ContentBlock::text("response")])
         }));
+        let SseEvent::Message { message } = rx.try_recv().expect("retained response broadcast")
+        else {
+            panic!("expected retained response before recovery state")
+        };
+        assert_eq!(message.message_id, request.operation_id);
+        assert!(matches!(
+            rx.try_recv().expect("recoverable state broadcast"),
+            SseEvent::StateChange {
+                state: ConvState::RecoverableContinuationFailure { .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
