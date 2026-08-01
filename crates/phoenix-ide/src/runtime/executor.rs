@@ -4408,7 +4408,24 @@ where
                 let continuation_outcome = match continuation_result {
                     Ok(outcome) => outcome,
                     Err(first_error) => {
-                        let reconciled = if self.active_direct_turn.is_none() {
+                        let reconciled = if let (Some(turn), Some(terminal)) = (
+                            self.active_direct_turn.as_ref(),
+                            direct_turn_terminal.as_ref(),
+                        ) {
+                            self.storage
+                                .settle_continuation_direct_turn(
+                                    &crate::runtime::traits::ContinuationDirectTurnSettlement {
+                                        turn: (**turn).clone(),
+                                        terminal: terminal.clone(),
+                                        operation_id: operation_id.clone(),
+                                        message: message.clone(),
+                                        state: self.state.clone(),
+                                        state_updated_at: self.state_updated_at,
+                                    },
+                                )
+                                .await
+                                .ok()
+                        } else {
                             self.storage
                                 .commit_continuation(
                                     &self.context.conversation_id,
@@ -4419,16 +4436,14 @@ where
                                 )
                                 .await
                                 .ok()
-                                .filter(|outcome| {
-                                    matches!(
-                                        outcome,
-                                        crate::db::ContinuationCommitOutcome::Applied
-                                            | crate::db::ContinuationCommitOutcome::Duplicate
-                                    )
-                                })
-                        } else {
-                            None
-                        };
+                        }
+                        .filter(|outcome| {
+                            matches!(
+                                outcome,
+                                crate::db::ContinuationCommitOutcome::Applied
+                                    | crate::db::ContinuationCommitOutcome::Duplicate
+                            )
+                        });
                         if let Some(outcome) = reconciled {
                             outcome
                         } else {
@@ -4515,6 +4530,22 @@ where
                             .await?;
                         self.state = persisted.state;
                         self.state_updated_at = persisted.state_updated_at;
+                        if continuation_outcome == crate::db::ContinuationCommitOutcome::Duplicate {
+                            let _ = self.broadcast_tx.send_message(message);
+                            drop(reserved_range);
+                            let _ =
+                                self.broadcast_tx
+                                    .send_seq(|sequence_id| SseEvent::StateChange {
+                                        sequence_id,
+                                        state: self.state.clone(),
+                                        presentation_mode: self
+                                            .state
+                                            .presentation_mode()
+                                            .to_string(),
+                                        state_updated_at: self.state_updated_at,
+                                    });
+                            return Ok(None);
+                        }
                         let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
                             SseEvent::StateChange {
                                 sequence_id,
@@ -9721,6 +9752,54 @@ mod authoritative_user_message_effect_tests {
             }
         ));
         assert_eq!(rt.broadcast_tx.next_seq(), 2);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_direct_turn_continuation_commit_reconciles_duplicate() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "ambiguous-direct-commit".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(12),
+            generation: 0,
+        }));
+        rt.state = ConvState::ContextExhausted {
+            summary: "summary".to_string(),
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: request.clone(),
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        storage.set_continuation_commit_error_once();
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request,
+            summary: "summary".to_string(),
+        })
+        .await
+        .expect("ambiguous direct-turn commit should reconcile");
+
+        assert!(rt.active_direct_turn.is_none());
+        assert!(matches!(rx.try_recv().unwrap(), SseEvent::Message { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::ContextExhausted { .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

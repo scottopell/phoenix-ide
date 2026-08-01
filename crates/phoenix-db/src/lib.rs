@@ -4816,11 +4816,12 @@ impl Database {
     pub async fn list_pending_continuation_conversation_ids(&self) -> DbResult<Vec<String>> {
         let rows = sqlx::query(
             "SELECT id, state FROM conversations
-             WHERE state_kind IN (
-                 'awaiting_continuation',
-                 'recoverable_continuation_failure',
-                 'awaiting_recovery'
-             )",
+             WHERE archived = 0
+               AND state_kind IN (
+                   'awaiting_continuation',
+                   'recoverable_continuation_failure',
+                   'awaiting_recovery'
+               )",
         )
         .fetch_all(&self.pool)
         .await?;

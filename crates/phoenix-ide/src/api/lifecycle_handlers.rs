@@ -373,6 +373,8 @@ pub(crate) async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(&id)
         .await
@@ -384,6 +386,16 @@ pub(crate) async fn abandon_task(
                 "pending_wake",
             ),
         )));
+    }
+    if state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .is_some_and(|runtime_state| !runtime_state.allows_model_change())
+    {
+        return Err(AppError::BadRequest(
+            "Conversation has active work; wait for it to settle before abandoning".to_string(),
+        ));
     }
     // 1. Validate conversation exists, is Work or Branch mode, Idle state, project-scoped
     let conv = state
@@ -679,6 +691,8 @@ pub(crate) async fn mark_merged(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(&id)
         .await
@@ -690,6 +704,16 @@ pub(crate) async fn mark_merged(
                 "pending_wake",
             ),
         )));
+    }
+    if state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .is_some_and(|runtime_state| !runtime_state.allows_model_change())
+    {
+        return Err(AppError::BadRequest(
+            "Conversation has active work; wait for it to settle before marking merged".to_string(),
+        ));
     }
     // 1. Validate conversation exists, is Work or Branch mode, Idle state
     let conv = state

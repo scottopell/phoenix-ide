@@ -980,6 +980,21 @@ impl MessageStore for InMemoryStorage {
         &self,
         settlement: &crate::runtime::traits::ContinuationDirectTurnSettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if std::mem::take(&mut *self.continuation_commit_error_once.lock().unwrap()) {
+            let mut states = self.states.lock().unwrap();
+            self.messages
+                .lock()
+                .unwrap()
+                .entry(settlement.message.conversation_id.clone())
+                .or_default()
+                .push(settlement.message.clone());
+            states.insert(
+                settlement.message.conversation_id.clone(),
+                settlement.state.clone(),
+            );
+            *self.active_direct_turn.lock().unwrap() = None;
+            return Err("ambiguous continuation commit failure".to_string());
+        }
         if *self.fail_continuation_commit.lock().unwrap() {
             return Err("injected continuation commit failure".to_string());
         }
