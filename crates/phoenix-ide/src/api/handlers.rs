@@ -4241,15 +4241,31 @@ async fn upgrade_conversation_model(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+fn continuation_operation_id(state: ConvState) -> String {
+    match state {
+        ConvState::RecoverableContinuationFailure { failure } => failure.request.operation_id,
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 /// Manually trigger context continuation (REQ-BED-023)
 async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let operation_id = match state.runtime.effective_conversation_state(&id).await {
-        Some(ConvState::RecoverableContinuationFailure { failure }) => failure.request.operation_id,
-        _ => uuid::Uuid::new_v4().to_string(),
+    let effective_state = match state.runtime.effective_conversation_state(&id).await {
+        Some(runtime_state) => runtime_state,
+        None => {
+            state
+                .runtime
+                .db()
+                .get_conversation(&id)
+                .await
+                .map_err(|error| AppError::NotFound(error.to_string()))?
+                .state
+        }
     };
+    let operation_id = continuation_operation_id(effective_state);
     state
         .runtime
         .send_event(&id, Event::UserTriggerContinuation { operation_id })
@@ -4257,6 +4273,28 @@ async fn trigger_continuation(
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+#[cfg(test)]
+mod continuation_operation_id_tests {
+    use super::*;
+
+    #[test]
+    fn retained_failure_reuses_durable_operation_id() {
+        let state = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "durable-operation".to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "failed".to_string(),
+            },
+        };
+
+        assert_eq!(continuation_operation_id(state), "durable-operation");
+    }
 }
 
 /// Cancel a specific queued steering message (task 01001).
