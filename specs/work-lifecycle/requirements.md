@@ -18,7 +18,7 @@ This spec governs the **action semantics and git side effects** of:
 It does **not** own:
 
 - **Transition legality** — when a terminal action is permitted based on conversation state
-  (`core_status ∈ {idle, error}`, `parent_status ∈ {absent, context_exhausted}`,
+  (`core_status ∈ {idle, error, recoverable_continuation_failure}`, `parent_status ∈ {absent, context_exhausted}`,
   `mode ∈ {work, branch}`, no continuation pointer). That is bedrock's `TaskResolved` rule
   and `TerminalActionRequiresNoContinuation` invariant (REQ-BED-029, REQ-BED-031). The
   handlers in this spec validate against that gate; they do not define it.

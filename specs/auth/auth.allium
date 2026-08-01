@@ -159,8 +159,8 @@ surface OwnerConversation {
             when conversation.status = awaiting_task_approval
         UserAnswersQuestion(conversation, answers, annotations?)
             when conversation.status = awaiting_user_response
-        UserTriggersContinuation(conversation)
-            when conversation.status = idle and conversation.context_warning
+        UserTriggersContinuation(conversation, operation_id)
+            when conversation.core_status in { idle, recoverable_continuation_failure }
         CreateShareToken(conversation)
         RevokeShareToken(conversation)
             when conversation.share_token != null

@@ -186,6 +186,7 @@ pub struct RuntimeManager {
     /// materialize concurrently, while callers for one conversation observe the
     /// same typed success or failure.
     runtime_creations: AsyncMutex<HashMap<String, RuntimeMaterializationSender>>,
+    conversation_admissions: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
@@ -1382,6 +1383,7 @@ impl RuntimeManager {
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
+            conversation_admissions: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
@@ -3721,6 +3723,17 @@ impl RuntimeManager {
     }
 
     /// Get the database handle
+    pub(crate) async fn conversation_admission(
+        &self,
+        conversation_id: &str,
+    ) -> Arc<AsyncMutex<()>> {
+        let mut admissions = self.conversation_admissions.lock().await;
+        admissions
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
     pub fn db(&self) -> &Database {
         &self.db
     }
@@ -4613,6 +4626,20 @@ mod scope_liveness_tests {
                 },
             ),
             (
+                "recoverable-continuation",
+                ConvState::RecoverableContinuationFailure {
+                    failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                        request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                            operation_id: "op-recoverable".to_string(),
+                            rejected_tool_calls: Vec::new(),
+                            attempt: 1,
+                        },
+                        error_kind: crate::db::ErrorKind::ServerError,
+                        message: "summary failed".to_string(),
+                    },
+                },
+            ),
+            (
                 "awaiting-continuation-auth",
                 ConvState::AwaitingRecovery {
                     message: "authentication required".to_string(),
@@ -4665,9 +4692,10 @@ mod scope_liveness_tests {
             .await
             .unwrap();
 
-        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 3);
+        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 4);
         let runtimes = manager.runtimes.read().await;
         assert!(runtimes.contains_key("awaiting-continuation"));
+        assert!(runtimes.contains_key("recoverable-continuation"));
         assert!(runtimes.contains_key("awaiting-continuation-auth"));
         assert!(runtimes.contains_key(&coordinator.id));
         assert!(!runtimes.contains_key("idle"));

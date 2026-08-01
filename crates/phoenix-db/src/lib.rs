@@ -4816,7 +4816,11 @@ impl Database {
     pub async fn list_pending_continuation_conversation_ids(&self) -> DbResult<Vec<String>> {
         let rows = sqlx::query(
             "SELECT id, state FROM conversations
-             WHERE state_kind IN ('awaiting_continuation', 'awaiting_recovery')",
+             WHERE state_kind IN (
+                 'awaiting_continuation',
+                 'recoverable_continuation_failure',
+                 'awaiting_recovery'
+             )",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -4828,7 +4832,9 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             if matches!(
                 state,
-                ConvState::AwaitingContinuation { .. } | ConvState::AwaitingRecovery {
+                ConvState::AwaitingContinuation { .. }
+                    | ConvState::RecoverableContinuationFailure { .. }
+                    | ConvState::AwaitingRecovery {
                     resume:
                         phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary { .. },
                     ..

@@ -404,10 +404,13 @@ pub(crate) async fn abandon_task(
     // exists, so the worktree/branch are still ours to destroy.
     if !matches!(
         conv.state,
-        ConvState::Idle | ConvState::ContextExhausted { .. } | ConvState::Error { .. },
+        ConvState::Idle
+            | ConvState::ContextExhausted { .. }
+            | ConvState::Error { .. }
+            | ConvState::RecoverableContinuationFailure { .. },
     ) {
         return Err(AppError::BadRequest(
-            "Conversation must be idle, context-exhausted, or in an error state to abandon a task"
+            "Conversation must be idle, context-exhausted, or in a recoverable error state to abandon a task"
                 .to_string(),
         ));
     }
@@ -707,10 +710,13 @@ pub(crate) async fn mark_merged(
     // (e.g. a usage-limit window) is exactly such a case.
     if !matches!(
         conv.state,
-        ConvState::Idle | ConvState::ContextExhausted { .. } | ConvState::Error { .. },
+        ConvState::Idle
+            | ConvState::ContextExhausted { .. }
+            | ConvState::Error { .. }
+            | ConvState::RecoverableContinuationFailure { .. },
     ) {
         return Err(AppError::BadRequest(
-            "Conversation must be idle, context-exhausted, or in an error state to mark as merged"
+            "Conversation must be idle, context-exhausted, or in a recoverable error state to mark as merged"
                 .to_string(),
         ));
     }

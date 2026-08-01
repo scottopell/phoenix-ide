@@ -2186,7 +2186,11 @@ pub fn transition_parent(
         // swallowed as a no-op for that state.
         // ============================================================
         (
-            ParentState::Core(CoreState::Idle | CoreState::Error { .. })
+            ParentState::Core(
+                CoreState::Idle
+                | CoreState::Error { .. }
+                | CoreState::RecoverableContinuationFailure { .. },
+            )
             | ParentState::ContextExhausted { .. },
             ParentEvent::Parent(ParentOnlyEvent::TaskResolved {
                 system_message,

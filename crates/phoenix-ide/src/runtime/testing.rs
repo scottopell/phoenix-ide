@@ -542,6 +542,7 @@ pub struct InMemoryStorage {
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
+    continuation_commit_error_once: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -573,6 +574,7 @@ impl InMemoryStorage {
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
             continuation_start_recovery_outcome: Mutex::new(None),
+            continuation_commit_error_once: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -591,6 +593,10 @@ impl InMemoryStorage {
         outcome: crate::db::ContinuationCommitOutcome,
     ) {
         *self.continuation_start_recovery_outcome.lock().unwrap() = Some(outcome);
+    }
+
+    pub fn set_continuation_commit_error_once(&self) {
+        *self.continuation_commit_error_once.lock().unwrap() = true;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -1221,6 +1227,9 @@ impl StateStore for InMemoryStorage {
         completed_state: &ConvState,
         _state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if std::mem::take(&mut *self.continuation_commit_error_once.lock().unwrap()) {
+            return Err("ambiguous continuation commit failure".to_string());
+        }
         if *self.fail_continuation_commit.lock().unwrap() {
             return Err("injected continuation commit failure".to_string());
         }

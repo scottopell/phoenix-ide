@@ -471,6 +471,7 @@ mod state_machine_props {
                     | ConvState::Terminal
                     | ConvState::Error { .. }
                     | ConvState::ContextExhausted { .. }
+                    | ConvState::RecoverableContinuationFailure { .. }
             )
         })
     }

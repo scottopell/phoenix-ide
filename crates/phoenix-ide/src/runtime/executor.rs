@@ -4407,51 +4407,79 @@ where
                 };
                 let continuation_outcome = match continuation_result {
                     Ok(outcome) => outcome,
-                    Err(error) => {
-                        let failure =
-                            phoenix_core::domain::sm_state::RecoverableContinuationFailure {
-                                request: request.clone(),
-                                error_kind: crate::db::ErrorKind::ServerError,
-                                message: format!("Failed to commit continuation summary: {error}"),
-                            };
-                        self.state = ConvState::RecoverableContinuationFailure { failure };
-                        self.state_updated_at = Utc::now();
-                        if let (Some(turn), Some(terminal)) = (
-                            self.active_direct_turn.as_deref(),
-                            direct_turn_terminal.as_ref(),
-                        ) {
+                    Err(first_error) => {
+                        let reconciled = if self.active_direct_turn.is_none() {
                             self.storage
-                                .settle_active_direct_turn(
-                                    &crate::runtime::traits::ActiveDirectTurnSettlement {
-                                        turn: turn.clone(),
-                                        terminal: terminal.clone(),
-                                        state: self.state.clone(),
-                                        state_updated_at: self.state_updated_at,
-                                    },
-                                )
-                                .await?;
-                            self.active_direct_turn = None;
-                            self.pending_direct_turn_terminal = None;
-                            self.direct_turn_cancellation_initiated = false;
-                        } else {
-                            self.storage
-                                .update_state(
+                                .commit_continuation(
                                     &self.context.conversation_id,
+                                    &operation_id,
+                                    &message,
                                     &self.state,
                                     self.state_updated_at,
                                 )
-                                .await?;
-                        }
-                        let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
-                            SseEvent::StateChange {
-                                sequence_id,
-                                state: self.state.clone(),
-                                presentation_mode: self.state.presentation_mode().to_string(),
-                                state_updated_at: self.state_updated_at,
+                                .await
+                                .ok()
+                                .filter(|outcome| {
+                                    matches!(
+                                        outcome,
+                                        crate::db::ContinuationCommitOutcome::Applied
+                                            | crate::db::ContinuationCommitOutcome::Duplicate
+                                    )
+                                })
+                        } else {
+                            None
+                        };
+                        if let Some(outcome) = reconciled {
+                            outcome
+                        } else {
+                            let error = first_error;
+                            let failure =
+                                phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                                    request: request.clone(),
+                                    error_kind: crate::db::ErrorKind::ServerError,
+                                    message: format!(
+                                        "Failed to commit continuation summary: {error}"
+                                    ),
+                                };
+                            self.state = ConvState::RecoverableContinuationFailure { failure };
+                            self.state_updated_at = Utc::now();
+                            if let (Some(turn), Some(terminal)) = (
+                                self.active_direct_turn.as_deref(),
+                                direct_turn_terminal.as_ref(),
+                            ) {
+                                self.storage
+                                    .settle_active_direct_turn(
+                                        &crate::runtime::traits::ActiveDirectTurnSettlement {
+                                            turn: turn.clone(),
+                                            terminal: terminal.clone(),
+                                            state: self.state.clone(),
+                                            state_updated_at: self.state_updated_at,
+                                        },
+                                    )
+                                    .await?;
+                                self.active_direct_turn = None;
+                                self.pending_direct_turn_terminal = None;
+                                self.direct_turn_cancellation_initiated = false;
+                            } else {
+                                self.storage
+                                    .update_state(
+                                        &self.context.conversation_id,
+                                        &self.state,
+                                        self.state_updated_at,
+                                    )
+                                    .await?;
                             }
-                        });
-                        drop(reserved_range);
-                        return Ok(None);
+                            let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
+                                SseEvent::StateChange {
+                                    sequence_id,
+                                    state: self.state.clone(),
+                                    presentation_mode: self.state.presentation_mode().to_string(),
+                                    state_updated_at: self.state_updated_at,
+                                }
+                            });
+                            drop(reserved_range);
+                            return Ok(None);
+                        }
                     }
                 };
                 match continuation_outcome {
@@ -9569,6 +9597,43 @@ mod authoritative_user_message_effect_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_continuation_commit_retries_idempotently() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "ambiguous-commit".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let awaiting = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        storage
+            .update_state(&rt.context.conversation_id, &awaiting, Utc::now())
+            .await
+            .unwrap();
+        storage.set_continuation_commit_error_once();
+        rt.state = ConvState::ContextExhausted {
+            summary: "summary".to_string(),
+        };
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request,
+            summary: "summary".to_string(),
+        })
+        .await
+        .expect("ambiguous commit should reconcile idempotently");
+
+        assert!(matches!(
+            storage.get_state(&rt.context.conversation_id).await.unwrap(),
+            ConvState::ContextExhausted { summary } if summary == "summary"
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), SseEvent::Message { .. }));
     }
 
     #[tokio::test]

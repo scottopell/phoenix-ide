@@ -4166,6 +4166,9 @@ async fn upgrade_conversation_model(
     Json(req): Json<UpgradeModelRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     // Validate the target model exists
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
+
     if state.llm_registry.get(&req.model).is_none() {
         return Err(AppError::BadRequest(format!(
             "Unknown model '{}'. Available: {:?}",
@@ -4253,6 +4256,8 @@ async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
     let effective_state = match state.runtime.effective_conversation_state(&id).await {
         Some(runtime_state) => runtime_state,
         None => {
