@@ -1656,6 +1656,13 @@ fn parent_tool_cycle_cap_from_env() -> u32 {
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ContinuationEffectDisposition {
+    #[default]
+    Continue,
+    AbortRemaining,
+}
+
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
 where
@@ -1872,6 +1879,7 @@ where
     pending_direct_turn_terminal: Option<Box<crate::runtime::traits::ActiveDirectTurnTerminal>>,
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
+    continuation_effect_disposition: ContinuationEffectDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
     /// a system message. `0` disables the cap. Read once at construction
     /// time from `PHOENIX_PARENT_TOOL_CYCLE_CAP`, with
@@ -1999,6 +2007,7 @@ where
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
+            continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             active_direct_turn: None,
             pending_direct_turn_terminal: None,
             direct_turn_cancellation_initiated: false,
@@ -2860,6 +2869,7 @@ where
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
+        self.continuation_effect_disposition = ContinuationEffectDisposition::Continue;
 
         // Update state. Bump the entry timestamp on phase change so every
         // SseEvent::StateChange the executor subsequently emits carries a
@@ -3013,10 +3023,28 @@ where
             for effect in result.effects {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-                if let Some(gen_event) = self.execute_effect(effect).await? {
+                let is_state_persist = matches!(effect, Effect::PersistState);
+                let effect_result = self.execute_effect(effect).await;
+                let effect_result = match effect_result {
+                    Ok(effect_result) => effect_result,
+                    Err(error) if is_state_persist => {
+                        let failed_state = std::mem::replace(&mut self.state, old_state.clone());
+                        self.state_updated_at = old_state_updated_at;
+                        self.manage_deadline(&failed_state);
+                        if let Some(tx) = &self.state_watcher {
+                            let _ = tx.send(self.state.clone());
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
                 }
-                if is_authoritative_persist && self.direct_turn_materialization_aborted {
+                if (is_authoritative_persist && self.direct_turn_materialization_aborted)
+                    || self.continuation_effect_disposition
+                        == ContinuationEffectDisposition::AbortRemaining
+                {
                     break;
                 }
             }
@@ -4251,6 +4279,8 @@ where
                                 )
                                 .await?;
                         }
+                        self.continuation_effect_disposition =
+                            ContinuationEffectDisposition::AbortRemaining;
                         let _ = self
                             .broadcast_tx
                             .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
@@ -9415,16 +9445,26 @@ mod authoritative_user_message_effect_tests {
             request: request.clone(),
         };
 
-        rt.execute_effect(Effect::BeginContinuation {
-            request: request.clone(),
-            content: crate::db::MessageContent::agent(vec![ContentBlock::text("response")]),
-            display_data: None,
-            usage_data: phoenix_core::domain::llm_types::Usage::default(),
-            message_id: request.operation_id.clone(),
-        })
+        rt.apply_transition_result(
+            crate::state_machine::transition::TransitionResult::new(rt.state.clone())
+                .with_effect(Effect::BeginContinuation {
+                    request: request.clone(),
+                    content: crate::db::MessageContent::agent(vec![ContentBlock::text("response")]),
+                    display_data: None,
+                    usage_data: phoenix_core::domain::llm_types::Usage::default(),
+                    message_id: request.operation_id.clone(),
+                })
+                .with_effect(Effect::RequestContinuation {
+                    request: request.clone(),
+                }),
+        )
         .await
         .expect("start failure should become visible recovery state");
 
+        assert!(
+            rt.llm_task_handle.is_none(),
+            "failed continuation start must abort the remaining request effect"
+        );
         assert!(matches!(
             storage.get_state(&rt.context.conversation_id).await.unwrap(),
             ConvState::RecoverableContinuationFailure { failure }
@@ -11381,6 +11421,56 @@ mod steer_drain_detector_tests {
             saw_awaiting_continuation,
             "manual continuation must broadcast AwaitingContinuation state_change"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_continuation_retry_persistence_restores_recoverable_state() {
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "retry-persist-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let failure = phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+            request: request.clone(),
+            error_kind: crate::db::ErrorKind::ServerError,
+            message: "summary request failed".to_string(),
+        };
+        let recoverable = ConvState::RecoverableContinuationFailure {
+            failure: failure.clone(),
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-retry-persist-failure",
+            recoverable.clone(),
+            vec![],
+        );
+        storage
+            .update_state(
+                "conv-retry-persist-failure",
+                &recoverable,
+                rt.state_updated_at,
+            )
+            .await
+            .expect("seed recoverable state");
+        storage.set_fail_state_update(true);
+
+        let error = rt
+            .process_event(Event::UserTriggerContinuation {
+                operation_id: request.operation_id,
+            })
+            .await
+            .expect_err("failed retry persistence must reject the transition");
+
+        assert!(error.contains("injected state update failure"));
+        assert_eq!(rt.state, recoverable);
+        assert!(rt.llm_task_handle.is_none());
+        assert!(matches!(
+            storage
+                .get_state("conv-retry-persist-failure")
+                .await
+                .expect("persisted state"),
+            ConvState::RecoverableContinuationFailure { failure: persisted }
+                if persisted == failure
+        ));
     }
 
     /// Mid-turn drain from `ToolExecuting` → `LlmRequesting`: persists run

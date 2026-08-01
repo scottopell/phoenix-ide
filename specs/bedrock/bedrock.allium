@@ -87,6 +87,7 @@ enum ErrorClass { retryable | non_retryable }
 enum ToolOutcome { success | error | cancelled }
 enum SubAgentOutcome { success | failure | timed_out }
 enum RecoveryKind { credential }
+enum RecoveryResumeTarget { conversation_turn | continuation_summary }
 enum TaskApprovalDecision { approved | rejected | feedback_provided }
 enum ModeKind { direct | managed | branch }
 
@@ -245,6 +246,7 @@ variant Parent : Conversation {
     proposal: TaskProposal when parent_status = awaiting_task_approval
     pending_questions: List<UserQuestion> when parent_status = awaiting_user_response
     recovery_kind: RecoveryKind when parent_status = awaiting_recovery
+    recovery_resume_target: RecoveryResumeTarget when parent_status = awaiting_recovery
     recovery_message: String when parent_status = awaiting_recovery
     continuation_summary: String when parent_status = context_exhausted
     successor: Conversation when parent_status = handed_off
@@ -895,12 +897,25 @@ rule AuthErrorWithActiveRecovery {
     requires: CredentialHelperIsRunning
     ensures: conversation.parent_status = awaiting_recovery
     ensures: conversation.recovery_kind = credential
+    ensures: conversation.recovery_resume_target = conversation_turn
     ensures: conversation.recovery_message = message
 
     @guidance
         -- Checked before ParentLlmErrorNonRecoverable. The
         -- recovery_in_progress flag is enriched on the event by
         -- the executor (keeps transition function pure).
+}
+
+rule ContinuationAuthErrorWithActiveRecovery {
+    when: ContinuationRequestFailed(conversation, operation_id, error, error_class)
+    requires: conversation.core_status = awaiting_continuation
+    requires: error_kind = auth
+    requires: CredentialHelperIsRunning
+    ensures: conversation.parent_status = awaiting_recovery
+    ensures: conversation.recovery_kind = credential
+    ensures: conversation.recovery_resume_target = continuation_summary
+    ensures: conversation.recovery_message = error
+    ensures: conversation.continuation_operation_id = operation_id
 }
 
 rule RecoverySucceeded {
@@ -1382,11 +1397,31 @@ rule ModeChangeNotification {
 -- Every rule that changes status implicitly requires state persistence
 -- before side effects execute.
 
--- REQ-BED-007: Server restart restores to idle
-rule ServerRestart {
+-- REQ-BED-007: ordinary interrupted turns restart from idle. Durable
+-- continuation operations retain their operation identity and recovery state.
+rule ServerRestartOrdinaryConversation {
     when: ServerRestarted(conversation)
     requires: conversation.is_busy
+    requires: conversation.core_status not in {
+        awaiting_continuation,
+        recoverable_continuation_failure
+    }
+    requires: conversation.parent_status != awaiting_recovery
+        or conversation.recovery_resume_target = conversation_turn
     ensures: conversation.core_status = idle
+}
+
+rule ServerRestartPendingContinuation {
+    when: ServerRestarted(conversation)
+    requires: conversation.core_status in {
+        awaiting_continuation,
+        recoverable_continuation_failure
+    }
+        or (conversation.parent_status = awaiting_recovery
+            and conversation.recovery_resume_target = continuation_summary)
+    ensures: conversation.core_status = previous(conversation.core_status)
+    ensures: conversation.parent_status = previous(conversation.parent_status)
+    ensures: ContinuationOperationMaterialized(conversation)
 }
 
 ------------------------------------------------------------
@@ -1472,6 +1507,7 @@ surface UserConversation {
         conversation.error_message when conversation.core_status = error
         conversation.recovery_message when conversation.parent_status = awaiting_recovery
         conversation.recovery_kind when conversation.parent_status = awaiting_recovery
+        conversation.recovery_resume_target when conversation.parent_status = awaiting_recovery
         conversation.continuation_summary when conversation.parent_status = context_exhausted
 
     provides:
@@ -1491,8 +1527,8 @@ surface UserConversation {
             when conversation.parent_status = awaiting_user_response
         UserDismissesQuestion(conversation)
             when conversation.parent_status = awaiting_user_response
-        UserTriggersContinuation(conversation)
-            when conversation.core_status = idle and conversation.context_warning
+        UserTriggersContinuation(conversation, operation_id)
+            when conversation.core_status in { idle, recoverable_continuation_failure }
         UserStartsContinuationConversation(conversation, new_conv)
             when conversation.parent_status = context_exhausted
                  and conversation.continued_in_conv_id = absent

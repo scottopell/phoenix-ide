@@ -180,10 +180,14 @@ WHEN conversation state changes
 THE SYSTEM SHALL persist the new state before executing effects
 
 WHEN server restarts
-THE SYSTEM SHALL restore all conversations to idle state
+THE SYSTEM SHALL restore ordinary interrupted conversations to idle state
 AND preserve complete message history
 
-**Rationale:** Users expect their conversation history to survive server restarts. Resuming from idle is simple and predictable; users can re-send their last message if interrupted.
+WHEN server restarts with a conversation in `awaiting_continuation`, `recoverable_continuation_failure`, or continuation-summary `awaiting_recovery`
+THE SYSTEM SHALL preserve the durable continuation operation identity and recovery state
+AND materialize the pending continuation operation at startup
+
+**Rationale:** Users expect their conversation history to survive server restarts. Ordinary interrupted turns resume from idle so users can re-send their last message. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
 
 ---
 

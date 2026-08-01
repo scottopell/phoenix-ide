@@ -153,7 +153,7 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | # | Condition | WorkDisposition | Primary verb | Secondary / suppressed |
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
-| 2 | phase = error | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
+| 2 | phase ∈ {`error`, `recoverable_continuation_failure`} | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
 | 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge on GitHub #N ↗` secondary when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
 | 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
@@ -211,13 +211,14 @@ from the raw provider wire.
 
 ### REQ-WAB-005: RESOLVE Zone Suppressed in Stuck Phases
 
-WHEN the conversation phase is `error`
+WHEN the conversation phase is `error` or `recoverable_continuation_failure`
 THE SYSTEM SHALL NOT render the RESOLVE zone (no Address feedback, no PR link).
 
-**Design:** Address feedback posts a `UserMessage` to the conversation. In `error` or
-`context_exhausted`, the conversation cannot resume a new LLM turn from a user message — the
-message would be rejected or would silently reopen a non-resumable stuck state. The error-state
-actions are terminal cleanup verbs, so RESOLVE is suppressed entirely rather than shown disabled
+**Design:** Address feedback posts a `UserMessage` to the conversation. In `error`,
+`recoverable_continuation_failure`, or `context_exhausted`, the conversation cannot resume a new
+LLM turn from a user message — the message would be rejected or would silently reopen a
+non-resumable stuck state. The stuck-state actions are terminal cleanup verbs, so RESOLVE is
+suppressed entirely rather than shown disabled
 (REQ-WAB-008). Context exhaustion does not render this bar at all (REQ-WAB-001).
 
 ---

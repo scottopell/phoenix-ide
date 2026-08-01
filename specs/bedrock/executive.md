@@ -6,7 +6,7 @@ Bedrock provides the core conversation state machine for PhoenixIDE. Users inter
 
 ## Technical Summary
 
-Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents require mandatory `timeout: Duration` with deadline enforcement in executor `select!`. On server restart, conversations resume from idle with full message history preserved.
+Implements Elm Architecture with a typed-effect executor boundary. The SM has two pure entry points: `handle_user_event()` for API-initiated events and `handle_outcome()` for executor results. Effects carry oneshot channels typed to their expected outcome (`LlmOutcome`, `ToolOutcome`, `SubAgentOutcome`, `PersistOutcome`) — the compiler prevents invalid event/state combinations. Persistence uses `CheckpointData::ToolRound` which structurally requires matched `tool_use`/`tool_result` pairs. Error classification is exhaustive with no `Unknown` variant. Executor loop uses `StepResult::Terminal` to force explicit exit on terminal states. Token streaming uses fire-and-forget `StreamToken` effects routed to SSE without SM state transitions. Sub-agents require mandatory `timeout: Duration` with deadline enforcement in executor `select!`. On server restart, ordinary interrupted conversations resume from idle with full message history preserved; durable continuation operations retain their operation identity and recovery state.
 
 ## Status Summary
 
@@ -18,7 +18,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-004:** Tool Execution Coordination | ✅ Complete | Serial execution with state tracking |
 | **REQ-BED-005:** Cancellation Handling | ✅ Complete | Synthetic tool results for cancelled tools |
 | **REQ-BED-006:** Error Recovery | ✅ Complete | Retry logic with exponential backoff, ErrorKind |
-| **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence, resume from idle on restart |
+| **REQ-BED-007:** State Persistence | ✅ Complete | Database persistence; ordinary turns resume from idle while durable continuation operations retain recovery state |
 | **REQ-BED-008:** Sub-Agent Spawning | ✅ Complete | State machine support (runtime not fully implemented in MVP) |
 | **REQ-BED-009:** Sub-Agent Isolation | ✅ Complete | Tool set restriction defined |
 | **REQ-BED-010:** Fixed Working Directory | ✅ Complete | Set at creation, passed to tools |

@@ -540,6 +540,7 @@ pub struct InMemoryStorage {
     settle_continuation_direct_turn_calls:
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
+    fail_state_update: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -569,6 +570,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_release: Mutex::new(None),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
+            fail_state_update: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
@@ -576,6 +578,10 @@ impl InMemoryStorage {
 
     pub fn set_fail_continuation_commit(&self, fail: bool) {
         *self.fail_continuation_commit.lock().unwrap() = fail;
+    }
+
+    pub fn set_fail_state_update(&self, fail: bool) {
+        *self.fail_state_update.lock().unwrap() = fail;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -1093,6 +1099,9 @@ impl StateStore for InMemoryStorage {
         state: &ConvState,
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
+        if *self.fail_state_update.lock().unwrap() {
+            return Err("injected state update failure".to_string());
+        }
         self.state_updated_ats
             .lock()
             .unwrap()

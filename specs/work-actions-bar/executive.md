@@ -55,7 +55,7 @@ a status display; no button requires a second click to arm.
 | REQ-WAB-002 | Responsive presentation: stable compact desktop rail; mobile PR rail; hero and supporting action groups; freshness stays an actionability cue, not PR status |
 | REQ-WAB-003 | Exactly one primary (glowing) verb across the bar — or none, in the continuation case |
 | REQ-WAB-004 | WorkDisposition derivation: a single derived state, total over every open-PR and stuck-with-PR case |
-| REQ-WAB-005 | RESOLVE zone suppressed in stuck phases (error, context_exhausted) |
+| REQ-WAB-005 | RESOLVE zone suppressed in stuck phases (`error`, `recoverable_continuation_failure`) |
 | REQ-WAB-006 | View Browser is not in this bar; the browser session affordance belongs to the work scope, surfaced via the viewer slot |
 | REQ-WAB-007 | Clean up and Abandon: info-icon tooltips explain intent and the diff-snapshot/confirm difference, mode-sensitive |
 | REQ-WAB-008 | No disabled-as-status buttons; StateBar owns stable PR identity/status; no two-step toggle affordances |

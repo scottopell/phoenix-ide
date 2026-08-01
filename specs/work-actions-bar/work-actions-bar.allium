@@ -154,6 +154,7 @@ enum RailFeedbackSignal {
 enum BarPhase {
     idle
     | error
+    | recoverable_continuation_failure
     | context_exhausted
 }
 
@@ -175,7 +176,7 @@ enum ConvMode {
 -- continuation, PR state, and no-PR work-change state maps to exactly one variant via derive_disposition.
 enum WorkDisposition {
     continued           -- continued_in_conv_id set; no primary; RESOLVE + FINISH suppressed
-    | stuck             -- phase in {error, context_exhausted}; RESOLVE suppressed; FINISH primary
+    | stuck             -- phase in {error, recoverable_continuation_failure}; RESOLVE suppressed; FINISH primary
     | address_feedback  -- idle, PR open, affordance enabled (any check state); a merge_link secondary rides along when checks pass
     | merge_ready       -- idle, PR open, checks passing, affordance disabled
     | pr_open_other     -- idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not green)
@@ -407,14 +408,14 @@ rule DispositionContinued {
     ensures: bar.presentation.inline_note = continued_note
 }
 
--- Row 2. Stuck error: RESOLVE always suppressed
+-- Row 2. Stuck failure: RESOLVE always suppressed
 -- (REQ-WAB-005); the primary collapses to a FINISH verb selected by PR state
 -- through the shared helper. View Diff and Abandon remain present.
 rule DispositionStuck {
     when: WorkActionsBarRendered(bar)
 
     requires: bar.inputs.continued_in_conv_id = null
-    requires: bar.inputs.phase = error
+    requires: bar.inputs.phase in { error, recoverable_continuation_failure }
 
     ensures: bar.presentation.disposition = stuck
     ensures: bar.presentation.resolve_zone.visible = false
@@ -724,7 +725,7 @@ invariant ResolvePrimaryImpliesVisible {
 -- REQ-WAB-005: RESOLVE is invisible whenever the phase is stuck.
 invariant ResolveHiddenWhenStuck {
     for b in WorkActionsBar:
-        b.inputs.phase = error implies
+        b.inputs.phase in { error, recoverable_continuation_failure } implies
             b.presentation.resolve_zone.visible = false
 }
 
