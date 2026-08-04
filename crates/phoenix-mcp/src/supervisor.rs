@@ -464,8 +464,6 @@ impl Actor {
                         }
                     });
                 } else {
-                    let call_id = self.next_call_id;
-                    self.next_call_id = self.next_call_id.wrapping_add(1);
                     let cancellation = cancel.clone();
                     let Some(mailbox) = self.mailbox.upgrade() else {
                         let _ = reply.send(Err(stopped()));
