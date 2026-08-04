@@ -1852,7 +1852,6 @@ impl McpClientManager {
             .map_err(|e| format!("MCP server '{name}': failed to persist OAuth token: {e}"))?;
 
         self.pending_oauth_urls.write().await.remove(&name);
-        // The flow is resolved; stop its loopback listener (if any) so it does
         let owner = if let Some((handle, epoch)) = resolved.owner.as_ref() {
             if handle.snapshot().epoch == *epoch {
                 handle
@@ -1866,9 +1865,9 @@ impl McpClientManager {
         } else {
             None
         };
-        // not hold the port for the rest of its window. On exchange *failure*
-        // the flow stays pending and this is not reached, so the listener keeps
-        // accepting for a retry (REQ-MCP-020).
+        // The flow is resolved; stop its loopback listener (if any) so it does
+        // not hold the port for the rest of its window. On exchange failure the
+        // flow stays pending, so the listener keeps accepting (REQ-MCP-020).
         if let Some(handle) = self.oauth.loopback_listeners.lock().unwrap().remove(&name) {
             handle.abort();
         }
@@ -2766,15 +2765,27 @@ impl McpClientManager {
         let mut removed = Vec::new();
         for name in removed_names {
             if let Some(handle) = self.servers.write().await.remove(&name) {
+                let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
                 match self.oauth.store().delete_token(&name).await {
                     Ok(()) => {
                         handle.remove().await;
-                        self.cancel_pending_oauth_flow(&name).await;
+                        if let Some(listener) =
+                            self.oauth.loopback_listeners.lock().unwrap().remove(&name)
+                        {
+                            listener.abort();
+                        }
                         self.pending_oauth_urls.write().await.remove(&name);
                         removed.push(name);
                     }
                     Err(error) => {
                         self.servers.write().await.insert(name.clone(), handle);
+                        if let Some(flow) = pending_flow {
+                            self.oauth
+                                .pending
+                                .lock()
+                                .unwrap()
+                                .insert(name.clone(), flow);
+                        }
                         tracing::warn!(server = %name, error = %error, "MCP token deletion failed; server removal aborted");
                         failed.push(McpReloadFailure {
                             server: name,
