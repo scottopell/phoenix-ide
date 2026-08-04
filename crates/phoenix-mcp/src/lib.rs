@@ -2603,7 +2603,7 @@ impl McpClientManager {
 
     #[allow(clippy::too_many_lines)] // One ordered lifecycle: claim, refresh or step-up, publish/fail.
     async fn recover_oauth(
-        &self,
+        self: &Arc<Self>,
         server_name: &str,
         handle: &SupervisorHandle,
         observed_epoch: u64,
@@ -2657,13 +2657,31 @@ impl McpClientManager {
                             .reconfigure(permit.config.clone())
                             .await
                             .map_err(McpToolCallError::Failed)?;
-                        let reconnect = self.begin_actor_connect_at_epoch(
-                            server_name.to_string(),
-                            &permit.config,
-                            handle.clone(),
-                            reconnect_epoch,
-                        );
-                        self.track_background_task(reconnect);
+                        let manager = Arc::clone(self);
+                        let name = server_name.to_string();
+                        let config = permit.config.clone();
+                        let retry_handle = handle.clone();
+                        self.spawn_background(async move {
+                            loop {
+                                if retry_handle.snapshot().epoch != reconnect_epoch {
+                                    return;
+                                }
+                                match Self::connect_one(
+                                    &name,
+                                    &config,
+                                    Arc::clone(&manager.pending_oauth_urls),
+                                    Arc::clone(&manager.oauth),
+                                )
+                                .await
+                                {
+                                    Ok(server) => {
+                                        retry_handle.publish(reconnect_epoch, server).await;
+                                        return;
+                                    }
+                                    Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+                                }
+                            }
+                        });
                         Err(McpToolCallError::Failed(error))
                     }
                     RefreshServerOutcome::Reprompt(error) => {
@@ -2802,17 +2820,11 @@ impl McpClientManager {
         let mut unchanged = Vec::new();
         for (name, config) in desired {
             let existing = self.servers.read().await.get(&name).cloned();
-            if existing.is_none()
-                && self
-                    .oauth
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .get(&name)
-                    .is_some_and(|flow| flow.config == config)
-            {
-                unchanged.push(name);
-                continue;
+            if existing.is_none() {
+                let stale_flow = self.oauth.pending.lock().unwrap().remove(&name);
+                if stale_flow.is_some() {
+                    self.pending_oauth_urls.write().await.remove(&name);
+                }
             }
             let (handle, is_restart) = match existing {
                 Some(handle) if handle.snapshot().config == config => {
