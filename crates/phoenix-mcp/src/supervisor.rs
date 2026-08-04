@@ -301,6 +301,7 @@ struct QueuedCall {
     arguments: Value,
     cancel: CancellationToken,
     reply: oneshot::Sender<Result<CallOutcome, String>>,
+    cancellation_watch: tokio::task::JoinHandle<()>,
 }
 
 enum Command {
@@ -444,7 +445,7 @@ impl Actor {
                         let _ = reply.send(Err(stopped()));
                         return;
                     };
-                    tokio::spawn(async move {
+                    let cancellation_watch = tokio::spawn(async move {
                         cancellation.cancelled().await;
                         let _ = mailbox.send(Command::CancelQueued { call_id }).await;
                     });
@@ -456,6 +457,7 @@ impl Actor {
                         arguments,
                         cancel,
                         reply,
+                        cancellation_watch,
                     });
                     self.start_next_stdio_call();
                 }
@@ -486,6 +488,7 @@ impl Actor {
                         .stdio_queue
                         .remove(position)
                         .expect("queued call exists");
+                    queued.cancellation_watch.abort();
                     let _ = queued.reply.send(Ok(CallOutcome {
                         result: Err(McpRequestError::Cancelled),
                         epoch: queued.epoch,
@@ -648,6 +651,7 @@ impl Actor {
                 }));
                 continue;
             }
+            call.cancellation_watch.abort();
             self.stdio_active = true;
             let Some(mailbox) = self.mailbox.upgrade() else {
                 let _ = call.reply.send(Err(stopped()));
