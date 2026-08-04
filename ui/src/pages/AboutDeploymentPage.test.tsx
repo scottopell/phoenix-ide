@@ -80,6 +80,26 @@ function resourcesSnapshot(overrides: Partial<AboutResourcesSnapshot> = {}): Abo
       load_average_five: 0.9,
       load_average_fifteen: 1.2,
     },
+    thermal: {
+      mode: 'observe_only',
+      state: 'nominal',
+      last_sample: {
+        freshness: 'fresh',
+        pressure: 'nominal',
+        sampled_at: '2026-06-01T00:00:03Z',
+        raw_temperature: { kind: 'unavailable' },
+      },
+      proposed_action: { kind: 'none', affects_targets: false, target_identities: [] },
+      applied_action: 'none',
+      coverage: {
+        eligible_work_scope_count: 1,
+        eligible_process_count: 2,
+        covered_process_count: 2,
+        uncovered_reasons: [
+          'browser sessions are excluded because authoritative native process ownership is not exposed',
+        ],
+      },
+    },
     managed_total: {
       cpu_percent: 24,
       memory_bytes: 3 * 1024,
@@ -370,11 +390,52 @@ describe('AboutDeploymentPage disk usage health', () => {
 
     expect(await screen.findByText('Host mostly idle')).toBeInTheDocument();
     expect(screen.getByText('Phoenix managed')).toBeInTheDocument();
+    expect(screen.getByLabelText('macOS thermal status')).toHaveTextContent('Nominal');
+    expect(screen.getByLabelText('macOS thermal status')).toHaveTextContent('Observe only');
+    expect(screen.getByLabelText('macOS thermal status')).toHaveTextContent('Nominal policy');
+    expect(screen.getByLabelText('macOS thermal status')).toHaveTextContent('Eligible WorkScopes1');
+    expect(screen.getByLabelText('macOS thermal status')).toHaveTextContent('Process coverage2 / 2');
+    expect(screen.getByText('No policy change proposed. No scheduler policy is applied in observe-only mode. Raw temperature unavailable.')).toBeInTheDocument();
+    expect(screen.getByText('1 thermal coverage gap')).toBeInTheDocument();
     expect(screen.getByText('MCP disabled on this deployment')).toBeInTheDocument();
     expect(screen.getByText('phoenix-api')).toBeInTheDocument();
     expect(screen.getByText('chromium')).toBeInTheDocument();
     expect(screen.getByText('Managed CPU over time')).toBeInTheDocument();
     expect(screen.getByText('Managed memory over time')).toBeInTheDocument();
+  });
+
+  it('shows stale thermal pressure, hysteretic state, and zero-target decisions honestly', async () => {
+    apiMock.deploymentResources.mockResolvedValueOnce({
+      ...resourcesSnapshot(),
+      thermal: {
+        ...resourcesSnapshot().thermal,
+        state: 'elevated',
+        last_sample: {
+          freshness: 'stale',
+          pressure: 'nominal',
+          sampled_at: '2026-06-01T00:00:01Z',
+          latest_attempted_at: '2026-06-01T00:00:03Z',
+          unavailable_reason: 'provider_failure',
+          raw_temperature: { kind: 'unavailable' },
+        },
+        proposed_action: { kind: 'deprioritize', affects_targets: false, target_identities: [] },
+        coverage: {
+          eligible_work_scope_count: 1,
+          eligible_process_count: 2,
+          covered_process_count: 0,
+          uncovered_reasons: [],
+        },
+      },
+    });
+
+    renderPage(deployment());
+
+    const status = await screen.findByLabelText('macOS thermal status');
+    expect(status).toHaveTextContent('Nominal');
+    expect(status).toHaveTextContent('Elevated policy');
+    expect(status).toHaveTextContent('Process coverage0 / 2');
+    expect(screen.getByText(/Deprioritization indicated, but no authoritative targets are covered/)).toBeInTheDocument();
+    expect(screen.getByText(/Thermal pressure is stale since/)).toHaveTextContent('provider failure');
   });
 
   it('navigates to the deterministic conversations destination', async () => {

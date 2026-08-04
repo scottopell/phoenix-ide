@@ -9,6 +9,10 @@
 //! (resource usage, sizes, `sampled_at`) are measured per request so a refresh
 //! yields current values.
 
+use super::resource_monitor::{
+    ReportedThermalSample, ResourceObservationGeneration, ThermalGovernorActionSample,
+    ThermalGovernorStateSample, ThermalPressureSample, ThermalProviderUnavailableReason,
+};
 use super::AppState;
 use crate::api::installation_ownership::{self, InstallationOwnership};
 use crate::api::process_sample::ProcessObservation;
@@ -143,8 +147,123 @@ impl TlsInfo {
 pub struct AboutResourcesSnapshot {
     pub sampled_at: DateTime<Utc>,
     pub host: HostResources,
+    pub thermal: ThermalGovernorSnapshot,
     pub managed_total: ManagedResourceTotals,
     pub categories: Vec<ManagedResourceCategory>,
+}
+
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ThermalPressure {
+    Nominal,
+    Elevated,
+}
+
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ThermalGovernorMode {
+    ObserveOnly,
+}
+
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ThermalGovernorState {
+    Nominal,
+    Elevated,
+    Unavailable,
+}
+
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ThermalGovernorActionKind {
+    None,
+    Deprioritize,
+    Restore,
+}
+
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ThermalUnavailableReason {
+    UnsupportedPlatform,
+    ProviderFailure,
+    Unreadable,
+}
+
+#[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ThermalRawTemperature {
+    Unavailable,
+}
+
+#[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "freshness", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ThermalSampleSnapshot {
+    Fresh {
+        pressure: ThermalPressure,
+        sampled_at: DateTime<Utc>,
+        raw_temperature: ThermalRawTemperature,
+    },
+    Stale {
+        pressure: ThermalPressure,
+        sampled_at: DateTime<Utc>,
+        latest_attempted_at: DateTime<Utc>,
+        unavailable_reason: ThermalUnavailableReason,
+        raw_temperature: ThermalRawTemperature,
+    },
+    Unavailable {
+        attempted_at: DateTime<Utc>,
+        unavailable_reason: ThermalUnavailableReason,
+        raw_temperature: ThermalRawTemperature,
+    },
+}
+
+#[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ThermalTargetIdentitySnapshot {
+    pub pid: u32,
+    pub start_identity: String,
+}
+
+#[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ThermalGovernorActionSnapshot {
+    pub kind: ThermalGovernorActionKind,
+    pub affects_targets: bool,
+    pub target_identities: Vec<ThermalTargetIdentitySnapshot>,
+}
+
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ObserveOnlyAppliedAction {
+    None,
+}
+
+#[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ThermalCoverageSnapshot {
+    pub eligible_work_scope_count: u32,
+    pub eligible_process_count: u32,
+    pub covered_process_count: u32,
+    pub uncovered_reasons: Vec<String>,
+}
+
+#[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ThermalGovernorSnapshot {
+    pub mode: ThermalGovernorMode,
+    pub state: ThermalGovernorState,
+    pub last_sample: ThermalSampleSnapshot,
+    pub proposed_action: ThermalGovernorActionSnapshot,
+    pub applied_action: ObserveOnlyAppliedAction,
+    pub coverage: ThermalCoverageSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -813,6 +932,182 @@ pub fn absolutize(path: &Path) -> PathBuf {
     }
 }
 
+fn thermal_snapshot_from_generation(
+    generation: &ResourceObservationGeneration,
+    has_browser: bool,
+    has_mcp: bool,
+) -> ThermalGovernorSnapshot {
+    let last_sample = thermal_sample_snapshot(generation.thermal_decision.reported_sample);
+    let coverage = thermal_coverage_snapshot(generation, has_browser, has_mcp);
+    let state = match generation.thermal_decision.state {
+        ThermalGovernorStateSample::Nominal => ThermalGovernorState::Nominal,
+        ThermalGovernorStateSample::Elevated => ThermalGovernorState::Elevated,
+        ThermalGovernorStateSample::Unavailable => ThermalGovernorState::Unavailable,
+    };
+    let proposed_action = match generation.thermal_decision.proposed_action {
+        ThermalGovernorActionSample::None => ThermalGovernorActionKind::None,
+        ThermalGovernorActionSample::Deprioritize => ThermalGovernorActionKind::Deprioritize,
+        ThermalGovernorActionSample::Restore => ThermalGovernorActionKind::Restore,
+    };
+    let target_identities = generation
+        .thermal_decision
+        .proposed_targets
+        .iter()
+        .map(|identity| ThermalTargetIdentitySnapshot {
+            pid: identity.pid,
+            start_identity: identity.start_time.to_string(),
+        })
+        .collect::<Vec<_>>();
+    ThermalGovernorSnapshot {
+        mode: ThermalGovernorMode::ObserveOnly,
+        state,
+        last_sample,
+        proposed_action: ThermalGovernorActionSnapshot {
+            kind: proposed_action,
+            affects_targets: !target_identities.is_empty()
+                && proposed_action != ThermalGovernorActionKind::None,
+            target_identities,
+        },
+        applied_action: ObserveOnlyAppliedAction::None,
+        coverage,
+    }
+}
+
+fn thermal_sample_snapshot(sample: ReportedThermalSample) -> ThermalSampleSnapshot {
+    fn pressure(value: ThermalPressureSample) -> ThermalPressure {
+        match value {
+            ThermalPressureSample::Nominal => ThermalPressure::Nominal,
+            ThermalPressureSample::Elevated => ThermalPressure::Elevated,
+        }
+    }
+    fn unavailable_reason(value: ThermalProviderUnavailableReason) -> ThermalUnavailableReason {
+        match value {
+            ThermalProviderUnavailableReason::UnsupportedPlatform => {
+                ThermalUnavailableReason::UnsupportedPlatform
+            }
+            ThermalProviderUnavailableReason::ProviderFailure => {
+                ThermalUnavailableReason::ProviderFailure
+            }
+            ThermalProviderUnavailableReason::Unreadable => ThermalUnavailableReason::Unreadable,
+        }
+    }
+    match sample {
+        ReportedThermalSample::Fresh {
+            pressure: value,
+            sampled_at,
+        } => ThermalSampleSnapshot::Fresh {
+            pressure: pressure(value),
+            sampled_at,
+            raw_temperature: ThermalRawTemperature::Unavailable,
+        },
+        ReportedThermalSample::Stale {
+            pressure: value,
+            sampled_at,
+            latest_attempted_at,
+            reason,
+        } => ThermalSampleSnapshot::Stale {
+            pressure: pressure(value),
+            sampled_at,
+            latest_attempted_at,
+            unavailable_reason: unavailable_reason(reason),
+            raw_temperature: ThermalRawTemperature::Unavailable,
+        },
+        ReportedThermalSample::Unavailable {
+            attempted_at,
+            reason,
+        } => ThermalSampleSnapshot::Unavailable {
+            attempted_at,
+            unavailable_reason: unavailable_reason(reason),
+            raw_temperature: ThermalRawTemperature::Unavailable,
+        },
+    }
+}
+
+fn log_thermal_coverage_gaps(has_browser: bool, has_terminal: bool, has_mcp: bool) {
+    use std::sync::Once;
+    static BROWSER_GAP: Once = Once::new();
+    static TERMINAL_GAP: Once = Once::new();
+    static MCP_GAP: Once = Once::new();
+
+    if has_browser {
+        BROWSER_GAP.call_once(|| {
+            tracing::debug!(
+                resource = "browser",
+                "excluding active browser sessions from thermal targets because authoritative native process ownership is unavailable"
+            );
+        });
+    }
+    if has_terminal {
+        TERMINAL_GAP.call_once(|| {
+            tracing::debug!(
+                resource = "terminal",
+                "excluding active terminal processes from thermal targets because their WorkScope owner is unavailable"
+            );
+        });
+    }
+    if has_mcp {
+        MCP_GAP.call_once(|| {
+            tracing::debug!(
+                resource = "mcp",
+                "excluding configured MCP servers from thermal targets because authoritative native process ownership is unavailable"
+            );
+        });
+    }
+}
+
+fn thermal_coverage_snapshot(
+    generation: &ResourceObservationGeneration,
+    has_browser: bool,
+    has_mcp: bool,
+) -> ThermalCoverageSnapshot {
+    let bash = generation.all_bash_pids();
+    let work_scopes = &generation.live_bash_work_scopes;
+    let has_terminal = generation.live_terminal_session_count > 0;
+    log_thermal_coverage_gaps(has_browser, has_terminal, has_mcp);
+    let mut uncovered_reasons = Vec::new();
+    if has_browser {
+        uncovered_reasons.push(
+            "browser sessions are excluded because authoritative native process ownership is not exposed"
+                .to_string(),
+        );
+    }
+    if has_terminal {
+        uncovered_reasons.push(
+            "terminal processes are excluded because resource sampling does not retain their WorkScope owner"
+                .to_string(),
+        );
+    }
+    if has_mcp {
+        uncovered_reasons.push(
+            "local stdio MCP servers are excluded because authoritative native process ownership is not exposed"
+                .to_string(),
+        );
+    }
+    if !generation.bash_attribution_available {
+        uncovered_reasons.push(
+            "live Bash WorkScopes are eligible, but native process attribution is unavailable"
+                .to_string(),
+        );
+    }
+    if generation.bash_sample_failure_count > 0 {
+        uncovered_reasons.push(format!(
+            "{} Bash process target(s) exited or changed identity during resource sampling",
+            generation.bash_sample_failure_count
+        ));
+    }
+    ThermalCoverageSnapshot {
+        eligible_work_scope_count: u32::try_from(work_scopes.len()).unwrap_or(u32::MAX),
+        eligible_process_count: u32::try_from(bash.len()).unwrap_or(u32::MAX),
+        covered_process_count: u32::try_from(
+            bash.iter()
+                .filter(|pid| generation.observations.contains_key(pid))
+                .count(),
+        )
+        .unwrap_or(u32::MAX),
+        uncovered_reasons,
+    }
+}
+
 async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
     let generation = state.resource_monitor.observe(state).await;
     let bash_pids = generation.all_bash_pids();
@@ -869,11 +1164,25 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
             "shell terminals exist, but native process enumeration failed; tmux server identity remains unavailable",
         ),
     };
-    let has_mcp = !state.mcp_manager.status().await.is_empty();
+    let mcp_status = state.mcp_manager.status().await;
+    let has_mcp = !mcp_status.is_empty();
+    let has_local_mcp = mcp_status
+        .iter()
+        .any(phoenix_tools::mcp::McpServerStatus::is_live_local_process);
 
     AboutResourcesSnapshot {
         sampled_at: generation.sampled_at,
         host: generation.host.clone(),
+        thermal: thermal_snapshot_from_generation(
+            &generation,
+            state
+                .runtime
+                .browser_sessions()
+                .active_session_count()
+                .await
+                > 0,
+            has_local_mcp,
+        ),
         managed_total: totals_from_observations(&all_pids, &generation.observations),
         categories: vec![
             api,
@@ -1119,6 +1428,7 @@ impl DeploymentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::resource_monitor::ThermalObservationSample;
     use phoenix_core::domain::db_schema::ConvMode;
     use phoenix_core::domain::db_schema::NonEmptyString;
     use std::fs;
@@ -1171,6 +1481,277 @@ mod tests {
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }
+    }
+
+    fn thermal_sample(
+        pressure: Option<ThermalPressureSample>,
+        unavailable_reason: Option<ThermalProviderUnavailableReason>,
+    ) -> ThermalObservationSample {
+        match (pressure, unavailable_reason) {
+            (Some(pressure), None) => ThermalObservationSample::Available {
+                pressure,
+                sampled_at: Utc::now(),
+            },
+            (None, Some(reason)) => ThermalObservationSample::Unavailable {
+                reason,
+                sampled_at: Utc::now(),
+            },
+            _ => panic!("thermal test sample must be exactly available or unavailable"),
+        }
+    }
+
+    fn generation_with_thermal(
+        thermal: ThermalObservationSample,
+        api_pids: BTreeSet<u32>,
+        terminal_pids: Option<BTreeSet<u32>>,
+        handles: Vec<crate::api::resource_monitor::HandleObservationTarget>,
+        observations: BTreeMap<u32, ProcessObservation>,
+    ) -> ResourceObservationGeneration {
+        let reported_sample = match thermal {
+            ThermalObservationSample::Available {
+                pressure,
+                sampled_at,
+            } => ReportedThermalSample::Fresh {
+                pressure,
+                sampled_at,
+            },
+            ThermalObservationSample::Unavailable { reason, sampled_at } => {
+                ReportedThermalSample::Unavailable {
+                    attempted_at: sampled_at,
+                    reason,
+                }
+            }
+        };
+        let covered_bash_identities: BTreeSet<crate::api::process_sample::ProcessIdentity> =
+            observations
+                .keys()
+                .map(|pid| crate::api::process_sample::ProcessIdentity {
+                    pid: *pid,
+                    start_time: u128::from(*pid),
+                })
+                .collect();
+        ResourceObservationGeneration {
+            sampled_at: Utc::now(),
+            host: HostResources {
+                logical_cpu_count: None,
+                cpu_busy_percent: None,
+                cpu_system_percent: None,
+                cpu_idle_percent: None,
+                total_memory_bytes: None,
+                available_memory_bytes: None,
+                used_memory_bytes: None,
+                load_average_one: None,
+                load_average_five: None,
+                load_average_fifteen: None,
+            },
+            thermal,
+            thermal_decision: crate::api::resource_monitor::ThermalGovernorDecisionSample {
+                state: ThermalGovernorStateSample::Elevated,
+                proposed_action: ThermalGovernorActionSample::Deprioritize,
+                proposed_targets: covered_bash_identities.clone(),
+                reported_sample,
+            },
+            observations,
+            api_pids,
+            live_terminal_session_count: terminal_pids
+                .as_ref()
+                .map_or(0, |pids| u32::try_from(pids.len()).unwrap_or(u32::MAX)),
+            terminal_pids,
+            live_bash_work_scopes: handles
+                .iter()
+                .map(|handle| handle.scope_key.clone())
+                .collect(),
+            covered_bash_identities,
+            bash_sample_failure_count: 0,
+            handles,
+            bash_attribution_available: true,
+        }
+    }
+
+    fn observation(pid: u32) -> ProcessObservation {
+        ProcessObservation {
+            pid,
+            name: format!("proc-{pid}"),
+            cpu_percent: Some(1.0),
+            memory_bytes: Some(10),
+            thread_count: Some(1),
+            cpu_time_seconds: Some(1.0),
+        }
+    }
+
+    #[test]
+    fn thermal_coverage_counts_only_authoritative_work_scope_bash_processes() {
+        let generation = generation_with_thermal(
+            thermal_sample(Some(ThermalPressureSample::Elevated), None),
+            BTreeSet::from([1]),
+            Some(BTreeSet::from([4])),
+            vec![crate::api::resource_monitor::HandleObservationTarget {
+                scope_key: "work:test".into(),
+                handle_id: "b-1".into(),
+                pids: BTreeSet::from([2, 3]),
+            }],
+            BTreeMap::from([
+                (1, observation(1)),
+                (2, observation(2)),
+                (4, observation(4)),
+            ]),
+        );
+
+        let coverage = thermal_coverage_snapshot(&generation, true, true);
+
+        assert_eq!(coverage.eligible_work_scope_count, 1);
+        assert_eq!(coverage.eligible_process_count, 2);
+        assert_eq!(coverage.covered_process_count, 1);
+        assert_eq!(coverage.uncovered_reasons.len(), 3);
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("browser sessions are excluded")));
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("MCP servers are excluded")));
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("terminal processes are excluded")));
+    }
+
+    #[test]
+    fn terminal_enumeration_failure_still_reports_active_coverage_gap() {
+        let mut generation = generation_with_thermal(
+            thermal_sample(Some(ThermalPressureSample::Nominal), None),
+            BTreeSet::new(),
+            None,
+            Vec::new(),
+            BTreeMap::new(),
+        );
+        generation.live_terminal_session_count = 1;
+
+        let coverage = thermal_coverage_snapshot(&generation, false, false);
+
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("terminal processes are excluded")));
+    }
+
+    #[test]
+    fn absent_resource_classes_do_not_report_thermal_coverage_gaps() {
+        let generation = generation_with_thermal(
+            thermal_sample(Some(ThermalPressureSample::Nominal), None),
+            BTreeSet::new(),
+            Some(BTreeSet::new()),
+            Vec::new(),
+            BTreeMap::new(),
+        );
+
+        let coverage = thermal_coverage_snapshot(&generation, false, false);
+
+        assert!(coverage.uncovered_reasons.is_empty());
+    }
+
+    #[test]
+    fn failed_bash_attribution_preserves_eligible_scope_and_reports_gap() {
+        let mut generation = generation_with_thermal(
+            thermal_sample(Some(ThermalPressureSample::Elevated), None),
+            BTreeSet::new(),
+            Some(BTreeSet::new()),
+            vec![crate::api::resource_monitor::HandleObservationTarget {
+                scope_key: "work:test".into(),
+                handle_id: "b-1".into(),
+                pids: BTreeSet::new(),
+            }],
+            BTreeMap::new(),
+        );
+        generation.handles.clear();
+        generation.bash_attribution_available = false;
+
+        let coverage = thermal_coverage_snapshot(&generation, true, true);
+
+        assert_eq!(coverage.eligible_work_scope_count, 1);
+        assert_eq!(coverage.eligible_process_count, 0);
+        assert_eq!(coverage.covered_process_count, 0);
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("native process attribution is unavailable")));
+    }
+
+    #[test]
+    fn post_enumeration_bash_failure_reports_explicit_coverage_gap() {
+        let mut generation = generation_with_thermal(
+            thermal_sample(Some(ThermalPressureSample::Elevated), None),
+            BTreeSet::new(),
+            Some(BTreeSet::new()),
+            vec![crate::api::resource_monitor::HandleObservationTarget {
+                scope_key: "work:test".into(),
+                handle_id: "b-1".into(),
+                pids: BTreeSet::from([2]),
+            }],
+            BTreeMap::new(),
+        );
+        generation.bash_sample_failure_count = 1;
+
+        let coverage = thermal_coverage_snapshot(&generation, true, true);
+
+        assert_eq!(coverage.eligible_process_count, 1);
+        assert_eq!(coverage.covered_process_count, 0);
+        assert!(coverage
+            .uncovered_reasons
+            .iter()
+            .any(|reason| reason.contains("exited or changed identity")));
+    }
+
+    #[test]
+    fn elevated_pressure_proposes_observe_only_deprioritization_without_applying() {
+        let snapshot = thermal_snapshot_from_generation(
+            &generation_with_thermal(
+                thermal_sample(Some(ThermalPressureSample::Elevated), None),
+                BTreeSet::new(),
+                Some(BTreeSet::new()),
+                vec![crate::api::resource_monitor::HandleObservationTarget {
+                    scope_key: "work:test".into(),
+                    handle_id: "b-1".into(),
+                    pids: BTreeSet::from([2]),
+                }],
+                BTreeMap::from([(2, observation(2))]),
+            ),
+            false,
+            false,
+        );
+
+        assert_eq!(snapshot.mode, ThermalGovernorMode::ObserveOnly);
+        assert_eq!(snapshot.state, ThermalGovernorState::Elevated);
+        assert_eq!(snapshot.applied_action, ObserveOnlyAppliedAction::None);
+        assert_eq!(
+            snapshot.proposed_action.kind,
+            ThermalGovernorActionKind::Deprioritize
+        );
+        assert!(snapshot.proposed_action.affects_targets);
+        assert_eq!(snapshot.proposed_action.target_identities.len(), 1);
+        assert_eq!(snapshot.proposed_action.target_identities[0].pid, 2);
+        assert_eq!(
+            snapshot.proposed_action.target_identities[0].start_identity,
+            "2"
+        );
+    }
+
+    #[test]
+    fn unavailable_provider_preserves_typed_unavailable_sample() {
+        let snapshot = thermal_sample_snapshot(ReportedThermalSample::Unavailable {
+            attempted_at: Utc::now(),
+            reason: ThermalProviderUnavailableReason::UnsupportedPlatform,
+        });
+
+        assert!(matches!(
+            snapshot,
+            ThermalSampleSnapshot::Unavailable {
+                unavailable_reason: ThermalUnavailableReason::UnsupportedPlatform,
+                raw_temperature: ThermalRawTemperature::Unavailable,
+                ..
+            }
+        ));
     }
 
     #[test]

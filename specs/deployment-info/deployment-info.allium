@@ -1,0 +1,258 @@
+-- allium: 3
+
+config {
+    minimum_safe_pressure_duration: Duration = 1_200.ms
+    maximum_safe_observation_gap: Duration = 2_500.ms
+}
+-- deployment-info.allium
+--
+-- Focused behavioural specification for the observe-only macOS thermal
+-- provider/governor diagnostics surfaced by Deployment Info.
+--
+-- Scope:
+--   - Typed macOS thermal-provider samples, including unavailable outcomes.
+--   - Governor mode and decision-state transitions for observe-only operation.
+--   - Non-mutating proposed-action semantics and sustained-safe restoration.
+--
+-- Excludes:
+--   - The rest of the Deployment Info page fetch/render flow.
+--   - Native scheduler-policy application details for enforcing mode.
+--   - Process-inventory discovery and WorkScope UI presentation details.
+--
+-- Requirement traceability:
+--   - REQ-DEPLOY-004E is modelled by ThermalSampleRecordsCapability,
+--     RawTemperatureUnavailableWithoutFabrication, and
+--     UnsupportedOrFailedProviderStaysUnavailable.
+--   - REQ-DEPLOY-004F is modelled by ObserveOnlyElevatedPressureProposesAction,
+--     ObserveOnlyRecoveryProposesRestoration, ObserveOnlyNeverAppliesPolicy,
+--     and ThermalResponseNeverUsesLifecycleControl.
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ThermalPressure {
+    nominal
+    | elevated
+}
+
+enum ThermalSampleAvailability {
+    available
+    | unavailable
+}
+
+enum GovernorMode {
+    observe_only
+    | enforcing
+}
+
+enum GovernorState {
+    nominal
+    | elevated
+    | unavailable
+}
+
+enum ThermalActionKind {
+    none
+    | deprioritize
+    | restore
+}
+
+enum ObserveOnlyAppliedAction {
+    none
+}
+
+enum UnavailableReason {
+    unsupported_platform
+    | provider_failure
+    | unreadable
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value ThermalSample {
+    availability: ThermalSampleAvailability
+    pressure: ThermalPressure?
+    sampled_at: Timestamp
+    unavailable_reason: UnavailableReason?
+    raw_temperature_available: Boolean
+}
+
+value NativeProcessIdentity {
+    pid: Integer
+    start_identity: Integer
+}
+
+value ProposedAction {
+    kind: ThermalActionKind
+    affects_targets: Boolean
+    target_identities: Set<NativeProcessIdentity>
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity ThermalGovernor {
+    mode: GovernorMode
+    state: GovernorState
+    last_sample: ThermalSample?
+    proposed_action: ProposedAction
+    applied_action: ObserveOnlyAppliedAction
+    covered_target_identities: Set<NativeProcessIdentity>
+    hypothetically_deprioritized_identities: Set<NativeProcessIdentity>
+
+    transitions state {
+        nominal -> elevated
+        elevated -> nominal
+        nominal -> unavailable
+        elevated -> unavailable
+        unavailable -> nominal
+        unavailable -> elevated
+    }
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- sample_is_supported_nominal(sample) -> Boolean
+--   sample.availability = available and sample.pressure = nominal.
+-- sample_is_supported_elevated(sample) -> Boolean
+--   sample.availability = available and sample.pressure = elevated.
+-- sample_is_unavailable(sample) -> Boolean
+--   sample.availability = unavailable.
+-- last_good_sample_exists(governor) -> Boolean
+--   The governor has retained a prior supported thermal sample.
+-- last_good_sample_is_stale(governor, sample) -> Boolean
+--   The retained supported sample is marked stale with the latest provider failure.
+-- policy_state_is_retained(governor) -> Boolean
+--   Provider unavailability does not discard the last actionable policy state.
+-- proposed_action_is_retained(governor) -> Boolean
+--   Provider unavailability does not discard the policy action associated with the retained state.
+-- raw_temperature_unavailable(sample) -> Boolean
+--   sample.raw_temperature_available = false.
+-- restoration_is_sustained_safe(governor, sample) -> Boolean
+--   Nominal pressure has remained continuously observed for at least
+--   config.minimum_safe_pressure_duration, with no gap between observations greater
+--   than config.maximum_safe_observation_gap; observation count alone is insufficient.
+-- proposed_deprioritization(governor) -> ProposedAction
+--   Returns a deprioritize action targeting the currently covered PID/start identities.
+-- proposed_restoration(governor) -> ProposedAction
+--   Returns a restore action targeting only PID/start identities previously retained
+--   as hypothetically deprioritized, never newly covered identities.
+-- no_proposed_action() -> ProposedAction
+--   Returns ProposedAction{ kind: none, affects_targets: false }.
+
+invariant ThermalSampleAvailabilityIsExclusive {
+    (sample.availability = available implies
+        sample.pressure != null and sample.unavailable_reason = null)
+    and
+    (sample.availability = unavailable implies
+        sample.pressure = null and sample.unavailable_reason != null)
+}
+
+invariant ProposedActionTargetEffectMatchesIdentities {
+    governor.proposed_action.affects_targets =
+        not governor.proposed_action.target_identities.empty()
+}
+
+invariant RestorationTransfersPreviouslyDeprioritizedIdentities {
+    governor.proposed_action.kind = restore implies
+        governor.hypothetically_deprioritized_identities.empty()
+}
+
+rule ThermalSampleRecordsCapability {
+    when: ThermalSampleObserved(governor, sample)
+    requires: sample.availability = available
+    ensures: ThermalGovernor{governor}.last_sample = sample
+}
+
+rule RawTemperatureUnavailableWithoutFabrication {
+    when: ThermalSampleObserved(governor, sample)
+    requires: raw_temperature_unavailable(sample)
+    ensures: ThermalGovernor{governor}.last_sample = sample
+}
+
+rule UnavailableProviderWithoutLastGoodSampleStaysUnavailable {
+    when: ThermalSampleObserved(governor, sample)
+    requires: sample_is_unavailable(sample)
+    requires: not last_good_sample_exists(governor)
+    ensures: ThermalGovernor{governor}.state = unavailable
+    ensures: ThermalGovernor{governor}.last_sample = sample
+    ensures: ThermalGovernor{governor}.proposed_action = no_proposed_action()
+}
+
+rule ProviderFailureRetainsLastGoodSampleAndPolicyObligation {
+    when: ThermalSampleObserved(governor, sample)
+    requires: sample_is_unavailable(sample)
+    requires: last_good_sample_exists(governor)
+    ensures: last_good_sample_is_stale(governor, sample)
+    ensures: policy_state_is_retained(governor)
+    ensures: proposed_action_is_retained(governor)
+}
+
+rule ObserveOnlyElevatedPressureProposesAction {
+    when: ThermalSampleObserved(governor, sample)
+    requires: ThermalGovernor{governor}.mode = observe_only
+    requires: sample_is_supported_elevated(sample)
+    ensures: ThermalGovernor{governor}.state = elevated
+    ensures: ThermalGovernor{governor}.last_sample = sample
+    ensures: ThermalGovernor{governor}.proposed_action = proposed_deprioritization(governor)
+}
+
+rule ObserveOnlyRecoveryProposesRestoration {
+    when: ThermalSampleObserved(governor, sample)
+    requires: ThermalGovernor{governor}.mode = observe_only
+    requires: ThermalGovernor{governor}.state = elevated
+    requires: sample_is_supported_nominal(sample)
+    requires: restoration_is_sustained_safe(governor, sample)
+    ensures: ThermalGovernor{governor}.state = nominal
+    ensures: ThermalGovernor{governor}.last_sample = sample
+    ensures: ThermalGovernor{governor}.proposed_action = proposed_restoration(governor)
+    ensures: ThermalGovernor{governor}.hypothetically_deprioritized_identities.empty()
+}
+
+rule NominalSampleWithoutRestorationKeepsState {
+    when: ThermalSampleObserved(governor, sample)
+    requires: ThermalGovernor{governor}.mode = observe_only
+    requires: ThermalGovernor{governor}.state = nominal
+    requires: sample_is_supported_nominal(sample)
+    ensures: ThermalGovernor{governor}.state = nominal
+    ensures: ThermalGovernor{governor}.last_sample = sample
+    ensures: ThermalGovernor{governor}.proposed_action = no_proposed_action()
+}
+
+rule ObserveOnlyNeverAppliesPolicy {
+    when: ThermalSampleObserved(governor, sample)
+    requires: ThermalGovernor{governor}.mode = observe_only
+    ensures: ThermalGovernor{governor}.applied_action = none
+}
+
+rule ThermalResponseNeverUsesLifecycleControl {
+    when: ThermalResponseEvaluated(governor)
+    ensures: ThermalGovernor{governor}.applied_action in { none, deprioritize, restore }
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ThermalObservationSurface {
+    facing deployment_operator: String
+
+    exposes:
+        ThermalGovernor.mode
+        ThermalGovernor.state
+        ThermalGovernor.last_sample
+        ThermalGovernor.proposed_action
+        ThermalGovernor.applied_action
+        ThermalGovernor.covered_target_identities
+        ThermalGovernor.hypothetically_deprioritized_identities
+
+    @guarantee ObserveOnlyActionIsDiagnosticOnly
+        -- In observe-only mode the proposed action is diagnostic state.
+        -- It never implies that native process policy changed.
+}

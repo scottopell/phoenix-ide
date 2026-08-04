@@ -182,3 +182,6 @@ tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["alloc", "NSProcessInfo"] }

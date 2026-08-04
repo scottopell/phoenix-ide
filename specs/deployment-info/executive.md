@@ -14,8 +14,8 @@ the machine is it using right now?"
 - Network binding and TLS posture (mode, cert/key/CA paths, auto-mode hosts,
   socket activation)
 - A live managed-resource monitor with a focused resource endpoint, host and
-  managed totals, per-category attribution, per-process rows, and bounded
-  client-side recent history
+  managed totals, per-category attribution, per-process rows, bounded
+  client-side recent history, and typed macOS thermal/governor diagnostics
 - Demand-driven request coalescing shared with Work Scope health and process inspectors, so overlapping consumers reuse one timestamped native-process observation generation
 - On-disk locations with sizes for small owned artifacts, paths-only for large
   caches, and a stable row for the attachment store
@@ -67,6 +67,8 @@ staying safe to open because ordinary inspection changes nothing.
 | **REQ-DEPLOY-004B:** Maintain bounded rolling history and rollups | Implemented | The UI keeps up to five minutes of good samples via `appendResourceHistory` and `RESOURCE_HISTORY_RETENTION_MS = 5 * 60 * 1_000`, then derives current/average/peak CPU and memory rollups with `computeResourceRollups`. Charts and summary cards read from that bounded client-side history. |
 | **REQ-DEPLOY-004C:** Preserve last-good semantics across refresh failures | Implemented | On fetch failure, `fetchResources` leaves `sample` and `history` intact, marks `stale: true` when a prior sample exists, and surfaces the error as `Live data stale — …`. When no sample exists yet, the page shows the error without fabricating data. |
 | **REQ-DEPLOY-004D:** Keep deployment facts and live resource monitoring separate | Implemented | `GET /api/deployment` carries build, network, log, and locality facts without a parallel resource snapshot; `GET /api/about/resources` is the sole live CPU, memory, load, and managed-process telemetry contract; and `GET /api/deployment/disk` owns explicit disk sizing. Deployment-facts and disk refreshes re-sample only their owning endpoints, while visible-page resource observations refresh independently on their demand-driven cadence. |
+| **REQ-DEPLOY-004E:** Report macOS thermal capability and governor status without fabrication | Implemented (observe-only) | `ResourceMonitor` samples the public `NSProcessInfo.thermalState` API on macOS and returns a typed unavailable outcome elsewhere. `AboutResourcesSnapshot.thermal` keeps pressure, unavailable reason, raw-temperature availability, governor mode, proposed/applied action, and ownership coverage structurally distinct. `AboutDeploymentPage` renders the live state, observe-only boundary, covered WorkScope count, and explicit Browser/terminal/MCP coverage gaps. |
+| **REQ-DEPLOY-004F:** Observe-only macOS governor decisions remain non-mutating | Implemented | `ThermalDecisionState` evaluates elevated pressure and two-sample nominal restoration hysteresis inside the demand-driven resource monitor. The only shipped mode is `ObserveOnly`; its wire snapshot always reports `applied_action: none`, and there is no scheduler-policy or lifecycle effect path. Focused Rust tests cover hysteresis, unavailable-provider behavior, authoritative WorkScope Bash coverage, and the non-mutating snapshot; the About page test covers operator-visible diagnostics. |
 | **REQ-DEPLOY-005:** Report on-disk locations and their sizes | Implemented | `GET /api/deployment/disk` returns `DeploymentDiskInfo` with typed `DiskSize` variants, aggregate managed-worktree sizing, and per-worktree rows with typed disposition. The UI keeps disk loading/error state separate from the live resource monitor. |
 | **REQ-DEPLOY-006:** Surface the log sinks, never the contents | Implemented | `LogInfo` reports independent stdout/file sinks from the logger configuration, and the page renders sink facts only — never log contents. |
 | **REQ-DEPLOY-007:** Freshness of sampled values | Implemented | `DeploymentInfo`, `DeploymentDiskInfo`, and `AboutResourcesSnapshot` all carry `sampled_at`; the UI distinguishes deployment-facts refresh, disk refresh, and continuous resource sampling rather than serving one cached omnibus snapshot. |
@@ -74,11 +76,12 @@ staying safe to open because ordinary inspection changes nothing.
 
 ## Behavioural Specification
 
-No Allium spec accompanies this feature. The page composes read-only endpoint
-fetches plus a narrowly scoped cleanup action, but it does not introduce a new
-state machine or lifecycle whose invariants would benefit from an Allium layer.
-The normative artifacts here are `requirements.md` plus the Rust/TS wire types
-exported from `crates/phoenix-ide/src/api/deployment.rs` into `ui/src/generated/`.
+`specs/deployment-info/deployment-info.allium` models the focused stateful part
+of this feature: provider sampling and governor decision semantics for the
+observe-only macOS thermal controller surfaced through deployment diagnostics.
+The rest of the page remains governed primarily by `requirements.md` plus the
+Rust/TS wire types exported from `crates/phoenix-ide/src/api/deployment.rs` into
+`ui/src/generated/`.
 
 ## Cross-Spec Cross-References
 

@@ -334,6 +334,65 @@ fetches.
 
 ---
 
+### REQ-DEPLOY-004E: Report macOS thermal capability and governor status without fabrication
+
+THE SYSTEM SHALL expose thermal state as a typed diagnostic distinct from CPU,
+memory, and load.
+
+WHEN the host platform provides a stable macOS thermal-pressure signal
+THE SYSTEM SHALL report that signal as a typed pressure state together with the
+sample time and governor mode.
+
+WHEN raw numeric temperature is unsupported, unavailable, or unreadable
+THE SYSTEM SHALL report raw temperature as unavailable rather than `0`, an
+inferred value, or a relabelled thermal-pressure state.
+
+WHEN the host platform is unsupported or the provider cannot produce a safe
+sample
+THE SYSTEM SHALL preserve a typed unavailable outcome with the reason rather
+than inferring thermal pressure from CPU usage or host load.
+
+THE SYSTEM SHALL report governor mode as a typed capability that distinguishes
+observe-only from enforcing behavior.
+
+**Rationale:** Thermal pressure and CPU utilization answer different operator
+questions. Preserving thermal capability as its own typed diagnostic keeps the
+page honest about what the operating system actually reported, and prevents
+fabricated temperature or pressure values from being mistaken for real host
+telemetry.
+
+---
+
+### REQ-DEPLOY-004F: Observe-only macOS governor decisions remain non-mutating
+
+WHEN the governor operates in observe-only mode
+THE SYSTEM SHALL sample real provider state, evaluate the same eligibility and
+decision logic used for enforcement, and record the scheduler-policy action it
+would take, but SHALL NOT change process priority, QoS, suspension state, or
+lifecycle as a thermal response.
+
+THE SYSTEM SHALL preserve the distinction between proposed and applied thermal
+policy action.
+
+THE SYSTEM SHALL keep thermal-governor authority internal to the system rather
+than exposing cross-conversation process control through user or tool APIs.
+
+THE SYSTEM SHALL never stop, suspend, duty-cycle, or kill workloads as a
+thermal-governor response.
+
+WHEN provider state returns to a sustained safer condition after an elevated
+state
+THE SYSTEM SHALL evaluate the corresponding restoration decision through the same
+governor state machine, while observe-only mode continues to record rather than
+apply that restoration.
+
+**Rationale:** Observe-only mode exists to validate decision correctness,
+coverage, and operator visibility before any native scheduler policy is allowed
+to mutate running workloads. Using the same decision engine in both modes keeps
+dry-run behaviour representative while preserving a hard non-mutation boundary.
+
+---
+
 ### REQ-DEPLOY-005: Report on-disk locations and their sizes
 
 THE SYSTEM SHALL load on-disk locations through a disk-specific API surface so the

@@ -2,5 +2,6 @@
 import type { HostResources } from "./HostResources";
 import type { ManagedResourceCategory } from "./ManagedResourceCategory";
 import type { ManagedResourceTotals } from "./ManagedResourceTotals";
+import type { ThermalGovernorSnapshot } from "./ThermalGovernorSnapshot";
 
-export type AboutResourcesSnapshot = { sampled_at: string, host: HostResources, managed_total: ManagedResourceTotals, categories: Array<ManagedResourceCategory>, };
+export type AboutResourcesSnapshot = { sampled_at: string, host: HostResources, thermal: ThermalGovernorSnapshot, managed_total: ManagedResourceTotals, categories: Array<ManagedResourceCategory>, };
