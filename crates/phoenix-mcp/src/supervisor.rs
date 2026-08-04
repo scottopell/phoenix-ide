@@ -126,6 +126,21 @@ impl SupervisorHandle {
         self.snapshots.clone()
     }
 
+    pub(crate) async fn wait_for_settled(&self) {
+        let mut snapshots = self.subscribe();
+        loop {
+            if !matches!(
+                snapshots.borrow().state,
+                SupervisorState::Connecting | SupervisorState::Recovering
+            ) {
+                return;
+            }
+            if snapshots.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub(crate) async fn status(&self) -> Option<Snapshot> {
         let (reply, receive) = oneshot::channel();
         self.mailbox.send(Command::Status { reply }).await.ok()?;

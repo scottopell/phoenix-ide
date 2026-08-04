@@ -2039,7 +2039,7 @@ impl McpClientManager {
             Ok(auth_url) => RefreshServerOutcome::Reprompt(format!(
                 "MCP server '{name}': authorization expired; re-authorize at {auth_url}"
             )),
-            Err(flow_error) => RefreshServerOutcome::Reprompt(format!(
+            Err(flow_error) => RefreshServerOutcome::Transient(format!(
                 "MCP server '{name}': OAuth refresh rejected ({reason}) and re-authorization \
                  could not start: {flow_error}"
             )),
@@ -2186,6 +2186,11 @@ impl McpClientManager {
             let _ = manager
                 .reload_from_actor_configs(Self::read_all_configs())
                 .await;
+            let handles: Vec<SupervisorHandle> =
+                manager.servers.read().await.values().cloned().collect();
+            for handle in handles {
+                let _ = tokio::time::timeout(CONNECT_TIMEOUT, handle.wait_for_settled()).await;
+            }
         })
     }
 
