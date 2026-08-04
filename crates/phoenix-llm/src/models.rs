@@ -367,6 +367,16 @@ fn validate_external_effort_capabilities(
                     spec.id
                 ));
             }
+            if matches!(spec.backend, ExternalBackend::Anthropic)
+                && levels
+                    .iter()
+                    .any(|level| matches!(level, ModelEffort::None | ModelEffort::Minimal))
+            {
+                return Err(format!(
+                    "model '{}' declares an Anthropic-invalid effort level",
+                    spec.id
+                ));
+            }
             let native_default = match native_default {
                 Some(level) => {
                     if !levels.contains(level) {
@@ -757,6 +767,15 @@ mod tests {
         )
         .expect("top-level external model array parses");
         assert_eq!(models.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_external_models_reject_non_native_effort_levels() {
+        let models = parse_external_models(
+            r#"[{"id":"bad-anthropic","backend":"anthropic","description":"Bad","context_window":128000,"recommended":false,"supports_tool_search":false,"effort_capabilities":{"support":"supported","levels":["none","high"]}}]"#,
+        )
+        .expect("top-level external model array parses");
+        assert!(models.is_empty());
     }
 
     #[test]

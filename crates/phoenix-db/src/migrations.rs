@@ -354,7 +354,6 @@ WHEN ((NEW.effort_source IN ('explicit', 'native_known')) != (NEW.effort_level I
 BEGIN
     SELECT RAISE(ABORT, 'invalid turn usage effort shape');
 END;
-UPDATE conversations SET model = 'gpt-5.4' WHERE model = 'gpt-5.3-codex';
 ";
 
 const MIGRATION_057: &str = r"
@@ -3103,7 +3102,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(migrated_model, "gpt-5.4");
+        assert_eq!(migrated_model, "gpt-5.3-codex");
         let historical_turn_usage_model: String =
             sqlx::query_scalar("SELECT model FROM turn_usage WHERE id = 9")
                 .fetch_one(&pool)

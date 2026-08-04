@@ -1850,26 +1850,14 @@ async fn create_conversation_with_id(
         }
     }
 
-    if req.model.as_deref() == Some("gpt-5.3-codex")
-        && state.llm_registry.get("gpt-5.3-codex").is_none()
-    {
-        req.model = Some("gpt-5.4".to_string());
+    if state.llm_registry.get(&req.model).is_none() {
+        let available = state.llm_registry.available_models().join(", ");
+        return Err(AppError::BadRequest(format!(
+            "Model '{}' is not available. Available models: {available}",
+            req.model
+        )));
     }
-
-    if let Some(ref model) = req.model {
-        if state.llm_registry.get(model).is_none() {
-            let available = state.llm_registry.available_models().join(", ");
-            return Err(AppError::BadRequest(format!(
-                "Model '{model}' is not available. Available models: {available}"
-            )));
-        }
-    }
-    let selected_model = crate::runtime::creation_worker::resolve_creation_model(
-        &state.llm_registry,
-        req.model.as_deref(),
-        req.mode.as_deref().unwrap_or("direct"),
-        phoenix_core::git::detect_git_repo_root(std::path::Path::new(&req.cwd)).is_some(),
-    );
+    let selected_model = req.model.clone();
     if let Some(effort) = req.effort {
         if !state.llm_registry.supports_effort(&selected_model, effort) {
             return Err(AppError::BadRequest(format!(
@@ -1887,7 +1875,7 @@ async fn create_conversation_with_id(
     let effective_cwd = req.cwd.clone();
     let desired_base_branch = req.base_branch.as_deref();
     let shell_model = selected_model.clone();
-    let intent_model = req.model.clone();
+    let intent_model = Some(req.model.clone());
     let resolved_mode_for_intent = match requested_mode {
         "direct" => None,
         other => Some(other.to_string()),
@@ -7659,7 +7647,7 @@ mod conversation_cwd_validation_tests {
         CreateConversationRequest {
             conversation_id: None,
             cwd,
-            model: None,
+            model: "mock-llm".to_string(),
             effort: None,
             text: "hello".to_string(),
             message_id: uuid::Uuid::new_v4().to_string(),
@@ -14256,7 +14244,7 @@ mod attachment_storage_tests {
         let stored_path = "/tmp/phoenix-creation-job-attachment.txt".to_string();
         let intent = crate::db::ConversationCreationIntent {
             cwd: "/tmp".to_string(),
-            model: None,
+            model: Some("mock-llm".to_string()),
             effort: None,
             text: "with attachment".to_string(),
             expansion_preflighted: false,

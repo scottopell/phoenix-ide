@@ -10,7 +10,7 @@ pub struct CreateConversationRequest {
     #[serde(default)]
     pub conversation_id: Option<String>,
     pub cwd: String,
-    pub model: Option<String>,
+    pub model: String,
     #[serde(default)]
     pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
     /// Initial message text (required)

@@ -550,6 +550,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCreating(false);
         return;
       }
+      if (!selectedModel) {
+        setError('Pick a model before creating the conversation.');
+        setCreating(false);
+        return;
+      }
       const submitText = selectedTask
         ? buildTaskStartPrompt(trimmedCwd, selectedTask, trimmed)
         : trimmed;
@@ -557,7 +562,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         trimmedCwd,
         submitText,
         messageId,
-        selectedModel || undefined,
+        selectedModel,
         selectedEffort,
         images,
         submission.mode,

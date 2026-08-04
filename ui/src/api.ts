@@ -1514,7 +1514,7 @@ export const api = {
     cwd: string,
     text: string,
     messageId: string,
-    model?: string,
+    model: string,
     effort?: ModelEffort | null,
     images: ImageData[] = [],
     mode?: 'direct' | 'managed' | 'branch' | 'auto',
