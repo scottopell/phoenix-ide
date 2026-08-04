@@ -2342,6 +2342,7 @@ impl McpClientManager {
 
     /// # Errors
     /// Returns cancellation or the serving/recovery failure.
+    #[allow(clippy::too_many_lines)] // One ordered lifecycle: call, classify, recover, retry.
     pub async fn call_tool_cancellable(
         self: &Arc<Self>,
         server_name: &str,
@@ -2376,9 +2377,14 @@ impl McpClientManager {
                 return Err(McpToolCallError::Failed(error.into_message(server_name)));
             }
             Err(McpRequestError::Cancelled) => {
-                self.recover_actor(server_name, &handle, first.epoch, None)
-                    .await
-                    .map_err(McpToolCallError::Failed)?;
+                let manager = Arc::clone(self);
+                let name = server_name.to_string();
+                let recovery_handle = handle.clone();
+                self.spawn_background(async move {
+                    let _ = manager
+                        .recover_actor(&name, &recovery_handle, first.epoch, None)
+                        .await;
+                });
                 return Err(McpToolCallError::Cancelled);
             }
             Err(_) => match recovery {
@@ -3112,10 +3118,7 @@ impl McpClientManager {
         let tool_call_timeout = match cfg.get("timeoutSeconds") {
             None => DEFAULT_TOOL_CALL_TIMEOUT,
             Some(value) => {
-                let Some(seconds) = value
-                    .as_u64()
-                    .filter(|seconds| *seconds > 0 && *seconds <= 31_536_000)
-                else {
+                let Some(seconds) = value.as_u64().filter(|seconds| *seconds > 0) else {
                     tracing::debug!(
                         server = %name,
                         "'timeoutSeconds' must be a positive integer; skipping server"
@@ -4797,14 +4800,20 @@ for line in sys.stdin:
             .expect("call task")
             .expect_err("call is cancelled");
         assert_eq!(error, McpToolCallError::Cancelled);
-        assert_eq!(
-            marker_lines(&marker)
-                .iter()
-                .filter(|line| line.starts_with("start|"))
-                .count(),
-            2,
-            "cancellation respawns the stdio server before returning"
-        );
+        let mut snapshots = manager
+            .servers
+            .read()
+            .await
+            .get("fixture")
+            .expect("fixture supervisor")
+            .subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !snapshots.borrow().is_ready() {
+                snapshots.changed().await.expect("supervisor remains alive");
+            }
+        })
+        .await
+        .expect("cancellation recovery settles");
 
         let changed = fixture_config(&script, &marker, "v2", "env2");
         let reload = manager
