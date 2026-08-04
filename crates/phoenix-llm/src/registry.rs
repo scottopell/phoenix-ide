@@ -913,6 +913,18 @@ impl ModelRegistry {
         }
     }
 
+    /// Resolve a persisted model id to an exact registered route, or to the
+    /// retired built-in replacement when no exact route exists.
+    pub fn resolve_model_id(&self, model_id: &str) -> String {
+        if self.get(model_id).is_some() {
+            model_id.to_string()
+        } else if model_id == "gpt-5.3-codex" {
+            "gpt-5.4".to_string()
+        } else {
+            model_id.to_string()
+        }
+    }
+
     /// Return an operator-declared output ceiling for a registered route.
     ///
     /// # Panics

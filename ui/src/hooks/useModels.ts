@@ -5,6 +5,7 @@ import { subscribeModels } from '../modelsPoller';
 interface UseModelsReturn {
   models: ModelInfo[];
   credentialStatus: CredentialStatus | null;
+  defaultModel: string | null;
 }
 
 /**
@@ -23,6 +24,7 @@ export function useModels(): UseModelsReturn {
 
   return {
     models: state?.models ?? [],
+    defaultModel: state?.default ?? null,
     // Preserve ConversationPage's prior semantics: 'not_configured' is treated
     // as "no credential status known yet", not a distinct state.
     credentialStatus:

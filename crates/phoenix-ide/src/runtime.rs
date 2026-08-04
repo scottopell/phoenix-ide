@@ -2843,10 +2843,11 @@ impl RuntimeManager {
         };
 
         // Resolve model once: use conversation's stored model, or fall back to registry default
-        let model_id = conv
+        let stored_model_id = conv
             .model
             .clone()
             .unwrap_or_else(|| self.llm_registry.default_model_id());
+        let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
         let context_window = self.llm_registry.context_window(&model_id);
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {

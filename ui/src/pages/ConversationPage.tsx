@@ -486,7 +486,7 @@ function ConversationPageContent({
   const [files, setFiles] = useState<FileAttachment[]>([]);
 
   // Shared models/credential poller — one request loop app-wide.
-  const { models: availableModels, credentialStatus } = useModels();
+  const { models: availableModels, credentialStatus, defaultModel } = useModels();
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
@@ -1662,7 +1662,7 @@ function ConversationPageContent({
         homeDir,
         '', // empty — server accepts empty text when seed_parent_id is set
         messageId,
-        conversation.model ?? undefined,
+        conversation.model ?? defaultModel ?? (() => { throw new Error('No model is available'); })(),
         null,
         [],
         'direct',
@@ -1675,7 +1675,7 @@ function ConversationPageContent({
       );
       navigate(routeForConversation(newConv));
     },
-    [conversation, navigate, createConversationWithStore],
+    [conversation, defaultModel, navigate, createConversationWithStore],
   );
 
   const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {
