@@ -192,9 +192,16 @@ class PhoenixClient:
     def create_conversation(self, cwd: str, text: str, images: list[dict], model: str | None = None) -> dict:
         """Create new conversation with initial message."""
         import uuid
-        payload = {"cwd": cwd, "text": text, "images": images, "message_id": str(uuid.uuid4())}
-        if model:
-            payload["model"] = model
+        selected_model = model or self.get_models().get("default")
+        if not selected_model:
+            raise RuntimeError("server did not advertise a default model")
+        payload = {
+            "cwd": cwd,
+            "model": selected_model,
+            "text": text,
+            "images": images,
+            "message_id": str(uuid.uuid4()),
+        }
         resp = self.http.post(
             f"{self.base_url}/api/conversations/new",
             json=payload

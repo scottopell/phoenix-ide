@@ -7647,7 +7647,7 @@ mod conversation_cwd_validation_tests {
         CreateConversationRequest {
             conversation_id: None,
             cwd,
-            model: "mock-llm".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: None,
             text: "hello".to_string(),
             message_id: uuid::Uuid::new_v4().to_string(),
@@ -7706,7 +7706,7 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn create_conversation_preserves_omitted_model_in_durable_intent() {
+    async fn create_conversation_preserves_explicit_model_in_durable_intent() {
         let state = hard_delete_cascade_tests::make_test_state().await;
         let conversation_id = uuid::Uuid::new_v4().to_string();
         let mut request = create_request("/".to_string());
@@ -7724,7 +7724,7 @@ mod conversation_cwd_validation_tests {
             .expect("job lookup")
             .expect("creation job");
 
-        assert_eq!(job.intent.model, None);
+        assert_eq!(job.intent.model.as_deref(), Some("claude-sonnet-5"));
     }
 
     #[tokio::test]
@@ -8138,13 +8138,34 @@ pub(crate) mod hard_delete_cascade_tests {
     use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
 
+    struct TestLlm;
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for TestLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            Ok(phoenix_llm::LlmResponse {
+                content: vec![],
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "claude-sonnet-5"
+        }
+    }
+
     /// Construct a minimal `AppState` backed by an in-memory database.
     /// The state machine handler is started so `runtime.try_get_handle`
     /// works when the test wants to verify SSE events; conversations
     /// are otherwise inert (no LLM calls fire).
     pub(crate) async fn make_test_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
-        let llm_registry = Arc::new(ModelRegistry::new_empty());
+        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(TestLlm)));
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
@@ -14244,7 +14265,7 @@ mod attachment_storage_tests {
         let stored_path = "/tmp/phoenix-creation-job-attachment.txt".to_string();
         let intent = crate::db::ConversationCreationIntent {
             cwd: "/tmp".to_string(),
-            model: Some("mock-llm".to_string()),
+            model: Some("mock".to_string()),
             effort: None,
             text: "with attachment".to_string(),
             expansion_preflighted: false,

@@ -535,6 +535,15 @@ def _server():
 # ----------------------- minimal client helpers -----------------------
 
 
+def _default_model(base_url: str) -> str:
+    response = httpx.get(f"{base_url}/api/models", timeout=10.0)
+    response.raise_for_status()
+    model = response.json().get("default")
+    if not isinstance(model, str) or not model:
+        raise AssertionError("/api/models did not advertise a default model")
+    return model
+
+
 def _new_conv(
     base_url: str,
     text: str,
@@ -543,6 +552,7 @@ def _new_conv(
 ) -> dict:
     payload = {
         "cwd": cwd if cwd is not None else str(ROOT),
+        "model": _default_model(base_url),
         "text": text,
         "images": images or [],
         "message_id": str(uuid.uuid4()),
@@ -690,6 +700,7 @@ async def _new_conv_and_stream_async(
     payload = {
         "conversation_id": conv_id,
         "cwd": str(ROOT),
+        "model": _default_model(base_url),
         "text": text,
         "images": [],
         "message_id": message_id,
