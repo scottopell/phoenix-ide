@@ -4937,28 +4937,27 @@ where
                 cache_key: PromptCacheKey::stable(&conv_id),
             };
 
-            let conservative_system_tokens: usize = request
+            let estimated_system_tokens: usize = request
                 .system
                 .iter()
-                .map(|segment| segment.text.len())
+                .map(|segment| estimate_dispatch_text_tokens(&segment.text))
                 .sum();
-            let conservative_tool_tokens: usize = request
+            let estimated_tool_tokens: usize = request
                 .tools
                 .iter()
                 .map(|tool| {
-                    tool.name.len()
-                        + tool.description.len()
-                        + tool.input_schema.to_string().len()
+                    estimate_dispatch_text_tokens(&tool.name)
+                        + estimate_dispatch_text_tokens(&tool.description)
+                        + estimate_dispatch_text_tokens(&tool.input_schema.to_string())
                 })
                 .sum();
-            let conservative_message_tokens: usize = request
+            let estimated_message_tokens: usize = request
                 .messages
                 .iter()
-                .map(conservative_message_token_bound)
+                .map(estimate_dispatch_message_tokens)
                 .sum();
-            let estimated_input_tokens = conservative_system_tokens
-                + conservative_message_tokens
-                + conservative_tool_tokens;
+            let estimated_input_tokens =
+                estimated_system_tokens + estimated_message_tokens + estimated_tool_tokens;
             let reserved_output_tokens = usize::try_from(request.reserved_output_tokens())
                 .unwrap_or(usize::MAX);
             if estimated_input_tokens.saturating_add(reserved_output_tokens) > context_window {
@@ -6422,16 +6421,26 @@ fn cap_block_text(text: String) -> String {
     format!("{truncated}…[truncated]")
 }
 
-/// Conservative UTF-8 byte upper bound for pre-dispatch capacity checks.
-/// Byte-fallback tokenizers cannot emit more tokens than input bytes; images use
-/// the existing fixed estimate because their encoded bytes are not provider tokens.
-fn conservative_message_token_bound(msg: &LlmMessage) -> usize {
+/// Calibrated pre-dispatch estimate: the normal chars/4 estimate plus a 50%
+/// safety factor. This avoids treating UTF-8 bytes as tokens while bounding
+/// token-dense input more conservatively than the continuation planner.
+fn estimate_dispatch_text_tokens(text: &str) -> usize {
+    estimate_text_tokens(text).saturating_mul(3).div_ceil(2)
+}
+
+fn estimate_dispatch_message_tokens(msg: &LlmMessage) -> usize {
     let content: usize = msg
         .content
         .iter()
         .map(|block| match block {
             ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
-            other => other.render_text().len(),
+            ContentBlock::ToolResult {
+                content, images, ..
+            } => {
+                estimate_dispatch_text_tokens(content)
+                    + images.len().saturating_mul(IMAGE_TOKEN_ESTIMATE)
+            }
+            other => estimate_dispatch_text_tokens(&other.render_text()),
         })
         .sum();
     content + MESSAGE_OVERHEAD_TOKENS

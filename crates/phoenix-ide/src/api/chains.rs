@@ -289,12 +289,20 @@ pub async fn regenerate_chain_name(
         ));
     }
 
-    let cheap_model = state.llm_registry.get_cheap_model().ok_or_else(|| {
-        AppError::Internal("no cheap LLM model is available for name regeneration".to_string())
-    })?;
+    let (cheap_model_id, cheap_model) =
+        state
+            .llm_registry
+            .get_cheap_model_with_id()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "no cheap LLM model is available for name regeneration".to_string(),
+                )
+            })?;
+    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
 
     let Some(generated) =
-        crate::title_generator::generate_chain_name(&first_messages, cheap_model).await
+        crate::title_generator::generate_chain_name(&first_messages, cheap_model, effective_effort)
+            .await
     else {
         // LLM failure/timeout — existing name stays as-is (REQ-CHN-010).
         return Err(AppError::Internal(

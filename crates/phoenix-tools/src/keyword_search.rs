@@ -419,8 +419,11 @@ impl KeywordSearchTool {
     /// has no model list of its own to drift from the registry's.
     fn select_filter_llm(
         ctx: &ToolContext,
-    ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
-        ctx.llm_selector().get_cheap_model()
+    ) -> Option<(
+        Arc<dyn phoenix_core::llm_service::CompletionService>,
+        phoenix_core::domain::llm_types::EffectiveEffort,
+    )> {
+        ctx.llm_selector().get_cheap_model_with_effort()
     }
 
     /// Filter results using LLM
@@ -431,7 +434,8 @@ impl KeywordSearchTool {
         search_root: &Path,
         results: &str,
     ) -> Result<String, String> {
-        let llm = Self::select_filter_llm(ctx).ok_or("No LLM available for filtering")?;
+        let (llm, effective_effort) =
+            Self::select_filter_llm(ctx).ok_or("No LLM available for filtering")?;
 
         let user_content = format!(
             "Search root: {}\n\nRipgrep results:\n{}\n\nOriginal query: {}",
@@ -449,7 +453,7 @@ impl KeywordSearchTool {
             }],
             tools: vec![],
             max_tokens: Some(4096),
-            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            effective_effort,
             telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
                 conversation_id: ctx.conversation_id.clone(),
                 root_conversation_id: ctx.root_conversation_id.clone(),

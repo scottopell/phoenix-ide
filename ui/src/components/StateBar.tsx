@@ -1051,7 +1051,7 @@ export function StateBar({
           {variant === "mobile"
             ? (conversation?.model ?? "default")
             : modelAbbrev}
-          {(currentEffortCapabilities?.support === 'supported' || effortIsStale) && (
+          {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
             <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
           )}
           <span className="conv-model-caret" aria-hidden="true">
@@ -1066,7 +1066,7 @@ export function StateBar({
           {variant === "mobile"
             ? (conversation?.model ?? "default")
             : modelAbbrev}
-          {(currentEffortCapabilities?.support === 'supported' || effortIsStale) && (
+          {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
             <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
           )}
         </span>

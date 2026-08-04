@@ -402,9 +402,12 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         .into_output(started.elapsed().as_millis()));
     }
 
-    let service = ctx.llm_selector().default_service().ok_or_else(|| {
-        "commission_review cannot run: no Phoenix LLM model is configured".to_string()
-    })?;
+    let (service, effective_effort) = ctx
+        .llm_selector()
+        .default_service_with_effort()
+        .ok_or_else(|| {
+            "commission_review cannot run: no Phoenix LLM model is configured".to_string()
+        })?;
     let chunks = review_chunks(&collection.body);
     let mut findings = Vec::new();
     let mut reviewer_summaries = Vec::new();
@@ -453,7 +456,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             }],
             tools: vec![],
             max_tokens: Some(4096),
-            effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            effective_effort,
             telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
                 conversation_id: ctx.conversation_id.clone(),
                 root_conversation_id: ctx.root_conversation_id.clone(),

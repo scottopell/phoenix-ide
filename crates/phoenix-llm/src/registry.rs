@@ -1047,18 +1047,19 @@ impl ModelRegistry {
 
     /// Get a cheap/fast model for auxiliary tasks like title generation.
     /// Prefers: claude-haiku-4-5 > gpt-5.4-mini > any available model
-    pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
-        // Priority order for cheap models
+    pub fn get_cheap_model_with_id(&self) -> Option<(String, Arc<dyn LlmService>)> {
         const CHEAP_MODELS: &[&str] = &["claude-haiku-4-5", "gpt-5.4-mini"];
-
         for model_id in CHEAP_MODELS {
             if let Some(service) = self.get(model_id) {
-                return Some(service);
+                return Some(((*model_id).to_string(), service));
             }
         }
-
-        // Fall back to default model if no cheap model available
         self.default()
+            .map(|service| (self.default_model_id(), service))
+    }
+
+    pub fn get_cheap_model(&self) -> Option<Arc<dyn LlmService>> {
+        self.get_cheap_model_with_id().map(|(_, service)| service)
     }
 
     /// Get the cheapest available model ID from the same provider family as `parent_model_id`.
@@ -1295,9 +1296,40 @@ impl phoenix_core::llm_service::LlmSelector for ModelRegistry {
         })
     }
 
+    fn default_service_with_effort(
+        &self,
+    ) -> Option<(
+        Arc<dyn phoenix_core::llm_service::CompletionService>,
+        phoenix_core::domain::llm_types::EffectiveEffort,
+    )> {
+        let model_id = self.default_model_id();
+        ModelRegistry::get(self, &model_id).map(|service| {
+            (
+                Arc::new(AsCompletion(service))
+                    as Arc<dyn phoenix_core::llm_service::CompletionService>,
+                self.effective_effort(&model_id, None),
+            )
+        })
+    }
+
     fn get_cheap_model(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
         ModelRegistry::get_cheap_model(self).map(|svc| {
             Arc::new(AsCompletion(svc)) as Arc<dyn phoenix_core::llm_service::CompletionService>
+        })
+    }
+
+    fn get_cheap_model_with_effort(
+        &self,
+    ) -> Option<(
+        Arc<dyn phoenix_core::llm_service::CompletionService>,
+        phoenix_core::domain::llm_types::EffectiveEffort,
+    )> {
+        self.get_cheap_model_with_id().map(|(model_id, service)| {
+            (
+                Arc::new(AsCompletion(service))
+                    as Arc<dyn phoenix_core::llm_service::CompletionService>,
+                self.effective_effort(&model_id, None),
+            )
         })
     }
 }

@@ -1886,7 +1886,7 @@ async fn create_conversation_with_id(
     let conv_mode = crate::db::ConvMode::Direct;
     let effective_cwd = req.cwd.clone();
     let desired_base_branch = req.base_branch.as_deref();
-let shell_model = selected_model.clone();
+    let shell_model = selected_model.clone();
     let intent_model = req.model.clone();
     let resolved_mode_for_intent = match requested_mode {
         "direct" => None,
@@ -5581,11 +5581,18 @@ async fn regenerate_conversation_name(
             )
         })?;
 
-    let cheap_model = state.llm_registry.get_cheap_model().ok_or_else(|| {
-        AppError::Internal("no cheap LLM model is available for name regeneration".to_string())
-    })?;
+    let (cheap_model_id, cheap_model) =
+        state
+            .llm_registry
+            .get_cheap_model_with_id()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "no cheap LLM model is available for name regeneration".to_string(),
+                )
+            })?;
+    let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
 
-    let generated = crate::title_generator::generate_title(&opening, cheap_model)
+    let generated = crate::title_generator::generate_title(&opening, cheap_model, effective_effort)
         .await
         .filter(|slug| !slug.is_empty())
         .ok_or_else(|| {
@@ -5671,13 +5678,17 @@ async fn suggest_handler(
         return Err(AppError::BadRequest("query must not be empty".to_string()));
     }
 
-    let llm = match &req.model {
-        Some(id) => state.llm_registry.get(id),
-        None => state.llm_registry.get_cheap_model(),
+    let (model_id, llm) = match &req.model {
+        Some(id) => state
+            .llm_registry
+            .get(id)
+            .map(|service| (id.clone(), service)),
+        None => state.llm_registry.get_cheap_model_with_id(),
     }
     .ok_or_else(|| AppError::Internal("no LLM model available".to_string()))?;
+    let effective_effort = state.llm_registry.effective_effort(&model_id, None);
 
-    let commands = crate::suggest::suggest_commands(query, llm)
+    let commands = crate::suggest::suggest_commands(query, llm, effective_effort)
         .await
         .map_err(AppError::Internal)?;
 

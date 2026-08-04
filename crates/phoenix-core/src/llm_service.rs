@@ -31,6 +31,19 @@ pub trait LlmSelector: Send + Sync {
     fn get(&self, model_id: &str) -> Option<Arc<dyn CompletionService>>;
     /// Default/fallback service, if any model is configured.
     fn default_service(&self) -> Option<Arc<dyn CompletionService>>;
+    fn default_service_with_effort(
+        &self,
+    ) -> Option<(
+        Arc<dyn CompletionService>,
+        crate::domain::llm_types::EffectiveEffort,
+    )> {
+        self.default_service().map(|service| {
+            (
+                service,
+                crate::domain::llm_types::EffectiveEffort::native_unknown(),
+            )
+        })
+    }
     /// A fast, cheap model for auxiliary work (result filtering, titles). The
     /// concrete preference list spans the supported providers and is owned by
     /// the implementor so there is one source of truth; the default here just
@@ -38,5 +51,19 @@ pub trait LlmSelector: Send + Sync {
     /// distinction.
     fn get_cheap_model(&self) -> Option<Arc<dyn CompletionService>> {
         self.default_service()
+    }
+
+    fn get_cheap_model_with_effort(
+        &self,
+    ) -> Option<(
+        Arc<dyn CompletionService>,
+        crate::domain::llm_types::EffectiveEffort,
+    )> {
+        self.get_cheap_model().map(|service| {
+            (
+                service,
+                crate::domain::llm_types::EffectiveEffort::native_unknown(),
+            )
+        })
     }
 }

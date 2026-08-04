@@ -37,9 +37,9 @@ pub(crate) fn resolve_creation_model(
 
     let registry_default = registry.default_model_id();
     if requested_mode == "managed" || (requested_mode == "auto" && repo_present) {
-        registry.cheap_model_id_for_provider(registry_default)
+        registry.cheap_model_id_for_provider(&registry_default)
     } else {
-        registry_default.to_string()
+        registry_default.clone()
     }
 }
 
@@ -341,14 +341,12 @@ async fn provision_conversation(
     let repo_root = phoenix_core::git::detect_git_repo_root(Path::new(&initial_cwd));
     let requested_mode = intent.mode.as_deref().unwrap_or("direct");
 
-
     let mut resolved_model = resolve_creation_model(
         &manager.llm_registry,
         intent.model.as_deref(),
         requested_mode,
         repo_root.is_some(),
     );
-
 
     let mut conv_mode = ConvMode::Direct;
     let mut effective_cwd = initial_cwd.clone();
@@ -573,7 +571,6 @@ async fn provision_conversation(
                 requested_mode,
                 true,
             );
-
         }
         other => {
             return Err((
@@ -619,8 +616,14 @@ async fn provision_conversation(
         );
     }
     let generated_title = if seed_title.is_none() && !title_source.is_empty() {
-        if let Some(cheap_model) = manager.model_registry().get_cheap_model() {
-            crate::title_generator::generate_title(&title_source, cheap_model).await
+        if let Some((cheap_model_id, cheap_model)) =
+            manager.model_registry().get_cheap_model_with_id()
+        {
+            let effective_effort = manager
+                .model_registry()
+                .effective_effort(&cheap_model_id, None);
+            crate::title_generator::generate_title(&title_source, cheap_model, effective_effort)
+                .await
         } else {
             None
         }
@@ -1544,7 +1547,7 @@ mod model_resolution_tests {
         let registry = registry();
         assert_eq!(
             resolve_creation_model(&registry, None, "managed", true),
-            registry.cheap_model_id_for_provider(registry.default_model_id())
+            registry.cheap_model_id_for_provider(&registry.default_model_id())
         );
     }
 
