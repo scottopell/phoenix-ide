@@ -171,7 +171,9 @@ impl SupervisorHandle {
         cancel: CancellationToken,
     ) -> Result<CallOutcome, String> {
         let (reply, receive) = oneshot::channel();
-        let deadline = tokio::time::Instant::now() + self.snapshot().config.tool_call_timeout();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.snapshot().config.tool_call_timeout())
+            .ok_or_else(|| "MCP tool call timeout exceeds platform deadline range".to_string())?;
         let call_cancel = cancel.child_token();
         let command = Command::Call {
             tool,
