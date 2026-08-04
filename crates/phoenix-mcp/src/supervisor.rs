@@ -2,6 +2,7 @@ use crate::{
     CallContext, McpRequestError, McpServer, McpServerConfig, McpToolDef, OAuthRecoveryKind,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -108,6 +109,7 @@ impl SupervisorHandle {
                 next_call_id: 1,
                 stdio_active: false,
                 stdio_queue: VecDeque::new(),
+                active_calls: HashMap::new(),
             }
             .run(),
         );
@@ -337,6 +339,7 @@ enum Command {
         reply: oneshot::Sender<Result<CallOutcome, String>>,
     },
     CallCompleted {
+        call_id: u64,
         epoch: u64,
         context: CallContext,
         result: Result<String, McpRequestError>,
@@ -393,6 +396,7 @@ struct Actor {
     next_call_id: u64,
     stdio_active: bool,
     stdio_queue: VecDeque<QueuedCall>,
+    active_calls: HashMap<u64, CancellationToken>,
 }
 
 impl Actor {
@@ -434,6 +438,9 @@ impl Actor {
                 };
                 let context = server.call_context();
                 let epoch = self.epoch;
+                let call_id = self.next_call_id;
+                self.next_call_id = self.next_call_id.wrapping_add(1);
+                self.active_calls.insert(call_id, cancel.clone());
                 if context.is_http() {
                     let Some(mailbox) = self.mailbox.upgrade() else {
                         let _ = reply.send(Err(stopped()));
@@ -443,6 +450,7 @@ impl Actor {
                         let result = context.call_tool(&tool, arguments, &cancel).await;
                         if let Err(error) = mailbox
                             .send(Command::CallCompleted {
+                                call_id,
                                 epoch,
                                 context,
                                 result,
@@ -481,12 +489,14 @@ impl Actor {
                 }
             }
             Command::CallCompleted {
+                call_id,
                 epoch,
                 context,
                 result,
                 reply,
             } => {
                 // Epochs fence lifecycle mutation, not delivery of a correlated
+                self.active_calls.remove(&call_id);
                 // call result: a successful remote side effect must still reach
                 // its original waiter even if a sibling triggered recovery.
                 let is_stdio = !context.is_http();
@@ -646,6 +656,10 @@ impl Actor {
                 let _ = reply.send(current);
             }
             Command::Remove { reply } | Command::Shutdown { reply } => {
+                for cancellation in self.active_calls.values() {
+                    cancellation.cancel();
+                }
+                self.active_calls.clear();
                 self.epoch = self.epoch.wrapping_add(1);
                 self.stop_server().await;
                 self.recovery_from = None;
@@ -684,6 +698,7 @@ impl Actor {
                 if let Err(error) = mailbox
                     .send(Command::CallCompleted {
                         epoch: call.epoch,
+                        call_id: call.call_id,
                         context: call.context,
                         result,
                         reply: call.reply,
