@@ -1241,7 +1241,7 @@ mod tests {
         request.max_tokens = Some(16_384);
         let explicit = serde_json::to_value(translate_request(&spec, &request)).unwrap();
         assert_eq!(explicit["output_config"]["effort"], "xhigh");
-        assert_eq!(explicit["max_tokens"], 64_000);
+        assert_eq!(explicit["max_tokens"], 16_384);
     }
 
     #[tokio::test]

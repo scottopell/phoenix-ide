@@ -259,6 +259,8 @@ impl ChainQa {
             .llm_registry
             .get_mid_tier_model()
             .ok_or(ChainQaError::NoModelAvailable)?;
+        let effective_effort = self.llm_registry.effective_effort(&model_id, None);
+        let max_output_tokens = self.llm_registry.output_token_limit(&model_id);
 
         // The chain root pins the language for all members (continuations
         // inherit it at creation time).
@@ -288,6 +290,8 @@ impl ChainQa {
             service,
             model_id,
             language,
+            effective_effort,
+            max_output_tokens,
         })
     }
 
@@ -362,7 +366,14 @@ impl ChainQa {
 
             // Planning turn: offer tools, non-streamed so its (possibly
             // narrated) text never reaches the user.
-            let request = build_agent_request(&messages, prep.language, false, index_fresh);
+            let request = build_agent_request(
+                &messages,
+                prep.language,
+                false,
+                index_fresh,
+                prep.effective_effort,
+                prep.max_output_tokens,
+            );
             let resp = prep
                 .service
                 .complete(&request)
@@ -470,7 +481,14 @@ impl ChainQa {
     ) -> Result<String, RunInvocationError> {
         // Final turn forces an answer with an empty tool set; search gating is
         // irrelevant here.
-        let request = build_agent_request(messages, prep.language, true, false);
+        let request = build_agent_request(
+            messages,
+            prep.language,
+            true,
+            false,
+            prep.effective_effort,
+            prep.max_output_tokens,
+        );
         let (chunk_tx, mut chunk_rx) = mpsc::channel::<TokenChunk>(256);
         let qa_id = prep.row_id.clone();
         let runtime_handle = Arc::clone(runtime);
@@ -711,6 +729,8 @@ struct PreparedInvocation {
     service: Arc<dyn LlmService>,
     #[allow(dead_code)] // Persisted into chain_qa.model via insert_chain_qa.
     model_id: String,
+    effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+    max_output_tokens: Option<u32>,
     /// Language inherited from the chain's root conversation.
     language: crate::llm_language::LlmLanguage,
 }
@@ -743,6 +763,8 @@ fn build_agent_request(
     language: crate::llm_language::LlmLanguage,
     force_answer: bool,
     search_enabled: bool,
+    effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
+    max_output_tokens: Option<u32>,
 ) -> LlmRequest {
     let tools = if force_answer {
         vec![]
@@ -755,8 +777,10 @@ fn build_agent_request(
         )],
         messages: messages.to_vec(),
         tools,
-        max_tokens: Some(ANSWER_MAX_TOKENS),
-        effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+        max_tokens: Some(
+            max_output_tokens.map_or(ANSWER_MAX_TOKENS, |limit| limit.min(ANSWER_MAX_TOKENS)),
+        ),
+        effective_effort,
         telemetry: None,
         // One cache key per language so phoenix-native and caveman prompts
         // don't collide on a shared cache slot.

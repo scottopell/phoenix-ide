@@ -82,6 +82,8 @@ import type { BashHandleInspection as BashHandleInspectionType } from './generat
 export type { ModelEffort } from './generated/ModelEffort';
 import type { ModelEffort } from './generated/ModelEffort';
 import type { EffortSource } from './generated/EffortSource';
+import type { UsageData } from './generated/UsageData';
+export type { UsageData } from './generated/UsageData';
 
 export type NativeDefaultCapability =
   | { known: ModelEffort }
@@ -609,7 +611,7 @@ export interface Message {
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)
-  usage_data?: UsageData;
+  usage_data?: UsageData | null;
   created_at: string;
 }
 
@@ -707,13 +709,6 @@ export interface FileAttachment {
 export const MAX_FILE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 export const MAX_TOTAL_FILE_ATTACHMENT_SIZE = 25 * 1024 * 1024;
 export const MAX_FILE_ATTACHMENTS = 10;
-
-export interface UsageData {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-}
 
 export interface ModelInfo {
   id: string;

@@ -2453,6 +2453,10 @@ impl RuntimeManager {
             root_conversation_id,
         );
         conv_context.max_turns = spec.max_turns;
+        conv_context.effort = conv.effort;
+        conv_context.effective_effort = self
+            .llm_registry
+            .effective_effort(&spec.model_id, conv.effort);
         conv_context.resource_scope = crate::work_scope::ResourceScopeKey::Work(
             conv.work_scope_id
                 .clone()

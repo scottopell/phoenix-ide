@@ -5592,15 +5592,19 @@ async fn regenerate_conversation_name(
             })?;
     let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
 
-    let generated = crate::title_generator::generate_title(&opening, cheap_model, effective_effort)
-        .await
-        .filter(|slug| !slug.is_empty())
-        .ok_or_else(|| {
-            AppError::Internal(
-                "conversation name regeneration failed — the existing name is unchanged"
-                    .to_string(),
-            )
-        })?;
+    let generated = crate::title_generator::generate_title(
+        &opening,
+        cheap_model,
+        effective_effort,
+        state.llm_registry.output_token_limit(&cheap_model_id),
+    )
+    .await
+    .filter(|slug| !slug.is_empty())
+    .ok_or_else(|| {
+        AppError::Internal(
+            "conversation name regeneration failed — the existing name is unchanged".to_string(),
+        )
+    })?;
 
     rename_conversation_slug(&state, &id, &generated).await?;
     conversation_response(&state, &id).await
@@ -5688,9 +5692,14 @@ async fn suggest_handler(
     .ok_or_else(|| AppError::Internal("no LLM model available".to_string()))?;
     let effective_effort = state.llm_registry.effective_effort(&model_id, None);
 
-    let commands = crate::suggest::suggest_commands(query, llm, effective_effort)
-        .await
-        .map_err(AppError::Internal)?;
+    let commands = crate::suggest::suggest_commands(
+        query,
+        llm,
+        effective_effort,
+        state.llm_registry.output_token_limit(&model_id),
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     Ok(Json(SuggestResponse { commands }))
 }

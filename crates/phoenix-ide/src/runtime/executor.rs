@@ -870,7 +870,7 @@ where
                     &conv_id,
                     &root_conv_id,
                     &llm_usage.model,
-                    phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+                    llm_usage.effective_effort,
                     &llm_usage.usage,
                     None,
                 )

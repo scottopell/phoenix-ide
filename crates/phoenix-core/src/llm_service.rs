@@ -24,6 +24,14 @@ pub trait CompletionService: Send + Sync {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, String>;
 }
 
+#[derive(Clone)]
+pub struct CompletionSelection {
+    pub model_id: String,
+    pub service: Arc<dyn CompletionService>,
+    pub effective_effort: crate::domain::llm_types::EffectiveEffort,
+    pub max_output_tokens: Option<u32>,
+}
+
 /// Selects a completion service by model id. Implemented by the concrete
 /// `ModelRegistry` in the `llm` module.
 pub trait LlmSelector: Send + Sync {
@@ -31,17 +39,12 @@ pub trait LlmSelector: Send + Sync {
     fn get(&self, model_id: &str) -> Option<Arc<dyn CompletionService>>;
     /// Default/fallback service, if any model is configured.
     fn default_service(&self) -> Option<Arc<dyn CompletionService>>;
-    fn default_service_with_effort(
-        &self,
-    ) -> Option<(
-        Arc<dyn CompletionService>,
-        crate::domain::llm_types::EffectiveEffort,
-    )> {
-        self.default_service().map(|service| {
-            (
-                service,
-                crate::domain::llm_types::EffectiveEffort::native_unknown(),
-            )
+    fn default_selection(&self) -> Option<CompletionSelection> {
+        self.default_service().map(|service| CompletionSelection {
+            model_id: "unknown".to_string(),
+            service,
+            effective_effort: crate::domain::llm_types::EffectiveEffort::native_unknown(),
+            max_output_tokens: None,
         })
     }
     /// A fast, cheap model for auxiliary work (result filtering, titles). The
@@ -53,17 +56,12 @@ pub trait LlmSelector: Send + Sync {
         self.default_service()
     }
 
-    fn get_cheap_model_with_effort(
-        &self,
-    ) -> Option<(
-        Arc<dyn CompletionService>,
-        crate::domain::llm_types::EffectiveEffort,
-    )> {
-        self.get_cheap_model().map(|service| {
-            (
-                service,
-                crate::domain::llm_types::EffectiveEffort::native_unknown(),
-            )
+    fn get_cheap_selection(&self) -> Option<CompletionSelection> {
+        self.get_cheap_model().map(|service| CompletionSelection {
+            model_id: "unknown".to_string(),
+            service,
+            effective_effort: crate::domain::llm_types::EffectiveEffort::native_unknown(),
+            max_output_tokens: None,
         })
     }
 }

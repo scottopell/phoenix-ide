@@ -622,8 +622,13 @@ async fn provision_conversation(
             let effective_effort = manager
                 .model_registry()
                 .effective_effort(&cheap_model_id, None);
-            crate::title_generator::generate_title(&title_source, cheap_model, effective_effort)
-                .await
+            crate::title_generator::generate_title(
+                &title_source,
+                cheap_model,
+                effective_effort,
+                manager.model_registry().output_token_limit(&cheap_model_id),
+            )
+            .await
         } else {
             None
         }

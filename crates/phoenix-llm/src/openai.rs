@@ -3126,7 +3126,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(explicit["reasoning"]["effort"], "max");
-        assert_eq!(explicit["max_output_tokens"], 64_000);
+        assert_eq!(explicit["max_output_tokens"], 16_384);
     }
 
     #[test]

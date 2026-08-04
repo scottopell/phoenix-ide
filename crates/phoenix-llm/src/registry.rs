@@ -1296,19 +1296,16 @@ impl phoenix_core::llm_service::LlmSelector for ModelRegistry {
         })
     }
 
-    fn default_service_with_effort(
-        &self,
-    ) -> Option<(
-        Arc<dyn phoenix_core::llm_service::CompletionService>,
-        phoenix_core::domain::llm_types::EffectiveEffort,
-    )> {
+    fn default_selection(&self) -> Option<phoenix_core::llm_service::CompletionSelection> {
         let model_id = self.default_model_id();
         ModelRegistry::get(self, &model_id).map(|service| {
-            (
-                Arc::new(AsCompletion(service))
+            phoenix_core::llm_service::CompletionSelection {
+                model_id: model_id.clone(),
+                service: Arc::new(AsCompletion(service))
                     as Arc<dyn phoenix_core::llm_service::CompletionService>,
-                self.effective_effort(&model_id, None),
-            )
+                effective_effort: self.effective_effort(&model_id, None),
+                max_output_tokens: self.output_token_limit(&model_id),
+            }
         })
     }
 
@@ -1318,18 +1315,15 @@ impl phoenix_core::llm_service::LlmSelector for ModelRegistry {
         })
     }
 
-    fn get_cheap_model_with_effort(
-        &self,
-    ) -> Option<(
-        Arc<dyn phoenix_core::llm_service::CompletionService>,
-        phoenix_core::domain::llm_types::EffectiveEffort,
-    )> {
+    fn get_cheap_selection(&self) -> Option<phoenix_core::llm_service::CompletionSelection> {
         self.get_cheap_model_with_id().map(|(model_id, service)| {
-            (
-                Arc::new(AsCompletion(service))
+            phoenix_core::llm_service::CompletionSelection {
+                model_id: model_id.clone(),
+                service: Arc::new(AsCompletion(service))
                     as Arc<dyn phoenix_core::llm_service::CompletionService>,
-                self.effective_effort(&model_id, None),
-            )
+                effective_effort: self.effective_effort(&model_id, None),
+                max_output_tokens: self.output_token_limit(&model_id),
+            }
         })
     }
 }

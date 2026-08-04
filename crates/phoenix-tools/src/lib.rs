@@ -199,6 +199,7 @@ pub struct ToolImage {
 #[derive(Debug, Clone)]
 pub struct ToolLlmUsage {
     pub model: String,
+    pub effective_effort: phoenix_core::domain::llm_types::EffectiveEffort,
     pub usage: phoenix_core::domain::llm_types::Usage,
 }
 

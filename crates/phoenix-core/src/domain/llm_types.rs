@@ -490,18 +490,8 @@ impl LlmRequest {
     }
 
     #[must_use]
-    pub fn raised_output_token_ceiling(&self) -> Option<u32> {
-        self.max_tokens.map(|current| {
-            if self
-                .effective_effort
-                .level()
-                .is_some_and(ModelEffort::needs_extended_output_headroom)
-            {
-                current.max(64_000)
-            } else {
-                current
-            }
-        })
+    pub const fn raised_output_token_ceiling(&self) -> Option<u32> {
+        self.max_tokens
     }
 }
 
@@ -874,6 +864,21 @@ mod attempt_capture_tests {
         assert_eq!(usage.reasoning_tokens, None);
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn explicit_utility_cap_is_not_raised_by_effective_effort() {
+        let request = LlmRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: Some(50),
+            effective_effort: EffectiveEffort::native_known(ModelEffort::Max),
+            telemetry: None,
+            cache_key: PromptCacheKey::ephemeral(),
+        };
+        assert_eq!(request.raised_output_token_ceiling(), Some(50));
+        assert_eq!(request.reserved_output_tokens(), 50);
     }
 
     #[test]

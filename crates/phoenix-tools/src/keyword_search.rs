@@ -17,7 +17,6 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -419,11 +418,8 @@ impl KeywordSearchTool {
     /// has no model list of its own to drift from the registry's.
     fn select_filter_llm(
         ctx: &ToolContext,
-    ) -> Option<(
-        Arc<dyn phoenix_core::llm_service::CompletionService>,
-        phoenix_core::domain::llm_types::EffectiveEffort,
-    )> {
-        ctx.llm_selector().get_cheap_model_with_effort()
+    ) -> Option<phoenix_core::llm_service::CompletionSelection> {
+        ctx.llm_selector().get_cheap_selection()
     }
 
     /// Filter results using LLM
@@ -434,8 +430,7 @@ impl KeywordSearchTool {
         search_root: &Path,
         results: &str,
     ) -> Result<String, String> {
-        let (llm, effective_effort) =
-            Self::select_filter_llm(ctx).ok_or("No LLM available for filtering")?;
+        let selection = Self::select_filter_llm(ctx).ok_or("No LLM available for filtering")?;
 
         let user_content = format!(
             "Search root: {}\n\nRipgrep results:\n{}\n\nOriginal query: {}",
@@ -452,8 +447,12 @@ impl KeywordSearchTool {
                 content: vec![ContentBlock::text(user_content)],
             }],
             tools: vec![],
-            max_tokens: Some(4096),
-            effective_effort,
+            max_tokens: Some(
+                selection
+                    .max_output_tokens
+                    .map_or(4096, |limit| limit.min(4096)),
+            ),
+            effective_effort: selection.effective_effort,
             telemetry: Some(phoenix_core::domain::llm_types::LlmRequestTelemetry {
                 conversation_id: ctx.conversation_id.clone(),
                 root_conversation_id: ctx.root_conversation_id.clone(),
@@ -465,7 +464,7 @@ impl KeywordSearchTool {
             cache_key: PromptCacheKey::stable("keyword-search-filter"),
         };
 
-        let response = llm.complete(&request).await;
+        let response = selection.service.complete(&request).await;
         ctx.record_llm_attempt(&attempt_capture);
         let response = response.map_err(|e| format!("LLM filtering failed: {e}"))?;
 
@@ -608,6 +607,7 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
 mod tests {
     use super::*;
     use crate::browser::BrowserSessionManager;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn test_context(working_dir: PathBuf) -> ToolContext {

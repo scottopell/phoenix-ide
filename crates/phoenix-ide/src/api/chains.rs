@@ -300,9 +300,13 @@ pub async fn regenerate_chain_name(
             })?;
     let effective_effort = state.llm_registry.effective_effort(&cheap_model_id, None);
 
-    let Some(generated) =
-        crate::title_generator::generate_chain_name(&first_messages, cheap_model, effective_effort)
-            .await
+    let Some(generated) = crate::title_generator::generate_chain_name(
+        &first_messages,
+        cheap_model,
+        effective_effort,
+        state.llm_registry.output_token_limit(&cheap_model_id),
+    )
+    .await
     else {
         // LLM failure/timeout — existing name stays as-is (REQ-CHN-010).
         return Err(AppError::Internal(
