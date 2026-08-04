@@ -418,6 +418,10 @@ impl Actor {
                 let _ = reply.send(self.snapshot.clone());
             }
             Command::Reconfigure { config, reply } => {
+                for cancellation in self.active_calls.values() {
+                    cancellation.cancel();
+                }
+                self.active_calls.clear();
                 self.epoch = self.epoch.wrapping_add(1);
                 self.stop_server().await;
                 self.recovery_from = None;
