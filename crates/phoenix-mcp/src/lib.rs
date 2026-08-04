@@ -1853,6 +1853,19 @@ impl McpClientManager {
 
         self.pending_oauth_urls.write().await.remove(&name);
         // The flow is resolved; stop its loopback listener (if any) so it does
+        let owner = if let Some((handle, epoch)) = resolved.owner.as_ref() {
+            if handle.snapshot().epoch == *epoch {
+                handle
+                    .reconfigure(resolved.config.clone())
+                    .await
+                    .ok()
+                    .map(|new_epoch| (handle.clone(), new_epoch))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // not hold the port for the rest of its window. On exchange *failure*
         // the flow stays pending and this is not reached, so the listener keeps
         // accepting for a retry (REQ-MCP-020).
@@ -1860,7 +1873,7 @@ impl McpClientManager {
             handle.abort();
         }
         let config = resolved.config;
-        let owner = resolved.owner;
+        let owner = owner.or(resolved.owner);
 
         let manager = Arc::clone(self);
         let reconnect_name = name.clone();
@@ -2188,9 +2201,9 @@ impl McpClientManager {
                 .await;
             let handles: Vec<SupervisorHandle> =
                 manager.servers.read().await.values().cloned().collect();
-            for handle in handles {
-                let _ = tokio::time::timeout(CONNECT_TIMEOUT, handle.wait_for_settled()).await;
-            }
+            let settles =
+                futures::future::join_all(handles.iter().map(SupervisorHandle::wait_for_settled));
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, settles).await;
         })
     }
 

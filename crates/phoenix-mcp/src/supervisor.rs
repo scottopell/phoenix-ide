@@ -129,10 +129,13 @@ impl SupervisorHandle {
     pub(crate) async fn wait_for_settled(&self) {
         let mut snapshots = self.subscribe();
         loop {
-            if !matches!(
-                snapshots.borrow().state,
-                SupervisorState::Connecting | SupervisorState::Recovering
-            ) {
+            let snapshot = snapshots.borrow().clone();
+            if snapshot.pending_oauth_url.is_some()
+                || !matches!(
+                    snapshot.state,
+                    SupervisorState::Connecting | SupervisorState::Recovering
+                )
+            {
                 return;
             }
             if snapshots.changed().await.is_err() {
