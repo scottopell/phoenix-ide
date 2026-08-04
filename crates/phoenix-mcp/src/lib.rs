@@ -2451,7 +2451,19 @@ impl McpClientManager {
                 }
                 Err(McpToolCallError::Cancelled)
             }
-            Err(error) => Err(McpToolCallError::Failed(error.into_message(server_name))),
+            Err(error) => {
+                if matches!(retry_recovery, CallRecovery::Transport) {
+                    let manager = Arc::clone(self);
+                    let name = server_name.to_string();
+                    let recovery_handle = retry_handle.clone();
+                    self.spawn_background(async move {
+                        let _ = manager
+                            .recover_actor(&name, &recovery_handle, retry.epoch, None)
+                            .await;
+                    });
+                }
+                Err(McpToolCallError::Failed(error.into_message(server_name)))
+            }
         }
     }
 
@@ -2750,6 +2762,7 @@ impl McpClientManager {
             .filter(|name| !desired.contains_key(*name))
             .cloned()
             .collect();
+        let mut failed = Vec::new();
         let mut removed = Vec::new();
         for name in removed_names {
             if let Some(handle) = self.servers.write().await.remove(&name) {
@@ -2763,6 +2776,11 @@ impl McpClientManager {
                     Err(error) => {
                         self.servers.write().await.insert(name.clone(), handle);
                         tracing::warn!(server = %name, error = %error, "MCP token deletion failed; server removal aborted");
+                        failed.push(McpReloadFailure {
+                            server: name,
+                            action: "remove".to_string(),
+                            error: error.clone(),
+                        });
                     }
                 }
             }
@@ -2771,7 +2789,6 @@ impl McpClientManager {
         let mut added = Vec::new();
         let mut restarted = Vec::new();
         let mut unchanged = Vec::new();
-        let mut failed = Vec::new();
         for (name, config) in desired {
             let existing = self.servers.read().await.get(&name).cloned();
             if existing.is_none()
