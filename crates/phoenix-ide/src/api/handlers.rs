@@ -8154,6 +8154,7 @@ pub(crate) mod hard_delete_cascade_tests {
             })
         }
 
+        #[allow(clippy::unnecessary_literal_bound)]
         fn model_id(&self) -> &str {
             "claude-sonnet-5"
         }
