@@ -493,10 +493,7 @@ impl Actor {
                 result,
                 reply,
             } => {
-                // Epochs fence lifecycle mutation, not delivery of a correlated
                 self.active_calls.remove(&call_id);
-                // call result: a successful remote side effect must still reach
-                // its original waiter even if a sibling triggered recovery.
                 let is_stdio = !context.is_http();
                 let _ = reply.send(Ok(context.outcome(epoch, result)));
                 if is_stdio {
@@ -515,6 +512,7 @@ impl Actor {
                         .remove(position)
                         .expect("queued call exists");
                     queued.cancellation_watch.abort();
+                    self.active_calls.remove(&call_id);
                     let _ = queued.reply.send(Ok(CallOutcome {
                         result: Err(McpRequestError::Cancelled),
                         epoch: queued.epoch,
@@ -674,6 +672,7 @@ impl Actor {
         }
         while let Some(call) = self.stdio_queue.pop_front() {
             if call.cancel.is_cancelled() {
+                self.active_calls.remove(&call.call_id);
                 let _ = call.reply.send(Ok(CallOutcome {
                     result: Err(McpRequestError::Cancelled),
                     epoch: call.epoch,
