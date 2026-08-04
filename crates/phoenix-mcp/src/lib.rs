@@ -2156,11 +2156,13 @@ impl McpClientManager {
                 }
                 Err(error) => {
                     if let Some(url) = pending.read().await.get(&name).cloned() {
-                        handle.unauthorized(epoch, url, error).await;
-                        let mut flows = oauth.pending.lock().unwrap();
-                        if let Some(flow) = flows.get_mut(&name) {
-                            flow.owner = Some((handle.clone(), epoch));
+                        {
+                            let mut flows = oauth.pending.lock().unwrap();
+                            if let Some(flow) = flows.get_mut(&name) {
+                                flow.owner = Some((handle.clone(), epoch));
+                            }
                         }
+                        handle.unauthorized(epoch, url, error).await;
                     } else {
                         handle.fail(epoch, error).await;
                     }
