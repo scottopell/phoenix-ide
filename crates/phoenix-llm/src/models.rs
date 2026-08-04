@@ -408,7 +408,7 @@ fn external_model_spec_from_config(
     }
     if let Some(max_output_tokens) = spec.max_output_tokens {
         if max_output_tokens == 0
-            || usize::try_from(max_output_tokens).unwrap_or(usize::MAX) > spec.context_window
+            || usize::try_from(max_output_tokens).unwrap_or(usize::MAX) >= spec.context_window
         {
             return Err(format!(
                 "model '{id}' has invalid max_output_tokens {max_output_tokens} for context_window {}",
@@ -427,6 +427,19 @@ fn external_model_spec_from_config(
     {
         return Err(format!(
             "model '{id}' declares xhigh/max effort but max_output_tokens is below 64000"
+        ));
+    }
+    if spec
+        .effort_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| {
+            matches!(capabilities, ExternalEffortCapabilities::Supported { levels, .. }
+            if levels.iter().any(|level| level.needs_extended_output_headroom()))
+        })
+        && spec.context_window <= 64_000 + 4_096
+    {
+        return Err(format!(
+            "model '{id}' declares xhigh/max effort but context_window must exceed 68096"
         ));
     }
     let effort_capabilities = validate_external_effort_capabilities(&spec)?;

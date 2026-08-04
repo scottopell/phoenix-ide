@@ -311,11 +311,37 @@ const MIGRATIONS: &[Migration] = &[
 const MIGRATION_058: &str = r"
 ALTER TABLE conversations ADD COLUMN effort TEXT
 CHECK (effort IS NULL OR effort IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
-ALTER TABLE turn_usage ADD COLUMN reasoning_tokens INTEGER;
-ALTER TABLE turn_usage ADD COLUMN effort_source TEXT NOT NULL DEFAULT 'native_unknown'
-CHECK (effort_source IN ('native_known', 'native_unknown', 'explicit', 'unsupported'));
-ALTER TABLE turn_usage ADD COLUMN effort_level TEXT
-CHECK (effort_level IS NULL OR effort_level IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
+ALTER TABLE turn_usage RENAME TO turn_usage_legacy_effort;
+CREATE TABLE turn_usage (
+    id INTEGER PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    root_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    first_byte_at TEXT,
+    reasoning_tokens INTEGER,
+    effort_source TEXT NOT NULL
+        CHECK (effort_source IN ('native_known', 'native_unknown', 'explicit', 'unsupported')),
+    effort_level TEXT
+        CHECK (effort_level IS NULL OR effort_level IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'))
+);
+INSERT INTO turn_usage (
+    id, conversation_id, root_conversation_id, model,
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+    created_at, first_byte_at, reasoning_tokens, effort_source, effort_level
+)
+SELECT
+    id, conversation_id, root_conversation_id, model,
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+    created_at, first_byte_at, NULL, 'native_unknown', NULL
+FROM turn_usage_legacy_effort;
+DROP TABLE turn_usage_legacy_effort;
+CREATE INDEX idx_turn_usage_conversation ON turn_usage(conversation_id);
+CREATE INDEX idx_turn_usage_root ON turn_usage(root_conversation_id);
 CREATE TRIGGER turn_usage_effort_shape_insert
 BEFORE INSERT ON turn_usage
 WHEN ((NEW.effort_source IN ('explicit', 'native_known')) != (NEW.effort_level IS NOT NULL))
@@ -2995,14 +3021,27 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn migration_058_adds_typed_effort_and_usage_columns() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE conversations (id TEXT PRIMARY KEY, model TEXT);\
              INSERT INTO conversations (id, model) VALUES ('legacy', 'gpt-5.3-codex');\
-             CREATE TABLE turn_usage (id INTEGER PRIMARY KEY, model TEXT);\
-             INSERT INTO turn_usage (id, model) VALUES (9, 'gpt-5.3-codex');\
+             CREATE TABLE turn_usage (\
+                 id INTEGER PRIMARY KEY,\
+                 conversation_id TEXT NOT NULL,\
+                 root_conversation_id TEXT NOT NULL,\
+                 model TEXT NOT NULL,\
+                 input_tokens INTEGER NOT NULL DEFAULT 0,\
+                 output_tokens INTEGER NOT NULL DEFAULT 0,\
+                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,\
+                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,\
+                 created_at TEXT NOT NULL,\
+                 first_byte_at TEXT\
+             );\
+             INSERT INTO turn_usage (id, conversation_id, root_conversation_id, model, created_at)\
+             VALUES (9, 'legacy', 'legacy', 'gpt-5.3-codex', '2026-01-01T00:00:00Z');\
              CREATE TABLE conversation_creation_jobs (id TEXT PRIMARY KEY, intent_json TEXT NOT NULL);\
              INSERT INTO conversation_creation_jobs (id, intent_json) VALUES ('job', '{\"model\":\"gpt-5.3-codex\"}');",
         )
@@ -3032,12 +3071,14 @@ mod tests {
             assert!(usage_columns.iter().any(|column| column == expected));
         }
 
-        sqlx::query("INSERT INTO turn_usage (id, model) VALUES (1, 'gpt-5.4')")
-            .execute(&pool)
-            .await
-            .unwrap();
+        assert!(sqlx::query(
+            "INSERT INTO turn_usage (id, conversation_id, root_conversation_id, model, created_at) VALUES (1, 'legacy', 'legacy', 'gpt-5.4', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
         let row = sqlx::query(
-            "SELECT reasoning_tokens, effort_source, effort_level FROM turn_usage WHERE id = 1",
+            "SELECT reasoning_tokens, effort_source, effort_level FROM turn_usage WHERE id = 9",
         )
         .fetch_one(&pool)
         .await
@@ -3046,13 +3087,13 @@ mod tests {
         assert_eq!(row.get::<String, _>("effort_source"), "native_unknown");
         assert_eq!(row.get::<Option<String>, _>("effort_level"), None);
         assert!(sqlx::query(
-            "INSERT INTO turn_usage (id, model, effort_source, effort_level) VALUES (2, 'gpt-5.4', 'explicit', NULL)",
+            "INSERT INTO turn_usage (id, conversation_id, root_conversation_id, model, created_at, effort_source, effort_level) VALUES (2, 'legacy', 'legacy', 'gpt-5.4', '2026-01-01T00:00:00Z', 'explicit', NULL)",
         )
         .execute(&pool)
         .await
         .is_err());
         assert!(sqlx::query(
-            "INSERT INTO turn_usage (id, model, effort_source, effort_level) VALUES (3, 'gpt-5.4', 'unsupported', 'high')",
+            "INSERT INTO turn_usage (id, conversation_id, root_conversation_id, model, created_at, effort_source, effort_level) VALUES (3, 'legacy', 'legacy', 'gpt-5.4', '2026-01-01T00:00:00Z', 'unsupported', 'high')",
         )
         .execute(&pool)
         .await
@@ -3086,7 +3127,7 @@ mod tests {
             .await
             .is_err());
         assert!(
-            sqlx::query("UPDATE turn_usage SET effort_source = 'nonsense' WHERE id = 1")
+            sqlx::query("UPDATE turn_usage SET effort_source = 'nonsense' WHERE id = 9")
                 .execute(&pool)
                 .await
                 .is_err()
