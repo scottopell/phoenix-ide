@@ -2776,6 +2776,7 @@ impl McpClientManager {
                 Some(handle) => {
                     let old = handle.snapshot().config;
                     self.cancel_pending_oauth_flow(&name).await;
+                    self.pending_oauth_urls.write().await.remove(&name);
                     self.invalidate_oauth_on_config_change(&name, &old, &config)
                         .await;
                     (handle, true)

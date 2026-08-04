@@ -172,7 +172,7 @@ impl SupervisorHandle {
             result = receive => result.unwrap_or_else(|_| Err(stopped())),
             () = tokio::time::sleep_until(deadline) => {
                 call_cancel.cancel();
-                Err("MCP tool call cancelled".to_string())
+                Err("MCP tool call timed out".to_string())
             }
         }
     }
