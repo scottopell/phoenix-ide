@@ -156,6 +156,8 @@ function publicStateForScope(
   return { status: 'loading', prStatus: null };
 }
 
+const ROUTINE_REFRESH_FRESHNESS_MS = 10_000;
+
 export function useConversationPrStatus({
   conversationId,
   convModeLabel,
@@ -169,6 +171,12 @@ export function useConversationPrStatus({
 }): ConversationPrStatusHandle {
   const latestSeqRef = useRef(0);
   const activeScopeRef = useRef<string | null>(null);
+  const inFlightRef = useRef<{
+    scopeKey: string;
+    seq: number;
+    promise: Promise<PrStatusResponse | undefined>;
+  } | null>(null);
+  const lastCompletedRef = useRef<{ scopeKey: string; at: number } | null>(null);
   const scopeKey = conversationId && branchName && (convModeLabel === 'Work' || convModeLabel === 'Branch')
     ? `${conversationId}\0${branchName}\0${convModeLabel}`
     : null;
@@ -185,48 +193,77 @@ export function useConversationPrStatus({
       : { scopeKey: null, status: 'disabled', prStatus: null }
   ));
 
-  const refresh = useCallback(async () => {
-    if (!scopeKey || !conversationId) return undefined;
-    if (activeScopeRef.current !== scopeKey) return undefined;
+  const refresh = useCallback((): Promise<PrStatusResponse | undefined> => {
+    if (!scopeKey || !conversationId || activeScopeRef.current !== scopeKey) {
+      return Promise.resolve(undefined);
+    }
+    if (inFlightRef.current?.scopeKey === scopeKey
+      && inFlightRef.current.seq === latestSeqRef.current) {
+      return inFlightRef.current.promise;
+    }
+
     const seq = ++latestSeqRef.current;
-    try {
-      const prStatus = await api.getPrStatus(conversationId);
-      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
-      setInternalState({ scopeKey, status: 'ready', prStatus });
-      return prStatus;
-    } catch {
-      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
-      const fallback = cachedSeedRef.current;
-      if (fallback) {
+    const promise = (async () => {
+      try {
+        const prStatus = await api.getPrStatus(conversationId);
+        if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
+        setInternalState({ scopeKey, status: 'ready', prStatus });
+        lastCompletedRef.current = { scopeKey, at: Date.now() };
+        return prStatus;
+      } catch {
+        if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
+        const fallback = cachedSeedRef.current;
+        if (fallback) {
+          const unavailable: PrStatusResponse = {
+            ...fallback,
+            unavailable_reason: 'command_failed',
+            refresh: {
+              ...fallback.refresh,
+              state: 'unavailable',
+              reason: 'command_failed',
+              last_attempted_at: new Date().toISOString(),
+              stale: true,
+            },
+          };
+          setInternalState({ scopeKey, status: 'ready', prStatus: unavailable });
+          return unavailable;
+        }
         const unavailable: PrStatusResponse = {
-          ...fallback,
+          found: false,
           unavailable_reason: 'command_failed',
           refresh: {
-            ...fallback.refresh,
             state: 'unavailable',
             reason: 'command_failed',
             last_attempted_at: new Date().toISOString(),
-            stale: true,
+            stale: false,
           },
+          work_change: { kind: 'unavailable', reason: 'command_failed' },
         };
         setInternalState({ scopeKey, status: 'ready', prStatus: unavailable });
         return unavailable;
+      } finally {
+        if (inFlightRef.current?.scopeKey === scopeKey && inFlightRef.current.seq === seq) {
+          inFlightRef.current = null;
+        }
       }
-      const unavailable: PrStatusResponse = {
-        found: false,
-        unavailable_reason: 'command_failed',
-        refresh: {
-          state: 'unavailable',
-          reason: 'command_failed',
-          last_attempted_at: new Date().toISOString(),
-          stale: false,
-        },
-        work_change: { kind: 'unavailable', reason: 'command_failed' },
-      };
-      setInternalState({ scopeKey, status: 'ready', prStatus: unavailable });
-      return unavailable;
-    }
+    })();
+    inFlightRef.current = { scopeKey, seq, promise };
+    return promise;
   }, [conversationId, scopeKey]);
+
+  const refreshRoutine = useCallback((): Promise<PrStatusResponse | undefined> => {
+    if (!scopeKey || activeScopeRef.current !== scopeKey) return Promise.resolve(undefined);
+    if (inFlightRef.current?.scopeKey === scopeKey
+      && inFlightRef.current.seq === latestSeqRef.current) {
+      return inFlightRef.current.promise;
+    }
+    const lastCompleted = lastCompletedRef.current;
+    if (lastCompleted?.scopeKey === scopeKey
+      && Date.now() - lastCompleted.at < ROUTINE_REFRESH_FRESHNESS_MS) {
+      return Promise.resolve(undefined);
+    }
+    return refresh();
+  }, [refresh, scopeKey]);
 
   useEffect(() => {
     latestSeqRef.current += 1;
@@ -245,7 +282,7 @@ export function useConversationPrStatus({
 
     const fetchStatus = async () => {
       if (cancelled) return;
-      await refresh();
+      await refreshRoutine();
     };
 
     const schedule = () => {
@@ -264,11 +301,12 @@ export function useConversationPrStatus({
     return () => {
       cancelled = true;
       latestSeqRef.current += 1;
+      if (inFlightRef.current?.scopeKey === scopeKey) inFlightRef.current = null;
       if (activeScopeRef.current === scopeKey) activeScopeRef.current = null;
       if (timeout != null) window.clearTimeout(timeout);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [scopeKey, refresh]);
+  }, [scopeKey, refreshRoutine]);
 
   const publicState = publicStateForScope(internalState, scopeKey, cachedSeed);
   const liveSelection = internalState.scopeKey === scopeKey && internalState.status === 'ready'
@@ -278,17 +316,30 @@ export function useConversationPrStatus({
     ? (selectionFromPrStatus(publicState.prStatus) ?? cachedSelection)
     : cachedSelection);
 
+  const refreshAfterMutation = useCallback(async () => {
+    const pending = inFlightRef.current?.scopeKey === scopeKey
+      ? inFlightRef.current.promise
+      : null;
+    if (pending) {
+      latestSeqRef.current += 1;
+      inFlightRef.current = null;
+      await pending;
+    }
+    if (activeScopeRef.current !== scopeKey) return undefined;
+    return refresh();
+  }, [refresh, scopeKey]);
+
   const pinActivePr = useCallback(async (request: PinAssociatedPrRequest) => {
     if (!scopeKey || !conversationId) return;
     await api.pinAssociatedPr(conversationId, request);
-    await refresh();
-  }, [conversationId, refresh, scopeKey]);
+    await refreshAfterMutation();
+  }, [conversationId, refreshAfterMutation, scopeKey]);
 
   const resumeInference = useCallback(async () => {
     if (!scopeKey || !conversationId) return;
     await api.resumeAssociatedPrInference(conversationId);
-    await refresh();
-  }, [conversationId, refresh, scopeKey]);
+    await refreshAfterMutation();
+  }, [conversationId, refreshAfterMutation, scopeKey]);
 
   return {
     state: publicState,

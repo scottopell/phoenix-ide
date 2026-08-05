@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { useConversationPrStatus } from './useConversationPrStatus';
@@ -6,6 +7,7 @@ import { api, type CachedPrSummary, type PrStatusResponse } from '../api';
 vi.mock('../api', () => ({
   api: {
     getPrStatus: vi.fn(),
+    resumeAssociatedPrInference: vi.fn(),
   },
 }));
 
@@ -58,12 +60,122 @@ function Probe({ conversationId, cached }: { conversationId: string; cached?: Ca
   const associatedCount = handle.activeSelection?.associated_prs.length ?? 0;
   const activePrNumber = handle.activePrSummary?.pr_number ?? 'none';
   const ambiguous = handle.ambiguous ? 'yes' : 'no';
-  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span><span data-testid="ambiguous">{ambiguous}</span></div>;
+  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span><span data-testid="ambiguous">{ambiguous}</span><button type="button" onClick={() => void handle.refresh()}>Refresh</button><button type="button" onClick={() => void handle.resumeInference?.()}>Resume inference</button></div>;
 }
 
 describe('useConversationPrStatus', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('coalesces concurrent explicit and routine refreshes for one scope', async () => {
+    const pending = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockReturnValue(pending.promise);
+
+    render(<Probe conversationId="conv-coalesce" />);
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(1));
+
+    screen.getByRole('button', { name: 'Refresh' }).click();
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(getPrStatus).toHaveBeenCalledTimes(1);
+
+    pending.resolve(prStatus(41));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('41'));
+  });
+
+  it('starts a valid replacement request after StrictMode invalidates effect setup', async () => {
+    const stale = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockReturnValueOnce(stale.promise).mockResolvedValueOnce(prStatus(46));
+
+    render(<StrictMode><Probe conversationId="conv-strict" /></StrictMode>);
+
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('46'));
+    await act(async () => {
+      stale.resolve(prStatus(45));
+      await stale.promise;
+    });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('46');
+  });
+
+  it('allows a routine retry immediately after a failed refresh', async () => {
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockRejectedValueOnce(new Error('network failed')).mockResolvedValueOnce(prStatus(47));
+
+    render(<Probe conversationId="conv-retry" />);
+    await waitFor(() => expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable'));
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('47'));
+    expect(getPrStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('starts a new status read after a mutation when an older read is pending', async () => {
+    const beforeMutation = deferred<PrStatusResponse>();
+    const afterMutation = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    const resumeInference = api.resumeAssociatedPrInference as ReturnType<typeof vi.fn>;
+    getPrStatus.mockReturnValueOnce(beforeMutation.promise).mockReturnValueOnce(afterMutation.promise);
+    resumeInference.mockResolvedValue(undefined);
+
+    render(<Probe conversationId="conv-mutation" />);
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(1));
+    screen.getByRole('button', { name: 'Resume inference' }).click();
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledWith('conv-mutation'));
+    expect(getPrStatus).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      beforeMutation.resolve(prStatus(48));
+      await beforeMutation.promise;
+    });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
+    afterMutation.resolve(prStatus(49));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('49'));
+  });
+
+  it('coalesces a visibility refresh with a scheduled poll', async () => {
+    vi.useFakeTimers();
+    try {
+      const poll = deferred<PrStatusResponse>();
+      const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+      getPrStatus.mockResolvedValueOnce(prStatus(44)).mockReturnValueOnce(poll.promise);
+
+      render(<Probe conversationId="conv-poll" />);
+      await act(async () => { await Promise.resolve(); });
+      expect(getPrStatus).toHaveBeenCalledTimes(1);
+
+      await act(async () => { vi.advanceTimersByTime(60_000); });
+      expect(getPrStatus).toHaveBeenCalledTimes(2);
+
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(getPrStatus).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        poll.resolve(prStatus(45));
+        await poll.promise;
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('suppresses recent routine visibility refreshes but preserves explicit refreshes', async () => {
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockResolvedValueOnce(prStatus(42)).mockResolvedValueOnce(prStatus(43));
+
+    render(<Probe conversationId="conv-fresh" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('42'));
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(getPrStatus).toHaveBeenCalledTimes(1);
+
+    screen.getByRole('button', { name: 'Refresh' }).click();
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('43'));
+    expect(getPrStatus).toHaveBeenCalledTimes(2);
   });
 
   it('ignores stale refresh results after the conversation scope changes', async () => {
