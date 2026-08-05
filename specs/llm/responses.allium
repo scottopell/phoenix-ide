@@ -184,7 +184,7 @@ entity CodexResponsesLiteRequest {
     developer_instructions_is_second: Boolean
     parallel_tool_calls: Boolean
     reasoning_context: String
-    reasoning_effort: String
+    reasoning_effort: String?
     compatibility_header: Boolean
 }
 

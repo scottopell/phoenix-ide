@@ -1658,11 +1658,15 @@ function ConversationPageContent({
       // Stash the seed draft BEFORE navigation so it's visible to the new
       // page on first render (useDraft reads localStorage synchronously in
       // its initializer).
+      const conversationModelIsAvailable = conversation.model !== null
+        && availableModels.some(model => model.id === conversation.model);
+      const seedModel = conversationModelIsAvailable ? conversation.model : defaultModel;
+      if (!seedModel) throw new Error('No model is available');
       const newConv = await createConversationWithStore(
         homeDir,
         '', // empty — server accepts empty text when seed_parent_id is set
         messageId,
-        conversation.model ?? defaultModel ?? (() => { throw new Error('No model is available'); })(),
+        seedModel,
         null,
         [],
         'direct',
@@ -1675,7 +1679,7 @@ function ConversationPageContent({
       );
       navigate(routeForConversation(newConv));
     },
-    [conversation, defaultModel, navigate, createConversationWithStore],
+    [conversation, availableModels, defaultModel, navigate, createConversationWithStore],
   );
 
   const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {

@@ -3883,9 +3883,19 @@ where
                 model.to_string()
             } else {
                 match mode {
-                    SubAgentMode::Explore => self
-                        .llm_registry
-                        .cheap_model_id_for_provider(&self.context.model_id),
+                    SubAgentMode::Explore => {
+                        let cheap_model = self
+                            .llm_registry
+                            .cheap_model_id_for_provider(&self.context.model_id);
+                        match self.context.effort {
+                            Some(effort)
+                                if !self.llm_registry.supports_effort(&cheap_model, effort) =>
+                            {
+                                self.context.model_id.clone()
+                            }
+                            _ => cheap_model,
+                        }
+                    }
                     SubAgentMode::Work => self.context.model_id.clone(),
                 }
             };
