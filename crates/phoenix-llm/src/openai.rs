@@ -2626,6 +2626,7 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
         messages,
         tools,
         max_tokens: request.max_tokens,
+        reasoning_effort: request.effective_effort.explicit_level(),
         stream: None,
         stream_options: None,
         tool_choice: if has_tools {
@@ -2774,6 +2775,7 @@ fn chat_message_to_response(
             output_tokens: u64::from(usage.completion_tokens),
             cache_creation_tokens: 0,
             cache_read_tokens: cached,
+            reasoning_tokens: usage.reasoning_tokens().map(u64::from),
         },
     ))
 }
@@ -2823,6 +2825,9 @@ fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmE
         return match status_code {
             401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
             429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
+            400..=499 if code.is_empty() => {
+                LlmError::invalid_request(format!("Bad request ({status_code}): {message}"))
+            }
             400..=499 => classify_responses_error(code, &message),
             500..=599 => LlmError::server_error(format!("Server error: {message}")),
             _ => LlmError::server_error(format!("Unexpected HTTP {status_display}: {message}")),
@@ -3080,6 +3085,8 @@ struct ChatCompletionsRequest {
     tools: Option<Vec<ChatTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ModelEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3457,7 +3464,7 @@ mod tests {
             family: "OpenAI".into(),
             description: String::new(),
             context_window: 100_000,
-            max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
+            max_output_tokens: Some(crate::DEFAULT_MAX_OUTPUT_TOKENS),
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -5170,6 +5177,24 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_serializes_only_explicit_reasoning_effort() {
+        let native = serde_json::to_value(translate_to_chat_request(
+            "compatible-chat-model",
+            &empty_request(),
+        ))
+        .expect("serialize native chat request");
+        assert!(native.get("reasoning_effort").is_none());
+
+        let mut request = empty_request();
+        request.effective_effort =
+            phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::High);
+        let explicit =
+            serde_json::to_value(translate_to_chat_request("compatible-chat-model", &request))
+                .expect("serialize explicit chat request");
+        assert_eq!(explicit["reasoning_effort"], "high");
+    }
+
+    #[test]
     fn chat_normalization_preserves_tool_id_and_cached_usage() {
         let response = ChatCompletionsResponse {
             choices: vec![ChatChoice {
@@ -5265,6 +5290,28 @@ mod tests {
             .to_string();
             let overload = openai_http_error(status, &status.to_string(), &body);
             assert_eq!(overload.kind, crate::LlmErrorKind::ServerOverloaded);
+        }
+    }
+
+    #[test]
+    fn chat_http_errors_without_codes_remain_terminal_client_errors() {
+        for status in [400, 404] {
+            for body in [
+                serde_json::json!({
+                    "error": {"message": "invalid model", "type": "invalid_request_error"}
+                }),
+                serde_json::json!({
+                    "error": {
+                        "message": "invalid model",
+                        "type": "invalid_request_error",
+                        "code": null
+                    }
+                }),
+            ] {
+                let error = openai_http_error(status, &status.to_string(), &body.to_string());
+                assert_eq!(error.kind, crate::LlmErrorKind::InvalidRequest);
+                assert!(!error.kind.is_auto_retryable());
+            }
         }
     }
 

@@ -66,6 +66,7 @@ entity ChatRequest {
     stream: Boolean
     include_usage: Boolean
     tool_count: Integer
+    reasoning_effort: String?
 }
 
 entity ChatResponse {
@@ -98,6 +99,68 @@ entity ChatDroppedProviderBlock {
     logged: Boolean
 }
 
+entity ChatPrivateReasoningOmission {
+    bytes: Integer
+    logged: Boolean
+}
+
+------------------------------------------------------------
+-- Helpers (pure functions referenced by the rules below)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; rules call these by
+-- bare identifier. This block is the single source of truth for signatures
+-- and semantics.
+--
+--   wire_model_name(request: llm/LlmRequest) -> String
+--       Returns the selected route's configured wire model name. This may
+--       differ from the user-facing registry ID; no model-family or backend
+--       inference changes it.
+--
+--   translate_chat_messages(request: llm/LlmRequest) -> List<ChatWireMessage>
+--       Translates the request in source order. System segments become a
+--       system message; user and assistant text/image blocks retain order;
+--       ToolUse becomes assistant tool_calls; ToolResult becomes a tool-role
+--       message whose tool_call_id is the exact model-issued ID. Unsupported
+--       content is consumed only through a declared logged-drop rule.
+--       An explicit effective effort is encoded in reasoning_effort using its
+--       provider-native wire name; model-native default effort omits the field.
+--
+--   normalize_chat_usage(usage: ChatUsage?) -> llm/Usage
+--       Null usage yields zero usage. Otherwise cached_prompt_tokens is read
+--       from wire prompt_tokens_details.cached_tokens, must not exceed the
+--       inclusive wire prompt_tokens total, and is split into Phoenix's
+--       cache-read bucket. Uncached input is prompt_tokens minus cached reads;
+--       output is completion_tokens. Provider reasoning tokens come from
+--       completion_tokens_details.reasoning_tokens and remain usage metadata,
+--       never visible reasoning content.
+--
+--   normalized_visible_text(response: ChatResponse) -> String?
+--       Returns exactly one public text carrier: refusal when present,
+--       otherwise final_text. Private wire reasoning_content maps to
+--       response.private_reasoning and is never included.
+--
+--   normalized_tool_ids(response: ChatResponse) -> List<String>
+--       Returns tool-call IDs from the normalized llm/LlmResponse in source
+--       order.
+--
+--   wire_tool_ids(response: ChatResponse) -> List<String>
+--       Returns response.tool_calls IDs in wire order. Equality with
+--       normalized_tool_ids proves IDs are preserved rather than regenerated.
+--
+--   classify_chat_error(code: JSON scalar?, message: String) -> llm/LlmError
+--       Numeric values and numeric strings retain HTTP classification. Named
+--       string codes use
+--       the shared exhaustive error taxonomy. Missing and unknown inline
+--       stream codes use the shared server-error policy because no transport
+--       status is available in an inline event.
+--
+--   length(value: String) -> Integer
+--       Returns the UTF-8 byte length used by content-free omission logging;
+--       it never exposes or persists the private reasoning text.
+--
+------------------------------------------------------------
+
 ------------------------------------------------------------
 -- Rules — endpoint and request translation
 ------------------------------------------------------------
@@ -120,7 +183,8 @@ rule ChatRequestTranslated {
         messages: translate_chat_messages(request),
         stream: false,
         include_usage: false,
-        tool_count: request.tool_count
+        tool_count: request.tool_count,
+        reasoning_effort: request.effective_effort.explicit_level
     )
 
     @guidance
@@ -138,7 +202,8 @@ rule ChatStreamingRequested {
         messages: translate_chat_messages(request),
         stream: true,
         include_usage: true,
-        tool_count: request.tool_count
+        tool_count: request.tool_count,
+        reasoning_effort: request.effective_effort.explicit_level
     )
 }
 
@@ -212,7 +277,10 @@ rule PrivateReasoningOmitted {
 
     requires: response.private_reasoning != null
 
-    ensures: PrivateReasoningDropped(bytes: length(response.private_reasoning))
+    ensures: ChatPrivateReasoningOmission.created(
+        bytes: length(response.private_reasoning),
+        logged: true
+    )
     ensures: normalized_visible_text(response) = response.final_text
 }
 
@@ -338,6 +406,7 @@ surface ChatCompletionsBoundary {
     context response: ChatResponse
     context stream: ChatStream
     context dropped: ChatDroppedProviderBlock
+    context reasoning_omission: ChatPrivateReasoningOmission
 
     exposes:
         endpoint.exact_url
@@ -345,10 +414,13 @@ surface ChatCompletionsBoundary {
         chat_request.messages
         chat_request.stream
         chat_request.include_usage
+        chat_request.reasoning_effort
         message.content_kinds
         stream.text
         dropped.block_kind
         dropped.logged
+        reasoning_omission.bytes
+        reasoning_omission.logged
 
     provides:
         ResolveChatEndpoint(configured_url?)

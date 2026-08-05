@@ -493,7 +493,11 @@ fn infer_provider_display_from_model_id(model_id: &str) -> String {
 
 /// Derive a provider-compatible models URL from an exact request endpoint.
 fn derive_models_url(base_url: &str) -> Option<String> {
-    let path = base_url.split('?').next().unwrap_or(base_url);
+    let path = base_url
+        .split('?')
+        .next()
+        .unwrap_or(base_url)
+        .trim_end_matches('/');
     let scheme_end = path.find("://").map_or(0, |idx| idx + 3);
     let endpoint_start = if let Some(prefix) = path.strip_suffix("/chat/completions") {
         prefix.len() + 1
@@ -1041,20 +1045,6 @@ impl ModelRegistry {
             .get(model_id)
             .and_then(super::ModelSpec::output_token_limit)
     }
-
-    /// Get the max output tokens for a model.
-    ///
-    /// Returns the model spec's declared cap, or [`super::DEFAULT_MAX_OUTPUT_TOKENS`]
-    /// when the model is unknown or the spec lock cannot be acquired.
-    pub fn max_output_tokens(&self, model_id: &str) -> u32 {
-        let default = super::DEFAULT_MAX_OUTPUT_TOKENS;
-        self.specs
-            .read()
-            .ok()
-            .and_then(|specs| specs.get(model_id).map(|s| s.max_output_tokens))
-            .unwrap_or(default)
-    }
-
 
     /// List all available model IDs
     ///
@@ -2468,10 +2458,15 @@ mod tests {
 
     #[test]
     fn test_derive_models_url_from_chat_completions() {
-        assert_eq!(
-            derive_models_url("https://gateway.example/v1/chat/completions"),
-            Some("https://gateway.example/v1/models".to_string())
-        );
+        for endpoint in [
+            "https://gateway.example/v1/chat/completions",
+            "https://gateway.example/v1/chat/completions/",
+        ] {
+            assert_eq!(
+                derive_models_url(endpoint),
+                Some("https://gateway.example/v1/models".to_string())
+            );
+        }
     }
 
     #[test]
@@ -2576,38 +2571,10 @@ mod tests {
             .get("claude-haiku-4-5")
             .expect("haiku should be registered");
         assert!(
-            haiku.max_output_tokens > 0,
+            haiku.output_token_limit().is_none_or(|limit| limit > 0),
             "claude-haiku-4-5 must have nonzero max_output_tokens"
         );
     }
-    #[test]
-    fn max_output_tokens_returns_spec_value_for_registered_model() {
-        let config = LlmConfig {
-            anthropic_api_key: Some("test-key".to_string()),
-            ..Default::default()
-        };
-        let registry = ModelRegistry::new(&config);
-
-        let got = registry.max_output_tokens("claude-haiku-4-5");
-        assert!(
-            got > 0,
-            "registered model must have nonzero max_output_tokens"
-        );
-
-        // Haiku is 16_384 in the built-in specs.
-        assert_eq!(got, 16_384, "claude-haiku-4-5 max_output_tokens mismatch");
-    }
-
-    #[test]
-    fn max_output_tokens_defaults_for_unknown_model() {
-        let registry = ModelRegistry::new(&LlmConfig::default());
-        assert_eq!(
-            registry.max_output_tokens("no-such-model"),
-            super::super::DEFAULT_MAX_OUTPUT_TOKENS,
-            "unknown model must return DEFAULT_MAX_OUTPUT_TOKENS"
-        );
-    }
-
     #[test]
     fn external_chat_completions_model_registers_with_openai_key() {
         // Chat Completions model should register when openai_api_key is present.

@@ -4716,7 +4716,6 @@ where
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
         let llm_client = self.llm_client.clone();
-        let max_output_tokens = llm_client.max_output_tokens();
         let tool_executor = self.tool_executor.clone();
         let clearable_names = self.clearable_names.clone();
         let clear_watermark_cache = self.clear_watermark_cache.clone();
@@ -4930,7 +4929,7 @@ where
             }
 
             let attempt_capture = task_attempt_capture;
-            let request = LlmRequest {
+            let mut request = LlmRequest {
                 system,
                 messages,
                 tools,
@@ -4969,12 +4968,15 @@ where
                 .sum();
             let estimated_input_tokens =
                 estimated_system_tokens + estimated_message_tokens + estimated_tool_tokens;
-            let reserved_output_tokens = usize::try_from(request.reserved_output_tokens())
-                .unwrap_or(usize::MAX);
-            if estimated_input_tokens.saturating_add(reserved_output_tokens) > context_window {
+            let Some(output_tokens) = clamp_output_tokens_to_remaining_context(
+                request.reserved_output_tokens(),
+                estimated_input_tokens,
+                context_window,
+            ) else {
                 let _ = llm_tx.send(LlmOutcome::TokenBudgetExceeded);
                 return;
-            }
+            };
+            request.max_tokens = Some(output_tokens);
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
@@ -6457,6 +6459,17 @@ fn estimate_dispatch_message_tokens(msg: &LlmMessage) -> usize {
     content + MESSAGE_OVERHEAD_TOKENS
 }
 
+fn clamp_output_tokens_to_remaining_context(
+    requested_output_tokens: u32,
+    estimated_input_tokens: usize,
+    context_window: usize,
+) -> Option<u32> {
+    let remaining = context_window.checked_sub(estimated_input_tokens)?;
+    let remaining = u32::try_from(remaining).unwrap_or(u32::MAX);
+    let clamped = requested_output_tokens.min(remaining);
+    (clamped > 0).then_some(clamped)
+}
+
 /// Estimate the token cost of a single message for the proactive budget.
 fn estimate_message_tokens(msg: &LlmMessage) -> usize {
     use phoenix_llm::ContentBlock;
@@ -6897,6 +6910,30 @@ mod strip_tool_blocks_tests {
     use phoenix_llm::{
         ContentBlock, ImageSource, LlmMessage, MessageRole, ToolReference, ToolSearchResultContent,
     };
+
+    #[test]
+    fn output_tokens_are_clamped_to_remaining_context() {
+        assert_eq!(
+            clamp_output_tokens_to_remaining_context(120_000, 10_000, 128_000),
+            Some(118_000)
+        );
+        assert_eq!(
+            clamp_output_tokens_to_remaining_context(16_384, 10_000, 128_000),
+            Some(16_384)
+        );
+    }
+
+    #[test]
+    fn exhausted_context_has_no_output_budget() {
+        assert_eq!(
+            clamp_output_tokens_to_remaining_context(16_384, 128_000, 128_000),
+            None
+        );
+        assert_eq!(
+            clamp_output_tokens_to_remaining_context(16_384, 128_001, 128_000),
+            None
+        );
+    }
 
     fn user_text(s: &str) -> LlmMessage {
         LlmMessage {

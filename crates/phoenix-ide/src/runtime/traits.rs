@@ -325,11 +325,6 @@ pub trait LlmClient: Send + Sync {
     #[allow(dead_code)] // API completeness
     fn model_id(&self) -> &str;
 
-    /// Maximum output tokens requested for a normal conversation turn.
-    fn max_output_tokens(&self) -> u32 {
-        phoenix_llm::DEFAULT_MAX_OUTPUT_TOKENS
-    }
-
     /// Typed provider/route limits for continuation-summary requests.
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
         phoenix_llm::ContinuationRequestLimits::TokenWindowOnly
@@ -666,10 +661,6 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
     fn model_id(&self) -> &str {
         (**self).model_id()
-    }
-
-    fn max_output_tokens(&self) -> u32 {
-        (**self).max_output_tokens()
     }
 
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
@@ -1201,10 +1192,6 @@ impl LlmClient for RegistryLlmClient {
 
     fn model_id(&self) -> &str {
         &self.model_id
-    }
-
-    fn max_output_tokens(&self) -> u32 {
-        self.registry.max_output_tokens(&self.model_id)
     }
 
     fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {

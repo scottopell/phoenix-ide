@@ -451,6 +451,7 @@ fn external_model_spec_from_config(
     if spec.context_window == 0 {
         return Err(format!("model '{id}' has invalid context_window 0"));
     }
+    let effort_capabilities = validate_external_effort_capabilities(&spec)?;
     let backend: ModelBackend = spec.backend.into();
     let family = match spec.family {
         Some(value) if value.trim().is_empty() => {
@@ -504,7 +505,6 @@ fn external_model_spec_from_config(
             "model '{id}' declares xhigh/max effort but context_window must exceed 68096"
         ));
     }
-    let effort_capabilities = validate_external_effort_capabilities(&spec)?;
     Ok(ModelSpec {
         id,
         api_name,
@@ -712,20 +712,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_gpt_54(),
-        },
-        // GPT-5 Codex models (responses API)
-        ModelSpec {
-            id: "gpt-5.3-codex".into(),
-            api_name: "gpt-5.3-codex".into(),
-            backend: ModelBackend::OpenAIResponses,
-            family: "OpenAI".into(),
-            description: "GPT-5.3 Codex (latest code model)".into(),
-            context_window: 200_000,
-            max_output_tokens: None,
-            recommended: true,
-            supports_tool_search: false,
-            source: ModelSource::BuiltIn,
-            effort_capabilities: EffortCapabilities::unknown(),
         },
         // Mock model for frontend development without API keys
         ModelSpec {

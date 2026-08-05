@@ -183,11 +183,6 @@ pub trait LlmService: Send + Sync {
     /// Get the model ID
     fn model_id(&self) -> &str;
 
-    /// Maximum output tokens requested for a normal conversation turn.
-    fn max_output_tokens(&self) -> u32 {
-        DEFAULT_MAX_OUTPUT_TOKENS
-    }
-
     /// True if this service routes through the ChatGPT-backend codex bridge.
     /// Consumed by [`crate::ModelSpec::context_window_for`] to apply the
     /// bridge's 272K cap regardless of the model's platform-API ceiling.
@@ -509,10 +504,6 @@ impl LlmService for LoggingService {
 
     fn uses_codex_bridge(&self) -> bool {
         self.inner.uses_codex_bridge()
-    }
-
-    fn max_output_tokens(&self) -> u32 {
-        self.inner.max_output_tokens()
     }
 
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {

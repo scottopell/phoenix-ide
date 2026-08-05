@@ -165,10 +165,6 @@ impl LlmService for LlmServiceImpl {
         &self.spec.id
     }
 
-    fn max_output_tokens(&self) -> u32 {
-        self.spec.max_output_tokens
-    }
-
     fn uses_codex_bridge(&self) -> bool {
         self.use_codex_backend
     }

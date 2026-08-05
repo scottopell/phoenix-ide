@@ -161,6 +161,13 @@ value LlmMessage {
     content: List<ContentBlock>
 }
 
+-- The resolved effort state carried to provider translation. Only an explicit
+-- conversation override has an explicit_level; native-known, native-unknown,
+-- and unsupported states leave it null so providers retain native behavior.
+value EffectiveEffort {
+    explicit_level: String?
+}
+
 -- A provider-agnostic completion request. `tool_count` abstracts the
 -- ToolDefinition list (the spec cares whether tools are present, not
 -- their schemas). `cache_key` is the caller-chosen prompt-cache cohort
@@ -171,6 +178,7 @@ value LlmRequest {
     messages: List<LlmMessage>
     tool_count: Integer
     max_tokens: Integer?
+    effective_effort: EffectiveEffort
     cache_key: String
 }
 
