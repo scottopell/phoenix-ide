@@ -511,6 +511,10 @@ fn derive_models_url(base_url: &str) -> Option<String> {
     Some(format!("{}models", &path[..endpoint_start]))
 }
 
+const fn codex_bridge_transport() -> LlmTransport {
+    LlmTransport::Websocket
+}
+
 /// Registry of available LLM models.
 ///
 /// Most state is frozen at construction. The Codex/ChatGPT bridge bits are
@@ -864,7 +868,7 @@ impl ModelRegistry {
             return Some(Arc::new(LoggingService::new(
                 service,
                 "openai",
-                crate::LlmTransport::Websocket,
+                codex_bridge_transport(),
             )));
         }
 
@@ -1324,7 +1328,7 @@ impl ModelRegistry {
                     Arc::new(LoggingService::new(
                         service,
                         "openai",
-                        LlmTransport::HttpSse,
+                        codex_bridge_transport(),
                     )) as Arc<dyn LlmService>,
                 );
                 new_codex_specs.insert(spec.id.clone(), spec);
@@ -1468,6 +1472,11 @@ pub struct CodexReloadOutcome {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn codex_bridge_transport_is_websocket_across_registration_paths() {
+        assert_eq!(codex_bridge_transport(), LlmTransport::Websocket);
+    }
 
     #[test]
     fn test_no_api_keys_no_models() {

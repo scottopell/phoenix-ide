@@ -218,6 +218,17 @@ rule UnsupportedProviderBlockLoggedAndDropped {
     )
 }
 
+rule AssistantImageLoggedAndDropped {
+    when: TranslateAssistantChatContent(block)
+
+    requires: block.kind = image
+
+    ensures: ChatDroppedProviderBlock.created(
+        block_kind: image,
+        logged: true
+    )
+}
+
 rule ToolResultImagesLoggedAndDropped {
     when: TranslateChatContent(block)
 
@@ -427,6 +438,7 @@ surface ChatCompletionsBoundary {
         TranslateChatRequest(request)
         TranslateStreamingChatRequest(request)
         TranslateChatContent(block)
+        TranslateAssistantChatContent(block)
         NormalizeChatResponse(response)
         ChatStreamEventReceived(stream, generation_kind?)
         ChatTerminalEventReceived(stream, finish_reason, usage?)
