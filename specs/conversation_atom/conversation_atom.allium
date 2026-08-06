@@ -543,6 +543,23 @@ rule SseSteerMessageCancelledApplied {
     ensures: atom.lastSequenceId = seq
 }
 
+rule LocalSteerMessageCancelledApplied {
+    when: LocalSteerMessageCancelledDispatched(atom, messageId, expectedConversationId)
+
+    requires: atom.conversationId = expectedConversationId
+
+    ensures: atom.steeringMessages = remove_by_id(atom.steeringMessages, messageId)
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+}
+
+rule LocalSteerMessageCancelledStaleConversation {
+    when: LocalSteerMessageCancelledDispatched(atom, messageId, expectedConversationId)
+
+    requires: atom.conversationId != expectedConversationId
+
+    ensures: atom = atom
+}
+
 -- `sse_error` with a sequence_id (wire-originated) routes through
 -- applyIfNewer. A replayed error after the user dismissed it does NOT
 -- re-pop the toast (because applyIfNewer drops it as a replay).

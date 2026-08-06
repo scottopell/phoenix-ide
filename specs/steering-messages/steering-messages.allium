@@ -431,6 +431,12 @@ surface SteeringQueueApi {
         -- In all cases that mutate the queue (enqueue, cancel), the DB reflects
         -- the new state before the HTTP response is returned to the caller.
 
+    @guarantee PendingQueueFencesDirectAcceptance
+        -- A non-empty durable steering queue prevents an idle observation from
+        -- routing a later request into direct-turn acceptance. The later
+        -- request joins the steering queue, covering the window where a steer
+        -- was accepted while busy but reaches the executor after it became idle.
+
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one
         -- of two points: turn-end (entering idle) or mid-turn (entering

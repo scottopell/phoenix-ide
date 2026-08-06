@@ -1556,11 +1556,16 @@ function ConversationPageContent({
     if (!conversationId) return;
     try {
       await api.cancelSteeringMessage(conversationId, localId);
+      dispatch({
+        type: 'local_steer_message_cancelled',
+        messageId: localId,
+        expectedConversationId: conversationId,
+      });
       dismiss(localId);
     } catch (err) {
       console.error('Failed to cancel steering message:', err);
     }
-  }, [conversationId, dismiss]);
+  }, [conversationId, dismiss, dispatch]);
 
   const openConversationById = useCallback(async (
     targetConversationId: string,

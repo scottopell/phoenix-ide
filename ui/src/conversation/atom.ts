@@ -362,6 +362,11 @@ export type SSEAction =
       expectedConversationId: string;
     }
   | {
+      type: 'local_steer_message_cancelled';
+      messageId: string;
+      expectedConversationId: string;
+    }
+  | {
       type: 'set_initial_data';
       conversationId: string;
       conversation: Conversation;
@@ -1436,6 +1441,15 @@ export function conversationReducer(
       if (action.expectedConversationId !== atom.conversationId) return atom;
       if (!atom.conversation) return atom;
       return { ...atom, conversation: { ...atom.conversation, ...action.updates } };
+
+    case 'local_steer_message_cancelled':
+      if (action.expectedConversationId !== atom.conversationId) return atom;
+      return {
+        ...atom,
+        steeringMessages: atom.steeringMessages.filter(
+          (message) => message.message_id !== action.messageId,
+        ),
+      };
 
     case 'set_initial_data': {
       // Don't overwrite if SSE has already provided authoritative data

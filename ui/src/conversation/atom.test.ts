@@ -542,6 +542,29 @@ describe('conversationReducer', () => {
       expect(atom.steeringMessages).toEqual([]);
     });
 
+    it('removes a queued bubble when REST cancellation succeeds', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        steeringMessages: [steeringMessage],
+      };
+
+      const cancelled = dispatch(atom, {
+        type: 'local_steer_message_cancelled',
+        messageId: steeringMessage.message_id,
+        expectedConversationId: 'conv-1',
+      });
+      const stale = dispatch(atom, {
+        type: 'local_steer_message_cancelled',
+        messageId: steeringMessage.message_id,
+        expectedConversationId: 'other-conversation',
+      });
+
+      expect(cancelled.steeringMessages).toEqual([]);
+      expect(cancelled.lastAppliedEventSeq).toBe(atom.lastAppliedEventSeq);
+      expect(stale).toBe(atom);
+    });
+
     it('replays enqueue and cancel entries through the same reducer rules', () => {
       const atom = dispatch(createInitialAtom(), {
         type: 'sse_init',

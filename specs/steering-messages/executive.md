@@ -26,6 +26,8 @@ The queue is **executor-owned, with a typed bedrock event as the delivery contra
 
 The executor also closes the acceptance-to-idle race: if `Event::SteerMessage` arrives after the conversation has already reached `Idle`, it immediately takes the queue and routes `SteerDrainedUserMessages` through the normal idle arm. An accepted prompt therefore cannot remain parked until an unrelated later turn.
 
+The send boundary treats a non-empty durable steering queue as an acceptance fence even if the live state is momentarily `Idle`. A request arriving in that window joins the steering queue instead of becoming a direct turn that the late-steer drain would immediately make busy.
+
 Three persistence-ordering rules are load-bearing:
 
 - **P1 (enqueue):** `enqueue_steer_message` reads the current queue, appends the new entry, writes the updated queue to the DB, broadcasts a renderable `steer_message_queued` event, and then sends `Event::SteerMessage` to the executor channel. The HTTP response returns only after the DB write succeeds. A crash between acceptance and executor processing does not lose the entry.
@@ -61,6 +63,7 @@ The spec was distilled from a working implementation; all rules and invariants a
 | **SteerMessageQueuedAck** (surface guarantee) | Complete | `RuntimeManager::enqueue_steer_message` broadcasts the renderable durable entry; `useConnection` dispatches it into `ConversationAtom.steeringMessages` |
 | **Steering reconnect/cancel projection** | Complete | `SseEvent::Init.steering_messages` restores the durable queue; `SteerMessageCancelled` removes cancelled entries; normal `Message` delivery removes the matching queue identity |
 | **PersistenceBeforeResponse** (surface guarantee) | Complete | Both enqueue (P1) and cancel (P2) write to DB before HTTP response |
+| **PendingQueueFencesDirectAcceptance** (surface guarantee) | Complete | `SendChatApplicationService::send` checks the durable steering queue before accepting an otherwise-idle direct turn. |
 | **MidTurnDrainSemantics** (surface guarantee) | Complete | Bedrock arm at `state_machine/transition.rs:454` omits `RequestLlm`. Executor's `run_effects_with_inline_drain` (`runtime/executor.rs:732`) runs persists first, then the deferred `RequestLlm`, so the in-flight call deterministically sees the steered messages — no race, no "steers persisted but unanswered" failure mode. |
 | **DirectSendTransparency** (surface guarantee) | Complete | When `not is_busy`, message bypasses queue entirely; SSE `steer_message_queued` event is not emitted |
 | **EnqueueDuringDrainPreserved** (surface guarantee) | Complete | `Effect::ClearSteeringQueueEntries { message_ids }` removes only the drained ids (not the whole queue). `Database::remove_steering_entries` deletes exactly those `message_id` rows from `steering_messages` (cascading their attachments) — a direct `DELETE`, no read-modify-write window, so a concurrent `enqueue_steer_message` cannot be clobbered. |
