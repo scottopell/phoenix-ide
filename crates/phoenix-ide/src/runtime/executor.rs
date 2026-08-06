@@ -4259,7 +4259,7 @@ where
                                 reason: error,
                             }
                         });
-                        let recovery_outcome = self
+                        let recovery_outcome = match self
                             .storage
                             .recover_continuation_start(
                                 &crate::runtime::traits::ContinuationStartRecoverySettlement {
@@ -4271,7 +4271,27 @@ where
                                     state_updated_at: self.state_updated_at,
                                 },
                             )
-                            .await?;
+                            .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(recovery_error) => {
+                                let persisted = self
+                                    .storage
+                                    .get_state_snapshot(&self.context.conversation_id)
+                                    .await?;
+                                self.state = persisted.state;
+                                self.state_updated_at = persisted.state_updated_at;
+                                self.continuation_effect_disposition =
+                                    ContinuationEffectDisposition::AbortRemaining;
+                                drop(reserved_range);
+                                tracing::error!(
+                                    %recovery_error,
+                                    operation_id = %request.operation_id,
+                                    "continuation start and recovery transactions both failed; restored durable state"
+                                );
+                                return Ok(None);
+                            }
+                        };
                         if recovery_outcome == crate::db::ContinuationCommitOutcome::Duplicate {
                             let persisted = self
                                 .storage
@@ -9581,6 +9601,54 @@ mod authoritative_user_message_effect_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn continuation_start_recovery_failure_restores_durable_state_and_aborts_dispatch() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "double-start-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+        storage.set_continuation_start_recovery_error(true);
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+
+        rt.apply_transition_result(
+            crate::state_machine::transition::TransitionResult::new(rt.state.clone())
+                .with_effect(Effect::BeginContinuation {
+                    request: request.clone(),
+                    content: crate::db::MessageContent::agent(vec![ContentBlock::text("response")]),
+                    display_data: None,
+                    usage_data: phoenix_core::domain::llm_types::Usage::default(),
+                    message_id: request.operation_id.clone(),
+                })
+                .with_effect(Effect::RequestContinuation { request }),
+        )
+        .await
+        .expect("recovery transaction failure must reconcile to durable authority");
+
+        assert_eq!(rt.state, ConvState::LlmRequesting { attempt: 1 });
+        assert!(rt.llm_task_handle.is_none());
+        assert_eq!(
+            storage.get_all_messages(&rt.context.conversation_id).len(),
+            0,
+            "neither failed transaction may materialize the threshold response"
+        );
     }
 
     #[tokio::test]

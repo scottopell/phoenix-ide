@@ -815,7 +815,7 @@ mod tests {
         assert!(matches!(
             state,
             ConvState::AwaitingContinuation { request }
-                if request.operation_id == "legacy-continuation-operation"
+                if request.operation_id == LEGACY_CONTINUATION_OPERATION_ID
                     && request.attempt == 2
         ));
     }
@@ -1093,8 +1093,10 @@ const fn first_continuation_attempt() -> u32 {
     1
 }
 
+pub const LEGACY_CONTINUATION_OPERATION_ID: &str = "legacy-continuation-operation";
+
 fn default_continuation_operation_id() -> String {
-    "legacy-continuation-operation".to_string()
+    LEGACY_CONTINUATION_OPERATION_ID.to_string()
 }
 
 /// Operation-specific inputs for a continuation summary request.

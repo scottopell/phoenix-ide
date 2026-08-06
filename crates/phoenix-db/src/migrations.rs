@@ -2893,7 +2893,7 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         // column) and abort startup.
         let mut tx = pool.begin().await?;
 
-        if migration.version == 58 {
+        if migration.version == 59 {
             let state_kind_exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
                     SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'state_kind'
@@ -3224,7 +3224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_058_adds_and_backfills_state_kind() {
+    async fn migration_059_adds_and_backfills_state_kind() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
         sqlx::query("DROP INDEX IF EXISTS idx_conversations_state_kind")
@@ -3235,7 +3235,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        stamp_migrations_except(&pool, 58).await;
+        stamp_migrations_except(&pool, 59).await;
 
         for (id, state_json) in [
             ("idle", r#"{"type":"idle"}"#),

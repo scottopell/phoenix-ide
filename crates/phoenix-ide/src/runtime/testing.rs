@@ -542,6 +542,7 @@ pub struct InMemoryStorage {
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
+    continuation_start_recovery_error: Mutex<bool>,
     continuation_commit_error_once: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
@@ -574,6 +575,7 @@ impl InMemoryStorage {
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
             continuation_start_recovery_outcome: Mutex::new(None),
+            continuation_start_recovery_error: Mutex::new(false),
             continuation_commit_error_once: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
@@ -582,6 +584,10 @@ impl InMemoryStorage {
 
     pub fn set_fail_continuation_commit(&self, fail: bool) {
         *self.fail_continuation_commit.lock().unwrap() = fail;
+    }
+
+    pub fn set_continuation_start_recovery_error(&self, error: bool) {
+        *self.continuation_start_recovery_error.lock().unwrap() = error;
     }
 
     pub fn set_fail_state_update(&self, fail: bool) {
@@ -1211,6 +1217,9 @@ impl StateStore for InMemoryStorage {
         &self,
         settlement: &crate::runtime::traits::ContinuationStartRecoverySettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if *self.continuation_start_recovery_error.lock().unwrap() {
+            return Err("injected continuation start recovery failure".to_string());
+        }
         if let Some(outcome) = *self.continuation_start_recovery_outcome.lock().unwrap() {
             return Ok(outcome);
         }

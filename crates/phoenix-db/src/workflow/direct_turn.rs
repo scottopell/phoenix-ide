@@ -1037,6 +1037,43 @@ impl WorkflowRepository {
         Ok(outcome)
     }
 
+    pub async fn reconcile_legacy_continuation_atomically(
+        &self,
+        conversation_id: &str,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<Option<String>> {
+        let mut tx = self.begin_tx().await?;
+        let summary = crate::reconcile_legacy_half_committed_continuation_tx(
+            &mut tx.tx,
+            conversation_id,
+            state_updated_at,
+        )
+        .await?;
+        let Some(summary) = summary else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        let conversation = ConversationAuthority(conversation_id.to_string());
+        if let Some(turn) =
+            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, &conversation).await?
+        {
+            self.terminalize_authoritative_turn_in_tx(
+                &mut tx,
+                &TerminalizeAuthoritativeTurnInput {
+                    command: TurnCommand::Complete {
+                        turn_id: turn.id,
+                        expected_generation: turn.generation,
+                    },
+                    projection: None,
+                },
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(summary))
+    }
+
     pub async fn settle_continuation_direct_turn_atomically(
         &self,
         input: &AtomicContinuationSettlementInput,

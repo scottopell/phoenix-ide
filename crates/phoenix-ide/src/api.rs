@@ -161,6 +161,16 @@ impl AppState {
         }
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
+        let reconciled_legacy_continuations = runtime
+            .reconcile_legacy_half_committed_continuations()
+            .await
+            .map_err(std::io::Error::other)?;
+        if reconciled_legacy_continuations > 0 {
+            tracing::info!(
+                reconciled_legacy_continuations,
+                "reconciled legacy half-committed continuations"
+            );
+        }
         let resumed_continuations = runtime
             .resume_pending_continuations()
             .await

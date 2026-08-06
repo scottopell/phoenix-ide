@@ -2175,6 +2175,36 @@ impl RuntimeManager {
         Ok(resumed)
     }
 
+    /// Reconcile legacy half-committed continuation rows left behind by older
+    /// builds that wrote the continuation message but crashed before flipping
+    /// the conversation state to `ContextExhausted`.
+    pub async fn reconcile_legacy_half_committed_continuations(
+        self: &Arc<Self>,
+    ) -> Result<usize, String> {
+        let conversation_ids = self
+            .db
+            .list_pending_continuation_conversation_ids()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut reconciled = 0;
+        for conversation_id in &conversation_ids {
+            let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+            let Some(_summary) = repository
+                .reconcile_legacy_continuation_atomically(conversation_id, Utc::now())
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            tracing::info!(
+                %conversation_id,
+                "reconciled legacy half-committed continuation to context exhausted"
+            );
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
     pub async fn start_creation_worker(self: &Arc<Self>) {
         let rx = self.creation_kick_rx.write().await.take();
         let Some(mut rx) = rx else {
@@ -4692,6 +4722,81 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_legacy_half_committed_continuation_without_dup_message() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "legacy-half-commit";
+        manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id:
+                            phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID
+                                .to_string(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "existing-summary",
+                conversation_id,
+                &crate::db::MessageContent::continuation("exact persisted summary"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .reconcile_legacy_half_committed_continuations()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::ContextExhausted {
+                summary: "exact persisted summary".to_string()
+            }
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(conversation_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "startup reconciliation must reuse the existing continuation message"
+        );
+        assert_eq!(
+            manager
+                .reconcile_legacy_half_committed_continuations()
+                .await
+                .unwrap(),
+            0,
+            "reconciliation must be idempotent once the state is finalized"
+        );
     }
 
     #[tokio::test]
