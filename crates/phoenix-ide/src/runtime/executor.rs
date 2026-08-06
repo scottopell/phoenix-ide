@@ -1714,8 +1714,8 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    continuation_admission_rx:
-        mpsc::Receiver<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    acknowledged_event_rx:
+        mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -1955,7 +1955,7 @@ where
         let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
-        let (_continuation_admission_tx, continuation_admission_rx) = mpsc::channel(1);
+        let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
         let clearable_names = Arc::new(tool_executor.clearable_tool_names());
@@ -1980,7 +1980,7 @@ where
             event_rx,
             event_tx,
             broadcast_tx,
-            continuation_admission_rx,
+            acknowledged_event_rx,
             tool_cancel_token: None,
             llm_task_handle: None,
             active_llm_attempt: None,
@@ -2105,11 +2105,11 @@ where
     }
 
     /// Set the parent event channel (for sub-agents)
-    pub fn with_continuation_admission_receiver(
+    pub fn with_acknowledged_event_receiver(
         mut self,
-        receiver: mpsc::Receiver<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+        receiver: mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
     ) -> Self {
-        self.continuation_admission_rx = receiver;
+        self.acknowledged_event_rx = receiver;
         self
     }
 
@@ -2241,9 +2241,9 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
-                Some((operation_id, acknowledgement)) = self.continuation_admission_rx.recv() => {
+                Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
                     let result = self
-                        .process_event(Event::UserTriggerContinuation { operation_id })
+                        .process_event(event)
                         .await;
                     let _ = acknowledgement.send(result);
                 }
@@ -4520,6 +4520,21 @@ where
                         if let Some(outcome) = reconciled {
                             outcome
                         } else {
+                            if let Ok(snapshot) = self
+                                .storage
+                                .get_state_snapshot(&self.context.conversation_id)
+                                .await
+                            {
+                                if matches!(
+                                    &snapshot.state,
+                                    ConvState::ContextExhausted { .. }
+                                        | ConvState::RecoverableContinuationFailure { .. }
+                                ) {
+                                    self.state = snapshot.state;
+                                    self.state_updated_at = snapshot.state_updated_at;
+                                    return Ok(None);
+                                }
+                            }
                             let error = first_error;
                             let failure =
                                 phoenix_core::domain::sm_state::RecoverableContinuationFailure {
@@ -4531,15 +4546,14 @@ where
                                 };
                             self.state = ConvState::RecoverableContinuationFailure { failure };
                             self.state_updated_at = Utc::now();
-                            if let (Some(turn), Some(terminal)) = (
-                                self.active_direct_turn.as_deref(),
-                                direct_turn_terminal.as_ref(),
-                            ) {
+                            if let Some(turn) = self.active_direct_turn.as_deref() {
                                 self.storage
                                     .settle_active_direct_turn(
                                         &crate::runtime::traits::ActiveDirectTurnSettlement {
                                             turn: turn.clone(),
-                                            terminal: terminal.clone(),
+                                            terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                                reason: error.clone(),
+                                            },
                                             state: self.state.clone(),
                                             state_updated_at: self.state_updated_at,
                                         },

@@ -2173,11 +2173,12 @@ impl ConvState {
     pub fn presentation_mode(&self) -> &'static str {
         match self {
             ConvState::Idle => "idle",
-            ConvState::CreationFailed { .. } | ConvState::Error { .. } => "error",
+            ConvState::CreationFailed { .. }
+            | ConvState::Error { .. }
+            | ConvState::RecoverableContinuationFailure { .. } => "error",
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
-            | ConvState::RecoverableContinuationFailure { .. }
             | ConvState::ContextExhausted { .. } => "needs_action",
             ConvState::CreationCancelled { .. }
             | ConvState::HandedOff { .. }

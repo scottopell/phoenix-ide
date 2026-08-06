@@ -4806,6 +4806,13 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    if matches!(conv.state, ConvState::AwaitingContinuation { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot archive while a continuation summary is pending",
+            "cancel_first",
+        ))));
+    }
+
     if conv.state.is_busy() {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot archive a busy conversation. Cancel the in-flight \
@@ -5198,6 +5205,12 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot hard-delete a busy conversation. Cancel the in-flight \
              operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+    if matches!(conv.state, ConvState::AwaitingContinuation { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot hard-delete while a continuation summary is pending",
             "cancel_first",
         ))));
     }
