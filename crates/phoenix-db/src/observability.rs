@@ -119,23 +119,27 @@ impl RetryAccounting {
     }
 }
 
-pub(crate) fn operation_span(operation: DbOperation, attempt: u32) -> Span {
+pub(crate) fn operation_span(operation: DbOperation) -> Span {
     tracing::info_span!(
         target: "phoenix_db::otel",
         "db.operation",
         db.system = "sqlite",
         db.operation = operation.as_str(),
-        db.attempt = attempt,
+        db.outcome = field::Empty,
+        db.attempt_count = field::Empty,
+        db.retry_count = field::Empty,
+        db.elapsed_ms = field::Empty,
     )
 }
 
-pub(crate) fn acquisition_span(operation: DbOperation, parent: &Span) -> Span {
+pub(crate) fn acquisition_span(operation: DbOperation, attempt: u32, parent: &Span) -> Span {
     tracing::info_span!(
         target: "phoenix_db::otel",
         parent: parent,
         "db.pool.acquire",
         db.system = "sqlite",
         db.operation = operation.as_str(),
+        db.attempt = attempt,
         db.outcome = field::Empty,
         db.elapsed_ms = field::Empty,
     )
@@ -165,6 +169,18 @@ pub(crate) fn transaction_span(
 
 fn elapsed_millis(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn record_operation(
+    span: &Span,
+    outcome: DbOutcome,
+    accounting: RetryAccounting,
+    elapsed: Duration,
+) {
+    span.record("db.outcome", outcome.as_str());
+    span.record("db.attempt_count", i64::from(accounting.attempts()));
+    span.record("db.retry_count", i64::from(accounting.retries()));
+    span.record("db.elapsed_ms", elapsed_millis(elapsed));
 }
 
 pub(crate) fn record_acquisition(

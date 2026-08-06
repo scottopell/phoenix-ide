@@ -497,13 +497,17 @@ mod tests {
                 target: "phoenix_db::otel",
                 "db.operation",
                 db.operation = "workflow.begin_attempt",
-                db.attempt = 1_u64,
+                db.outcome = tracing::field::Empty,
+                db.attempt_count = tracing::field::Empty,
+                db.retry_count = tracing::field::Empty,
+                db.elapsed_ms = tracing::field::Empty,
             );
             let db_acquire = tracing::info_span!(
                 target: "phoenix_db::otel",
                 parent: &db_operation,
                 "db.pool.acquire",
                 db.operation = "workflow.begin_attempt",
+                db.attempt = 1_u64,
                 db.outcome = tracing::field::Empty,
             );
             db_acquire.record("db.outcome", "success");
@@ -514,12 +518,37 @@ mod tests {
                 "db.transaction",
                 db.operation = "workflow.begin_attempt",
                 db.begin_mode = "deferred",
+                db.attempt = 1_u64,
                 db.outcome = tracing::field::Empty,
                 db.retry_count = tracing::field::Empty,
             );
             db_transaction.record("db.outcome", "contention_retry");
             db_transaction.record("db.retry_count", 1_i64);
             drop(db_transaction);
+            let db_acquire_retry = tracing::info_span!(
+                target: "phoenix_db::otel",
+                parent: &db_operation,
+                "db.pool.acquire",
+                db.operation = "workflow.begin_attempt",
+                db.attempt = 2_u64,
+                db.outcome = "success",
+            );
+            drop(db_acquire_retry);
+            let db_transaction_retry = tracing::info_span!(
+                target: "phoenix_db::otel",
+                parent: &db_operation,
+                "db.transaction",
+                db.operation = "workflow.begin_attempt",
+                db.begin_mode = "deferred",
+                db.attempt = 2_u64,
+                db.outcome = "success",
+                db.retry_count = 1_i64,
+            );
+            drop(db_transaction_retry);
+            db_operation.record("db.outcome", "success");
+            db_operation.record("db.attempt_count", 2_i64);
+            db_operation.record("db.retry_count", 1_i64);
+            db_operation.record("db.elapsed_ms", 12_i64);
             drop(db_operation);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
@@ -569,7 +598,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 9);
+        assert_eq!(spans.len(), 11);
         assert_eq!(
             spans
                 .iter()
@@ -581,6 +610,8 @@ mod tests {
                 "conversation.stream.init",
                 "conversation.runtime.materialize",
                 "browser.conversation_open",
+                "db.pool.acquire",
+                "db.transaction",
                 "db.pool.acquire",
                 "db.transaction",
                 "db.operation",
@@ -613,6 +644,34 @@ mod tests {
             .iter()
             .find(|span| span.name == "db.operation")
             .expect("DB operation span exported");
+        let operation_attributes = format!("{:?}", db_operation_span.attributes);
+        for required in [
+            "success",
+            "db.attempt_count",
+            "db.retry_count",
+            "db.elapsed_ms",
+        ] {
+            assert!(
+                operation_attributes.contains(required),
+                "missing aggregate DB operation attribute {required}"
+            );
+        }
+        let phase_spans = spans
+            .iter()
+            .filter(|span| span.name == "db.pool.acquire" || span.name == "db.transaction");
+        for phase in phase_spans {
+            assert_eq!(
+                phase.parent_span_id,
+                db_operation_span.span_context.span_id()
+            );
+            assert!(
+                phase
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key.as_str() == "db.attempt"),
+                "attempt belongs on each child phase span"
+            );
+        }
         assert_eq!(
             db_acquire_span.span_context.trace_id(),
             db_operation_span.span_context.trace_id()

@@ -397,6 +397,8 @@ impl WorkflowRepository {
     ) -> DbResult<ClaimAuthoritativeTurnResult> {
         const MAX_ATTEMPTS: u32 = 5;
         let operation = DbOperation::ClaimDirectTurn;
+        let operation_span = observability::operation_span(operation);
+        let operation_started = std::time::Instant::now();
         let mut accounting = RetryAccounting::default();
         loop {
             let attempt = accounting.start_attempt();
@@ -405,6 +407,7 @@ impl WorkflowRepository {
                     input,
                     operation,
                     attempt,
+                    &operation_span,
                     MAX_ATTEMPTS,
                     &mut accounting,
                 )
@@ -416,7 +419,26 @@ impl WorkflowRepository {
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
-                result => return result,
+                result => {
+                    let outcome = match &result {
+                        Ok(result) => DbOutcome::from(result.outcome),
+                        Err(DbError::Sqlx(error))
+                            if error
+                                .as_database_error()
+                                .is_some_and(super::is_sqlite_busy_retryable) =>
+                        {
+                            DbOutcome::RetryExhausted
+                        }
+                        Err(_) => DbOutcome::Failure,
+                    };
+                    observability::record_operation(
+                        &operation_span,
+                        outcome,
+                        accounting,
+                        operation_started.elapsed(),
+                    );
+                    return result;
+                }
             }
         }
     }
@@ -426,16 +448,18 @@ impl WorkflowRepository {
         input: &ClaimAuthoritativeTurnInput,
         operation: DbOperation,
         attempt: u32,
+        operation_span: &tracing::Span,
         max_attempts: u32,
         accounting: &mut RetryAccounting,
     ) -> DbResult<ClaimAuthoritativeTurnResult> {
-        let operation_span = observability::operation_span(operation, attempt);
-        let mut connection = self.acquire_observed(operation, &operation_span).await?;
+        let mut connection = self
+            .acquire_observed(operation, attempt, operation_span)
+            .await?;
         let span = observability::transaction_span(
             operation,
             super::DbBeginMode::Deferred,
             attempt,
-            &operation_span,
+            operation_span,
         );
         let started = std::time::Instant::now();
         let result: DbResult<ClaimAuthoritativeTurnResult> = async {

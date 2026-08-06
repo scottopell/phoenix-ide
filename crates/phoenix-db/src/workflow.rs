@@ -432,9 +432,10 @@ impl WorkflowRepository {
     pub(crate) async fn acquire_observed(
         &self,
         operation: DbOperation,
+        attempt: u32,
         parent: &tracing::Span,
     ) -> DbResult<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
-        let acquire_span = observability::acquisition_span(operation, parent);
+        let acquire_span = observability::acquisition_span(operation, attempt, parent);
         let acquire_started = Instant::now();
         let connection = self.pool.acquire().instrument(acquire_span.clone()).await;
         observability::record_acquisition(
@@ -1644,12 +1645,27 @@ impl WorkflowRepository {
     pub async fn begin_attempt(&self, input: &BeginAttemptInput) -> DbResult<BeginAttemptResult> {
         const MAX_ATTEMPTS: u32 = 5;
         let operation = DbOperation::BeginWorkflowAttempt;
+        let operation_span = observability::operation_span(operation);
+        let operation_started = Instant::now();
         let mut accounting = RetryAccounting::default();
 
         loop {
             let attempt = accounting.start_attempt();
-            let operation_span = observability::operation_span(operation, attempt);
-            let mut connection = self.acquire_observed(operation, &operation_span).await?;
+            let mut connection = match self
+                .acquire_observed(operation, attempt, &operation_span)
+                .await
+            {
+                Ok(connection) => connection,
+                Err(error) => {
+                    observability::record_operation(
+                        &operation_span,
+                        DbOutcome::Failure,
+                        accounting,
+                        operation_started.elapsed(),
+                    );
+                    return Err(error);
+                }
+            };
             let span = observability::transaction_span(
                 operation,
                 DbBeginMode::Deferred,
@@ -1684,6 +1700,12 @@ impl WorkflowRepository {
                             started.elapsed(),
                             sqlite,
                         );
+                        observability::record_operation(
+                            &operation_span,
+                            DbOutcome::RetryExhausted,
+                            accounting,
+                            operation_started.elapsed(),
+                        );
                         return Err(DbError::Sqlx(sqlx::Error::Database(error)));
                     }
                     accounting.record_retry();
@@ -1707,6 +1729,12 @@ impl WorkflowRepository {
                         started.elapsed(),
                         None,
                     );
+                    observability::record_operation(
+                        &operation_span,
+                        outcome,
+                        accounting,
+                        operation_started.elapsed(),
+                    );
                     return Ok(result);
                 }
                 Err(error) => {
@@ -1722,6 +1750,12 @@ impl WorkflowRepository {
                         accounting,
                         started.elapsed(),
                         sqlite,
+                    );
+                    observability::record_operation(
+                        &operation_span,
+                        DbOutcome::Failure,
+                        accounting,
+                        operation_started.elapsed(),
                     );
                     return Err(error);
                 }

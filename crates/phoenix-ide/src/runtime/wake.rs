@@ -10,9 +10,9 @@ use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_db::workflow::wake::{
     MaterializePendingDeliveryMessageInput, MaterializePendingDeliveryMessageOutcome,
     WakeAdoptMaterializedPendingOutcome, WakeCancelIfUnresolvedInput, WakeCancellationOutcome,
-    WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationOutcome,
-    WakePendingDelivery, WakePendingGlobalCursor, WakeRegistrationOutcome, WakeRepository,
-    WakeTerminalEvidenceInput, WakeTerminalEvidenceOutcome,
+    WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationLeaseWindow,
+    WakeObservationOutcome, WakePendingDelivery, WakePendingGlobalCursor, WakeRegistrationOutcome,
+    WakeRepository, WakeTerminalEvidenceInput, WakeTerminalEvidenceOutcome,
 };
 use phoenix_db::workflow::LocalAttemptAuthority;
 use phoenix_tools::bash::handle::{FinalCause, HandleState};
@@ -257,13 +257,18 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                         .saturating_add(LEASE_DURATION.as_secs())
                         .min(candidate.expires_at.0.saturating_add(1)),
                 );
+                let Some(lease_window) =
+                    WakeObservationLeaseWindow::new(now, LEASE_DURATION, claim_until)
+                else {
+                    next_wait = Duration::ZERO;
+                    continue;
+                };
                 match self
                     .repo
-                    .claim_observation_if_eligible(
+                    .claim_observation_with_lease_window(
                         candidate.workflow_id,
                         self.process_incarnation,
-                        now,
-                        claim_until,
+                        lease_window,
                     )
                     .await
                     .map_err(|e| e.to_string())?
