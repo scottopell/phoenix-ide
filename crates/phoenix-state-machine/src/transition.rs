@@ -2107,6 +2107,7 @@ pub fn transition_parent(
                     request: request.clone(),
                 }))
                 .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestContinuation {
                     request: request.clone(),
                 }),

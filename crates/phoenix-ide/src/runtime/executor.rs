@@ -4357,6 +4357,9 @@ where
                                 .await?;
                             self.state = persisted.state;
                             self.state_updated_at = persisted.state_updated_at;
+                            self.continuation_effect_disposition =
+                                ContinuationEffectDisposition::AbortRemaining;
+
                             if matches!(
                                 &self.state,
                                 ConvState::AwaitingContinuation { request: persisted_request }
@@ -4537,7 +4540,6 @@ where
                                 ) {
                                     self.state = snapshot.state;
                                     self.state_updated_at = snapshot.state_updated_at;
-                                    let _ = self.broadcast_tx.send_message(message.clone());
                                     let _ = self.broadcast_tx.send_seq(|sequence_id| {
                                         SseEvent::StateChange {
                                             sequence_id,
