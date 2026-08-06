@@ -8,7 +8,7 @@ The queue is FIFO, survives Phoenix restarts (persisted in the `steering_message
 
 **Drain semantics (REQ-STEER-002, REQ-STEER-005):** all queued entries drain together as a batch at each hook point — the queue is never partially drained. There are two hook points:
 
-- **Turn-end drain (REQ-STEER-002):** when the conversation transitions into `Idle` from any other state, every queued entry is delivered and the conversation re-enters `LlmRequesting` to respond.
+- **Turn-end drain (REQ-STEER-002):** when the conversation transitions into `Idle` from any other state, every queued entry is delivered and the conversation re-enters `LlmRequesting` to respond. If executor-channel delivery races that transition, receiving the steer while already `Idle` runs the same drain immediately.
 - **Mid-turn drain (REQ-STEER-005):** when the conversation transitions into `LlmRequesting` from `ToolExecuting` or `AwaitingSubAgents` (i.e., between tool rounds within a single user turn), every queued entry is persisted before the deferred `RequestLlm` starts, so that next call sees the newly drained messages.
 
 Drain-all (rather than one-at-a-time) and the mid-turn hook are deliberate: the user's intent in queuing a steer mid-turn is "interject as soon as possible", not "let the model finish a full round-trip per steer." Coherence of multi-message bursts is a user concern — the queue makes no attempt to pace delivery.
@@ -22,7 +22,9 @@ The queue is **executor-owned, with a typed bedrock event as the delivery contra
 **Bedrock arms accept `SteerDrainedUserMessages`:**
 - From `Idle` (turn-end drain): transitions to `LlmRequesting { attempt: 1 }`, emits one `persist_user_message` per entry in FIFO order, then `PersistState`, then `ClearSteeringQueueEntries { message_ids }`, then `NotifyLlmRequesting`, and finally `RequestLlm`.
 - From `LlmRequesting` (mid-turn drain): stays in `LlmRequesting`, emits one `persist_user_message` per entry in FIFO order, then `PersistState`, then `ClearSteeringQueueEntries { message_ids }`. **No new `RequestLlm`** — the deferred-RequestLlm machinery in the executor (see Drain rule below) issues the LLM call after these persists complete.
-- All other source states: rejected as `InvalidTransition`. The executor only emits the event at the two hook points above, so other source states are unreachable in normal flow.
+- All other source states: rejected as `InvalidTransition`. The executor emits the event only at the two transition hook points or when steer delivery arrives after the idle hook, so other source states are unreachable in normal flow.
+
+The executor also closes the acceptance-to-idle race: if `Event::SteerMessage` arrives after the conversation has already reached `Idle`, it immediately takes the queue and routes `SteerDrainedUserMessages` through the normal idle arm. An accepted prompt therefore cannot remain parked until an unrelated later turn.
 
 Three persistence-ordering rules are load-bearing:
 
@@ -48,6 +50,7 @@ The spec was distilled from a working implementation; all rules and invariants a
 |---|---|---|
 | **EnqueueSteeringMessage** (REQ-STEER-001) | Complete | `crates/phoenix-ide/src/runtime.rs:1140` (`enqueue_steer_message`); persist-before-channel ordering at `:1157-1175` |
 | **DrainOnIdleEntry** (REQ-STEER-002) | Complete | Detector: `crates/phoenix-ide/src/runtime/executor.rs:787` (`maybe_drain_steering_queue`, `entering_idle` branch). Inline processing: `:732` (`run_effects_with_inline_drain`). Bedrock arm: `crates/phoenix-ide/src/state_machine/transition.rs:431` (`(Idle, SteerDrainedUserMessages)` — emits N `persist_user_message`, `PersistState`, `ClearSteeringQueueEntries`, then `RequestLlm`). |
+| **DrainWhenSteerArrivesAfterIdle** | Complete | `ConversationRuntime::process_event` converts a late `SteerMessage` into `SteerDrainedUserMessages` when the executor is already idle, then uses the normal bedrock arm. |
 | **CancelSteeringMessage** (REQ-STEER-003) | Complete | `runtime/executor.rs:552` (in-memory removal); HTTP handler at `api/handlers.rs:1844` (`cancel_steering_message`); route registered at `api/handlers.rs:98` |
 | **TerminalConversationRejectsSteer** (REQ-STEER-004) | Complete | Send path checks `is_terminal` before any queue logic runs |
 | **DrainOnEnteringLlmRound** (REQ-STEER-005) | Complete | Detector: `runtime/executor.rs:787` (`maybe_drain_steering_queue`, `entering_llm_requesting_from_tool_round` branch). Inline processing + deferred-RequestLlm: `:732` (`run_effects_with_inline_drain`). Bedrock arm: `state_machine/transition.rs:454` (`(LlmRequesting, SteerDrainedUserMessages)` — emits N `persist_user_message`, `PersistState`, `ClearSteeringQueueEntries`; no `RequestLlm` — executor's deferred-RequestLlm carries the in-flight call). |

@@ -237,6 +237,28 @@ rule DrainOnIdleEntry {
         -- arm emits persist effects in the same order.
 }
 
+-- A steer may be accepted while the durable state is busy but arrive on the
+-- executor channel after that executor has already reached idle. Treat the
+-- late arrival as the missed idle drain hook rather than waiting for another
+-- unrelated transition.
+rule DrainWhenSteerArrivesAfterIdle {
+    when: SteerMessageReceivedByExecutor(conversation)
+    requires: conversation.core_status = idle
+    for q in SteeringQueue where q.conversation = conversation and q.depth > 0:
+        ensures: q.depth = 0
+        ensures: q.entries.all(e =>
+                     bedrock.UserSendsMessage(conversation,
+                         e.text, e.llm_text, e.images,
+                         e.message_id, e.user_agent, e.skill_invocation))
+        ensures: bedrock.RequestLlmIssued(conversation)
+
+    @guidance
+        -- The executor appends the received entry, atomically takes the full
+        -- queue, and routes SteerDrainedUserMessages through the normal Idle
+        -- bedrock arm. That arm owns transcript persistence, durable queue
+        -- removal, state notification, and the single RequestLlm effect.
+}
+
 -- REQ-STEER-005
 -- When a conversation transitions into llm_requesting from a tool round
 -- (executing_tools or awaiting_sub_agents) and the queue is non-empty,

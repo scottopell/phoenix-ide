@@ -619,8 +619,12 @@ function ConversationPageContent({
     [atom.messages, queuedMessages],
   );
   const pendingMessages = useMemo(
-    () => deriveDisplayedPendingMessages(localPendingMessages, atom.steeringMessages),
-    [atom.steeringMessages, localPendingMessages],
+    () => deriveDisplayedPendingMessages(
+      localPendingMessages,
+      atom.steeringMessages,
+      atom.conversation?.archived === true,
+    ),
+    [atom.conversation?.archived, atom.steeringMessages, localPendingMessages],
   );
 
   const viewableMessages = atom.messages;

@@ -23,13 +23,28 @@ describe('deriveDisplayedPendingMessages', () => {
       text: 'from coordinator',
       images: [],
       files: [],
-    }]);
+    }], false);
 
     expect(displayed.map((message) => [message.localId, message.text])).toEqual([
       ['same-id', 'server copy'],
       ['external-id', 'from coordinator'],
       ['local-only', 'waiting locally'],
     ]);
+  });
+
+  it('does not render queued input for an archived conversation', () => {
+    const displayed = deriveDisplayedPendingMessages(
+      [queued('local-only')],
+      [{
+        message_id: 'server-queued',
+        text: 'will never run',
+        images: [],
+        files: [],
+      }],
+      true,
+    );
+
+    expect(displayed).toEqual([]);
   });
 });
 

@@ -2648,30 +2648,39 @@ where
             self.parent_tool_cycle_count = 0;
         }
 
-        // Steering messages are buffered rather than fed to the state machine.
-        // They are delivered as `UserMessage` when the conversation next enters `Idle`.
-        if let Event::SteerMessage {
-            text,
-            llm_text,
-            images,
-            files,
-            message_id,
-            user_agent,
-            skill_invocation,
-        } = event
-        {
-            let entry = crate::state_machine::event::SteerEntry {
+        // A steer normally waits for the next drain hook. If channel delivery
+        // loses the race with a transition to Idle, drain it immediately so a
+        // successfully accepted prompt cannot wait for an unrelated future turn.
+        let event = match event {
+            Event::SteerMessage {
                 text,
                 llm_text,
                 images,
                 files,
-                message_id: message_id.clone(),
+                message_id,
                 user_agent,
                 skill_invocation,
-            };
-            self.steering_queue.push(entry);
-            return Ok(());
-        }
+            } => {
+                self.steering_queue
+                    .push(crate::state_machine::event::SteerEntry {
+                        text,
+                        llm_text,
+                        images,
+                        files,
+                        message_id,
+                        user_agent,
+                        skill_invocation,
+                    });
+                if matches!(self.state, ConvState::Idle) && !self.context.is_sub_agent {
+                    Event::SteerDrainedUserMessages {
+                        entries: std::mem::take(&mut self.steering_queue),
+                    }
+                } else {
+                    return Ok(());
+                }
+            }
+            event => event,
+        };
 
         // Cancel steering: remove entry from in-memory queue.
         // DB is already updated by the cancel handler before this event arrives.
@@ -10633,6 +10642,19 @@ mod steer_drain_detector_tests {
         }
     }
 
+    fn mk_steer_event(id: &str, text: &str) -> Event {
+        let entry = mk_entry(id, text);
+        Event::SteerMessage {
+            text: entry.text,
+            llm_text: entry.llm_text,
+            images: entry.images,
+            files: entry.files,
+            message_id: entry.message_id,
+            user_agent: entry.user_agent,
+            skill_invocation: entry.skill_invocation,
+        }
+    }
+
     fn mk_tool_executing() -> ConvState {
         ConvState::ToolExecuting {
             current_tool: ToolCall::new(
@@ -10740,6 +10762,27 @@ mod steer_drain_detector_tests {
         );
         // Drain transition lands in LlmRequesting (Idle → LlmRequesting via the
         // SteerDrainedUserMessages arm).
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn steer_arriving_after_idle_drains_immediately() {
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-late-steer", ConvState::Idle, vec![]);
+
+        rt.process_event(mk_steer_event("late-steer", "do this next"))
+            .await
+            .expect("late steer must drain from idle");
+
+        let messages = storage.get_all_messages("conv-late-steer");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["late-steer"]
+        );
+        assert!(rt.steering_queue.is_empty());
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
     }
 

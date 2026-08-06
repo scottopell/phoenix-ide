@@ -72,7 +72,9 @@ export function derivePendingMessages(
 export function deriveDisplayedPendingMessages(
   localPendingMessages: PendingUserMessage[],
   steeringMessages: QueuedSteeringMessage[],
+  conversationArchived: boolean,
 ): PendingUserMessage[] {
+  if (conversationArchived) return [];
   const authoritativeIds = new Set(steeringMessages.map((message) => message.message_id));
   return [
     ...steeringMessages.map((message) => ({
