@@ -116,6 +116,23 @@ describe('useConversationPrStatus', () => {
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('59'));
   });
 
+  it('keeps a safety read authoritative over a later ordinary refresh', async () => {
+    const safety = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockResolvedValueOnce(prStatus(65)).mockReturnValueOnce(safety.promise);
+
+    render(<Probe conversationId="conv-safety-priority" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('65'));
+    screen.getByRole('button', { name: 'Safety refresh' }).click();
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+
+    screen.getByRole('button', { name: 'Refresh' }).click();
+    expect(getPrStatus).toHaveBeenCalledTimes(2);
+
+    safety.resolve(prStatus(66));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('66'));
+  });
+
   it('starts a new read for each state-driven explicit refresh', async () => {
     const earlier = deferred<PrStatusResponse>();
     const later = deferred<PrStatusResponse>();
@@ -221,6 +238,35 @@ describe('useConversationPrStatus', () => {
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('55'));
   });
 
+  it('does not reuse a pre-mutation safety read for post-mutation state', async () => {
+    const safety = deferred<PrStatusResponse>();
+    const afterMutation = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    const resumeInference = api.resumeAssociatedPrInference as ReturnType<typeof vi.fn>;
+    getPrStatus
+      .mockResolvedValueOnce(prStatus(69))
+      .mockReturnValueOnce(safety.promise)
+      .mockReturnValueOnce(afterMutation.promise);
+    resumeInference.mockResolvedValue(undefined);
+
+    render(<Probe conversationId="conv-mutation-safety" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('69'));
+    screen.getByRole('button', { name: 'Safety refresh' }).click();
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+
+    screen.getByRole('button', { name: 'Resume inference' }).click();
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledWith('conv-mutation-safety'));
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      safety.resolve(prStatus(70));
+      await safety.promise;
+    });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('69');
+    afterMutation.resolve(prStatus(71));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('71'));
+  });
+
   it('coalesces a visibility refresh with a scheduled poll', async () => {
     vi.useFakeTimers();
     try {
@@ -244,6 +290,29 @@ describe('useConversationPrStatus', () => {
       });
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it('replaces a stalled in-flight refresh instead of reusing it indefinitely', async () => {
+    const stalled = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValue(40_000);
+    getPrStatus.mockReturnValueOnce(stalled.promise).mockResolvedValueOnce(prStatus(67));
+    try {
+      render(<Probe conversationId="conv-stalled" />);
+      await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(1));
+
+      document.dispatchEvent(new Event('visibilitychange'));
+      await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('67'));
+
+      await act(async () => {
+        stalled.resolve(prStatus(68));
+        await stalled.promise;
+      });
+      expect(screen.getByTestId('pr-number')).toHaveTextContent('67');
+    } finally {
+      dateNow.mockRestore();
     }
   });
 
@@ -283,7 +352,10 @@ describe('useConversationPrStatus', () => {
   });
 
   it('expires routine freshness when the wall clock moves backward', async () => {
-    const dateNow = vi.spyOn(Date, 'now').mockReturnValueOnce(20_000).mockReturnValue(0);
+    const dateNow = vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(20_000)
+      .mockReturnValueOnce(20_000)
+      .mockReturnValue(0);
     try {
       const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
       getPrStatus.mockResolvedValueOnce(prStatus(56)).mockResolvedValueOnce(prStatus(57));
@@ -300,7 +372,10 @@ describe('useConversationPrStatus', () => {
   });
 
   it('expires routine freshness when wall time advances across system sleep', async () => {
-    const dateNow = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValue(20_000);
+    const dateNow = vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(1_000)
+      .mockReturnValueOnce(1_000)
+      .mockReturnValue(20_000);
     try {
       const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
       getPrStatus.mockResolvedValueOnce(prStatus(63)).mockResolvedValueOnce(prStatus(64));

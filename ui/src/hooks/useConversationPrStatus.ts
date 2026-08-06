@@ -158,6 +158,7 @@ function publicStateForScope(
 }
 
 const ROUTINE_REFRESH_FRESHNESS_MS = 10_000;
+const IN_FLIGHT_REUSE_MS = 30_000;
 
 type PrStatusRefreshIntent = 'background' | 'explicit' | 'safety' | 'post-mutation';
 
@@ -178,6 +179,8 @@ export function useConversationPrStatus({
     scopeKey: string;
     seq: number;
     intent: PrStatusRefreshIntent;
+    monotonicStartedAt: number;
+    wallStartedAt: number;
     promise: Promise<PrStatusResponse | undefined>;
   } | null>(null);
   const lastCompletedRef = useRef<{
@@ -206,12 +209,22 @@ export function useConversationPrStatus({
       return Promise.resolve(undefined);
     }
     const current = inFlightRef.current;
-    const currentIsReusable = intent === 'background'
-      && current?.scopeKey === scopeKey
-      && current.seq === latestSeqRef.current;
+    const currentMonotonicAge = current ? performance.now() - current.monotonicStartedAt : -1;
+    const currentWallAge = current ? Date.now() - current.wallStartedAt : -1;
+    const currentIsLive = current?.scopeKey === scopeKey
+      && current.seq === latestSeqRef.current
+      && currentMonotonicAge >= 0
+      && currentWallAge >= 0
+      && currentMonotonicAge < IN_FLIGHT_REUSE_MS
+      && currentWallAge < IN_FLIGHT_REUSE_MS;
+    const currentIsReusable = currentIsLive
+      && (intent === 'background'
+        || (intent === 'explicit' && current?.intent === 'safety'));
     if (currentIsReusable) return current.promise;
 
     const seq = ++latestSeqRef.current;
+    const monotonicStartedAt = performance.now();
+    const wallStartedAt = Date.now();
     inFlightRef.current = null;
     const promise = (async () => {
       try {
@@ -260,7 +273,14 @@ export function useConversationPrStatus({
         }
       }
     })();
-    inFlightRef.current = { scopeKey, seq, intent, promise };
+    inFlightRef.current = {
+      scopeKey,
+      seq,
+      intent,
+      monotonicStartedAt,
+      wallStartedAt,
+      promise,
+    };
     return promise;
   }, [conversationId, scopeKey]);
 
@@ -276,10 +296,6 @@ export function useConversationPrStatus({
 
   const refreshRoutine = useCallback((): Promise<PrStatusResponse | undefined> => {
     if (!scopeKey || activeScopeRef.current !== scopeKey) return Promise.resolve(undefined);
-    if (inFlightRef.current?.scopeKey === scopeKey
-      && inFlightRef.current.seq === latestSeqRef.current) {
-      return inFlightRef.current.promise;
-    }
     const lastCompleted = lastCompletedRef.current;
     if (lastCompleted?.scopeKey === scopeKey) {
       const monotonicElapsed = performance.now() - lastCompleted.monotonicAt;
@@ -315,8 +331,8 @@ export function useConversationPrStatus({
 
     const schedule = () => {
       if (timeout != null) window.clearTimeout(timeout);
-      timeout = window.setTimeout(async () => {
-        await fetchStatus();
+      timeout = window.setTimeout(() => {
+        void fetchStatus();
         if (!cancelled) schedule();
       }, 60_000);
     };
