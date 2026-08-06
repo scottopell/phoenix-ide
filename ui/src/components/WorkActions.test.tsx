@@ -1178,13 +1178,13 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     expect(button.textContent).toMatch(/Capturing/i);
     // Button is disabled while capturing — no double-submit (codex #2).
     expect((screen.getByTestId('address-feedback-button') as HTMLButtonElement).disabled).toBe(true);
-    expect(handle.refresh).not.toHaveBeenCalled();
+    expect(handle.refreshAfterMutation).not.toHaveBeenCalled();
 
     resolveSend();
 
     // Once send completes, PR status refreshes and the label settles back.
     await waitFor(() => {
-      expect(handle.refresh).toHaveBeenCalledTimes(1);
+      expect(handle.refreshAfterMutation).toHaveBeenCalledTimes(1);
     });
     await waitFor(() => {
       expect(screen.getByTestId('address-feedback-button').textContent).toMatch(
