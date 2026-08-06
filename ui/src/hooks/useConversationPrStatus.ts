@@ -19,6 +19,7 @@ type InternalConversationPrStatusState = ConversationPrStatusState & { scopeKey:
 export interface ConversationPrStatusHandle {
   state: ConversationPrStatusState;
   refresh: () => Promise<PrStatusResponse | undefined>;
+  refreshForSafety: () => Promise<PrStatusResponse | undefined>;
   activeSelection?: AssociatedPrStatusEnvelope | null;
   activePrSummary?: AssociatedPrSummaryResponse | null;
   ambiguous?: boolean;
@@ -158,7 +159,7 @@ function publicStateForScope(
 
 const ROUTINE_REFRESH_FRESHNESS_MS = 10_000;
 
-type PrStatusRefreshIntent = 'background' | 'explicit' | 'post-mutation';
+type PrStatusRefreshIntent = 'background' | 'explicit' | 'safety' | 'post-mutation';
 
 export function useConversationPrStatus({
   conversationId,
@@ -265,6 +266,11 @@ export function useConversationPrStatus({
     [startRefresh],
   );
 
+  const refreshForSafety = useCallback(
+    () => startRefresh('safety'),
+    [startRefresh],
+  );
+
   const refreshRoutine = useCallback((): Promise<PrStatusResponse | undefined> => {
     if (!scopeKey || activeScopeRef.current !== scopeKey) return Promise.resolve(undefined);
     if (inFlightRef.current?.scopeKey === scopeKey
@@ -350,6 +356,7 @@ export function useConversationPrStatus({
   return {
     state: publicState,
     refresh,
+    refreshForSafety,
     activeSelection,
     activePrSummary: activePrSummaryFromSelection(activeSelection),
     ambiguous: isSelectionAmbiguous(activeSelection),

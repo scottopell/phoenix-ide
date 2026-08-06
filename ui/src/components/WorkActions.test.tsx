@@ -99,6 +99,7 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
   return {
     state: { status: 'ready' as const, prStatus: committedStatus },
     refresh: vi.fn().mockResolvedValue(committedStatus),
+    refreshForSafety: vi.fn().mockResolvedValue(committedStatus),
     activeSelection: selectionValue,
     activePrSummary: selectionValue?.active_pr
       ? associated.find((pr) => pr.repo_owner === selectionValue.active_pr?.pr.repo_owner
@@ -115,6 +116,7 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
 const loadingPrStatusHandle = {
   state: { status: 'loading' as const, prStatus: null },
   refresh: vi.fn().mockResolvedValue(undefined),
+  refreshForSafety: vi.fn().mockResolvedValue(undefined),
 };
 
 /** Count of glowing primaries across the whole bar — must always be exactly 1
@@ -721,7 +723,7 @@ describe('WorkControlBar — active PR interactions', () => {
       ],
     };
     const handle = prStatusHandle({ found: false }, {
-      refresh: vi.fn().mockResolvedValue(latest),
+      refreshForSafety: vi.fn().mockResolvedValue(latest),
     });
 
     renderWithProviders(
@@ -736,7 +738,7 @@ describe('WorkControlBar — active PR interactions', () => {
 
     fireEvent.click(screen.getByTestId('clean-up-button'));
 
-    await waitFor(() => expect(handle.refresh).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(handle.refreshForSafety).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
     expect(screen.getAllByLabelText(/Mark as merged\. Deletes the worktree/)).toHaveLength(2);
     expect(screen.getAllByText('ⓘ')).toHaveLength(2);

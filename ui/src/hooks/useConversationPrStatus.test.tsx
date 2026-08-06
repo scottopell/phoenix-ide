@@ -60,7 +60,7 @@ function Probe({ conversationId, cached }: { conversationId: string | null; cach
   const associatedCount = handle.activeSelection?.associated_prs.length ?? 0;
   const activePrNumber = handle.activePrSummary?.pr_number ?? 'none';
   const ambiguous = handle.ambiguous ? 'yes' : 'no';
-  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span><span data-testid="ambiguous">{ambiguous}</span><button type="button" onClick={() => void handle.refresh()}>Refresh</button><button type="button" onClick={() => void handle.resumeInference?.()}>Resume inference</button></div>;
+  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span><span data-testid="ambiguous">{ambiguous}</span><button type="button" onClick={() => void handle.refresh()}>Refresh</button><button type="button" onClick={() => void handle.refreshForSafety()}>Safety refresh</button><button type="button" onClick={() => void handle.resumeInference?.()}>Resume inference</button></div>;
 }
 
 describe('useConversationPrStatus', () => {
@@ -88,6 +88,32 @@ describe('useConversationPrStatus', () => {
 
     explicit.resolve(prStatus(41));
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('41'));
+  });
+
+  it('starts a safety read instead of reusing an ordinary explicit read', async () => {
+    const ordinary = deferred<PrStatusResponse>();
+    const safety = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus
+      .mockResolvedValueOnce(prStatus(57))
+      .mockReturnValueOnce(ordinary.promise)
+      .mockReturnValueOnce(safety.promise);
+
+    render(<Probe conversationId="conv-safety" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('57'));
+    screen.getByRole('button', { name: 'Refresh' }).click();
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+
+    screen.getByRole('button', { name: 'Safety refresh' }).click();
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      ordinary.resolve(prStatus(58));
+      await ordinary.promise;
+    });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('57');
+    safety.resolve(prStatus(59));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('59'));
   });
 
   it('starts a valid replacement request after StrictMode invalidates effect setup', async () => {

@@ -272,7 +272,7 @@ export function WorkControlBar({
     disposition.primary === role ? ' work-actions-btn--primary' : '';
 
   const terminalActionStillSafe = async (): Promise<boolean> => {
-    const latest = await prStatusHandle.refresh();
+    const latest = await prStatusHandle.refreshForSafety();
     if (!latest) return false;
     const actionable = (latest.associated_prs ?? []).filter(
       (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
