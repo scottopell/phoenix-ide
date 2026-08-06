@@ -3390,8 +3390,11 @@ impl RuntimeManager {
         conv_id: &str,
         live_state: ConvState,
     ) -> watch::Sender<ConvState> {
-        let (event_tx, mut event_rx) = mpsc::channel(32);
-        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (event_tx, event_rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let _event_rx = event_rx;
+            std::future::pending::<()>().await;
+        });
         let (state_tx, state_rx) = watch::channel(live_state);
         self.runtimes.write().await.insert(
             conv_id.to_string(),
