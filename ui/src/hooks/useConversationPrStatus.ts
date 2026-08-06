@@ -175,6 +175,7 @@ export function useConversationPrStatus({
   cachedPr?: CachedPrSummary | null | undefined;
 }): ConversationPrStatusHandle {
   const latestSeqRef = useRef(0);
+  const activationGenerationRef = useRef(0);
   const activeScopeRef = useRef<string | null>(null);
   const inFlightRef = useRef<{
     scopeKey: string;
@@ -289,14 +290,16 @@ export function useConversationPrStatus({
   );
 
   const refreshForSafety = useCallback(async () => {
+    const activationGeneration = activationGenerationRef.current;
     let result = await startRefresh('safety');
-    while (!result && scopeKey && activeScopeRef.current === scopeKey) {
+    while (!result && scopeKey && activeScopeRef.current === scopeKey
+      && activationGenerationRef.current === activationGeneration) {
       const replacement = inFlightRef.current?.scopeKey === scopeKey
         ? inFlightRef.current.promise
         : null;
       result = replacement ? await replacement : await startRefresh('safety');
     }
-    return result;
+    return activationGenerationRef.current === activationGeneration ? result : undefined;
   }, [scopeKey, startRefresh]);
 
   const refreshRoutine = useCallback((): Promise<PrStatusResponse | undefined> => {
@@ -315,6 +318,7 @@ export function useConversationPrStatus({
   }, [scopeKey, startRefresh]);
 
   useEffect(() => {
+    activationGenerationRef.current += 1;
     latestSeqRef.current += 1;
     activeScopeRef.current = scopeKey;
     if (!scopeKey) {
@@ -349,6 +353,7 @@ export function useConversationPrStatus({
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       cancelled = true;
+      activationGenerationRef.current += 1;
       latestSeqRef.current += 1;
       if (inFlightRef.current?.scopeKey === scopeKey) inFlightRef.current = null;
       if (activeScopeRef.current === scopeKey) activeScopeRef.current = null;

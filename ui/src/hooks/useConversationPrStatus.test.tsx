@@ -145,6 +145,31 @@ describe('useConversationPrStatus', () => {
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('67'));
   });
 
+  it('cancels a safety result after navigating away and back to the same scope', async () => {
+    const oldSafety = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus
+      .mockResolvedValueOnce(prStatus(72))
+      .mockReturnValueOnce(oldSafety.promise)
+      .mockResolvedValueOnce(prStatus(73));
+
+    const { rerender } = render(<Probe conversationId="conv-aba" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('72'));
+    screen.getByRole('button', { name: 'Safety refresh' }).click();
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+
+    rerender(<Probe conversationId={null} />);
+    rerender(<Probe conversationId="conv-aba" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('73'));
+
+    await act(async () => {
+      oldSafety.resolve(prStatus(74));
+      await oldSafety.promise;
+    });
+    expect(getPrStatus).toHaveBeenCalledTimes(3);
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('73');
+  });
+
   it('starts a new read for each state-driven explicit refresh', async () => {
     const earlier = deferred<PrStatusResponse>();
     const later = deferred<PrStatusResponse>();
