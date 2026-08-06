@@ -4318,6 +4318,7 @@ where
                                         operation_id = %request.operation_id,
                                         "continuation start committed ambiguously; resuming persisted operation"
                                     );
+                                    let _ = self.broadcast_tx.send_message(message.clone());
                                     drop(reserved_range);
                                     return Ok(None);
                                 }
