@@ -184,7 +184,7 @@ pub(crate) fn record_operation(
 }
 
 pub(crate) fn record_acquisition(
-    span: &Span,
+    span: Span,
     operation: DbOperation,
     elapsed: Duration,
     success: bool,
@@ -198,6 +198,7 @@ pub(crate) fn record_acquisition(
     span.record("db.outcome", outcome.as_str());
     span.record("db.elapsed_ms", elapsed_ms);
     if !success {
+        let _entered = span.enter();
         tracing::warn!(
             target: "phoenix_db::observability",
             db_operation = operation.as_str(),
@@ -206,6 +207,7 @@ pub(crate) fn record_acquisition(
             "SQLite pool acquisition failed"
         );
     } else if elapsed >= SLOW_ACQUIRE {
+        let _entered = span.enter();
         tracing::warn!(
             target: "phoenix_db::observability",
             db_operation = operation.as_str(),
@@ -214,10 +216,11 @@ pub(crate) fn record_acquisition(
             "slow SQLite pool acquisition"
         );
     }
+    drop(span);
 }
 
 pub(crate) fn record_transaction(
-    span: &Span,
+    span: Span,
     operation: DbOperation,
     outcome: DbOutcome,
     accounting: RetryAccounting,
@@ -234,6 +237,7 @@ pub(crate) fn record_transaction(
     }
 
     if outcome == DbOutcome::ContentionRetry {
+        let _entered = span.enter();
         tracing::info!(
             target: "phoenix_db::observability",
             db_operation = operation.as_str(),
@@ -246,6 +250,7 @@ pub(crate) fn record_transaction(
             "retrying SQLite transaction after contention"
         );
     } else if matches!(outcome, DbOutcome::Failure | DbOutcome::RetryExhausted) {
+        let _entered = span.enter();
         tracing::error!(
             target: "phoenix_db::observability",
             db_operation = operation.as_str(),
@@ -258,6 +263,7 @@ pub(crate) fn record_transaction(
             "SQLite transaction failed"
         );
     } else if elapsed >= SLOW_TRANSACTION {
+        let _entered = span.enter();
         tracing::warn!(
             target: "phoenix_db::observability",
             db_operation = operation.as_str(),
@@ -268,6 +274,7 @@ pub(crate) fn record_transaction(
             "slow SQLite transaction"
         );
     }
+    drop(span);
 }
 
 pub(crate) fn sqlite_class(error: &sqlx::Error) -> Option<SqliteErrorClass> {
@@ -279,6 +286,96 @@ pub(crate) fn sqlite_class(error: &sqlx::Error) -> Option<SqliteErrorClass> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
+
+    #[derive(Clone, Default)]
+    struct PhaseCapture {
+        event_scopes: Arc<Mutex<Vec<Vec<String>>>>,
+        closed_spans: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S> Layer<S> for PhaseCapture
+    where
+        S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+            if event.metadata().target() != "phoenix_db::observability" {
+                return;
+            }
+            let scope = ctx
+                .event_scope(event)
+                .expect("observability event has a current span")
+                .from_root()
+                .map(|span| span.name().to_owned())
+                .collect();
+            self.event_scopes
+                .lock()
+                .expect("event scope capture lock")
+                .push(scope);
+        }
+
+        fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+            let name = ctx.span(&id).expect("closed span exists").name().to_owned();
+            self.closed_spans
+                .lock()
+                .expect("closed span capture lock")
+                .push(name);
+        }
+    }
+
+    #[test]
+    fn exceptional_events_are_emitted_in_the_supplied_phase_span() {
+        let capture = PhaseCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let operation = operation_span(DbOperation::BeginWorkflowAttempt);
+            let acquisition = acquisition_span(DbOperation::BeginWorkflowAttempt, 1, &operation);
+            record_acquisition(
+                acquisition,
+                DbOperation::BeginWorkflowAttempt,
+                Duration::ZERO,
+                false,
+            );
+
+            let transaction = transaction_span(
+                DbOperation::BeginWorkflowAttempt,
+                DbBeginMode::Deferred,
+                1,
+                &operation,
+            );
+            let mut accounting = RetryAccounting::default();
+            accounting.start_attempt();
+            accounting.record_retry();
+            record_transaction(
+                transaction,
+                DbOperation::BeginWorkflowAttempt,
+                DbOutcome::ContentionRetry,
+                accounting,
+                Duration::ZERO,
+                None,
+            );
+        });
+
+        assert_eq!(
+            *capture
+                .event_scopes
+                .lock()
+                .expect("event scope capture lock"),
+            [
+                vec!["db.operation".to_owned(), "db.pool.acquire".to_owned()],
+                vec!["db.operation".to_owned(), "db.transaction".to_owned()],
+            ]
+        );
+        assert_eq!(
+            *capture
+                .closed_spans
+                .lock()
+                .expect("closed span capture lock"),
+            ["db.pool.acquire", "db.transaction", "db.operation"]
+        );
+    }
 
     #[test]
     fn telemetry_vocabulary_is_bounded_and_stable() {

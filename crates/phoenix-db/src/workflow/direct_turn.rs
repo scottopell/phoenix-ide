@@ -753,7 +753,7 @@ impl WorkflowRepository {
             Err(_) => (DbOutcome::Failure, None),
         };
         observability::record_transaction(
-            &span,
+            span,
             operation,
             outcome,
             *accounting,

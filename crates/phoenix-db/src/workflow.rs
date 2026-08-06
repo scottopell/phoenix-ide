@@ -439,7 +439,7 @@ impl WorkflowRepository {
         let acquire_started = Instant::now();
         let connection = self.pool.acquire().instrument(acquire_span.clone()).await;
         observability::record_acquisition(
-            &acquire_span,
+            acquire_span,
             operation,
             acquire_started.elapsed(),
             connection.is_ok(),
@@ -1733,7 +1733,7 @@ impl WorkflowRepository {
                     let sqlite = SqliteErrorClass::from_database_error(error.as_ref());
                     if attempt == MAX_ATTEMPTS {
                         observability::record_transaction(
-                            &span,
+                            span,
                             operation,
                             DbOutcome::RetryExhausted,
                             accounting,
@@ -1750,7 +1750,7 @@ impl WorkflowRepository {
                     }
                     accounting.record_retry();
                     observability::record_transaction(
-                        &span,
+                        span,
                         operation,
                         DbOutcome::ContentionRetry,
                         accounting,
@@ -1762,7 +1762,7 @@ impl WorkflowRepository {
                 Ok(result) => {
                     let outcome = DbOutcome::from(result.outcome);
                     observability::record_transaction(
-                        &span,
+                        span,
                         operation,
                         outcome,
                         accounting,
@@ -1784,7 +1784,7 @@ impl WorkflowRepository {
                         None
                     };
                     observability::record_transaction(
-                        &span,
+                        span,
                         operation,
                         DbOutcome::Failure,
                         accounting,

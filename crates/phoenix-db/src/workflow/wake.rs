@@ -802,7 +802,7 @@ impl WakeRepository {
         now: Timestamp,
         lease_until: phoenix_workflow::LeaseExpiry,
     ) -> DbResult<WakeObservationOutcome> {
-        let Some(lease_window) = WakeObservationLeaseWindow::database_timed(
+        let Some(lease_window) = WakeObservationLeaseWindow::new(
             now,
             Duration::from_secs(lease_until.0.saturating_sub(now.0)),
             lease_until,
@@ -1071,7 +1071,7 @@ impl WakeRepository {
             Err(_) => (DbOutcome::Failure, None),
         };
         observability::record_transaction(
-            &span,
+            span,
             operation,
             outcome,
             *accounting,
@@ -5048,6 +5048,31 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compatibility_claim_uses_the_callers_timestamp_domain() {
+        let (_dir, repo, _other) = open_repo_pair().await;
+        let workflow_id = WorkflowId(1);
+        let input = intent();
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &input, "fp-1", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        assert!(matches!(
+            repo.claim_observation_if_eligible(
+                workflow_id,
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap(),
+            WakeObservationOutcome::Started { .. }
+        ));
     }
 
     fn unwrap_started(outcome: super::WakeObservationOutcome) -> super::BeginAttemptResult {
