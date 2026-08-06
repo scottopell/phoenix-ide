@@ -429,6 +429,23 @@ impl WorkflowRepository {
         Ok(WorkflowTx::new(self.pool.begin().await?))
     }
 
+    pub(crate) async fn acquire_observed(
+        &self,
+        operation: DbOperation,
+        parent: &tracing::Span,
+    ) -> DbResult<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
+        let acquire_span = observability::acquisition_span(operation, parent);
+        let acquire_started = Instant::now();
+        let connection = self.pool.acquire().instrument(acquire_span.clone()).await;
+        observability::record_acquisition(
+            &acquire_span,
+            operation,
+            acquire_started.elapsed(),
+            connection.is_ok(),
+        );
+        connection.map_err(Into::into)
+    }
+
     pub(crate) async fn begin_immediate_tx(&self) -> DbResult<WorkflowTx<'_>> {
         Ok(WorkflowTx::new(
             self.pool.begin_with("BEGIN IMMEDIATE").await?,
@@ -806,9 +823,8 @@ impl<'a> WorkflowTx<'a> {
         match insert_attempt {
             Ok(_) => {}
             Err(sqlx::Error::Database(error))
-                if is_sqlite_busy_retryable(error.as_ref())
-                    || is_sqlite_unique_constraint(error.as_ref())
-                    || is_sqlite_primary_key_constraint(error.as_ref()) =>
+                if classify_attempt_insert_error_code(error.code().as_deref())
+                    == AttemptInsertErrorClass::AuthorityConflict =>
             {
                 return Ok(BeginAttemptResult {
                     outcome: ClaimOutcome::AuthorityConflict,
@@ -1243,22 +1259,37 @@ async fn insert_external_acceptance_binding_tx(
 const SQLITE_CONSTRAINT_UNIQUE: &str = "2067";
 const SQLITE_CONSTRAINT_PRIMARYKEY: &str = "1555";
 const SQLITE_BUSY: &str = "5";
+const SQLITE_BUSY_SNAPSHOT: &str = "517";
 const DIRECT_TURN_PROFILE_KIND: &str = "direct_turn";
 
-fn sqlite_error_code_is(error: &dyn DatabaseError, expected: &str) -> bool {
-    error.code().as_deref() == Some(expected)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptInsertErrorClass {
+    AuthorityConflict,
+    Contention,
+    Other,
+}
+
+fn classify_attempt_insert_error_code(code: Option<&str>) -> AttemptInsertErrorClass {
+    match code {
+        Some(SQLITE_CONSTRAINT_UNIQUE | SQLITE_CONSTRAINT_PRIMARYKEY) => {
+            AttemptInsertErrorClass::AuthorityConflict
+        }
+        Some(SQLITE_BUSY | SQLITE_BUSY_SNAPSHOT) => AttemptInsertErrorClass::Contention,
+        _ => AttemptInsertErrorClass::Other,
+    }
 }
 
 fn is_sqlite_unique_constraint(error: &dyn DatabaseError) -> bool {
-    sqlite_error_code_is(error, SQLITE_CONSTRAINT_UNIQUE)
+    error.code().as_deref() == Some(SQLITE_CONSTRAINT_UNIQUE)
 }
 
 fn is_sqlite_primary_key_constraint(error: &dyn DatabaseError) -> bool {
-    sqlite_error_code_is(error, SQLITE_CONSTRAINT_PRIMARYKEY)
+    error.code().as_deref() == Some(SQLITE_CONSTRAINT_PRIMARYKEY)
 }
 
 fn is_sqlite_busy_retryable(error: &dyn DatabaseError) -> bool {
-    sqlite_error_code_is(error, SQLITE_BUSY) || error.code().as_deref() == Some("517")
+    classify_attempt_insert_error_code(error.code().as_deref())
+        == AttemptInsertErrorClass::Contention
 }
 
 async fn workflow_profile_kind(
@@ -1617,15 +1648,30 @@ impl WorkflowRepository {
 
         loop {
             let attempt = accounting.start_attempt();
-            let span = observability::transaction_span(operation, DbBeginMode::Deferred, attempt);
+            let operation_span = observability::operation_span(operation, attempt);
+            let mut connection = self.acquire_observed(operation, &operation_span).await?;
+            let span = observability::transaction_span(
+                operation,
+                DbBeginMode::Deferred,
+                attempt,
+                &operation_span,
+            );
             let started = Instant::now();
-            let result = self
-                .begin_attempt_once(input, operation)
-                .instrument(span.clone())
-                .await;
+            let result = async {
+                let mut tx = WorkflowTx::new(connection.begin().await?);
+                let result = tx.begin_attempt(input).await?;
+                if result.outcome == ClaimOutcome::Started {
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                }
+                Ok(result)
+            }
+            .instrument(span.clone())
+            .await;
 
             match result {
-                Err(DbError::Sqlx(sqlx::Error::Database(ref error)))
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
                     if is_sqlite_busy_retryable(error.as_ref()) =>
                 {
                     let sqlite = SqliteErrorClass::from_database_error(error.as_ref());
@@ -1638,11 +1684,7 @@ impl WorkflowRepository {
                             started.elapsed(),
                             sqlite,
                         );
-                        return Ok(BeginAttemptResult {
-                            outcome: ClaimOutcome::AuthorityConflict,
-                            authority: None,
-                            attempt: None,
-                        });
+                        return Err(DbError::Sqlx(sqlx::Error::Database(error)));
                     }
                     accounting.record_retry();
                     observability::record_transaction(
@@ -1653,14 +1695,10 @@ impl WorkflowRepository {
                         started.elapsed(),
                         sqlite,
                     );
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 Ok(result) => {
-                    let outcome = if result.outcome == ClaimOutcome::Started {
-                        DbOutcome::Success
-                    } else {
-                        DbOutcome::AuthorityConflict
-                    };
+                    let outcome = DbOutcome::from(result.outcome);
                     observability::record_transaction(
                         &span,
                         operation,
@@ -1689,31 +1727,6 @@ impl WorkflowRepository {
                 }
             }
         }
-    }
-
-    async fn begin_attempt_once(
-        &self,
-        input: &BeginAttemptInput,
-        operation: DbOperation,
-    ) -> DbResult<BeginAttemptResult> {
-        let acquire_span = observability::acquisition_span(operation);
-        let acquire_started = Instant::now();
-        let connection = self.pool.acquire().instrument(acquire_span.clone()).await;
-        observability::record_acquisition(
-            &acquire_span,
-            operation,
-            acquire_started.elapsed(),
-            connection.is_ok(),
-        );
-        let mut connection = connection?;
-        let mut tx = WorkflowTx::new(connection.begin().await?);
-        let result = tx.begin_attempt(input).await?;
-        if result.outcome == ClaimOutcome::Started {
-            tx.commit().await?;
-        } else {
-            tx.rollback().await?;
-        }
-        Ok(result)
     }
 
     pub async fn renew_lease_exact(&self, input: &RenewLeaseInput) -> DbResult<AuthorityOutcome> {
@@ -2777,6 +2790,34 @@ mod tests {
     };
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
+
+    #[test]
+    fn attempt_insert_error_classification_distinguishes_contention_from_uniqueness() {
+        assert_eq!(
+            classify_attempt_insert_error_code(Some(SQLITE_CONSTRAINT_UNIQUE)),
+            AttemptInsertErrorClass::AuthorityConflict
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(Some(SQLITE_CONSTRAINT_PRIMARYKEY)),
+            AttemptInsertErrorClass::AuthorityConflict
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(Some(SQLITE_BUSY)),
+            AttemptInsertErrorClass::Contention
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(Some(SQLITE_BUSY_SNAPSHOT)),
+            AttemptInsertErrorClass::Contention
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(Some("787")),
+            AttemptInsertErrorClass::Other
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(None),
+            AttemptInsertErrorClass::Other
+        );
+    }
 
     fn profile() -> ProfileRef {
         ProfileRef {

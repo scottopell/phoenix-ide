@@ -8,6 +8,7 @@ use super::{
     LocalReceiptRecord, RecordObservationInput, RenewLeaseInput, WorkflowRepository,
     WorkflowSequenceName, WorkflowTx,
 };
+use crate::observability::{self, DbOperation, DbOutcome, RetryAccounting};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
@@ -25,12 +26,13 @@ use phoenix_workflow::{
     RuntimeAcceptanceStatus, Timestamp, TransitionId, Version, WorkflowId, WorkflowStatus,
 };
 use serde::Serialize;
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 #[cfg(test)]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex, OnceLock,
 };
+use tracing::Instrument;
 
 #[cfg(test)]
 type FailpointKey = (u64, u64);
@@ -729,26 +731,33 @@ impl WakeRepository {
         now: Timestamp,
         lease_until: phoenix_workflow::LeaseExpiry,
     ) -> DbResult<WakeObservationOutcome> {
-        for _ in 0..20 {
-            match self
+        const MAX_ATTEMPTS: u32 = 21;
+        let operation = DbOperation::ClaimWakeObservation;
+        let mut accounting = RetryAccounting::default();
+        loop {
+            let attempt = accounting.start_attempt();
+            let result = self
                 .claim_observation_if_eligible_once(
                     workflow_id,
                     process_incarnation,
                     now,
                     lease_until,
+                    operation,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    &mut accounting,
                 )
-                .await
-            {
+                .await;
+            match result {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                    if super::is_sqlite_busy_retryable(error.as_ref())
+                        && attempt < MAX_ATTEMPTS =>
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 result => return result,
             }
         }
-        self.claim_observation_if_eligible_once(workflow_id, process_incarnation, now, lease_until)
-            .await
     }
 
     async fn claim_observation_if_eligible_once(
@@ -757,8 +766,25 @@ impl WakeRepository {
         process_incarnation: ProcessIncarnation,
         now: Timestamp,
         lease_until: phoenix_workflow::LeaseExpiry,
+        operation: DbOperation,
+        attempt: u32,
+        max_attempts: u32,
+        accounting: &mut RetryAccounting,
     ) -> DbResult<WakeObservationOutcome> {
-        let mut tx = self.workflow_repo.begin_tx().await?;
+        let operation_span = observability::operation_span(operation, attempt);
+        let mut connection = self
+            .workflow_repo
+            .acquire_observed(operation, &operation_span)
+            .await?;
+        let span = observability::transaction_span(
+            operation,
+            super::DbBeginMode::Deferred,
+            attempt,
+            &operation_span,
+        );
+        let started = std::time::Instant::now();
+        let result: DbResult<WakeObservationOutcome> = async {
+            let mut tx = WorkflowTx::new(connection.begin().await?);
         let effect = sqlx::query(
             "SELECT status FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2",
         )
@@ -878,6 +904,43 @@ impl WakeRepository {
                 Ok(WakeObservationOutcome::Ineligible)
             }
         }
+        }
+        .instrument(span.clone())
+        .await;
+        let (outcome, sqlite) = match &result {
+            Ok(WakeObservationOutcome::Started { canonical }) => {
+                (DbOutcome::from(canonical.outcome), None)
+            }
+            Ok(WakeObservationOutcome::Busy { .. }) => (DbOutcome::AuthorityConflict, None),
+            Ok(WakeObservationOutcome::Ineligible) => (DbOutcome::Ineligible, None),
+            Err(DbError::Sqlx(error)) => {
+                let sqlite = observability::sqlite_class(error);
+                let outcome = if error
+                    .as_database_error()
+                    .is_some_and(super::is_sqlite_busy_retryable)
+                {
+                    if attempt < max_attempts {
+                        accounting.record_retry();
+                        DbOutcome::ContentionRetry
+                    } else {
+                        DbOutcome::RetryExhausted
+                    }
+                } else {
+                    DbOutcome::Failure
+                };
+                (outcome, sqlite)
+            }
+            Err(_) => (DbOutcome::Failure, None),
+        };
+        observability::record_transaction(
+            &span,
+            operation,
+            outcome,
+            *accounting,
+            started.elapsed(),
+            sqlite,
+        );
+        result
     }
 
     pub async fn renew_observation_lease(

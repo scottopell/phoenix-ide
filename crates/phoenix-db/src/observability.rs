@@ -11,12 +11,16 @@ pub(crate) const SLOW_TRANSACTION: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbOperation {
     BeginWorkflowAttempt,
+    ClaimDirectTurn,
+    ClaimWakeObservation,
 }
 
 impl DbOperation {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::BeginWorkflowAttempt => "workflow.begin_attempt",
+            Self::ClaimDirectTurn => "workflow.claim_direct_turn",
+            Self::ClaimWakeObservation => "workflow.claim_wake_observation",
         }
     }
 }
@@ -24,7 +28,9 @@ impl DbOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbOutcome {
     Success,
+    Ineligible,
     AuthorityConflict,
+    UnsupportedCodec,
     ContentionRetry,
     RetryExhausted,
     Failure,
@@ -34,10 +40,23 @@ impl DbOutcome {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::Ineligible => "ineligible",
             Self::AuthorityConflict => "authority_conflict",
+            Self::UnsupportedCodec => "unsupported_codec",
             Self::ContentionRetry => "contention_retry",
             Self::RetryExhausted => "retry_exhausted",
             Self::Failure => "failure",
+        }
+    }
+}
+
+impl From<phoenix_workflow::ClaimOutcome> for DbOutcome {
+    fn from(outcome: phoenix_workflow::ClaimOutcome) -> Self {
+        match outcome {
+            phoenix_workflow::ClaimOutcome::Started => Self::Success,
+            phoenix_workflow::ClaimOutcome::Ineligible => Self::Ineligible,
+            phoenix_workflow::ClaimOutcome::AuthorityConflict => Self::AuthorityConflict,
+            phoenix_workflow::ClaimOutcome::UnsupportedCodec => Self::UnsupportedCodec,
         }
     }
 }
@@ -100,9 +119,20 @@ impl RetryAccounting {
     }
 }
 
-pub(crate) fn acquisition_span(operation: DbOperation) -> Span {
+pub(crate) fn operation_span(operation: DbOperation, attempt: u32) -> Span {
     tracing::info_span!(
         target: "phoenix_db::otel",
+        "db.operation",
+        db.system = "sqlite",
+        db.operation = operation.as_str(),
+        db.attempt = attempt,
+    )
+}
+
+pub(crate) fn acquisition_span(operation: DbOperation, parent: &Span) -> Span {
+    tracing::info_span!(
+        target: "phoenix_db::otel",
+        parent: parent,
         "db.pool.acquire",
         db.system = "sqlite",
         db.operation = operation.as_str(),
@@ -115,9 +145,11 @@ pub(crate) fn transaction_span(
     operation: DbOperation,
     begin_mode: DbBeginMode,
     attempt: u32,
+    parent: &Span,
 ) -> Span {
     tracing::info_span!(
         target: "phoenix_db::otel",
+        parent: parent,
         "db.transaction",
         db.system = "sqlite",
         db.operation = operation.as_str(),
@@ -241,6 +273,25 @@ mod tests {
         assert_eq!(DbBeginMode::Deferred.as_str(), "deferred");
         assert_eq!(DbOutcome::ContentionRetry.as_str(), "contention_retry");
         assert_eq!(DbOutcome::RetryExhausted.as_str(), "retry_exhausted");
+    }
+
+    #[test]
+    fn classifies_every_claim_outcome_without_collapsing_ineligible() {
+        use phoenix_workflow::ClaimOutcome;
+
+        assert_eq!(DbOutcome::from(ClaimOutcome::Started), DbOutcome::Success);
+        assert_eq!(
+            DbOutcome::from(ClaimOutcome::Ineligible),
+            DbOutcome::Ineligible
+        );
+        assert_eq!(
+            DbOutcome::from(ClaimOutcome::AuthorityConflict),
+            DbOutcome::AuthorityConflict
+        );
+        assert_eq!(
+            DbOutcome::from(ClaimOutcome::UnsupportedCodec),
+            DbOutcome::UnsupportedCodec
+        );
     }
 
     #[test]

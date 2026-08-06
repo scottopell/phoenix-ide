@@ -1,4 +1,5 @@
 use super::WorkflowRepository;
+use crate::observability::{self, DbOperation, DbOutcome, RetryAccounting};
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
@@ -16,7 +17,8 @@ use phoenix_workflow::{
     TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep, TurnTerminal, Version,
     WorkflowId, WorkflowStatus,
 };
-use sqlx::Row;
+use sqlx::{Acquire, Row};
+use tracing::Instrument;
 
 use super::{
     CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, DeliveryResolutionDecision,
@@ -393,22 +395,123 @@ impl WorkflowRepository {
         &self,
         input: &ClaimAuthoritativeTurnInput,
     ) -> DbResult<ClaimAuthoritativeTurnResult> {
-        let mut tx = self.begin_tx().await?;
-        let Some(canonical_turn) =
-            load_turn_for_workflow_tx(&self.pool, &mut tx.tx, input.turn_id, input.workflow_id)
-                .await?
-        else {
-            tx.rollback().await?;
-            return Ok(ClaimAuthoritativeTurnResult {
-                outcome: ClaimOutcome::Ineligible,
-                authority: None,
-                attempt: None,
-                canonical_turn: None,
-            });
-        };
-        let Some(existing_live_attempt) =
-            load_live_attempt_tx(&mut tx.tx, input.workflow_id, DIRECT_TURN_EFFECT_ID).await?
-        else {
+        const MAX_ATTEMPTS: u32 = 5;
+        let operation = DbOperation::ClaimDirectTurn;
+        let mut accounting = RetryAccounting::default();
+        loop {
+            let attempt = accounting.start_attempt();
+            let result = self
+                .claim_authoritative_turn_once(
+                    input,
+                    operation,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    &mut accounting,
+                )
+                .await;
+            match result {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref())
+                        && attempt < MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn claim_authoritative_turn_once(
+        &self,
+        input: &ClaimAuthoritativeTurnInput,
+        operation: DbOperation,
+        attempt: u32,
+        max_attempts: u32,
+        accounting: &mut RetryAccounting,
+    ) -> DbResult<ClaimAuthoritativeTurnResult> {
+        let operation_span = observability::operation_span(operation, attempt);
+        let mut connection = self.acquire_observed(operation, &operation_span).await?;
+        let span = observability::transaction_span(
+            operation,
+            super::DbBeginMode::Deferred,
+            attempt,
+            &operation_span,
+        );
+        let started = std::time::Instant::now();
+        let result: DbResult<ClaimAuthoritativeTurnResult> = async {
+            let mut tx = super::WorkflowTx::new(connection.begin().await?);
+            let Some(canonical_turn) =
+                load_turn_for_workflow_tx(&self.pool, &mut tx.tx, input.turn_id, input.workflow_id)
+                    .await?
+            else {
+                tx.rollback().await?;
+                return Ok(ClaimAuthoritativeTurnResult {
+                    outcome: ClaimOutcome::Ineligible,
+                    authority: None,
+                    attempt: None,
+                    canonical_turn: None,
+                });
+            };
+            let Some(existing_live_attempt) =
+                load_live_attempt_tx(&mut tx.tx, input.workflow_id, DIRECT_TURN_EFFECT_ID).await?
+            else {
+                let attempt_id = next_attempt_id_tx(&mut tx).await?;
+                let result = tx
+                    .begin_attempt(&super::BeginAttemptInput {
+                        workflow_id: input.workflow_id,
+                        effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                        attempt_id,
+                        process_incarnation: input.process_incarnation,
+                        now: input.now,
+                        lease_until: Some(input.lease_until),
+                    })
+                    .await?;
+                if result.outcome == ClaimOutcome::Started {
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                }
+                return Ok(ClaimAuthoritativeTurnResult {
+                    outcome: result.outcome,
+                    authority: result.authority,
+                    attempt: result.attempt,
+                    canonical_turn: Some(canonical_turn),
+                });
+            };
+            if let Some(lease_until) = existing_live_attempt
+                .lease
+                .as_ref()
+                .map(|lease| lease.lease_until)
+            {
+                if lease_until.is_live_at(input.now) {
+                    tx.rollback().await?;
+                    return Ok(ClaimAuthoritativeTurnResult {
+                        outcome: ClaimOutcome::AuthorityConflict,
+                        authority: None,
+                        attempt: None,
+                        canonical_turn: Some(canonical_turn),
+                    });
+                }
+            }
+            let expired = expire_direct_turn_lease_in_tx(
+                &mut tx,
+                &super::ExpireLeaseInput {
+                    workflow_id: input.workflow_id,
+                    effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                    attempt_id: existing_live_attempt.id,
+                    now: input.now,
+                },
+            )
+            .await?;
+            if expired != AuthorityOutcome::Authorized {
+                tx.rollback().await?;
+                return Ok(ClaimAuthoritativeTurnResult {
+                    outcome: ClaimOutcome::Ineligible,
+                    authority: None,
+                    attempt: None,
+                    canonical_turn: Some(canonical_turn),
+                });
+            }
             let attempt_id = next_attempt_id_tx(&mut tx).await?;
             let result = tx
                 .begin_attempt(&super::BeginAttemptInput {
@@ -425,69 +528,45 @@ impl WorkflowRepository {
             } else {
                 tx.rollback().await?;
             }
-            return Ok(ClaimAuthoritativeTurnResult {
+            Ok(ClaimAuthoritativeTurnResult {
                 outcome: result.outcome,
                 authority: result.authority,
                 attempt: result.attempt,
                 canonical_turn: Some(canonical_turn),
-            });
-        };
-        if let Some(lease_until) = existing_live_attempt
-            .lease
-            .as_ref()
-            .map(|lease| lease.lease_until)
-        {
-            if lease_until.is_live_at(input.now) {
-                tx.rollback().await?;
-                return Ok(ClaimAuthoritativeTurnResult {
-                    outcome: ClaimOutcome::AuthorityConflict,
-                    authority: None,
-                    attempt: None,
-                    canonical_turn: Some(canonical_turn),
-                });
-            }
-        }
-        let expired = expire_direct_turn_lease_in_tx(
-            &mut tx,
-            &super::ExpireLeaseInput {
-                workflow_id: input.workflow_id,
-                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
-                attempt_id: existing_live_attempt.id,
-                now: input.now,
-            },
-        )
-        .await?;
-        if expired != AuthorityOutcome::Authorized {
-            tx.rollback().await?;
-            return Ok(ClaimAuthoritativeTurnResult {
-                outcome: ClaimOutcome::Ineligible,
-                authority: None,
-                attempt: None,
-                canonical_turn: Some(canonical_turn),
-            });
-        }
-        let attempt_id = next_attempt_id_tx(&mut tx).await?;
-        let result = tx
-            .begin_attempt(&super::BeginAttemptInput {
-                workflow_id: input.workflow_id,
-                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
-                attempt_id,
-                process_incarnation: input.process_incarnation,
-                now: input.now,
-                lease_until: Some(input.lease_until),
             })
-            .await?;
-        if result.outcome == ClaimOutcome::Started {
-            tx.commit().await?;
-        } else {
-            tx.rollback().await?;
         }
-        Ok(ClaimAuthoritativeTurnResult {
-            outcome: result.outcome,
-            authority: result.authority,
-            attempt: result.attempt,
-            canonical_turn: Some(canonical_turn),
-        })
+        .instrument(span.clone())
+        .await;
+        let (outcome, sqlite) = match &result {
+            Ok(result) => (DbOutcome::from(result.outcome), None),
+            Err(DbError::Sqlx(error)) => {
+                let sqlite = observability::sqlite_class(error);
+                let outcome = if error
+                    .as_database_error()
+                    .is_some_and(super::is_sqlite_busy_retryable)
+                {
+                    if attempt < max_attempts {
+                        accounting.record_retry();
+                        DbOutcome::ContentionRetry
+                    } else {
+                        DbOutcome::RetryExhausted
+                    }
+                } else {
+                    DbOutcome::Failure
+                };
+                (outcome, sqlite)
+            }
+            Err(_) => (DbOutcome::Failure, None),
+        };
+        observability::record_transaction(
+            &span,
+            operation,
+            outcome,
+            *accounting,
+            started.elapsed(),
+            sqlite,
+        );
+        result
     }
 
     pub async fn release_authoritative_turn_dispatch_failure(
