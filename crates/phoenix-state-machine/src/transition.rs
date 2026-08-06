@@ -2917,12 +2917,13 @@ pub fn transition_parent(
             ParentEvent::Core(CoreEvent::ContinuationFailed {
                 operation_id,
                 error,
+                error_kind,
             }),
         ) if request.operation_id == operation_id => Ok(ParentTransitionResult::new(
             ParentState::Core(CoreState::RecoverableContinuationFailure {
                 failure: crate::state::RecoverableContinuationFailure {
                     request: request.clone(),
-                    error_kind: ErrorKind::ContextExhausted,
+                    error_kind,
                     message: error,
                 },
             }),

@@ -80,21 +80,6 @@ pub type TurnTriggerSlot = Arc<Mutex<Option<opentelemetry::trace::SpanContext>>>
 /// the `TraceLayer` span). Overwrites only when a real exportable span is
 /// current — internal callers with no ambient span (or with tracing export
 /// disabled) never clear a trigger already deposited for a queued event.
-fn continuation_operation_is_awaiting(state: &ConvState, operation_id: &str) -> bool {
-    matches!(
-        state,
-        ConvState::AwaitingContinuation { request } if request.operation_id == operation_id
-    )
-}
-
-fn continuation_operation_is_recoverable(state: &ConvState, operation_id: &str) -> bool {
-    matches!(
-        state,
-        ConvState::RecoverableContinuationFailure { failure }
-            if failure.request.operation_id == operation_id
-    )
-}
-
 fn deposit_turn_trigger(handle: &ConversationHandle) {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -300,6 +285,8 @@ enum BashLifecycleBridgeAction {
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
+    pub continuation_admission_tx:
+        mpsc::Sender<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
     /// the turn the event starts can link back to it.
@@ -2574,6 +2561,7 @@ impl RuntimeManager {
         // so the first non-message event is ordered strictly after it.
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1);
+        let (continuation_admission_tx, continuation_admission_rx) = mpsc::channel(1);
 
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
@@ -2611,6 +2599,7 @@ impl RuntimeManager {
         )
         .with_wake_registrar(self.wake_registrar())
         .with_parent(parent_event_tx.clone())
+        .with_continuation_admission_receiver(continuation_admission_rx)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
@@ -2636,6 +2625,7 @@ impl RuntimeManager {
             conv.id.clone(),
             ConversationHandle {
                 event_tx: event_tx.clone(),
+                continuation_admission_tx,
                 turn_trigger,
                 broadcast_tx: broadcaster.clone(),
                 identity: sub_agent_identity.clone(),
@@ -3011,6 +3001,7 @@ impl RuntimeManager {
         }
 
         let (event_tx, event_rx) = mpsc::channel(32);
+        let (continuation_admission_tx, continuation_admission_rx) = mpsc::channel(1);
         tracing::debug!(
             conv_id = %conversation_id,
             receivers = broadcaster.receiver_count(),
@@ -3215,6 +3206,7 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         );
+        let runtime = runtime.with_continuation_admission_receiver(continuation_admission_rx);
         let runtime = if is_coordinator {
             runtime.with_coordinator_read_service(crate::api::global_read::GlobalReadService::new(
                 self.db.clone(),
@@ -3301,6 +3293,7 @@ impl RuntimeManager {
         let cleanup_identity = identity.clone();
         let handle = ConversationHandle {
             event_tx: event_tx.clone(),
+            continuation_admission_tx: continuation_admission_tx.clone(),
             turn_trigger: turn_trigger.clone(),
             broadcast_tx: broadcaster.clone(),
             identity: identity.clone(),
@@ -3325,6 +3318,7 @@ impl RuntimeManager {
                 conversation_id.to_string(),
                 ConversationHandle {
                     event_tx,
+                    continuation_admission_tx,
                     turn_trigger,
                     broadcast_tx: broadcaster,
                     identity,
@@ -3373,6 +3367,7 @@ impl RuntimeManager {
     #[cfg(test)]
     pub(crate) async fn inject_handle_for_test(&self, conv_id: &str, live_state: ConvState) {
         let (event_tx, event_rx) = mpsc::channel(32);
+        let (continuation_admission_tx, _continuation_admission_rx) = mpsc::channel(1);
         // Keep the receiver alive so sends into event_tx succeed (a dropped
         // receiver closes the channel and causes `enqueue_steer_message` to err).
         tokio::spawn(async move {
@@ -3384,37 +3379,13 @@ impl RuntimeManager {
             conv_id.to_string(),
             ConversationHandle {
                 event_tx,
+                continuation_admission_tx,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
             },
         );
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn inject_handle_with_state_sender_for_test(
-        &self,
-        conv_id: &str,
-        live_state: ConvState,
-    ) -> watch::Sender<ConvState> {
-        let (event_tx, event_rx) = mpsc::channel(32);
-        tokio::spawn(async move {
-            let _event_rx = event_rx;
-            std::future::pending::<()>().await;
-        });
-        let (state_tx, state_rx) = watch::channel(live_state);
-        self.runtimes.write().await.insert(
-            conv_id.to_string(),
-            ConversationHandle {
-                event_tx,
-                turn_trigger: TurnTriggerSlot::default(),
-                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
-                identity: Arc::new(()),
-                state_rx,
-            },
-        );
-        state_tx
     }
 
     /// Evict an active runtime so it gets recreated with fresh config on next access.
@@ -3490,8 +3461,7 @@ impl RuntimeManager {
         operation_id: String,
     ) -> Result<(), String> {
         let handle = self.get_or_create(conversation_id).await?;
-        let mut state_rx = handle.state_rx.clone();
-        let initial_state = state_rx.borrow_and_update().clone();
+        let initial_state = handle.state_rx.borrow().clone();
         let eligible = matches!(initial_state, ConvState::Idle)
             || matches!(
                 &initial_state,
@@ -3505,41 +3475,15 @@ impl RuntimeManager {
             ));
         }
         deposit_turn_trigger(&handle);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         handle
-            .event_tx
-            .send(Event::UserTriggerContinuation {
-                operation_id: operation_id.clone(),
-            })
+            .continuation_admission_tx
+            .send((operation_id, ack_tx))
             .await
-            .map_err(|error| format!("Failed to send event: {error}"))?;
-
-        let mut saw_candidate = false;
-        loop {
-            state_rx
-                .changed()
-                .await
-                .map_err(|_| "Continuation runtime stopped before admission settled".to_string())?;
-            let live_state = state_rx.borrow_and_update().clone();
-            let persisted_state = self
-                .db
-                .get_conversation(conversation_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .state;
-
-            if continuation_operation_is_awaiting(&live_state, &operation_id) {
-                saw_candidate = true;
-                if continuation_operation_is_awaiting(&persisted_state, &operation_id) {
-                    return Ok(());
-                }
-            } else if continuation_operation_is_recoverable(&live_state, &operation_id)
-                && continuation_operation_is_recoverable(&persisted_state, &operation_id)
-            {
-                return Ok(());
-            } else if saw_candidate && live_state == persisted_state {
-                return Err("Continuation retry was not durably admitted".to_string());
-            }
-        }
+            .map_err(|error| format!("Failed to send continuation admission: {error}"))?;
+        ack_rx
+            .await
+            .map_err(|_| "Continuation runtime stopped before admission settled".to_string())?
     }
 
     /// Queue a steering message to be delivered when the conversation next
@@ -3622,6 +3566,7 @@ impl RuntimeManager {
         let runtimes = self.runtimes.read().await;
         runtimes.get(conversation_id).map(|h| ConversationHandle {
             event_tx: h.event_tx.clone(),
+            continuation_admission_tx: h.continuation_admission_tx.clone(),
             turn_trigger: h.turn_trigger.clone(),
             broadcast_tx: h.broadcast_tx.clone(),
             identity: h.identity.clone(),
@@ -4905,12 +4850,11 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn continuation_retry_admission_waits_for_matching_durable_projection() {
+    async fn continuation_retry_admission_waits_for_executor_acknowledgement() {
         let manager = Arc::new(test_manager().await);
         let conversation_id = "retry-admission";
-        let operation_id = "retry-operation";
         let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-            operation_id: operation_id.to_string(),
+            operation_id: "retry-operation".to_string(),
             rejected_tool_calls: Vec::new(),
             attempt: 1,
         };
@@ -4931,94 +4875,20 @@ mod scope_liveness_tests {
             .update_conversation_state(conversation_id, &recoverable)
             .await
             .unwrap();
-        let state_tx = manager
-            .inject_handle_with_state_sender_for_test(conversation_id, recoverable)
-            .await;
+        let handle = manager.get_or_create(conversation_id).await.unwrap();
+        let mut state_rx = handle.state_rx.clone();
 
-        let admission = manager.conversation_admission(conversation_id).await;
-        let manager_for_retry = Arc::clone(&manager);
-        let retry = tokio::spawn(async move {
-            let _guard = admission.lock().await;
-            manager_for_retry
-                .admit_continuation_retry(conversation_id, operation_id.to_string())
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        let awaiting = ConvState::AwaitingContinuation {
-            request: request.clone(),
-        };
-        state_tx.send(awaiting.clone()).unwrap();
-        tokio::task::yield_now().await;
+        manager
+            .admit_continuation_retry(conversation_id, request.operation_id.clone())
+            .await
+            .unwrap();
+        state_rx.changed().await.unwrap();
         assert!(
-            !retry.is_finished(),
-            "live transition alone must not acknowledge durable admission"
+            matches!(state_rx.borrow().clone(), ConvState::AwaitingContinuation { request: persisted } if persisted.operation_id == request.operation_id)
         );
-
-        let failed_again = ConvState::RecoverableContinuationFailure {
-            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
-                request: request.clone(),
-                error_kind: crate::db::ErrorKind::ServerError,
-                message: "provider failed immediately".to_string(),
-            },
-        };
-        manager
-            .db()
-            .update_conversation_state(conversation_id, &failed_again)
-            .await
-            .unwrap();
-        state_tx.send(failed_again).unwrap();
         assert!(
-            retry.await.unwrap().is_ok(),
-            "matching later failure proves the retry crossed durable admission"
+            matches!(manager.db().get_conversation(conversation_id).await.unwrap().state, ConvState::AwaitingContinuation { request: persisted } if persisted.operation_id == request.operation_id)
         );
-    }
-
-    #[tokio::test]
-    async fn continuation_retry_admission_accepts_matching_durable_awaiting_state() {
-        let manager = Arc::new(test_manager().await);
-        let conversation_id = "retry-admission-awaiting";
-        let operation_id = "retry-operation-awaiting";
-        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-            operation_id: operation_id.to_string(),
-            rejected_tool_calls: Vec::new(),
-            attempt: 1,
-        };
-        let recoverable = ConvState::RecoverableContinuationFailure {
-            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
-                request: request.clone(),
-                error_kind: crate::db::ErrorKind::ServerError,
-                message: "summary failed".to_string(),
-            },
-        };
-        manager
-            .db()
-            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
-            .await
-            .unwrap();
-        manager
-            .db()
-            .update_conversation_state(conversation_id, &recoverable)
-            .await
-            .unwrap();
-        let state_tx = manager
-            .inject_handle_with_state_sender_for_test(conversation_id, recoverable)
-            .await;
-        let manager_for_retry = Arc::clone(&manager);
-        let retry = tokio::spawn(async move {
-            manager_for_retry
-                .admit_continuation_retry(conversation_id, operation_id.to_string())
-                .await
-        });
-        tokio::task::yield_now().await;
-        let awaiting = ConvState::AwaitingContinuation { request };
-        manager
-            .db()
-            .update_conversation_state(conversation_id, &awaiting)
-            .await
-            .unwrap();
-        state_tx.send(awaiting).unwrap();
-        assert!(retry.await.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -5056,11 +4926,13 @@ mod scope_liveness_tests {
     /// real conversation runtime — mirrors the handle the executor inserts.
     async fn register_lingering_handle(mgr: &RuntimeManager, conv_id: &str) {
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (continuation_admission_tx, _continuation_admission_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
         mgr.runtimes.write().await.insert(
             conv_id.to_string(),
             ConversationHandle {
                 event_tx,
+                continuation_admission_tx,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),

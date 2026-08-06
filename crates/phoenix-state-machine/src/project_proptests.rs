@@ -759,6 +759,7 @@ mod random_walk {
                 1 => Event::ContinuationFailed {
                     operation_id: request.operation_id.clone(),
                     error: random_string(rng, 15),
+                    error_kind: phoenix_core::domain::db_schema::ErrorKind::ContextExhausted,
                 },
                 2 => {
                     let error_kind = random_error_kind(rng);

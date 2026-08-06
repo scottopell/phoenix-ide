@@ -1714,6 +1714,8 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
+    continuation_admission_rx:
+        mpsc::Receiver<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -1953,6 +1955,7 @@ where
         let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
+        let (_continuation_admission_tx, continuation_admission_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
         let clearable_names = Arc::new(tool_executor.clearable_tool_names());
@@ -1977,6 +1980,7 @@ where
             event_rx,
             event_tx,
             broadcast_tx,
+            continuation_admission_rx,
             tool_cancel_token: None,
             llm_task_handle: None,
             active_llm_attempt: None,
@@ -2101,6 +2105,14 @@ where
     }
 
     /// Set the parent event channel (for sub-agents)
+    pub fn with_continuation_admission_receiver(
+        mut self,
+        receiver: mpsc::Receiver<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    ) -> Self {
+        self.continuation_admission_rx = receiver;
+        self
+    }
+
     pub fn with_parent(mut self, parent_tx: mpsc::Sender<Event>) -> Self {
         self.parent_event_tx = Some(parent_tx);
         self
@@ -2229,6 +2241,12 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
+                Some((operation_id, acknowledgement)) = self.continuation_admission_rx.recv() => {
+                    let result = self
+                        .process_event(Event::UserTriggerContinuation { operation_id })
+                        .await;
+                    let _ = acknowledgement.send(result);
+                }
                 Some(event) = self.event_rx.recv() => {
                     // Eviction shutdown signal — exit cleanly so the broadcaster
                     // is dropped and connected SSE clients detect the closed
@@ -4290,6 +4308,19 @@ where
                                     self.pending_direct_turn_terminal = None;
                                     self.direct_turn_cancellation_initiated = false;
                                 }
+                                if matches!(
+                                    &self.state,
+                                    ConvState::AwaitingContinuation { request: persisted }
+                                        if persisted.operation_id == request.operation_id
+                                ) {
+                                    tracing::warn!(
+                                        %recovery_error,
+                                        operation_id = %request.operation_id,
+                                        "continuation start committed ambiguously; resuming persisted operation"
+                                    );
+                                    drop(reserved_range);
+                                    return Ok(None);
+                                }
                                 self.continuation_effect_disposition =
                                     ContinuationEffectDisposition::AbortRemaining;
                                 drop(reserved_range);
@@ -6124,6 +6155,7 @@ where
                         .send(Event::ContinuationFailed {
                             operation_id,
                             error,
+                            error_kind: crate::db::ErrorKind::InvalidRequest,
                         })
                         .await;
                 });
@@ -6162,6 +6194,7 @@ where
                         .send(Event::ContinuationFailed {
                             operation_id,
                             error: e,
+                            error_kind: crate::db::ErrorKind::ServerError,
                         })
                         .await;
                     return;
@@ -6282,6 +6315,7 @@ where
                             .send(Event::ContinuationFailed {
                                 operation_id,
                                 error: "the model returned an empty summary".to_string(),
+                                error_kind: crate::db::ErrorKind::ContextExhausted,
                             })
                             .await;
                         return;
@@ -10021,6 +10055,7 @@ mod authoritative_user_message_effect_tests {
                 Event::ContinuationFailed {
                     operation_id: "direct-turn-continuation-op".to_string(),
                     error: "continuation failed".to_string(),
+                    error_kind: crate::db::ErrorKind::ContextExhausted,
                 },
                 ConvState::ContextExhausted {
                     summary: "preserved continuation summary".to_string(),

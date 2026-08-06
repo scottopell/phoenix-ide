@@ -513,6 +513,7 @@ pub enum Event {
     ContinuationFailed {
         operation_id: String,
         error: String,
+        error_kind: ErrorKind,
     },
     /// Continuation request returned a typed error.
     ContinuationError {
@@ -758,6 +759,7 @@ pub enum CoreEvent {
     ContinuationFailed {
         operation_id: String,
         error: String,
+        error_kind: ErrorKind,
     },
     ContinuationError {
         operation_id: String,
@@ -960,9 +962,11 @@ impl TryFrom<Event> for ParentEvent {
             Event::ContinuationFailed {
                 operation_id,
                 error,
+                error_kind,
             } => Ok(ParentEvent::Core(CoreEvent::ContinuationFailed {
                 operation_id,
                 error,
+                error_kind,
             })),
             Event::ContinuationError {
                 operation_id,
@@ -1143,9 +1147,11 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::ContinuationFailed {
                 operation_id,
                 error,
+                error_kind,
             } => Ok(SubAgentEvent::Core(CoreEvent::ContinuationFailed {
                 operation_id,
                 error,
+                error_kind,
             })),
             Event::ContinuationError {
                 operation_id,
