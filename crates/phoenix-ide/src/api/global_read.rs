@@ -1243,7 +1243,8 @@ mod tests {
 
         sqlx::query(
             "UPDATE conversations
-             SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue me\"}'
+             SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue me\"}',
+                 state_kind = 'context_exhausted'
              WHERE id = 'scope-owner'",
         )
         .execute(db.pool())
@@ -1254,7 +1255,9 @@ mod tests {
             .await
             .is_ok());
         sqlx::query(
-            "UPDATE conversations SET state = '{\"type\":\"idle\"}' WHERE id = 'scope-owner'",
+            "UPDATE conversations
+             SET state = '{\"type\":\"idle\"}', state_kind = 'idle'
+             WHERE id = 'scope-owner'",
         )
         .execute(db.pool())
         .await
