@@ -4929,7 +4929,7 @@ where
             }
 
             let attempt_capture = task_attempt_capture;
-            let mut request = LlmRequest {
+            let request = LlmRequest {
                 system,
                 messages,
                 tools,
@@ -4946,37 +4946,6 @@ where
                 // (system prompt + earlier turns), so all turns share one key.
                 cache_key: PromptCacheKey::stable(&conv_id),
             };
-
-            let estimated_system_tokens: usize = request
-                .system
-                .iter()
-                .map(|segment| estimate_dispatch_text_tokens(&segment.text))
-                .sum();
-            let estimated_tool_tokens: usize = request
-                .tools
-                .iter()
-                .map(|tool| {
-                    estimate_dispatch_text_tokens(&tool.name)
-                        + estimate_dispatch_text_tokens(&tool.description)
-                        + estimate_dispatch_text_tokens(&tool.input_schema.to_string())
-                })
-                .sum();
-            let estimated_message_tokens: usize = request
-                .messages
-                .iter()
-                .map(estimate_dispatch_message_tokens)
-                .sum();
-            let estimated_input_tokens =
-                estimated_system_tokens + estimated_message_tokens + estimated_tool_tokens;
-            let Some(output_tokens) = clamp_output_tokens_to_remaining_context(
-                request.reserved_output_tokens(),
-                estimated_input_tokens,
-                context_window,
-            ) else {
-                let _ = llm_tx.send(LlmOutcome::TokenBudgetExceeded);
-                return;
-            };
-            request.max_tokens = Some(output_tokens);
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
@@ -6434,42 +6403,6 @@ fn cap_block_text(text: String) -> String {
     format!("{truncated}…[truncated]")
 }
 
-/// Calibrated pre-dispatch estimate: the normal chars/4 estimate plus a 50%
-/// safety factor. This avoids treating UTF-8 bytes as tokens while bounding
-/// token-dense input more conservatively than the continuation planner.
-fn estimate_dispatch_text_tokens(text: &str) -> usize {
-    estimate_text_tokens(text).saturating_mul(3).div_ceil(2)
-}
-
-fn estimate_dispatch_message_tokens(msg: &LlmMessage) -> usize {
-    let content: usize = msg
-        .content
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
-            ContentBlock::ToolResult {
-                content, images, ..
-            } => {
-                estimate_dispatch_text_tokens(content)
-                    + images.len().saturating_mul(IMAGE_TOKEN_ESTIMATE)
-            }
-            other => estimate_dispatch_text_tokens(&other.render_text()),
-        })
-        .sum();
-    content + MESSAGE_OVERHEAD_TOKENS
-}
-
-fn clamp_output_tokens_to_remaining_context(
-    requested_output_tokens: u32,
-    estimated_input_tokens: usize,
-    context_window: usize,
-) -> Option<u32> {
-    let remaining = context_window.checked_sub(estimated_input_tokens)?;
-    let remaining = u32::try_from(remaining).unwrap_or(u32::MAX);
-    let clamped = requested_output_tokens.min(remaining);
-    (clamped > 0).then_some(clamped)
-}
-
 /// Estimate the token cost of a single message for the proactive budget.
 fn estimate_message_tokens(msg: &LlmMessage) -> usize {
     use phoenix_llm::ContentBlock;
@@ -6910,30 +6843,6 @@ mod strip_tool_blocks_tests {
     use phoenix_llm::{
         ContentBlock, ImageSource, LlmMessage, MessageRole, ToolReference, ToolSearchResultContent,
     };
-
-    #[test]
-    fn output_tokens_are_clamped_to_remaining_context() {
-        assert_eq!(
-            clamp_output_tokens_to_remaining_context(120_000, 10_000, 128_000),
-            Some(118_000)
-        );
-        assert_eq!(
-            clamp_output_tokens_to_remaining_context(16_384, 10_000, 128_000),
-            Some(16_384)
-        );
-    }
-
-    #[test]
-    fn exhausted_context_has_no_output_budget() {
-        assert_eq!(
-            clamp_output_tokens_to_remaining_context(16_384, 128_000, 128_000),
-            None
-        );
-        assert_eq!(
-            clamp_output_tokens_to_remaining_context(16_384, 128_001, 128_000),
-            None
-        );
-    }
 
     fn user_text(s: &str) -> LlmMessage {
         LlmMessage {
@@ -8574,6 +8483,92 @@ mod error_mapping_tests {
             matches!(outcome, LlmOutcome::InvalidResponse { .. }),
             "invalid_response must map to LlmOutcome::InvalidResponse, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn provider_context_window_error_still_maps_to_token_budget_exceeded() {
+        let outcome = llm_error_to_outcome(phoenix_llm::LlmError::context_window_exceeded(
+            "provider rejected oversized context",
+        ));
+        assert!(
+            matches!(outcome, LlmOutcome::TokenBudgetExceeded),
+            "provider context-window errors must retain the terminal path, got {outcome:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_context_budget_tests {
+    use super::*;
+    use crate::db::{MessageContent, UserContent};
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::traits::MessageStore;
+    use crate::state_machine::ConvContext;
+    use crate::tools::BrowserSessionManager;
+    use phoenix_llm::{ContentBlock, LlmResponse, ModelRegistry, Usage};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn conservative_prompt_estimate_cannot_short_circuit_provider_dispatch() {
+        let cwd = TempDir::new().expect("cwd");
+        let conv_id = "large-estimate-still-dispatches";
+        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .add_message(
+                "large-user-message",
+                conv_id,
+                &MessageContent::User(UserContent::new("x".repeat(500_000))),
+                None,
+                None,
+            )
+            .await
+            .expect("persist large message");
+
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("accepted by provider")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+
+        runtime
+            .dispatch_llm_request()
+            .await
+            .expect("dispatch large request");
+        runtime
+            .llm_task_handle
+            .take()
+            .expect("request task")
+            .await
+            .expect("request task completed");
+
+        let requests = llm.recorded_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the provider can authoritatively reject the assembled request"
+        );
+        assert_eq!(requests[0].reserved_output_tokens(), 16_384);
     }
 }
 
