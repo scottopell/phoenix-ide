@@ -180,7 +180,11 @@ export function useConversationPrStatus({
     intent: PrStatusRefreshIntent;
     promise: Promise<PrStatusResponse | undefined>;
   } | null>(null);
-  const lastCompletedRef = useRef<{ scopeKey: string; monotonicAt: number } | null>(null);
+  const lastCompletedRef = useRef<{
+    scopeKey: string;
+    monotonicAt: number;
+    wallAt: number;
+  } | null>(null);
   const scopeKey = conversationId && branchName && (convModeLabel === 'Work' || convModeLabel === 'Branch')
     ? `${conversationId}\0${branchName}\0${convModeLabel}`
     : null;
@@ -215,7 +219,7 @@ export function useConversationPrStatus({
         if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
         setInternalState({ scopeKey, status: 'ready', prStatus });
         lastCompletedRef.current = prStatus.refresh.state !== 'unavailable' && !prStatus.refresh.stale
-          ? { scopeKey, monotonicAt: performance.now() }
+          ? { scopeKey, monotonicAt: performance.now(), wallAt: Date.now() }
           : null;
         return prStatus;
       } catch {
@@ -277,9 +281,14 @@ export function useConversationPrStatus({
       return inFlightRef.current.promise;
     }
     const lastCompleted = lastCompletedRef.current;
-    if (lastCompleted?.scopeKey === scopeKey
-      && performance.now() - lastCompleted.monotonicAt < ROUTINE_REFRESH_FRESHNESS_MS) {
-      return Promise.resolve(undefined);
+    if (lastCompleted?.scopeKey === scopeKey) {
+      const monotonicElapsed = performance.now() - lastCompleted.monotonicAt;
+      const wallElapsed = Date.now() - lastCompleted.wallAt;
+      if (monotonicElapsed >= 0 && wallElapsed >= 0
+        && monotonicElapsed < ROUTINE_REFRESH_FRESHNESS_MS
+        && wallElapsed < ROUTINE_REFRESH_FRESHNESS_MS) {
+        return Promise.resolve(undefined);
+      }
     }
     return startRefresh('background');
   }, [scopeKey, startRefresh]);

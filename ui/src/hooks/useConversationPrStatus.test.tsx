@@ -282,18 +282,35 @@ describe('useConversationPrStatus', () => {
     expect(getPrStatus).toHaveBeenCalledTimes(1);
   });
 
-  it('uses monotonic time when evaluating routine freshness', async () => {
-    const dateNow = vi.spyOn(Date, 'now').mockReturnValueOnce(20_000).mockReturnValueOnce(0);
+  it('expires routine freshness when the wall clock moves backward', async () => {
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValueOnce(20_000).mockReturnValue(0);
     try {
       const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
-      getPrStatus.mockResolvedValue(prStatus(56));
+      getPrStatus.mockResolvedValueOnce(prStatus(56)).mockResolvedValueOnce(prStatus(57));
 
       render(<Probe conversationId="conv-clock-correction" />);
       await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('56'));
 
       document.dispatchEvent(new Event('visibilitychange'));
-      expect(getPrStatus).toHaveBeenCalledTimes(1);
-      expect(dateNow).not.toHaveBeenCalled();
+      await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('57'));
+      expect(getPrStatus).toHaveBeenCalledTimes(2);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('expires routine freshness when wall time advances across system sleep', async () => {
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValue(20_000);
+    try {
+      const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+      getPrStatus.mockResolvedValueOnce(prStatus(63)).mockResolvedValueOnce(prStatus(64));
+
+      render(<Probe conversationId="conv-system-sleep" />);
+      await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('63'));
+
+      document.dispatchEvent(new Event('visibilitychange'));
+      await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('64'));
+      expect(getPrStatus).toHaveBeenCalledTimes(2);
     } finally {
       dateNow.mockRestore();
     }
