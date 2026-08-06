@@ -31,6 +31,11 @@ Five perspectives—durable workflow/state machine, SQLite recovery, concurrency
 - **Authorized subjects:** registration accepts an authorization-bound subject capability supplied by the resource-owning adapter, not a freely constructed resource description. This model PR seals the boundary; the Bash integration supplies its production minting path.
 - **Transferability policy:** WorkScope-keyed resources permit delivery-owner transfer; fixed-owner resources, including sub-agent-like resources, reject transfer.
 - **Fence scope:** a durable fence receipt gates only finalization of the proposed cancellation or expiry. Earlier authoritative fired or forgotten evidence may supersede the proposal without that receipt.
+- **Execution authority:** terminal evidence carries a sealed observation capability bound to contract identity, generation, resource identity, and effect attempt; crossed or stale workers cannot close another contract.
+- **Transfer authority:** delivery-owner changes carry a sealed continuation/WorkScope capability binding both current and successor owners; transferability alone does not authorize redirection.
+- **Acceptance lifecycle:** fired, expired, and forgotten contracts remain workflow-active while runtime acceptance is owed. Generic transition and delivery-resolution wrappers reject wake profiles so only the wake-specific acceptance path may settle that debt.
+- **Rebuildable policy:** registration events include the typed delivery-transferability policy; replay never guesses policy from profile naming.
+- **Profile identity:** wake profile kind and version are validated nominal types, structurally matching the normalized relational constraints.
 
 ## Authoritative aggregate
 
@@ -74,7 +79,7 @@ The durable authority row normalizes contract identity, owners, profile/resource
 
 ## Pure transition contract
 
-Commands are closed: `Register`, `Observe`, `Cancel`, `DeadlineElapsed`, `TransferDeliveryOwner`, and `Reconcile`. Every `(state, command)` pair returns a typed accepted/replayed/rejected outcome, a new state, and owed effects. No semantic branch panics or relies on wall-clock polling.
+Commands are closed: `Register`, `Observe`, `Cancel`, `DeadlineElapsed`, `TransferDeliveryOwner`, and `Reconcile`. Registration, observation, and ownership transfer consume sealed capabilities minted by their owning adapter or WorkScope authority; public commands cannot manufacture resource authority from IDs. Every `(state, command)` pair returns a typed accepted/replayed/rejected outcome, a new state, and owed effects. No semantic branch panics or relies on wall-clock polling.
 
 Owed effects include adapter watch/unwatch, reducer inbox delivery, public projection append, and lifecycle cleanup. An effect is idempotently keyed by contract generation and transition identity. Effect completion never rewrites aggregate truth.
 

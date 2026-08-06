@@ -82,17 +82,7 @@ impl WakeContractRepository {
                     WakeState::Absent => Generation(0),
                     WakeState::Present(contract) => contract.generation,
                 };
-                let next_status = match &result.new_state {
-                    WakeState::Present(contract)
-                        if matches!(
-                            contract.lifecycle,
-                            phoenix_workflow::wake_contract::WakeLifecycle::Closed(_)
-                        ) =>
-                    {
-                        WorkflowStatus::Completed
-                    }
-                    WakeState::Absent | WakeState::Present(_) => WorkflowStatus::Active,
-                };
+                let next_status = workflow_status_after_event(event);
                 let codec = codec();
                 let event_payload = encode(event)?;
                 let snapshot_payload = encode(&result.new_state)?;
@@ -317,8 +307,8 @@ async fn validate_authority_projection_tx(
     .bind(contract.delivery_owner.as_str())
     .bind(contract.registering_tool_use_id.as_str())
     .bind(transferability_str(contract.delivery_transferability))
-    .bind(&contract.subject.profile.kind.0)
-    .bind(i64::from(contract.subject.profile.version.0))
+    .bind(contract.subject.profile.kind.as_str())
+    .bind(i64::from(contract.subject.profile.version.get()))
     .bind(&contract.subject.resource.codec.family.0)
     .bind(i64::from(contract.subject.resource.codec.version.0))
     .bind(&contract.subject.resource.payload.0)
@@ -366,8 +356,8 @@ async fn insert_contract_identity_tx(
     .bind(contract.delivery_owner.as_str())
     .bind(contract.registering_tool_use_id.as_str())
     .bind(transferability_str(contract.delivery_transferability))
-    .bind(&contract.subject.profile.kind.0)
-    .bind(i64::from(contract.subject.profile.version.0))
+    .bind(contract.subject.profile.kind.as_str())
+    .bind(i64::from(contract.subject.profile.version.get()))
     .bind(&contract.subject.resource.codec.family.0)
     .bind(i64::from(contract.subject.resource.codec.version.0))
     .bind(&contract.subject.resource.payload.0)
@@ -554,6 +544,25 @@ struct TerminalBundle {
     barrier: LocalBarrierDecl,
     barrier_member: LocalBarrierMemberDecl,
     delivery: LocalDeliveryDecl,
+}
+
+fn workflow_status_after_event(
+    event: &phoenix_workflow::wake_contract::WakeContractEvent,
+) -> WorkflowStatus {
+    match &event.kind {
+        phoenix_workflow::wake_contract::WakeEventKind::Terminalized {
+            resume_policy:
+                phoenix_workflow::wake_contract::WakeResumePolicy::SuppressAutomaticResume,
+            ..
+        } => WorkflowStatus::Completed,
+        phoenix_workflow::wake_contract::WakeEventKind::Registered { .. }
+        | phoenix_workflow::wake_contract::WakeEventKind::DeliveryOwnerTransferred { .. }
+        | phoenix_workflow::wake_contract::WakeEventKind::TerminalProposed { .. }
+        | phoenix_workflow::wake_contract::WakeEventKind::Terminalized {
+            resume_policy: phoenix_workflow::wake_contract::WakeResumePolicy::RequestWhenIdle,
+            ..
+        } => WorkflowStatus::Active,
+    }
 }
 
 fn terminal_bundle(
@@ -932,8 +941,8 @@ mod tests {
     fn subject() -> WakeSubject {
         WakeSubject {
             profile: WakeProfileRef {
-                kind: WakeProfileKind("bash".into()),
-                version: WakeProfileVersion(1),
+                kind: WakeProfileKind::new("bash").unwrap(),
+                version: WakeProfileVersion::new(1).unwrap(),
             },
             resource: EncodedWakeValue {
                 codec: WakeCodecRef {
@@ -1049,6 +1058,10 @@ mod tests {
                 transition_id,
                 kind: WakeCommandKind::ObserveTerminal {
                     expected_head: contract.head(),
+                    authority: phoenix_workflow::wake_contract::WakeObservationAuthority::for_test(
+                        contract,
+                        phoenix_workflow::AttemptId(1),
+                    ),
                     evidence: phoenix_workflow::wake_contract::TerminalEvidence {
                         occurred_at,
                         value: EncodedWakeValue {
@@ -1413,6 +1426,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime_acceptance_enabled, 1);
+        let workflow_status: String =
+            sqlx::query_scalar("SELECT status FROM workflows WHERE workflow_id = 5")
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(workflow_status, "Active");
+        let acceptance_status: String = sqlx::query_scalar(
+            "SELECT runtime_acceptance_status FROM workflow_deliveries WHERE workflow_id = 5",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(acceptance_status, "Owed");
         let authority: (i64, String, String, String, String) = sqlx::query_as(
             "SELECT version, delivery_owner, registering_tool_use_id,
                     delivery_transferability, lifecycle_kind

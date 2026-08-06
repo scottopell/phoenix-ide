@@ -1754,11 +1754,12 @@ impl WorkflowRepository {
         &self,
         input: &AcceptOrSuppressDeliveryInput,
     ) -> DbResult<CommitOutcome> {
-        if workflow_profile_kind(&self.pool, input.workflow_id)
-            .await?
-            .as_deref()
-            == Some(DIRECT_TURN_PROFILE_KIND)
-        {
+        if matches!(
+            workflow_profile_kind(&self.pool, input.workflow_id)
+                .await?
+                .as_deref(),
+            Some(DIRECT_TURN_PROFILE_KIND | "wake.contract")
+        ) {
             return Ok(CommitOutcome::InvalidPlan);
         }
         let mut tx = self.begin_tx().await?;
@@ -3376,6 +3377,42 @@ mod tests {
             .unwrap(),
             CommitOutcome::InvalidPlan
         );
+    }
+
+    #[tokio::test]
+    async fn generic_delivery_resolution_rejects_wake_contract_workflow() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        create_workflow(&repo, WorkflowId(35)).await;
+        sqlx::query("UPDATE workflows SET profile_kind = 'wake.contract' WHERE workflow_id = 35")
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.accept_or_suppress_deliveries_exact(&AcceptOrSuppressDeliveryInput {
+                workflow_id: WorkflowId(35),
+                expected_version: Version(0),
+                transition_id: TransitionId(1),
+                generation: Generation(0),
+                next_status: WorkflowStatus::Active,
+                event_codec: local_codec_owned("event"),
+                event_payload: vec![1],
+                next_snapshot_codec: local_codec_owned("snapshot"),
+                next_snapshot_payload: vec![2],
+                committed_at: Timestamp(8),
+                accept_delivery_ids: vec![],
+                suppress_delivery_ids: vec![],
+                suppression_reason: SuppressionReason::ReducerTerminal,
+            })
+            .await
+            .unwrap(),
+            CommitOutcome::InvalidPlan
+        );
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM workflows WHERE workflow_id = 35")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 0);
     }
 
     #[tokio::test]

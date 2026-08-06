@@ -19,8 +19,8 @@ fn encoded(bytes: Vec<u8>) -> EncodedWakeValue {
 fn subject() -> WakeSubject {
     WakeSubject {
         profile: WakeProfileRef {
-            kind: WakeProfileKind("test".to_string()),
-            version: WakeProfileVersion(1),
+            kind: WakeProfileKind::new("test").unwrap(),
+            version: WakeProfileVersion::new(1).unwrap(),
         },
         resource: encoded(b"resource".to_vec()),
         terminal_evidence_codec: codec(),
@@ -54,6 +54,14 @@ fn contract(state: &WakeState) -> &WakeContract {
         panic!("expected present contract")
     };
     contract
+}
+
+fn observation_authority(state: &WakeState) -> WakeObservationAuthority {
+    WakeObservationAuthority::for_test(contract(state), AttemptId(1))
+}
+
+fn transfer_authority(state: &WakeState, new_owner: WakeOwner) -> AuthorizedWakeOwnerTransfer {
+    AuthorizedWakeOwnerTransfer::for_test(contract(state), new_owner)
 }
 
 fn evidence(occurred_at: u64, payload: u8) -> TerminalEvidence {
@@ -143,6 +151,7 @@ fn generated_command(state: &WakeState, action: GeneratedAction, next_id: u64) -
     let kind = match action {
         GeneratedAction::Observe { at, payload } => WakeCommandKind::ObserveTerminal {
             expected_head: current_head,
+            authority: observation_authority(state),
             evidence: evidence(u64::from(at), payload),
         },
         GeneratedAction::Cancel { at } => WakeCommandKind::Cancel {
@@ -156,7 +165,7 @@ fn generated_command(state: &WakeState, action: GeneratedAction, next_id: u64) -
         },
         GeneratedAction::Transfer { owner } => WakeCommandKind::TransferDeliveryOwner {
             expected_head: current_head,
-            new_owner: WakeOwner::new(format!("owner-{owner}")).unwrap(),
+            authority: transfer_authority(state, WakeOwner::new(format!("owner-{owner}")).unwrap()),
         },
         GeneratedAction::Forget { at } => WakeCommandKind::Reconcile {
             expected_head: current_head,
@@ -226,6 +235,7 @@ proptest! {
                 3,
                 WakeCommandKind::ObserveTerminal {
                     expected_head: contract(&proposed.new_state).head(),
+                    authority: observation_authority(&proposed.new_state),
                     evidence: evidence(observed_at, 1),
                 },
             ),
@@ -271,6 +281,7 @@ proptest! {
             &proposed.new_state,
             command(3, WakeCommandKind::ObserveTerminal {
                 expected_head: contract(&proposed.new_state).head(),
+                authority: observation_authority(&proposed.new_state),
                 evidence: evidence(deadline, 1),
             }),
         );
@@ -293,6 +304,7 @@ proptest! {
             &proposed.new_state,
             command(5, WakeCommandKind::ObserveTerminal {
                 expected_head: contract(&proposed.new_state).head(),
+                authority: observation_authority(&proposed.new_state),
                 evidence: evidence(deadline.saturating_add(1), 2),
             }),
         );
@@ -435,6 +447,7 @@ fn transition_id_reuse_requires_the_exact_semantic_command() {
             2,
             WakeCommandKind::ObserveTerminal {
                 expected_head: contract(&proposed.new_state).head(),
+                authority: observation_authority(&proposed.new_state),
                 evidence: evidence(4, 1),
             },
         ),
@@ -455,6 +468,7 @@ fn registration_event_is_rebuildable_and_registry_is_exhaustive() {
     let WakeEventKind::Registered {
         registration_owner,
         subject: registered_subject,
+        delivery_transferability,
         condition,
         registered_at,
         deadline,
@@ -465,6 +479,10 @@ fn registration_event_is_rebuildable_and_registry_is_exhaustive() {
     assert_eq!(registration_owner, WakeOwner::new("registrant").unwrap());
     assert_eq!(event.registering_tool_use_id.as_str(), "tool-use");
     assert_eq!(registered_subject, subject());
+    assert_eq!(
+        delivery_transferability,
+        WakeDeliveryTransferability::WorkScope
+    );
     assert_eq!(condition, WakeCondition::Terminal);
     assert_eq!(registered_at, Timestamp(0));
     assert_eq!(deadline, Timestamp(10));
@@ -488,7 +506,7 @@ fn prior_transition_ids_cannot_be_reused_after_the_head_advances() {
             2,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: contract(&state).head(),
-                new_owner: WakeOwner::new("successor").unwrap(),
+                authority: transfer_authority(&state, WakeOwner::new("successor").unwrap()),
             },
         ),
     );
@@ -546,7 +564,10 @@ fn delivery_owner_can_transfer_during_terminal_arbitration() {
             3,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: contract(&proposed.new_state).head(),
-                new_owner: WakeOwner::new("successor").unwrap(),
+                authority: transfer_authority(
+                    &proposed.new_state,
+                    WakeOwner::new("successor").unwrap(),
+                ),
             },
         ),
     );
@@ -594,7 +615,7 @@ fn fixed_owner_subjects_cannot_transfer_delivery() {
             2,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: contract(&state).head(),
-                new_owner: WakeOwner::new("successor").unwrap(),
+                authority: transfer_authority(&state, WakeOwner::new("successor").unwrap()),
             },
         ),
     );
@@ -610,6 +631,58 @@ fn wake_owner_deserialization_rejects_empty_values() {
 }
 
 #[test]
+fn wake_profile_deserialization_rejects_invalid_identities() {
+    assert!(serde_json::from_str::<WakeProfileKind>("\"\"").is_err());
+    assert!(serde_json::from_str::<WakeProfileVersion>("0").is_err());
+}
+
+#[test]
+fn crossed_observation_authority_cannot_terminalize_a_contract() {
+    let state = registered(10);
+    let mut authority = observation_authority(&state);
+    authority.resource.payload = WakePayload(b"other-resource".to_vec());
+    let result = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::ObserveTerminal {
+                expected_head: contract(&state).head(),
+                authority,
+                evidence: evidence(5, 7),
+            },
+        ),
+    );
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::ObservationAuthorityMismatch)
+    ));
+}
+
+#[test]
+fn stale_transfer_authority_cannot_redirect_delivery() {
+    let state = registered(10);
+    let mut authority = AuthorizedWakeOwnerTransfer::for_test(
+        contract(&state),
+        WakeOwner::new("successor").unwrap(),
+    );
+    authority.current_owner = WakeOwner::new("unrelated-owner").unwrap();
+    let result = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::TransferDeliveryOwner {
+                expected_head: contract(&state).head(),
+                authority,
+            },
+        ),
+    );
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::DeliveryOwnerTransferAuthorityMismatch)
+    ));
+}
+
+#[test]
 fn terminal_evidence_must_use_the_registered_profile_codec() {
     let state = registered(10);
     let mut mismatched = evidence(5, 1);
@@ -620,6 +693,7 @@ fn terminal_evidence_must_use_the_registered_profile_codec() {
             2,
             WakeCommandKind::ObserveTerminal {
                 expected_head: contract(&state).head(),
+                authority: observation_authority(&state),
                 evidence: mismatched,
             },
         ),
@@ -640,7 +714,10 @@ fn transfer_does_not_invalidate_the_proposal_capability() {
             3,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: contract(&proposed.new_state).head(),
-                new_owner: WakeOwner::new("successor").unwrap(),
+                authority: transfer_authority(
+                    &proposed.new_state,
+                    WakeOwner::new("successor").unwrap(),
+                ),
             },
         ),
     );
@@ -733,7 +810,7 @@ fn delivery_transfer_preserves_registration_and_resource_identity() {
             2,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: before.head(),
-                new_owner: WakeOwner::new("successor").unwrap(),
+                authority: transfer_authority(&state, WakeOwner::new("successor").unwrap()),
             },
         ),
     );
@@ -754,6 +831,7 @@ fn event_boundary_adds_contract_and_transition_identity_once() {
             2,
             WakeCommandKind::ObserveTerminal {
                 expected_head: contract(&state).head(),
+                authority: observation_authority(&state),
                 evidence: evidence(5, 7),
             },
         ),

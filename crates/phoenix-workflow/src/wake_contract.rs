@@ -1,4 +1,4 @@
-use crate::{Generation, Timestamp, TransitionId, Version};
+use crate::{AttemptId, Generation, Timestamp, TransitionId, Version};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -86,11 +86,58 @@ impl<'de> Deserialize<'de> for RegisteringToolUseId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WakeProfileKind(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WakeProfileKind(String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WakeProfileVersion(pub u32);
+impl WakeProfileKind {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WakeProfileKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| D::Error::custom("wake profile kind cannot be empty"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WakeProfileVersion(u32);
+
+impl WakeProfileVersion {
+    #[must_use]
+    pub fn new(value: u32) -> Option<Self> {
+        (value > 0).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WakeProfileVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| D::Error::custom("wake profile version must be positive"))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WakeProfileRef {
@@ -157,6 +204,50 @@ impl AuthorizedWakeSubject {
             subject,
             authorized_owner: owner,
             transferability: WakeDeliveryTransferability::FixedOwner,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuthorizedWakeOwnerTransfer {
+    contract_id: WakeContractId,
+    generation: Generation,
+    resource: EncodedWakeValue,
+    current_owner: WakeOwner,
+    new_owner: WakeOwner,
+}
+
+impl AuthorizedWakeOwnerTransfer {
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test(contract: &WakeContract, new_owner: WakeOwner) -> Self {
+        Self {
+            contract_id: contract.id.clone(),
+            generation: contract.generation,
+            resource: contract.subject.resource.clone(),
+            current_owner: contract.delivery_owner.clone(),
+            new_owner,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WakeObservationAuthority {
+    contract_id: WakeContractId,
+    generation: Generation,
+    resource: EncodedWakeValue,
+    attempt_id: AttemptId,
+}
+
+impl WakeObservationAuthority {
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test(contract: &WakeContract, attempt_id: AttemptId) -> Self {
+        Self {
+            contract_id: contract.id.clone(),
+            generation: contract.generation,
+            resource: contract.subject.resource.clone(),
+            attempt_id,
         }
     }
 }
@@ -369,6 +460,7 @@ pub enum WakeCommandKind {
     },
     ObserveTerminal {
         expected_head: WakeHeadToken,
+        authority: WakeObservationAuthority,
         evidence: TerminalEvidence,
     },
     Cancel {
@@ -382,7 +474,7 @@ pub enum WakeCommandKind {
     },
     TransferDeliveryOwner {
         expected_head: WakeHeadToken,
-        new_owner: WakeOwner,
+        authority: AuthorizedWakeOwnerTransfer,
     },
     Reconcile {
         expected_head: WakeHeadToken,
@@ -432,6 +524,7 @@ pub enum WakeEventKind {
     Registered {
         registration_owner: WakeOwner,
         subject: WakeSubject,
+        delivery_transferability: WakeDeliveryTransferability,
         condition: WakeCondition,
         registered_at: Timestamp,
         deadline: Timestamp,
@@ -511,6 +604,8 @@ pub enum WakeRejection {
     AlreadyDeliveryOwner,
     SubjectOwnerMismatch,
     DeliveryOwnerTransferForbidden,
+    DeliveryOwnerTransferAuthorityMismatch,
+    ObservationAuthorityMismatch,
     ConflictingTransitionReuse,
     NonMonotonicTransitionId,
 }
@@ -701,6 +796,7 @@ fn register(
         WakeEventKind::Registered {
             registration_owner: contract.registration_owner.clone(),
             subject: contract.subject.clone(),
+            delivery_transferability: contract.delivery_transferability,
             condition: contract.condition.clone(),
             registered_at,
             deadline,
@@ -760,6 +856,17 @@ fn transition_present(
 
     let committed_command = command.clone();
     match (&contract.lifecycle, command) {
+        (
+            WakeLifecycle::Open(_),
+            WakeCommandKind::ObserveTerminal {
+                authority,
+                evidence: _,
+                ..
+            },
+        ) if !observation_authority_matches(contract, &authority) => rejected(
+            &WakeState::Present(contract.clone()),
+            WakeRejection::ObservationAuthorityMismatch,
+        ),
         (WakeLifecycle::Open(_), WakeCommandKind::ObserveTerminal { evidence, .. })
             if evidence.value.codec != contract.subject.terminal_evidence_codec =>
         {
@@ -929,12 +1036,12 @@ fn transition_present(
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
-            WakeCommandKind::TransferDeliveryOwner { new_owner, .. },
-        ) => transfer_delivery_owner(contract, transition_id, &committed_command, new_owner),
+            WakeCommandKind::TransferDeliveryOwner { authority, .. },
+        ) => transfer_delivery_owner(contract, transition_id, &committed_command, authority),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)),
-            WakeCommandKind::TransferDeliveryOwner { new_owner, .. },
-        ) => transfer_delivery_owner(contract, transition_id, &committed_command, new_owner),
+            WakeCommandKind::TransferDeliveryOwner { authority, .. },
+        ) => transfer_delivery_owner(contract, transition_id, &committed_command, authority),
         (WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)), _) => rejected(
             &WakeState::Present(contract.clone()),
             WakeRejection::TerminalArbitrationPending,
@@ -1017,12 +1124,29 @@ fn transfer_delivery_owner(
     contract: &WakeContract,
     transition_id: TransitionId,
     command: &WakeCommandKind,
-    new_owner: WakeOwner,
+    authority: AuthorizedWakeOwnerTransfer,
 ) -> WakeTransition {
     if contract.delivery_transferability == WakeDeliveryTransferability::FixedOwner {
         return rejected(
             &WakeState::Present(contract.clone()),
             WakeRejection::DeliveryOwnerTransferForbidden,
+        );
+    }
+    let AuthorizedWakeOwnerTransfer {
+        contract_id,
+        generation,
+        resource,
+        current_owner,
+        new_owner,
+    } = authority;
+    if contract_id != contract.id
+        || generation != contract.generation
+        || resource != contract.subject.resource
+        || current_owner != contract.delivery_owner
+    {
+        return rejected(
+            &WakeState::Present(contract.clone()),
+            WakeRejection::DeliveryOwnerTransferAuthorityMismatch,
         );
     }
     if new_owner == contract.delivery_owner {
@@ -1067,6 +1191,16 @@ fn advanced(
     next.head_transition_id = transition_id;
     next.head_command_fingerprint = WakeCommandFingerprint::for_command(command);
     next
+}
+
+fn observation_authority_matches(
+    contract: &WakeContract,
+    authority: &WakeObservationAuthority,
+) -> bool {
+    authority.contract_id == contract.id
+        && authority.generation == contract.generation
+        && authority.resource == contract.subject.resource
+        && authority.attempt_id.0 > 0
 }
 
 fn observation_fence_proof(
