@@ -6091,7 +6091,12 @@ where
                     format!("Persisted effort '{effort}' is not supported by model '{model_id}'");
                 let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
-                    let _ = event_tx.send(Event::ContinuationFailed { error }).await;
+                    let _ = event_tx
+                        .send(Event::ContinuationFailed {
+                            operation_id,
+                            error,
+                        })
+                        .await;
                 });
                 return;
             }

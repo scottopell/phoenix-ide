@@ -2045,6 +2045,17 @@ impl ConvState {
     }
 
     #[must_use]
+    pub fn allows_terminal_action(&self) -> bool {
+        matches!(
+            self,
+            ConvState::Idle
+                | ConvState::Error { .. }
+                | ConvState::RecoverableContinuationFailure { .. }
+                | ConvState::ContextExhausted { .. }
+        )
+    }
+
+    #[must_use]
     pub fn error_kind(&self) -> Option<&ErrorKind> {
         match self {
             Self::CreationFailed { error_kind, .. }

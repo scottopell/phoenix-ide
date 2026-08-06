@@ -141,16 +141,16 @@ THE SYSTEM SHALL NOT transition to error state — a cancellation the user reque
 
 ### REQ-BED-006: Error Recovery
 
-WHEN LLM request fails with retryable error (network, rate limit, 5xx)
+WHEN an in-flight conversation-turn LLM request fails with retryable error (network, rate limit, 5xx)
 THE SYSTEM SHALL retry automatically up to 3 times with exponential backoff
 AND remain in LLM requesting state during retries
 AND display retry status to user
 
-WHEN LLM request fails after all retries exhausted
+WHEN an in-flight conversation-turn LLM request fails after all retries are exhausted
 THE SYSTEM SHALL transition to error state
 AND display actionable error message indicating retry failure
 
-WHEN a recoverable LLM operation fails with an auth error while credential recovery is in progress
+WHEN a recoverable LLM-backed operation fails with an auth error while credential recovery is in progress
 THE SYSTEM SHALL transition to awaiting recovery
 AND SHALL carry a typed resume target for the suspended operation
 
@@ -158,11 +158,20 @@ WHEN credential recovery succeeds from awaiting recovery
 THE SYSTEM SHALL resume the operation identified by the typed resume target
 AND SHALL NOT infer the operation from display text, UI state, or the error message
 
-WHEN credential recovery fails from awaiting recovery
+WHEN credential recovery fails from awaiting recovery for a conversation-turn request
 THE SYSTEM SHALL transition to error state
+AND SHALL preserve the failure as turn error state rather than as continuation content
+
+WHEN credential recovery fails from awaiting recovery for continuation-summary generation
+THE SYSTEM SHALL transition to a user-retryable continuation failure state
+AND SHALL preserve the continuation operation identity for an explicit retry
 AND SHALL NOT fabricate continuation summaries or persist auth failure copy as continuation content
 
-WHEN LLM request fails with non-retryable error (4xx other than recoverable auth)
+WHEN continuation-summary generation fails without a durable summary commit
+THE SYSTEM SHALL transition to a user-retryable continuation failure state
+AND SHALL preserve the continuation operation identity and retry context for an explicit retry
+
+WHEN an in-flight conversation-turn LLM request fails with non-retryable error (4xx other than recoverable auth)
 THE SYSTEM SHALL transition to error state immediately
 AND display specific error message
 
