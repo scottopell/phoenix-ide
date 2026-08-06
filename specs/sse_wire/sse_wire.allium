@@ -128,12 +128,10 @@ value SteeringMessage {
 --     replay is inert because no subsequent init can fire for the deleted row.
 --
 -- Note on `rate_limit_snapshot` replay: the snapshot represents a
--- point-in-time codex quota state, so a stale snapshot replayed on
--- reconnect can paint the UI's quota chip with data that has since
--- been superseded. The protocol accepts that staleness in exchange for
--- the structural simplicity of "all broadcasts ride the ring": the
--- whitelist and the broadcaster agree that "rate_limit_snapshot"
--- replays like any other ephemeral event.
+-- point-in-time codex quota state. It remains in the conversation ring
+-- so sequence coverage stays structurally uniform, but clients consume
+-- a replayed entry only as a sequence witness. Only a live snapshot or
+-- an account-scoped source may update account-global quota state.
 --
 -- Distinguish from "llm_attempt" on rationale (the per-retry
 -- context's reconnect preservation is load-bearing for the StateBar's
@@ -342,7 +340,9 @@ rule StreamOpened {
         -- concurrent enqueue or cancellation is therefore represented either
         -- in the snapshot or by the live delta; identity-based client
         -- reconciliation tolerates both. A token-shared transcript stream
-        -- carries an empty steering_messages list.
+        -- carries an empty steering_messages list and filters both steering
+        -- mutation variants from its pending replay and live broadcast path;
+        -- unpublished input is never part of the shared transcript.
         --
         -- init_sent is set true atomically with last_delivered_seq
         -- at creation, enforcing InitAlwaysFirst by construction:

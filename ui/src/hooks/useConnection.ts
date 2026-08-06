@@ -204,16 +204,6 @@ function transformInitData(raw: SseInitData): InitPayload {
   };
 }
 
-export function restoreInitSideChannels(raw: SseInitData): void {
-  for (const entry of raw.pending_events) {
-    if (!entry || typeof entry !== 'object' || (entry as { type?: unknown }).type !== 'rate_limit_snapshot') {
-      continue;
-    }
-    const parsed = v.safeParse(SseRateLimitSnapshotDataSchema, entry);
-    if (parsed.success) setCodexQuota(parsed.output.snapshot);
-  }
-}
-
 /**
  * Hook for managing SSE connection lifecycle with reconnection handling.
  *
@@ -412,7 +402,6 @@ export function useConnection({
             }
 
             dispatchMachineRef.current({ type: 'SSE_OPEN' });
-            restoreInitSideChannels(res.data);
             const payload = transformInitData(res.data);
             latestConversationRef.current = payload.conversation;
             latestPhaseRef.current = payload.phase;

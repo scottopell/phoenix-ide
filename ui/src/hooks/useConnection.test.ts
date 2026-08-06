@@ -433,7 +433,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(12);
   });
 
-  it('restores the latest replayed quota snapshot from init', () => {
+  it('does not project a replayed conversation quota snapshot into account state', () => {
     renderHook(() => useConnection({ conversationId: 'conv-A', dispatch: vi.fn() }));
     const payload = makeInitPayload('conv-A', 'slug-A');
     payload.last_sequence_id = 1;
@@ -451,7 +451,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
 
     act(() => FakeEventSource.instances[0]!.emit('init', payload));
 
-    expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(41);
+    expect(getCodexQuotaSnapshot()).toBeNull();
   });
 
   it('drops a stale-EventSource event after slug change (cross-conversation contamination guard)', () => {

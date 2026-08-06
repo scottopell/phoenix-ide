@@ -481,6 +481,29 @@ describe('conversationReducer', () => {
       expect(atom.steeringMessages).toEqual([steeringMessage]);
     });
 
+    it('removes delivered steering input during authoritative history reconciliation', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        steeringMessages: [steeringMessage],
+      };
+      const delivered = { ...makeMessage(8, 'user'), message_id: steeringMessage.message_id };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [delivered],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        snapshotStartedAtEventSeq: 0,
+      });
+
+      expect(next.steeringMessages).toEqual([]);
+      expect(next.messages).toEqual([delivered]);
+    });
+
     it('applies live enqueue, idempotent replacement, cancel, and delivery', () => {
       let atom = dispatch(createInitialAtom(), {
         type: 'sse_init',

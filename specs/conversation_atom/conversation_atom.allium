@@ -820,6 +820,13 @@ invariant SteeringMessagesUniqueById {
                 i != j implies i.message_id != j.message_id
 }
 
+invariant SteeringMessagesAreNotDelivered {
+    for a in ConversationAtoms:
+        for queued in a.steeringMessages:
+            for delivered in a.messages:
+                queued.message_id != delivered.message_id
+}
+
 -- The streaming buffer is valid only while the conversation is in the
 -- llm_requesting phase. Any transition that moves phase out of
 -- llm_requesting must clear the buffer.

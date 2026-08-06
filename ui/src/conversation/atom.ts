@@ -617,7 +617,16 @@ function materializeMessages(atom: ConversationAtom, messages: Message[]): Conve
     materialized.push(nextMessage);
   }
   materialized.sort((left, right) => left.sequence_id - right.sequence_id);
-  return withDerivedMessageSyncState(nextAtom, materialized);
+  const deliveredMessageIds = new Set(materialized.map((message) => message.message_id));
+  return withDerivedMessageSyncState(
+    {
+      ...nextAtom,
+      steeringMessages: nextAtom.steeringMessages.filter(
+        (message) => !deliveredMessageIds.has(message.message_id),
+      ),
+    },
+    materialized,
+  );
 }
 
 function toolResultUseId(message: Message): string | null {

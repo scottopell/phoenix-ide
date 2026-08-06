@@ -3821,7 +3821,13 @@ async fn stream_conversation(
         pending_truncated,
     };
 
-    Ok(sse_stream(id, init_event, broadcast_rx, Some(init_trace)))
+    Ok(sse_stream(
+        id,
+        init_event,
+        broadcast_rx,
+        Some(init_trace),
+        crate::api::sse::SseStreamAudience::Authenticated,
+    ))
 }
 
 // ============================================================
@@ -7559,7 +7565,13 @@ async fn shared_sse_stream(
         pending_truncated,
     };
 
-    Ok(sse_stream(conversation_id, init_event, broadcast_rx, None))
+    Ok(sse_stream(
+        conversation_id,
+        init_event,
+        broadcast_rx,
+        None,
+        crate::api::sse::SseStreamAudience::SharedTranscript,
+    ))
 }
 
 // ============================================================

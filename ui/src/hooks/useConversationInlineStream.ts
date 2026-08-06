@@ -25,7 +25,6 @@ import {
 import { parseConversationState, isAgentWorking } from '../utils';
 import { conversationReducer, createInitialAtom, type ConversationAtom, type InitPayload } from '../conversation/atom';
 import { setCodexQuota } from '../codexQuota';
-import { restoreInitSideChannels } from './useConnection';
 import * as v from 'valibot';
 
 export type InlineStreamState =
@@ -170,7 +169,6 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         if (raw === null) return;
         const res = v.safeParse(SseInitDataSchema, raw);
         if (!res.success) return;
-        restoreInitSideChannels(res.output);
         dispatch({ type: 'atom', atomAction: { type: 'sse_init', payload: transformInitData(res.output) } });
       });
 
