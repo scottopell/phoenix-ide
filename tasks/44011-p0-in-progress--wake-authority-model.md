@@ -25,6 +25,7 @@ Five perspectives—durable workflow/state machine, SQLite recovery, concurrency
 - **Delivery while busy:** terminal delivery is durable and queued; automatic resumption waits until the current authoritative turn settles.
 - **Ownership transfer:** continuation transfers delivery ownership, not workflow or resource identity.
 - **Deadline occurrence precedence:** evidence occurring at or before the deadline remains eligible even when observed after expiry is proposed; evidence after the deadline cannot replace expiry.
+- **Bounded registration:** wake deadlines are strictly after registration and no more than 1,800 seconds later; adapters reject zero or over-bound durations before registration.
 - **Identity split:** registration ownership is immutable audit identity; continuation changes only the current delivery owner while preserving contract, workflow, and resource identity.
 
 ## Authoritative aggregate
@@ -51,11 +52,10 @@ enum CanonicalTerminal {
     Expired { deadline: OccurredAt },
     Cancelled { cause: CancellationCause, occurred_at: OccurredAt },
     Forgotten { cause: ForgottenCause, occurred_at: OccurredAt },
-    Failed { cause: FailureCause, occurred_at: OccurredAt },
 }
 ```
 
-Cancellation, forgotten, and failure causes are closed enums. Diagnostics are adjunct typed data, never authority-bearing strings.
+Cancellation and forgotten causes are closed enums. Adapter protocol failures reconcile through typed forgotten causes rather than introducing a fifth terminal family. Diagnostics are adjunct typed data, never authority-bearing strings.
 
 `TerminalProposed` is an open semantic arbitration substate, not terminal truth or an execution retry state. Entering it fences this contract generation's observation authority. Finalization requires a nominal observation-fence proof bound to the contract, proposed head, and proposal transition; this is profile-local reconciliation of already-authoritative evidence, not the permanent engine-wide exact-drain machinery retired by ADR-019.
 
@@ -68,6 +68,7 @@ Commands are closed: `Register`, `Observe`, `Cancel`, `DeadlineElapsed`, `Transf
 Owed effects include adapter watch/unwatch, reducer inbox delivery, public projection append, and lifecycle cleanup. An effect is idempotently keyed by contract generation and transition identity. Effect completion never rewrites aggregate truth.
 
 Replay requires the exact semantic command and transition identity. Reusing a transition identity with a different command kind, head, or payload is a typed conflict. Every accepted command advances the composite `(generation, version)` head exactly once; stale same-generation versions cannot mutate authority.
+Transition identities are monotonic within a contract generation. Exact replay is valid only at the current head; any older identity is rejected even when its payload matches a historical command.
 
 The model boundary exposes an exhaustive public-event registry. Registration events contain the full immutable registration facts, transfer events contain both delivery owners, and terminal events contain canonical terminal evidence plus the delivery owner, so downstream projections can be rebuilt without becoming authorities.
 

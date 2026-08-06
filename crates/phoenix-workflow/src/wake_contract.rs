@@ -1,14 +1,34 @@
 use crate::{Generation, Timestamp, TransitionId, Version};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WakeContractId(pub String);
+const MAX_WAKE_DURATION_SECONDS: u64 = 1_800;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WakeContractId(String);
 
 impl WakeContractId {
     #[must_use]
     pub fn new(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
         (!value.is_empty()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WakeContractId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| D::Error::custom("wake contract ID cannot be empty"))
     }
 }
 
@@ -75,13 +95,6 @@ pub enum ForgottenCause {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FailureCause {
-    AdapterProtocolViolation,
-    EvidenceRejected,
-    ManualResolution,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalEvidence {
     pub occurred_at: Timestamp,
     pub value: EncodedWakeValue,
@@ -103,10 +116,6 @@ pub enum CanonicalTerminal {
         cause: ForgottenCause,
         occurred_at: Timestamp,
     },
-    Failed {
-        cause: FailureCause,
-        occurred_at: Timestamp,
-    },
 }
 
 impl CanonicalTerminal {
@@ -115,9 +124,9 @@ impl CanonicalTerminal {
         match self {
             Self::Fired { evidence } => evidence.occurred_at,
             Self::Expired { deadline } => *deadline,
-            Self::Cancelled { occurred_at, .. }
-            | Self::Forgotten { occurred_at, .. }
-            | Self::Failed { occurred_at, .. } => *occurred_at,
+            Self::Cancelled { occurred_at, .. } | Self::Forgotten { occurred_at, .. } => {
+                *occurred_at
+            }
         }
     }
 }
@@ -190,12 +199,29 @@ pub enum WakeLifecycle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeCommandFingerprint(String);
+
+impl WakeCommandFingerprint {
+    fn for_command(command: &WakeCommandKind) -> Self {
+        let encoded = serde_json::to_vec(command).expect("wake commands serialize");
+        let digest = Sha256::digest(encoded);
+        let value = digest
+            .iter()
+            .fold(String::with_capacity(64), |mut value, byte| {
+                write!(value, "{byte:02x}").expect("writing to a string cannot fail");
+                value
+            });
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeContract {
     pub id: WakeContractId,
     pub generation: Generation,
     pub version: Version,
     pub head_transition_id: TransitionId,
-    pub head_command: Box<WakeCommandKind>,
+    pub head_command_fingerprint: WakeCommandFingerprint,
     pub registration_owner: WakeOwner,
     pub delivery_owner: WakeOwner,
     pub subject: WakeSubject,
@@ -222,14 +248,14 @@ pub enum WakeState {
     Present(WakeContract),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservationFenceProof {
     contract_id: WakeContractId,
     proposed_head: WakeHeadToken,
     proposal_transition_id: TransitionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ReconcileObservation {
     ObservationAuthorityFenced(ObservationFenceProof),
     ResourceUnavailable {
@@ -237,12 +263,11 @@ pub enum ReconcileObservation {
         occurred_at: Timestamp,
     },
     ProtocolFailure {
-        cause: FailureCause,
         occurred_at: Timestamp,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum WakeCommandKind {
     Register {
         id: WakeContractId,
@@ -288,7 +313,7 @@ impl WakeCommandKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WakeCommand {
     pub transition_id: TransitionId,
     pub kind: WakeCommandKind,
@@ -305,10 +330,9 @@ impl CanonicalTerminal {
     pub fn resume_policy(&self) -> WakeResumePolicy {
         match self {
             Self::Cancelled { .. } => WakeResumePolicy::SuppressAutomaticResume,
-            Self::Fired { .. }
-            | Self::Expired { .. }
-            | Self::Forgotten { .. }
-            | Self::Failed { .. } => WakeResumePolicy::RequestWhenIdle,
+            Self::Fired { .. } | Self::Expired { .. } | Self::Forgotten { .. } => {
+                WakeResumePolicy::RequestWhenIdle
+            }
         }
     }
 }
@@ -393,6 +417,7 @@ pub enum WakeRejection {
     ObservationFenceProofMismatch,
     AlreadyDeliveryOwner,
     ConflictingTransitionReuse,
+    NonMonotonicTransitionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,7 +448,7 @@ pub struct WakeEffectKey {
     pub role: WakeEffectRole,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum WakeOwedEffectKind {
     BeginObservation {
         subject: WakeSubject,
@@ -442,7 +467,7 @@ pub enum WakeOwedEffectKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WakeOwedEffect {
     pub key: WakeEffectKey,
     pub kind: WakeOwedEffectKind,
@@ -471,7 +496,7 @@ pub fn transition(state: &WakeState, command: WakeCommand) -> WakeTransition {
             },
         ) => register(
             command.transition_id,
-            command_kind,
+            &command_kind,
             id,
             registration_owner,
             subject,
@@ -482,7 +507,8 @@ pub fn transition(state: &WakeState, command: WakeCommand) -> WakeTransition {
         (WakeState::Absent, _) => rejected(state, WakeRejection::ContractMissing),
         (WakeState::Present(contract), WakeCommandKind::Register { .. })
             if command.transition_id == contract.head_transition_id
-                && command_kind == *contract.head_command =>
+                && WakeCommandFingerprint::for_command(&command_kind)
+                    == contract.head_command_fingerprint =>
         {
             replayed(contract)
         }
@@ -490,6 +516,11 @@ pub fn transition(state: &WakeState, command: WakeCommand) -> WakeTransition {
             if command.transition_id == contract.head_transition_id =>
         {
             rejected(state, WakeRejection::ConflictingTransitionReuse)
+        }
+        (WakeState::Present(contract), WakeCommandKind::Register { .. })
+            if command.transition_id < contract.head_transition_id =>
+        {
+            rejected(state, WakeRejection::NonMonotonicTransitionId)
         }
         (WakeState::Present(_), WakeCommandKind::Register { .. }) => {
             rejected(state, WakeRejection::ContractAlreadyExists)
@@ -503,7 +534,7 @@ pub fn transition(state: &WakeState, command: WakeCommand) -> WakeTransition {
 #[allow(clippy::too_many_arguments)]
 fn register(
     transition_id: TransitionId,
-    command: WakeCommandKind,
+    command: &WakeCommandKind,
     id: WakeContractId,
     registration_owner: WakeOwner,
     subject: WakeSubject,
@@ -511,7 +542,12 @@ fn register(
     registered_at: Timestamp,
     deadline: Timestamp,
 ) -> WakeTransition {
-    if deadline < registered_at {
+    let valid_deadline = deadline > registered_at
+        && deadline
+            .0
+            .checked_sub(registered_at.0)
+            .is_some_and(|duration| duration <= MAX_WAKE_DURATION_SECONDS);
+    if !valid_deadline {
         return rejected(&WakeState::Absent, WakeRejection::InvalidDeadline);
     }
     let contract = WakeContract {
@@ -519,7 +555,7 @@ fn register(
         generation: Generation(0),
         version: Version(1),
         head_transition_id: transition_id,
-        head_command: Box::new(command),
+        head_command_fingerprint: WakeCommandFingerprint::for_command(command),
         registration_owner: registration_owner.clone(),
         delivery_owner: registration_owner,
         subject: subject.clone(),
@@ -562,7 +598,8 @@ fn transition_present(
     command: WakeCommandKind,
 ) -> WakeTransition {
     if transition_id == contract.head_transition_id {
-        return if command == *contract.head_command {
+        return if WakeCommandFingerprint::for_command(&command) == contract.head_command_fingerprint
+        {
             replayed(contract)
         } else {
             rejected(
@@ -570,6 +607,12 @@ fn transition_present(
                 WakeRejection::ConflictingTransitionReuse,
             )
         };
+    }
+    if transition_id < contract.head_transition_id {
+        return rejected(
+            &WakeState::Present(contract.clone()),
+            WakeRejection::NonMonotonicTransitionId,
+        );
     }
     let expected_head = command
         .expected_head()
@@ -592,7 +635,7 @@ fn transition_present(
         ) if evidence.occurred_at <= contract.deadline => close(
             contract,
             transition_id,
-            committed_command.clone(),
+            &committed_command,
             CanonicalTerminal::Fired { evidence },
         ),
         (
@@ -610,7 +653,7 @@ fn transition_present(
         ) => propose(
             contract,
             transition_id,
-            committed_command.clone(),
+            &committed_command,
             ProposedTerminal::Cancelled { cause, occurred_at },
         ),
         (
@@ -619,7 +662,7 @@ fn transition_present(
         ) if observed_at >= contract.deadline => propose(
             contract,
             transition_id,
-            committed_command.clone(),
+            &committed_command,
             ProposedTerminal::Expired {
                 deadline: contract.deadline,
             },
@@ -637,7 +680,7 @@ fn transition_present(
         ) if proposal.terminal.admits_evidence_at(evidence.occurred_at) => close(
             contract,
             transition_id,
-            committed_command.clone(),
+            &committed_command,
             CanonicalTerminal::Fired { evidence },
         ),
         (
@@ -656,7 +699,7 @@ fn transition_present(
         ) if proof == observation_fence_proof(contract, proposal) => close(
             contract,
             transition_id,
-            committed_command.clone(),
+            &committed_command,
             proposal.terminal.clone().into_terminal(),
         ),
         (
@@ -668,6 +711,18 @@ fn transition_present(
         ) => rejected(
             &WakeState::Present(contract.clone()),
             WakeRejection::ObservationFenceProofMismatch,
+        ),
+        (
+            WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)),
+            WakeCommandKind::Reconcile {
+                observation: ReconcileObservation::ResourceUnavailable { cause, occurred_at },
+                ..
+            },
+        ) if proposal.terminal.admits_evidence_at(occurred_at) => close(
+            contract,
+            transition_id,
+            &committed_command,
+            CanonicalTerminal::Forgotten { cause, occurred_at },
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)),
@@ -685,20 +740,23 @@ fn transition_present(
         ) => close(
             contract,
             transition_id,
-            committed_command.clone(),
+            &committed_command,
             CanonicalTerminal::Forgotten { cause, occurred_at },
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
             WakeCommandKind::Reconcile {
-                observation: ReconcileObservation::ProtocolFailure { cause, occurred_at },
+                observation: ReconcileObservation::ProtocolFailure { occurred_at },
                 ..
             },
         ) => close(
             contract,
             transition_id,
-            committed_command.clone(),
-            CanonicalTerminal::Failed { cause, occurred_at },
+            &committed_command,
+            CanonicalTerminal::Forgotten {
+                cause: ForgottenCause::AdapterLostAuthority,
+                occurred_at,
+            },
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
@@ -713,7 +771,11 @@ fn transition_present(
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
             WakeCommandKind::TransferDeliveryOwner { new_owner, .. },
-        ) => transfer_delivery_owner(contract, transition_id, committed_command, new_owner),
+        ) => transfer_delivery_owner(contract, transition_id, &committed_command, new_owner),
+        (
+            WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)),
+            WakeCommandKind::TransferDeliveryOwner { new_owner, .. },
+        ) => transfer_delivery_owner(contract, transition_id, &committed_command, new_owner),
         (WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)), _) => rejected(
             &WakeState::Present(contract.clone()),
             WakeRejection::TerminalArbitrationPending,
@@ -731,7 +793,7 @@ fn transition_present(
 fn close(
     contract: &WakeContract,
     transition_id: TransitionId,
-    command: WakeCommandKind,
+    command: &WakeCommandKind,
     terminal: CanonicalTerminal,
 ) -> WakeTransition {
     let mut next = advanced(contract, transition_id, command);
@@ -761,7 +823,7 @@ fn close(
 fn propose(
     contract: &WakeContract,
     transition_id: TransitionId,
-    command: WakeCommandKind,
+    command: &WakeCommandKind,
     proposal: ProposedTerminal,
 ) -> WakeTransition {
     let mut next = advanced(contract, transition_id, command);
@@ -795,7 +857,7 @@ fn propose(
 fn transfer_delivery_owner(
     contract: &WakeContract,
     transition_id: TransitionId,
-    command: WakeCommandKind,
+    command: &WakeCommandKind,
     new_owner: WakeOwner,
 ) -> WakeTransition {
     if new_owner == contract.delivery_owner {
@@ -833,12 +895,12 @@ fn transfer_delivery_owner(
 fn advanced(
     contract: &WakeContract,
     transition_id: TransitionId,
-    command: WakeCommandKind,
+    command: &WakeCommandKind,
 ) -> WakeContract {
     let mut next = contract.clone();
     next.version = next.version.next();
     next.head_transition_id = transition_id;
-    next.head_command = Box::new(command);
+    next.head_command_fingerprint = WakeCommandFingerprint::for_command(command);
     next
 }
 

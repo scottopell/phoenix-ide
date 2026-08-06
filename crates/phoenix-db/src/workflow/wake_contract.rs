@@ -114,8 +114,20 @@ impl WakeContractRepository {
                     )
                     .await?;
                 }
+                if let WakeState::Present(contract) = &result.new_state {
+                    if current == WakeState::Absent {
+                        insert_contract_identity_tx(&mut tx, input.workflow_id, &contract.id)
+                            .await?;
+                    }
+                }
+                if is_fence_finalization(event) {
+                    validate_fence_receipt_tx(&mut tx, input.workflow_id, &current).await?;
+                }
                 if should_revoke_observation_authority(event) {
                     revoke_observation_authority_tx(&mut tx, input.workflow_id).await?;
+                }
+                if terminal_bundle.is_some() {
+                    invalidate_prior_required_effects_tx(&mut tx, input.workflow_id).await?;
                 }
                 let committed = tx
                     .commit_transition_plan(&CommitTransitionPlanCas {
@@ -217,7 +229,7 @@ impl WakeContractRepository {
              (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
               external_acceptance_enabled, version, generation, status, snapshot_codec_family,
               snapshot_codec_version, snapshot_payload, created_at, updated_at)
-             VALUES (?1, 'wake.contract', 1, 0, 0, 0, ?2, 'Active', ?3, ?4, ?5, ?6, ?6)",
+             VALUES (?1, 'wake.contract', 1, 1, 0, 0, ?2, 'Active', ?3, ?4, ?5, ?6, ?6)",
         )
         .bind(super::to_i64(workflow_id.0, "workflow_id")?)
         .bind(super::to_i64(generation.0, "generation")?)
@@ -253,6 +265,22 @@ impl WakeContractRepository {
     }
 }
 
+async fn insert_contract_identity_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    contract_id: &phoenix_workflow::wake_contract::WakeContractId,
+) -> DbResult<()> {
+    sqlx::query(
+        "INSERT INTO wake_contract_identity_bindings (contract_id, workflow_id)
+         VALUES (?1, ?2)",
+    )
+    .bind(contract_id.as_str())
+    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .execute(&mut *tx.tx)
+    .await?;
+    Ok(())
+}
+
 async fn validate_replay_artifacts_tx(
     tx: &mut super::WorkflowTx<'_>,
     workflow_id: WorkflowId,
@@ -263,36 +291,35 @@ async fn validate_replay_artifacts_tx(
             "cannot replay an absent wake contract".into(),
         ));
     };
-    let expected_effect_id = match &*contract.head_command {
-        phoenix_workflow::wake_contract::WakeCommandKind::Register { .. } => Some(effect_id(
-            contract.head_transition_id,
-            WakeEffectRole::BeginObservation,
-        )),
-        phoenix_workflow::wake_contract::WakeCommandKind::Cancel { .. }
-        | phoenix_workflow::wake_contract::WakeCommandKind::DeadlineElapsed { .. } => {
-            Some(effect_id(
-                contract.head_transition_id,
-                WakeEffectRole::FenceObservationAuthority,
-            ))
-        }
-        phoenix_workflow::wake_contract::WakeCommandKind::TransferDeliveryOwner { .. } => {
-            Some(effect_id(
-                contract.head_transition_id,
-                WakeEffectRole::TransferDeliveryOwner,
-            ))
-        }
-        phoenix_workflow::wake_contract::WakeCommandKind::ObserveTerminal { .. }
-        | phoenix_workflow::wake_contract::WakeCommandKind::Reconcile { .. } => matches!(
-            contract.lifecycle,
-            phoenix_workflow::wake_contract::WakeLifecycle::Closed(_)
-        )
-        .then(|| {
-            effect_id(
-                contract.head_transition_id,
-                WakeEffectRole::CommitTerminalization,
-            )
-        }),
-    };
+    let event_payload: Vec<u8> = sqlx::query_scalar(
+        "SELECT event_payload FROM workflow_transitions
+         WHERE workflow_id = ?1 AND transition_id = ?2",
+    )
+    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .bind(super::to_i64(
+        contract.head_transition_id.0,
+        "transition_id",
+    )?)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    let event: phoenix_workflow::wake_contract::WakeContractEvent = decode(&event_payload)?;
+    let expected_effect_id = Some(effect_id(
+        contract.head_transition_id,
+        match event.kind {
+            phoenix_workflow::wake_contract::WakeEventKind::Registered { .. } => {
+                WakeEffectRole::BeginObservation
+            }
+            phoenix_workflow::wake_contract::WakeEventKind::DeliveryOwnerTransferred { .. } => {
+                WakeEffectRole::TransferDeliveryOwner
+            }
+            phoenix_workflow::wake_contract::WakeEventKind::TerminalProposed { .. } => {
+                WakeEffectRole::FenceObservationAuthority
+            }
+            phoenix_workflow::wake_contract::WakeEventKind::Terminalized { .. } => {
+                WakeEffectRole::CommitTerminalization
+            }
+        },
+    ));
     if let Some(effect_id) = expected_effect_id {
         let effect_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM workflow_effects
@@ -369,8 +396,7 @@ fn terminal_bundle(
         phoenix_workflow::wake_contract::CanonicalTerminal::Forgotten { .. } => {
             ReceiptOrigin::ForgottenInterruption
         }
-        phoenix_workflow::wake_contract::CanonicalTerminal::Fired { .. }
-        | phoenix_workflow::wake_contract::CanonicalTerminal::Failed { .. } => {
+        phoenix_workflow::wake_contract::CanonicalTerminal::Fired { .. } => {
             ReceiptOrigin::Reconciliation
         }
     };
@@ -409,6 +435,64 @@ fn terminal_bundle(
                 .then_some(RuntimeAcceptanceStatus::Owed),
         },
     }))
+}
+
+fn is_fence_finalization(event: &phoenix_workflow::wake_contract::WakeContractEvent) -> bool {
+    matches!(
+        event.kind,
+        phoenix_workflow::wake_contract::WakeEventKind::Terminalized { .. }
+    )
+}
+
+async fn validate_fence_receipt_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    current: &WakeState,
+) -> DbResult<()> {
+    let WakeState::Present(contract) = current else {
+        return Ok(());
+    };
+    let phoenix_workflow::wake_contract::WakeLifecycle::Open(
+        phoenix_workflow::wake_contract::OpenWakeLifecycle::TerminalProposed(proposal),
+    ) = &contract.lifecycle
+    else {
+        return Ok(());
+    };
+    let fence_effect_id = effect_id(
+        proposal.transition_id,
+        WakeEffectRole::FenceObservationAuthority,
+    );
+    let receipted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_effects e
+         JOIN workflow_receipts r
+           ON r.workflow_id = e.workflow_id AND r.effect_id = e.effect_id
+         WHERE e.workflow_id = ?1 AND e.effect_id = ?2 AND e.status = 'Receipted'",
+    )
+    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .bind(super::to_i64(fence_effect_id, "effect_id")?)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    if receipted != 1 {
+        return Err(DbError::Serialization(
+            "terminal proposal requires a durable fence-effect receipt".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn invalidate_prior_required_effects_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE workflow_effects SET status = 'Invalidated'
+         WHERE workflow_id = ?1 AND role = 'Required'
+           AND status IN ('Blocked', 'Eligible', 'Executing', 'RetryWait', 'AmbiguityWait')",
+    )
+    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .execute(&mut *tx.tx)
+    .await?;
+    Ok(())
 }
 
 fn should_revoke_observation_authority(
@@ -647,7 +731,7 @@ mod tests {
             command: WakeCommand {
                 transition_id: TransitionId(1),
                 kind: WakeCommandKind::Register {
-                    id: WakeContractId("contract".into()),
+                    id: WakeContractId::new("contract").unwrap(),
                     registration_owner: WakeOwner("conversation".into()),
                     subject: subject(),
                     condition: WakeCondition::Terminal,
@@ -670,6 +754,49 @@ mod tests {
                     expected_head: contract.head(),
                     cause: CancellationCause::UserRequested,
                     occurred_at: Timestamp(20),
+                },
+            },
+        }
+    }
+
+    fn propose_cancel(
+        state: &WakeState,
+        workflow_id: WorkflowId,
+    ) -> (
+        CommitWakeCommandInput,
+        phoenix_workflow::wake_contract::ObservationFenceProof,
+    ) {
+        let input = cancel(state, workflow_id);
+        let modeled = transition(state, input.command.clone());
+        let [phoenix_workflow::wake_contract::WakeOwedEffect {
+            kind:
+                phoenix_workflow::wake_contract::WakeOwedEffectKind::FenceObservationAuthority { proof },
+            ..
+        }] = modeled.owed_effects.as_slice()
+        else {
+            panic!("cancellation proposal must owe a fence")
+        };
+        (input, proof.clone())
+    }
+
+    fn finalize_proposal(
+        state: &WakeState,
+        workflow_id: WorkflowId,
+        proof: phoenix_workflow::wake_contract::ObservationFenceProof,
+    ) -> CommitWakeCommandInput {
+        let WakeState::Present(contract) = state else {
+            panic!("expected present contract")
+        };
+        CommitWakeCommandInput {
+            workflow_id,
+            command: WakeCommand {
+                transition_id: TransitionId(3),
+                kind: WakeCommandKind::Reconcile {
+                    expected_head: contract.head(),
+                    observation:
+                        phoenix_workflow::wake_contract::ReconcileObservation::ObservationAuthorityFenced(
+                            proof,
+                        ),
                 },
             },
         }
@@ -828,6 +955,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contract_identity_is_unique_across_workflows() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        assert!(matches!(
+            repo.commit_wake_command(&register(WorkflowId(8)))
+                .await
+                .unwrap(),
+            CommitWakeCommandOutcome::Applied { .. }
+        ));
+        assert!(repo
+            .commit_wake_command(&register(WorkflowId(9)))
+            .await
+            .is_err());
+        assert_eq!(
+            repo.load_state(WorkflowId(9)).await.unwrap(),
+            WakeState::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn terminalization_requires_a_durable_fence_receipt() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let registered = repo
+            .commit_wake_command(&register(WorkflowId(10)))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        let (proposal, proof) = propose_cancel(&state, WorkflowId(10));
+        let proposed = repo.commit_wake_command(&proposal).await.unwrap();
+        let CommitWakeCommandOutcome::Applied {
+            state: proposed_state,
+            ..
+        } = proposed
+        else {
+            panic!("proposal should apply")
+        };
+        let finalization = finalize_proposal(&proposed_state, WorkflowId(10), proof.clone());
+        assert!(matches!(
+            repo.commit_wake_command(&finalization).await,
+            Err(DbError::Serialization(message)) if message.contains("fence-effect receipt")
+        ));
+        let fence_effect_id: i64 = sqlx::query_scalar(
+            "SELECT effect_id FROM workflow_effects
+             WHERE workflow_id = 10 AND kind = 'fence_observation_authority'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_receipts
+             (workflow_id, receipt_id, effect_id, generation, declared_workflow_version,
+              process_incarnation, attempt_id, origin, receipt_codec_family,
+              receipt_codec_version, receipt_payload)
+             VALUES (10, 99, ?1, 0, 2, 0, NULL, 'Reconciliation', 'wake.contract', 1, X'00')",
+        )
+        .bind(fence_effect_id)
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE workflow_effects SET status = 'Receipted'
+             WHERE workflow_id = 10 AND effect_id = ?1",
+        )
+        .bind(fence_effect_id)
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.commit_wake_command(&finalization).await.unwrap(),
+            CommitWakeCommandOutcome::Applied { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn terminalization_atomically_creates_canonical_bundle() {
         let (_dir, repo, restarted) = open_repo_pair().await;
         let registered = repo
@@ -855,6 +1057,22 @@ mod tests {
         assert_eq!(table_count(&repo, "barriers", 5).await, 1);
         assert_eq!(table_count(&repo, "barrier_members", 5).await, 1);
         assert_eq!(table_count(&repo, "deliveries", 5).await, 1);
+        let runtime_acceptance_enabled: i64 = sqlx::query_scalar(
+            "SELECT runtime_acceptance_enabled FROM workflows WHERE workflow_id = 5",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(runtime_acceptance_enabled, 1);
+        let open_required_effects: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_effects
+             WHERE workflow_id = 5 AND role = 'Required'
+               AND status NOT IN ('Receipted', 'Invalidated')",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(open_required_effects, 0);
         let receipt_payload: Vec<u8> = sqlx::query_scalar(
             "SELECT receipt_payload FROM workflow_receipts WHERE workflow_id = 5",
         )

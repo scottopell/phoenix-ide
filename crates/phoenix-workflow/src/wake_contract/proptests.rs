@@ -163,7 +163,6 @@ fn generated_command(state: &WakeState, action: GeneratedAction, next_id: u64) -
         GeneratedAction::Fail { at } => WakeCommandKind::Reconcile {
             expected_head: current_head,
             observation: ReconcileObservation::ProtocolFailure {
-                cause: FailureCause::AdapterProtocolViolation,
                 occurred_at: Timestamp(u64::from(at)),
             },
         },
@@ -214,7 +213,7 @@ proptest! {
         cancel_at in 1u64..1_000,
         observed_at in 0u64..1_000,
     ) {
-        let state = registered(2_000);
+        let state = registered(1_800);
         let proposed = cancel(&state, 2, cancel_at);
         let after_observation = transition(
             &proposed.new_state,
@@ -252,7 +251,7 @@ proptest! {
 
     #[test]
     fn expiry_admits_evidence_at_deadline_but_not_after(
-        deadline in 0u64..10_000,
+        deadline in 1u64..=1_800,
         delta in 1u64..10_000,
     ) {
         let state = registered(deadline);
@@ -304,7 +303,7 @@ proptest! {
         stale_version in 0u64..100,
         stale_generation in 1u64..100,
     ) {
-        let state = registered(u64::MAX);
+        let state = registered(1_800);
         for expected_head in [
             WakeHeadToken { generation: Generation(0), version: Version(stale_version) },
             WakeHeadToken { generation: Generation(stale_generation), version: Version(1) },
@@ -333,7 +332,7 @@ proptest! {
     fn arbitrary_command_sequences_preserve_transition_invariants(
         actions in prop::collection::vec(action_strategy(), 0..100),
     ) {
-        let mut state = registered(50_000);
+        let mut state = registered(1_800);
         let registration_owner = contract(&state).registration_owner.clone();
         let identity = contract(&state).id.clone();
         let subject = contract(&state).subject.clone();
@@ -475,6 +474,87 @@ fn registration_event_is_rebuildable_and_registry_is_exhaustive() {
 }
 
 #[test]
+fn prior_transition_ids_cannot_be_reused_after_the_head_advances() {
+    let state = registered(10);
+    let transferred = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::TransferDeliveryOwner {
+                expected_head: contract(&state).head(),
+                new_owner: WakeOwner("successor".into()),
+            },
+        ),
+    );
+    let reused = transition(&transferred.new_state, register_command(10));
+    assert_eq!(reused.new_state, transferred.new_state);
+    assert_eq!(
+        reused.disposition,
+        WakeDisposition::Rejected(WakeRejection::NonMonotonicTransitionId)
+    );
+}
+
+#[test]
+fn registration_rejects_deadlines_beyond_the_profile_bound() {
+    let result = transition(&WakeState::Absent, register_command(1_801));
+    assert_eq!(result.new_state, WakeState::Absent);
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::InvalidDeadline)
+    ));
+}
+
+#[test]
+fn earlier_resource_loss_wins_while_cancellation_is_proposed() {
+    let state = registered(10);
+    let proposed = cancel(&state, 2, 5);
+    let reconciled = transition(
+        &proposed.new_state,
+        command(
+            3,
+            WakeCommandKind::Reconcile {
+                expected_head: contract(&proposed.new_state).head(),
+                observation: ReconcileObservation::ResourceUnavailable {
+                    cause: ForgottenCause::ResourceDestroyed,
+                    occurred_at: Timestamp(4),
+                },
+            },
+        ),
+    );
+    assert!(matches!(
+        contract(&reconciled.new_state).lifecycle,
+        WakeLifecycle::Closed(CanonicalTerminal::Forgotten {
+            occurred_at: Timestamp(4),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn delivery_owner_can_transfer_during_terminal_arbitration() {
+    let state = registered(10);
+    let proposed = cancel(&state, 2, 5);
+    let transferred = transition(
+        &proposed.new_state,
+        command(
+            3,
+            WakeCommandKind::TransferDeliveryOwner {
+                expected_head: contract(&proposed.new_state).head(),
+                new_owner: WakeOwner("successor".into()),
+            },
+        ),
+    );
+    assert_eq!(
+        contract(&transferred.new_state).delivery_owner,
+        WakeOwner("successor".into())
+    );
+    assert!(matches!(
+        contract(&transferred.new_state).lifecycle,
+        WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_))
+    ));
+}
+
+#[test]
 fn finalization_requires_matching_observation_fence_proof() {
     let state = registered(10);
     let proposed = cancel(&state, 2, 5);
@@ -582,7 +662,7 @@ fn event_boundary_adds_contract_and_transition_identity_once() {
     let WakeDisposition::Applied { event } = &result.disposition else {
         panic!("observation should apply")
     };
-    assert_eq!(event.contract_id, WakeContractId("contract".to_string()));
+    assert_eq!(event.contract_id, WakeContractId::new("contract").unwrap());
     assert_eq!(event.transition_id, TransitionId(2));
     assert!(matches!(
         event.kind,
@@ -598,25 +678,11 @@ fn event_boundary_adds_contract_and_transition_identity_once() {
 }
 
 #[test]
-fn zero_duration_registration_is_immediately_expirable() {
-    let state = registered(0);
-    let result = transition(
-        &state,
-        command(
-            2,
-            WakeCommandKind::DeadlineElapsed {
-                expected_head: contract(&state).head(),
-                observed_at: Timestamp(0),
-            },
-        ),
-    );
+fn zero_duration_registration_is_rejected_by_bounded_deadline_policy() {
+    let result = transition(&WakeState::Absent, register_command(0));
+    assert_eq!(result.new_state, WakeState::Absent);
     assert!(matches!(
-        contract(&result.new_state).lifecycle,
-        WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(TerminalProposal {
-            terminal: ProposedTerminal::Expired {
-                deadline: Timestamp(0)
-            },
-            ..
-        }))
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::InvalidDeadline)
     ));
 }

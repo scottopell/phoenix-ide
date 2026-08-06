@@ -321,7 +321,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "project_conversation_work_scope_attachments",
         sql: MIGRATION_061,
     },
+    Migration {
+        version: 62,
+        name: "create_wake_contract_identity_bindings",
+        sql: MIGRATION_062,
+    },
 ];
+
+const MIGRATION_062: &str = r"
+CREATE TABLE wake_contract_identity_bindings (
+    contract_id TEXT PRIMARY KEY CHECK (contract_id <> ''),
+    workflow_id INTEGER NOT NULL UNIQUE
+        REFERENCES workflows(workflow_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+";
 
 const MIGRATION_061: &str = r"
 CREATE VIEW IF NOT EXISTS conversation_work_scope_attachments AS
