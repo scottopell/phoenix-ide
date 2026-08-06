@@ -931,6 +931,21 @@ impl<'a> WorkflowTx<'a> {
         &mut self,
         input: &AcceptReceiptInput,
     ) -> DbResult<ReceiptAcceptanceResult> {
+        self.accept_receipt_with_delivery_policy(input, true).await
+    }
+
+    pub(crate) async fn accept_receipt_without_delivery(
+        &mut self,
+        input: &AcceptReceiptInput,
+    ) -> DbResult<ReceiptAcceptanceResult> {
+        self.accept_receipt_with_delivery_policy(input, false).await
+    }
+
+    async fn accept_receipt_with_delivery_policy(
+        &mut self,
+        input: &AcceptReceiptInput,
+        create_delivery: bool,
+    ) -> DbResult<ReceiptAcceptanceResult> {
         let effect = sqlx::query(
             "SELECT e.status, e.generation, e.declared_workflow_version,
                     EXISTS (
@@ -1038,16 +1053,18 @@ impl<'a> WorkflowTx<'a> {
             }
             Err(error) => return Err(DbError::Sqlx(error)),
         }
-        sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (?1, ?2, ?3, NULL, 'reducer', ?4, ?5, 'Receipt', ?6, ?7, 'Pending', ?8, NULL, NULL)")
-            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(input.delivery_id.0, "delivery_id")?)
-            .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
-            .bind(&input.receipt_event_codec.family)
-            .bind(i64::from(input.receipt_event_codec.version))
-            .bind(&input.receipt_event_payload)
-            .bind(requires_runtime)
-            .bind(if requires_runtime { Some("Owed") } else { None })
-            .execute(&mut *self.tx).await?;
+        if create_delivery {
+            sqlx::query("INSERT INTO workflow_deliveries (workflow_id, delivery_id, effect_id, barrier_id, consumer_kind, event_codec_family, event_codec_version, payload_kind, payload_blob, requires_runtime_acceptance, status, runtime_acceptance_status, suppression_reason, accepted_by_transition_id) VALUES (?1, ?2, ?3, NULL, 'reducer', ?4, ?5, 'Receipt', ?6, ?7, 'Pending', ?8, NULL, NULL)")
+                .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+                .bind(to_i64(input.delivery_id.0, "delivery_id")?)
+                .bind(to_i64(input.authority.effect_id.0, "effect_id")?)
+                .bind(&input.receipt_event_codec.family)
+                .bind(i64::from(input.receipt_event_codec.version))
+                .bind(&input.receipt_event_payload)
+                .bind(requires_runtime)
+                .bind(if requires_runtime { Some("Owed") } else { None })
+                .execute(&mut *self.tx).await?;
+        }
         sqlx::query("UPDATE workflow_attempts SET status = 'ReceiptAccepted' WHERE workflow_id = ?1 AND attempt_id = ?2")
             .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
             .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
@@ -1073,7 +1090,7 @@ impl<'a> WorkflowTx<'a> {
                 receipt_codec: input.receipt_codec.clone(),
                 receipt_payload: input.receipt_payload.clone(),
             }),
-            delivery: Some(LocalDeliveryRecord {
+            delivery: create_delivery.then(|| LocalDeliveryRecord {
                 delivery_id: input.delivery_id,
                 workflow_id: input.authority.workflow_id,
                 effect_id: Some(input.authority.effect_id),

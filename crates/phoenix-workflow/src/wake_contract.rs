@@ -145,11 +145,58 @@ pub struct WakeProfileRef {
     pub version: WakeProfileVersion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WakeCodecFamily(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WakeCodecFamily(String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WakeCodecVersion(pub u32);
+impl WakeCodecFamily {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WakeCodecFamily {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| D::Error::custom("wake codec family cannot be empty"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WakeCodecVersion(u32);
+
+impl WakeCodecVersion {
+    #[must_use]
+    pub fn new(value: u32) -> Option<Self> {
+        (value > 0).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WakeCodecVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| D::Error::custom("wake codec version must be positive"))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WakeCodecRef {
@@ -267,9 +314,10 @@ pub enum CancellationCause {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForgottenCause {
-    ResourceLostAfterRestart,
-    ResourceDestroyed,
-    AdapterLostAuthority,
+    PhoenixRestart,
+    CascadeDestroyedHandle,
+    SubagentHandleMissing,
+    TmuxHandleMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,10 +487,13 @@ pub struct ObservationFenceProof {
 pub enum ReconcileObservation {
     ObservationAuthorityFenced(ObservationFenceProof),
     ResourceUnavailable {
+        authority: WakeObservationAuthority,
         cause: ForgottenCause,
         occurred_at: Timestamp,
     },
     ProtocolFailure {
+        authority: WakeObservationAuthority,
+        cause: ForgottenCause,
         occurred_at: Timestamp,
     },
 }
@@ -588,6 +639,7 @@ pub enum WakeRejection {
     ContractAlreadyExists,
     ContractMissing,
     InvalidDeadline,
+    InvalidTransitionId,
     StaleHead {
         expected: WakeHeadToken,
         actual: WakeHeadToken,
@@ -696,6 +748,9 @@ pub fn finalize_proposed_terminal(
 #[must_use]
 pub fn transition(state: &WakeState, command: WakeCommand) -> WakeTransition {
     let command_kind = command.kind.clone();
+    if command.transition_id.0 == 0 {
+        return rejected(state, WakeRejection::InvalidTransitionId);
+    }
     match (state, command.kind) {
         (
             WakeState::Absent,
@@ -855,6 +910,20 @@ fn transition_present(
     }
 
     let committed_command = command.clone();
+    if let WakeCommandKind::Reconcile {
+        observation:
+            ReconcileObservation::ResourceUnavailable { authority, .. }
+            | ReconcileObservation::ProtocolFailure { authority, .. },
+        ..
+    } = &command
+    {
+        if !observation_authority_matches(contract, authority) {
+            return rejected(
+                &WakeState::Present(contract.clone()),
+                WakeRejection::ObservationAuthorityMismatch,
+            );
+        }
+    }
     match (&contract.lifecycle, command) {
         (
             WakeLifecycle::Open(_),
@@ -961,7 +1030,12 @@ fn transition_present(
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)),
             WakeCommandKind::Reconcile {
-                observation: ReconcileObservation::ResourceUnavailable { cause, occurred_at },
+                observation:
+                    ReconcileObservation::ResourceUnavailable {
+                        authority: _,
+                        cause,
+                        occurred_at,
+                    },
                 ..
             },
         ) if proposal.terminal.admits_evidence_at(occurred_at) => close(
@@ -973,17 +1047,19 @@ fn transition_present(
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)),
             WakeCommandKind::Reconcile {
-                observation: ReconcileObservation::ProtocolFailure { occurred_at },
+                observation:
+                    ReconcileObservation::ProtocolFailure {
+                        authority: _,
+                        cause,
+                        occurred_at,
+                    },
                 ..
             },
         ) if proposal.terminal.admits_evidence_at(occurred_at) => close(
             contract,
             transition_id,
             &committed_command,
-            CanonicalTerminal::Forgotten {
-                cause: ForgottenCause::AdapterLostAuthority,
-                occurred_at,
-            },
+            CanonicalTerminal::Forgotten { cause, occurred_at },
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)),
@@ -1000,7 +1076,12 @@ fn transition_present(
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
             WakeCommandKind::Reconcile {
-                observation: ReconcileObservation::ResourceUnavailable { cause, occurred_at },
+                observation:
+                    ReconcileObservation::ResourceUnavailable {
+                        authority: _,
+                        cause,
+                        occurred_at,
+                    },
                 ..
             },
         ) => close(
@@ -1012,17 +1093,19 @@ fn transition_present(
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
             WakeCommandKind::Reconcile {
-                observation: ReconcileObservation::ProtocolFailure { occurred_at },
+                observation:
+                    ReconcileObservation::ProtocolFailure {
+                        authority: _,
+                        cause,
+                        occurred_at,
+                    },
                 ..
             },
         ) => close(
             contract,
             transition_id,
             &committed_command,
-            CanonicalTerminal::Forgotten {
-                cause: ForgottenCause::AdapterLostAuthority,
-                occurred_at,
-            },
+            CanonicalTerminal::Forgotten { cause, occurred_at },
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),

@@ -1,15 +1,17 @@
 use super::{
-    CommitTransitionPlanCas, LocalBarrierDecl, LocalBarrierMemberDecl, LocalCodec,
-    LocalDeliveryDecl, LocalDeliveryPayloadKind, LocalEffectDecl, WorkflowRepository,
+    AcceptOrSuppressDeliveryInput, AcceptReceiptInput, CommitTransitionPlanCas,
+    DeliveryResolutionDecision, DeliveryResolutionPlan, LocalBarrierDecl, LocalBarrierMemberDecl,
+    LocalCodec, LocalDeliveryDecl, LocalDeliveryPayloadKind, LocalEffectDecl,
+    ReceiptAcceptanceResult, WorkflowRepository,
 };
 use crate::{DbError, DbResult};
 use phoenix_workflow::wake_contract::{
     transition, WakeCommand, WakeDisposition, WakeEffectRole, WakeRejection, WakeState,
 };
 use phoenix_workflow::{
-    BarrierId, BarrierStatus, CommitOutcome, DeliveryId, EffectId, EffectRole, EffectStatus,
-    ExecutionCapability, Generation, ReceiptFamily, ReceiptOrigin, RuntimeAcceptanceStatus,
-    TransitionId, Version, WorkflowId, WorkflowStatus,
+    AuthorityOutcome, BarrierId, BarrierStatus, CommitOutcome, DeliveryId, EffectId, EffectRole,
+    EffectStatus, ExecutionCapability, Generation, ReceiptFamily, ReceiptOrigin,
+    RuntimeAcceptanceStatus, TransitionId, Version, WorkflowId, WorkflowStatus,
 };
 
 const WAKE_CONTRACT_CODEC_FAMILY: &str = "wake.contract";
@@ -50,6 +52,78 @@ impl WakeContractRepository {
             #[cfg(test)]
             fail_after_transition_once: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub async fn accept_terminal_delivery(
+        &self,
+        input: &AcceptOrSuppressDeliveryInput,
+    ) -> DbResult<CommitOutcome> {
+        if !input.suppress_delivery_ids.is_empty() || input.accept_delivery_ids.is_empty() {
+            return Ok(CommitOutcome::InvalidPlan);
+        }
+        let mut tx = self.workflow_repo.begin_immediate_tx().await?;
+        let state = self.load_state_tx(&mut tx, input.workflow_id).await?;
+        let WakeState::Present(contract) = state else {
+            tx.rollback().await?;
+            return Ok(CommitOutcome::InvalidPlan);
+        };
+        if !matches!(
+            contract.lifecycle,
+            phoenix_workflow::wake_contract::WakeLifecycle::Closed(_)
+        ) {
+            tx.rollback().await?;
+            return Ok(CommitOutcome::InvalidPlan);
+        }
+        let outcome = tx
+            .resolve_deliveries_exact(DeliveryResolutionPlan {
+                workflow_id: input.workflow_id,
+                expected_version: input.expected_version,
+                transition_id: input.transition_id,
+                generation: input.generation,
+                next_status: input.next_status,
+                event_codec: &input.event_codec,
+                event_payload: &input.event_payload,
+                next_snapshot_codec: &input.next_snapshot_codec,
+                next_snapshot_payload: &input.next_snapshot_payload,
+                committed_at: input.committed_at,
+                exact_delivery_ids: &input.accept_delivery_ids,
+                decision: DeliveryResolutionDecision::Accept,
+            })
+            .await?;
+        match outcome {
+            CommitOutcome::Committed => tx.commit().await?,
+            CommitOutcome::VersionConflict
+            | CommitOutcome::InvalidPlan
+            | CommitOutcome::UnsupportedCodec => tx.rollback().await?,
+        }
+        Ok(outcome)
+    }
+
+    pub async fn accept_fence_receipt(
+        &self,
+        input: &AcceptReceiptInput,
+    ) -> DbResult<ReceiptAcceptanceResult> {
+        let mut tx = self.workflow_repo.begin_immediate_tx().await?;
+        let is_fence: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_effects
+             WHERE workflow_id = ?1 AND effect_id = ?2
+               AND kind = 'fence_observation_authority'",
+        )
+        .bind(super::to_i64(input.authority.workflow_id.0, "workflow_id")?)
+        .bind(super::to_i64(input.authority.effect_id.0, "effect_id")?)
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        if is_fence != 1 {
+            tx.rollback().await?;
+            return Ok(ReceiptAcceptanceResult {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                delivery: None,
+            });
+        }
+        let result = tx.accept_receipt_without_delivery(input).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     pub async fn commit_wake_command(
@@ -309,12 +383,12 @@ async fn validate_authority_projection_tx(
     .bind(transferability_str(contract.delivery_transferability))
     .bind(contract.subject.profile.kind.as_str())
     .bind(i64::from(contract.subject.profile.version.get()))
-    .bind(&contract.subject.resource.codec.family.0)
-    .bind(i64::from(contract.subject.resource.codec.version.0))
+    .bind(contract.subject.resource.codec.family.as_str())
+    .bind(i64::from(contract.subject.resource.codec.version.get()))
     .bind(&contract.subject.resource.payload.0)
-    .bind(&contract.subject.terminal_evidence_codec.family.0)
+    .bind(contract.subject.terminal_evidence_codec.family.as_str())
     .bind(i64::from(
-        contract.subject.terminal_evidence_codec.version.0,
+        contract.subject.terminal_evidence_codec.version.get(),
     ))
     .bind(super::to_i64(contract.registered_at.0, "registered_at")?)
     .bind(super::to_i64(contract.deadline.0, "deadline")?)
@@ -358,12 +432,12 @@ async fn insert_contract_identity_tx(
     .bind(transferability_str(contract.delivery_transferability))
     .bind(contract.subject.profile.kind.as_str())
     .bind(i64::from(contract.subject.profile.version.get()))
-    .bind(&contract.subject.resource.codec.family.0)
-    .bind(i64::from(contract.subject.resource.codec.version.0))
+    .bind(contract.subject.resource.codec.family.as_str())
+    .bind(i64::from(contract.subject.resource.codec.version.get()))
     .bind(&contract.subject.resource.payload.0)
-    .bind(&contract.subject.terminal_evidence_codec.family.0)
+    .bind(contract.subject.terminal_evidence_codec.family.as_str())
     .bind(i64::from(
-        contract.subject.terminal_evidence_codec.version.0,
+        contract.subject.terminal_evidence_codec.version.get(),
     ))
     .bind(super::to_i64(contract.registered_at.0, "registered_at")?)
     .bind(super::to_i64(contract.deadline.0, "deadline")?)
@@ -879,6 +953,7 @@ fn current_commit_time() -> phoenix_workflow::Timestamp {
 mod tests {
     use super::*;
     use crate::migrations::run_pending_migrations;
+    use crate::workflow::BeginAttemptInput;
     use phoenix_workflow::wake_contract::{
         AuthorizedWakeSubject, CancellationCause, EncodedWakeValue, ForgottenCause,
         RegisteringToolUseId, WakeCodecFamily, WakeCodecRef, WakeCodecVersion, WakeCommandKind,
@@ -886,6 +961,7 @@ mod tests {
         WakeProfileVersion, WakeSubject,
     };
     use phoenix_workflow::Timestamp;
+    use phoenix_workflow::{ProcessIncarnation, ReceiptId};
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
 
@@ -946,14 +1022,14 @@ mod tests {
             },
             resource: EncodedWakeValue {
                 codec: WakeCodecRef {
-                    family: WakeCodecFamily("bash.handle".into()),
-                    version: WakeCodecVersion(1),
+                    family: WakeCodecFamily::new("bash.handle").unwrap(),
+                    version: WakeCodecVersion::new(1).unwrap(),
                 },
                 payload: WakePayload(b"handle".to_vec()),
             },
             terminal_evidence_codec: WakeCodecRef {
-                family: WakeCodecFamily("bash.terminal".into()),
-                version: WakeCodecVersion(1),
+                family: WakeCodecFamily::new("bash.terminal").unwrap(),
+                version: WakeCodecVersion::new(1).unwrap(),
             },
         }
     }
@@ -1066,8 +1142,8 @@ mod tests {
                         occurred_at,
                         value: EncodedWakeValue {
                             codec: WakeCodecRef {
-                                family: WakeCodecFamily("bash.terminal".into()),
-                                version: WakeCodecVersion(1),
+                                family: WakeCodecFamily::new("bash.terminal").unwrap(),
+                                version: WakeCodecVersion::new(1).unwrap(),
                             },
                             payload: WakePayload(b"done".to_vec()),
                         },
@@ -1254,25 +1330,37 @@ mod tests {
         .fetch_one(&repo.workflow_repo.pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO workflow_receipts
-             (workflow_id, receipt_id, effect_id, generation, declared_workflow_version,
-              process_incarnation, attempt_id, origin, receipt_codec_family,
-              receipt_codec_version, receipt_payload)
-             VALUES (10, 99, ?1, 0, 2, 0, NULL, 'Reconciliation', 'wake.contract', 1, X'00')",
-        )
-        .bind(fence_effect_id)
-        .execute(&repo.workflow_repo.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE workflow_effects SET status = 'Receipted'
-             WHERE workflow_id = 10 AND effect_id = ?1",
-        )
-        .bind(fence_effect_id)
-        .execute(&repo.workflow_repo.pool)
-        .await
-        .unwrap();
+        let begun = repo
+            .workflow_repo
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(10),
+                effect_id: EffectId(u64::try_from(fence_effect_id).unwrap()),
+                attempt_id: phoenix_workflow::AttemptId(1),
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(6),
+                lease_until: None,
+            })
+            .await
+            .unwrap();
+        let receipt = repo
+            .accept_fence_receipt(&AcceptReceiptInput {
+                authority: begun.authority.unwrap(),
+                receipt_id: ReceiptId(99),
+                delivery_id: DeliveryId(99),
+                attempt_id: Some(phoenix_workflow::AttemptId(1)),
+                origin: ReceiptOrigin::Execution,
+                receipt_codec: codec(),
+                receipt_payload: vec![0],
+                receipt_event_codec: codec(),
+                receipt_event_payload: vec![0],
+                receipt_event_requires_runtime_acceptance: false,
+                request_runtime_acceptance_for_cancellation: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.outcome, AuthorityOutcome::Authorized);
+        assert!(receipt.delivery.is_none());
+        assert_eq!(table_count(&repo, "deliveries", 10).await, 0);
         assert!(matches!(
             repo.finalize_receipted_proposal(WorkflowId(10), TransitionId(3))
                 .await
@@ -1361,7 +1449,12 @@ mod tests {
                     expected_head: contract.head(),
                     observation:
                         phoenix_workflow::wake_contract::ReconcileObservation::ResourceUnavailable {
-                            cause: ForgottenCause::ResourceDestroyed,
+                            authority:
+                                phoenix_workflow::wake_contract::WakeObservationAuthority::for_test(
+                                    contract,
+                                    phoenix_workflow::AttemptId(1),
+                                ),
+                            cause: ForgottenCause::CascadeDestroyedHandle,
                             occurred_at: Timestamp(19),
                         },
                 },
@@ -1439,6 +1532,40 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(acceptance_status, "Owed");
+        let state_before_acceptance = restarted.load_state(WorkflowId(5)).await.unwrap();
+        let delivery_id: i64 =
+            sqlx::query_scalar("SELECT delivery_id FROM workflow_deliveries WHERE workflow_id = 5")
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            repo.accept_terminal_delivery(&AcceptOrSuppressDeliveryInput {
+                workflow_id: WorkflowId(5),
+                expected_version: Version(2),
+                transition_id: TransitionId(3),
+                generation: Generation(0),
+                next_status: WorkflowStatus::Completed,
+                event_codec: codec(),
+                event_payload: encode(&"runtime-accepted").unwrap(),
+                next_snapshot_codec: codec(),
+                next_snapshot_payload: encode(&state_before_acceptance).unwrap(),
+                committed_at: Timestamp(21),
+                accept_delivery_ids: vec![DeliveryId(u64::try_from(delivery_id).unwrap())],
+                suppress_delivery_ids: vec![],
+                suppression_reason: phoenix_workflow::SuppressionReason::ReducerTerminal,
+            })
+            .await
+            .unwrap(),
+            CommitOutcome::Committed
+        );
+        let accepted: (String, String) = sqlx::query_as(
+            "SELECT status, runtime_acceptance_status
+             FROM workflow_deliveries WHERE workflow_id = 5",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(accepted, ("Accepted".into(), "Accepted".into()));
         let authority: (i64, String, String, String, String) = sqlx::query_as(
             "SELECT version, delivery_owner, registering_tool_use_id,
                     delivery_transferability, lifecycle_kind

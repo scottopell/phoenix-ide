@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 fn codec() -> WakeCodecRef {
     WakeCodecRef {
-        family: WakeCodecFamily("test".to_string()),
-        version: WakeCodecVersion(1),
+        family: WakeCodecFamily::new("test").unwrap(),
+        version: WakeCodecVersion::new(1).unwrap(),
     }
 }
 
@@ -170,13 +170,16 @@ fn generated_command(state: &WakeState, action: GeneratedAction, next_id: u64) -
         GeneratedAction::Forget { at } => WakeCommandKind::Reconcile {
             expected_head: current_head,
             observation: ReconcileObservation::ResourceUnavailable {
-                cause: ForgottenCause::ResourceLostAfterRestart,
+                authority: observation_authority(state),
+                cause: ForgottenCause::PhoenixRestart,
                 occurred_at: Timestamp(u64::from(at)),
             },
         },
         GeneratedAction::Fail { at } => WakeCommandKind::Reconcile {
             expected_head: current_head,
             observation: ReconcileObservation::ProtocolFailure {
+                authority: observation_authority(state),
+                cause: ForgottenCause::TmuxHandleMissing,
                 occurred_at: Timestamp(u64::from(at)),
             },
         },
@@ -539,7 +542,8 @@ fn earlier_resource_loss_wins_while_cancellation_is_proposed() {
             WakeCommandKind::Reconcile {
                 expected_head: contract(&proposed.new_state).head(),
                 observation: ReconcileObservation::ResourceUnavailable {
-                    cause: ForgottenCause::ResourceDestroyed,
+                    authority: observation_authority(&proposed.new_state),
+                    cause: ForgottenCause::CascadeDestroyedHandle,
                     occurred_at: Timestamp(4),
                 },
             },
@@ -637,6 +641,49 @@ fn wake_profile_deserialization_rejects_invalid_identities() {
 }
 
 #[test]
+fn wake_codec_deserialization_rejects_invalid_identities() {
+    assert!(serde_json::from_str::<WakeCodecFamily>("\"\"").is_err());
+    assert!(serde_json::from_str::<WakeCodecVersion>("0").is_err());
+}
+
+#[test]
+fn zero_transition_identity_is_rejected_before_registration() {
+    let mut command = register_command(10);
+    command.transition_id = TransitionId(0);
+    let result = transition(&WakeState::Absent, command);
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::InvalidTransitionId)
+    ));
+    assert_eq!(result.new_state, WakeState::Absent);
+}
+
+#[test]
+fn crossed_reconciliation_authority_cannot_forget_a_contract() {
+    let state = registered(10);
+    let mut authority = observation_authority(&state);
+    authority.resource.payload = WakePayload(b"other-resource".to_vec());
+    let result = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::Reconcile {
+                expected_head: contract(&state).head(),
+                observation: ReconcileObservation::ResourceUnavailable {
+                    authority,
+                    cause: ForgottenCause::TmuxHandleMissing,
+                    occurred_at: Timestamp(5),
+                },
+            },
+        ),
+    );
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::ObservationAuthorityMismatch)
+    ));
+}
+
+#[test]
 fn crossed_observation_authority_cannot_terminalize_a_contract() {
     let state = registered(10);
     let mut authority = observation_authority(&state);
@@ -686,7 +733,7 @@ fn stale_transfer_authority_cannot_redirect_delivery() {
 fn terminal_evidence_must_use_the_registered_profile_codec() {
     let state = registered(10);
     let mut mismatched = evidence(5, 1);
-    mismatched.value.codec.family = WakeCodecFamily("other".into());
+    mismatched.value.codec.family = WakeCodecFamily::new("other").unwrap();
     let result = transition(
         &state,
         command(
@@ -743,7 +790,8 @@ fn finalization_requires_matching_observation_fence_proof() {
             WakeCommandKind::Reconcile {
                 expected_head: contract(&proposed_state).head(),
                 observation: ReconcileObservation::ResourceUnavailable {
-                    cause: ForgottenCause::AdapterLostAuthority,
+                    authority: observation_authority(&proposed_state),
+                    cause: ForgottenCause::TmuxHandleMissing,
                     occurred_at: Timestamp(6),
                 },
             },

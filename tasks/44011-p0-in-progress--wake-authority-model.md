@@ -36,6 +36,10 @@ Five perspectives—durable workflow/state machine, SQLite recovery, concurrency
 - **Acceptance lifecycle:** fired, expired, and forgotten contracts remain workflow-active while runtime acceptance is owed. Generic transition and delivery-resolution wrappers reject wake profiles so only the wake-specific acceptance path may settle that debt.
 - **Rebuildable policy:** registration events include the typed delivery-transferability policy; replay never guesses policy from profile naming.
 - **Profile identity:** wake profile kind and version are validated nominal types, structurally matching the normalized relational constraints.
+- **Codec identity:** resource and terminal-evidence codec families are non-empty and versions are positive at the model boundary, matching normalized SQL constraints.
+- **Forgotten reasons:** forgotten terminals use only the normative finite reasons: Phoenix restart, cascade-destroyed handle, missing sub-agent handle, or missing tmux handle.
+- **Wake-specific settlement:** the wake repository owns terminal runtime acceptance and fence receipt acknowledgement. Terminal acceptance atomically settles the exact owed delivery; fence acknowledgement persists the receipt without exposing an internal reducer delivery.
+- **Transition identity:** transition zero is rejected by the pure model before persistence.
 
 ## Authoritative aggregate
 
