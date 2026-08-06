@@ -3207,11 +3207,31 @@ where
                 state_updated_at: self.state_updated_at,
             };
             if let Err(error) = self.storage.settle_active_direct_turn(&settlement).await {
-                self.pending_direct_turn_terminal = Some(terminal);
-                return Err(error);
+                let snapshot = self
+                    .storage
+                    .get_state_snapshot(&self.context.conversation_id)
+                    .await?;
+                let active = self
+                    .storage
+                    .load_active_direct_turn(&self.context.conversation_id)
+                    .await?;
+                let committed = snapshot.state == settlement.state
+                    && active
+                        .as_ref()
+                        .is_none_or(|loaded| loaded.active != settlement.turn);
+                if committed {
+                    self.state = snapshot.state;
+                    self.state_updated_at = snapshot.state_updated_at;
+                    self.active_direct_turn = None;
+                    self.direct_turn_cancellation_initiated = false;
+                } else {
+                    self.pending_direct_turn_terminal = Some(terminal);
+                    return Err(error);
+                }
+            } else {
+                self.active_direct_turn = None;
+                self.direct_turn_cancellation_initiated = false;
             }
-            self.active_direct_turn = None;
-            self.direct_turn_cancellation_initiated = false;
         } else {
             self.storage
                 .update_state(
@@ -6350,13 +6370,11 @@ where
                         .join("\n");
 
                     if summary.trim().is_empty() {
-                        // An empty summary is indistinguishable to the user from
-                        // "no summary" but silently seeds a blank continuation.
-                        // Route it through the same fallback path as a failure
-                        // so the terminal state carries an explanatory message.
+                        // An empty summary is a retryable continuation failure;
+                        // preserve the operation so the user can retry it.
                         tracing::warn!(
                             conv_id = %conv_id,
-                            "continuation: model returned an empty summary; using fallback"
+                            "continuation: model returned an empty summary; preserving retryable failure"
                         );
                         let _ = event_tx
                             .send(Event::ContinuationFailed {
@@ -10136,6 +10154,54 @@ mod authoritative_user_message_effect_tests {
             assert_eq!(settlements[0].terminal, expected);
             assert_eq!(settlements[0].state, new_state);
         }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recoverable_failure_settlement_reconciles_committed_authority() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(19),
+            generation: 0,
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::Idle,
+                rt.state_updated_at,
+            )
+            .await
+            .unwrap();
+        storage.set_active_direct_turn(Some(turn.clone()));
+        storage.set_settle_active_direct_turn_commit_error_once();
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                reason: "continuation failed".to_string(),
+            },
+        ));
+        rt.state = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "ambiguous-settlement".to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "continuation failed".to_string(),
+            },
+        };
+
+        rt.persist_state_effect(false).await.unwrap();
+
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert!(matches!(
+            storage.get_current_state(&rt.context.conversation_id),
+            Some(ConvState::RecoverableContinuationFailure { .. })
+        ));
     }
 
     #[tokio::test]

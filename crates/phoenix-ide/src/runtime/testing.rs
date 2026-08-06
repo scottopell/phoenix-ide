@@ -537,6 +537,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    settle_active_direct_turn_commit_error_once: Mutex<bool>,
     settle_continuation_direct_turn_calls:
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
@@ -571,6 +572,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_calls: Mutex::new(Vec::new()),
             settle_active_direct_turn_started: Mutex::new(None),
             settle_active_direct_turn_release: Mutex::new(None),
+            settle_active_direct_turn_commit_error_once: Mutex::new(false),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
@@ -603,6 +605,13 @@ impl InMemoryStorage {
 
     pub fn set_continuation_commit_error_once(&self) {
         *self.continuation_commit_error_once.lock().unwrap() = true;
+    }
+
+    pub fn set_settle_active_direct_turn_commit_error_once(&self) {
+        *self
+            .settle_active_direct_turn_commit_error_once
+            .lock()
+            .unwrap() = true;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -977,6 +986,27 @@ impl MessageStore for InMemoryStorage {
             .take();
         if let Some(release) = release {
             let _ = release.await;
+        }
+        if std::mem::take(
+            &mut *self
+                .settle_active_direct_turn_commit_error_once
+                .lock()
+                .unwrap(),
+        ) {
+            let conversation_id = self
+                .states
+                .lock()
+                .unwrap()
+                .keys()
+                .next()
+                .cloned()
+                .expect("test settlement requires seeded conversation state");
+            self.states
+                .lock()
+                .unwrap()
+                .insert(conversation_id, settlement.state.clone());
+            *self.active_direct_turn.lock().unwrap() = None;
+            return Err("ambiguous active direct turn settlement".to_string());
         }
         *self.active_direct_turn.lock().unwrap() = None;
         Ok(())
