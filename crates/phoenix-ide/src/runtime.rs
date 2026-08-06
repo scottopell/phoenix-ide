@@ -186,7 +186,7 @@ pub struct RuntimeManager {
     /// materialize concurrently, while callers for one conversation observe the
     /// same typed success or failure.
     runtime_creations: AsyncMutex<HashMap<String, RuntimeMaterializationSender>>,
-    conversation_admissions: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    conversation_admissions: AsyncMutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
@@ -3820,10 +3820,16 @@ impl RuntimeManager {
         conversation_id: &str,
     ) -> Arc<AsyncMutex<()>> {
         let mut admissions = self.conversation_admissions.lock().await;
-        admissions
-            .entry(conversation_id.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        if let Some(admission) = admissions
+            .get(conversation_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return admission;
+        }
+        let admission = Arc::new(AsyncMutex::new(()));
+        admissions.insert(conversation_id.to_string(), Arc::downgrade(&admission));
+        admissions.retain(|_, entry| entry.strong_count() > 0);
+        admission
     }
 
     pub fn db(&self) -> &Database {

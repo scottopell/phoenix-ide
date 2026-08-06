@@ -299,6 +299,11 @@ class PhoenixClient:
                             error_msg = state_data.get('message', 'Unknown error') if state_data else 'Unknown error'
                             raise PhoenixError(error_msg)
 
+                        if state == 'recoverable_continuation_failure':
+                            state_data = data.get('state_data', {})
+                            error_msg = state_data.get('message', 'Continuation summary failed') if state_data else 'Continuation summary failed'
+                            raise PhoenixError(error_msg)
+
                         if state == 'context_exhausted':
                             state_data = data.get('state_data', {})
                             summary = state_data.get('summary', '') if state_data else ''
@@ -345,6 +350,10 @@ class PhoenixClient:
             elif state == 'error':
                 state_data = data['conversation'].get('state_data', {})
                 error_msg = state_data.get('message', 'Unknown error') if state_data else 'Unknown error'
+                raise PhoenixError(error_msg)
+            elif state == 'recoverable_continuation_failure':
+                state_data = data['conversation'].get('state_data', {})
+                error_msg = state_data.get('message', 'Continuation summary failed') if state_data else 'Continuation summary failed'
                 raise PhoenixError(error_msg)
             elif state == 'context_exhausted':
                 return self.get_messages(conv_id)
