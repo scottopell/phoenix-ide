@@ -4357,9 +4357,6 @@ where
                                 .await?;
                             self.state = persisted.state;
                             self.state_updated_at = persisted.state_updated_at;
-                            self.continuation_effect_disposition =
-                                ContinuationEffectDisposition::AbortRemaining;
-
                             if matches!(
                                 &self.state,
                                 ConvState::AwaitingContinuation { request: persisted_request }
@@ -4416,6 +4413,10 @@ where
                             .await?;
                         self.state = persisted.state;
                         self.state_updated_at = persisted.state_updated_at;
+                        if outcome == crate::db::ContinuationCommitOutcome::Stale {
+                            self.continuation_effect_disposition =
+                                ContinuationEffectDisposition::AbortRemaining;
+                        }
                         let _ = self
                             .broadcast_tx
                             .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
