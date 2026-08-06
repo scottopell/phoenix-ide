@@ -179,7 +179,7 @@ export function useConversationPrStatus({
     intent: PrStatusRefreshIntent;
     promise: Promise<PrStatusResponse | undefined>;
   } | null>(null);
-  const lastCompletedRef = useRef<{ scopeKey: string; at: number } | null>(null);
+  const lastCompletedRef = useRef<{ scopeKey: string; monotonicAt: number } | null>(null);
   const scopeKey = conversationId && branchName && (convModeLabel === 'Work' || convModeLabel === 'Branch')
     ? `${conversationId}\0${branchName}\0${convModeLabel}`
     : null;
@@ -214,8 +214,8 @@ export function useConversationPrStatus({
         const prStatus = await api.getPrStatus(conversationId);
         if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
         setInternalState({ scopeKey, status: 'ready', prStatus });
-        lastCompletedRef.current = prStatus.refresh.state === 'fresh' && !prStatus.refresh.stale
-          ? { scopeKey, at: Date.now() }
+        lastCompletedRef.current = prStatus.refresh.state !== 'unavailable' && !prStatus.refresh.stale
+          ? { scopeKey, monotonicAt: performance.now() }
           : null;
         return prStatus;
       } catch {
@@ -273,7 +273,7 @@ export function useConversationPrStatus({
     }
     const lastCompleted = lastCompletedRef.current;
     if (lastCompleted?.scopeKey === scopeKey
-      && Date.now() - lastCompleted.at < ROUTINE_REFRESH_FRESHNESS_MS) {
+      && performance.now() - lastCompleted.monotonicAt < ROUTINE_REFRESH_FRESHNESS_MS) {
       return Promise.resolve(undefined);
     }
     return startRefresh('background');

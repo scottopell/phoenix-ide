@@ -211,6 +211,43 @@ describe('useConversationPrStatus', () => {
     expect(getPrStatus).toHaveBeenCalledTimes(2);
   });
 
+  it('suppresses routine refreshes after a successful not-found result', async () => {
+    const notFound: PrStatusResponse = {
+      found: false,
+      refresh: {
+        state: 'not_found',
+        last_attempted_at: '2026-01-01T00:00:00Z',
+        stale: false,
+      },
+      work_change: { kind: 'clean' },
+    };
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockResolvedValue(notFound);
+
+    render(<Probe conversationId="conv-not-found" />);
+    await waitFor(() => expect(screen.getByTestId('refresh-state')).toHaveTextContent('not_found'));
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(getPrStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses monotonic time when evaluating routine freshness', async () => {
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValueOnce(20_000).mockReturnValueOnce(0);
+    try {
+      const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+      getPrStatus.mockResolvedValue(prStatus(56));
+
+      render(<Probe conversationId="conv-clock-correction" />);
+      await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('56'));
+
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(getPrStatus).toHaveBeenCalledTimes(1);
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
   it('reads immediately when a recently refreshed scope is reactivated', async () => {
     const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
     getPrStatus.mockResolvedValueOnce(prStatus(50)).mockResolvedValueOnce(prStatus(51));
