@@ -2242,10 +2242,16 @@ where
 
             tokio::select! {
                 Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
-                    let result = self
-                        .process_event(event)
-                        .await;
+                    let result = self.process_event(event).await;
+                    let terminal = result.is_ok()
+                        && matches!(self.state.step_result(), StepResult::Terminal(_));
+                    if terminal {
+                        self.emit_terminal_lifecycle_event().await;
+                    }
                     let _ = acknowledgement.send(result);
+                    if terminal {
+                        return;
+                    }
                 }
                 Some(event) = self.event_rx.recv() => {
                     // Eviction shutdown signal — exit cleanly so the broadcaster
