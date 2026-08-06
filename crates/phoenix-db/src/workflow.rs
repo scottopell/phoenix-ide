@@ -476,6 +476,46 @@ fn external_binding_from_input(
 
 type SqliteTx<'a> = Transaction<'a, Sqlite>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseCommitClock {
+    SqliteWallClock,
+    Projected { current: Timestamp },
+}
+
+impl LeaseCommitClock {
+    fn at_elapsed(self, elapsed: std::time::Duration) -> Self {
+        match self {
+            Self::SqliteWallClock => Self::SqliteWallClock,
+            Self::Projected { current } => Self::Projected {
+                current: Timestamp(current.0.saturating_add(elapsed.as_secs())),
+            },
+        }
+    }
+}
+
+pub(crate) async fn lease_is_live_immediately_before_commit(
+    tx: &mut SqliteTx<'_>,
+    lease_until: LeaseExpiry,
+    clock: LeaseCommitClock,
+) -> DbResult<bool> {
+    let lease_until = to_i64(lease_until.0, "lease_until")?;
+    match clock {
+        LeaseCommitClock::SqliteWallClock => Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT ?1 > unixepoch('now')",
+        )
+        .bind(lease_until)
+        .fetch_one(&mut **tx)
+        .await?),
+        LeaseCommitClock::Projected { current } => {
+            Ok(sqlx::query_scalar::<_, bool>("SELECT ?1 > ?2")
+                .bind(lease_until)
+                .bind(to_i64(current.0, "commit_now")?)
+                .fetch_one(&mut **tx)
+                .await?)
+        }
+    }
+}
+
 pub(crate) struct WorkflowTx<'a> {
     pub(crate) tx: SqliteTx<'a>,
 }
@@ -3674,5 +3714,44 @@ mod tests {
                 .next_eligible_at,
             Timestamp(20)
         );
+    }
+}
+
+#[cfg(test)]
+mod lease_commit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn projected_commit_liveness_is_strict_at_expiry() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+
+        assert!(lease_is_live_immediately_before_commit(
+            &mut tx,
+            LeaseExpiry(100),
+            LeaseCommitClock::Projected {
+                current: Timestamp(99),
+            },
+        )
+        .await
+        .unwrap());
+        assert!(!lease_is_live_immediately_before_commit(
+            &mut tx,
+            LeaseExpiry(100),
+            LeaseCommitClock::Projected {
+                current: Timestamp(100),
+            },
+        )
+        .await
+        .unwrap());
+        assert!(!lease_is_live_immediately_before_commit(
+            &mut tx,
+            LeaseExpiry(100),
+            LeaseCommitClock::Projected {
+                current: Timestamp(101),
+            },
+        )
+        .await
+        .unwrap());
     }
 }

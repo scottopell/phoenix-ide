@@ -205,12 +205,14 @@ pub struct WakeObservationLeaseWindow {
     initial_now: Timestamp,
     lease_duration: Duration,
     latest_lease_until: phoenix_workflow::LeaseExpiry,
+    commit_clock: super::LeaseCommitClock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WakeObservationAttemptLease {
     now: Timestamp,
     lease_until: phoenix_workflow::LeaseExpiry,
+    commit_clock: super::LeaseCommitClock,
 }
 
 impl WakeObservationLeaseWindow {
@@ -220,10 +222,41 @@ impl WakeObservationLeaseWindow {
         lease_duration: Duration,
         latest_lease_until: phoenix_workflow::LeaseExpiry,
     ) -> Option<Self> {
+        Self::with_commit_clock(
+            initial_now,
+            lease_duration,
+            latest_lease_until,
+            super::LeaseCommitClock::Projected {
+                current: initial_now,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn database_timed(
+        initial_now: Timestamp,
+        lease_duration: Duration,
+        latest_lease_until: phoenix_workflow::LeaseExpiry,
+    ) -> Option<Self> {
+        Self::with_commit_clock(
+            initial_now,
+            lease_duration,
+            latest_lease_until,
+            super::LeaseCommitClock::SqliteWallClock,
+        )
+    }
+
+    fn with_commit_clock(
+        initial_now: Timestamp,
+        lease_duration: Duration,
+        latest_lease_until: phoenix_workflow::LeaseExpiry,
+        commit_clock: super::LeaseCommitClock,
+    ) -> Option<Self> {
         let window = Self {
             initial_now,
             lease_duration,
             latest_lease_until,
+            commit_clock,
         };
         window.at_elapsed(Duration::ZERO).map(|_| window)
     }
@@ -237,7 +270,11 @@ impl WakeObservationLeaseWindow {
         );
         lease_until
             .is_live_at(now)
-            .then_some(WakeObservationAttemptLease { now, lease_until })
+            .then_some(WakeObservationAttemptLease {
+                now,
+                lease_until,
+                commit_clock: self.commit_clock,
+            })
     }
 }
 
@@ -765,7 +802,7 @@ impl WakeRepository {
         now: Timestamp,
         lease_until: phoenix_workflow::LeaseExpiry,
     ) -> DbResult<WakeObservationOutcome> {
-        let Some(lease_window) = WakeObservationLeaseWindow::new(
+        let Some(lease_window) = WakeObservationLeaseWindow::database_timed(
             now,
             Duration::from_secs(lease_until.0.saturating_sub(now.0)),
             lease_until,
@@ -803,6 +840,7 @@ impl WakeRepository {
                     workflow_id,
                     process_incarnation,
                     attempt_lease,
+                    operation_started,
                     operation,
                     attempt,
                     &operation_span,
@@ -850,13 +888,18 @@ impl WakeRepository {
         workflow_id: WorkflowId,
         process_incarnation: ProcessIncarnation,
         attempt_lease: WakeObservationAttemptLease,
+        operation_started: Instant,
         operation: DbOperation,
         attempt: u32,
         operation_span: &tracing::Span,
         max_attempts: u32,
         accounting: &mut RetryAccounting,
     ) -> DbResult<WakeObservationOutcome> {
-        let WakeObservationAttemptLease { now, lease_until } = attempt_lease;
+        let WakeObservationAttemptLease {
+            now,
+            lease_until,
+            commit_clock,
+        } = attempt_lease;
         let mut connection = self
             .workflow_repo
             .acquire_observed(operation, attempt, operation_span)
@@ -954,6 +997,16 @@ impl WakeRepository {
             .await?;
         match result.outcome {
             ClaimOutcome::Started => {
+                if !super::lease_is_live_immediately_before_commit(
+                    &mut tx.tx,
+                    lease_until,
+                    commit_clock.at_elapsed(operation_started.elapsed()),
+                )
+                .await?
+                {
+                    tx.rollback().await?;
+                    return Ok(WakeObservationOutcome::Ineligible);
+                }
                 tx.commit().await?;
                 Ok(WakeObservationOutcome::Started { canonical: result })
             }
@@ -4806,6 +4859,9 @@ mod tests {
             Some(WakeObservationAttemptLease {
                 now: Timestamp(17),
                 lease_until: phoenix_workflow::LeaseExpiry(47),
+                commit_clock: super::super::LeaseCommitClock::Projected {
+                    current: Timestamp(10),
+                },
             })
         );
         assert_eq!(
@@ -4813,6 +4869,9 @@ mod tests {
             Some(WakeObservationAttemptLease {
                 now: Timestamp(85),
                 lease_until: phoenix_workflow::LeaseExpiry(100),
+                commit_clock: super::super::LeaseCommitClock::Projected {
+                    current: Timestamp(10),
+                },
             })
         );
     }
@@ -8562,6 +8621,63 @@ mod tests {
         assert_eq!(link_owner, "conv-2");
         assert_eq!(message_owner, "conv-2");
         assert_eq!(locator_owner, "conv-2");
+    }
+
+    #[tokio::test]
+    async fn expired_precommit_observation_rolls_back_started_attempt_and_lease() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = next_test_workflow_id(&repo).await.unwrap();
+        assert!(matches!(
+            repo.register_allocated(
+                workflow_id,
+                &intent(),
+                "fp-expired-precommit",
+                Timestamp(10)
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let lease_window = WakeObservationLeaseWindow::with_commit_clock(
+            Timestamp(20),
+            Duration::from_secs(10),
+            phoenix_workflow::LeaseExpiry(30),
+            super::super::LeaseCommitClock::Projected {
+                current: Timestamp(30),
+            },
+        )
+        .expect("initially live lease window");
+
+        let outcome = repo
+            .claim_observation_with_lease_window(workflow_id, ProcessIncarnation(1), lease_window)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, WakeObservationOutcome::Ineligible);
+        let durable_attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_attempts WHERE workflow_id = ?1")
+                .bind(i64::try_from(workflow_id.0).unwrap())
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        let durable_leases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_reclaimable_leases WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(durable_attempts, 0);
+        assert_eq!(durable_leases, 0);
+        assert_eq!(
+            restarted
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow_id,
+            workflow_id
+        );
     }
 
     #[tokio::test]

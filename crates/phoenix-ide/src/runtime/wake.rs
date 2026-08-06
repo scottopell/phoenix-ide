@@ -258,7 +258,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                         .min(candidate.expires_at.0.saturating_add(1)),
                 );
                 let Some(lease_window) =
-                    WakeObservationLeaseWindow::new(now, LEASE_DURATION, claim_until)
+                    WakeObservationLeaseWindow::database_timed(now, LEASE_DURATION, claim_until)
                 else {
                     next_wait = Duration::ZERO;
                     continue;
