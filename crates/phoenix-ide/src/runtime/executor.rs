@@ -2243,8 +2243,7 @@ where
             tokio::select! {
                 Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_event(event).await;
-                    let terminal = result.is_ok()
-                        && matches!(self.state.step_result(), StepResult::Terminal(_));
+                    let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
                         self.emit_terminal_lifecycle_event().await;
                     }
@@ -4538,6 +4537,18 @@ where
                                 ) {
                                     self.state = snapshot.state;
                                     self.state_updated_at = snapshot.state_updated_at;
+                                    let _ = self.broadcast_tx.send_message(message.clone());
+                                    let _ = self.broadcast_tx.send_seq(|sequence_id| {
+                                        SseEvent::StateChange {
+                                            sequence_id,
+                                            state: self.state.clone(),
+                                            state_updated_at: self.state_updated_at,
+                                            presentation_mode: self
+                                                .state
+                                                .presentation_mode()
+                                                .to_string(),
+                                        }
+                                    });
                                     return Ok(None);
                                 }
                             }

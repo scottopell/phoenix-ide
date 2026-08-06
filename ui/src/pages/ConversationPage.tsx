@@ -1616,9 +1616,9 @@ function ConversationPageContent({
     try {
       await api.triggerContinuation(conversationId);
     } catch (err) {
-      showInfo(err instanceof Error ? err.message : 'Failed to trigger continuation');
+      showError(err instanceof Error ? err.message : 'Failed to trigger continuation');
     }
-  }, [conversationId, isArchived, showInfo]);
+  }, [conversationId, isArchived, showError]);
 
   const handleUpgradeModel = useCallback(async (newModelId: string, effort?: import('../api').ModelEffort | null) => {
     if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
