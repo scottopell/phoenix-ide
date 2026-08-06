@@ -2364,6 +2364,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         work_scope_id: str | None = None,
     ) -> str:
         mode_kind = str(mode["mode"]).lower()
+        state_kind = str(json.loads(state_json)["type"])
         scope_id = work_scope_id or str(_uuid.uuid4())
         if work_scope_id is None:
             authority_kind = (
@@ -2410,17 +2411,18 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
         conn.execute(
             "INSERT INTO conversations ("
             " id, slug, title, parent_conversation_id, user_initiated,"
-            " state, state_updated_at, created_at, updated_at, archived,"
+            " state, state_kind, state_updated_at, created_at, updated_at, archived,"
             " model, project_id, desired_base_branch, seed_parent_id, seed_label,"
             " cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,"
             " runtime_role, work_scope_id"
-            ") VALUES (?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, ?,"
+            ") VALUES (?, ?, ?, NULL, 1, ?, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, ?,"
             " ?, ?, ?, ?, 'user', ?)",
             (
                 conversation_id,
                 slug,
                 title,
                 state_json,
+                state_kind,
                 now,
                 now,
                 now,
@@ -2811,8 +2813,8 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
             {"type": "context_exhausted", "summary": _SEED_CONTEXT_SUMMARY}
         )
         conn.execute(
-            "UPDATE conversations SET state = ?, state_updated_at = ?, updated_at = ?"
-            " WHERE id = ?",
+            "UPDATE conversations SET state = ?, state_kind = 'context_exhausted',"
+            " state_updated_at = ?, updated_at = ? WHERE id = ?",
             (state_json, now, now, conv_id),
         )
 

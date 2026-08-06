@@ -4281,6 +4281,15 @@ where
                                     .await?;
                                 self.state = persisted.state;
                                 self.state_updated_at = persisted.state_updated_at;
+                                if matches!(
+                                    &self.state,
+                                    ConvState::RecoverableContinuationFailure { failure }
+                                        if failure.request.operation_id == request.operation_id
+                                ) {
+                                    self.active_direct_turn = None;
+                                    self.pending_direct_turn_terminal = None;
+                                    self.direct_turn_cancellation_initiated = false;
+                                }
                                 self.continuation_effect_disposition =
                                     ContinuationEffectDisposition::AbortRemaining;
                                 drop(reserved_range);

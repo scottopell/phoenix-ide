@@ -87,6 +87,14 @@ fn continuation_operation_is_awaiting(state: &ConvState, operation_id: &str) -> 
     )
 }
 
+fn continuation_operation_is_recoverable(state: &ConvState, operation_id: &str) -> bool {
+    matches!(
+        state,
+        ConvState::RecoverableContinuationFailure { failure }
+            if failure.request.operation_id == operation_id
+    )
+}
+
 fn deposit_turn_trigger(handle: &ConversationHandle) {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -3524,6 +3532,10 @@ impl RuntimeManager {
                 if continuation_operation_is_awaiting(&persisted_state, &operation_id) {
                     return Ok(());
                 }
+            } else if continuation_operation_is_recoverable(&live_state, &operation_id)
+                && continuation_operation_is_recoverable(&persisted_state, &operation_id)
+            {
+                return Ok(());
             } else if saw_candidate && live_state == persisted_state {
                 return Err("Continuation retry was not durably admitted".to_string());
             }
@@ -4943,6 +4955,63 @@ mod scope_liveness_tests {
             "live transition alone must not acknowledge durable admission"
         );
 
+        let failed_again = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: request.clone(),
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "provider failed immediately".to_string(),
+            },
+        };
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &failed_again)
+            .await
+            .unwrap();
+        state_tx.send(failed_again).unwrap();
+        assert!(
+            retry.await.unwrap().is_ok(),
+            "matching later failure proves the retry crossed durable admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_retry_admission_accepts_matching_durable_awaiting_state() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "retry-admission-awaiting";
+        let operation_id = "retry-operation-awaiting";
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: operation_id.to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let recoverable = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: request.clone(),
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "summary failed".to_string(),
+            },
+        };
+        manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &recoverable)
+            .await
+            .unwrap();
+        let state_tx = manager
+            .inject_handle_with_state_sender_for_test(conversation_id, recoverable)
+            .await;
+        let manager_for_retry = Arc::clone(&manager);
+        let retry = tokio::spawn(async move {
+            manager_for_retry
+                .admit_continuation_retry(conversation_id, operation_id.to_string())
+                .await
+        });
+        tokio::task::yield_now().await;
+        let awaiting = ConvState::AwaitingContinuation { request };
         manager
             .db()
             .update_conversation_state(conversation_id, &awaiting)
