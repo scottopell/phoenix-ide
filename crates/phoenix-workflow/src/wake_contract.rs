@@ -32,8 +32,59 @@ impl<'de> Deserialize<'de> for WakeContractId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WakeOwner(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WakeOwner(String);
+
+impl WakeOwner {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WakeOwner {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| D::Error::custom("wake owner cannot be empty"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RegisteringToolUseId(String);
+
+impl RegisteringToolUseId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RegisteringToolUseId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| D::Error::custom("registering tool-use ID cannot be empty"))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WakeProfileKind(pub String);
@@ -73,6 +124,41 @@ pub struct WakeSubject {
     pub profile: WakeProfileRef,
     pub resource: EncodedWakeValue,
     pub terminal_evidence_codec: WakeCodecRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WakeDeliveryTransferability {
+    WorkScope,
+    FixedOwner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuthorizedWakeSubject {
+    subject: WakeSubject,
+    authorized_owner: WakeOwner,
+    transferability: WakeDeliveryTransferability,
+}
+
+impl AuthorizedWakeSubject {
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn work_scope_for_test(subject: WakeSubject, owner: WakeOwner) -> Self {
+        Self {
+            subject,
+            authorized_owner: owner,
+            transferability: WakeDeliveryTransferability::WorkScope,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn fixed_owner_for_test(subject: WakeSubject, owner: WakeOwner) -> Self {
+        Self {
+            subject,
+            authorized_owner: owner,
+            transferability: WakeDeliveryTransferability::FixedOwner,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,7 +311,9 @@ pub struct WakeContract {
     pub head_command_fingerprint: WakeCommandFingerprint,
     pub registration_owner: WakeOwner,
     pub delivery_owner: WakeOwner,
+    pub registering_tool_use_id: RegisteringToolUseId,
     pub subject: WakeSubject,
+    pub delivery_transferability: WakeDeliveryTransferability,
     pub condition: WakeCondition,
     pub registered_at: Timestamp,
     pub deadline: Timestamp,
@@ -273,7 +361,8 @@ pub enum WakeCommandKind {
     Register {
         id: WakeContractId,
         registration_owner: WakeOwner,
-        subject: WakeSubject,
+        registering_tool_use_id: RegisteringToolUseId,
+        subject: AuthorizedWakeSubject,
         condition: WakeCondition,
         registered_at: Timestamp,
         deadline: Timestamp,
@@ -397,6 +486,7 @@ pub struct WakeContractEvent {
     pub contract_id: WakeContractId,
     pub head: WakeHeadToken,
     pub transition_id: TransitionId,
+    pub registering_tool_use_id: RegisteringToolUseId,
     pub kind: WakeEventKind,
 }
 
@@ -419,6 +509,8 @@ pub enum WakeRejection {
     ObservationFenceProofRequired,
     ObservationFenceProofMismatch,
     AlreadyDeliveryOwner,
+    SubjectOwnerMismatch,
+    DeliveryOwnerTransferForbidden,
     ConflictingTransitionReuse,
     NonMonotonicTransitionId,
 }
@@ -515,6 +607,7 @@ pub fn transition(state: &WakeState, command: WakeCommand) -> WakeTransition {
             WakeCommandKind::Register {
                 id,
                 registration_owner,
+                registering_tool_use_id,
                 subject,
                 condition,
                 registered_at,
@@ -525,6 +618,7 @@ pub fn transition(state: &WakeState, command: WakeCommand) -> WakeTransition {
             &command_kind,
             id,
             registration_owner,
+            &registering_tool_use_id,
             subject,
             condition,
             registered_at,
@@ -563,11 +657,20 @@ fn register(
     command: &WakeCommandKind,
     id: WakeContractId,
     registration_owner: WakeOwner,
-    subject: WakeSubject,
+    registering_tool_use_id: &RegisteringToolUseId,
+    subject: AuthorizedWakeSubject,
     condition: WakeCondition,
     registered_at: Timestamp,
     deadline: Timestamp,
 ) -> WakeTransition {
+    if subject.authorized_owner != registration_owner {
+        return rejected(&WakeState::Absent, WakeRejection::SubjectOwnerMismatch);
+    }
+    let AuthorizedWakeSubject {
+        subject,
+        transferability,
+        ..
+    } = subject;
     let valid_deadline = deadline > registered_at
         && deadline
             .0
@@ -584,7 +687,9 @@ fn register(
         head_command_fingerprint: WakeCommandFingerprint::for_command(command),
         registration_owner: registration_owner.clone(),
         delivery_owner: registration_owner,
+        registering_tool_use_id: registering_tool_use_id.clone(),
         subject: subject.clone(),
+        delivery_transferability: transferability,
         condition: condition.clone(),
         registered_at,
         deadline,
@@ -914,6 +1019,12 @@ fn transfer_delivery_owner(
     command: &WakeCommandKind,
     new_owner: WakeOwner,
 ) -> WakeTransition {
+    if contract.delivery_transferability == WakeDeliveryTransferability::FixedOwner {
+        return rejected(
+            &WakeState::Present(contract.clone()),
+            WakeRejection::DeliveryOwnerTransferForbidden,
+        );
+    }
     if new_owner == contract.delivery_owner {
         return rejected(
             &WakeState::Present(contract.clone()),
@@ -979,6 +1090,7 @@ fn event(
         head: contract.head(),
         transition_id,
         kind,
+        registering_tool_use_id: contract.registering_tool_use_id.clone(),
     }
 }
 

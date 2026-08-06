@@ -8,6 +8,9 @@ description = "Pure durable-workflow core algebra for Phoenix IDE. No storage or
 [lib]
 path = "src/lib.rs"
 
+[features]
+test-support = []
+
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

@@ -55,6 +55,7 @@ tokio = { version = "1", features = ["time"] }
 # workspace feature unification happens to pull the feature in via phoenix-ide.
 # Dev-only: production `cargo build` never enables it.
 phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+phoenix-workflow = { path = "../phoenix-workflow", features = ["test-support"] }
 
 # `#[tokio::test]` runtime for the async persistence tests.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

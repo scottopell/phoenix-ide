@@ -27,6 +27,10 @@ Five perspectives—durable workflow/state machine, SQLite recovery, concurrency
 - **Deadline occurrence precedence:** evidence occurring at or before the deadline remains eligible even when observed after expiry is proposed; evidence after the deadline cannot replace expiry.
 - **Bounded registration:** wake deadlines are strictly after registration and no more than 1,800 seconds later; adapters reject zero or over-bound durations before registration.
 - **Identity split:** registration ownership is immutable audit identity; continuation changes only the current delivery owner while preserving contract, workflow, and resource identity.
+- **Registration authority:** registration and delivery owners are nominal non-empty identities. Registration also durably binds the originating tool-use identity in aggregate, canonical events, and normalized relational state so terminal delivery can address the original invocation after restart.
+- **Authorized subjects:** registration accepts an authorization-bound subject capability supplied by the resource-owning adapter, not a freely constructed resource description. This model PR seals the boundary; the Bash integration supplies its production minting path.
+- **Transferability policy:** WorkScope-keyed resources permit delivery-owner transfer; fixed-owner resources, including sub-agent-like resources, reject transfer.
+- **Fence scope:** a durable fence receipt gates only finalization of the proposed cancellation or expiry. Earlier authoritative fired or forgotten evidence may supersede the proposal without that receipt.
 
 ## Authoritative aggregate
 
@@ -34,8 +38,11 @@ Five perspectives—durable workflow/state machine, SQLite recovery, concurrency
 struct WakeContract {
     id: WakeContractId,
     generation: Generation,
-    owner: ConversationId,
+    registration_owner: WakeOwner,
+    delivery_owner: WakeOwner,
+    registering_tool_use_id: RegisteringToolUseId,
     subject: WakeSubject,
+    delivery_transferability: WakeDeliveryTransferability,
     condition: WakeCondition,
     registered_at: OccurredAt,
     deadline: OccurredAt,
@@ -59,7 +66,8 @@ Cancellation and forgotten causes are closed enums. Adapter protocol failures re
 
 `TerminalProposed` is an open semantic arbitration substate, not terminal truth or an execution retry state. Entering it fences this contract generation's observation authority. Finalization requires a nominal observation-fence proof bound to the contract, generation, and proposal transition; this is profile-local reconciliation of already-authoritative evidence, not the permanent engine-wide exact-drain machinery retired by ADR-019.
 
-Registration ownership is immutable. A separate delivery owner names the conversation that receives canonical delivery and may change during continuation without rewriting registration attribution or resource identity.
+Registration ownership is immutable and structurally non-empty. A separate non-empty delivery owner names the conversation that receives canonical delivery and may change during continuation only when the registered subject is WorkScope-transferable, without rewriting registration attribution or resource identity. Fixed-owner subjects reject transfer.
+Registration durably carries the non-empty registering tool-use identity through the aggregate, canonical events, and normalized authority row. Registration accepts an authorization-bound subject capability minted by the resource-owning adapter; the unrestricted subject value is retained only after that capability is validated and consumed. The Bash adapter integration owns the production capability-minting API.
 The subject declares the exact terminal-evidence codec accepted by the profile; evidence with any other codec family/version is rejected before occurrence arbitration.
 
 The durable authority row normalizes contract identity, owners, profile/resource/evidence codecs, deadline, lifecycle, and terminal occurrence time for SQL validation and recovery. Polymorphic payloads and event bodies remain earned blobs; normalized facts are not inferred from those blobs.
@@ -72,7 +80,7 @@ Owed effects include adapter watch/unwatch, reducer inbox delivery, public proje
 
 Replay requires the exact semantic command and transition identity. Reusing a transition identity with a different command kind, head, or payload is a typed conflict. Every accepted command advances the composite `(generation, version)` head exactly once; stale same-generation versions cannot mutate authority.
 Transition identities are monotonic within a contract generation. Exact replay is valid only at the current head; any older identity is rejected even when its payload matches a historical command.
-Proposal capabilities are bound to immutable contract identity, generation, and the proposal transition rather than the mutable head version. Delivery-owner transfer therefore preserves the capability; restart recovery reconstructs finalization only after the repository verifies the proposal's durable fence receipt.
+Proposal capabilities are bound to immutable contract identity, generation, and the proposal transition rather than the mutable head version. Delivery-owner transfer therefore preserves the capability; restart recovery reconstructs finalization only after the repository verifies the proposal's durable fence receipt. A fence receipt is required only when finalizing that proposed cancellation or expiry; occurrence-precedence evidence that terminalized earlier may close the contract as fired or forgotten without waiting for the proposal fence.
 
 Repository `committed_at` records transaction commit time. Domain occurrence timestamps remain exclusively in terminal evidence/proposals and never substitute for storage audit time.
 

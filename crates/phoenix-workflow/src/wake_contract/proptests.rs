@@ -32,8 +32,12 @@ fn register_command(deadline: u64) -> WakeCommand {
         transition_id: TransitionId(1),
         kind: WakeCommandKind::Register {
             id: WakeContractId::new("contract").unwrap(),
-            registration_owner: WakeOwner("registrant".to_string()),
-            subject: subject(),
+            registration_owner: WakeOwner::new("registrant").unwrap(),
+            registering_tool_use_id: RegisteringToolUseId::new("tool-use").unwrap(),
+            subject: AuthorizedWakeSubject::work_scope_for_test(
+                subject(),
+                WakeOwner::new("registrant").unwrap(),
+            ),
             condition: WakeCondition::Terminal,
             registered_at: Timestamp(0),
             deadline: Timestamp(deadline),
@@ -152,7 +156,7 @@ fn generated_command(state: &WakeState, action: GeneratedAction, next_id: u64) -
         },
         GeneratedAction::Transfer { owner } => WakeCommandKind::TransferDeliveryOwner {
             expected_head: current_head,
-            new_owner: WakeOwner(format!("owner-{owner}")),
+            new_owner: WakeOwner::new(format!("owner-{owner}")).unwrap(),
         },
         GeneratedAction::Forget { at } => WakeCommandKind::Reconcile {
             expected_head: current_head,
@@ -458,7 +462,8 @@ fn registration_event_is_rebuildable_and_registry_is_exhaustive() {
     else {
         panic!("expected registration event")
     };
-    assert_eq!(registration_owner, WakeOwner("registrant".to_string()));
+    assert_eq!(registration_owner, WakeOwner::new("registrant").unwrap());
+    assert_eq!(event.registering_tool_use_id.as_str(), "tool-use");
     assert_eq!(registered_subject, subject());
     assert_eq!(condition, WakeCondition::Terminal);
     assert_eq!(registered_at, Timestamp(0));
@@ -483,7 +488,7 @@ fn prior_transition_ids_cannot_be_reused_after_the_head_advances() {
             2,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: contract(&state).head(),
-                new_owner: WakeOwner("successor".into()),
+                new_owner: WakeOwner::new("successor").unwrap(),
             },
         ),
     );
@@ -541,18 +546,67 @@ fn delivery_owner_can_transfer_during_terminal_arbitration() {
             3,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: contract(&proposed.new_state).head(),
-                new_owner: WakeOwner("successor".into()),
+                new_owner: WakeOwner::new("successor").unwrap(),
             },
         ),
     );
     assert_eq!(
         contract(&transferred.new_state).delivery_owner,
-        WakeOwner("successor".into())
+        WakeOwner::new("successor").unwrap()
     );
     assert!(matches!(
         contract(&transferred.new_state).lifecycle,
         WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_))
     ));
+}
+
+#[test]
+fn registration_rejects_subject_authorized_for_a_different_owner() {
+    let mut registration = register_command(10);
+    let WakeCommandKind::Register {
+        registration_owner, ..
+    } = &mut registration.kind
+    else {
+        unreachable!()
+    };
+    *registration_owner = WakeOwner::new("intruder").unwrap();
+    let result = transition(&WakeState::Absent, registration);
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::SubjectOwnerMismatch)
+    ));
+}
+
+#[test]
+fn fixed_owner_subjects_cannot_transfer_delivery() {
+    let mut registration = register_command(10);
+    let WakeCommandKind::Register { subject, .. } = &mut registration.kind else {
+        unreachable!()
+    };
+    *subject = AuthorizedWakeSubject::fixed_owner_for_test(
+        self::subject(),
+        WakeOwner::new("registrant").unwrap(),
+    );
+    let state = transition(&WakeState::Absent, registration).new_state;
+    let result = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::TransferDeliveryOwner {
+                expected_head: contract(&state).head(),
+                new_owner: WakeOwner::new("successor").unwrap(),
+            },
+        ),
+    );
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::DeliveryOwnerTransferForbidden)
+    ));
+}
+
+#[test]
+fn wake_owner_deserialization_rejects_empty_values() {
+    assert!(serde_json::from_str::<WakeOwner>("\"\"").is_err());
 }
 
 #[test]
@@ -586,7 +640,7 @@ fn transfer_does_not_invalidate_the_proposal_capability() {
             3,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: contract(&proposed.new_state).head(),
-                new_owner: WakeOwner("successor".into()),
+                new_owner: WakeOwner::new("successor").unwrap(),
             },
         ),
     );
@@ -679,7 +733,7 @@ fn delivery_transfer_preserves_registration_and_resource_identity() {
             2,
             WakeCommandKind::TransferDeliveryOwner {
                 expected_head: before.head(),
-                new_owner: WakeOwner("successor".to_string()),
+                new_owner: WakeOwner::new("successor").unwrap(),
             },
         ),
     );
@@ -688,7 +742,7 @@ fn delivery_transfer_preserves_registration_and_resource_identity() {
     assert_eq!(after.subject, before.subject);
     assert_eq!(after.generation, before.generation);
     assert_eq!(after.registration_owner, before.registration_owner);
-    assert_eq!(after.delivery_owner, WakeOwner("successor".to_string()));
+    assert_eq!(after.delivery_owner, WakeOwner::new("successor").unwrap());
 }
 
 #[test]

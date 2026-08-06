@@ -337,6 +337,10 @@ CREATE TABLE wake_contract_identity_bindings (
     version INTEGER NOT NULL CHECK (version >= 1),
     registration_owner TEXT NOT NULL CHECK (registration_owner <> ''),
     delivery_owner TEXT NOT NULL CHECK (delivery_owner <> ''),
+    registering_tool_use_id TEXT NOT NULL CHECK (registering_tool_use_id <> ''),
+    delivery_transferability TEXT NOT NULL CHECK (
+        delivery_transferability IN ('WorkScope', 'FixedOwner')
+    ),
     profile_kind TEXT NOT NULL CHECK (profile_kind <> ''),
     profile_version INTEGER NOT NULL CHECK (profile_version >= 1),
     resource_codec_family TEXT NOT NULL CHECK (resource_codec_family <> ''),

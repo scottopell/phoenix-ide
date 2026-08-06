@@ -119,7 +119,7 @@ impl WakeContractRepository {
                         insert_contract_identity_tx(&mut tx, input.workflow_id, contract).await?;
                     }
                 }
-                if is_fence_finalization(event) {
+                if is_proposal_finalization(&current, event) {
                     validate_fence_receipt_tx(&mut tx, input.workflow_id, &current).await?;
                 }
                 if should_revoke_observation_authority(event) {
@@ -301,19 +301,22 @@ async fn validate_authority_projection_tx(
     let matches: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM wake_contract_identity_bindings
          WHERE workflow_id = ?1 AND contract_id = ?2 AND generation = ?3 AND version = ?4
-           AND registration_owner = ?5 AND delivery_owner = ?6 AND profile_kind = ?7
-           AND profile_version = ?8 AND resource_codec_family = ?9
-           AND resource_codec_version = ?10 AND resource_payload = ?11
-           AND evidence_codec_family = ?12 AND evidence_codec_version = ?13
-           AND registered_at = ?14 AND deadline = ?15 AND lifecycle_kind = ?16
-           AND terminal_occurred_at IS ?17",
+           AND registration_owner = ?5 AND delivery_owner = ?6
+           AND registering_tool_use_id = ?7 AND delivery_transferability = ?8
+           AND profile_kind = ?9 AND profile_version = ?10 AND resource_codec_family = ?11
+           AND resource_codec_version = ?12 AND resource_payload = ?13
+           AND evidence_codec_family = ?14 AND evidence_codec_version = ?15
+           AND registered_at = ?16 AND deadline = ?17 AND lifecycle_kind = ?18
+           AND terminal_occurred_at IS ?19",
     )
     .bind(super::to_i64(workflow_id.0, "workflow_id")?)
     .bind(contract.id.as_str())
     .bind(super::to_i64(contract.generation.0, "generation")?)
     .bind(super::to_i64(contract.version.0, "version")?)
-    .bind(&contract.registration_owner.0)
-    .bind(&contract.delivery_owner.0)
+    .bind(contract.registration_owner.as_str())
+    .bind(contract.delivery_owner.as_str())
+    .bind(contract.registering_tool_use_id.as_str())
+    .bind(transferability_str(contract.delivery_transferability))
     .bind(&contract.subject.profile.kind.0)
     .bind(i64::from(contract.subject.profile.version.0))
     .bind(&contract.subject.resource.codec.family.0)
@@ -350,17 +353,19 @@ async fn insert_contract_identity_tx(
     sqlx::query(
         "INSERT INTO wake_contract_identity_bindings
          (contract_id, workflow_id, generation, version, registration_owner, delivery_owner,
-          profile_kind, profile_version, resource_codec_family, resource_codec_version,
-          resource_payload, evidence_codec_family, evidence_codec_version, registered_at,
-          deadline, lifecycle_kind, terminal_occurred_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+          registering_tool_use_id, delivery_transferability, profile_kind, profile_version,
+          resource_codec_family, resource_codec_version, resource_payload, evidence_codec_family,
+          evidence_codec_version, registered_at, deadline, lifecycle_kind, terminal_occurred_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
     )
     .bind(contract.id.as_str())
     .bind(super::to_i64(workflow_id.0, "workflow_id")?)
     .bind(super::to_i64(contract.generation.0, "generation")?)
     .bind(super::to_i64(contract.version.0, "version")?)
-    .bind(&contract.registration_owner.0)
-    .bind(&contract.delivery_owner.0)
+    .bind(contract.registration_owner.as_str())
+    .bind(contract.delivery_owner.as_str())
+    .bind(contract.registering_tool_use_id.as_str())
+    .bind(transferability_str(contract.delivery_transferability))
     .bind(&contract.subject.profile.kind.0)
     .bind(i64::from(contract.subject.profile.version.0))
     .bind(&contract.subject.resource.codec.family.0)
@@ -401,7 +406,7 @@ async fn update_contract_identity_tx(
     .bind(super::to_i64(workflow_id.0, "workflow_id")?)
     .bind(super::to_i64(contract.generation.0, "generation")?)
     .bind(super::to_i64(contract.version.0, "version")?)
-    .bind(&contract.delivery_owner.0)
+    .bind(contract.delivery_owner.as_str())
     .bind(lifecycle_kind)
     .bind(
         terminal_at
@@ -416,6 +421,15 @@ async fn update_contract_identity_tx(
         ));
     }
     Ok(())
+}
+
+fn transferability_str(
+    transferability: phoenix_workflow::wake_contract::WakeDeliveryTransferability,
+) -> &'static str {
+    match transferability {
+        phoenix_workflow::wake_contract::WakeDeliveryTransferability::WorkScope => "WorkScope",
+        phoenix_workflow::wake_contract::WakeDeliveryTransferability::FixedOwner => "FixedOwner",
+    }
 }
 
 fn lifecycle_columns(
@@ -599,7 +613,7 @@ fn terminal_bundle(
             delivery_id,
             effect_id: None,
             barrier_id: Some(barrier_id),
-            consumer_kind: delivery_owner.0.clone(),
+            consumer_kind: delivery_owner.as_str().to_owned(),
             event_codec: codec(),
             payload_kind: LocalDeliveryPayloadKind::Barrier,
             payload_blob: payload,
@@ -610,10 +624,23 @@ fn terminal_bundle(
     }))
 }
 
-fn is_fence_finalization(event: &phoenix_workflow::wake_contract::WakeContractEvent) -> bool {
+fn is_proposal_finalization(
+    current: &WakeState,
+    event: &phoenix_workflow::wake_contract::WakeContractEvent,
+) -> bool {
+    let WakeState::Present(contract) = current else {
+        return false;
+    };
+    let phoenix_workflow::wake_contract::WakeLifecycle::Open(
+        phoenix_workflow::wake_contract::OpenWakeLifecycle::TerminalProposed(proposal),
+    ) = &contract.lifecycle
+    else {
+        return false;
+    };
     matches!(
-        event.kind,
-        phoenix_workflow::wake_contract::WakeEventKind::Terminalized { .. }
+        &event.kind,
+        phoenix_workflow::wake_contract::WakeEventKind::Terminalized { terminal, .. }
+            if terminal == &proposal.terminal.clone().into_terminal()
     )
 }
 
@@ -844,9 +871,10 @@ mod tests {
     use super::*;
     use crate::migrations::run_pending_migrations;
     use phoenix_workflow::wake_contract::{
-        CancellationCause, EncodedWakeValue, WakeCodecFamily, WakeCodecRef, WakeCodecVersion,
-        WakeCommandKind, WakeCondition, WakeContractId, WakeOwner, WakePayload, WakeProfileKind,
-        WakeProfileRef, WakeProfileVersion, WakeSubject,
+        AuthorizedWakeSubject, CancellationCause, EncodedWakeValue, ForgottenCause,
+        RegisteringToolUseId, WakeCodecFamily, WakeCodecRef, WakeCodecVersion, WakeCommandKind,
+        WakeCondition, WakeContractId, WakeOwner, WakePayload, WakeProfileKind, WakeProfileRef,
+        WakeProfileVersion, WakeSubject,
     };
     use phoenix_workflow::Timestamp;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -928,8 +956,12 @@ mod tests {
                 transition_id: TransitionId(1),
                 kind: WakeCommandKind::Register {
                     id: WakeContractId::new("contract").unwrap(),
-                    registration_owner: WakeOwner("conversation".into()),
-                    subject: subject(),
+                    registration_owner: WakeOwner::new("conversation").unwrap(),
+                    registering_tool_use_id: RegisteringToolUseId::new("tool-use").unwrap(),
+                    subject: AuthorizedWakeSubject::work_scope_for_test(
+                        subject(),
+                        WakeOwner::new("conversation").unwrap(),
+                    ),
                     condition: WakeCondition::Terminal,
                     registered_at: Timestamp(10),
                     deadline: Timestamp(100),
@@ -999,17 +1031,26 @@ mod tests {
     }
 
     fn observe(state: &WakeState, workflow_id: WorkflowId) -> CommitWakeCommandInput {
+        observe_at(state, workflow_id, TransitionId(2), Timestamp(20))
+    }
+
+    fn observe_at(
+        state: &WakeState,
+        workflow_id: WorkflowId,
+        transition_id: TransitionId,
+        occurred_at: Timestamp,
+    ) -> CommitWakeCommandInput {
         let WakeState::Present(contract) = state else {
             panic!("expected present contract")
         };
         CommitWakeCommandInput {
             workflow_id,
             command: WakeCommand {
-                transition_id: TransitionId(2),
+                transition_id,
                 kind: WakeCommandKind::ObserveTerminal {
                     expected_head: contract.head(),
                     evidence: phoenix_workflow::wake_contract::TerminalEvidence {
-                        occurred_at: Timestamp(20),
+                        occurred_at,
                         value: EncodedWakeValue {
                             codec: WakeCodecRef {
                                 family: WakeCodecFamily("bash.terminal".into()),
@@ -1228,6 +1269,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn earlier_terminal_evidence_supersedes_cancellation_without_a_fence_receipt() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let registered = repo
+            .commit_wake_command(&register(WorkflowId(11)))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        let (proposal, _) = propose_cancel(&state, WorkflowId(11));
+        let proposed = repo.commit_wake_command(&proposal).await.unwrap();
+        let CommitWakeCommandOutcome::Applied {
+            state: proposed_state,
+            ..
+        } = proposed
+        else {
+            panic!("proposal should apply")
+        };
+
+        assert!(matches!(
+            repo.commit_wake_command(&observe_at(
+                &proposed_state,
+                WorkflowId(11),
+                TransitionId(3),
+                Timestamp(19),
+            ))
+            .await
+            .unwrap(),
+            CommitWakeCommandOutcome::Applied {
+                state: WakeState::Present(phoenix_workflow::wake_contract::WakeContract {
+                    lifecycle: phoenix_workflow::wake_contract::WakeLifecycle::Closed(
+                        phoenix_workflow::wake_contract::CanonicalTerminal::Fired { .. }
+                    ),
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            restarted.load_state(WorkflowId(11)).await.unwrap(),
+            WakeState::Present(phoenix_workflow::wake_contract::WakeContract {
+                lifecycle: phoenix_workflow::wake_contract::WakeLifecycle::Closed(
+                    phoenix_workflow::wake_contract::CanonicalTerminal::Fired { .. }
+                ),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn earlier_resource_loss_supersedes_cancellation_without_a_fence_receipt() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let registered = repo
+            .commit_wake_command(&register(WorkflowId(12)))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        let (proposal, _) = propose_cancel(&state, WorkflowId(12));
+        let proposed = repo.commit_wake_command(&proposal).await.unwrap();
+        let CommitWakeCommandOutcome::Applied {
+            state: proposed_state,
+            ..
+        } = proposed
+        else {
+            panic!("proposal should apply")
+        };
+        let WakeState::Present(contract) = &proposed_state else {
+            panic!("proposal should preserve the contract")
+        };
+        let unavailable = CommitWakeCommandInput {
+            workflow_id: WorkflowId(12),
+            command: WakeCommand {
+                transition_id: TransitionId(3),
+                kind: WakeCommandKind::Reconcile {
+                    expected_head: contract.head(),
+                    observation:
+                        phoenix_workflow::wake_contract::ReconcileObservation::ResourceUnavailable {
+                            cause: ForgottenCause::ResourceDestroyed,
+                            occurred_at: Timestamp(19),
+                        },
+                },
+            },
+        };
+
+        assert!(matches!(
+            repo.commit_wake_command(&unavailable).await.unwrap(),
+            CommitWakeCommandOutcome::Applied {
+                state: WakeState::Present(phoenix_workflow::wake_contract::WakeContract {
+                    lifecycle: phoenix_workflow::wake_contract::WakeLifecycle::Closed(
+                        phoenix_workflow::wake_contract::CanonicalTerminal::Forgotten { .. }
+                    ),
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            restarted.load_state(WorkflowId(12)).await.unwrap(),
+            WakeState::Present(phoenix_workflow::wake_contract::WakeContract {
+                lifecycle: phoenix_workflow::wake_contract::WakeLifecycle::Closed(
+                    phoenix_workflow::wake_contract::CanonicalTerminal::Forgotten { .. }
+                ),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn terminalization_atomically_creates_canonical_bundle() {
         let (_dir, repo, restarted) = open_repo_pair().await;
         let registered = repo
@@ -1262,14 +1413,24 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime_acceptance_enabled, 1);
-        let authority: (i64, String, String) = sqlx::query_as(
-            "SELECT version, delivery_owner, lifecycle_kind
+        let authority: (i64, String, String, String, String) = sqlx::query_as(
+            "SELECT version, delivery_owner, registering_tool_use_id,
+                    delivery_transferability, lifecycle_kind
              FROM wake_contract_identity_bindings WHERE workflow_id = 5",
         )
         .fetch_one(&repo.workflow_repo.pool)
         .await
         .unwrap();
-        assert_eq!(authority, (2, "conversation".into(), "Fired".into()));
+        assert_eq!(
+            authority,
+            (
+                2,
+                "conversation".into(),
+                "tool-use".into(),
+                "WorkScope".into(),
+                "Fired".into(),
+            )
+        );
         let open_required_effects: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM workflow_effects
              WHERE workflow_id = 5 AND role = 'Required'
