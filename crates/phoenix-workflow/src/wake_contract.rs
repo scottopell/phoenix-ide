@@ -72,6 +72,7 @@ pub struct EncodedWakeValue {
 pub struct WakeSubject {
     pub profile: WakeProfileRef,
     pub resource: EncodedWakeValue,
+    pub terminal_evidence_codec: WakeCodecRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,7 +252,7 @@ pub enum WakeState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservationFenceProof {
     contract_id: WakeContractId,
-    proposed_head: WakeHeadToken,
+    proposal_generation: Generation,
     proposal_transition_id: TransitionId,
 }
 
@@ -411,6 +412,8 @@ pub enum WakeRejection {
     AlreadyClosed,
     DeadlineNotReached,
     EvidenceAfterDeadline,
+    EvidenceCodecMismatch,
+    ObservationDidNotPrecedeProposal,
     TerminalArbitrationPending,
     EvidenceDidNotPrecedeProposal,
     ObservationFenceProofRequired,
@@ -478,6 +481,29 @@ pub struct WakeTransition {
     pub disposition: WakeDisposition,
     pub new_state: WakeState,
     pub owed_effects: Vec<WakeOwedEffect>,
+}
+
+#[must_use]
+pub fn finalize_proposed_terminal(
+    state: &WakeState,
+    transition_id: TransitionId,
+) -> Option<WakeCommand> {
+    let WakeState::Present(contract) = state else {
+        return None;
+    };
+    let WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)) = &contract.lifecycle
+    else {
+        return None;
+    };
+    Some(WakeCommand {
+        transition_id,
+        kind: WakeCommandKind::Reconcile {
+            expected_head: contract.head(),
+            observation: ReconcileObservation::ObservationAuthorityFenced(observation_fence_proof(
+                contract, proposal,
+            )),
+        },
+    })
 }
 
 #[must_use]
@@ -629,6 +655,14 @@ fn transition_present(
 
     let committed_command = command.clone();
     match (&contract.lifecycle, command) {
+        (WakeLifecycle::Open(_), WakeCommandKind::ObserveTerminal { evidence, .. })
+            if evidence.value.codec != contract.subject.terminal_evidence_codec =>
+        {
+            rejected(
+                &WakeState::Present(contract.clone()),
+                WakeRejection::EvidenceCodecMismatch,
+            )
+        }
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
             WakeCommandKind::ObserveTerminal { evidence, .. },
@@ -725,11 +759,31 @@ fn transition_present(
             CanonicalTerminal::Forgotten { cause, occurred_at },
         ),
         (
+            WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)),
+            WakeCommandKind::Reconcile {
+                observation: ReconcileObservation::ProtocolFailure { occurred_at },
+                ..
+            },
+        ) if proposal.terminal.admits_evidence_at(occurred_at) => close(
+            contract,
+            transition_id,
+            &committed_command,
+            CanonicalTerminal::Forgotten {
+                cause: ForgottenCause::AdapterLostAuthority,
+                occurred_at,
+            },
+        ),
+        (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)),
-            WakeCommandKind::Reconcile { .. },
+            WakeCommandKind::Reconcile {
+                observation:
+                    ReconcileObservation::ResourceUnavailable { .. }
+                    | ReconcileObservation::ProtocolFailure { .. },
+                ..
+            },
         ) => rejected(
             &WakeState::Present(contract.clone()),
-            WakeRejection::ObservationFenceProofRequired,
+            WakeRejection::ObservationDidNotPrecedeProposal,
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
@@ -910,7 +964,7 @@ fn observation_fence_proof(
 ) -> ObservationFenceProof {
     ObservationFenceProof {
         contract_id: contract.id.clone(),
-        proposed_head: contract.head(),
+        proposal_generation: contract.generation,
         proposal_transition_id: proposal.transition_id,
     }
 }

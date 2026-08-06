@@ -332,7 +332,25 @@ const MIGRATION_062: &str = r"
 CREATE TABLE wake_contract_identity_bindings (
     contract_id TEXT PRIMARY KEY CHECK (contract_id <> ''),
     workflow_id INTEGER NOT NULL UNIQUE
-        REFERENCES workflows(workflow_id) ON DELETE CASCADE
+        REFERENCES workflows(workflow_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    registration_owner TEXT NOT NULL CHECK (registration_owner <> ''),
+    delivery_owner TEXT NOT NULL CHECK (delivery_owner <> ''),
+    profile_kind TEXT NOT NULL CHECK (profile_kind <> ''),
+    profile_version INTEGER NOT NULL CHECK (profile_version >= 1),
+    resource_codec_family TEXT NOT NULL CHECK (resource_codec_family <> ''),
+    resource_codec_version INTEGER NOT NULL CHECK (resource_codec_version >= 1),
+    resource_payload BLOB NOT NULL,
+    evidence_codec_family TEXT NOT NULL CHECK (evidence_codec_family <> ''),
+    evidence_codec_version INTEGER NOT NULL CHECK (evidence_codec_version >= 1),
+    registered_at INTEGER NOT NULL CHECK (registered_at >= 0),
+    deadline INTEGER NOT NULL CHECK (deadline > registered_at),
+    lifecycle_kind TEXT NOT NULL CHECK (
+        lifecycle_kind IN ('Observing', 'TerminalProposed', 'Fired', 'Expired', 'Cancelled', 'Forgotten')
+    ),
+    terminal_occurred_at INTEGER CHECK (terminal_occurred_at IS NULL OR terminal_occurred_at >= 0),
+    CHECK ((lifecycle_kind IN ('Observing', 'TerminalProposed')) = (terminal_occurred_at IS NULL))
 ) WITHOUT ROWID;
 ";
 

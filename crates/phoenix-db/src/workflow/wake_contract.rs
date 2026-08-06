@@ -102,7 +102,7 @@ impl WakeContractRepository {
                     .map(|effect| local_effect(effect, contract_version(&result.new_state)))
                     .collect::<DbResult<Vec<_>>>()?;
                 let terminal_bundle = terminal_bundle(event, &result.new_state)?;
-                let committed_at = committed_at(&result.new_state);
+                let committed_at = current_commit_time();
 
                 if current == WakeState::Absent {
                     self.insert_initial_head(
@@ -116,8 +116,7 @@ impl WakeContractRepository {
                 }
                 if let WakeState::Present(contract) = &result.new_state {
                     if current == WakeState::Absent {
-                        insert_contract_identity_tx(&mut tx, input.workflow_id, &contract.id)
-                            .await?;
+                        insert_contract_identity_tx(&mut tx, input.workflow_id, contract).await?;
                     }
                 }
                 if is_fence_finalization(event) {
@@ -169,6 +168,10 @@ impl WakeContractRepository {
                     )
                     .await?;
                 }
+                if current != WakeState::Absent {
+                    update_contract_identity_tx(&mut tx, input.workflow_id, &result.new_state)
+                        .await?;
+                }
 
                 #[cfg(test)]
                 if self
@@ -192,6 +195,22 @@ impl WakeContractRepository {
         }
     }
 
+    pub async fn finalize_receipted_proposal(
+        &self,
+        workflow_id: WorkflowId,
+        transition_id: TransitionId,
+    ) -> DbResult<CommitWakeCommandOutcome> {
+        let state = self.load_state(workflow_id).await?;
+        let command =
+            phoenix_workflow::wake_contract::finalize_proposed_terminal(&state, transition_id)
+                .ok_or_else(|| DbError::Serialization("wake has no terminal proposal".into()))?;
+        self.commit_wake_command(&CommitWakeCommandInput {
+            workflow_id,
+            command,
+        })
+        .await
+    }
+
     pub async fn load_state(&self, workflow_id: WorkflowId) -> DbResult<WakeState> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let state = self.load_state_tx(&mut tx, workflow_id).await?;
@@ -207,13 +226,18 @@ impl WakeContractRepository {
         let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
             return Ok(WakeState::Absent);
         };
-        if head.binding.profile.profile_kind != "wake.contract" {
+        if head.binding.profile.profile_kind != "wake.contract"
+            || head.binding.profile.profile_version != 1
+            || head.snapshot_codec.family != WAKE_CONTRACT_CODEC_FAMILY
+            || head.snapshot_codec.version != WAKE_CONTRACT_CODEC_VERSION
+        {
             return Err(DbError::Serialization(format!(
-                "workflow {} uses profile {}, not wake.contract",
-                workflow_id.0, head.binding.profile.profile_kind
+                "workflow {} has an unsupported wake contract profile or snapshot codec",
+                workflow_id.0
             )));
         }
-        decode(&head.snapshot_payload)
+        let state = decode(&head.snapshot_payload)?;
+        validate_authority_projection_tx(tx, workflow_id, state).await
     }
 
     async fn insert_initial_head(
@@ -265,20 +289,155 @@ impl WakeContractRepository {
     }
 }
 
+async fn validate_authority_projection_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    state: WakeState,
+) -> DbResult<WakeState> {
+    let WakeState::Present(contract) = &state else {
+        return Ok(state);
+    };
+    let (lifecycle_kind, terminal_at) = lifecycle_columns(&contract.lifecycle);
+    let matches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wake_contract_identity_bindings
+         WHERE workflow_id = ?1 AND contract_id = ?2 AND generation = ?3 AND version = ?4
+           AND registration_owner = ?5 AND delivery_owner = ?6 AND profile_kind = ?7
+           AND profile_version = ?8 AND resource_codec_family = ?9
+           AND resource_codec_version = ?10 AND resource_payload = ?11
+           AND evidence_codec_family = ?12 AND evidence_codec_version = ?13
+           AND registered_at = ?14 AND deadline = ?15 AND lifecycle_kind = ?16
+           AND terminal_occurred_at IS ?17",
+    )
+    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .bind(contract.id.as_str())
+    .bind(super::to_i64(contract.generation.0, "generation")?)
+    .bind(super::to_i64(contract.version.0, "version")?)
+    .bind(&contract.registration_owner.0)
+    .bind(&contract.delivery_owner.0)
+    .bind(&contract.subject.profile.kind.0)
+    .bind(i64::from(contract.subject.profile.version.0))
+    .bind(&contract.subject.resource.codec.family.0)
+    .bind(i64::from(contract.subject.resource.codec.version.0))
+    .bind(&contract.subject.resource.payload.0)
+    .bind(&contract.subject.terminal_evidence_codec.family.0)
+    .bind(i64::from(
+        contract.subject.terminal_evidence_codec.version.0,
+    ))
+    .bind(super::to_i64(contract.registered_at.0, "registered_at")?)
+    .bind(super::to_i64(contract.deadline.0, "deadline")?)
+    .bind(lifecycle_kind)
+    .bind(
+        terminal_at
+            .map(|time| super::to_i64(time.0, "terminal_occurred_at"))
+            .transpose()?,
+    )
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    if matches != 1 {
+        return Err(DbError::Serialization(
+            "wake contract snapshot and normalized authority disagree".into(),
+        ));
+    }
+    Ok(state)
+}
+
 async fn insert_contract_identity_tx(
     tx: &mut super::WorkflowTx<'_>,
     workflow_id: WorkflowId,
-    contract_id: &phoenix_workflow::wake_contract::WakeContractId,
+    contract: &phoenix_workflow::wake_contract::WakeContract,
 ) -> DbResult<()> {
+    let (lifecycle_kind, terminal_at) = lifecycle_columns(&contract.lifecycle);
     sqlx::query(
-        "INSERT INTO wake_contract_identity_bindings (contract_id, workflow_id)
-         VALUES (?1, ?2)",
+        "INSERT INTO wake_contract_identity_bindings
+         (contract_id, workflow_id, generation, version, registration_owner, delivery_owner,
+          profile_kind, profile_version, resource_codec_family, resource_codec_version,
+          resource_payload, evidence_codec_family, evidence_codec_version, registered_at,
+          deadline, lifecycle_kind, terminal_occurred_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )
-    .bind(contract_id.as_str())
+    .bind(contract.id.as_str())
     .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .bind(super::to_i64(contract.generation.0, "generation")?)
+    .bind(super::to_i64(contract.version.0, "version")?)
+    .bind(&contract.registration_owner.0)
+    .bind(&contract.delivery_owner.0)
+    .bind(&contract.subject.profile.kind.0)
+    .bind(i64::from(contract.subject.profile.version.0))
+    .bind(&contract.subject.resource.codec.family.0)
+    .bind(i64::from(contract.subject.resource.codec.version.0))
+    .bind(&contract.subject.resource.payload.0)
+    .bind(&contract.subject.terminal_evidence_codec.family.0)
+    .bind(i64::from(
+        contract.subject.terminal_evidence_codec.version.0,
+    ))
+    .bind(super::to_i64(contract.registered_at.0, "registered_at")?)
+    .bind(super::to_i64(contract.deadline.0, "deadline")?)
+    .bind(lifecycle_kind)
+    .bind(
+        terminal_at
+            .map(|time| super::to_i64(time.0, "terminal_occurred_at"))
+            .transpose()?,
+    )
     .execute(&mut *tx.tx)
     .await?;
     Ok(())
+}
+
+async fn update_contract_identity_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+    state: &WakeState,
+) -> DbResult<()> {
+    let WakeState::Present(contract) = state else {
+        return Ok(());
+    };
+    let (lifecycle_kind, terminal_at) = lifecycle_columns(&contract.lifecycle);
+    let updated = sqlx::query(
+        "UPDATE wake_contract_identity_bindings
+         SET generation = ?2, version = ?3, delivery_owner = ?4,
+             lifecycle_kind = ?5, terminal_occurred_at = ?6
+         WHERE workflow_id = ?1",
+    )
+    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .bind(super::to_i64(contract.generation.0, "generation")?)
+    .bind(super::to_i64(contract.version.0, "version")?)
+    .bind(&contract.delivery_owner.0)
+    .bind(lifecycle_kind)
+    .bind(
+        terminal_at
+            .map(|time| super::to_i64(time.0, "terminal_occurred_at"))
+            .transpose()?,
+    )
+    .execute(&mut *tx.tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(DbError::Serialization(
+            "wake contract authority projection is missing".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn lifecycle_columns(
+    lifecycle: &phoenix_workflow::wake_contract::WakeLifecycle,
+) -> (&'static str, Option<phoenix_workflow::Timestamp>) {
+    use phoenix_workflow::wake_contract::{CanonicalTerminal, OpenWakeLifecycle, WakeLifecycle};
+    match lifecycle {
+        WakeLifecycle::Open(OpenWakeLifecycle::Observing) => ("Observing", None),
+        WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)) => ("TerminalProposed", None),
+        WakeLifecycle::Closed(CanonicalTerminal::Fired { evidence }) => {
+            ("Fired", Some(evidence.occurred_at))
+        }
+        WakeLifecycle::Closed(CanonicalTerminal::Expired { deadline }) => {
+            ("Expired", Some(*deadline))
+        }
+        WakeLifecycle::Closed(CanonicalTerminal::Cancelled { occurred_at, .. }) => {
+            ("Cancelled", Some(*occurred_at))
+        }
+        WakeLifecycle::Closed(CanonicalTerminal::Forgotten { occurred_at, .. }) => {
+            ("Forgotten", Some(*occurred_at))
+        }
+    }
 }
 
 async fn validate_replay_artifacts_tx(
@@ -303,6 +462,20 @@ async fn validate_replay_artifacts_tx(
     .fetch_one(&mut *tx.tx)
     .await?;
     let event: phoenix_workflow::wake_contract::WakeContractEvent = decode(&event_payload)?;
+    let codec_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_supported_codecs
+         WHERE workflow_id = ?1 AND codec_family = ?2 AND codec_version = ?3",
+    )
+    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .bind(WAKE_CONTRACT_CODEC_FAMILY)
+    .bind(i64::from(WAKE_CONTRACT_CODEC_VERSION))
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    if codec_count != 1 {
+        return Err(DbError::Serialization(
+            "wake contract codec/version is not supported".into(),
+        ));
+    }
     let expected_effect_id = Some(effect_id(
         contract.head_transition_id,
         match event.kind {
@@ -462,6 +635,30 @@ async fn validate_fence_receipt_tx(
         proposal.transition_id,
         WakeEffectRole::FenceObservationAuthority,
     );
+    let proposal_payload: Vec<u8> = sqlx::query_scalar(
+        "SELECT event_payload FROM workflow_transitions
+         WHERE workflow_id = ?1 AND transition_id = ?2",
+    )
+    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .bind(super::to_i64(
+        proposal.transition_id.0,
+        "proposal_transition_id",
+    )?)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    let proposal_event: phoenix_workflow::wake_contract::WakeContractEvent =
+        decode(&proposal_payload)?;
+    if !matches!(
+        proposal_event.kind,
+        phoenix_workflow::wake_contract::WakeEventKind::TerminalProposed { proposal: ref durable }
+            if durable == &proposal.terminal
+                && proposal_event.contract_id == contract.id
+                && proposal_event.head.generation == contract.generation
+    ) {
+        return Err(DbError::Serialization(
+            "terminal proposal does not match its durable event".into(),
+        ));
+    }
     let receipted: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM workflow_effects e
          JOIN workflow_receipts r
@@ -635,16 +832,11 @@ fn effect_id(transition_id: TransitionId, role: WakeEffectRole) -> u64 {
     transition_id.0.saturating_mul(8).saturating_add(role)
 }
 
-fn committed_at(state: &WakeState) -> phoenix_workflow::Timestamp {
-    match state {
-        WakeState::Absent => phoenix_workflow::Timestamp(0),
-        WakeState::Present(contract) => match &contract.lifecycle {
-            phoenix_workflow::wake_contract::WakeLifecycle::Closed(terminal) => {
-                terminal.occurred_at()
-            }
-            phoenix_workflow::wake_contract::WakeLifecycle::Open(_) => contract.registered_at,
-        },
-    }
+fn current_commit_time() -> phoenix_workflow::Timestamp {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    phoenix_workflow::Timestamp(seconds)
 }
 
 #[cfg(test)]
@@ -721,6 +913,10 @@ mod tests {
                     version: WakeCodecVersion(1),
                 },
                 payload: WakePayload(b"handle".to_vec()),
+            },
+            terminal_evidence_codec: WakeCodecRef {
+                family: WakeCodecFamily("bash.terminal".into()),
+                version: WakeCodecVersion(1),
             },
         }
     }
@@ -1024,7 +1220,9 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            repo.commit_wake_command(&finalization).await.unwrap(),
+            repo.finalize_receipted_proposal(WorkflowId(10), TransitionId(3))
+                .await
+                .unwrap(),
             CommitWakeCommandOutcome::Applied { .. }
         ));
     }
@@ -1064,6 +1262,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime_acceptance_enabled, 1);
+        let authority: (i64, String, String) = sqlx::query_as(
+            "SELECT version, delivery_owner, lifecycle_kind
+             FROM wake_contract_identity_bindings WHERE workflow_id = 5",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(authority, (2, "conversation".into(), "Fired".into()));
         let open_required_effects: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM workflow_effects
              WHERE workflow_id = 5 AND role = 'Required'

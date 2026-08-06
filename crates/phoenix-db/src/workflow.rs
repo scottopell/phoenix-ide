@@ -1323,11 +1323,12 @@ impl WorkflowRepository {
         &self,
         input: &CommitTransitionHeadCas,
     ) -> DbResult<CommitOutcome> {
-        if workflow_profile_kind(&self.pool, input.workflow_id)
-            .await?
-            .as_deref()
-            == Some(DIRECT_TURN_PROFILE_KIND)
-        {
+        if matches!(
+            workflow_profile_kind(&self.pool, input.workflow_id)
+                .await?
+                .as_deref(),
+            Some(DIRECT_TURN_PROFILE_KIND | "wake.contract")
+        ) {
             return Ok(CommitOutcome::InvalidPlan);
         }
         let mut tx = self.pool.begin().await?;
@@ -1590,11 +1591,12 @@ impl WorkflowRepository {
         &self,
         input: &CommitTransitionPlanCas,
     ) -> DbResult<CommitOutcome> {
-        if workflow_profile_kind(&self.pool, input.workflow_id)
-            .await?
-            .as_deref()
-            == Some(DIRECT_TURN_PROFILE_KIND)
-        {
+        if matches!(
+            workflow_profile_kind(&self.pool, input.workflow_id)
+                .await?
+                .as_deref(),
+            Some(DIRECT_TURN_PROFILE_KIND | "wake.contract")
+        ) {
             return Ok(CommitOutcome::InvalidPlan);
         }
         let mut tx = self.pool.begin().await?;

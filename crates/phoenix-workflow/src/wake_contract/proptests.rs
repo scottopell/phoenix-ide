@@ -23,6 +23,7 @@ fn subject() -> WakeSubject {
             version: WakeProfileVersion(1),
         },
         resource: encoded(b"resource".to_vec()),
+        terminal_evidence_codec: codec(),
     }
 }
 
@@ -173,13 +174,13 @@ fn generated_command(state: &WakeState, action: GeneratedAction, next_id: u64) -
                     WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)) => {
                         ObservationFenceProof {
                             contract_id: current.id.clone(),
-                            proposed_head: current.head(),
+                            proposal_generation: current.generation,
                             proposal_transition_id: proposal.transition_id,
                         }
                     }
                     WakeLifecycle::Open(_) | WakeLifecycle::Closed(_) => ObservationFenceProof {
                         contract_id: current.id.clone(),
-                        proposed_head: current.head(),
+                        proposal_generation: current.generation,
                         proposal_transition_id: TransitionId(0),
                     },
                 },
@@ -555,6 +556,50 @@ fn delivery_owner_can_transfer_during_terminal_arbitration() {
 }
 
 #[test]
+fn terminal_evidence_must_use_the_registered_profile_codec() {
+    let state = registered(10);
+    let mut mismatched = evidence(5, 1);
+    mismatched.value.codec.family = WakeCodecFamily("other".into());
+    let result = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::ObserveTerminal {
+                expected_head: contract(&state).head(),
+                evidence: mismatched,
+            },
+        ),
+    );
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::EvidenceCodecMismatch)
+    ));
+}
+
+#[test]
+fn transfer_does_not_invalidate_the_proposal_capability() {
+    let state = registered(10);
+    let proposed = cancel(&state, 2, 5);
+    let transferred = transition(
+        &proposed.new_state,
+        command(
+            3,
+            WakeCommandKind::TransferDeliveryOwner {
+                expected_head: contract(&proposed.new_state).head(),
+                new_owner: WakeOwner("successor".into()),
+            },
+        ),
+    );
+    let finalization = finalize_proposed_terminal(&transferred.new_state, TransitionId(4))
+        .expect("proposal remains recoverably finalizable");
+    let finalized = transition(&transferred.new_state, finalization);
+    assert!(matches!(
+        contract(&finalized.new_state).lifecycle,
+        WakeLifecycle::Closed(CanonicalTerminal::Cancelled { .. })
+    ));
+}
+
+#[test]
 fn finalization_requires_matching_observation_fence_proof() {
     let state = registered(10);
     let proposed = cancel(&state, 2, 5);
@@ -575,7 +620,7 @@ fn finalization_requires_matching_observation_fence_proof() {
     );
     assert!(matches!(
         missing.disposition,
-        WakeDisposition::Rejected(WakeRejection::ObservationFenceProofRequired)
+        WakeDisposition::Rejected(WakeRejection::ObservationDidNotPrecedeProposal)
     ));
 
     let wrong = ObservationFenceProof {

@@ -57,9 +57,12 @@ enum CanonicalTerminal {
 
 Cancellation and forgotten causes are closed enums. Adapter protocol failures reconcile through typed forgotten causes rather than introducing a fifth terminal family. Diagnostics are adjunct typed data, never authority-bearing strings.
 
-`TerminalProposed` is an open semantic arbitration substate, not terminal truth or an execution retry state. Entering it fences this contract generation's observation authority. Finalization requires a nominal observation-fence proof bound to the contract, proposed head, and proposal transition; this is profile-local reconciliation of already-authoritative evidence, not the permanent engine-wide exact-drain machinery retired by ADR-019.
+`TerminalProposed` is an open semantic arbitration substate, not terminal truth or an execution retry state. Entering it fences this contract generation's observation authority. Finalization requires a nominal observation-fence proof bound to the contract, generation, and proposal transition; this is profile-local reconciliation of already-authoritative evidence, not the permanent engine-wide exact-drain machinery retired by ADR-019.
 
 Registration ownership is immutable. A separate delivery owner names the conversation that receives canonical delivery and may change during continuation without rewriting registration attribution or resource identity.
+The subject declares the exact terminal-evidence codec accepted by the profile; evidence with any other codec family/version is rejected before occurrence arbitration.
+
+The durable authority row normalizes contract identity, owners, profile/resource/evidence codecs, deadline, lifecycle, and terminal occurrence time for SQL validation and recovery. Polymorphic payloads and event bodies remain earned blobs; normalized facts are not inferred from those blobs.
 
 ## Pure transition contract
 
@@ -69,6 +72,9 @@ Owed effects include adapter watch/unwatch, reducer inbox delivery, public proje
 
 Replay requires the exact semantic command and transition identity. Reusing a transition identity with a different command kind, head, or payload is a typed conflict. Every accepted command advances the composite `(generation, version)` head exactly once; stale same-generation versions cannot mutate authority.
 Transition identities are monotonic within a contract generation. Exact replay is valid only at the current head; any older identity is rejected even when its payload matches a historical command.
+Proposal capabilities are bound to immutable contract identity, generation, and the proposal transition rather than the mutable head version. Delivery-owner transfer therefore preserves the capability; restart recovery reconstructs finalization only after the repository verifies the proposal's durable fence receipt.
+
+Repository `committed_at` records transaction commit time. Domain occurrence timestamps remain exclusively in terminal evidence/proposals and never substitute for storage audit time.
 
 The model boundary exposes an exhaustive public-event registry. Registration events contain the full immutable registration facts, transfer events contain both delivery owners, and terminal events contain canonical terminal evidence plus the delivery owner, so downstream projections can be rebuilt without becoming authorities.
 
