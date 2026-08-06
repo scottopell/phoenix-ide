@@ -289,11 +289,14 @@ export function useConversationPrStatus({
   );
 
   const refreshForSafety = useCallback(async () => {
-    while (scopeKey && activeScopeRef.current === scopeKey) {
-      const result = await startRefresh('safety');
-      if (result || activeScopeRef.current !== scopeKey) return result;
+    let result = await startRefresh('safety');
+    while (!result && scopeKey && activeScopeRef.current === scopeKey) {
+      const replacement = inFlightRef.current?.scopeKey === scopeKey
+        ? inFlightRef.current.promise
+        : null;
+      result = replacement ? await replacement : await startRefresh('safety');
     }
-    return undefined;
+    return result;
   }, [scopeKey, startRefresh]);
 
   const refreshRoutine = useCallback((): Promise<PrStatusResponse | undefined> => {

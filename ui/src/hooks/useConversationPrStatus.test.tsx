@@ -123,8 +123,7 @@ describe('useConversationPrStatus', () => {
     getPrStatus
       .mockResolvedValueOnce(prStatus(65))
       .mockReturnValueOnce(safety.promise)
-      .mockReturnValueOnce(stateUpdate.promise)
-      .mockResolvedValueOnce(prStatus(68));
+      .mockReturnValueOnce(stateUpdate.promise);
 
     render(<Probe conversationId="conv-safety-priority" />);
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('65'));
@@ -137,13 +136,13 @@ describe('useConversationPrStatus', () => {
       safety.resolve(prStatus(66));
       await safety.promise;
     });
-    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(4));
+    expect(getPrStatus).toHaveBeenCalledTimes(3);
 
     await act(async () => {
       stateUpdate.resolve(prStatus(67));
       await stateUpdate.promise;
     });
-    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('68'));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('67'));
   });
 
   it('starts a new read for each state-driven explicit refresh', async () => {
@@ -276,6 +275,7 @@ describe('useConversationPrStatus', () => {
       await safety.promise;
     });
     expect(screen.getByTestId('pr-number')).toHaveTextContent('69');
+    expect(getPrStatus).toHaveBeenCalledTimes(3);
     afterMutation.resolve(prStatus(71));
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('71'));
   });
