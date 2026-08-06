@@ -47,7 +47,7 @@ function cachedPr(number: number): CachedPrSummary {
   };
 }
 
-function Probe({ conversationId, cached }: { conversationId: string; cached?: CachedPrSummary | null }) {
+function Probe({ conversationId, cached }: { conversationId: string | null; cached?: CachedPrSummary | null }) {
   const handle = useConversationPrStatus({
     conversationId,
     convModeLabel: 'Work',
@@ -68,19 +68,25 @@ describe('useConversationPrStatus', () => {
     vi.clearAllMocks();
   });
 
-  it('coalesces concurrent explicit and routine refreshes for one scope', async () => {
-    const pending = deferred<PrStatusResponse>();
+  it('starts an explicit safety refresh instead of reusing a background read', async () => {
+    const background = deferred<PrStatusResponse>();
+    const explicit = deferred<PrStatusResponse>();
     const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
-    getPrStatus.mockReturnValue(pending.promise);
+    getPrStatus.mockReturnValueOnce(background.promise).mockReturnValueOnce(explicit.promise);
 
-    render(<Probe conversationId="conv-coalesce" />);
+    render(<Probe conversationId="conv-explicit" />);
     await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(1));
 
     screen.getByRole('button', { name: 'Refresh' }).click();
-    document.dispatchEvent(new Event('visibilitychange'));
-    expect(getPrStatus).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
 
-    pending.resolve(prStatus(41));
+    await act(async () => {
+      background.resolve(prStatus(40));
+      await background.promise;
+    });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
+
+    explicit.resolve(prStatus(41));
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('41'));
   });
 
@@ -124,17 +130,44 @@ describe('useConversationPrStatus', () => {
     await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(1));
     screen.getByRole('button', { name: 'Resume inference' }).click();
     await waitFor(() => expect(resumeInference).toHaveBeenCalledWith('conv-mutation'));
-    expect(getPrStatus).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
 
     await act(async () => {
       beforeMutation.resolve(prStatus(48));
       await beforeMutation.promise;
     });
     expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
-    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
-    expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
     afterMutation.resolve(prStatus(49));
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('49'));
+  });
+
+  it('does not reuse a pre-mutation explicit read for post-mutation state', async () => {
+    const beforeMutation = deferred<PrStatusResponse>();
+    const afterMutation = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    const resumeInference = api.resumeAssociatedPrInference as ReturnType<typeof vi.fn>;
+    getPrStatus
+      .mockResolvedValueOnce(prStatus(53))
+      .mockReturnValueOnce(beforeMutation.promise)
+      .mockReturnValueOnce(afterMutation.promise);
+    resumeInference.mockResolvedValue(undefined);
+
+    render(<Probe conversationId="conv-mutation-explicit" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('53'));
+    screen.getByRole('button', { name: 'Refresh' }).click();
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+
+    screen.getByRole('button', { name: 'Resume inference' }).click();
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledWith('conv-mutation-explicit'));
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      beforeMutation.resolve(prStatus(54));
+      await beforeMutation.promise;
+    });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('53');
+    afterMutation.resolve(prStatus(55));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('55'));
   });
 
   it('coalesces a visibility refresh with a scheduled poll', async () => {
@@ -176,6 +209,48 @@ describe('useConversationPrStatus', () => {
     screen.getByRole('button', { name: 'Refresh' }).click();
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('43'));
     expect(getPrStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads immediately when a recently refreshed scope is reactivated', async () => {
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockResolvedValueOnce(prStatus(50)).mockResolvedValueOnce(prStatus(51));
+
+    const { rerender } = render(<Probe conversationId="conv-reactivate" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('50'));
+
+    rerender(<Probe conversationId={null} />);
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('none');
+    rerender(<Probe conversationId="conv-reactivate" />);
+
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('51'));
+  });
+
+  it('clears prior freshness when a later HTTP response is unavailable', async () => {
+    const unavailable: PrStatusResponse = {
+      found: false,
+      refresh: {
+        state: 'unavailable',
+        reason: 'command_failed',
+        last_attempted_at: '2026-01-01T00:00:00Z',
+        stale: true,
+      },
+      work_change: { kind: 'unavailable', reason: 'command_failed' },
+    };
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus
+      .mockResolvedValueOnce(prStatus(52))
+      .mockResolvedValueOnce(unavailable)
+      .mockResolvedValueOnce(prStatus(53));
+
+    render(<Probe conversationId="conv-unavailable" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('52'));
+    screen.getByRole('button', { name: 'Refresh' }).click();
+    await waitFor(() => expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable'));
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('53'));
+    expect(getPrStatus).toHaveBeenCalledTimes(3);
   });
 
   it('ignores stale refresh results after the conversation scope changes', async () => {

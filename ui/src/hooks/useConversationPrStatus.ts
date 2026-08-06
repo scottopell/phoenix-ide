@@ -158,6 +158,8 @@ function publicStateForScope(
 
 const ROUTINE_REFRESH_FRESHNESS_MS = 10_000;
 
+type PrStatusRefreshIntent = 'background' | 'explicit' | 'post-mutation';
+
 export function useConversationPrStatus({
   conversationId,
   convModeLabel,
@@ -174,6 +176,7 @@ export function useConversationPrStatus({
   const inFlightRef = useRef<{
     scopeKey: string;
     seq: number;
+    intent: PrStatusRefreshIntent;
     promise: Promise<PrStatusResponse | undefined>;
   } | null>(null);
   const lastCompletedRef = useRef<{ scopeKey: string; at: number } | null>(null);
@@ -193,25 +196,31 @@ export function useConversationPrStatus({
       : { scopeKey: null, status: 'disabled', prStatus: null }
   ));
 
-  const refresh = useCallback((): Promise<PrStatusResponse | undefined> => {
+  const startRefresh = useCallback((intent: PrStatusRefreshIntent): Promise<PrStatusResponse | undefined> => {
     if (!scopeKey || !conversationId || activeScopeRef.current !== scopeKey) {
       return Promise.resolve(undefined);
     }
-    if (inFlightRef.current?.scopeKey === scopeKey
-      && inFlightRef.current.seq === latestSeqRef.current) {
-      return inFlightRef.current.promise;
-    }
+    const current = inFlightRef.current;
+    const currentIsReusable = current?.scopeKey === scopeKey
+      && current.seq === latestSeqRef.current
+      && (intent === 'background'
+        || (intent === 'explicit' && current.intent !== 'background'));
+    if (currentIsReusable) return current.promise;
 
     const seq = ++latestSeqRef.current;
+    inFlightRef.current = null;
     const promise = (async () => {
       try {
         const prStatus = await api.getPrStatus(conversationId);
         if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
         setInternalState({ scopeKey, status: 'ready', prStatus });
-        lastCompletedRef.current = { scopeKey, at: Date.now() };
+        lastCompletedRef.current = prStatus.refresh.state === 'fresh' && !prStatus.refresh.stale
+          ? { scopeKey, at: Date.now() }
+          : null;
         return prStatus;
       } catch {
         if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return undefined;
+        lastCompletedRef.current = null;
         const fallback = cachedSeedRef.current;
         if (fallback) {
           const unavailable: PrStatusResponse = {
@@ -247,9 +256,14 @@ export function useConversationPrStatus({
         }
       }
     })();
-    inFlightRef.current = { scopeKey, seq, promise };
+    inFlightRef.current = { scopeKey, seq, intent, promise };
     return promise;
   }, [conversationId, scopeKey]);
+
+  const refresh = useCallback(
+    () => startRefresh('explicit'),
+    [startRefresh],
+  );
 
   const refreshRoutine = useCallback((): Promise<PrStatusResponse | undefined> => {
     if (!scopeKey || activeScopeRef.current !== scopeKey) return Promise.resolve(undefined);
@@ -262,8 +276,8 @@ export function useConversationPrStatus({
       && Date.now() - lastCompleted.at < ROUTINE_REFRESH_FRESHNESS_MS) {
       return Promise.resolve(undefined);
     }
-    return refresh();
-  }, [refresh, scopeKey]);
+    return startRefresh('background');
+  }, [scopeKey, startRefresh]);
 
   useEffect(() => {
     latestSeqRef.current += 1;
@@ -293,7 +307,7 @@ export function useConversationPrStatus({
       }, 60_000);
     };
 
-    void fetchStatus();
+    void startRefresh('background');
     schedule();
 
     const onVisible = () => { if (document.visibilityState === 'visible') void fetchStatus(); };
@@ -306,7 +320,7 @@ export function useConversationPrStatus({
       if (timeout != null) window.clearTimeout(timeout);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [scopeKey, refreshRoutine]);
+  }, [scopeKey, refreshRoutine, startRefresh]);
 
   const publicState = publicStateForScope(internalState, scopeKey, cachedSeed);
   const liveSelection = internalState.scopeKey === scopeKey && internalState.status === 'ready'
@@ -316,18 +330,10 @@ export function useConversationPrStatus({
     ? (selectionFromPrStatus(publicState.prStatus) ?? cachedSelection)
     : cachedSelection);
 
-  const refreshAfterMutation = useCallback(async () => {
-    const pending = inFlightRef.current?.scopeKey === scopeKey
-      ? inFlightRef.current.promise
-      : null;
-    if (pending) {
-      latestSeqRef.current += 1;
-      inFlightRef.current = null;
-      await pending;
-    }
-    if (activeScopeRef.current !== scopeKey) return undefined;
-    return refresh();
-  }, [refresh, scopeKey]);
+  const refreshAfterMutation = useCallback(
+    () => startRefresh('post-mutation'),
+    [startRefresh],
+  );
 
   const pinActivePr = useCallback(async (request: PinAssociatedPrRequest) => {
     if (!scopeKey || !conversationId) return;
