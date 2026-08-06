@@ -4,6 +4,9 @@
     clippy::too_many_lines
 )]
 
+use crate::observability::{
+    self, DbBeginMode, DbOperation, DbOutcome, RetryAccounting, SqliteErrorClass,
+};
 use crate::{DbError, DbResult};
 use phoenix_workflow::{
     AttemptId, AttemptStatus, AuthorityOutcome, BarrierId, BarrierStatus, ClaimOutcome, CodecRef,
@@ -16,8 +19,10 @@ use phoenix_workflow::{
     SupportedCodecRegistry, SuppressionReason, Timestamp, TransitionId, Version, WorkflowBinding,
     WorkflowId, WorkflowStatus,
 };
-use sqlx::{error::DatabaseError, Row, SqlitePool};
+use sqlx::{error::DatabaseError, Acquire, Row, SqlitePool};
 use std::collections::BTreeSet;
+use std::time::Instant;
+use tracing::Instrument;
 
 pub mod direct_turn;
 pub mod wake;
@@ -1606,25 +1611,102 @@ impl WorkflowRepository {
     }
 
     pub async fn begin_attempt(&self, input: &BeginAttemptInput) -> DbResult<BeginAttemptResult> {
-        for _ in 0..5 {
-            match self.begin_attempt_once(input).await {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+        const MAX_ATTEMPTS: u32 = 5;
+        let operation = DbOperation::BeginWorkflowAttempt;
+        let mut accounting = RetryAccounting::default();
+
+        loop {
+            let attempt = accounting.start_attempt();
+            let span = observability::transaction_span(operation, DbBeginMode::Deferred, attempt);
+            let started = Instant::now();
+            let result = self
+                .begin_attempt_once(input, operation)
+                .instrument(span.clone())
+                .await;
+
+            match result {
+                Err(DbError::Sqlx(sqlx::Error::Database(ref error)))
                     if is_sqlite_busy_retryable(error.as_ref()) =>
                 {
-                    std::thread::yield_now();
+                    let sqlite = SqliteErrorClass::from_database_error(error.as_ref());
+                    if attempt == MAX_ATTEMPTS {
+                        observability::record_transaction(
+                            &span,
+                            operation,
+                            DbOutcome::RetryExhausted,
+                            accounting,
+                            started.elapsed(),
+                            sqlite,
+                        );
+                        return Ok(BeginAttemptResult {
+                            outcome: ClaimOutcome::AuthorityConflict,
+                            authority: None,
+                            attempt: None,
+                        });
+                    }
+                    accounting.record_retry();
+                    observability::record_transaction(
+                        &span,
+                        operation,
+                        DbOutcome::ContentionRetry,
+                        accounting,
+                        started.elapsed(),
+                        sqlite,
+                    );
+                    tokio::task::yield_now().await;
                 }
-                result => return result,
+                Ok(result) => {
+                    let outcome = if result.outcome == ClaimOutcome::Started {
+                        DbOutcome::Success
+                    } else {
+                        DbOutcome::AuthorityConflict
+                    };
+                    observability::record_transaction(
+                        &span,
+                        operation,
+                        outcome,
+                        accounting,
+                        started.elapsed(),
+                        None,
+                    );
+                    return Ok(result);
+                }
+                Err(error) => {
+                    let sqlite = if let DbError::Sqlx(error) = &error {
+                        observability::sqlite_class(error)
+                    } else {
+                        None
+                    };
+                    observability::record_transaction(
+                        &span,
+                        operation,
+                        DbOutcome::Failure,
+                        accounting,
+                        started.elapsed(),
+                        sqlite,
+                    );
+                    return Err(error);
+                }
             }
         }
-        Ok(BeginAttemptResult {
-            outcome: ClaimOutcome::AuthorityConflict,
-            authority: None,
-            attempt: None,
-        })
     }
 
-    async fn begin_attempt_once(&self, input: &BeginAttemptInput) -> DbResult<BeginAttemptResult> {
-        let mut tx = self.begin_tx().await?;
+    async fn begin_attempt_once(
+        &self,
+        input: &BeginAttemptInput,
+        operation: DbOperation,
+    ) -> DbResult<BeginAttemptResult> {
+        let acquire_span = observability::acquisition_span(operation);
+        let acquire_started = Instant::now();
+        let connection = self.pool.acquire().instrument(acquire_span.clone()).await;
+        observability::record_acquisition(
+            &acquire_span,
+            operation,
+            acquire_started.elapsed(),
+            connection.is_ok(),
+        );
+        let mut connection = connection?;
+        let mut tx = WorkflowTx::new(connection.begin().await?);
         let result = tx.begin_attempt(input).await?;
         if result.outcome == ClaimOutcome::Started {
             tx.commit().await?;

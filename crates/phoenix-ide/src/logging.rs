@@ -161,6 +161,8 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "conversation.turn"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
+    ("phoenix_db::otel", "db.pool.acquire"),
+    ("phoenix_db::otel", "db.transaction"),
 ];
 
 fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
@@ -452,6 +454,26 @@ mod tests {
             drop(stream_init);
             drop(runtime_materialize);
             drop(browser_open);
+            let db_transaction = tracing::info_span!(
+                target: "phoenix_db::otel",
+                "db.transaction",
+                db.operation = "workflow.begin_attempt",
+                db.begin_mode = "deferred",
+                db.outcome = tracing::field::Empty,
+                db.retry_count = tracing::field::Empty,
+            );
+            let db_acquire = tracing::info_span!(
+                target: "phoenix_db::otel",
+                parent: &db_transaction,
+                "db.pool.acquire",
+                db.operation = "workflow.begin_attempt",
+                db.outcome = tracing::field::Empty,
+            );
+            db_acquire.record("db.outcome", "success");
+            drop(db_acquire);
+            db_transaction.record("db.outcome", "contention_retry");
+            db_transaction.record("db.retry_count", 1_i64);
+            drop(db_transaction);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
                 "llm.request",
@@ -500,7 +522,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 6);
+        assert_eq!(spans.len(), 8);
         assert_eq!(
             spans
                 .iter()
@@ -512,10 +534,41 @@ mod tests {
                 "conversation.stream.init",
                 "conversation.runtime.materialize",
                 "browser.conversation_open",
+                "db.pool.acquire",
+                "db.transaction",
                 "llm.request"
             ]
         );
         assert!(spans.iter().all(|span| span.events.is_empty()));
+        let db_span = spans
+            .iter()
+            .find(|span| span.name == "db.transaction")
+            .expect("DB transaction span exported");
+        let db_attributes = format!("{:?}", db_span.attributes);
+        for required in ["workflow.begin_attempt", "deferred", "contention_retry"] {
+            assert!(
+                db_attributes.contains(required),
+                "missing DB attribute {required}"
+            );
+        }
+        let retries = db_span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.retry_count")
+            .expect("numeric retry count exported");
+        assert!(matches!(retries.value, opentelemetry::Value::I64(1)));
+        let db_acquire_span = spans
+            .iter()
+            .find(|span| span.name == "db.pool.acquire")
+            .expect("DB pool acquisition span exported");
+        assert_eq!(
+            db_acquire_span.span_context.trace_id(),
+            db_span.span_context.trace_id()
+        );
+        assert_eq!(
+            db_acquire_span.parent_span_id,
+            db_span.span_context.span_id()
+        );
         let llm_span = spans
             .iter()
             .find(|span| span.name == "llm.request")
