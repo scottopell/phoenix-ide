@@ -218,9 +218,7 @@ export function useConversationPrStatus({
       && currentWallAge >= 0
       && currentMonotonicAge < IN_FLIGHT_REUSE_MS
       && currentWallAge < IN_FLIGHT_REUSE_MS;
-    const currentIsReusable = currentIsLive
-      && (intent === 'background'
-        || (intent === 'explicit' && current?.intent === 'safety'));
+    const currentIsReusable = currentIsLive && intent === 'background';
     if (currentIsReusable) return current.promise;
 
     const seq = ++latestSeqRef.current;
@@ -290,10 +288,13 @@ export function useConversationPrStatus({
     [startRefresh],
   );
 
-  const refreshForSafety = useCallback(
-    () => startRefresh('safety'),
-    [startRefresh],
-  );
+  const refreshForSafety = useCallback(async () => {
+    while (scopeKey && activeScopeRef.current === scopeKey) {
+      const result = await startRefresh('safety');
+      if (result || activeScopeRef.current !== scopeKey) return result;
+    }
+    return undefined;
+  }, [scopeKey, startRefresh]);
 
   const refreshRoutine = useCallback((): Promise<PrStatusResponse | undefined> => {
     if (!scopeKey || activeScopeRef.current !== scopeKey) return Promise.resolve(undefined);

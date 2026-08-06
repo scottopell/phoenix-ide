@@ -116,10 +116,15 @@ describe('useConversationPrStatus', () => {
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('59'));
   });
 
-  it('keeps a safety read authoritative over a later ordinary refresh', async () => {
+  it('retries a safety read after a later state-driven refresh supersedes it', async () => {
     const safety = deferred<PrStatusResponse>();
+    const stateUpdate = deferred<PrStatusResponse>();
     const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
-    getPrStatus.mockResolvedValueOnce(prStatus(65)).mockReturnValueOnce(safety.promise);
+    getPrStatus
+      .mockResolvedValueOnce(prStatus(65))
+      .mockReturnValueOnce(safety.promise)
+      .mockReturnValueOnce(stateUpdate.promise)
+      .mockResolvedValueOnce(prStatus(68));
 
     render(<Probe conversationId="conv-safety-priority" />);
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('65'));
@@ -127,10 +132,18 @@ describe('useConversationPrStatus', () => {
     await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
 
     screen.getByRole('button', { name: 'Refresh' }).click();
-    expect(getPrStatus).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      safety.resolve(prStatus(66));
+      await safety.promise;
+    });
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(4));
 
-    safety.resolve(prStatus(66));
-    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('66'));
+    await act(async () => {
+      stateUpdate.resolve(prStatus(67));
+      await stateUpdate.promise;
+    });
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('68'));
   });
 
   it('starts a new read for each state-driven explicit refresh', async () => {
