@@ -100,6 +100,7 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
     state: { status: 'ready' as const, prStatus: committedStatus },
     refresh: vi.fn().mockResolvedValue(committedStatus),
     refreshForSafety: vi.fn().mockResolvedValue(committedStatus),
+    refreshAfterMutation: vi.fn().mockResolvedValue(committedStatus),
     activeSelection: selectionValue,
     activePrSummary: selectionValue?.active_pr
       ? associated.find((pr) => pr.repo_owner === selectionValue.active_pr?.pr.repo_owner
@@ -117,6 +118,7 @@ const loadingPrStatusHandle = {
   state: { status: 'loading' as const, prStatus: null },
   refresh: vi.fn().mockResolvedValue(undefined),
   refreshForSafety: vi.fn().mockResolvedValue(undefined),
+  refreshAfterMutation: vi.fn().mockResolvedValue(undefined),
 };
 
 /** Count of glowing primaries across the whole bar — must always be exactly 1
@@ -331,6 +333,34 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(resolve).toHaveClass('work-actions-btn--primary');
     expect(resolve.textContent).toMatch(/Address PR #12 feedback/i);
     expect(primaryCount()).toBe(1);
+  });
+
+  it('refreshes status after feedback capture with post-mutation ordering', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://gh/pr/12',
+      display_state: 'open',
+      check_state: 'failing',
+    });
+
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-capture"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={onSendMessage}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('address-feedback-button'));
+
+    await waitFor(() => expect(onSendMessage).toHaveBeenCalledWith('Address `.phoenix/pr-context/pr-12.json`'));
+    await waitFor(() => expect(handle.refreshAfterMutation).toHaveBeenCalledTimes(1));
+    expect(handle.refresh).not.toHaveBeenCalled();
   });
 
   it('cached open PR seed keeps address-feedback primary while fresh status loads', () => {

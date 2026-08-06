@@ -234,6 +234,7 @@ function makePrStatusHandle(prStatus: PrStatusResponse, selection: ReturnType<ty
     state: { status: 'ready' as const, prStatus: selection ? { ...prStatus, selection } : prStatus },
     refresh: vi.fn().mockResolvedValue(undefined),
     refreshForSafety: vi.fn().mockResolvedValue(undefined),
+  refreshAfterMutation: vi.fn().mockResolvedValue(undefined),
     activeSelection: selection,
     activePrSummary: selection?.active_pr
       ? selection.associated_prs.find((pr) => pr.repo_owner === selection.active_pr?.pr.repo_owner

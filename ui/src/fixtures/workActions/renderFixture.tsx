@@ -16,6 +16,7 @@ export function WorkActionsFixture({ scenario }: Props) {
     state: scenario.prState,
     refresh: async () => undefined,
     refreshForSafety: async () => undefined,
+    refreshAfterMutation: async () => undefined,
   };
 
   return (

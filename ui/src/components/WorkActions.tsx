@@ -182,7 +182,7 @@ export function WorkControlBar({
     try {
       const ctx = await api.createPrAutoFixContext(conversationId);
       await onSendMessage(ctx.message);
-      await prStatusHandle.refresh();
+      await prStatusHandle.refreshAfterMutation();
     } catch (err) {
       showError?.(err instanceof Error ? err.message : 'Failed to capture PR context');
     } finally {

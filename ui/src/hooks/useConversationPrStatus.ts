@@ -20,6 +20,7 @@ export interface ConversationPrStatusHandle {
   state: ConversationPrStatusState;
   refresh: () => Promise<PrStatusResponse | undefined>;
   refreshForSafety: () => Promise<PrStatusResponse | undefined>;
+  refreshAfterMutation: () => Promise<PrStatusResponse | undefined>;
   activeSelection?: AssociatedPrStatusEnvelope | null;
   activePrSummary?: AssociatedPrSummaryResponse | null;
   ambiguous?: boolean;
@@ -381,6 +382,7 @@ export function useConversationPrStatus({
     state: publicState,
     refresh,
     refreshForSafety,
+    refreshAfterMutation,
     activeSelection,
     activePrSummary: activePrSummaryFromSelection(activeSelection),
     ambiguous: isSelectionAmbiguous(activeSelection),
