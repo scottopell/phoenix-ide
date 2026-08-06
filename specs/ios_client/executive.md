@@ -18,13 +18,13 @@ rather than duplicating their state machines.
 
 Unit coverage follows a contract-test pattern (see `ios/README.md`
 "Testing"): pure components get one test per rule of the contract they
-implement; views stay untested. Covered so far: `SSEParser` (SSE wire
-format) and `Outbox` (the user_message_queue delivery rules, exercised
-against real disk persistence via a test seam). Remaining verification
-steps: on-device build and an airplane-mode queue/drain test pass;
-next unit-test candidates are `PhoenixEvent` decoding, `BashResult`
-parsing, and the `ConversationSession` reducer (needs dependency
-injection first).
+implement; views stay untested. Coverage includes SSE framing and typed
+hard-delete decoding, the outbox delivery and real-disk durability rules,
+versioned-store downgrade protection, typed conversation states and chat
+eligibility, question encoding, image processing, attention diffs, bash
+result parsing, certificate-pin decisions, legacy conversation decoding,
+and reducer ordering/hard-delete behavior. Remaining verification steps:
+on-device build and an airplane-mode queue/drain test pass.
 
 ## Requirement Coverage
 
@@ -47,15 +47,15 @@ injection first).
 | REQ-IOS-015 image attachments | `AttachmentViews.swift`, `ImageProcessing` (tested), composer PhotosPicker, outbox `images` |
 | REQ-IOS-016 question answering | `QuestionCard.swift`, `QuestionAnswers` encoder (tested), respond/dismiss actions |
 | REQ-IOS-017 coordinator access | `AppModel.openCoordinator`, list globe entry + row badge |
-| REQ-IOS-018 nudges (stopgap) | `AttentionMonitor` (diff tested), `BackgroundRefresh`, `NotificationRouter` |
+| REQ-IOS-018 advisory nudges | `AttentionMonitor` (diff tested), `BackgroundRefresh`, `NotificationRouter` |
 
 ## Known Gaps / Future Work
 
-- Real-time push does not exist yet. The nudge tier (REQ-IOS-018) is an
-  explicit stopgap: best-effort BGAppRefresh polling with local
+- Real-time push does not exist yet. The nudge tier (REQ-IOS-018) is
+  best-effort BGAppRefresh polling with local
   notifications, bounded by iOS's ≥15-minute opportunistic cadence. The
   intended end state is server-side APNs on durable inbox observations —
-  tracked as `tasks/58046` (blocked on the durable-workflows stack) — at
+  tracked as `tasks/20004` (blocked on the durable-workflows stack) — at
   which point the stopgap is deleted, not extended.
 - Steering-queue entries are not reorderable/deletable server-side from the app.
 - No archived-conversations view, rename, or delete (archive itself is

@@ -12,42 +12,42 @@ struct ConversationView: View {
         VStack(spacing: 0) {
             OfflineBanner()
             ConnectionStateBar(session: session)
-            if session.isHardDeleted {
-                ContentUnavailableView(
-                    "Conversation deleted",
-                    systemImage: "trash",
-                    description: Text("This conversation was deleted on the server."))
-            } else {
-                TimelineView(.periodic(from: .now, by: 30)) { context in
-                    if let staleness = cacheAgeNote(at: context.date) {
-                        Text(staleness)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 2)
-                            .background(.thinMaterial)
-                    }
-                }
-                if !session.outbox.persistenceHealthy {
-                    Label(
-                        "Storage write failed — queued messages may not survive a restart",
-                        systemImage: "externaldrive.badge.exclamationmark")
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                if let staleness = cacheAgeNote(at: context.date) {
+                    Text(staleness)
                         .font(.caption2)
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 4)
-                        .background(.red.gradient)
+                        .padding(.vertical, 2)
+                        .background(.thinMaterial)
                 }
-                if isUncachedOffline {
-                    ContentUnavailableView {
-                        Label("Not cached on this device", systemImage: "icloud.slash")
-                    } description: {
-                        Text("Open this conversation once while connected to read it offline.")
-                    }
-                    .frame(maxHeight: .infinity)
-                } else {
-                    messageList
+            }
+            if !session.outbox.persistenceHealthy {
+                Label(
+                    "Storage write failed — queued messages may not survive a restart",
+                    systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.caption2)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                    .background(.red.gradient)
+            }
+            if session.isHardDeleted {
+                ContentUnavailableView {
+                    Label("Conversation deleted", systemImage: "trash")
+                } description: {
+                    Text("It was deleted from another Phoenix client.")
                 }
+                .frame(maxHeight: .infinity)
+            } else if isUncachedOffline {
+                ContentUnavailableView {
+                    Label("Not cached on this device", systemImage: "icloud.slash")
+                } description: {
+                    Text("Open this conversation once while connected to read it offline.")
+                }
+                .frame(maxHeight: .infinity)
+            } else {
+                messageList
                 StateDetailView(session: session)
                 ComposerView(session: session, draft: $draft)
             }

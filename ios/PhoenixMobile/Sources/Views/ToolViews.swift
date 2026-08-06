@@ -246,8 +246,14 @@ struct BashResult {
         case "still_running": parts.append("still running")
         case "kill_pending_kernel": parts.append("kill pending")
         case "tombstoned":
-            parts.append(finalCause == "killed" ? "killed" : "finished")
-            if let exitCode { parts.append("exit \(exitCode)") }
+            if finalCause == "killed" {
+                parts.append("killed\(signalNumber.map { " (signal \($0))" } ?? "")")
+            } else if finalCause == "exited" {
+                parts.append("exited \(exitCode.map(String.init) ?? "?")")
+            } else {
+                parts.append("finished")
+                if let exitCode { parts.append("exit \(exitCode)") }
+            }
         case "waiter_panicked": parts.append("waiter panicked")
         default: parts.append(status ?? "?")
         }

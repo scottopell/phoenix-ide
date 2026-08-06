@@ -27,6 +27,7 @@ enum ConversationState: Equatable {
     case awaitingRecovery(message: String)
     case provisioning
     case error(message: String)
+    case creationFailed(message: String)
     case contextExhausted(summary: String?)
     case cancelling
     case cancellingTool
@@ -83,6 +84,11 @@ enum ConversationState: Equatable {
             return .provisioning
         case "error":
             return .error(message: json["message"]?.stringValue ?? "Unknown error")
+        case "creation_failed":
+            return .creationFailed(
+                message: json["error"]?.stringValue
+                    ?? json["message"]?.stringValue
+                    ?? "Conversation creation failed")
         case "context_exhausted":
             return .contextExhausted(summary: json["summary"]?.stringValue)
         case "cancelling":
@@ -99,7 +105,6 @@ enum ConversationState: Equatable {
             return .other(type: type)
         }
     }
-
     /// Mirrors the server's chat/steering acceptance families. Plain
     /// cancellation rejects chat, while tool and sub-agent cancellation
     /// still accept a follow-up for after the current turn.
@@ -112,7 +117,7 @@ enum ConversationState: Equatable {
              .awaitingUserResponse, .awaitingTaskApproval,
              .awaitingCommissionReviewApproval, .awaitingRecovery, .provisioning,
              .contextExhausted,
-             .terminal, .handedOff, .other, .unknown:
+             .creationFailed, .terminal, .handedOff, .other, .unknown:
             return false
         }
     }
@@ -124,7 +129,7 @@ enum ConversationState: Equatable {
              .awaitingRecovery, .provisioning:
             return true
         case .idle, .awaitingLlm, .awaitingContinuation,
-             .awaitingUserResponse, .error, .contextExhausted, .cancelling,
+             .awaitingUserResponse, .error, .creationFailed, .contextExhausted, .cancelling,
              .cancellingTool, .cancellingSubAgents, .terminal, .handedOff,
              .other, .unknown:
             return false

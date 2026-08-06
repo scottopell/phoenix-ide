@@ -23,6 +23,7 @@ xcodegen generate
 open PhoenixMobile.xcodeproj
 ```
 
+
 Select your device or a simulator and run. There are no third-party
 package dependencies — first build works offline.
 
@@ -69,20 +70,22 @@ cannot cover Swift.
 
 **The testing pattern:** pure components get *contract tests* — one test
 per rule of the contract they implement, named after that rule — and
-views stay untested. The two exemplars to mimic:
+views stay untested. Representative exemplars:
 
 - `Tests/SSEParserTests.swift` — contract: the SSE wire format.
 - `Tests/OutboxTests.swift` — contract: the delivery rules in
   `specs/user_message_queue/user_message_queue.allium` (+ REQ-IOS-002
   deviations). Persistence runs for real against a per-test temp
   directory via the `DiskStore.baseDirectory` seam.
+- `Tests/ConversationSessionReducerTests.swift` — event ordering, turn-close,
+  and hard-delete behavior at the session boundary.
+- `Tests/DiskStoreVersioningTests.swift` — upgrade/downgrade protection for
+  every durable store.
 
-When adding logic, keep it out of views and in a pure type so it can be
-tested this way. Next candidates, in value order: `PhoenixEvent` decoding
-(init snapshot + pending-events replay shapes), `BashResult` envelope
-parsing, and the `ConversationSession` reducer (sequence guard, init
-replay floor, dedup-by-message_id) — the reducer needs its API/SSE
-dependencies made injectable first.
+When adding logic, keep it out of views and in a pure type or an explicit
+session boundary so it can be tested this way. High-value remaining cases
+include broader `PhoenixEvent` init/pending-replay decoding and sequence-floor
+fuzzing.
 
 ## How offline works
 
@@ -117,7 +120,7 @@ PhoenixMobile/Sources/
     ImageProcessing.swift   Picked photos -> bounded JPEG ImagePayload
     AttentionMonitor.swift  STOPGAP nudge tier: BGAppRefresh list diff ->
                             local notifications. Deleted (not extended)
-                            when server-side APNs lands (tasks/58046)
+                            when server-side APNs lands (tasks/20004)
     BackgroundRefresh.swift BGTaskScheduler plumbing for the stopgap tier
   API/
     Models.swift            Wire types (Conversation, Message, envelopes)
@@ -139,4 +142,3 @@ PhoenixMobile/Sources/
     AttachmentViews.swift   Base64 image rendering with visible decode
                             fallback; strips for messages + tool results
 ```
-

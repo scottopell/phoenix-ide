@@ -134,13 +134,15 @@ struct ConversationListView: View {
                             isCoordinator: conversation.id == model.coordinatorConversationId)
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button {
-                            Task { await model.archive(conversationId: conversation.id) }
-                        } label: {
-                            Label("Archive", systemImage: "archivebox")
+                        if conversation.id != model.coordinatorConversationId {
+                            Button {
+                                Task { await model.archive(conversationId: conversation.id) }
+                            } label: {
+                                Label("Archive", systemImage: "archivebox")
+                            }
+                            .tint(.orange)
+                            .disabled(!model.connectivity.isOnline)
                         }
-                        .tint(.orange)
-                        .disabled(!model.connectivity.isOnline)
                     }
                 }
             }
@@ -199,7 +201,7 @@ struct ConversationRow: View {
                 }
             }
             HStack(spacing: 6) {
-                Text(conversation.slug)
+                Text(conversation.displaySlug)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

@@ -117,7 +117,6 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(out.count, 1)
         XCTAssertEqual(out[0].data, "x")
     }
-
     func testInitDecodesTranscriptGenerationAndTailCoverage() {
         let json = """
         {
@@ -350,5 +349,18 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(seq, 9)
         XCTAssertEqual(message, "approval failed")
         XCTAssertTrue(retryable)
+    }
+
+    func testHardDeleteEventCarriesConversationIdentity() {
+        let frame = SSEFrame(
+            event: "conversation_hard_deleted",
+            data: "{\"type\":\"conversation_hard_deleted\",\"sequence_id\":42,\"conversation_id\":\"c1\"}")
+        guard case .conversationHardDeleted(let seq, let conversationId) =
+            PhoenixEvent.decode(frame: frame)
+        else {
+            return XCTFail("expected typed hard-delete event")
+        }
+        XCTAssertEqual(seq, 42)
+        XCTAssertEqual(conversationId, "c1")
     }
 }

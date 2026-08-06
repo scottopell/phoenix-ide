@@ -63,6 +63,19 @@ final class DiskStoreVersioningTests: XCTestCase {
     }
 
     @MainActor
+    func testDowngradedWriterCannotOverwriteNewerStore() {
+        freshDiskStore()
+        let future = [Record(name: "future", count: 99)]
+        XCTAssertTrue(DiskStore.saveVersioned(future, name: "records", version: 9))
+
+        XCTAssertFalse(DiskStore.saveVersioned(
+            [Record(name: "downgraded", count: 1)], name: "records", version: 1))
+        XCTAssertEqual(
+            DiskStore.loadVersioned([Record].self, name: "records", version: 9),
+            future)
+    }
+
+    @MainActor
     func testOlderVersionRoutesThroughMigrateHook() {
         freshDiskStore()
         // v1 stored shape: [String]. Current (v2) shape: [Record].

@@ -6,7 +6,7 @@ import Foundation
 
 struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     var id: String
-    var slug: String
+    var slug: String?
     var title: String?
     var model: String?
     var cwd: String?
@@ -43,8 +43,13 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
         if let cwd, !cwd.isEmpty {
             return (cwd as NSString).lastPathComponent
         }
-        return slug
+        if let slug, !slug.isEmpty { return slug }
+        return id
     }
+
+    /// Stable secondary label for list rows. Legacy/imported rows can have
+    /// a null slug, so identity is the lossless floor.
+    var displaySlug: String { slug.flatMap { $0.isEmpty ? nil : $0 } ?? id }
 
     var updatedAtDate: Date? {
         updated_at.flatMap { Self.parseDate($0) }

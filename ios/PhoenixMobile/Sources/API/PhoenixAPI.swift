@@ -83,6 +83,9 @@ final class ServerTrustDelegate: NSObject, URLSessionDelegate {
         let existingPin = CertPinStore.evaluateExisting(
             host: space.host, port: space.port, fingerprint: fingerprint)
 
+        // Standard trust still has to succeed (or the explicit private-chain
+        // policy below must be enabled). A matching pin proves identity; it
+        // does not override the user's current trust setting.
         if SecTrustEvaluateWithError(trust, nil) {
             if existingPin == .reject {
                 completionHandler(.cancelAuthenticationChallenge, nil)

@@ -86,11 +86,22 @@ enum DiskStore {
 
     @discardableResult
     static func saveVersioned<T: Encodable>(_ value: T, name: String, version: Int) -> Bool {
+        let destination = url(for: name)
+        if let existing = try? Data(contentsOf: destination),
+           let stored = (try? JSONDecoder().decode(VersionProbe.self, from: existing))?
+            .schema_version,
+           stored > version
+        {
+            // A downgraded app must never overwrite a store whose schema it
+            // cannot understand. The user can upgrade or explicitly clear
+            // the cache; ordinary writes stay fail-closed until then.
+            return false
+        }
         guard let data = try? JSONEncoder().encode(
             SaveEnvelope(schema_version: version, payload: value))
         else { return false }
         do {
-            try data.write(to: url(for: name), options: .atomic)
+            try data.write(to: destination, options: .atomic)
             return true
         } catch {
             return false

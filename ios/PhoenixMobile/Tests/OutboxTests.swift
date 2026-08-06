@@ -79,19 +79,24 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testDeliveryIsBlockedUntilQueueCanBePersisted() throws {
-        let file = FileManager.default.temporaryDirectory
-            .appendingPathComponent("phoenix-unwritable-store-\(UUID().uuidString)")
-        try Data("not a directory".utf8).write(to: file)
-        DiskStore.baseDirectory = file
+    func testDeliveryRemainsBlockedUntilFailedEnqueueWriteRecovers() throws {
+        let blockedRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-outbox-blocked-\(UUID().uuidString)")
+        try Data("not a directory".utf8).write(to: blockedRoot)
+        DiskStore.baseDirectory = blockedRoot
 
         let outbox = Outbox(conversationId: "c1")
-        _ = outbox.enqueue(text: "must stay local")
+        let entry = outbox.enqueue(text: "must be durable")
+        XCTAssertFalse(outbox.persistenceHealthy)
+        XCTAssertFalse(outbox.prepareForDelivery(), "POST must stay blocked without a disk copy")
 
         XCTAssertFalse(outbox.prepareForDelivery())
         XCTAssertTrue(outbox.entries.isEmpty)
+        try FileManager.default.removeItem(at: blockedRoot)
+        XCTAssertTrue(outbox.prepareForDelivery())
+        XCTAssertNil(entry)
+        XCTAssertTrue(Outbox(conversationId: "c1").visibleEntries.isEmpty)
     }
-
     // MARK: - PostAccepted{AsSteeringQueued, AsPendingReflection}
 
     @MainActor
