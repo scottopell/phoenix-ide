@@ -4307,6 +4307,18 @@ where
                                     self.active_direct_turn = None;
                                     self.pending_direct_turn_terminal = None;
                                     self.direct_turn_cancellation_initiated = false;
+                                    let _ = self.broadcast_tx.send_message(message.clone());
+                                    let _ = self.broadcast_tx.send_seq(|sequence_id| {
+                                        SseEvent::StateChange {
+                                            sequence_id,
+                                            state: self.state.clone(),
+                                            state_updated_at: self.state_updated_at,
+                                            presentation_mode: self
+                                                .state
+                                                .presentation_mode()
+                                                .to_string(),
+                                        }
+                                    });
                                 }
                                 if matches!(
                                     &self.state,

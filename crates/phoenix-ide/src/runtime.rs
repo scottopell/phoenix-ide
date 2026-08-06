@@ -3455,6 +3455,31 @@ impl RuntimeManager {
             .map_err(|e| format!("Failed to send event: {e}"))
     }
 
+    pub async fn send_event_and_wait_for_state(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+        accepted: impl Fn(&ConvState) -> bool,
+    ) -> Result<(), String> {
+        let handle = self.get_or_create(conversation_id).await?;
+        let mut state_rx = handle.state_rx.clone();
+        deposit_turn_trigger(&handle);
+        handle
+            .event_tx
+            .send(event)
+            .await
+            .map_err(|error| error.to_string())?;
+        loop {
+            state_rx
+                .changed()
+                .await
+                .map_err(|_| "runtime stopped before state settled".to_string())?;
+            if accepted(&state_rx.borrow_and_update()) {
+                return Ok(());
+            }
+        }
+    }
+
     pub async fn admit_continuation_retry(
         self: &Arc<Self>,
         conversation_id: &str,
