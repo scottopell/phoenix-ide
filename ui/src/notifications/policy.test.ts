@@ -151,6 +151,8 @@ describe('notification policy reducer', () => {
         type: 'recoverable_continuation_failure',
         message: 'Selected model is at capacity',
         error_kind: 'server_overloaded',
+        operation_id: 'continuation-operation-1',
+        attempt: 1,
       },
     });
     const result = notificationPolicyReducer(
@@ -176,6 +178,8 @@ describe('notification policy reducer', () => {
         type: 'recoverable_continuation_failure',
         message: 'Selected model is at capacity',
         error_kind: 'server_overloaded',
+        operation_id: 'continuation-operation-1',
+        attempt: 1,
       },
     });
     const first = notificationPolicyReducer(
@@ -203,7 +207,10 @@ describe('notification policy reducer', () => {
       retry.state,
       {
         type: 'conversation_state_changed',
-        conversation: { ...failed, updated_at: '2026-08-06T13:00:00Z' },
+        conversation: {
+          ...failed,
+          state: { ...failed.state!, attempt: 2 },
+        },
         previousState: retrying.state,
         nextState: failed.state!,
       },

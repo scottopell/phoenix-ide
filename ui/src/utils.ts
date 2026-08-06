@@ -336,6 +336,13 @@ export function parseConversationState(raw: unknown): ConversationState {
         type: 'recoverable_continuation_failure',
         message: stringOr(value['message'], 'Continuation summary generation failed'),
         error_kind: stringOr(value['error_kind'], 'server_error') as ErrorKind,
+        operation_id: stringOr(
+          (value['request'] as Record<string, unknown> | undefined)?.['operation_id'],
+          'legacy-continuation-operation',
+        ),
+        attempt: typeof (value['request'] as Record<string, unknown> | undefined)?.['attempt'] === 'number'
+          ? (value['request'] as Record<string, unknown>)['attempt'] as number
+          : 1,
       };
     }
     case 'handed_off': {

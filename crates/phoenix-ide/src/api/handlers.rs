@@ -4260,6 +4260,17 @@ async fn trigger_continuation(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if conversation.archived {
+        return Err(AppError::BadRequest(
+            "Cannot retry continuation for an archived conversation".to_string(),
+        ));
+    }
     let effective_state = match state.runtime.effective_conversation_state(&id).await {
         Some(runtime_state) => runtime_state,
         None => {

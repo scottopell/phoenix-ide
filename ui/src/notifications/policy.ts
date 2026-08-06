@@ -160,7 +160,8 @@ export function eventForState(state: ConversationState, conversation: Conversati
 export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
   if (event.type === 'agent_finished') return null;
   if (event.conversation.state?.type === 'recoverable_continuation_failure') {
-    return `${event.conversation.id}:${event.type}:${event.conversation.updated_at}`;
+    const state = event.conversation.state;
+    return `${event.conversation.id}:${event.type}:${state.operation_id}:${state.attempt}`;
   }
   return `${event.conversation.id}:${event.type}`;
 }

@@ -2906,7 +2906,9 @@ mod tests {
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
-        sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-a'")
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = 'llm_requesting' WHERE id = 'conv-a'",
+        )
             .bind(serde_json::to_string(&ConvState::LlmRequesting { attempt: 0 }).unwrap())
             .execute(&repo.pool)
             .await

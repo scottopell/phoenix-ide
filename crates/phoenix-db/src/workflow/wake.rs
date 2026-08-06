@@ -5636,7 +5636,9 @@ mod tests {
         let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
         materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await;
         let busy = ConvState::LlmRequesting { attempt: 1 };
-        sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-1'")
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = 'llm_requesting' WHERE id = 'conv-1'",
+        )
             .bind(serde_json::to_string(&busy).unwrap())
             .execute(&repo.workflow_repo.pool)
             .await

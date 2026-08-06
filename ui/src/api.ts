@@ -501,7 +501,7 @@ export type ConversationState =
   | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
   | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }
   | { type: 'awaiting_continuation'; attempt: number }
-  | { type: 'recoverable_continuation_failure'; message: string; error_kind: ErrorKind }
+  | { type: 'recoverable_continuation_failure'; message: string; error_kind: ErrorKind; operation_id: string; attempt: number }
   | { type: 'cancelling' }
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }

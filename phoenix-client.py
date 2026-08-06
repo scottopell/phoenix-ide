@@ -301,6 +301,16 @@ class PhoenixClient:
                     if event.event == "init":
                         messages = data.get('messages', [])
                         conversation = data.get('conversation')
+                        state = conversation.get('state') if isinstance(conversation, dict) else None
+                        state_kind = _state_kind(state)
+                        if state_kind == 'recoverable_continuation_failure':
+                            raise PhoenixError(
+                                _state_error_message(state, 'Continuation summary failed')
+                            )
+                        if state_kind == 'error':
+                            raise PhoenixError(_state_error_message(state, 'Unknown error'))
+                        if state_kind == 'context_exhausted':
+                            return {'conversation': conversation, 'messages': messages}
 
                     elif event.event == "message":
                         msg = data.get('message')
