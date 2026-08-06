@@ -202,10 +202,9 @@ export function useConversationPrStatus({
       return Promise.resolve(undefined);
     }
     const current = inFlightRef.current;
-    const currentIsReusable = current?.scopeKey === scopeKey
-      && current.seq === latestSeqRef.current
-      && (intent === 'background'
-        || (intent === 'explicit' && current.intent !== 'background'));
+    const currentIsReusable = intent === 'background'
+      && current?.scopeKey === scopeKey
+      && current.seq === latestSeqRef.current;
     if (currentIsReusable) return current.promise;
 
     const seq = ++latestSeqRef.current;

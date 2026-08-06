@@ -116,6 +116,31 @@ describe('useConversationPrStatus', () => {
     await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('59'));
   });
 
+  it('starts a new read for each state-driven explicit refresh', async () => {
+    const earlier = deferred<PrStatusResponse>();
+    const later = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus
+      .mockResolvedValueOnce(prStatus(60))
+      .mockReturnValueOnce(earlier.promise)
+      .mockReturnValueOnce(later.promise);
+
+    render(<Probe conversationId="conv-explicit-order" />);
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('60'));
+    screen.getByRole('button', { name: 'Refresh' }).click();
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(2));
+    screen.getByRole('button', { name: 'Refresh' }).click();
+    await waitFor(() => expect(getPrStatus).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      earlier.resolve(prStatus(61));
+      await earlier.promise;
+    });
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('60');
+    later.resolve(prStatus(62));
+    await waitFor(() => expect(screen.getByTestId('pr-number')).toHaveTextContent('62'));
+  });
+
   it('starts a valid replacement request after StrictMode invalidates effect setup', async () => {
     const stale = deferred<PrStatusResponse>();
     const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
