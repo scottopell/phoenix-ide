@@ -1847,7 +1847,7 @@ export const api = {
 
   async cancelSteeringMessage(convId: string, messageId: string): Promise<void> {
     const resp = await fetch(
-      `/api/conversations/${convId}/steering-queue/${messageId}`,
+      `/api/conversations/${encodeURIComponent(convId)}/steering-queue/${encodeURIComponent(messageId)}`,
       { method: 'DELETE' },
     );
     if (resp.status === 404) return; // already delivered or never queued

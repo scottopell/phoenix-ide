@@ -162,19 +162,18 @@ impl SendChatApplicationService {
             .effective_state(&conversation.id, &conversation.state)
             .await?;
         let acceptability = check_user_message_acceptable(&effective_state);
-        let queued_steering_fence = if acceptability.is_ok() {
-            !self
-                .db
-                .get_steering_queue(&conversation.id)
-                .await
-                .map_err(map_conversation_load_error)?
-                .is_empty()
-        } else {
-            false
-        };
-        if should_enqueue_steering(&acceptability, queued_steering_fence) {
-            let validated_files = validate_files(&req).await?;
-            let expanded = expand_request(&self.db, &conversation, &req).await?;
+        if let Err(err) = &acceptability {
+            if !should_enqueue_steering(&acceptability) {
+                return Ok(SendChatOutcome::Rejected {
+                    message: err.to_string(),
+                    code: transition_code(err),
+                });
+            }
+        }
+
+        let validated_files = validate_files(&req).await?;
+        let expanded = expand_request(&self.db, &conversation, &req).await?;
+        if should_enqueue_steering(&acceptability) {
             match lookup_durable_replay(&self.db, &req, &submitted).await? {
                 DurableReplayOutcome::Missing => {}
                 DurableReplayOutcome::ExactMaterialized => {
@@ -192,6 +191,45 @@ impl SendChatApplicationService {
                     return Ok(SendChatOutcome::Delivered);
                 }
             }
+        }
+
+        let mut acceptance_guard = self.runtime.lock_steering_acceptance().await;
+        let acceptance_state = self
+            .effective_state(&conversation.id, &conversation.state)
+            .await?;
+        let acceptance_acceptability = check_user_message_acceptable(&acceptance_state);
+        let receipt_key = (req.conversation_id.clone(), req.message_id.clone());
+        if let Some(receipt) = acceptance_guard.get(&receipt_key) {
+            return replay_steering_receipt(receipt, &req, &request_fingerprint);
+        }
+        if let Some((queued_conversation_id, queued_entry)) =
+            find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
+        {
+            if queued_conversation_id != req.conversation_id
+                || !queued_retry_matches(&queued_entry, &req)
+            {
+                return Err(SendChatServiceError::IdempotencyConflict);
+            }
+            acceptance_guard.remove(&receipt_key);
+            return Ok(SendChatOutcome::QueuedAsSteering);
+        }
+        let steering_queue = self
+            .runtime
+            .db()
+            .get_steering_queue(&req.conversation_id)
+            .await
+            .map_err(map_conversation_load_error)?;
+        if should_enqueue_steering(&acceptability)
+            || should_enqueue_steering(&acceptance_acceptability)
+            || pending_queue_fences_direct_acceptance(&acceptance_state, !steering_queue.is_empty())
+        {
+            if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
+                return Ok(SendChatOutcome::Rejected {
+                    message: "Steering queue is full; try again once a queued message has been delivered."
+                        .to_string(),
+                    code: "steering_queue_full",
+                });
+            }
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
                 llm_text: expanded.llm_text,
@@ -201,51 +239,21 @@ impl SendChatApplicationService {
                 user_agent: req.user_agent.clone(),
                 skill_invocation: expanded.skill_invocation,
             };
-            {
-                let mut receipts = self.runtime.lock_steering_acceptance().await;
-                let receipt_key = (req.conversation_id.clone(), req.message_id.clone());
-                if let Some(receipt) = receipts.get(&receipt_key) {
-                    return replay_steering_receipt(receipt, &req, &request_fingerprint);
-                }
-                if let Some((queued_conversation_id, queued_entry)) =
-                    find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
-                {
-                    if queued_conversation_id != req.conversation_id
-                        || !queued_retry_matches(&queued_entry, &req)
-                    {
-                        return Err(SendChatServiceError::IdempotencyConflict);
-                    }
-                    receipts.remove(&receipt_key);
-                    return Ok(SendChatOutcome::QueuedAsSteering);
-                }
-                let steering_queue = self
-                    .runtime
-                    .db()
-                    .get_steering_queue(&req.conversation_id)
-                    .await
-                    .map_err(map_conversation_load_error)?;
-                if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
-                    return Ok(SendChatOutcome::Rejected {
-                            message: "Steering queue is full; try again once a queued message has been delivered."
-                                .to_string(),
-                            code: "steering_queue_full",
-                        });
-                }
-                self.runtime
-                    .enqueue_steer_message(&conversation.id, event)
-                    .await
-                    .map_err(SendChatServiceError::Dispatch)?;
-                insert_transient_steering_receipt(
-                    &self.db,
-                    &mut receipts,
-                    (req.conversation_id.clone(), req.message_id.clone()),
-                    SteeringAcceptanceReceipt {
-                        conversation_id: conversation.id.clone(),
-                        request_fingerprint,
-                    },
-                )
-                .await;
-            }
+            self.runtime
+                .enqueue_steer_message(&conversation.id, event)
+                .await
+                .map_err(SendChatServiceError::Dispatch)?;
+            insert_transient_steering_receipt(
+                &self.db,
+                &mut acceptance_guard,
+                receipt_key,
+                SteeringAcceptanceReceipt {
+                    conversation_id: conversation.id.clone(),
+                    request_fingerprint,
+                },
+            )
+            .await;
+            drop(acceptance_guard);
             if let Err(error) = record_pr_auto_fix_context_baseline(
                 self.runtime.db(),
                 &conversation.id,
@@ -257,15 +265,7 @@ impl SendChatApplicationService {
             }
             return Ok(SendChatOutcome::QueuedAsSteering);
         }
-        if let Err(err) = acceptability {
-            return Ok(SendChatOutcome::Rejected {
-                message: err.to_string(),
-                code: transition_code(&err),
-            });
-        }
 
-        let validated_files = validate_files(&req).await?;
-        let expanded = expand_request(&self.db, &conversation, &req).await?;
         let images = map_images(req.images);
         let delivery = PreparedDirectTurnDelivery {
             text: expanded.display_text.clone(),
@@ -339,6 +339,7 @@ impl SendChatApplicationService {
             }
             Err(error) => return Err(map_direct_turn_accept_error(error)),
         };
+        drop(acceptance_guard);
         match step.outcome {
             TurnOutcome::Created { .. } | TurnOutcome::ExactReplay { .. } => {
                 self.runtime.kick_direct_turn_worker();
@@ -397,15 +398,15 @@ impl SendChatApplicationService {
     }
 }
 
-fn should_enqueue_steering(
-    acceptability: &Result<(), TransitionError>,
-    queued_steering_fence: bool,
-) -> bool {
-    queued_steering_fence
-        || matches!(
-            acceptability,
-            Err(TransitionError::AgentBusy | TransitionError::CancellationInProgress)
-        )
+fn should_enqueue_steering(acceptability: &Result<(), TransitionError>) -> bool {
+    matches!(
+        acceptability,
+        Err(TransitionError::AgentBusy | TransitionError::CancellationInProgress)
+    )
+}
+
+fn pending_queue_fences_direct_acceptance(state: &ConvState, queue_nonempty: bool) -> bool {
+    queue_nonempty && matches!(state, ConvState::Idle)
 }
 
 struct ExpandedDispatchMessage {
@@ -785,9 +786,9 @@ fn transition_code(err: &TransitionError) -> &'static str {
 mod tests {
     use super::{
         lookup_durable_replay, map_conversation_load_error, map_direct_turn_accept_error,
-        persisted_skill_matches, queued_retry_matches, replay_steering_receipt,
-        should_enqueue_steering, submitted_identity_from_request, DurableReplayOutcome,
-        MessageExpansionPolicy, SendChatRequest, SendChatServiceError,
+        pending_queue_fences_direct_acceptance, persisted_skill_matches, queued_retry_matches,
+        replay_steering_receipt, should_enqueue_steering, submitted_identity_from_request,
+        DurableReplayOutcome, MessageExpansionPolicy, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use phoenix_core::domain::db_schema::SkillContent;
@@ -818,12 +819,29 @@ mod tests {
 
     #[test]
     fn durable_steering_backlog_fences_idle_direct_acceptance() {
-        assert!(should_enqueue_steering(&Ok(()), true));
-        assert!(!should_enqueue_steering(&Ok(()), false));
-        assert!(should_enqueue_steering(
-            &Err(crate::state_machine::TransitionError::AgentBusy),
-            false,
+        assert!(pending_queue_fences_direct_acceptance(
+            &crate::db::ConvState::Idle,
+            true
         ));
+        assert!(!pending_queue_fences_direct_acceptance(
+            &crate::db::ConvState::Idle,
+            false
+        ));
+    }
+
+    #[test]
+    fn durable_steering_backlog_does_not_fence_error_recovery() {
+        assert!(!pending_queue_fences_direct_acceptance(
+            &crate::db::ConvState::Error {
+                message: "recoverable".to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Network,
+                resets_at: None,
+            },
+            true,
+        ));
+        assert!(should_enqueue_steering(&Err(
+            crate::state_machine::TransitionError::AgentBusy
+        )));
     }
 
     fn prepared_payload(req: &SendChatRequest, delivery_text: &str) -> PreparedDirectTurnPayload {

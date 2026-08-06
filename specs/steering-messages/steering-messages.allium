@@ -433,9 +433,12 @@ surface SteeringQueueApi {
 
     @guarantee PendingQueueFencesDirectAcceptance
         -- A non-empty durable steering queue prevents an idle observation from
-        -- routing a later request into direct-turn acceptance. The later
-        -- request joins the steering queue, covering the window where a steer
-        -- was accepted while busy but reaches the executor after it became idle.
+        -- routing a later request into direct-turn acceptance. The queue check
+        -- and direct acceptance are serialized with steering persistence. The
+        -- later request joins the steering queue, covering the window where a
+        -- steer was accepted while busy but reaches the executor after it became
+        -- idle. Error recovery remains a direct turn so it cannot be stranded
+        -- behind a queue that error dismissal intentionally does not drain.
 
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one
