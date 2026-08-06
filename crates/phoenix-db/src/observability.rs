@@ -142,6 +142,8 @@ pub(crate) fn acquisition_span(operation: DbOperation, attempt: u32, parent: &Sp
         db.attempt = attempt,
         db.outcome = field::Empty,
         db.elapsed_ms = field::Empty,
+        db.sqlite.primary = field::Empty,
+        db.sqlite.extended = field::Empty,
     )
 }
 
@@ -187,23 +189,44 @@ pub(crate) fn record_acquisition(
     span: Span,
     operation: DbOperation,
     elapsed: Duration,
-    success: bool,
+    outcome: DbOutcome,
+    sqlite: Option<SqliteErrorClass>,
 ) {
-    let outcome = if success {
-        DbOutcome::Success
-    } else {
-        DbOutcome::Failure
-    };
     let elapsed_ms = elapsed_millis(elapsed);
     span.record("db.outcome", outcome.as_str());
     span.record("db.elapsed_ms", elapsed_ms);
-    if !success {
+    if let Some(sqlite) = sqlite {
+        span.record("db.sqlite.primary", sqlite.primary);
+        span.record("db.sqlite.extended", sqlite.extended);
+    }
+    if matches!(
+        outcome,
+        DbOutcome::ContentionRetry | DbOutcome::RetryExhausted
+    ) {
+        let _entered = span.enter();
+        let message = if outcome == DbOutcome::ContentionRetry {
+            "retrying SQLite pool acquisition after contention"
+        } else {
+            "SQLite pool acquisition contention exhausted"
+        };
+        tracing::warn!(
+            target: "phoenix_db::observability",
+            db_operation = operation.as_str(),
+            db_outcome = outcome.as_str(),
+            db_elapsed_ms = elapsed_ms,
+            db_sqlite_primary = sqlite.map(|value| value.primary),
+            db_sqlite_extended = sqlite.map(|value| value.extended),
+            "{message}"
+        );
+    } else if outcome == DbOutcome::Failure {
         let _entered = span.enter();
         tracing::warn!(
             target: "phoenix_db::observability",
             db_operation = operation.as_str(),
             db_outcome = outcome.as_str(),
             db_elapsed_ms = elapsed_ms,
+            db_sqlite_primary = sqlite.map(|value| value.primary),
+            db_sqlite_extended = sqlite.map(|value| value.extended),
             "SQLite pool acquisition failed"
         );
     } else if elapsed >= SLOW_ACQUIRE {
@@ -336,7 +359,8 @@ mod tests {
                 acquisition,
                 DbOperation::BeginWorkflowAttempt,
                 Duration::ZERO,
-                false,
+                DbOutcome::Failure,
+                None,
             );
 
             let transaction = transaction_span(

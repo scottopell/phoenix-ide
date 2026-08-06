@@ -64,8 +64,14 @@ pub struct ClaimAuthoritativeTurnInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectTurnLeaseWindow {
     initial_now: Timestamp,
-    lease_duration: std::time::Duration,
+    limit: DirectTurnLeaseLimit,
     commit_clock: super::LeaseCommitClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectTurnLeaseLimit {
+    Renewable(std::time::Duration),
+    HardDeadline(LeaseExpiry),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +83,21 @@ struct DirectTurnAttemptLease {
 
 impl DirectTurnLeaseWindow {
     #[must_use]
-    pub fn new(initial_now: Timestamp, lease_duration: std::time::Duration) -> Option<Self> {
-        Self::with_commit_clock(
+    pub fn renewable(initial_now: Timestamp, lease_duration: std::time::Duration) -> Option<Self> {
+        Self::with_limit_and_commit_clock(
             initial_now,
-            lease_duration,
+            DirectTurnLeaseLimit::Renewable(lease_duration),
+            super::LeaseCommitClock::Projected {
+                current: initial_now,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn hard_deadline(initial_now: Timestamp, deadline: LeaseExpiry) -> Option<Self> {
+        Self::with_limit_and_commit_clock(
+            initial_now,
+            DirectTurnLeaseLimit::HardDeadline(deadline),
             super::LeaseCommitClock::Projected {
                 current: initial_now,
             },
@@ -92,21 +109,21 @@ impl DirectTurnLeaseWindow {
         initial_now: Timestamp,
         lease_duration: std::time::Duration,
     ) -> Option<Self> {
-        Self::with_commit_clock(
+        Self::with_limit_and_commit_clock(
             initial_now,
-            lease_duration,
+            DirectTurnLeaseLimit::Renewable(lease_duration),
             super::LeaseCommitClock::SqliteWallClock,
         )
     }
 
-    fn with_commit_clock(
+    fn with_limit_and_commit_clock(
         initial_now: Timestamp,
-        lease_duration: std::time::Duration,
+        limit: DirectTurnLeaseLimit,
         commit_clock: super::LeaseCommitClock,
     ) -> Option<Self> {
         let window = Self {
             initial_now,
-            lease_duration,
+            limit,
             commit_clock,
         };
         window.at_elapsed(std::time::Duration::ZERO).map(|_| window)
@@ -114,7 +131,12 @@ impl DirectTurnLeaseWindow {
 
     fn at_elapsed(self, elapsed: std::time::Duration) -> Option<DirectTurnAttemptLease> {
         let now = Timestamp(self.initial_now.0.saturating_add(elapsed.as_secs()));
-        let lease_until = LeaseExpiry(now.0.saturating_add(self.lease_duration.as_secs()));
+        let lease_until = match self.limit {
+            DirectTurnLeaseLimit::Renewable(duration) => {
+                LeaseExpiry(now.0.saturating_add(duration.as_secs()))
+            }
+            DirectTurnLeaseLimit::HardDeadline(deadline) => deadline,
+        };
         lease_until
             .is_live_at(now)
             .then_some(DirectTurnAttemptLease {
@@ -489,10 +511,8 @@ impl WorkflowRepository {
         &self,
         input: &ClaimAuthoritativeTurnInput,
     ) -> DbResult<ClaimAuthoritativeTurnResult> {
-        let Some(lease_window) = DirectTurnLeaseWindow::new(
-            input.now,
-            std::time::Duration::from_secs(input.lease_until.0.saturating_sub(input.now.0)),
-        ) else {
+        let Some(lease_window) = DirectTurnLeaseWindow::hard_deadline(input.now, input.lease_until)
+        else {
             return Ok(ineligible_claim_result(None));
         };
         self.claim_authoritative_turn_with_lease_window(
@@ -599,7 +619,7 @@ impl WorkflowRepository {
             max_attempts,
         } = observability;
         let mut connection = self
-            .acquire_observed(operation, attempt, operation_span)
+            .acquire_observed(operation, attempt, max_attempts, accounting, operation_span)
             .await?;
         let span = observability::transaction_span(
             operation,
@@ -2500,8 +2520,9 @@ fn map_constraint(error: sqlx::Error) -> DbError {
 mod tests {
     #[test]
     fn direct_turn_lease_window_refreshes_caps_and_rejects_exact_expiry() {
-        let window = DirectTurnLeaseWindow::new(Timestamp(10), std::time::Duration::from_secs(30))
-            .expect("live window");
+        let window =
+            DirectTurnLeaseWindow::renewable(Timestamp(10), std::time::Duration::from_secs(30))
+                .expect("live window");
         assert_eq!(
             window.at_elapsed(std::time::Duration::from_secs(7)),
             Some(DirectTurnAttemptLease {
@@ -2513,7 +2534,7 @@ mod tests {
             })
         );
 
-        let capped = DirectTurnLeaseWindow::new(
+        let capped = DirectTurnLeaseWindow::renewable(
             Timestamp(u64::MAX - 10),
             std::time::Duration::from_secs(30),
         )
@@ -2533,7 +2554,26 @@ mod tests {
             None,
             "a lease is expired when now equals lease_until"
         );
-        assert!(DirectTurnLeaseWindow::new(Timestamp(10), std::time::Duration::ZERO).is_none());
+        assert!(
+            DirectTurnLeaseWindow::renewable(Timestamp(10), std::time::Duration::ZERO).is_none()
+        );
+    }
+
+    #[test]
+    fn direct_turn_hard_deadline_does_not_slide_across_retries() {
+        let window = DirectTurnLeaseWindow::hard_deadline(Timestamp(10), LeaseExpiry(40))
+            .expect("live hard deadline");
+        assert_eq!(
+            window.at_elapsed(std::time::Duration::from_secs(5)),
+            Some(DirectTurnAttemptLease {
+                now: Timestamp(15),
+                lease_until: LeaseExpiry(40),
+                commit_clock: super::super::LeaseCommitClock::Projected {
+                    current: Timestamp(10),
+                },
+            })
+        );
+        assert_eq!(window.at_elapsed(std::time::Duration::from_secs(30)), None);
     }
 
     use super::*;
@@ -2679,9 +2719,9 @@ mod tests {
     async fn expired_precommit_direct_turn_rolls_back_started_attempt() {
         let repo = repo().await;
         let (turn_id, workflow_id) = created_turn(&repo, "expired-precommit", 91).await;
-        let lease_window = DirectTurnLeaseWindow::with_commit_clock(
+        let lease_window = DirectTurnLeaseWindow::with_limit_and_commit_clock(
             Timestamp(10),
-            std::time::Duration::from_secs(30),
+            DirectTurnLeaseLimit::Renewable(std::time::Duration::from_secs(30)),
             super::super::LeaseCommitClock::Projected {
                 current: Timestamp(40),
             },
@@ -2700,6 +2740,86 @@ mod tests {
 
         assert_eq!(result.outcome, ClaimOutcome::Ineligible);
         assert!(result.authority.is_none());
+        assert!(result.attempt.is_none());
+        let durable_attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_attempts WHERE workflow_id = ?1")
+                .bind(i64::try_from(workflow_id.0).unwrap())
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(durable_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn repository_retry_persists_explicit_hard_deadline_without_sliding() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "explicit-hard-deadline", 92).await;
+        let lease_window = DirectTurnLeaseWindow::hard_deadline(Timestamp(10), LeaseExpiry(40))
+            .expect("live hard deadline");
+        let attempt_lease = lease_window
+            .at_elapsed(std::time::Duration::from_secs(5))
+            .expect("retry before deadline");
+        let operation = DbOperation::ClaimDirectTurn;
+        let operation_span = observability::operation_span(operation);
+        let operation_started = std::time::Instant::now();
+        let mut accounting = RetryAccounting::default();
+        let attempt = accounting.start_attempt();
+        let result = repo
+            .claim_authoritative_turn_once(
+                ClaimIdentity {
+                    turn_id,
+                    workflow_id,
+                    process_incarnation: ProcessIncarnation(1),
+                },
+                ClaimAttemptTiming {
+                    lease: attempt_lease,
+                    operation_started,
+                },
+                ClaimAttemptObservability {
+                    operation,
+                    attempt,
+                    operation_span: &operation_span,
+                    max_attempts: 5,
+                },
+                &mut accounting,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ClaimOutcome::Started);
+        assert_eq!(
+            result
+                .attempt
+                .and_then(|attempt| attempt.lease)
+                .map(|lease| lease.lease_until),
+            Some(LeaseExpiry(40))
+        );
+        let stored_lease: i64 = sqlx::query_scalar(
+            "SELECT lease_until FROM workflow_reclaimable_leases WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_lease, 40);
+    }
+
+    #[tokio::test]
+    async fn compatibility_claim_at_hard_deadline_creates_no_attempt() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "hard-deadline", 92).await;
+        let result = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(40),
+                lease_until: LeaseExpiry(40),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ClaimOutcome::Ineligible);
         assert!(result.attempt.is_none());
         let durable_attempts: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM workflow_attempts WHERE workflow_id = ?1")

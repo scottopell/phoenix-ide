@@ -351,7 +351,7 @@ mod tests {
             now: Timestamp,
             duration: Duration,
         ) -> Option<phoenix_db::workflow::DirectTurnLeaseWindow> {
-            phoenix_db::workflow::DirectTurnLeaseWindow::new(now, duration)
+            phoenix_db::workflow::DirectTurnLeaseWindow::renewable(now, duration)
         }
 
         fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {

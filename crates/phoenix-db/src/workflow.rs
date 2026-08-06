@@ -433,16 +433,34 @@ impl WorkflowRepository {
         &self,
         operation: DbOperation,
         attempt: u32,
+        max_attempts: u32,
+        accounting: &mut RetryAccounting,
         parent: &tracing::Span,
     ) -> DbResult<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
         let acquire_span = observability::acquisition_span(operation, attempt, parent);
         let acquire_started = Instant::now();
         let connection = self.pool.acquire().instrument(acquire_span.clone()).await;
+        let (outcome, sqlite) = match &connection {
+            Ok(_) => (DbOutcome::Success, None),
+            Err(error) => {
+                let sqlite = observability::sqlite_class(error);
+                let outcome = match retry_decision_for_sqlite_error(error, attempt, max_attempts) {
+                    RetryDecision::Retry => {
+                        accounting.record_retry();
+                        DbOutcome::ContentionRetry
+                    }
+                    RetryDecision::Exhausted => DbOutcome::RetryExhausted,
+                    RetryDecision::Fail => DbOutcome::Failure,
+                };
+                (outcome, sqlite)
+            }
+        };
         observability::record_acquisition(
             acquire_span,
             operation,
             acquire_started.elapsed(),
-            connection.is_ok(),
+            outcome,
+            sqlite,
         );
         connection.map_err(Into::into)
     }
@@ -1320,6 +1338,40 @@ fn classify_attempt_insert_error_code(code: Option<&str>) -> AttemptInsertErrorC
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    Retry,
+    Exhausted,
+    Fail,
+}
+
+fn retry_decision_for_sqlite_code(
+    code: Option<&str>,
+    attempt: u32,
+    max_attempts: u32,
+) -> RetryDecision {
+    match (code, attempt < max_attempts) {
+        (Some(SQLITE_BUSY | SQLITE_BUSY_SNAPSHOT), true) => RetryDecision::Retry,
+        (Some(SQLITE_BUSY | SQLITE_BUSY_SNAPSHOT), false) => RetryDecision::Exhausted,
+        _ => RetryDecision::Fail,
+    }
+}
+
+fn retry_decision_for_sqlite_error(
+    error: &sqlx::Error,
+    attempt: u32,
+    max_attempts: u32,
+) -> RetryDecision {
+    retry_decision_for_sqlite_code(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        attempt,
+        max_attempts,
+    )
+}
+
 fn is_sqlite_unique_constraint(error: &dyn DatabaseError) -> bool {
     error.code().as_deref() == Some(SQLITE_CONSTRAINT_UNIQUE)
 }
@@ -1692,14 +1744,37 @@ impl WorkflowRepository {
         loop {
             let attempt = accounting.start_attempt();
             let mut connection = match self
-                .acquire_observed(operation, attempt, &operation_span)
+                .acquire_observed(
+                    operation,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    &mut accounting,
+                    &operation_span,
+                )
                 .await
             {
                 Ok(connection) => connection,
+                Err(DbError::Sqlx(error))
+                    if retry_decision_for_sqlite_error(&error, attempt, MAX_ATTEMPTS)
+                        == RetryDecision::Retry =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    continue;
+                }
                 Err(error) => {
+                    let outcome = if matches!(
+                        &error,
+                        DbError::Sqlx(error)
+                            if retry_decision_for_sqlite_error(error, attempt, MAX_ATTEMPTS)
+                                == RetryDecision::Exhausted
+                    ) {
+                        DbOutcome::RetryExhausted
+                    } else {
+                        DbOutcome::Failure
+                    };
                     observability::record_operation(
                         &operation_span,
-                        DbOutcome::Failure,
+                        outcome,
                         accounting,
                         operation_started.elapsed(),
                     );
@@ -2890,6 +2965,30 @@ mod tests {
         assert_eq!(
             classify_attempt_insert_error_code(None),
             AttemptInsertErrorClass::Other
+        );
+    }
+
+    #[test]
+    fn acquisition_error_retry_decision_honors_retryable_codes_and_budget() {
+        assert_eq!(
+            retry_decision_for_sqlite_code(Some(SQLITE_BUSY), 1, 5),
+            RetryDecision::Retry
+        );
+        assert_eq!(
+            retry_decision_for_sqlite_code(Some(SQLITE_BUSY_SNAPSHOT), 4, 5),
+            RetryDecision::Retry
+        );
+        assert_eq!(
+            retry_decision_for_sqlite_code(Some(SQLITE_BUSY_SNAPSHOT), 5, 5),
+            RetryDecision::Exhausted
+        );
+        assert_eq!(
+            retry_decision_for_sqlite_code(Some("787"), 1, 5),
+            RetryDecision::Fail
+        );
+        assert_eq!(
+            retry_decision_for_sqlite_code(None, 1, 5),
+            RetryDecision::Fail
         );
     }
 

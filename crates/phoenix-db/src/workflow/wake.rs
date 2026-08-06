@@ -902,7 +902,7 @@ impl WakeRepository {
         } = attempt_lease;
         let mut connection = self
             .workflow_repo
-            .acquire_observed(operation, attempt, operation_span)
+            .acquire_observed(operation, attempt, max_attempts, accounting, operation_span)
             .await?;
         let span = observability::transaction_span(
             operation,
