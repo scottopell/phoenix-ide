@@ -311,6 +311,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_conversation_state_kind_discriminator",
         sql: MIGRATION_059,
     },
+    Migration {
+        version: 60,
+        name: "enforce_conversation_state_kind_consistency",
+        sql: MIGRATION_060,
+    },
 ];
 
 const MIGRATION_058: &str = r"
@@ -377,6 +382,22 @@ UPDATE conversations
 SET state_kind = json_extract(state, '$.type');
 
 CREATE INDEX IF NOT EXISTS idx_conversations_state_kind ON conversations(state_kind);
+";
+
+const MIGRATION_060: &str = r"
+CREATE TRIGGER conversations_state_kind_insert
+BEFORE INSERT ON conversations
+WHEN json_extract(NEW.state, '$.type') IS NOT NEW.state_kind
+BEGIN
+    SELECT RAISE(ABORT, 'conversation state_kind must match state type');
+END;
+
+CREATE TRIGGER conversations_state_kind_update
+BEFORE UPDATE OF state, state_kind ON conversations
+WHEN json_extract(NEW.state, '$.type') IS NOT NEW.state_kind
+BEGIN
+    SELECT RAISE(ABORT, 'conversation state_kind must match state type');
+END;
 ";
 
 const MIGRATION_057: &str = r"
@@ -3221,6 +3242,24 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    #[tokio::test]
+    async fn migration_060_rejects_mismatched_state_kind_writes() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        stamp_migrations_except(&pool, 60).await;
+        let applied = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(applied, 1);
+
+        let mismatch = sqlx::query(
+            "INSERT INTO conversations
+             (id, state, state_kind, cwd, user_initiated, state_updated_at, created_at, updated_at)
+             VALUES ('bad', '{\"type\":\"idle\"}', 'error', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatch.is_err());
     }
 
     #[tokio::test]

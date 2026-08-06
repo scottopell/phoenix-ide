@@ -158,7 +158,11 @@ export function eventForState(state: ConversationState, conversation: Conversati
 // catch-up paths dedupe against each other. Completions get no key — each
 // completion is independently notification-worthy.
 export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
-  return event.type === 'agent_finished' ? null : `${event.conversation.id}:${event.type}`;
+  if (event.type === 'agent_finished') return null;
+  if (event.conversation.state?.type === 'recoverable_continuation_failure') {
+    return `${event.conversation.id}:${event.type}:${event.conversation.updated_at}`;
+  }
+  return `${event.conversation.id}:${event.type}`;
 }
 
 // Completions carry `updated_at` so a later completion for the same

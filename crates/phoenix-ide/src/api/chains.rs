@@ -22,6 +22,7 @@
 //! Single-member roots and non-root members are not chains.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -387,6 +388,7 @@ pub async fn archive_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
+    let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "archive").await?;
     }
@@ -428,6 +430,21 @@ pub async fn archive_chain_handler(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+async fn lock_chain_admissions(
+    state: &AppState,
+    member_ids: &[String],
+) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    let mut sorted_ids = member_ids.to_vec();
+    sorted_ids.sort();
+    let mut guards = Vec::with_capacity(sorted_ids.len());
+    for id in sorted_ids {
+        let admission: Arc<tokio::sync::Mutex<()>> =
+            state.runtime.conversation_admission(&id).await;
+        guards.push(admission.lock_owned().await);
+    }
+    guards
+}
+
 /// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
 ///
 /// Pre-checks every member's busy state up front and refuses the whole
@@ -449,6 +466,7 @@ pub async fn delete_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
+    let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
     }

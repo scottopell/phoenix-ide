@@ -203,7 +203,7 @@ describe('notification policy reducer', () => {
       retry.state,
       {
         type: 'conversation_state_changed',
-        conversation: failed,
+        conversation: { ...failed, updated_at: '2026-08-06T13:00:00Z' },
         previousState: retrying.state,
         nextState: failed.state!,
       },

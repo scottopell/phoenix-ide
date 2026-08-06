@@ -1061,9 +1061,12 @@ impl WorkflowRepository {
             self.terminalize_authoritative_turn_in_tx(
                 &mut tx,
                 &TerminalizeAuthoritativeTurnInput {
-                    command: TurnCommand::Complete {
+                    command: TurnCommand::Fail {
                         turn_id: turn.id,
                         expected_generation: turn.generation,
+                        reason:
+                            "legacy continuation operation interrupted after summary persistence"
+                                .to_string(),
                     },
                     projection: None,
                 },

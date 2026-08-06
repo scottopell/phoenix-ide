@@ -797,8 +797,6 @@ mod tests {
         assert_eq!(request.attempt, 1);
     }
 
-    /// Task 02713: model change is allowed from `Idle` and `Error` only.
-    ///
     /// The `match` below is intentionally wildcard-free: adding a new
     /// `ConvState` variant breaks this test's compilation, forcing an
     /// explicit decision about whether a mid-state model swap is safe
