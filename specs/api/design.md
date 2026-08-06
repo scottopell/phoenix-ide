@@ -187,14 +187,14 @@ The core event types a client must handle:
 
 | Type | Description | Payload |
 |------|-------------|--------|
-| `init` | Initial snapshot on connect | Conversation + messages + `last_sequence_id` + `pending_events` (ring replay) |
+| `init` | Initial snapshot on connect | Conversation + messages + durable steering queue + `last_sequence_id` + `pending_events` (ring replay) |
 | `message` | A newly persisted message | Single message (carries `sequence_id`) |
 | `state_change` | Conversation phase transition | New state + state_data |
 | `token` | Streaming text chunk | `{ sequence_id, text, request_id }` |
 | `agent_done` | Agent finished turn | `{ sequence_id }` |
 | `error` | User-facing error | `{ sequence_id, message, error }` |
 
-The complete set additionally includes `message_updated`, `llm_first_byte`, `llm_attempt`, `conversation_became_terminal`, `conversation_hard_deleted`, `conversation_update`, `browser_session_state`, `steer_message_queued`, and `rate_limit_snapshot` — enumerated authoritatively in `specs/sse_wire/`.
+The complete set additionally includes `message_updated`, `llm_first_byte`, `llm_attempt`, `conversation_became_terminal`, `conversation_hard_deleted`, `conversation_update`, `browser_session_state`, `bash_tool_progress`, `steer_message_queued`, `steer_message_cancelled`, `rate_limit_snapshot`, and `work_scope_update` — enumerated authoritatively in `specs/sse_wire/`.
 
 #### Token Streaming Events
 

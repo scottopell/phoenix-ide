@@ -59,6 +59,7 @@ use crate::runtime::{
     user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation,
     MessageSnapshotMode, SseEvent,
 };
+use crate::state_machine::event::SteerEntry;
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
@@ -123,6 +124,38 @@ impl From<&Message> for EnrichedMessage {
 impl From<Message> for EnrichedMessage {
     fn from(msg: Message) -> Self {
         Self::from(&msg)
+    }
+}
+
+/// Browser-facing projection of a durable steering-queue entry.
+///
+/// Executor-only delivery fields are absent by construction: the UI renders
+/// the submitted content while the runtime retains the richer LLM payload.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct QueuedSteeringMessage {
+    pub message_id: String,
+    pub text: String,
+    #[ts(type = "Array<unknown>")]
+    pub images: Vec<phoenix_core::domain::db_schema::ImageData>,
+    #[ts(type = "Array<unknown>")]
+    pub files: Vec<phoenix_core::domain::db_schema::FileAttachment>,
+}
+
+impl From<&SteerEntry> for QueuedSteeringMessage {
+    fn from(entry: &SteerEntry) -> Self {
+        Self {
+            message_id: entry.message_id.clone(),
+            text: entry.text.clone(),
+            images: entry.images.clone(),
+            files: entry.files.clone(),
+        }
+    }
+}
+
+impl From<SteerEntry> for QueuedSteeringMessage {
+    fn from(entry: SteerEntry) -> Self {
+        Self::from(&entry)
     }
 }
 
@@ -225,6 +258,8 @@ pub enum SseWireEvent {
         /// and transforms to `Message` at that boundary.
         #[ts(type = "Array<unknown>")]
         messages: Vec<EnrichedMessage>,
+        /// Durable server-authoritative steering queue at snapshot time.
+        steering_messages: Vec<QueuedSteeringMessage>,
         agent_working: bool,
         presentation_mode: String,
         last_sequence_id: i64,
@@ -385,8 +420,13 @@ pub enum SseWireEvent {
     /// processed. The UI shows the message with a "Queued" indicator.
     SteerMessageQueued {
         sequence_id: i64,
-        message_id: String,
+        message: QueuedSteeringMessage,
         queue_position: usize,
+    },
+    /// A durable steering entry was removed before delivery.
+    SteerMessageCancelled {
+        sequence_id: i64,
+        message_id: String,
     },
     /// Mid-stream quota snapshot from the codex backend. Ephemeral.
     RateLimitSnapshot {
@@ -424,6 +464,7 @@ impl SseWireEvent {
             SseWireEvent::BrowserSessionState { .. } => "browser_session_state",
             SseWireEvent::BashToolProgress { .. } => "bash_tool_progress",
             SseWireEvent::SteerMessageQueued { .. } => "steer_message_queued",
+            SseWireEvent::SteerMessageCancelled { .. } => "steer_message_cancelled",
             SseWireEvent::RateLimitSnapshot { .. } => "rate_limit_snapshot",
             SseWireEvent::WorkScopeUpdate { .. } => "work_scope_update",
         }
@@ -438,6 +479,7 @@ impl From<SseEvent> for SseWireEvent {
                 sequence_id,
                 conversation,
                 messages,
+                steering_messages,
                 agent_working,
                 presentation_mode,
                 last_sequence_id,
@@ -452,6 +494,10 @@ impl From<SseEvent> for SseWireEvent {
                 sequence_id,
                 conversation,
                 messages: messages.iter().map(EnrichedMessage::from).collect(),
+                steering_messages: steering_messages
+                    .iter()
+                    .map(QueuedSteeringMessage::from)
+                    .collect(),
                 agent_working,
                 presentation_mode,
                 last_sequence_id,
@@ -583,12 +629,19 @@ impl From<SseEvent> for SseWireEvent {
             },
             SseEvent::SteerMessageQueued {
                 sequence_id,
-                message_id,
+                message,
                 queue_position,
             } => SseWireEvent::SteerMessageQueued {
                 sequence_id,
-                message_id,
+                message: message.into(),
                 queue_position,
+            },
+            SseEvent::SteerMessageCancelled {
+                sequence_id,
+                message_id,
+            } => SseWireEvent::SteerMessageCancelled {
+                sequence_id,
+                message_id,
             },
             SseEvent::RateLimitSnapshot {
                 sequence_id,

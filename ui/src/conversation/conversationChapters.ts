@@ -45,7 +45,7 @@ export function truncateLabel(text: string, max = LABEL_MAX_CHARS): string {
 }
 
 function userText(unit: Extract<HistoricalUnit, { kind: 'user' | 'pending_user' }>): string {
-  // `pending_user` carries a QueuedMessage (text on the object); `user`
+  // `pending_user` carries a PendingUserMessage (text on the object); `user`
   // carries a persisted Message (text under content). Both surface the same
   // prompt string.
   if (unit.kind === 'pending_user') {

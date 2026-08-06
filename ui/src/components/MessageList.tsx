@@ -32,7 +32,7 @@ import {
   type VirtualTranscriptRangeChange,
 } from './VirtualTranscript';
 import type { Message, ConversationState } from '../api';
-import type { QueuedMessage } from '../hooks';
+import type { PendingUserMessage } from '../hooks';
 import {
   UserMessage,
   QueuedUserMessage,
@@ -116,7 +116,7 @@ const MessageSquareIcon = () => (
 
 interface MessageListProps {
   messages: Message[];
-  pendingMessages: QueuedMessage[];
+  pendingMessages: PendingUserMessage[];
   convState: ConversationState;
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;

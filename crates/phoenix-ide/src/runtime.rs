@@ -1017,6 +1017,8 @@ pub enum SseEvent {
         sequence_id: i64,
         conversation: Box<EnrichedConversation>,
         messages: Vec<crate::db::Message>,
+        /// Durable server-authoritative steering queue at snapshot time.
+        steering_messages: Vec<crate::state_machine::event::SteerEntry>,
         agent_working: bool,
         /// Presentation mode for UI display (`idle`/`working`/`needs_action`/`error`/`done`)
         presentation_mode: String,
@@ -1201,9 +1203,14 @@ pub enum SseEvent {
     /// with a "Queued" indicator instead of "Sending...".
     SteerMessageQueued {
         sequence_id: i64,
-        message_id: String,
+        message: crate::state_machine::event::SteerEntry,
         /// Zero-based position in the steering queue.
         queue_position: usize,
+    },
+    /// A queued steering message was cancelled before delivery.
+    SteerMessageCancelled {
+        sequence_id: i64,
+        message_id: String,
     },
     /// Codex-bridge quota snapshot. Emitted once per turn on success (parsed
     /// from `x-codex-*` response headers in `openai.rs::complete_streaming`)
@@ -3398,7 +3405,12 @@ impl RuntimeManager {
             return Err("enqueue_steer_message expects Event::SteerMessage".into());
         };
 
-        // Build SteerEntry and persist before touching the executor channel (P1).
+        // Materialize the runtime before persistence so a newly-created
+        // executor loads the old queue, not the just-appended entry that it
+        // will also receive through the channel below.
+        let handle = self.get_or_create(conversation_id).await?;
+
+        // Build SteerEntry and persist before touching the executor channel.
         let new_entry = crate::state_machine::event::SteerEntry {
             text: text.clone(),
             llm_text: llm_text.clone(),
@@ -3417,6 +3429,15 @@ impl RuntimeManager {
         db.update_steering_queue(conversation_id, &queue)
             .await
             .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
+        let queue_position = queue.len() - 1;
+        let persisted_entry = queue[queue_position].clone();
+        let _ = handle
+            .broadcast_tx
+            .send_seq(|sequence_id| SseEvent::SteerMessageQueued {
+                sequence_id,
+                message: persisted_entry,
+                queue_position,
+            });
         tracing::info!(
             conversation_id,
             message_id,
@@ -3425,7 +3446,6 @@ impl RuntimeManager {
         );
 
         // DB is durable; now update the executor's in-memory queue via channel.
-        let handle = self.get_or_create(conversation_id).await?;
         deposit_turn_trigger(&handle);
         handle
             .event_tx

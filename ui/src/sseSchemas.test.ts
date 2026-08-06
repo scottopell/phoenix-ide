@@ -120,6 +120,7 @@ describe('parseEvent', () => {
       message_snapshot: 'full',
       conversation: { id: 'conv-1' },
       messages: [],
+      steering_messages: [],
       agent_working: false,
       last_sequence_id: 0,
       presentation_mode: 'idle',

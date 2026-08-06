@@ -12,6 +12,7 @@
 export type { SseWireEvent } from './SseWireEvent';
 export type { ChainSseWireEvent } from './ChainSseWireEvent';
 export type { EnrichedMessage } from './EnrichedMessage';
+export type { QueuedSteeringMessage } from './QueuedSteeringMessage';
 export type { MessageType } from './MessageType';
 export type { UsageData } from './UsageData';
 export type { UserFacingError } from './UserFacingError';
@@ -106,6 +107,10 @@ export type SseBrowserSessionStateData = Omit<
 >;
 export type SseSteerMessageQueuedData = Omit<
   Extract<SseWireEvent, { type: 'steer_message_queued' }>,
+  'type'
+>;
+export type SseSteerMessageCancelledData = Omit<
+  Extract<SseWireEvent, { type: 'steer_message_cancelled' }>,
   'type'
 >;
 export type SseRateLimitSnapshotData = Omit<

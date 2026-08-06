@@ -158,6 +158,7 @@ describe('SharePage SSE schema validation', () => {
         message_snapshot: 'full',
         conversation: { id: 'conv-1', slug: 'test', model: 'test' },
         messages: [],
+        steering_messages: [],
         agent_working: false,
         last_sequence_id: 0,
         presentation_mode: 'idle',

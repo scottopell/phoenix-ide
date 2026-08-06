@@ -17,6 +17,29 @@ import { StrictMode } from 'react';
 import { useConnection } from './useConnection';
 import type { SSEAction } from '../conversation/atom';
 import { ConversationStore } from '../conversation/ConversationStore';
+import { clearCodexQuota, getCodexQuotaSnapshot } from '../codexQuota';
+import type { SseWireEvent } from '../generated/sse';
+
+const WIRE_EVENT_TYPES: Record<SseWireEvent['type'], true> = {
+  init: true,
+  message: true,
+  message_updated: true,
+  state_change: true,
+  llm_first_byte: true,
+  llm_attempt: true,
+  token: true,
+  agent_done: true,
+  conversation_became_terminal: true,
+  conversation_update: true,
+  error: true,
+  conversation_hard_deleted: true,
+  browser_session_state: true,
+  bash_tool_progress: true,
+  steer_message_queued: true,
+  steer_message_cancelled: true,
+  rate_limit_snapshot: true,
+  work_scope_update: true,
+};
 
 // ---------------------------------------------------------------------------
 // EventSource shim
@@ -47,6 +70,10 @@ class FakeEventSource {
     set.add(fn);
   }
 
+  registeredEventTypes(): string[] {
+    return [...this.listeners.keys()].sort();
+  }
+
   removeEventListener(type: string, fn: Listener): void {
     this.listeners.get(type)?.delete(fn);
   }
@@ -73,6 +100,7 @@ let originalEventSource: typeof EventSource | undefined;
 let originalFetch: typeof fetch | undefined;
 
 beforeEach(() => {
+  clearCodexQuota();
   originalEventSource = (globalThis as { EventSource?: typeof EventSource }).EventSource;
   originalFetch = globalThis.fetch;
   (globalThis as { EventSource: unknown }).EventSource =
@@ -82,6 +110,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearCodexQuota();
   if (originalEventSource) {
     (globalThis as { EventSource: typeof EventSource }).EventSource = originalEventSource;
   }
@@ -106,13 +135,14 @@ function makeInitPayload(convId: string, slug: string) {
     },
     message_snapshot: 'full',
     messages: [],
+    steering_messages: [],
     agent_working: false,
     last_sequence_id: 0,
     presentation_mode: 'idle',
     context_window_size: 0,
     project_name: null,
     pending_anchor_sequence_id: 0,
-    pending_events: [],
+    pending_events: [] as unknown[],
     pending_truncated: false,
   };
 }
@@ -122,6 +152,13 @@ function makeInitPayload(convId: string, slug: string) {
 // ---------------------------------------------------------------------------
 
 describe('useConnection epoch stamping (task 08683)', () => {
+  it('registers every named conversation wire event plus stream lifecycle events', () => {
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch: vi.fn() }));
+
+    const expected = [...Object.keys(WIRE_EVENT_TYPES), 'open', 'ping'].sort();
+    expect(FakeEventSource.instances[0]!.registeredEventTypes()).toEqual(expected);
+  });
+
   it('opens the legacy stream URL when no replay cursor is available', () => {
     const dispatch = vi.fn<(a: SSEAction) => void>();
 
@@ -359,6 +396,62 @@ describe('useConnection epoch stamping (task 08683)', () => {
       const withEpoch = a as { epoch?: number };
       expect(withEpoch.epoch).toBe(1);
     }
+  });
+
+  it('dispatches renderable steering deltas and stores live quota snapshots', () => {
+    const captured: SSEAction[] = [];
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch: (action) => captured.push(action) }));
+    const es = FakeEventSource.instances[0]!;
+
+    act(() => {
+      es.emit('init', makeInitPayload('conv-A', 'slug-A'));
+      es.emit('steer_message_queued', {
+        sequence_id: 1,
+        message: { message_id: 'external-1', text: 'from coordinator', images: [], files: [] },
+        queue_position: 0,
+      });
+      es.emit('steer_message_cancelled', { sequence_id: 2, message_id: 'external-1' });
+      es.emit('rate_limit_snapshot', {
+        sequence_id: 3,
+        snapshot: {
+          plan_type: 'plus', resets_at: null, limit_id: 'codex', limit_name: null,
+          primary: { used_percent: 12, window_minutes: 300, resets_at: null },
+          secondary: null, additional_limits: [], credits: null, individual_limit: null,
+          promo_message: null, rate_limit_reached_type: null,
+        },
+      });
+    });
+
+    expect(captured).toContainEqual(expect.objectContaining({
+      type: 'sse_steer_message_queued',
+      message: expect.objectContaining({ message_id: 'external-1', text: 'from coordinator' }),
+      epoch: 1,
+    }));
+    expect(captured).toContainEqual(expect.objectContaining({
+      type: 'sse_steer_message_cancelled', messageId: 'external-1', epoch: 1,
+    }));
+    expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(12);
+  });
+
+  it('restores the latest replayed quota snapshot from init', () => {
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch: vi.fn() }));
+    const payload = makeInitPayload('conv-A', 'slug-A');
+    payload.last_sequence_id = 1;
+    payload.pending_anchor_sequence_id = 0;
+    payload.pending_events = [{
+      type: 'rate_limit_snapshot',
+      sequence_id: 1,
+      snapshot: {
+        plan_type: 'plus', resets_at: null, limit_id: 'codex', limit_name: null,
+        primary: { used_percent: 41, window_minutes: 300, resets_at: null },
+        secondary: null, additional_limits: [], credits: null, individual_limit: null,
+        promo_message: null, rate_limit_reached_type: null,
+      },
+    }];
+
+    act(() => FakeEventSource.instances[0]!.emit('init', payload));
+
+    expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(41);
   });
 
   it('drops a stale-EventSource event after slug change (cross-conversation contamination guard)', () => {

@@ -603,6 +603,18 @@ impl InMemoryStorage {
             .unwrap_or_default()
     }
 
+    /// Seed the persisted steering queue for a conversation (test-only).
+    pub fn set_steering_queue(
+        &self,
+        conv_id: &str,
+        queue: Vec<crate::state_machine::event::SteerEntry>,
+    ) {
+        self.steering_queues
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), queue);
+    }
+
     /// Seed the `conv_mode` for a conversation (used by tests that need to
     /// exercise mode-aware effect handlers like `NotifyContextExhausted`).
     pub fn set_mode(&self, conv_id: &str, mode: crate::db::ConvMode) {
@@ -1120,18 +1132,6 @@ impl StateStore for InMemoryStorage {
         &self,
         _metrics: &phoenix_llm::LlmAttemptMetrics,
     ) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn update_steering_queue(
-        &self,
-        conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String> {
-        self.steering_queues
-            .lock()
-            .unwrap()
-            .insert(conv_id.to_string(), queue.to_vec());
         Ok(())
     }
 

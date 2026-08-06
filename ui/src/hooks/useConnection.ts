@@ -21,9 +21,11 @@ import {
   SseConversationHardDeletedDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
+  SseSteerMessageCancelledDataSchema,
   SseRateLimitSnapshotDataSchema,
   SseWorkScopeUpdateDataSchema,
 } from '../sseSchemas';
+import { setCodexQuota } from '../codexQuota';
 import {
   ConnectionState,
   ConnectionMachineState,
@@ -188,6 +190,7 @@ function transformInitData(raw: SseInitData): InitPayload {
   return {
     conversation,
     messages,
+    steeringMessages: raw.steering_messages,
     phase,
     contextWindow: {
       used: raw.context_window_size ?? 0,
@@ -199,6 +202,16 @@ function transformInitData(raw: SseInitData): InitPayload {
     pendingTruncated: raw.pending_truncated,
     messageSnapshot: raw.message_snapshot,
   };
+}
+
+export function restoreInitSideChannels(raw: SseInitData): void {
+  for (const entry of raw.pending_events) {
+    if (!entry || typeof entry !== 'object' || (entry as { type?: unknown }).type !== 'rate_limit_snapshot') {
+      continue;
+    }
+    const parsed = v.safeParse(SseRateLimitSnapshotDataSchema, entry);
+    if (parsed.success) setCodexQuota(parsed.output.snapshot);
+  }
 }
 
 /**
@@ -399,6 +412,7 @@ export function useConnection({
             }
 
             dispatchMachineRef.current({ type: 'SSE_OPEN' });
+            restoreInitSideChannels(res.data);
             const payload = transformInitData(res.data);
             latestConversationRef.current = payload.conversation;
             latestPhaseRef.current = payload.phase;
@@ -656,11 +670,6 @@ export function useConnection({
             );
           });
 
-          // Steering message queued server-side. Client already transitioned
-          // the bubble to `steering_queued` on the POST response; this event
-          // validates the payload (so a Rust-side schema change surfaces as a
-          // tsc error) and is otherwise a no-op. The bubble auto-clears when
-          // the server echoes the delivered message as a `message` event.
           on('steer_message_queued', (e) => {
             const res = parseEvent(
               SseSteerMessageQueuedDataSchema,
@@ -668,7 +677,27 @@ export function useConnection({
               'steer_message_queued',
               stampedDispatch,
             );
-            if (res.ok) stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_steer_message_queued',
+              sequenceId: res.data.sequence_id,
+              message: res.data.message,
+            });
+          });
+
+          on('steer_message_cancelled', (e) => {
+            const res = parseEvent(
+              SseSteerMessageCancelledDataSchema,
+              e,
+              'steer_message_cancelled',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_steer_message_cancelled',
+              sequenceId: res.data.sequence_id,
+              messageId: res.data.message_id,
+            });
           });
 
           // Codex quota snapshot (task 67003). Account-global, not
@@ -683,6 +712,7 @@ export function useConnection({
               stampedDispatch,
             );
             if (!res.ok) return;
+            setCodexQuota(res.data.snapshot);
             stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 

@@ -212,7 +212,7 @@ AND apply appropriate cache headers
 
 ### REQ-API-012: Reconnect Replay Buffer
 
-WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
+WHEN the server emits a replayable non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, error, browser_session_state, steer_message_queued, steer_message_cancelled, rate_limit_snapshot, llm_first_byte, llm_attempt, work_scope_update)
 THE SYSTEM SHALL retain the event in a per-conversation in-memory ring buffer until the next persisted Message broadcast replaces it (anchor reset)
 
 WHEN the server emits an eager (non-persisted) assistant Message via the runtime's BroadcastAssistantMessage effect

@@ -211,6 +211,7 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     message_snapshot: 'full',
     conversation,
     messages,
+    steering_messages: [],
     agent_working: false,
     last_sequence_id: 100,
     presentation_mode: 'idle',

@@ -177,6 +177,7 @@ mod tests {
                 sequence_id,
                 conversation,
                 messages,
+                steering_messages,
                 agent_working,
                 presentation_mode,
                 last_sequence_id,
@@ -205,6 +206,10 @@ mod tests {
                     "transcript_generation": transcript_generation,
                     "message_snapshot": message_snapshot,
                     "messages": enriched_msgs,
+                    "steering_messages": steering_messages
+                        .iter()
+                        .map(crate::api::wire::QueuedSteeringMessage::from)
+                        .collect::<Vec<_>>(),
                     "agent_working": agent_working,
                     "presentation_mode": presentation_mode,
                     "last_sequence_id": last_sequence_id,
@@ -358,13 +363,21 @@ mod tests {
             }),
             SseEvent::SteerMessageQueued {
                 sequence_id,
-                message_id,
+                message,
                 queue_position,
             } => json!({
                 "type": "steer_message_queued",
                 "sequence_id": sequence_id,
-                "message_id": message_id,
+                "message": crate::api::wire::QueuedSteeringMessage::from(message),
                 "queue_position": queue_position,
+            }),
+            SseEvent::SteerMessageCancelled {
+                sequence_id,
+                message_id,
+            } => json!({
+                "type": "steer_message_cancelled",
+                "sequence_id": sequence_id,
+                "message_id": message_id,
             }),
             SseEvent::RateLimitSnapshot {
                 sequence_id,
@@ -514,6 +527,18 @@ mod tests {
         }
     }
 
+    fn fixture_steer_entry(message_id: &str) -> crate::state_machine::event::SteerEntry {
+        crate::state_machine::event::SteerEntry {
+            text: "queued from another client".to_string(),
+            llm_text: Some("queued from another client".to_string()),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: message_id.to_string(),
+            user_agent: Some("test-agent".to_string()),
+            skill_invocation: None,
+        }
+    }
+
     // ------------------------------------------------------------------
     // Parity tests — one per SseEvent variant
     // ------------------------------------------------------------------
@@ -526,6 +551,7 @@ mod tests {
             transcript_generation: 1,
             message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: vec![fixture_user_message(), fixture_agent_message_with_bash()],
+            steering_messages: vec![fixture_steer_entry("msg-steer-init")],
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: 42,
@@ -536,6 +562,16 @@ mod tests {
             pending_truncated: false,
         };
         assert_parity(&event);
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(
+            typed["steering_messages"][0]["message_id"],
+            "msg-steer-init"
+        );
+        assert_eq!(
+            typed["steering_messages"][0]["text"],
+            "queued from another client"
+        );
+        assert!(typed["steering_messages"][0].get("llm_text").is_none());
     }
 
     /// Init with a populated `ReplayRing` snapshot. Exercises the recursive
@@ -575,6 +611,7 @@ mod tests {
             transcript_generation: 1,
             message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: vec![fixture_user_message()],
+            steering_messages: Vec::new(),
             agent_working: true,
             presentation_mode: "working".to_string(),
             last_sequence_id: 45,
@@ -621,6 +658,7 @@ mod tests {
             transcript_generation: 1,
             message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: vec![fixture_user_message()],
+            steering_messages: Vec::new(),
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: 99,
@@ -965,8 +1003,17 @@ mod tests {
     fn parity_steer_message_queued() {
         let event = SseEvent::SteerMessageQueued {
             sequence_id: 22,
-            message_id: "msg-steer-1".to_string(),
+            message: fixture_steer_entry("msg-steer-1"),
             queue_position: 0,
+        };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_steer_message_cancelled() {
+        let event = SseEvent::SteerMessageCancelled {
+            sequence_id: 23,
+            message_id: "msg-steer-1".to_string(),
         };
         assert_parity(&event);
     }
@@ -1037,6 +1084,7 @@ mod tests {
             transcript_generation: 1,
             message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: Vec::new(),
+            steering_messages: Vec::new(),
             agent_working: true,
             presentation_mode: "working".to_string(),
             last_sequence_id: init_seq,
@@ -1135,6 +1183,7 @@ mod tests {
             transcript_generation: 1,
             message_snapshot: crate::runtime::MessageSnapshotMode::Full,
             messages: Vec::new(),
+            steering_messages: Vec::new(),
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: init_seq,

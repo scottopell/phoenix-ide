@@ -4,9 +4,34 @@ import { useState } from 'react';
 import {
   useMessageQueue,
   derivePendingMessages,
+  deriveDisplayedPendingMessages,
   deriveFailedMessages,
   type QueuedMessage,
 } from './useMessageQueue';
+
+describe('deriveDisplayedPendingMessages', () => {
+  it('renders API-originated steering and deduplicates sender-local optimism', () => {
+    const local = queued('same-id', { status: 'steering_queued', text: 'local copy' });
+    const unsent = queued('local-only', { text: 'waiting locally' });
+    const displayed = deriveDisplayedPendingMessages([local, unsent], [{
+      message_id: 'same-id',
+      text: 'server copy',
+      images: [],
+      files: [],
+    }, {
+      message_id: 'external-id',
+      text: 'from coordinator',
+      images: [],
+      files: [],
+    }]);
+
+    expect(displayed.map((message) => [message.localId, message.text])).toEqual([
+      ['same-id', 'server copy'],
+      ['external-id', 'from coordinator'],
+      ['local-only', 'waiting locally'],
+    ]);
+  });
+});
 
 function queued(localId: string, overrides: Partial<QueuedMessage> = {}): QueuedMessage {
   return {

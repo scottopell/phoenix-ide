@@ -269,7 +269,8 @@ handling. The current set, sourced from `SseWireEvent::event_type()`
 ```
 init, message, message_updated, state_change, token, agent_done,
 conversation_became_terminal, conversation_update, error,
-browser_session_state, steer_message_queued, rate_limit_snapshot,
+browser_session_state, bash_tool_progress, steer_message_queued,
+steer_message_cancelled, rate_limit_snapshot, work_scope_update,
 conversation_hard_deleted
 ```
 

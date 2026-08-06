@@ -1,5 +1,5 @@
 import * as v from 'valibot';
-import type { ConversationState, Message, Conversation } from '../api';
+import type { ConversationState, Message, Conversation, QueuedSteeringMessage } from '../api';
 import type { ErrorPresentation } from '../errorPresentation';
 import type { BashToolProgress } from '../generated/sse';
 import type { WorkScopeInventory } from '../generated/sse';
@@ -15,6 +15,7 @@ import {
   SseConversationUpdateDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
+  SseSteerMessageCancelledDataSchema,
   SseRateLimitSnapshotDataSchema,
   SseWorkScopeUpdateDataSchema,
   SseErrorDataSchema,
@@ -80,6 +81,8 @@ export interface ConversationAtom {
   phaseLastAppliedEventSeq: number;
   conversationLastAppliedEventSeq: number;
   messages: Message[];
+  /** Durable server-authoritative messages awaiting steering delivery. */
+  steeringMessages: QueuedSteeringMessage[];
   contextWindow: { used: number };
   systemPrompt: string | null;
   lastAppliedEventSeq: number;
@@ -175,6 +178,7 @@ export interface ConversationAtom {
 export interface InitPayload {
   conversation: Conversation;
   messages: Message[];
+  steeringMessages: QueuedSteeringMessage[];
   phase: ConversationState;
   contextWindow: { used: number };
   transcriptGeneration: number;
@@ -284,6 +288,18 @@ export type SSEAction =
     }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
   | { type: 'sse_browser_session_state'; sequenceId: number; active: boolean; epoch?: number }
+  | {
+      type: 'sse_steer_message_queued';
+      sequenceId: number;
+      message: QueuedSteeringMessage;
+      epoch?: number;
+    }
+  | {
+      type: 'sse_steer_message_cancelled';
+      sequenceId: number;
+      messageId: string;
+      epoch?: number;
+    }
   // REQ-WSUI-007 / REQ-WSUI-010: full-snapshot work-scope inventory push.
   // The wire payload carries the complete `WorkScopeInventory` for the
   // scope; the reducer replaces `workScope` wholesale (no delta merge).
@@ -383,6 +399,7 @@ export function createInitialAtom(): ConversationAtom {
     phaseLastAppliedEventSeq: 0,
     conversationLastAppliedEventSeq: 0,
     messages: [],
+    steeringMessages: [],
     contextWindow: { used: 0 },
     systemPrompt: null,
     lastAppliedEventSeq: 0,
@@ -630,12 +647,18 @@ function clearProgressForMaterializedResults(
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
+      const steeringMessages = atom.steeringMessages.filter(
+        (message) => message.message_id !== action.message.message_id,
+      );
       const idx = atom.messages.findIndex((m) => m.message_id === action.message.message_id);
       if (idx >= 0) {
-        return withoutLiveBashProgress(atom, toolResultUseId(action.message));
+        return withoutLiveBashProgress(
+          { ...atom, steeringMessages },
+          toolResultUseId(action.message),
+        );
       }
       let nextAtom: ConversationAtom = withoutLiveBashProgress(
-        { ...atom, streamingBuffer: null },
+        { ...atom, streamingBuffer: null, steeringMessages },
         toolResultUseId(action.message),
       );
       let nextMessage = action.message;
@@ -765,6 +788,24 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         ...atom,
         conversation: { ...atom.conversation, browser_session_active: action.active },
         conversationLastAppliedEventSeq: action.sequenceId,
+      };
+    case 'sse_steer_message_queued': {
+      const existingIndex = atom.steeringMessages.findIndex(
+        (message) => message.message_id === action.message.message_id,
+      );
+      if (existingIndex < 0) {
+        return { ...atom, steeringMessages: [...atom.steeringMessages, action.message] };
+      }
+      const steeringMessages = [...atom.steeringMessages];
+      steeringMessages[existingIndex] = action.message;
+      return { ...atom, steeringMessages };
+    }
+    case 'sse_steer_message_cancelled':
+      return {
+        ...atom,
+        steeringMessages: atom.steeringMessages.filter(
+          (message) => message.message_id !== action.messageId,
+        ),
       };
     case 'sse_work_scope_update':
       return { ...atom, workScope: action.inventory };
@@ -1077,9 +1118,6 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
       });
     }
     case 'steer_message_queued': {
-      // Validated for forward-compat parity with the live handler in
-      // useConnection.ts; no reducer action needed (no-op). Schema drift
-      // still warns in DEV so a Rust-side wire change surfaces here.
       const res = v.safeParse(SseSteerMessageQueuedDataSchema, entry);
       if (!res.success) {
         if (import.meta.env.DEV) {
@@ -1088,8 +1126,23 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         return atom;
       }
       return conversationReducer(atom, {
-        type: 'sse_sequence_consumed',
+        type: 'sse_steer_message_queued',
         sequenceId: res.output.sequence_id,
+        message: res.output.message,
+      });
+    }
+    case 'steer_message_cancelled': {
+      const res = v.safeParse(SseSteerMessageCancelledDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending steer_message_cancelled entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_steer_message_cancelled',
+        sequenceId: res.output.sequence_id,
+        messageId: res.output.message_id,
       });
     }
     case 'rate_limit_snapshot': {
@@ -1176,6 +1229,10 @@ export function conversationReducer(
       } else {
         mergedMessages = [...p.messages].sort((left, right) => left.sequence_id - right.sequence_id);
       }
+      const deliveredMessageIds = new Set(mergedMessages.map((message) => message.message_id));
+      const steeringMessages = p.steeringMessages.filter(
+        (message) => !deliveredMessageIds.has(message.message_id),
+      );
 
       const snapshotMessageAnchor = p.messages.reduce(
         (maxSeq, message) => Math.max(maxSeq, message.sequence_id),
@@ -1221,6 +1278,7 @@ export function conversationReducer(
         pendingMessagePatches: isFreshConnect ? {} : atom.pendingMessagePatches,
         ...deriveMessageSyncState(mergedMessages),
         messages: mergedMessages,
+        steeringMessages,
         streamingBuffer: phase1StreamingBuffer,
         uiError: null,
         toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
@@ -1299,6 +1357,8 @@ export function conversationReducer(
     case 'sse_token':
     case 'sse_conversation_update':
     case 'sse_browser_session_state':
+    case 'sse_steer_message_queued':
+    case 'sse_steer_message_cancelled':
     case 'sse_work_scope_update':
       return applyContiguousWireAction(atom, action);
 

@@ -2670,23 +2670,6 @@ where
                 skill_invocation,
             };
             self.steering_queue.push(entry);
-            let queue_position = self.steering_queue.len() - 1;
-            // Persist updated queue
-            if let Err(e) = self
-                .storage
-                .update_steering_queue(&self.context.conversation_id, &self.steering_queue)
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to persist steering queue");
-            }
-            // Notify the UI so it can show the queued indicator
-            let _ = self
-                .broadcast_tx
-                .send_seq(|seq| SseEvent::SteerMessageQueued {
-                    sequence_id: seq,
-                    message_id,
-                    queue_position,
-                });
             return Ok(());
         }
 
@@ -11476,7 +11459,6 @@ mod steer_drain_detector_tests {
     /// enqueue-during-drain race.
     #[tokio::test]
     async fn clear_steering_queue_entries_preserves_concurrent_enqueue() {
-        use crate::runtime::traits::StateStore;
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-clear-effect",
             ConvState::LlmRequesting { attempt: 1 },
@@ -11484,17 +11466,14 @@ mod steer_drain_detector_tests {
         );
         // Pre-seed storage as if drain took [p1, p2] from in-memory, then a
         // concurrent enqueue persisted [p1, p2, c1] (c1 added by enqueue).
-        storage
-            .update_steering_queue(
-                "conv-clear-effect",
-                &[
-                    mk_entry("p1", "pending-1"),
-                    mk_entry("p2", "pending-2"),
-                    mk_entry("c1", "concurrent"),
-                ],
-            )
-            .await
-            .expect("seed steering queue");
+        storage.set_steering_queue(
+            "conv-clear-effect",
+            vec![
+                mk_entry("p1", "pending-1"),
+                mk_entry("p2", "pending-2"),
+                mk_entry("c1", "concurrent"),
+            ],
+        );
 
         // Drain only removes p1 and p2.
         rt.execute_effect(Effect::ClearSteeringQueueEntries {

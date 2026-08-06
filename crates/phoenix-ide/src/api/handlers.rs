@@ -3797,6 +3797,12 @@ async fn stream_conversation(
     }
 
     init_trace.record_ms("stream.metadata_hydration_ms", metadata_started.elapsed());
+    let steering_messages = state
+        .runtime
+        .db()
+        .get_steering_queue(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
@@ -3804,6 +3810,7 @@ async fn stream_conversation(
         transcript_generation: conversation.transcript_generation,
         message_snapshot: StreamDbMessageSelection::message_snapshot(),
         messages,
+        steering_messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
@@ -4276,6 +4283,13 @@ async fn cancel_steering_message(
         .remove_steering_entries(&id, std::slice::from_ref(&message_id))
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let broadcaster = state.runtime.conversation_broadcaster(&id).await;
+    let cancelled_message_id = message_id.clone();
+    let _ = broadcaster.send_seq(|sequence_id| SseEvent::SteerMessageCancelled {
+        sequence_id,
+        message_id: cancelled_message_id,
+    });
 
     // Notify the live executor (if running) to remove the entry from its
     // in-memory queue. DB is already updated above, so the executor write
@@ -7533,6 +7547,8 @@ async fn shared_sse_stream(
         transcript_generation: conversation.transcript_generation,
         message_snapshot: crate::runtime::MessageSnapshotMode::Full,
         messages,
+        // Pending steering input is not part of the published transcript.
+        steering_messages: Vec::new(),
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
@@ -14536,6 +14552,7 @@ mod chat_authority_tests {
             .runtime
             .inject_handle_for_test("c-fm7", ConvState::LlmRequesting { attempt: 1 })
             .await;
+        let mut sse_rx = state.runtime.subscribe("c-fm7").await.expect("subscribe");
 
         // Verify effective_conversation_state returns the live state.
         let effective = state
@@ -14565,6 +14582,21 @@ mod chat_authority_tests {
             result.0.steering,
             "must be routed as steering, not UserMessage"
         );
+        let queued_event = tokio::time::timeout(std::time::Duration::from_secs(1), sse_rx.recv())
+            .await
+            .expect("queued event timeout")
+            .expect("queued event");
+        let SseEvent::SteerMessageQueued { message, .. } = queued_event else {
+            panic!("expected steer_message_queued event");
+        };
+        assert_eq!(message.text, "continue please");
+        let durable_queue = state
+            .db
+            .get_steering_queue("c-fm7")
+            .await
+            .expect("durable queue");
+        assert_eq!(durable_queue.len(), 1, "broadcast follows durable append");
+        assert_eq!(durable_queue[0].message_id, message.message_id);
     }
 }
 

@@ -9,7 +9,7 @@
 --             LlmRequesting entry from a tool round,
 --           user cancellation of queued entries,
 --           persistence and crash recovery,
---           SSE notification of queuing
+--           SSE notification of queue mutations and reconnect snapshots
 -- Excludes:
 --   - Conversation state machine transitions other than the
 --     SteerDrainedUserMessages arms (see bedrock.allium)
@@ -147,7 +147,7 @@ rule EnqueueSteeringMessage {
                      skill_invocation: skill_invocation
                  }
         -- The client receives a zero-based position indicating its place in line.
-        ensures: SteerMessageQueuedEmitted(conversation, message_id,
+        ensures: SteerMessageQueuedEmitted(conversation, q.entries.last,
                      queue_position = q.depth)
         -- HTTP response confirms the message was accepted as a steering entry.
         ensures: ChatResponseSent(conversation, message_id, steering = true)
@@ -299,6 +299,7 @@ rule CancelSteeringMessage {
     when: UserCancelsSteeringMessage(conversation, message_id)
     for q in SteeringQueue where q.conversation = conversation:
         ensures: not q.entries.any(e => e.message_id = message_id)
+        ensures: SteerMessageCancelledEmitted(conversation, message_id)
 
     @guidance
         -- The HTTP response is 200 OK in all cases, including when no entry with
@@ -386,8 +387,18 @@ surface SteeringQueueApi {
     @guarantee SteerMessageQueuedAck
         -- When a message is accepted as a steering entry (conversation was busy
         -- at call time), the HTTP response body contains { steering: true } and
-        -- an SSE event SteerMessageQueued { message_id, queue_position } is
-        -- emitted to all connected clients before the response is flushed.
+        -- an SSE event carrying the renderable SteerEntry and its queue position
+        -- is emitted to all connected clients before the response is flushed.
+
+    @guarantee AuthoritativeQueueProjection
+        -- A newly-subscribed client receives the complete persisted queue in
+        -- FIFO order. Live enqueue and cancellation events mutate that same
+        -- projection, so browser-local send state is never required to render
+        -- a server-accepted steering message.
+
+    @guarantee SteerMessageCancelledAck
+        -- After cancellation is durable, all connected clients receive the
+        -- cancelled message_id and remove that queued entry if present.
 
     @guarantee DirectSendTransparency
         -- When a message is sent while the conversation is idle, { steering: false }

@@ -12,8 +12,6 @@
 --           specs/sse_wire/sse_wire.allium); ConversationAtom per-event reducer
 --           semantics (see specs/conversation_atom/conversation_atom.allium).
 --
--- Supersedes: tasks/02682-p3-ready--distill-user-message-queue-allium-spec.md.
-
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
@@ -62,8 +60,19 @@ entity AuthoritativeUserMessage {
     message_id: String
 }
 
+entity AuthoritativeSteeringMessage {
+    scope: ConversationScope
+    message_id: String
+    text: String
+    images: List<ImageData>
+}
+
 entity PendingRender {
     entry: LocalQueueEntry
+}
+
+entity AuthoritativeSteeringRender {
+    entry: AuthoritativeSteeringMessage
 }
 
 entity FailedRender {
@@ -205,6 +214,22 @@ rule AuthoritativeMessageReconcilesQueueEntry {
         -- entries after page reload.
 }
 
+rule AuthoritativeSteeringMessageReconcilesQueueEntry {
+    when: ServerSteeringQueueContains(msg, entry)
+
+    requires: msg.scope = entry.scope
+    requires: msg.message_id = entry.local_id
+    requires: entry.status = pending or entry.status = steering_queued
+
+    ensures: entry.status = reconciled
+    ensures: entry.visible = false
+
+    @guidance
+        -- Once the server queue carries the accepted message, browser-local
+        -- storage is no longer its render authority. The server entry remains
+        -- visible until cancellation or authoritative transcript delivery.
+}
+
 rule DerivePendingRender {
     when: RenderConversation(scope)
 
@@ -212,6 +237,14 @@ rule DerivePendingRender {
         for entry in LocalQueueEntries where scope = scope:
             if entry.status = pending or entry.status = steering_queued:
                 PendingRender.created(entry: entry)
+}
+
+rule DeriveAuthoritativeSteeringRender {
+    when: RenderConversation(scope)
+
+    ensures:
+        for entry in AuthoritativeSteeringMessages where scope = scope:
+            AuthoritativeSteeringRender.created(entry: entry)
 }
 
 rule DeriveFailedRender {
@@ -296,6 +329,9 @@ invariant RenderedUserMessagesAreUnionWithoutDuplicates {
             and not AuthoritativeUserMessage{scope: entry.scope, message_id: entry.local_id}
 
     for msg in AuthoritativeUserMessages:
+        no PendingRender{entry: LocalQueueEntry{scope: msg.scope, local_id: msg.message_id}}
+
+    for msg in AuthoritativeSteeringMessages:
         no PendingRender{entry: LocalQueueEntry{scope: msg.scope, local_id: msg.message_id}}
 }
 

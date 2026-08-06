@@ -63,6 +63,11 @@ value Message {
     -- does not inspect them.
 }
 
+value SteeringMessage {
+    message_id: String
+    text: String
+}
+
 -- Opaque conversation phase. The reducer only tests `phase.type` as a
 -- string and otherwise passes the value through. Full semantics live in
 -- bedrock's ConvState.
@@ -99,6 +104,8 @@ entity ConversationAtom {
     conversationId: String?
     phase: Phase
     messages: List<Message>
+    -- Server-authoritative persisted steering queue in FIFO order.
+    steeringMessages: List<SteeringMessage>
     transcriptGeneration: Integer?
     transcriptCoverage: String
     lastSequenceId: Integer
@@ -204,6 +211,7 @@ rule SseInitFreshConnect {
     -- so the per-event rules below can apply each pending entry via
     -- their normal applyIfNewer guard.
     ensures: atom.messages = reconcile_snapshot(atom.messages, payload.messages, payload.message_snapshot, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.steeringMessages = without_delivered(payload.steering_messages, payload.messages)
     ensures: atom.phase = payload.phase
     ensures: atom.lastSequenceId = payload.pending_anchor_sequence_id
     ensures: atom.streamingBuffer = null
@@ -270,6 +278,7 @@ rule SseInitReconnectMerge {
     -- observed tokens). Cleared when payload.phase is anything
     -- else, because the turn ended while disconnected.
     ensures: atom.messages = reconcile_snapshot(atom.messages, payload.messages, payload.message_snapshot, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.steeringMessages = without_delivered(payload.steering_messages, atom.messages)
     ensures: atom.phase = payload.phase
     ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase, payload.pending_truncated)
     ensures: atom.uiError = null
@@ -345,6 +354,7 @@ rule SseMessageAppended {
     requires: not message_in_list(atom.messages, message.message_id)
 
     ensures: atom.messages = append(atom.messages, message)
+    ensures: atom.steeringMessages = remove_by_id(atom.steeringMessages, message.message_id)
     ensures: atom.streamingBuffer = null
     ensures: atom.lastSequenceId = seq
 
@@ -369,6 +379,7 @@ rule SseMessageDedupReplay {
     requires: message_in_list(atom.messages, message.message_id)
 
     ensures: atom.messages = atom.messages
+    ensures: atom.steeringMessages = remove_by_id(atom.steeringMessages, message.message_id)
     ensures: atom.streamingBuffer = atom.streamingBuffer
     ensures: atom.lastSequenceId = seq
 
@@ -512,6 +523,24 @@ rule SseConversationUpdateApplied {
         -- Shallow merge into atom.conversation. If atom.conversation is
         -- null (before init), the rule applies lastSequenceId but leaves
         -- the merge as a no-op.
+}
+
+rule SseSteerMessageQueuedApplied {
+    when: SseSteerMessageQueuedDispatched(atom, message, seq)
+
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.steeringMessages = upsert_by_id(atom.steeringMessages, message)
+    ensures: atom.lastSequenceId = seq
+}
+
+rule SseSteerMessageCancelledApplied {
+    when: SseSteerMessageCancelledDispatched(atom, messageId, seq)
+
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.steeringMessages = remove_by_id(atom.steeringMessages, messageId)
+    ensures: atom.lastSequenceId = seq
 }
 
 -- `sse_error` with a sequence_id (wire-originated) routes through
@@ -781,6 +810,13 @@ invariant MessagesUniqueById {
     for a in ConversationAtoms:
         for i in a.messages:
             for j in a.messages:
+                i != j implies i.message_id != j.message_id
+}
+
+invariant SteeringMessagesUniqueById {
+    for a in ConversationAtoms:
+        for i in a.steeringMessages:
+            for j in a.steeringMessages:
                 i != j implies i.message_id != j.message_id
 }
 
