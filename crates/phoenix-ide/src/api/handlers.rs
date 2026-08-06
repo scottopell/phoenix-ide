@@ -4273,7 +4273,7 @@ async fn trigger_continuation(
     let operation_id = continuation_operation_id(effective_state);
     state
         .runtime
-        .send_event(&id, Event::UserTriggerContinuation { operation_id })
+        .admit_continuation_retry(&id, operation_id)
         .await
         .map_err(AppError::BadRequest)?;
 

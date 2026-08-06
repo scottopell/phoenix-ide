@@ -80,6 +80,13 @@ pub type TurnTriggerSlot = Arc<Mutex<Option<opentelemetry::trace::SpanContext>>>
 /// the `TraceLayer` span). Overwrites only when a real exportable span is
 /// current — internal callers with no ambient span (or with tracing export
 /// disabled) never clear a trigger already deposited for a queued event.
+fn continuation_operation_is_awaiting(state: &ConvState, operation_id: &str) -> bool {
+    matches!(
+        state,
+        ConvState::AwaitingContinuation { request } if request.operation_id == operation_id
+    )
+}
+
 fn deposit_turn_trigger(handle: &ConversationHandle) {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -3347,6 +3354,28 @@ impl RuntimeManager {
         );
     }
 
+    #[cfg(test)]
+    pub(crate) async fn inject_handle_with_state_sender_for_test(
+        &self,
+        conv_id: &str,
+        live_state: ConvState,
+    ) -> watch::Sender<ConvState> {
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let (state_tx, state_rx) = watch::channel(live_state);
+        self.runtimes.write().await.insert(
+            conv_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+        state_tx
+    }
+
     /// Evict an active runtime so it gets recreated with fresh config on next access.
     /// Used after model upgrades to pick up the new model and context window.
     ///
@@ -3412,6 +3441,60 @@ impl RuntimeManager {
             .send(event)
             .await
             .map_err(|e| format!("Failed to send event: {e}"))
+    }
+
+    pub async fn admit_continuation_retry(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        operation_id: String,
+    ) -> Result<(), String> {
+        let handle = self.get_or_create(conversation_id).await?;
+        let mut state_rx = handle.state_rx.clone();
+        let initial_state = state_rx.borrow_and_update().clone();
+        let eligible = matches!(initial_state, ConvState::Idle)
+            || matches!(
+                &initial_state,
+                ConvState::RecoverableContinuationFailure { failure }
+                    if failure.request.operation_id == operation_id
+            );
+        if !eligible {
+            return Err(format!(
+                "Cannot trigger continuation while conversation is {}",
+                initial_state.variant_name()
+            ));
+        }
+        deposit_turn_trigger(&handle);
+        handle
+            .event_tx
+            .send(Event::UserTriggerContinuation {
+                operation_id: operation_id.clone(),
+            })
+            .await
+            .map_err(|error| format!("Failed to send event: {error}"))?;
+
+        let mut saw_candidate = false;
+        loop {
+            state_rx
+                .changed()
+                .await
+                .map_err(|_| "Continuation runtime stopped before admission settled".to_string())?;
+            let live_state = state_rx.borrow_and_update().clone();
+            let persisted_state = self
+                .db
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .state;
+
+            if continuation_operation_is_awaiting(&live_state, &operation_id) {
+                saw_candidate = true;
+                if continuation_operation_is_awaiting(&persisted_state, &operation_id) {
+                    return Ok(());
+                }
+            } else if saw_candidate && live_state == persisted_state {
+                return Err("Continuation retry was not durably admitted".to_string());
+            }
+        }
     }
 
     /// Queue a steering message to be delivered when the conversation next
@@ -4699,6 +4782,66 @@ mod scope_liveness_tests {
         assert!(runtimes.contains_key("awaiting-continuation-auth"));
         assert!(runtimes.contains_key(&coordinator.id));
         assert!(!runtimes.contains_key("idle"));
+    }
+
+    #[tokio::test]
+    async fn continuation_retry_admission_waits_for_matching_durable_projection() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "retry-admission";
+        let operation_id = "retry-operation";
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: operation_id.to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let recoverable = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: request.clone(),
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "summary failed".to_string(),
+            },
+        };
+        manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &recoverable)
+            .await
+            .unwrap();
+        let state_tx = manager
+            .inject_handle_with_state_sender_for_test(conversation_id, recoverable)
+            .await;
+
+        let admission = manager.conversation_admission(conversation_id).await;
+        let manager_for_retry = Arc::clone(&manager);
+        let retry = tokio::spawn(async move {
+            let _guard = admission.lock().await;
+            manager_for_retry
+                .admit_continuation_retry(conversation_id, operation_id.to_string())
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        let awaiting = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        state_tx.send(awaiting.clone()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "live transition alone must not acknowledge durable admission"
+        );
+
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &awaiting)
+            .await
+            .unwrap();
+        state_tx.send(awaiting).unwrap();
+        assert!(retry.await.unwrap().is_ok());
     }
 
     #[tokio::test]
