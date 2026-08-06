@@ -19,31 +19,52 @@ enum CertPinStore {
     private static let fingerprintKey = "phoenix.certPin.fingerprint"
     private static let mismatchAtKey = "phoenix.certPin.mismatchAt"
 
-    enum Decision {
+    enum Decision: Equatable {
         case accept
         case reject
+    }
+
+    enum ExistingPinDecision: Equatable {
+        case unpinned
+        case accept
+        case reject
+    }
+
+    /// Evaluate a certificate only when this exact host/port already owns
+    /// the pin. CA trust must not bypass this check: once a host is pinned,
+    /// every later leaf is compared before credentials can be sent.
+    static func evaluateExisting(
+        host: String, port: Int, fingerprint: String?
+    ) -> ExistingPinDecision {
+        let defaults = UserDefaults.standard
+        let key = "\(host):\(port)"
+        guard defaults.string(forKey: hostKey) == key,
+              let pinnedFingerprint = defaults.string(forKey: fingerprintKey)
+        else { return .unpinned }
+
+        guard fingerprint == pinnedFingerprint else {
+            defaults.set(Date(), forKey: mismatchAtKey)
+            return .reject
+        }
+        return .accept
     }
 
     /// TOFU evaluation for a self-signed presentation.
     static func evaluate(host: String, port: Int, fingerprint: String) -> Decision {
         let defaults = UserDefaults.standard
         let key = "\(host):\(port)"
-        let pinnedHost = defaults.string(forKey: hostKey)
-        let pinnedFingerprint = defaults.string(forKey: fingerprintKey)
-
-        guard pinnedHost == key, let pinnedFingerprint else {
+        switch evaluateExisting(host: host, port: port, fingerprint: fingerprint) {
+        case .accept:
+            return .accept
+        case .reject:
+            return .reject
+        case .unpinned:
             // First use (or a different server): pin and accept.
             defaults.set(key, forKey: hostKey)
             defaults.set(fingerprint, forKey: fingerprintKey)
             defaults.removeObject(forKey: mismatchAtKey)
             return .accept
         }
-        if pinnedFingerprint == fingerprint {
-            return .accept
-        }
-        // Certificate changed: fail closed and record it for Settings.
-        defaults.set(Date(), forKey: mismatchAtKey)
-        return .reject
     }
 
     /// The pinned server ("host:port") and a short fingerprint prefix for

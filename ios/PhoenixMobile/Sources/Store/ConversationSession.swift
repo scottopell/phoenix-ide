@@ -34,6 +34,7 @@ final class ConversationSession {
     /// finalized message arrives or the turn ends.
     private(set) var streamingText = ""
     private(set) var lastErrorToast: String?
+    private(set) var isHardDeleted = false
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
     /// renderer. Rebuilt on message changes, not per render.
@@ -51,6 +52,16 @@ final class ConversationSession {
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
     private var retryDelay: TimeInterval = 1
+    private let onHardDeleted: (String) -> Void
+
+    private struct PendingMessagePatch {
+        var content: JSONValue?
+        var displayData: JSONValue?
+    }
+
+    /// `message_updated` can precede its eager `message` during replay.
+    /// Retain the newest fields until the identity-bearing message arrives.
+    private var pendingMessagePatches: [String: PendingMessagePatch] = [:]
 
     private var snapshotName: String { "conv-\(conversationId)" }
 
@@ -71,10 +82,16 @@ final class ConversationSession {
     /// cache-age note (REQ-IOS-001).
     private(set) var snapshotSavedAt: Date?
 
-    init(conversationId: String, api: PhoenixAPI, connectivity: ConnectivityMonitor) {
+    init(
+        conversationId: String,
+        api: PhoenixAPI,
+        connectivity: ConnectivityMonitor,
+        onHardDeleted: @escaping (String) -> Void = { _ in }
+    ) {
         self.conversationId = conversationId
         self.api = api
         self.connectivity = connectivity
+        self.onHardDeleted = onHardDeleted
         self.outbox = Outbox(conversationId: conversationId)
 
         // Cached snapshot renders immediately; the stream refreshes it.
@@ -146,6 +163,7 @@ final class ConversationSession {
     }
 
     private func persistSnapshot() {
+        guard !isHardDeleted else { return }
         let now = Date()
         snapshotSavedAt = now
         DiskStore.saveVersioned(
@@ -163,7 +181,10 @@ final class ConversationSession {
     /// same idempotent delivery.
     func send(text: String, images: [ImagePayload] = []) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || !images.isEmpty else { return }
+        guard (!trimmed.isEmpty || !images.isEmpty),
+              !isHardDeleted,
+              typedState.acceptsChatMessage
+        else { return }
         _ = outbox.enqueue(text: trimmed, images: images)
         drainOutbox()
     }
@@ -182,13 +203,16 @@ final class ConversationSession {
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
     func drainOutbox() {
-        guard drainTask == nil else { return }
+        guard drainTask == nil, !isHardDeleted else { return }
         drainTask = Task {
             defer { drainTask = nil }
             // Loop until no sendable entries remain, so a message enqueued
             // while a drain is already running is picked up by this pass
             // instead of waiting for the next trigger.
             while !Task.isCancelled {
+                // Never POST an entry whose durable copy is missing. This
+                // retries the persistence point on every delivery trigger.
+                guard outbox.prepareForDelivery() else { return }
                 let sendable = outbox.entries.filter {
                     $0.status == .pending && !$0.acceptedByServer
                         && !inFlight.contains($0.localId)
@@ -304,7 +328,7 @@ final class ConversationSession {
                     if Task.isCancelled { return }
                     if let frame = parser.consume(byte),
                        let event = PhoenixEvent.decode(frame: frame) {
-                        apply(event)
+                        receive(event)
                     }
                 }
                 // Server closed the stream (e.g. broadcast lag): reconnect
@@ -332,7 +356,8 @@ final class ConversationSession {
 
     // MARK: - Reducer
 
-    private func apply(_ event: PhoenixEvent) {
+    func receive(_ event: PhoenixEvent) {
+        guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
             conversation = snap.conversation
@@ -350,6 +375,7 @@ final class ConversationSession {
             }
             streamingText = ""
             streamingRequestId = nil
+            pendingMessagePatches.removeAll()
             // Replay the ring through the same reducer so an in-flight turn
             // (streaming text, tool phase) survives the reconnect. The
             // replay floor is the ring anchor — ring entries sit in
@@ -402,7 +428,12 @@ final class ConversationSession {
             // the floor must not clobber content a newer update already set.
             guard applyIfNewer(seq) else { return }
             guard let idx = messages.firstIndex(where: { $0.message_id == messageId }) else {
-                return  // update for an unknown target is a silent no-op
+                var patch = pendingMessagePatches[messageId]
+                    ?? PendingMessagePatch(content: nil, displayData: nil)
+                if let content, content != .null { patch.content = content }
+                if let displayData, displayData != .null { patch.displayData = displayData }
+                pendingMessagePatches[messageId] = patch
+                return
             }
             if let content, content != .null { messages[idx].content = content }
             if let displayData, displayData != .null { messages[idx].display_data = displayData }
@@ -457,9 +488,9 @@ final class ConversationSession {
             // agent_done can close a turn without a trailing idle
             // state_change; leave resting/needs-action states alone but
             // clear in-flight ones so the spinner doesn't outlive the turn.
-            switch typedState {
-            case .llmRequesting, .toolExecuting, .awaitingSubAgents,
-                 .awaitingLlm, .cancelling:
+            if presentationMode == "working"
+                || (presentationMode == nil && typedState.isKnownWorkingState)
+            {
                 typedState = .idle
                 convState = .string("idle")
                 conversation?.state = .string("idle")
@@ -468,8 +499,6 @@ final class ConversationSession {
                 // the spinner back for a turn that already ended.
                 presentationMode = "idle"
                 conversation?.presentation_mode = "idle"
-            default:
-                break
             }
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
@@ -495,7 +524,7 @@ final class ConversationSession {
             }
 
         case .steerMessageQueued(let seq, let messageId):
-            _ = applyIfNewer(seq)
+            guard applyIfNewer(seq) else { return }
             outbox.markAccepted(messageId, steering: true)
 
         case .errorEvent(let seq, let message):
@@ -504,6 +533,26 @@ final class ConversationSession {
 
         case .conversationBecameTerminal(let seq):
             _ = applyIfNewer(seq)
+
+        case .conversationHardDeleted(let seq, let deletedConversationId):
+            guard deletedConversationId == conversationId, applyIfNewer(seq) else { return }
+            drainTask?.cancel()
+            drainTask = nil
+            inFlight.removeAll()
+            isHardDeleted = true
+            conversation = nil
+            messages = []
+            convState = nil
+            typedState = .terminal
+            presentationMode = "done"
+            agentWorking = false
+            streamingText = ""
+            streamingRequestId = nil
+            pendingMessagePatches.removeAll()
+            toolUseIndex = [:]
+            DiskStore.remove(name: snapshotName)
+            outbox.clear()
+            onHardDeleted(conversationId)
 
         case .other(_, let seq):
             if let seq { _ = applyIfNewer(seq) }
@@ -517,6 +566,11 @@ final class ConversationSession {
     }
 
     private func upsert(_ message: Message) {
+        var message = message
+        if let patch = pendingMessagePatches.removeValue(forKey: message.message_id) {
+            if let content = patch.content { message.content = content }
+            if let displayData = patch.displayData { message.display_data = displayData }
+        }
         if let idx = messages.firstIndex(where: { $0.message_id == message.message_id }) {
             // Eager (in-flight) messages are later re-broadcast persisted
             // with the same message_id; the second arrival refreshes fields.

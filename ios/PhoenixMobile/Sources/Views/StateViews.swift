@@ -11,6 +11,7 @@ import SwiftUI
 struct StateDetailView: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
+    @State private var confirmEmptyQuestionDismissal = false
 
     var body: some View {
         switch session.typedState {
@@ -42,13 +43,7 @@ struct StateDetailView: View {
 
         case .awaitingUserResponse(let questions):
             if questions.isEmpty {
-                // Degenerate payload: still show the condition rather than
-                // nothing; dismiss is the only meaningful resolution.
-                needsActionCard(
-                    icon: "questionmark.bubble",
-                    title: "The agent is waiting for a response",
-                    detail: nil,
-                    footnote: "No question payload — respond from the web UI.")
+                emptyQuestionCard
             } else {
                 QuestionCard(session: session, questions: questions)
             }
@@ -59,6 +54,9 @@ struct StateDetailView: View {
 
         case .error(let message):
             errorCard(message: message)
+
+        case .creationFailed(let message):
+            errorCard(message: message, dismissible: false)
 
         case .contextExhausted:
             // Gate on the server's mode, per this type's own rule: an
@@ -89,6 +87,10 @@ struct StateDetailView: View {
                     title: "Action needed",
                     detail: type.replacingOccurrences(of: "_", with: " "),
                     footnote: "Handle this from the web UI.")
+            } else if session.presentationMode == "error" {
+                errorCard(
+                    message: type.replacingOccurrences(of: "_", with: " "),
+                    dismissible: false)
             } else if session.agentWorking {
                 workingRow {
                     Text(type.replacingOccurrences(of: "_", with: " "))
@@ -152,7 +154,7 @@ struct StateDetailView: View {
         .padding(.vertical, 6)
     }
 
-    private func errorCard(message: String) -> some View {
+    private func errorCard(message: String, dismissible: Bool = true) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Label("Agent error", systemImage: "exclamationmark.triangle.fill")
                 .font(.callout.bold())
@@ -160,16 +162,18 @@ struct StateDetailView: View {
             Text(message)
                 .font(.callout)
                 .lineLimit(4)
-            HStack {
-                Spacer()
-                // Exemplar online-only action (see ConversationAction):
-                // resumable errors clear server-side; non-resumable ones
-                // come back as a conflict toast explaining why.
-                Button("Dismiss error") {
-                    session.perform(.dismissError)
+            if dismissible {
+                HStack {
+                    Spacer()
+                    // Exemplar online-only action (see ConversationAction):
+                    // resumable errors clear server-side; non-resumable ones
+                    // come back as a conflict toast explaining why.
+                    Button("Dismiss error") {
+                        session.perform(.dismissError)
+                    }
+                    .font(.callout.bold())
+                    .disabled(!model.connectivity.isOnline)
                 }
-                .font(.callout.bold())
-                .disabled(!model.connectivity.isOnline)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -181,6 +185,47 @@ struct StateDetailView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    private var emptyQuestionCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("The agent is waiting for a response", systemImage: "questionmark.bubble")
+                .font(.callout.bold())
+            Text("The question payload is empty. Dismiss it to unblock the conversation.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Dismiss question") {
+                    confirmEmptyQuestionDismissal = true
+                }
+                .font(.callout.bold())
+                .disabled(!model.connectivity.isOnline || session.actionInFlight != nil)
+            }
+            if !model.connectivity.isOnline {
+                Text("Offline — dismissal needs a connection and is never queued.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.blue.opacity(0.1))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.blue.opacity(0.35), lineWidth: 0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .confirmationDialog(
+            "Dismiss this unanswered prompt?",
+            isPresented: $confirmEmptyQuestionDismissal,
+            titleVisibility: .visible
+        ) {
+            Button("Dismiss question", role: .destructive) {
+                session.perform(.dismissQuestion)
+            }
+        }
     }
 }
 

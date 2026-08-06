@@ -54,16 +54,34 @@ final class ServerTrustDelegate: NSObject, URLSessionDelegate {
             completionHandler(.performDefaultHandling, nil)
             return
         }
-        // Properly CA-signed certificates need no pinning.
+        let space = challenge.protectionSpace
+        let fingerprint = Self.leafFingerprint(trust)
+
+        // A pin established for this host remains authoritative even if a
+        // later certificate passes CA validation. Otherwise DNS/VPN drift to
+        // a different trusted endpoint could receive the Bearer password.
+        switch CertPinStore.evaluateExisting(
+            host: space.host, port: space.port, fingerprint: fingerprint)
+        {
+        case .accept:
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        case .reject:
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        case .unpinned:
+            break
+        }
+
+        // Properly CA-signed certificates need no new pin.
         if SecTrustEvaluateWithError(trust, nil) {
             completionHandler(.useCredential, URLCredential(trust: trust))
             return
         }
-        guard allowSelfSigned, let fingerprint = Self.leafFingerprint(trust) else {
+        guard allowSelfSigned, let fingerprint else {
             completionHandler(.performDefaultHandling, nil)
             return
         }
-        let space = challenge.protectionSpace
         switch CertPinStore.evaluate(host: space.host, port: space.port, fingerprint: fingerprint) {
         case .accept:
             completionHandler(.useCredential, URLCredential(trust: trust))

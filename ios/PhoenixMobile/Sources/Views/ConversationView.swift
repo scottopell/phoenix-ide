@@ -30,7 +30,14 @@ struct ConversationView: View {
                     .padding(.vertical, 4)
                     .background(.red.gradient)
             }
-            if isUncachedOffline {
+            if session.isHardDeleted {
+                ContentUnavailableView {
+                    Label("Conversation deleted", systemImage: "trash")
+                } description: {
+                    Text("It was deleted from another Phoenix client.")
+                }
+                .frame(maxHeight: .infinity)
+            } else if isUncachedOffline {
                 ContentUnavailableView {
                     Label("Not cached on this device", systemImage: "icloud.slash")
                 } description: {
@@ -40,8 +47,12 @@ struct ConversationView: View {
             } else {
                 messageList
             }
-            StateDetailView(session: session)
-            ComposerView(session: session, draft: $draft)
+            if !session.isHardDeleted {
+                StateDetailView(session: session)
+                if !isUncachedOffline {
+                    ComposerView(session: session, draft: $draft)
+                }
+            }
         }
         .navigationTitle(session.conversation?.displayTitle ?? "Conversation")
         .navigationBarTitleDisplayMode(.inline)

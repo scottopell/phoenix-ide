@@ -1,10 +1,9 @@
 import PhotosUI
 import SwiftUI
 
-/// Message input. Always enabled — sending offline or mid-turn is the
-/// normal case, not an error: the outbox holds the message (text and
-/// images alike) until it can be delivered (or the server steers it into
-/// the running turn).
+/// Message input. Offline and working states remain sendable through the
+/// outbox/steering path; live-state decisions and terminal states are gated
+/// because replaying ordinary chat there would fabricate an invalid intent.
 struct ComposerView: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
@@ -84,8 +83,10 @@ struct ComposerView: View {
     }
 
     private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !attachments.isEmpty
+        session.typedState.acceptsChatMessage
+            && !session.isHardDeleted
+            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !attachments.isEmpty)
     }
 
     private var attachmentChips: some View {

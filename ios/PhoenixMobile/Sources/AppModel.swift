@@ -85,9 +85,24 @@ final class AppModel {
         guard let api else { return nil }
         if let existing = sessions[conversationId] { return existing }
         let session = ConversationSession(
-            conversationId: conversationId, api: api, connectivity: connectivity)
+            conversationId: conversationId,
+            api: api,
+            connectivity: connectivity,
+            onHardDeleted: { [weak self] id in
+                self?.handleHardDeleted(id)
+            })
         sessions[conversationId] = session
         return session
+    }
+
+    private func handleHardDeleted(_ conversationId: String) {
+        listStore.remove(id: conversationId)
+        sessions[conversationId] = nil
+        if pendingOpenConversationId == conversationId {
+            pendingOpenConversationId = nil
+        }
+        UNUserNotificationCenter.current().removeDeliveredNotifications(
+            withIdentifiers: ["attention-\(conversationId)"])
     }
 
     func refreshList() async {
@@ -183,6 +198,10 @@ final class AppModel {
 
     @discardableResult
     func archive(conversationId: String) async -> Bool {
+        guard conversationId != coordinatorConversationId else {
+            lastActionError = "The Coordinator is a permanent fleet conversation and can't be archived."
+            return false
+        }
         guard let api, connectivity.isOnline else {
             lastActionError = "Archiving needs a connection — it can't be queued."
             return false
@@ -250,6 +269,10 @@ final class AppModel {
     /// and must not leak across a server/account switch.
     func signOut() {
         clearCache()
+        pendingOpenConversationId = nil
+        let notificationCenter = UNUserNotificationCenter.current()
+        notificationCenter.removeAllDeliveredNotifications()
+        notificationCenter.removeAllPendingNotificationRequests()
         UserDefaults.standard.removeObject(forKey: Self.lastCwdKey)
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
         coordinatorConversationId = nil

@@ -93,6 +93,21 @@ final class Outbox {
             entries.filter(\.isVisible), name: storeName, version: Self.schemaVersion)
     }
 
+    /// Re-establish the enqueue-before-POST durability point immediately
+    /// before delivery. A transiently failed enqueue write can recover here;
+    /// a continuing failure keeps every entry unsendable.
+    func prepareForDelivery() -> Bool {
+        persist()
+        return persistenceHealthy
+    }
+
+    /// A hard-deleted conversation owns no remaining local delivery state.
+    func clear() {
+        entries.removeAll()
+        persistenceHealthy = true
+        DiskStore.remove(name: storeName)
+    }
+
     private func update(_ localId: String, _ mutate: (inout OutboxEntry) -> Void) {
         guard let idx = entries.firstIndex(where: { $0.localId == localId }) else { return }
         mutate(&entries[idx])

@@ -91,6 +91,12 @@ final class ConversationStateTests: XCTestCase {
             .error(message: "rate limited"))
     }
 
+    func testCreationFailedCarriesServerError() {
+        XCTAssertEqual(
+            parse("{\"type\":\"creation_failed\",\"error\":\"worktree setup failed\"}"),
+            .creationFailed(message: "worktree setup failed"))
+    }
+
     func testCancellingVariantsCollapse() {
         XCTAssertEqual(parse("{\"type\":\"cancelling\"}"), .cancelling)
         XCTAssertEqual(
@@ -126,5 +132,21 @@ final class ConversationStateTests: XCTestCase {
             .toolExecuting(toolName: "tool", remainingCount: 0, completedCount: 0))
         XCTAssertEqual(
             parse("{\"type\":\"error\"}"), .error(message: "Unknown error"))
+    }
+
+
+    func testChatEligibilityMatchesInteractiveStateFamilies() {
+        XCTAssertTrue(ConversationState.idle.acceptsChatMessage)
+        XCTAssertTrue(ConversationState.error(message: "retryable").acceptsChatMessage)
+        XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.awaitingUserResponse(questions: []).acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.awaitingTaskApproval(title: "", priority: "", plan: "")
+                .acceptsChatMessage)
+        XCTAssertFalse(ConversationState.contextExhausted.acceptsChatMessage)
+        XCTAssertFalse(ConversationState.handedOff.acceptsChatMessage)
+        XCTAssertFalse(ConversationState.terminal.acceptsChatMessage)
+        XCTAssertFalse(ConversationState.other(type: "provisioning").acceptsChatMessage)
     }
 }

@@ -36,6 +36,11 @@ WHEN the user submits a non-empty message
 THE SYSTEM SHALL persist a queue entry to disk before attempting delivery
 AND render the entry optimistically in the transcript with its queue status
 
+WHEN that persistence point fails
+THE SYSTEM SHALL keep the in-memory entry visible
+AND SHALL NOT attempt delivery until the full visible outbox is successfully persisted
+AND SHALL retry persistence on later delivery triggers
+
 WHEN delivery fails at the transport level (no route, timeout, connection reset)
 THE SYSTEM SHALL keep the entry queued
 AND retry automatically on the next delivery trigger
@@ -116,6 +121,14 @@ WHEN the device reports no network path
 THE SYSTEM SHALL suspend reconnect attempts until the path returns rather
 than burning backoff cycles
 
+WHEN a message update arrives before its identity-bearing message event
+THE SYSTEM SHALL retain the update by message id
+AND apply it when the message arrives
+
+WHEN a conversation hard-delete event arrives
+THE SYSTEM SHALL remove its transcript, snapshot, outbox, and list entry
+AND SHALL disable further interaction with the deleted conversation
+
 **Rationale:** Mirrors the web client's connection machine against the
 server contract in `specs/sse_wire/sse_wire.allium`; the init-as-resync
 design means the client never needs gap detection.
@@ -155,7 +168,12 @@ THE SYSTEM SHALL authenticate every request with `Authorization: Bearer
 AND store the password in the iOS Keychain
 
 WHEN the server presents a certificate that passes standard trust evaluation
-THE SYSTEM SHALL accept it without pinning
+AND no pin exists for that host and port
+THE SYSTEM SHALL accept it without creating a pin
+
+WHEN a pin exists for the host and port
+THE SYSTEM SHALL compare the presented leaf certificate before accepting it
+regardless of whether standard trust evaluation succeeds
 
 WHEN the server presents a self-signed certificate, the user has enabled the
 trust toggle, and no certificate is pinned for that host and port
@@ -222,6 +240,8 @@ THE SYSTEM SHALL parse the typed response envelope (success shapes tagged
 by `status`, error shapes tagged by `error` — see `specs/bash/`)
 AND show a one-glance outcome header (status, exit code or signal,
 duration, handle for in-flight ops) colored by outcome
+AND for tombstones use `final_cause` as the terminal outcome even when
+`signal_number` is absent
 AND show the output tail collapsed, with the full output expandable and a
 truncation notice when the server truncated
 AND degrade to the generic result card when the payload is not a parseable
@@ -257,6 +277,8 @@ detail area between transcript and composer:
   asked, task plan awaiting approval, context exhausted)
 - the error state renders an error card carrying the message and the
   dismiss action
+- any unhandled state whose presentation mode is error renders a visible
+  error card rather than disappearing
 
 WHEN deciding whether the agent is busy
 THE SYSTEM SHALL use the server's presentation_mode, not re-derive it from
@@ -287,6 +309,11 @@ AND SHALL NOT queue the action for later replay
 WHEN an online-only action is rejected by the server (e.g. dismissing a
 non-resumable error)
 THE SYSTEM SHALL surface the server's explanation
+
+WHEN the conversation is in a state that rejects ordinary chat
+THE SYSTEM SHALL disable the composer
+AND SHALL continue allowing chat in working states where the server accepts
+the message as steering
 
 **Rationale:** Queuing an action against live server state fabricates a
 stale intent — an archive or cancel replayed minutes later can destroy
@@ -337,6 +364,8 @@ THE SYSTEM SHALL route through that store's migration hook
 WHEN loading a NEWER version (downgraded app)
 THE SYSTEM SHALL treat the file as absent rather than misparse it
 AND SHALL NOT delete it
+AND SHALL refuse to overwrite it until the user upgrades or explicitly
+clears the store
 
 WHEN loading a pre-envelope legacy file
 THE SYSTEM SHALL decode the bare payload as version zero
@@ -387,6 +416,9 @@ THE SYSTEM SHALL render each question with its header, text, and options
 AND offer a free-text "Other" answer per question
 AND offer dismissal (with confirmation) as the no-answer resolution
 
+WHEN the question payload is empty or contains no decodable questions
+THE SYSTEM SHALL still offer the online-only dismissal action
+
 WHEN encoding answers
 THE SYSTEM SHALL key them by question text, with a single-select answer
 being the chosen option label (or the trimmed Other text) and a
@@ -425,6 +457,9 @@ AND first-time opening SHALL require connectivity
 WHEN the Coordinator appears in the conversation list
 THE SYSTEM SHALL badge it distinctly
 
+WHEN the user opens list actions for the Coordinator
+THE SYSTEM SHALL NOT offer archive
+
 The remembered Coordinator id is per-server state and SHALL be cleared on
 sign-out.
 
@@ -435,7 +470,7 @@ entry point; every offline guarantee is inherited rather than rebuilt.
 
 ---
 
-### REQ-IOS-018: Needs-Attention Nudges (Stopgap Tier)
+### REQ-IOS-018: Advisory Background Nudges
 
 WHEN the user enables nudges (behind notification authorization)
 THE SYSTEM SHALL schedule opportunistic background refreshes
@@ -459,11 +494,6 @@ Missed, delayed, or skipped background runs SHALL NOT affect correctness
 — the tier is advisory only, and no product behavior may come to depend
 on a run occurring.
 
-**Rationale:** This is deliberately the *cheap, client-only* tier of the
-notification architecture, not its end state. The intended goal is
-server-side push (APNs) hung on the durable-workflow inbox observations
-(`specs/durable-workflows` REQ-DWF-031), which delivers real-time,
-at-least-once notification without polling; this tier exists only because
-that server capability does not exist yet, and it is designed to be
-deleted — not extended — when it does. iOS controls the refresh cadence
-(≥15 min, best-effort), which bounds how good this tier can ever be.
+**Rationale:** Opportunistic refresh can provide useful advisory awareness
+without becoming part of the correctness model. iOS controls the refresh
+cadence (≥15 min, best-effort), so every nudge is explicitly non-authoritative.

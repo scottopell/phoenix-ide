@@ -29,6 +29,7 @@ enum ConversationState: Equatable {
     case awaitingUserResponse(questions: [UserQuestion])
     case awaitingTaskApproval(title: String, priority: String, plan: String)
     case error(message: String)
+    case creationFailed(message: String)
     case contextExhausted
     /// Covers `cancelling`, `cancelling_tool`, `cancelling_sub_agents`.
     case cancelling
@@ -73,6 +74,11 @@ enum ConversationState: Equatable {
                 plan: json["plan"]?.stringValue ?? "")
         case "error":
             return .error(message: json["message"]?.stringValue ?? "Unknown error")
+        case "creation_failed":
+            return .creationFailed(
+                message: json["error"]?.stringValue
+                    ?? json["message"]?.stringValue
+                    ?? "Conversation creation failed")
         case "context_exhausted":
             return .contextExhausted
         case "cancelling", "cancelling_tool", "cancelling_sub_agents":
@@ -83,6 +89,31 @@ enum ConversationState: Equatable {
             return .handedOff
         default:
             return .other(type: type)
+        }
+    }
+
+    /// Mirrors the server's chat-acceptance surface at the client boundary.
+    /// Working states remain sendable because the server accepts them as
+    /// steering; blocking, provisioning, and terminal states do not.
+    var acceptsChatMessage: Bool {
+        switch self {
+        case .idle, .error, .llmRequesting, .toolExecuting,
+             .awaitingSubAgents, .cancelling:
+            return true
+        case .awaitingLlm, .awaitingUserResponse, .awaitingTaskApproval,
+             .creationFailed, .contextExhausted, .terminal, .handedOff,
+             .other, .unknown:
+            return false
+        }
+    }
+
+    var isKnownWorkingState: Bool {
+        switch self {
+        case .awaitingLlm, .llmRequesting, .toolExecuting,
+             .awaitingSubAgents, .cancelling:
+            return true
+        default:
+            return false
         }
     }
 }
