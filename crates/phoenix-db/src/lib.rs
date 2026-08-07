@@ -3354,6 +3354,28 @@ impl Database {
         Ok(metadata)
     }
 
+    /// List conversation ids eligible for command-palette content search.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_conversation_search_ids(&self) -> DbResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT c.id FROM conversations c \
+             WHERE c.user_initiated = 1 AND c.runtime_role != 'coordinator' \
+               AND c.parent_conversation_id IS NULL \
+               AND NOT (c.archived = 1 AND EXISTS (\
+                   SELECT 1 FROM conversation_creation_jobs j \
+                   WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
+               ))",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get("id").map_err(DbError::from))
+            .collect()
+    }
+
     /// List active (non-archived) user-initiated conversations.
     ///
     /// # Errors

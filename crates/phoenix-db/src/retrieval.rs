@@ -361,11 +361,12 @@ impl Fts5Retriever {
 }
 
 impl Fts5Retriever {
+    #[allow(clippy::too_many_lines)]
     async fn retrieve_match_expr(
         &self,
         request: &RetrievalRequest,
         match_expr: &str,
-        prefix_guard: Option<(&str, &str)>,
+        raw_prefix_guard: Option<(&str, Option<&str>)>,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
         let (scope_ids, excluding): (&[String], bool) = match &request.scope {
             RetrievalScope::Global => (&[], false),
@@ -403,12 +404,16 @@ impl Fts5Retriever {
                   ))",
             );
         }
-        if prefix_guard.is_some() {
-            sql.push_str(
-                " AND (message_fts.rowid IN (\
-                    SELECT rowid FROM message_fts WHERE message_fts MATCH ?\
-                  ) OR instr(lower(message_fts.text), ?) > 0)",
-            );
+        if let Some((_, earlier_expr)) = raw_prefix_guard {
+            if earlier_expr.is_some() {
+                sql.push_str(
+                    " AND (message_fts.rowid IN (\
+                        SELECT rowid FROM message_fts WHERE message_fts MATCH ?\
+                      ) OR instr(lower(message_fts.text), ?) > 0)",
+                );
+            } else {
+                sql.push_str(" AND instr(lower(message_fts.text), ?) > 0");
+            }
         }
         if !scope_ids.is_empty() {
             if excluding {
@@ -454,8 +459,11 @@ impl Fts5Retriever {
         }
 
         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(match_expr);
-        if let Some((exact_expr, typed_term)) = prefix_guard {
-            q = q.bind(exact_expr).bind(typed_term);
+        if let Some((guard, earlier_expr)) = raw_prefix_guard {
+            if let Some(earlier_expr) = earlier_expr {
+                q = q.bind(earlier_expr);
+            }
+            q = q.bind(guard);
         }
         for id in scope_ids {
             q = q.bind(id);
@@ -480,21 +488,32 @@ impl MessageRetriever for Fts5Retriever {
         &self,
         request: RetrievalRequest,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let Some(exact_expr) = build_fts_query(&request.query, RetrievalMatchMode::ExactTerms)
-        else {
+        let Some(match_expr) = build_fts_query(&request.query, request.match_mode) else {
             return Ok(Vec::new());
         };
-        if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
-            let final_term = content_terms(&request.query)
-                .pop()
-                .expect("non-empty query has a term");
-            let prefix_expr = build_fts_query(&request.query, RetrievalMatchMode::FinalTokenPrefix)
-                .expect("non-empty query has a prefix expression");
-            self.retrieve_match_expr(&request, &prefix_expr, Some((&exact_expr, &final_term)))
-                .await
+        let terms = content_terms(&request.query);
+        let raw_prefix_guard = if request.match_mode == RetrievalMatchMode::FinalTokenPrefix {
+            terms.last().and_then(|term| {
+                raw_prefix_guard(term).map(|guard| {
+                    let earlier = terms[..terms.len() - 1]
+                        .iter()
+                        .map(|term| format!("\"{term}\""))
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    (guard, (!earlier.is_empty()).then_some(earlier))
+                })
+            })
         } else {
-            self.retrieve_match_expr(&request, &exact_expr, None).await
-        }
+            None
+        };
+        self.retrieve_match_expr(
+            &request,
+            &match_expr,
+            raw_prefix_guard
+                .as_ref()
+                .map(|(guard, earlier)| (guard.as_str(), earlier.as_deref())),
+        )
+        .await
     }
 
     async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError> {
@@ -883,16 +902,32 @@ fn build_fts_query(natural: &str, match_mode: RetrievalMatchMode) -> Option<Stri
     Some(terms.join(" OR "))
 }
 
+fn raw_prefix_guard(term: &str) -> Option<String> {
+    if term.ends_with("ization") {
+        Some(term.to_string())
+    } else if term.ends_with("izatio") {
+        Some(term.trim_end_matches("izatio").to_string())
+    } else {
+        term.strip_suffix('i')
+            .filter(|base| base.len() >= 3)
+            .map(str::to_string)
+    }
+}
+
 fn build_prefix_alternatives(term: &str) -> String {
-    const MIN_PREFIX_CHARS: usize = 3;
-    const MAX_PREFIX_CHARS: usize = 64;
-    let chars: Vec<char> = term.chars().take(MAX_PREFIX_CHARS).collect();
-    let shortest = MIN_PREFIX_CHARS.min(chars.len());
-    let alternatives = (shortest..=chars.len())
-        .rev()
-        .map(|length| format!("\"{}\"*", chars[..length].iter().collect::<String>()))
-        .collect::<Vec<_>>();
-    format!("({})", alternatives.join(" OR "))
+    let fallback_stem = term
+        .strip_suffix("izatio")
+        .map(str::to_string)
+        .filter(|base| base.len() >= 3)
+        .or_else(|| {
+            term.strip_suffix('i')
+                .filter(|base| base.len() >= 3)
+                .map(|base| base.strip_suffix('n').unwrap_or(base).to_string())
+        });
+    match fallback_stem {
+        Some(stem) => format!("(\"{term}\"* OR \"{stem}\")"),
+        None => format!("\"{term}\"*"),
+    }
 }
 
 /// Stable, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used to
@@ -949,7 +984,7 @@ mod tests {
     #[test]
     fn build_query_prefixes_only_for_palette_mode() {
         let q = build_fts_query("observed runni", RetrievalMatchMode::FinalTokenPrefix).unwrap();
-        assert_eq!(q, "\"observed\" OR (\"runni\"* OR \"runn\"* OR \"run\"*)");
+        assert_eq!(q, "\"observed\" OR (\"runni\"* OR \"run\")");
     }
 
     #[test]
@@ -1542,6 +1577,39 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].snippet.chars().count(), 240);
         assert!(hits[0].snippet.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn prefix_match_uses_unicode61_case_and_diacritic_rules() {
+        let db = Database::open_in_memory().await.unwrap();
+        for (id, slug, content) in [
+            ("c-case", "case", "ÜBER diagnostics"),
+            ("c-diacritic", "diacritic", "école diagnostics"),
+        ] {
+            db.create_conversation(id, slug, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.add_message(
+                &format!("m-{id}"),
+                id,
+                &MessageContent::user(content),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let retriever = Fts5Retriever::new(db.pool().clone());
+        retriever.reconcile().await.unwrap();
+
+        for (query, expected) in [("übe", "c-case"), ("eco", "c-diacritic")] {
+            let hits = retriever
+                .retrieve(RetrievalRequest::palette_conversation_search(query, 10))
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "Unicode prefix {query} should match");
+            assert_eq!(hits[0].conversation_id, expected);
+        }
     }
 
     #[tokio::test]
