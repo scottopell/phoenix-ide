@@ -2129,6 +2129,26 @@ export const api = {
     return resp.json();
   },
 
+  async searchConversationContent(
+    query: string,
+    limit = 20,
+    signal?: AbortSignal,
+  ): Promise<ConversationContentSearchResponse> {
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    const resp = await fetch(
+      `/api/conversations/search?${params}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      if (body.error_type === 'conversation_search_warming') {
+        throw new ConversationSearchWarmingError(body.error ?? 'Conversation search is warming up');
+      }
+      throw new Error(body.error ?? 'Failed to search conversation content');
+    }
+    return resp.json();
+  },
+
   async searchConversationCode(
     convId: string,
     query: string,

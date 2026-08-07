@@ -365,6 +365,7 @@ impl Fts5Retriever {
         &self,
         request: &RetrievalRequest,
         match_expr: &str,
+        prefix_guard: Option<(&str, &str)>,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
         let (scope_ids, excluding): (&[String], bool) = match &request.scope {
             RetrievalScope::Global => (&[], false),
@@ -400,6 +401,13 @@ impl Fts5Retriever {
                       SELECT 1 FROM conversation_creation_jobs j \
                       WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
                   ))",
+            );
+        }
+        if prefix_guard.is_some() {
+            sql.push_str(
+                " AND (message_fts.rowid IN (\
+                    SELECT rowid FROM message_fts WHERE message_fts MATCH ?\
+                  ) OR instr(lower(message_fts.text), ?) > 0)",
             );
         }
         if !scope_ids.is_empty() {
@@ -446,6 +454,9 @@ impl Fts5Retriever {
         }
 
         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(match_expr);
+        if let Some((exact_expr, typed_term)) = prefix_guard {
+            q = q.bind(exact_expr).bind(typed_term);
+        }
         for id in scope_ids {
             q = q.bind(id);
         }
@@ -469,7 +480,7 @@ impl MessageRetriever for Fts5Retriever {
         &self,
         request: RetrievalRequest,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError> {
-        let Some(mut match_expr) = build_fts_query(&request.query, RetrievalMatchMode::ExactTerms)
+        let Some(exact_expr) = build_fts_query(&request.query, RetrievalMatchMode::ExactTerms)
         else {
             return Ok(Vec::new());
         };
@@ -477,21 +488,13 @@ impl MessageRetriever for Fts5Retriever {
             let final_term = content_terms(&request.query)
                 .pop()
                 .expect("non-empty query has a term");
-            let mut probe = request.clone();
-            probe.query.clone_from(&final_term);
-            probe.grouping = RetrievalGrouping::None;
-            probe.limit = 1;
-            let exact_final = format!("\"{final_term}\"");
-            if self
-                .retrieve_match_expr(&probe, &exact_final)
-                .await?
-                .is_empty()
-            {
-                match_expr = build_fts_query(&request.query, RetrievalMatchMode::FinalTokenPrefix)
-                    .expect("non-empty query has a prefix expression");
-            }
+            let prefix_expr = build_fts_query(&request.query, RetrievalMatchMode::FinalTokenPrefix)
+                .expect("non-empty query has a prefix expression");
+            self.retrieve_match_expr(&request, &prefix_expr, Some((&exact_expr, &final_term)))
+                .await
+        } else {
+            self.retrieve_match_expr(&request, &exact_expr, None).await
         }
-        self.retrieve_match_expr(&request, &match_expr).await
     }
 
     async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError> {
@@ -1434,6 +1437,45 @@ mod tests {
             assert_eq!(hits.len(), 1, "partial Porter input {query} should match");
             assert_eq!(hits[0].conversation_id, "c1");
         }
+    }
+
+    #[tokio::test]
+    async fn literal_partial_term_does_not_disable_prefix_matches_elsewhere() {
+        let db = Database::open_in_memory().await.unwrap();
+        for (id, slug, content) in [
+            ("c-literal", "literal", "runni diagnostics"),
+            ("c-complete", "complete", "running diagnostics"),
+            ("c-unrelated", "unrelated", "runbook diagnostics"),
+        ] {
+            db.create_conversation(id, slug, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.add_message(
+                &format!("m-{id}"),
+                id,
+                &MessageContent::user(content),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let retriever = Fts5Retriever::new(db.pool().clone());
+        retriever.reconcile().await.unwrap();
+
+        let hits = retriever
+            .retrieve(RetrievalRequest::palette_conversation_search("runni", 10))
+            .await
+            .unwrap();
+        let ids = hits
+            .into_iter()
+            .map(|hit| hit.conversation_id)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            ids,
+            HashSet::from(["c-literal".to_string(), "c-complete".to_string()])
+        );
     }
 
     #[tokio::test]

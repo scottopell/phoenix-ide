@@ -27,7 +27,8 @@ pub use coordinator_query::{
 };
 pub use migrations::run_pending_migrations;
 pub use retrieval::{
-    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope, RetrievedChunk,
+    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
+    RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
 };
 pub use schema::*;
 pub use workflow::*;
