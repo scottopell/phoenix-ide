@@ -23,6 +23,7 @@ import {
   type RestoreBasis,
 } from '../conversation/historyExpansion';
 import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
+import { transcriptCoverageAfterInit } from '../conversation/atom';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import { messageCacheWrite } from '../conversation/messageCachePersistence';
 import {
@@ -640,9 +641,7 @@ function ConversationPageContent({
           generation: historyGenerationRef.current,
           transcriptGeneration: payload.transcriptGeneration,
         },
-        hasEarlierHistory: atomRef.current.transcriptCoverage === 'tail'
-          || (payload.transcriptCoverage === 'tail'
-            && atomRef.current.transcriptCoverage !== 'complete'),
+        hasEarlierHistory: transcriptCoverageAfterInit(atomRef.current, payload) === 'tail',
       });
     },
   });
@@ -858,12 +857,18 @@ function ConversationPageContent({
       setResolvedRouteConversationId(null);
       setArchiveStatusConfirmedConversationId(null);
       setError(null);
-      void resolveAuthoritativeRoute().catch((err: unknown) => {
-        if (!cancelled) {
-          console.error('Failed to resolve conversation route after reconnect:', err);
-          setError(err instanceof Error ? err.message : 'Failed to resolve conversation route');
+      const retryRouteResolution = async () => {
+        try {
+          await resolveAuthoritativeRoute();
+        } catch (err) {
+          if (cancelled) return;
+          console.warn('Failed to resolve conversation route after reconnect; retrying', err);
+          window.setTimeout(() => {
+            if (!cancelled) void retryRouteResolution();
+          }, 1_000);
         }
-      });
+      };
+      void retryRouteResolution();
     };
     window.addEventListener('online', handleOnline);
     void loadConversation();

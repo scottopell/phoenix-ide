@@ -3822,7 +3822,6 @@ async fn stream_conversation(
                 image_count,
                 file_count,
             ));
-            init_conversation.creation_error = job.error;
         }
     }
 

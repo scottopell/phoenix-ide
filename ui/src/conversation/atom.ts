@@ -1139,6 +1139,21 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
   }
 }
 
+export function transcriptCoverageAfterInit(
+  atom: Pick<ConversationAtom, 'conversationId' | 'transcriptGeneration' | 'transcriptCoverage'>,
+  payload: InitPayload,
+): 'tail' | 'complete' {
+  const sameOwner = atom.conversationId === payload.conversation.id;
+  const sameGeneration = sameOwner
+    && atom.transcriptGeneration !== null
+    && atom.transcriptGeneration === payload.transcriptGeneration;
+  if (payload.transcriptCoverage === 'preserve' && sameGeneration) return atom.transcriptCoverage;
+  if (payload.transcriptCoverage === 'tail' && sameGeneration && atom.transcriptCoverage === 'complete') {
+    return 'complete';
+  }
+  return payload.transcriptCoverage === 'complete' ? 'complete' : 'tail';
+}
+
 export function conversationReducer(
   atom: ConversationAtom,
   action: SSEAction
@@ -1170,12 +1185,7 @@ export function conversationReducer(
         || generationChanged;
       const preservesTranscript = p.transcriptCoverage === 'preserve' && knownGenerationMatches;
       const mergesMessageSuffix = p.transcriptCoverage === 'tail' && knownGenerationMatches;
-      const nextTranscriptCoverage: 'tail' | 'complete' = preservesTranscript
-        || (mergesMessageSuffix && atom.transcriptCoverage === 'complete')
-        ? atom.transcriptCoverage
-        : p.transcriptCoverage === 'complete'
-          ? 'complete'
-          : 'tail';
+      const nextTranscriptCoverage = transcriptCoverageAfterInit(atom, p);
       let mergedMessages: Message[];
       if (preservesTranscript) {
         mergedMessages = atom.messages;
