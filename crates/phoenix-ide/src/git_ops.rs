@@ -993,6 +993,350 @@ pub(crate) fn ensure_local_exclude_has_phoenix(dir: &Path) -> Result<(), String>
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum WorktreeLossKind {
+    StagedTrackedPaths,
+    UnstagedTrackedPaths,
+    UntrackedNonIgnoredPaths,
+    InitializedSubmoduleState,
+    DetachedUnreachableCommits,
+}
+
+impl WorktreeLossKind {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::StagedTrackedPaths => "staged_tracked_paths",
+            Self::UnstagedTrackedPaths => "unstaged_tracked_paths",
+            Self::UntrackedNonIgnoredPaths => "untracked_non_ignored_paths",
+            Self::InitializedSubmoduleState => "initialized_submodule_state",
+            Self::DetachedUnreachableCommits => "detached_unreachable_commits",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeLossItem {
+    pub scope_id: phoenix_core::work_scope::WorkScopeId,
+    pub kind: WorktreeLossKind,
+    pub item_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeLossScopeInventory {
+    pub scope_id: phoenix_core::work_scope::WorkScopeId,
+    pub losses: Vec<WorktreeLossItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeLossInventory {
+    pub generation: String,
+    pub fingerprint: String,
+    pub scopes: Vec<WorktreeLossScopeInventory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeInspectionScope<'a> {
+    pub scope_id: phoenix_core::work_scope::WorkScopeId,
+    pub root: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeStatusCode {
+    Unmodified,
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unmerged,
+}
+
+impl WorktreeStatusCode {
+    fn parse(code: u8) -> Result<Self, String> {
+        match code {
+            b'.' => Ok(Self::Unmodified),
+            b'M' => Ok(Self::Modified),
+            b'A' => Ok(Self::Added),
+            b'D' => Ok(Self::Deleted),
+            b'R' => Ok(Self::Renamed),
+            b'C' => Ok(Self::Copied),
+            b'T' => Ok(Self::TypeChanged),
+            b'U' => Ok(Self::Unmerged),
+            _ => Err("invalid git status code".to_string()),
+        }
+    }
+
+    fn is_unmodified(self) -> bool {
+        matches!(self, Self::Unmodified)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedScopeStatus {
+    staged: Vec<String>,
+    unstaged: Vec<String>,
+    untracked: Vec<String>,
+    initialized_submodule_state: Vec<String>,
+}
+
+fn parse_scope_status_losses(output: &[u8]) -> Result<ParsedScopeStatus, String> {
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    let mut untracked = Vec::new();
+    let mut initialized_submodule_state = Vec::new();
+    let mut parts = output.split(|byte| *byte == 0).peekable();
+    while let Some(record) = parts.next() {
+        if record.is_empty() {
+            continue;
+        }
+        match record[0] {
+            b'1' | b'2' | b'u' => {
+                if record.len() < 4 || record[1] != b' ' {
+                    return Err("invalid porcelain v2 record".to_string());
+                }
+                let index_status = WorktreeStatusCode::parse(record[2])?;
+                let worktree_status = WorktreeStatusCode::parse(record[3])?;
+                let field_count = match record[0] {
+                    b'1' => 9,
+                    b'2' => 10,
+                    b'u' => 11,
+                    _ => unreachable!(),
+                };
+                let path = record
+                    .splitn(field_count, |byte| *byte == b' ')
+                    .nth(field_count - 1)
+                    .ok_or_else(|| "invalid porcelain v2 path record".to_string())?;
+                let path = String::from_utf8(path.to_vec())
+                    .map_err(|_| "invalid utf-8 in git status path".to_string())?;
+                if record[0] == b'2' {
+                    let _rename_source = parts
+                        .next()
+                        .ok_or_else(|| "rename record missing source path".to_string())?;
+                }
+                let submodule_bits = record
+                    .splitn(5, |byte| *byte == b' ')
+                    .nth(4)
+                    .and_then(|field| field.first().copied())
+                    .ok_or_else(|| "invalid porcelain v2 submodule field".to_string())?;
+                if submodule_bits != b'N' {
+                    initialized_submodule_state.push(path.clone());
+                }
+                if !index_status.is_unmodified() {
+                    staged.push(path.clone());
+                }
+                if !worktree_status.is_unmodified() {
+                    unstaged.push(path);
+                }
+            }
+            b'?' => {
+                if record.len() < 3 || record[1] != b' ' {
+                    return Err("invalid porcelain v2 untracked record".to_string());
+                }
+                let path = String::from_utf8(record[2..].to_vec())
+                    .map_err(|_| "invalid utf-8 in git status path".to_string())?;
+                untracked.push(path);
+            }
+            b'!' | b'#' => {}
+            _ => return Err("unsupported porcelain v2 record".to_string()),
+        }
+    }
+    staged.sort();
+    staged.dedup();
+    unstaged.sort();
+    unstaged.dedup();
+    untracked.sort();
+    untracked.dedup();
+    initialized_submodule_state.sort();
+    initialized_submodule_state.dedup();
+    Ok(ParsedScopeStatus {
+        staged,
+        unstaged,
+        untracked,
+        initialized_submodule_state,
+    })
+}
+
+fn canonical_scope_path(repo_root: &Path, scope_root: &Path) -> Result<String, String> {
+    let scope_root = std::fs::canonicalize(scope_root)
+        .map_err(|error| format!("scope root is unavailable: {error}"))?;
+    let relative = scope_root
+        .strip_prefix(repo_root)
+        .map_err(|_| "scope root is outside repository".to_string())?;
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| "scope root is not valid UTF-8".to_string())?;
+    Ok(relative.to_string())
+}
+
+fn scope_pathspec(relative_path: &str) -> String {
+    if relative_path.is_empty() {
+        ":(literal).".to_string()
+    } else {
+        format!(":(literal){relative_path}")
+    }
+}
+
+fn capture_scope_status_losses(repo_root: &Path, relative_path: &str) -> Result<ParsedScopeStatus, String> {
+    let pathspec = scope_pathspec(relative_path);
+    let output = run_git_bytes(
+        repo_root,
+        &[
+            "-c",
+            "status.renames=copies",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--",
+            &pathspec,
+        ],
+    )?;
+    parse_scope_status_losses(&output)
+}
+
+fn detached_unreachable_head_identity(repo_root: &Path) -> Result<Option<String>, String> {
+    let head_name = run_git(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if head_name.trim() != "HEAD" {
+        return Ok(None);
+    }
+    let head_oid = run_git(repo_root, &["rev-parse", "HEAD"])?;
+    let refs = run_git(
+        repo_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+    )?;
+    for reference in refs.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let status = git_command()
+            .current_dir(repo_root)
+            .args(["merge-base", "--is-ancestor", head_oid.trim(), reference])
+            .status()
+            .map_err(|error| format!("Failed to run git merge-base --is-ancestor: {error}"))?;
+        if status.success() {
+            return Ok(None);
+        }
+        if status.code() != Some(1) {
+            return Err(format!(
+                "git merge-base --is-ancestor failed for {reference}"
+            ));
+        }
+    }
+    Ok(Some(head_oid.trim().to_string()))
+}
+
+fn worktree_loss_generation(repo_root: &Path, scopes: &[WorktreeInspectionScope<'_>]) -> Result<String, String> {
+    let repo_root = std::fs::canonicalize(repo_root)
+        .map_err(|error| format!("repository root is unavailable: {error}"))?;
+    let repo_marker = repo_root
+        .to_str()
+        .ok_or_else(|| "repository root is not valid UTF-8".to_string())?;
+    let mut scope_markers = scopes
+        .iter()
+        .map(|scope| {
+            canonical_scope_path(&repo_root, scope.root)
+                .map(|path| format!("{}={path}", scope.scope_id.as_str()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    scope_markers.sort();
+    Ok(format!("git-loss-v1|repo={repo_marker}|scopes={}", scope_markers.join(",")))
+}
+
+pub(crate) fn inspect_worktree_loss_inventory(
+    repo_root: &Path,
+    scopes: &[WorktreeInspectionScope<'_>],
+) -> Result<WorktreeLossInventory, String> {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+
+    let repo_root = std::fs::canonicalize(repo_root)
+        .map_err(|error| format!("repository root is unavailable: {error}"))?;
+    let generation = worktree_loss_generation(&repo_root, scopes)?;
+    let detached_unreachable_head = detached_unreachable_head_identity(&repo_root)?;
+
+    let mut scope_entries = scopes
+        .iter()
+        .map(|scope| {
+            let relative_path = canonical_scope_path(&repo_root, scope.root)?;
+            let parsed = capture_scope_status_losses(&repo_root, &relative_path)?;
+            let mut losses = Vec::new();
+            losses.extend(parsed.staged.into_iter().map(|item_identity| WorktreeLossItem {
+                scope_id: scope.scope_id.clone(),
+                kind: WorktreeLossKind::StagedTrackedPaths,
+                item_identity,
+            }));
+            losses.extend(parsed.unstaged.into_iter().map(|item_identity| WorktreeLossItem {
+                scope_id: scope.scope_id.clone(),
+                kind: WorktreeLossKind::UnstagedTrackedPaths,
+                item_identity,
+            }));
+            losses.extend(parsed.untracked.into_iter().map(|item_identity| WorktreeLossItem {
+                scope_id: scope.scope_id.clone(),
+                kind: WorktreeLossKind::UntrackedNonIgnoredPaths,
+                item_identity,
+            }));
+            losses.extend(parsed.initialized_submodule_state.into_iter().map(|item_identity| {
+                WorktreeLossItem {
+                    scope_id: scope.scope_id.clone(),
+                    kind: WorktreeLossKind::InitializedSubmoduleState,
+                    item_identity,
+                }
+            }));
+            if let Some(head_oid) = &detached_unreachable_head {
+                losses.push(WorktreeLossItem {
+                    scope_id: scope.scope_id.clone(),
+                    kind: WorktreeLossKind::DetachedUnreachableCommits,
+                    item_identity: head_oid.clone(),
+                });
+            }
+            losses.sort_by(|left, right| {
+                left.kind
+                    .cmp(&right.kind)
+                    .then_with(|| left.item_identity.cmp(&right.item_identity))
+            });
+            Ok(WorktreeLossScopeInventory {
+                scope_id: scope.scope_id.clone(),
+                losses,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    scope_entries.sort_by(|left, right| left.scope_id.as_str().cmp(right.scope_id.as_str()));
+
+    let canonical = serde_json::json!({
+        "generation": generation,
+        "scopes": scope_entries
+            .iter()
+            .map(|scope| serde_json::json!({
+                "scope_id": scope.scope_id.as_str(),
+                "losses": scope.losses.iter().map(|loss| serde_json::json!({
+                    "kind": loss.kind.as_str(),
+                    "item_identity": loss.item_identity,
+                })).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let canonical = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
+    let fingerprint = sha2::Sha256::digest(canonical).iter().fold(
+        String::with_capacity(64),
+        |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        },
+    );
+
+    Ok(WorktreeLossInventory {
+        generation,
+        fingerprint,
+        scopes: scope_entries,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,6 +1369,38 @@ mod tests {
         .unwrap();
         run_git(dest, &["config", "user.email", "probe@test"]).unwrap();
         run_git(dest, &["config", "user.name", "probe"]).unwrap();
+    }
+
+    fn scope_id(value: &str) -> phoenix_core::work_scope::WorkScopeId {
+        phoenix_core::work_scope::WorkScopeId::parse(value).unwrap()
+    }
+
+    fn flatten_losses(
+        inventory: &WorktreeLossInventory,
+    ) -> Vec<(String, &'static str, String)> {
+        inventory
+            .scopes
+            .iter()
+            .flat_map(|scope| {
+                scope.losses.iter().map(|loss| {
+                    (
+                        scope.scope_id.as_str().to_string(),
+                        loss.kind.as_str(),
+                        loss.item_identity.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn add_submodule(parent: &Path, child: &Path, path: &str) {
+        git_command()
+            .current_dir(parent)
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args(["submodule", "add", "--quiet", child.to_str().unwrap(), path])
+            .status()
+            .unwrap();
+        run_git(parent, &["commit", "-q", "-am", "add submodule"]).unwrap();
     }
 
     #[test]
@@ -1674,6 +2050,152 @@ mod tests {
             staged.trim(),
             ".gitignore",
             "the new `.gitignore` must be staged: {staged:?}"
+        );
+    }
+
+
+    #[test]
+    fn inspect_worktree_loss_inventory_captures_all_five_categories() {
+        let submodule_src = TempDir::new().unwrap();
+        init_repo(submodule_src.path());
+        commit_file(submodule_src.path(), "module.txt", "base\n", "base module");
+
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        commit_file(repo.path(), "tracked.txt", "base\n", "add tracked");
+        add_submodule(repo.path(), submodule_src.path(), "vendor/sub");
+
+        std::fs::write(repo.path().join("tracked.txt"), "unstaged\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]).unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "worktree\n").unwrap();
+        std::fs::write(repo.path().join("ignored.log"), "ignore me\n").unwrap();
+        std::fs::write(repo.path().join("visible.tmp"), "keep me\n").unwrap();
+        std::fs::write(repo.path().join(".gitignore"), "*.log\n").unwrap();
+        run_git(repo.path(), &["checkout", "--detach", "HEAD"]).unwrap();
+        run_git(repo.path(), &["branch", "-D", "main"]).unwrap();
+
+        let submodule = repo.path().join("vendor/sub");
+        std::fs::write(submodule.join("module.txt"), "dirty\n").unwrap();
+        std::fs::write(submodule.join("nested.tmp"), "untracked\n").unwrap();
+
+        let inventory = inspect_worktree_loss_inventory(
+            repo.path(),
+            &[WorktreeInspectionScope {
+                scope_id: scope_id("scope-root"),
+                root: repo.path(),
+            }],
+        )
+        .unwrap();
+
+        let detached = run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(inventory.scopes.len(), 1);
+        assert_eq!(
+            flatten_losses(&inventory),
+            vec![
+                (
+                    "scope-root".to_string(),
+                    "staged_tracked_paths",
+                    "tracked.txt".to_string(),
+                ),
+                (
+                    "scope-root".to_string(),
+                    "unstaged_tracked_paths",
+                    "tracked.txt".to_string(),
+                ),
+                (
+                    "scope-root".to_string(),
+                    "untracked_non_ignored_paths",
+                    ".gitignore".to_string(),
+                ),
+                (
+                    "scope-root".to_string(),
+                    "untracked_non_ignored_paths",
+                    "visible.tmp".to_string(),
+                ),
+                (
+                    "scope-root".to_string(),
+                    "initialized_submodule_state",
+                    "vendor/sub".to_string(),
+                ),
+                (
+                    "scope-root".to_string(),
+                    "detached_unreachable_commits",
+                    detached,
+                ),
+            ]
+        );
+        assert!(
+            !flatten_losses(&inventory)
+                .iter()
+                .any(|(_, _, item)| item == "ignored.log"),
+            "ignored paths must be absent"
+        );
+    }
+
+    #[test]
+    fn inspect_worktree_loss_inventory_is_deterministic_across_scope_order() {
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("a")).unwrap();
+        std::fs::create_dir_all(repo.path().join("b")).unwrap();
+        std::fs::write(repo.path().join("a/one.txt"), "one\n").unwrap();
+        std::fs::write(repo.path().join("b/two.txt"), "two\n").unwrap();
+
+        let a_root = repo.path().join("a");
+        let b_root = repo.path().join("b");
+        let scopes_a = vec![
+            WorktreeInspectionScope {
+                scope_id: scope_id("scope-b"),
+                root: b_root.as_path(),
+            },
+            WorktreeInspectionScope {
+                scope_id: scope_id("scope-a"),
+                root: a_root.as_path(),
+            },
+        ];
+        let inventory_a = inspect_worktree_loss_inventory(repo.path(), &scopes_a).unwrap();
+
+        let scopes_b = vec![
+            WorktreeInspectionScope {
+                scope_id: scope_id("scope-a"),
+                root: a_root.as_path(),
+            },
+            WorktreeInspectionScope {
+                scope_id: scope_id("scope-b"),
+                root: b_root.as_path(),
+            },
+        ];
+        let inventory_b = inspect_worktree_loss_inventory(repo.path(), &scopes_b).unwrap();
+
+        assert_eq!(inventory_a.generation, inventory_b.generation);
+        assert_eq!(inventory_a.fingerprint, inventory_b.fingerprint);
+        assert_eq!(flatten_losses(&inventory_a), flatten_losses(&inventory_b));
+    }
+
+    #[test]
+    fn inspect_worktree_loss_inventory_scopes_paths_relative_to_scope_root() {
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("nested/inner")).unwrap();
+        std::fs::write(repo.path().join("nested/inner/file.txt"), "content\n").unwrap();
+
+        let nested_root = repo.path().join("nested");
+        let inventory = inspect_worktree_loss_inventory(
+            repo.path(),
+            &[WorktreeInspectionScope {
+                scope_id: scope_id("scope-inner"),
+                root: nested_root.as_path(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            flatten_losses(&inventory),
+            vec![(
+                "scope-inner".to_string(),
+                "untracked_non_ignored_paths",
+                "inner/file.txt".to_string(),
+            )]
         );
     }
 
