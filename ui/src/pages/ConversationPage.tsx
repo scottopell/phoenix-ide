@@ -640,9 +640,9 @@ function ConversationPageContent({
           generation: historyGenerationRef.current,
           transcriptGeneration: payload.transcriptGeneration,
         },
-        hasEarlierHistory: payload.transcriptCoverage === 'tail'
-          || (payload.transcriptCoverage === 'preserve'
-            && atomRef.current.transcriptCoverage === 'tail'),
+        hasEarlierHistory: atomRef.current.transcriptCoverage === 'tail'
+          || (payload.transcriptCoverage === 'tail'
+            && atomRef.current.transcriptCoverage !== 'complete'),
       });
     },
   });

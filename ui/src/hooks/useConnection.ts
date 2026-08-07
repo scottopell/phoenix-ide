@@ -180,9 +180,11 @@ function buildStreamUrl(
 }
 
 function transformInitData(raw: SseInitData): InitPayload {
-  const conversation = raw.project_name != null
-    ? { ...raw.conversation, project_name: raw.project_name }
-    : raw.conversation;
+  const conversation = {
+    ...raw.conversation,
+    presentation_mode: raw.presentation_mode,
+    ...(raw.project_name != null && { project_name: raw.project_name }),
+  };
   const messages = raw.messages || [];
   const phase = parseConversationState(conversation?.state);
 
