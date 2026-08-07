@@ -1,7 +1,10 @@
 use std::fmt;
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::work_scope::WorkScopeId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -213,20 +216,23 @@ pub struct CloseObligation {
     pub phase: ClosePhase,
     pub inspection_generation: Option<String>,
     pub inspection_fingerprint: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseInspection {
     pub attempt_id: String,
-    pub scope: String,
-    pub generation: String,
-    pub fingerprint: String,
+    pub scope: WorkScopeId,
+    pub generation: Option<String>,
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseInspectionLoss {
     pub attempt_id: String,
-    pub scope: String,
+    pub scope: WorkScopeId,
     pub generation: String,
     pub category: LossCategory,
     pub item_identity: String,
@@ -235,17 +241,21 @@ pub struct CloseInspectionLoss {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseRetiredResource {
     pub attempt_id: String,
-    pub scope: String,
+    pub scope: WorkScopeId,
     pub resource_kind: RetiredResourceKind,
     pub resource_identity: String,
     pub outcome: RetirementOutcome,
     pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseTombstone {
-    pub product_conversation_id: ProductConversationId,
+    pub conversation_id: ProductConversationId,
+    pub root_conversation_id: ProductConversationId,
     pub kind: CloseTombstoneKind,
+    pub deleted_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

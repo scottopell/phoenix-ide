@@ -375,19 +375,60 @@ CREATE TABLE close_obligations (
     )),
     inspection_generation TEXT CHECK (inspection_generation IS NULL OR inspection_generation <> ''),
     inspection_fingerprint TEXT CHECK (inspection_fingerprint IS NULL OR inspection_fingerprint <> ''),
-    CHECK ((phase IN ('awaiting_retirement_inspection', 'awaiting_loss_confirmation', 'retirement_requested', 'needs_repair')) = (inspection_generation IS NOT NULL AND inspection_fingerprint IS NOT NULL))
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    CHECK ((inspection_generation IS NULL) = (inspection_fingerprint IS NULL)),
+    CHECK ((phase IN ('awaiting_retirement_inspection', 'awaiting_loss_confirmation', 'retirement_requested', 'needs_repair')) >= (inspection_generation IS NOT NULL)),
+    CHECK ((phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair')) <= (inspection_generation IS NOT NULL)),
+    CHECK ((phase = 'completed') = (completed_at IS NOT NULL))
 );
+
+CREATE TRIGGER close_obligations_reject_completed_at_mismatch_on_update
+BEFORE UPDATE ON close_obligations
+FOR EACH ROW
+WHEN ((NEW.phase = 'completed') <> (NEW.completed_at IS NOT NULL))
+BEGIN
+    SELECT RAISE(FAIL, 'close_obligations completed_at must match completed phase');
+END;
+
+CREATE TRIGGER close_obligations_reject_inspection_pair_mismatch_on_update
+BEFORE UPDATE ON close_obligations
+FOR EACH ROW
+WHEN ((NEW.inspection_generation IS NULL) <> (NEW.inspection_fingerprint IS NULL))
+BEGIN
+    SELECT RAISE(FAIL, 'close_obligations inspection_generation/fingerprint must both be null or both nonnull');
+END;
+
+CREATE TRIGGER close_obligations_reject_missing_inspection_on_update
+BEFORE UPDATE ON close_obligations
+FOR EACH ROW
+WHEN ((NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair')) AND NEW.inspection_generation IS NULL)
+BEGIN
+    SELECT RAISE(FAIL, 'close_obligations inspection required for phase');
+END;
+
+CREATE TRIGGER close_obligations_touch_updated_at
+AFTER UPDATE ON close_obligations
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+    UPDATE close_obligations
+    SET updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE attempt_id = NEW.attempt_id;
+END;
 CREATE UNIQUE INDEX close_obligations_one_active_per_root
 ON close_obligations(root_conversation_id)
 WHERE phase <> 'completed';
 
 CREATE TABLE close_retirement_inspections (
     attempt_id TEXT NOT NULL REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
-    scope TEXT NOT NULL CHECK (scope <> ''),
-    generation TEXT NOT NULL CHECK (generation <> ''),
-    fingerprint TEXT NOT NULL CHECK (fingerprint <> ''),
-    PRIMARY KEY (attempt_id, scope, generation),
-    UNIQUE (attempt_id, scope)
+    scope TEXT NOT NULL REFERENCES work_scopes(id),
+    generation TEXT CHECK (generation IS NULL OR generation <> ''),
+    fingerprint TEXT CHECK (fingerprint IS NULL OR fingerprint <> ''),
+    PRIMARY KEY (attempt_id, scope),
+    UNIQUE (attempt_id, scope, generation),
+    CHECK ((generation IS NULL) = (fingerprint IS NULL))
 );
 
 CREATE TABLE close_retirement_losses (
@@ -410,7 +451,7 @@ CREATE TABLE close_retirement_losses (
 
 CREATE TABLE close_retirement_resources (
     attempt_id TEXT NOT NULL REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
-    scope TEXT NOT NULL CHECK (scope <> ''),
+    scope TEXT NOT NULL REFERENCES work_scopes(id),
     resource_kind TEXT NOT NULL CHECK (resource_kind IN (
         'worktree',
         'bash_process_group',
@@ -428,16 +469,34 @@ CREATE TABLE close_retirement_resources (
         'identity_not_proven',
         'manual_repair_required'
     )),
-    detail TEXT,
+    detail TEXT CHECK (detail IS NULL OR detail <> ''),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     PRIMARY KEY (attempt_id, scope, resource_kind, resource_identity),
     CHECK ((outcome = 'residual') = (failure_reason IS NOT NULL))
 );
 
+CREATE TRIGGER close_retirement_resources_touch_updated_at
+AFTER UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+    UPDATE close_retirement_resources
+    SET updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE attempt_id = NEW.attempt_id
+      AND scope = NEW.scope
+      AND resource_kind = NEW.resource_kind
+      AND resource_identity = NEW.resource_identity;
+END;
+
 CREATE TABLE close_tombstones (
-    root_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    conversation_id TEXT PRIMARY KEY CHECK (conversation_id <> ''),
+    root_conversation_id TEXT NOT NULL CHECK (root_conversation_id <> ''),
     tombstone_kind TEXT NOT NULL CHECK (tombstone_kind IN ('root', 'continuation')),
-    PRIMARY KEY (root_conversation_id, tombstone_kind)
+    deleted_at TEXT NOT NULL
 );
+CREATE INDEX close_tombstones_root_conversation_idx
+ON close_tombstones(root_conversation_id);
 ";
 
 const MIGRATION_061: &str = r"
@@ -3377,7 +3436,10 @@ mod tests {
     async fn migration_062_creates_close_retirement_tables_and_preserves_chain_topology() {
         let pool = test_pool().await;
         sqlx::raw_sql(
-            "CREATE TABLE conversations (
+            "CREATE TABLE work_scopes (
+                 id TEXT PRIMARY KEY
+             );
+             CREATE TABLE conversations (
                  id TEXT PRIMARY KEY,
                  work_scope_id TEXT,
                  continued_in_conv_id TEXT REFERENCES conversations(id),
@@ -3388,6 +3450,12 @@ mod tests {
         .await
         .unwrap();
 
+        sqlx::query(
+            "INSERT INTO work_scopes (id) VALUES ('scope-root'), ('scope-next'), ('scope-solo')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO conversations (id, work_scope_id, continued_in_conv_id, archived) VALUES
                 ('root', 'scope-root', 'next', 0),
@@ -3456,7 +3524,10 @@ mod tests {
     async fn migration_062_enforces_close_retirement_constraints() {
         let pool = test_pool().await;
         sqlx::raw_sql(
-            "CREATE TABLE conversations (
+            "CREATE TABLE work_scopes (
+                 id TEXT PRIMARY KEY
+             );
+             CREATE TABLE conversations (
                  id TEXT PRIMARY KEY,
                  work_scope_id TEXT,
                  continued_in_conv_id TEXT REFERENCES conversations(id),
@@ -3466,6 +3537,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("INSERT INTO work_scopes (id) VALUES ('scope-a'), ('scope-b')")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO conversations (id) VALUES ('root'), ('other')")
             .execute(&pool)
             .await
@@ -3474,36 +3549,58 @@ mod tests {
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
 
         sqlx::query(
-            "INSERT INTO close_obligations (attempt_id, root_conversation_id, phase)
-             VALUES ('attempt-1', 'root', 'awaiting_blocker_resolution')",
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+             ) VALUES (
+                 'attempt-1', 'root', 'awaiting_blocker_resolution',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', NULL
+             )",
         )
         .execute(&pool)
         .await
         .unwrap();
         assert!(sqlx::query(
-            "INSERT INTO close_obligations (attempt_id, root_conversation_id, phase)
-             VALUES ('attempt-2', 'root', 'settling_active_work')",
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+             ) VALUES (
+                 'attempt-2', 'root', 'settling_active_work',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', NULL
+             )",
         )
         .execute(&pool)
         .await
         .is_err());
         assert!(sqlx::query(
-            "INSERT INTO close_obligations (attempt_id, root_conversation_id, phase, inspection_generation, inspection_fingerprint)
-             VALUES ('bad-shape-1', 'other', 'awaiting_blocker_resolution', 'g1', 'fp1')",
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, inspection_generation, inspection_fingerprint,
+                 created_at, updated_at, completed_at
+             ) VALUES (
+                 'bad-shape-1', 'other', 'awaiting_blocker_resolution', 'g1', 'fp1',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', NULL
+             )",
         )
         .execute(&pool)
         .await
         .is_err());
         assert!(sqlx::query(
-            "INSERT INTO close_obligations (attempt_id, root_conversation_id, phase)
-             VALUES ('bad-shape-2', 'other', 'retirement_requested')",
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+             ) VALUES (
+                 'bad-shape-2', 'other', 'retirement_requested',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', NULL
+             )",
         )
         .execute(&pool)
         .await
         .is_err());
         sqlx::query(
-            "INSERT INTO close_obligations (attempt_id, root_conversation_id, phase, inspection_generation, inspection_fingerprint)
-             VALUES ('attempt-3', 'other', 'retirement_requested', 'g1', 'fp1')",
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, inspection_generation, inspection_fingerprint,
+                 created_at, updated_at, completed_at
+             ) VALUES (
+                 'attempt-3', 'other', 'retirement_requested', 'g1', 'fp1',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', NULL
+             )",
         )
         .execute(&pool)
         .await
@@ -3541,9 +3638,10 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO close_retirement_resources (
-                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason, detail
+                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason, detail, created_at, updated_at
              ) VALUES (
-                'attempt-3', 'scope-a', 'worktree', '/tmp/wt', 'absence_adopted', NULL, NULL
+                'attempt-3', 'scope-a', 'worktree', '/tmp/wt', 'absence_adopted', NULL, NULL,
+                '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
              )",
         )
         .execute(&pool)
@@ -3551,9 +3649,10 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO close_retirement_resources (
-                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason, detail
+                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason, detail, created_at, updated_at
              ) VALUES (
-                'attempt-3', 'scope-a', 'bash_process_group', 'pg-9', 'residual', 'manual_repair_required', 'left alive'
+                'attempt-3', 'scope-a', 'bash_process_group', 'pg-9', 'residual', 'manual_repair_required', 'left alive',
+                '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
              )",
         )
         .execute(&pool)
@@ -3561,9 +3660,10 @@ mod tests {
         .unwrap();
         assert!(sqlx::query(
             "INSERT INTO close_retirement_resources (
-                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason
+                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason, created_at, updated_at
              ) VALUES (
-                'attempt-3', 'scope-a', 'browser_session', 'browser-1', 'residual', NULL
+                'attempt-3', 'scope-a', 'browser_session', 'browser-1', 'residual', NULL,
+                '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
              )",
         )
         .execute(&pool)
@@ -3571,9 +3671,10 @@ mod tests {
         .is_err());
         assert!(sqlx::query(
             "INSERT INTO close_retirement_resources (
-                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason
+                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason, created_at, updated_at
              ) VALUES (
-                'attempt-3', 'scope-a', 'browser_session', 'browser-2', 'retired', 'manual_repair_required'
+                'attempt-3', 'scope-a', 'browser_session', 'browser-2', 'retired', 'manual_repair_required',
+                '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
              )",
         )
         .execute(&pool)
@@ -3581,19 +3682,184 @@ mod tests {
         .is_err());
 
         sqlx::query(
-            "INSERT INTO close_tombstones (root_conversation_id, tombstone_kind)
-             VALUES ('root', 'root'), ('root', 'continuation')",
+            "INSERT INTO close_tombstones (conversation_id, root_conversation_id, tombstone_kind, deleted_at)
+             VALUES
+                ('root', 'root', 'root', '2025-01-01T00:00:00Z'),
+                ('cont-1', 'root', 'continuation', '2025-01-01T00:00:01Z'),
+                ('cont-2', 'root', 'continuation', '2025-01-01T00:00:02Z')",
         )
         .execute(&pool)
         .await
         .unwrap();
         assert!(sqlx::query(
-            "INSERT INTO close_tombstones (root_conversation_id, tombstone_kind)
-             VALUES ('root', 'invalid')",
+            "INSERT INTO close_tombstones (conversation_id, root_conversation_id, tombstone_kind, deleted_at)
+             VALUES ('bad-kind', 'root', 'invalid', '2025-01-01T00:00:03Z')",
         )
         .execute(&pool)
         .await
         .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO close_tombstones (conversation_id, root_conversation_id, tombstone_kind, deleted_at)
+             VALUES ('', 'root', 'continuation', '2025-01-01T00:00:04Z')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        assert!(sqlx::query(
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+             ) VALUES (
+                 'missing-created', 'other', 'awaiting_blocker_resolution',
+                 NULL, '2025-01-01T00:00:00Z', NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+             ) VALUES (
+                 'missing-completed-at', 'other', 'completed',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query(
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, inspection_generation, inspection_fingerprint,
+                 created_at, updated_at, completed_at
+             ) VALUES (
+                 'attempt-4', 'root', 'completed', NULL, NULL,
+                 '2025-01-02T00:00:00Z', '2025-01-02T00:00:00Z', '2025-01-02T00:05:00Z'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, inspection_generation, inspection_fingerprint,
+                 created_at, updated_at, completed_at
+             ) VALUES (
+                 'attempt-5', 'root', 'awaiting_retirement_inspection', 'g2', NULL,
+                 '2025-01-03T00:00:00Z', '2025-01-03T00:00:00Z', NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO close_retirement_inspections (attempt_id, scope, generation, fingerprint)
+             VALUES ('attempt-3', 'missing-scope', 'g1', 'fp1')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query(
+            "INSERT INTO close_retirement_inspections (attempt_id, scope, generation, fingerprint)
+             VALUES ('attempt-4', 'scope-b', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "INSERT INTO close_retirement_inspections (attempt_id, scope, generation, fingerprint)
+             VALUES ('attempt-4', 'scope-a', 'g2', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO close_retirement_resources (
+                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason, detail, created_at, updated_at
+             ) VALUES (
+                'attempt-3', 'scope-missing', 'worktree', '/tmp/missing', 'retired', NULL, NULL,
+                '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO close_retirement_resources (
+                attempt_id, scope, resource_kind, resource_identity, outcome, failure_reason, detail, created_at, updated_at
+             ) VALUES (
+                'attempt-3', 'scope-a', 'worktree', '/tmp/empty-detail', 'retired', NULL, '',
+                '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_062_tombstones_survive_conversation_deletion_and_allow_multiple_continuations(
+    ) {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE work_scopes (
+                 id TEXT PRIMARY KEY
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 work_scope_id TEXT,
+                 continued_in_conv_id TEXT REFERENCES conversations(id),
+                 archived BOOLEAN NOT NULL DEFAULT 0
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO conversations (id, continued_in_conv_id) VALUES ('root', 'cont-1'), ('cont-1', 'cont-2'), ('cont-2', NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        stamp_migrations_except(&pool, 62).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        sqlx::query(
+            "INSERT INTO close_tombstones (conversation_id, root_conversation_id, tombstone_kind, deleted_at)
+             VALUES
+                ('root', 'root', 'root', '2025-01-01T00:00:00Z'),
+                ('cont-1', 'root', 'continuation', '2025-01-01T00:00:01Z'),
+                ('cont-2', 'root', 'continuation', '2025-01-01T00:00:02Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM conversations")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let tombstones: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT conversation_id, root_conversation_id, tombstone_kind FROM close_tombstones ORDER BY conversation_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tombstones,
+            vec![
+                (
+                    "cont-1".to_string(),
+                    "root".to_string(),
+                    "continuation".to_string(),
+                ),
+                (
+                    "cont-2".to_string(),
+                    "root".to_string(),
+                    "continuation".to_string(),
+                ),
+                ("root".to_string(), "root".to_string(), "root".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
