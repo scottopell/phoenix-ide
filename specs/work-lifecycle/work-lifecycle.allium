@@ -252,8 +252,8 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         attempt_id,
-        inspection_generation: RetirementInspection.generation,
-        inspection_fingerprint: RetirementInspection.fingerprint
+        inspection_generation: aggregate_inspection_generation(product_conversation, attempt_id),
+        inspection_fingerprint: aggregate_inspection_fingerprint(product_conversation, attempt_id)
     )
 
     @guidance
@@ -282,8 +282,8 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
     ensures: RetirementInspectionRequiresConfirmation(
         product_conversation,
         attempt_id,
-        inspection_generation: RetirementInspection.generation,
-        inspection_fingerprint: RetirementInspection.fingerprint
+        inspection_generation: aggregate_inspection_generation(product_conversation, attempt_id),
+        inspection_fingerprint: aggregate_inspection_fingerprint(product_conversation, attempt_id)
     )
 
     @guidance
@@ -365,20 +365,20 @@ rule RetirementRequestedCreatesPerResourceEvidence {
         retirement_requested,
         needs_repair
     }
-    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
-    requires: not blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
-    requires: owned_resource_pending_retirement(product_conversation, scope_binding.scope)
-    requires: retirement_step_succeeds_for_pending_resource(product_conversation, scope_binding.scope)
-    ensures: RetiredResource.created(
-        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
-        product_conversation: product_conversation,
-        scope: scope_binding.scope,
-        kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope),
-        resource_identity: retired_resource_identity_for_pending_step(product_conversation, scope_binding.scope)
-    )
-    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    ensures:
+        for scope_binding in attached_owned_scopes_with_pending_resources(product_conversation):
+            if exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+               and not blocked_by_distinct_open_product_or_identity_conflict(product_conversation, scope_binding.scope)
+               and retirement_step_succeeds_for_pending_resource(product_conversation, scope_binding.scope):
+                RetiredResource.created(
+                    attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+                    product_conversation: product_conversation,
+                    scope: scope_binding.scope,
+                    kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope),
+                    resource_identity: retired_resource_identity_for_pending_step(product_conversation, scope_binding.scope)
+                )
+                and ResourceRetirementProgressRecorded(product_conversation, attempt_id, scope_binding.scope)
 
     @guidance
         -- Resource retirement is stepwise and idempotent. Each successful step creates
@@ -498,7 +498,19 @@ rule ResourceRetirementFailureProducesResidualRepairState {
         retirement_requested,
         needs_repair
     }
-    requires: exists RetirementResidualResource{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope}, product_conversation: product_conversation, scope: AttachedWorkScope.scope, residual: RetirementResidual{resource_identity: residual_resource_identity_for_attempt(product_conversation, AttachedWorkScope.scope)}}
+    let scope_binding = failing_retirement_scope(product_conversation, attempt_id)
+    let resource_identity = residual_resource_identity_for_attempt(product_conversation, scope_binding.scope)
+    ensures: RetirementResidualResource.created(
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        residual: RetirementResidual{
+            resource_kind: residual_resource_kind_for_attempt(product_conversation, scope_binding.scope),
+            resource_identity: resource_identity,
+            reason: residual_reason_for_attempt(product_conversation, scope_binding.scope),
+            detail: residual_repair_detail_for_attempt(product_conversation, scope_binding.scope)
+        }
+    )
     ensures: ResourceRetirementFailed(product_conversation, attempt_id)
 
     @guidance

@@ -1545,6 +1545,14 @@ rule CloseObligationQueuesCancellationDuringSettlement {
     ensures: CloseSettlementCancellationQueued(product_conversation, attempt_id)
 }
 
+rule RepeatedCloseCancellationDuringSettlementIsIdempotent {
+    when: UserCancelsClose(product_conversation, attempt_id)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
+    ensures: CloseCancellationAlreadyPending(product_conversation, attempt_id)
+    ensures: not AdditionalCloseSettlementCancellationQueued(product_conversation, attempt_id)
+}
+
 rule CloseObligationBeginsSettlementWithoutBusyWork {
     when: CloseEvaluationRequested(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_blocker_resolution
@@ -1823,6 +1831,24 @@ rule ConversationLifecycleEnteredHistory {
         -- History.
 }
 
+rule UserStartsFollowUpFromHistory {
+    when: UserStartsFollowUpConversation(source_product_conversation, follow_up_objective)
+    requires: source_product_conversation.kind = ordinary
+    requires: source_product_conversation.lifecycle = history
+
+    let target = ProductConversation{kind: ordinary, lifecycle: open}
+    let target_conversation = Conversation{kind: Parent, product_conversation: target}
+
+    ensures: FollowUpProvisioningRequested(source_product_conversation, target, target_conversation, follow_up_objective)
+    ensures: ConversationSourceRelationCreated(target, source_product_conversation, follow_up)
+    ensures: NoSourceTranscriptInjected(target_conversation)
+
+    @guidance
+        -- Follow-up is a typed command from History. It creates a separate Open
+        -- aggregate with fresh environment intent and visible follow_up provenance;
+        -- the source transcript is not injected.
+}
+
 -- REQ-BED-032: User hard-deletes a conversation when the conversation is
 -- not busy. Cascade cleanup runs as direct function calls in the handler;
 -- the SSE wire event ConversationHardDeleted is emitted last for UI
@@ -1840,6 +1866,8 @@ rule UserHardDeletesConversationRule {
         -- Direct call: cascade_bash_on_delete (REQ-BASH-006).
     ensures: TmuxServerCleanedUp(aggregate)
         -- Direct call: cascade_tmux_on_delete (REQ-TMUX-007).
+    ensures: BrowserSessionsCleanedUp(aggregate)
+        -- Direct call: aggregate-scoped browser lifecycle cascade.
     ensures: ProjectWorktreeCleanedUp(aggregate)
         -- Direct call: cascade_projects_on_delete
         -- (specs/projects/ subscriber rule).
@@ -1922,6 +1950,17 @@ rule RejectHardDeleteWhileBusy {
     requires: conversation.is_busy
 
     ensures: HardDeleteRejected(conversation, reason: cancel_first)
+}
+
+rule RepeatedHardDeleteOfAbsentAggregateIsIdempotent {
+    when: UserHardDeletesProductConversation(product_conversation_id)
+    requires: not exists ProductConversation{id: product_conversation_id}
+    ensures: HardDeleteSucceeded(product_conversation_id)
+    ensures: ProductConversationRemainsAbsent(product_conversation_id)
+
+    @guidance
+        -- Retry reaches the same success post-state even after the aggregate row is
+        -- gone; idempotence does not require reloading a deleted row first.
 }
 
 -- REQ-BED-017: Mode change injects synthetic message

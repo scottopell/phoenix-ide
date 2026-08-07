@@ -798,12 +798,23 @@ rule StateChangeBroadcast {
 rule ProjectedTranscriptMessageClaimsRootSequence {
     when: msg: PersistedMessage.created
 
+    let root_conversation_id = DurableRootOf(msg.conversation_id)
+    let root_sequence_id = NextRootSequenceForPersistedMessage(msg)
+
     ensures: RootProjectedEventCommitted(
-        root_conversation_id: DurableRootOf(msg.conversation_id),
+        root_conversation_id: root_conversation_id,
         projected_kind: "message",
         payload_identity: msg.message_id,
-        root_sequence_id: NextRootSequenceForPersistedMessage(msg)
+        root_sequence_id: root_sequence_id
     )
+    ensures: AggregateBoundLiveEventEmitted(
+        root_conversation_id: root_conversation_id,
+        member_conversation_id: msg.conversation_id,
+        event_type: "message",
+        payload_identity: msg.message_id,
+        root_sequence_id: root_sequence_id
+    )
+    ensures: RootReplayEntryStored(root_conversation_id, root_sequence_id, "message", msg.message_id)
 
     @guidance
         -- Transcript row projection is itself the concrete root-stream producer for

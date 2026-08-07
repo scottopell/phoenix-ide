@@ -332,6 +332,10 @@ THE SYSTEM SHALL treat the source relation kind as a typed closed set that inclu
 AND SHALL preserve the recorded direction on the target conversation so the retrieved target can say which source conversation it points to
 AND SHALL treat that typed source relation as the only current provenance authority for source breadcrumbing and deleted-source reporting rather than consulting continuation topology or any legacy raw source-conversation-id field
 
+WHEN a reader presents predecessor/successor conversation relations
+THE SYSTEM SHALL derive those continuation relations directly from the authoritative `continued_in_conv_id` topology
+AND SHALL NOT persist a second continuation relation row or infer provenance from that topology
+
 WHEN the source conversation named by that relation has been permanently deleted
 THE SYSTEM SHALL preserve tombstone-grade source identity sufficient to distinguish a deleted source from an absent or never-recorded source
 AND SHALL return a typed deleted-source outcome that still identifies the deleted root and relation kind so surviving UI or retrieval consumers can render **Deleted source** rather than behaving as though no source existed
