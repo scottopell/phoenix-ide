@@ -186,7 +186,8 @@ impl WakeContractRepository {
                     CommitWakeCommandOutcome::Rejected(WakeRejection::ConflictingTransitionReuse),
                 ));
             }
-            validate_registration_replay_artifacts_tx(&mut tx, workflow_id).await?;
+            validate_registration_replay_artifacts_tx(&mut tx, workflow_id, &expected.new_state)
+                .await?;
             tx.rollback().await?;
             return Ok((
                 workflow_id,
@@ -764,20 +765,69 @@ fn lifecycle_columns(
 async fn validate_registration_replay_artifacts_tx(
     tx: &mut super::WorkflowTx<'_>,
     workflow_id: WorkflowId,
+    expected_state: &WakeState,
 ) -> DbResult<()> {
+    let WakeState::Present(expected_contract) = expected_state else {
+        return Err(DbError::Serialization(
+            "wake registration replay expected an aggregate".into(),
+        ));
+    };
+    let expected_transition_payload =
+        encode(&phoenix_workflow::wake_contract::WakeContractEvent {
+            contract_id: expected_contract.id.clone(),
+            head: expected_contract.head(),
+            transition_id: TransitionId(1),
+            registering_tool_use_id: expected_contract.registering_tool_use_id.clone(),
+            kind: phoenix_workflow::wake_contract::WakeEventKind::Registered {
+                registration_owner: expected_contract.registration_owner.clone(),
+                subject: expected_contract.subject.clone(),
+                delivery_transferability: expected_contract.delivery_transferability,
+                condition: expected_contract.condition.clone(),
+                registered_at: expected_contract.registered_at,
+                deadline: expected_contract.deadline,
+            },
+        })?;
+    let expected_effect = local_effect(
+        &transition(
+            &WakeState::Absent,
+            WakeCommand {
+                transition_id: TransitionId(1),
+                kind: WakeCommandKind::Register {
+                    id: expected_contract.id.clone(),
+                    registration_owner: expected_contract.registration_owner.clone(),
+                    registering_tool_use_id: expected_contract.registering_tool_use_id.clone(),
+                    subject: AuthorizedWakeSubject::work_scope_for_test(
+                        expected_contract.subject.clone(),
+                        expected_contract.registration_owner.clone(),
+                    ),
+                    condition: expected_contract.condition.clone(),
+                    registered_at: expected_contract.registered_at,
+                    deadline: expected_contract.deadline,
+                },
+            },
+        )
+        .owed_effects[0],
+        Version(1),
+    )?;
     let workflow_id = super::to_i64(workflow_id.0, "workflow_id")?;
     let registration_rows: i64 = sqlx::query_scalar(
         "SELECT
              (SELECT COUNT(*) FROM workflow_transitions
-              WHERE workflow_id = ?1 AND transition_id = 1) +
+              WHERE workflow_id = ?1 AND transition_id = 1
+                AND generation = 0 AND event_codec_family = ?3
+                AND event_codec_version = ?4 AND event_payload = ?5) +
              (SELECT COUNT(*) FROM workflow_effects
-              WHERE workflow_id = ?1 AND effect_id = ?2 AND kind = 'begin_observation')",
+              WHERE workflow_id = ?1 AND effect_id = ?2 AND kind = 'begin_observation'
+                AND intent_codec_family = ?3 AND intent_codec_version = ?4
+                AND intent_payload = ?6 AND generation = 0 AND role = 'Required'
+                AND capability_kind = 'ReclaimableObservation')",
     )
     .bind(workflow_id)
-    .bind(super::to_i64(
-        effect_id(TransitionId(1), WakeEffectRole::BeginObservation)?,
-        "effect_id",
-    )?)
+    .bind(super::to_i64(expected_effect.effect_id.0, "effect_id")?)
+    .bind(WAKE_CONTRACT_CODEC_FAMILY)
+    .bind(i64::from(WAKE_CONTRACT_CODEC_VERSION))
+    .bind(expected_transition_payload)
+    .bind(expected_effect.intent_payload)
     .fetch_one(&mut *tx.tx)
     .await?;
     if registration_rows != 2 {
@@ -951,8 +1001,8 @@ async fn validate_replay_artifacts_tx(
             bundle
         } else {
             let terminal_event_payload: Vec<u8> = sqlx::query_scalar(
-                "SELECT receipt_payload FROM workflow_receipts
-                 WHERE workflow_id = ?1 AND receipt_id = ?2",
+                "SELECT event_payload FROM workflow_transitions
+                     WHERE workflow_id = ?1 AND transition_id = ?2",
             )
             .bind(workflow_id)
             .bind(terminal_id)

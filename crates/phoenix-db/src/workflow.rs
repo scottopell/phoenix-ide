@@ -1736,13 +1736,16 @@ impl WorkflowRepository {
         &self,
         input: &RecordObservationInput,
     ) -> DbResult<RecordObservationResult> {
-        let mut tx = self.begin_tx().await?;
+        let mut tx = self.begin_immediate_tx().await?;
         #[cfg(not(test))]
         let input = RecordObservationInput {
             now: Timestamp(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |duration| duration.as_secs()),
+                u64::try_from(
+                    sqlx::query_scalar::<_, i64>("SELECT CAST(strftime('%s','now') AS INTEGER)")
+                        .fetch_one(&mut *tx.tx)
+                        .await?,
+                )
+                .map_err(|_| DbError::Serialization("repository time is negative".into()))?,
             ),
             ..input.clone()
         };
