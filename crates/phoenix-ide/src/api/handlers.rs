@@ -3846,8 +3846,6 @@ async fn send_chat(
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
-    let _admission_guard = admission.lock().await;
     let service = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
         state.runtime.clone(),

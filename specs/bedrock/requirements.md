@@ -424,7 +424,8 @@ AND the request SHALL NOT include any tool capabilities
 AND the request SHALL frame the summary as an operational handoff to a fresh agent that resumes in the same working directory with no memory of the session
 AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
 AND the request SHALL preserve the prior tool history as text rather than discarding it
-AND the request SHALL be bounded to fit the context window and any request-shape limits declared by the selected provider route
+AND the request SHALL be locally bounded against the context window and any request-shape limits declared by the selected provider route
+AND provider rejection SHALL remain authoritative when the provider's effective limits differ from local budgeting
 AND bounded history SHALL retain a contiguous newest suffix and begin with a user-role message when non-empty
 AND the system SHALL persist a stable operation identity and the retry inputs before requesting the summary
 
@@ -447,7 +448,7 @@ THE SYSTEM SHALL reject the request as an invalid cancellation state
 AND SHALL NOT abort the in-flight continuation request
 AND SHALL remain awaiting the continuation summary
 
-**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. The prior tool history is flattened to text rather than deleted so the summary can draw on the actual work record, and the request is bounded to fit the window so it cannot overflow. An empty summary would silently seed a blank continuation, so it is treated as a recoverable failure. Stable operation identity permits provider calls to be retried while summary commit and continuation remain exactly once.
+**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. The prior tool history is flattened to text rather than deleted so the summary can draw on the actual work record. Local bounds reduce overflow risk, while provider rejection remains recoverable because provider tokenization and effective route limits can differ from local budgeting. An empty summary would silently seed a blank continuation, so it is treated as a recoverable failure. Stable operation identity permits provider calls to be retried while summary commit and continuation remain exactly once.
 
 ---
 

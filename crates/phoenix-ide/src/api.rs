@@ -105,16 +105,9 @@ struct AgentFacingWakeRegistrationAvailable(bool);
 const AGENT_FACING_WAKE_REGISTRATION: AgentFacingWakeRegistrationAvailable =
     AgentFacingWakeRegistrationAvailable(false);
 
-async fn reconcile_startup_continuations(
+async fn resume_startup_continuations(
     runtime: &Arc<RuntimeManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let reconciled = runtime
-        .reconcile_legacy_half_committed_continuations()
-        .await
-        .map_err(std::io::Error::other)?;
-    if reconciled > 0 {
-        tracing::info!(reconciled, "reconciled legacy half-committed continuations");
-    }
     let resumed = runtime
         .resume_pending_continuations()
         .await
@@ -181,7 +174,7 @@ impl AppState {
         }
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
-        reconcile_startup_continuations(&runtime).await?;
+        resume_startup_continuations(&runtime).await?;
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
         // Retrieval works on existing index rows while this sweep runs and

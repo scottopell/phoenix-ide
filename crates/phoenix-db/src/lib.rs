@@ -16,7 +16,6 @@ use phoenix_core::domain::creation_protocol::{
     CreationStage, CreationStatus, CreationWorkerId,
 };
 use phoenix_core::domain::db_schema as schema;
-use phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID;
 use phoenix_core::work_scope::{
     AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeRetirementBlocker,
     WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -277,68 +276,6 @@ pub(crate) async fn commit_continuation_tx(
         return Ok(ContinuationCommitOutcome::Stale);
     }
     Ok(ContinuationCommitOutcome::Applied)
-}
-
-pub(crate) async fn reconcile_legacy_half_committed_continuation_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    conversation_id: &str,
-    state_updated_at: DateTime<Utc>,
-) -> DbResult<Option<String>> {
-    let row = sqlx::query("SELECT state FROM conversations WHERE id = ?1")
-        .bind(conversation_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
-    let persisted_json: String = row.get("state");
-    let persisted: ConvState = serde_json::from_str(&persisted_json)
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
-    if !matches!(
-        persisted,
-        ConvState::AwaitingContinuation { ref request }
-            if request.operation_id == LEGACY_CONTINUATION_OPERATION_ID
-    ) {
-        return Ok(None);
-    }
-
-    let row = sqlx::query(
-        "SELECT content FROM messages
-         WHERE conversation_id = ?1 AND message_type = 'continuation'
-         ORDER BY sequence_id DESC LIMIT 1",
-    )
-    .bind(conversation_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let content_json: String = row.get("content");
-    let value = serde_json::from_str(&content_json)
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let content = MessageContent::from_stored_json(MessageType::Continuation, value)
-        .map_err(DbError::Serialization)?;
-    let MessageContent::Continuation(summary) = content else {
-        return Ok(None);
-    };
-    let summary = summary.summary;
-    let target = ConvState::ContextExhausted {
-        summary: summary.clone(),
-    };
-    let target_json = serde_json::to_string(&target)
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let updated = sqlx::query(
-        "UPDATE conversations
-         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
-         WHERE id = ?5 AND state = ?6",
-    )
-    .bind(target_json)
-    .bind(conv_state_kind(&target))
-    .bind(state_updated_at.to_rfc3339())
-    .bind(Utc::now().to_rfc3339())
-    .bind(conversation_id)
-    .bind(persisted_json)
-    .execute(&mut **tx)
-    .await?;
-    Ok((updated.rows_affected() == 1).then_some(summary))
 }
 
 #[derive(Debug, Clone)]

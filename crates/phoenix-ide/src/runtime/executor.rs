@@ -1714,8 +1714,8 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    acknowledged_event_rx:
-        mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    continuation_retry_rx:
+        mpsc::Receiver<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -1955,7 +1955,7 @@ where
         let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
-        let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
+        let (_continuation_retry_tx, continuation_retry_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
         let clearable_names = Arc::new(tool_executor.clearable_tool_names());
@@ -1980,7 +1980,7 @@ where
             event_rx,
             event_tx,
             broadcast_tx,
-            acknowledged_event_rx,
+            continuation_retry_rx,
             tool_cancel_token: None,
             llm_task_handle: None,
             active_llm_attempt: None,
@@ -2105,11 +2105,11 @@ where
     }
 
     /// Set the parent event channel (for sub-agents)
-    pub fn with_acknowledged_event_receiver(
+    pub fn with_continuation_retry_receiver(
         mut self,
-        receiver: mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+        receiver: mpsc::Receiver<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
     ) -> Self {
-        self.acknowledged_event_rx = receiver;
+        self.continuation_retry_rx = receiver;
         self
     }
 
@@ -2241,16 +2241,11 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
-                Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
-                    let result = self.process_event(event).await;
-                    let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
-                    if terminal {
-                        self.emit_terminal_lifecycle_event().await;
-                    }
+                Some((operation_id, acknowledgement)) = self.continuation_retry_rx.recv() => {
+                    let result = self
+                        .process_event(Event::UserTriggerContinuation { operation_id })
+                        .await;
                     let _ = acknowledgement.send(result);
-                    if terminal {
-                        return;
-                    }
                 }
                 Some(event) = self.event_rx.recv() => {
                     // Eviction shutdown signal — exit cleanly so the broadcaster

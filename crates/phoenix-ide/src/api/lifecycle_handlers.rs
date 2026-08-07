@@ -658,13 +658,12 @@ pub(crate) async fn abandon_task(
     );
     if let Err(error) = state
         .runtime
-        .send_event_and_wait_for_state(
+        .send_event(
             &id,
             Event::TaskResolved {
                 system_message,
                 repo_root: repo_root_str,
             },
-            |settled| matches!(settled, ConvState::Terminal),
         )
         .await
     {
@@ -769,13 +768,12 @@ pub(crate) async fn mark_merged(
 
     if let Err(error) = state
         .runtime
-        .send_event_and_wait_for_state(
+        .send_event(
             &id,
             Event::TaskResolved {
                 system_message,
                 repo_root: repo_root_str,
             },
-            |settled| matches!(settled, ConvState::Terminal),
         )
         .await
     {
