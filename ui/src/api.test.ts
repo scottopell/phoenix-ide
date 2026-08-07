@@ -90,7 +90,7 @@ describe('api.continueConversation', () => {
   });
 });
 
-describe('conversation metadata client', () => {
+describe('conversation route client', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
   });
@@ -99,30 +99,30 @@ describe('conversation metadata client', () => {
     vi.unstubAllGlobals();
   });
 
-  it('GETs metadata by id without fetching messages', async () => {
+  it('GETs route by id', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => ({ conversation: { id: 'conv-1' }, agent_working: false, presentation_mode: 'idle', context_window_size: 0 }),
+      json: async () => ({ id: 'conv-1', slug: 'slug-1' }),
     } as unknown as Response);
 
-    await api.getConversationMeta('conv/1');
+    await api.getConversationRoute('conv/1');
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/conv%2F1/meta');
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/conv%2F1/route');
   });
 
-  it('GETs metadata by slug without fetching messages', async () => {
+  it('GETs route by slug', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => ({ conversation: { id: 'conv-1' }, agent_working: false, presentation_mode: 'idle', context_window_size: 0 }),
+      json: async () => ({ id: 'conv-1', slug: 'slug one' }),
     } as unknown as Response);
 
-    await api.getConversationMetaBySlug('slug one');
+    await api.getConversationRouteBySlug('slug one');
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/by-slug/slug%20one/meta');
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/by-slug/slug%20one/route');
   });
 });
 

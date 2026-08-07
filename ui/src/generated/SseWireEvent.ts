@@ -4,6 +4,7 @@ import type { ErrorPresentation } from "./ErrorPresentation";
 import type { LlmAttemptReason } from "./LlmAttemptReason";
 import type { MessageSnapshotMode } from "./MessageSnapshotMode";
 import type { QuotaDetails } from "./QuotaDetails";
+import type { TranscriptCoverage } from "./TranscriptCoverage";
 import type { WorkScopeInventory } from "./WorkScopeInventory";
 
 /**
@@ -35,7 +36,7 @@ conversation: unknown,
  * valibot schema validates each element against `MessageSchema`
  * and transforms to `Message` at that boundary.
  */
-messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, project_name: string | null, transcript_generation: number, message_snapshot: MessageSnapshotMode, 
+messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, project_name: string | null, transcript_generation: number, message_snapshot: MessageSnapshotMode, transcript_coverage: TranscriptCoverage, 
 /**
  * `ReplayRing` anchor: the seq of the last persisted Message at
  * subscribe time. Every entry in `pending_events` has

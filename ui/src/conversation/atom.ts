@@ -199,6 +199,7 @@ export interface InitPayload {
 
   pendingTruncated: boolean;
   messageSnapshot?: 'full' | 'suffix';
+  transcriptCoverage: 'complete' | 'tail' | 'preserve';
 }
 
 // Task 02675: every wire-originated SSE action carries a `sequenceId` from
@@ -1165,13 +1166,17 @@ export function conversationReducer(
       const hadMessagesBeforeInit = atom.messages.length > 0;
       const generationChanged = atom.transcriptGeneration !== null && atom.transcriptGeneration !== p.transcriptGeneration;
       const isFreshConnect = atom.lastAppliedEventSeq === 0 || generationChanged;
-      const snapshotIsSuffix = p.messageSnapshot === 'suffix';
-      const mergesMessageSuffix = snapshotIsSuffix && knownGenerationMatches;
-      const nextTranscriptCoverage: 'tail' | 'complete' = snapshotIsSuffix
-        ? (knownGenerationMatches && hadMessagesBeforeInit ? atom.transcriptCoverage : 'tail')
-        : 'complete';
+      const preservesTranscript = p.transcriptCoverage === 'preserve' && knownGenerationMatches;
+      const mergesMessageSuffix = p.transcriptCoverage === 'tail' && knownGenerationMatches;
+      const nextTranscriptCoverage: 'tail' | 'complete' = preservesTranscript
+        ? atom.transcriptCoverage
+        : p.transcriptCoverage === 'complete'
+          ? 'complete'
+          : 'tail';
       let mergedMessages: Message[];
-      if (mergesMessageSuffix) {
+      if (preservesTranscript) {
+        mergedMessages = atom.messages;
+      } else if (mergesMessageSuffix) {
         mergedMessages = mergeMessagesByIdentity(atom.messages, p.messages);
       } else {
         mergedMessages = [...p.messages].sort((left, right) => left.sequence_id - right.sequence_id);

@@ -147,29 +147,30 @@ export interface ConnectionInfo {
   retryNow: () => void;
 }
 
-export type InitialSseRequestMode =
-  | { kind: 'full' }
-  | { kind: 'messages_after_floor'; afterMessageFloor: number; transcriptGeneration: number };
-
-
 interface UseConnectionOptions {
   conversationId: string | undefined;
   /** Dispatch SSE events directly to the conversation atom. */
   dispatch: Dispatch<SSEAction>;
   /** Latest event-sequence cursor already applied by the atom, if any. */
   getLastAppliedEventSeq?: () => number;
-  /** Optional demand-driven cold-load mode used only before an event cursor exists. */
-  getInitialRequestMode?: () => InitialSseRequestMode;
+  /** Generation paired with a replay cursor so the server may safely preserve the transcript. */
+  getTranscriptGeneration?: () => number | null;
+  /** Called only after an init has passed runtime validation and stream identity checks. */
+  onValidatedInit?: (payload: InitPayload) => void;
 }
 
-function buildStreamUrl(conversationId: string, lastAppliedEventSeq: number, initialRequestMode?: InitialSseRequestMode, openId?: string): string {
+function buildStreamUrl(
+  conversationId: string,
+  lastAppliedEventSeq: number,
+  transcriptGeneration: number | null,
+  openId?: string,
+): string {
   const params = new URLSearchParams();
   if (lastAppliedEventSeq > 0) {
     params.set('after_event_sequence', String(lastAppliedEventSeq));
-  } else if (initialRequestMode?.kind === 'messages_after_floor') {
-    params.set('init_mode', 'messages_after_floor');
-    params.set('after_message_floor', String(initialRequestMode.afterMessageFloor));
-    params.set('transcript_generation', String(initialRequestMode.transcriptGeneration));
+    if (transcriptGeneration !== null) {
+      params.set('transcript_generation', String(transcriptGeneration));
+    }
   }
   if (openId) params.set('open_id', openId);
   const query = params.toString();
@@ -198,6 +199,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
     messageSnapshot: raw.message_snapshot,
+    transcriptCoverage: raw.transcript_coverage,
   };
 }
 
@@ -215,7 +217,8 @@ export function useConnection({
   conversationId,
   dispatch,
   getLastAppliedEventSeq,
-  getInitialRequestMode,
+  getTranscriptGeneration,
+  onValidatedInit,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -246,7 +249,8 @@ export function useConnection({
   const latestConversationRef = useRef<import('../api').Conversation | null>(null);
   const latestPhaseRef = useRef<import('../api').ConversationState | null>(null);
   const getLastAppliedEventSeqRef = useRef(getLastAppliedEventSeq);
-  const getInitialRequestModeRef = useRef(getInitialRequestMode);
+  const getTranscriptGenerationRef = useRef(getTranscriptGeneration);
+  const onValidatedInitRef = useRef(onValidatedInit);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -261,8 +265,12 @@ export function useConnection({
   }, [getLastAppliedEventSeq]);
 
   useEffect(() => {
-    getInitialRequestModeRef.current = getInitialRequestMode;
-  }, [getInitialRequestMode]);
+    getTranscriptGenerationRef.current = getTranscriptGeneration;
+  }, [getTranscriptGeneration]);
+
+  useEffect(() => {
+    onValidatedInitRef.current = onValidatedInit;
+  }, [onValidatedInit]);
 
   const getContext = useCallback((): TransitionContext => ({
     browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -342,9 +350,7 @@ export function useConnection({
           dispatchRef.current({ type: 'connection_opened', epoch });
 
           const lastAppliedEventSeq = getLastAppliedEventSeqRef.current?.() ?? 0;
-          const initialRequestMode = lastAppliedEventSeq > 0
-            ? undefined
-            : getInitialRequestModeRef.current?.();
+          const transcriptGeneration = getTranscriptGenerationRef.current?.() ?? null;
           const openId = generateUUID();
           const previousAttempt = openAttemptRef.current;
           const openAttempt = previousAttempt?.conversationId === convId
@@ -352,7 +358,7 @@ export function useConnection({
             : 0;
           openAttemptRef.current = { conversationId: convId, attempt: openAttempt };
           const measurement = new ConversationOpenMeasurement(openId, openAttempt);
-          const url = buildStreamUrl(convId, lastAppliedEventSeq, initialRequestMode, openId);
+          const url = buildStreamUrl(convId, lastAppliedEventSeq, transcriptGeneration, openId);
           const es = new EventSource(url);
           es.addEventListener('open', () => measurement.nativeOpen());
           eventSourceRef.current = es;
@@ -398,14 +404,22 @@ export function useConnection({
               return;
             }
 
-            dispatchMachineRef.current({ type: 'SSE_OPEN' });
             const payload = transformInitData(res.data);
+            if (payload.conversation.id !== convId) {
+              stampedDispatch({
+                type: 'sse_error',
+                error: { type: 'BackendError', message: 'SSE init conversation did not match the resolved route' },
+              });
+              return;
+            }
+            dispatchMachineRef.current({ type: 'SSE_OPEN' });
             latestConversationRef.current = payload.conversation;
             latestPhaseRef.current = payload.phase;
             stampedDispatch({
               type: 'sse_init',
               payload,
             });
+            onValidatedInitRef.current?.(payload);
             const telemetry = measurement.connected();
             if (telemetry) reportConversationOpen(telemetry);
           }, () => measurement.initReceived());
