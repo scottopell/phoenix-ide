@@ -365,7 +365,8 @@ CREATE TABLE wake_contract_identity_bindings (
     CHECK ((lifecycle_kind IN ('Observing', 'TerminalProposed')) = (terminal_occurred_at IS NULL)),
     CHECK ((lifecycle_kind = 'Forgotten') = (forgotten_reason IS NOT NULL)),
     CHECK (lifecycle_kind != 'Fired' OR terminal_occurred_at <= deadline),
-    CHECK (lifecycle_kind != 'Expired' OR terminal_occurred_at = deadline)
+    CHECK (lifecycle_kind != 'Expired' OR terminal_occurred_at = deadline),
+    CHECK (lifecycle_kind != 'Cancelled' OR terminal_occurred_at <= deadline)
 ) WITHOUT ROWID;
 ";
 

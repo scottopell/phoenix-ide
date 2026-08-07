@@ -5,7 +5,8 @@ use super::{
 };
 use crate::{DbError, DbResult};
 use phoenix_workflow::wake_contract::{
-    transition, WakeCommand, WakeDisposition, WakeEffectRole, WakeRejection, WakeState,
+    transition, WakeCommand, WakeCommandKind, WakeDisposition, WakeEffectRole, WakeRejection,
+    WakeState,
 };
 use phoenix_workflow::{
     AuthorityOutcome, BarrierId, BarrierStatus, CommitOutcome, DeliveryId, EffectId, EffectRole,
@@ -93,6 +94,42 @@ impl WakeContractRepository {
         &self,
         input: &CommitWakeCommandInput,
     ) -> DbResult<CommitWakeCommandOutcome> {
+        if let WakeCommandKind::ObserveTerminal { authority, .. }
+        | WakeCommandKind::Reconcile {
+            observation:
+                phoenix_workflow::wake_contract::ReconcileObservation::ProtocolFailure {
+                    authority, ..
+                },
+            ..
+        } = &input.command.kind
+        {
+            let authoritative: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workflow_attempts a
+                 JOIN workflow_effects e
+                   ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id
+                 WHERE a.workflow_id = ?1 AND a.attempt_id = ?2
+                   AND (
+                       a.status IN ('Begun', 'ObservationRecorded')
+                       OR (a.status = 'AuthorityLost' AND EXISTS (
+                           SELECT 1 FROM workflow_authoritative_observations o
+                           WHERE o.workflow_id = a.workflow_id
+                             AND o.attempt_id = a.attempt_id
+                       ))
+                   )
+                   AND e.generation = (
+                       SELECT generation FROM workflows WHERE workflow_id = ?1
+                   )",
+            )
+            .bind(super::to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(super::to_i64(authority.attempt_id().0, "attempt_id")?)
+            .fetch_one(&self.workflow_repo.pool)
+            .await?;
+            if authoritative != 1 {
+                return Ok(CommitWakeCommandOutcome::Rejected(
+                    WakeRejection::ObservationAuthorityMismatch,
+                ));
+            }
+        }
         #[cfg(not(test))]
         if matches!(
             input.command.kind,
@@ -855,16 +892,17 @@ async fn revoke_observation_authority_tx(
     tx: &mut super::WorkflowTx<'_>,
     workflow_id: WorkflowId,
 ) -> DbResult<()> {
+    let workflow_id = super::to_i64(workflow_id.0, "workflow_id")?;
     sqlx::query(
         "UPDATE workflow_attempts
          SET status = 'AuthorityLost'
          WHERE workflow_id = ?1 AND status IN ('Begun', 'ObservationRecorded')",
     )
-    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+    .bind(workflow_id)
     .execute(&mut *tx.tx)
     .await?;
     sqlx::query("DELETE FROM workflow_reclaimable_leases WHERE workflow_id = ?1")
-        .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+        .bind(workflow_id)
         .execute(&mut *tx.tx)
         .await?;
     Ok(())
@@ -1261,6 +1299,46 @@ mod tests {
             .unwrap()
     }
 
+    async fn start_observation_attempt(repo: &WakeContractRepository, workflow_id: WorkflowId) {
+        repo.workflow_repo
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id,
+                effect_id: EffectId(9),
+                attempt_id: phoenix_workflow::AttemptId(1),
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(11),
+                lease_until: Some(phoenix_workflow::LeaseExpiry(100)),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn persist_observation_before_fence(
+        repo: &WakeContractRepository,
+        workflow_id: WorkflowId,
+    ) {
+        start_observation_attempt(repo, workflow_id).await;
+        let authority = crate::workflow::LocalAttemptAuthority {
+            workflow_id,
+            effect_id: EffectId(9),
+            attempt_id: phoenix_workflow::AttemptId(1),
+            declared_workflow_version: Version(1),
+            generation: Generation(0),
+            process_incarnation: ProcessIncarnation(1),
+        };
+        repo.workflow_repo
+            .record_observation(&crate::workflow::RecordObservationInput {
+                authority,
+                observation_id: 1,
+                observation_codec: codec(),
+                observation_payload: vec![1],
+                observed_at: Timestamp(19),
+                now: Timestamp(19),
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn registration_allocates_from_the_shared_workflow_sequence_atomically() {
         let (_dir, repo, _) = open_repo_pair().await;
@@ -1442,6 +1520,7 @@ mod tests {
         let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
             panic!("registration should apply")
         };
+        start_observation_attempt(&repo, WorkflowId(10)).await;
         let (proposal, proof) = propose_cancel(&state, WorkflowId(10));
         let proposed = repo.commit_wake_command(&proposal).await.unwrap();
         let CommitWakeCommandOutcome::Applied {
@@ -1451,6 +1530,14 @@ mod tests {
         else {
             panic!("proposal should apply")
         };
+        let attempt_status: String = sqlx::query_scalar(
+            "SELECT status FROM workflow_attempts
+             WHERE workflow_id = 10 AND attempt_id = 1",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(attempt_status, "AuthorityLost");
         let finalization = finalize_proposal(&proposed_state, WorkflowId(10), proof.clone());
         assert!(matches!(
             repo.commit_wake_command(&finalization).await,
@@ -1468,7 +1555,7 @@ mod tests {
             .begin_attempt(&BeginAttemptInput {
                 workflow_id: WorkflowId(10),
                 effect_id: EffectId(u64::try_from(fence_effect_id).unwrap()),
-                attempt_id: phoenix_workflow::AttemptId(1),
+                attempt_id: phoenix_workflow::AttemptId(2),
                 process_incarnation: ProcessIncarnation(1),
                 now: Timestamp(6),
                 lease_until: Some(phoenix_workflow::LeaseExpiry(100)),
@@ -1480,7 +1567,7 @@ mod tests {
                 authority: begun.authority.unwrap(),
                 receipt_id: ReceiptId(99),
                 delivery_id: DeliveryId(99),
-                attempt_id: Some(phoenix_workflow::AttemptId(1)),
+                attempt_id: Some(phoenix_workflow::AttemptId(2)),
                 origin: ReceiptOrigin::Execution,
                 receipt_codec: codec(),
                 receipt_payload: vec![0],
@@ -1520,6 +1607,7 @@ mod tests {
         let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
             panic!("registration should apply")
         };
+        persist_observation_before_fence(&repo, WorkflowId(11)).await;
         let (proposal, _) = propose_cancel(&state, WorkflowId(11));
         let proposed = repo.commit_wake_command(&proposal).await.unwrap();
         let CommitWakeCommandOutcome::Applied {
@@ -1641,6 +1729,7 @@ mod tests {
         let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
             panic!("registration should apply")
         };
+        start_observation_attempt(&repo, WorkflowId(5)).await;
         let terminal = observe(&state, WorkflowId(5));
         assert!(matches!(
             repo.commit_wake_command(&terminal).await.unwrap(),
@@ -1739,6 +1828,7 @@ mod tests {
             panic!("registration should apply")
         };
         repo.fail_after_transition_once(WorkflowId(6));
+        start_observation_attempt(&repo, WorkflowId(6)).await;
         assert!(repo
             .commit_wake_command(&observe(&state, WorkflowId(6)))
             .await

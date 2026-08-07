@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 const MAX_WAKE_DURATION_SECONDS: u64 = 1_800;
 const MAX_WAKE_TRANSITION_ID: u64 = (i64::MAX as u64 - 4) / 8;
+const MAX_WAKE_TIMESTAMP: u64 = i64::MAX as u64;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -686,6 +687,7 @@ pub enum WakeRejection {
     ContractMissing,
     InvalidDeadline,
     InvalidTransitionId,
+    InvalidTimestamp,
     StaleHead {
         expected: WakeHeadToken,
         actual: WakeHeadToken,
@@ -868,7 +870,9 @@ fn register(
         transferability,
         ..
     } = subject;
-    let valid_deadline = deadline > registered_at
+    let valid_deadline = registered_at.0 <= MAX_WAKE_TIMESTAMP
+        && deadline.0 <= MAX_WAKE_TIMESTAMP
+        && deadline > registered_at
         && deadline
             .0
             .checked_sub(registered_at.0)
@@ -957,6 +961,12 @@ fn transition_present(
     }
 
     let committed_command = command.clone();
+    if command_timestamp(&command).is_some_and(|timestamp| timestamp.0 > MAX_WAKE_TIMESTAMP) {
+        return rejected(
+            &WakeState::Present(contract.clone()),
+            WakeRejection::InvalidTimestamp,
+        );
+    }
     match &command {
         WakeCommandKind::Reconcile {
             observation: ReconcileObservation::ResourceUnavailable { authority, .. },
@@ -1232,9 +1242,14 @@ fn transition_present(
             &WakeState::Present(contract.clone()),
             WakeRejection::TerminalArbitrationPending,
         ),
-        (WakeLifecycle::Closed(_), WakeCommandKind::TransferDeliveryOwner { authority, .. }) => {
-            transfer_delivery_owner(contract, transition_id, &committed_command, authority)
-        }
+        (
+            WakeLifecycle::Closed(
+                CanonicalTerminal::Fired { .. }
+                | CanonicalTerminal::Expired { .. }
+                | CanonicalTerminal::Forgotten { .. },
+            ),
+            WakeCommandKind::TransferDeliveryOwner { authority, .. },
+        ) => transfer_delivery_owner(contract, transition_id, &committed_command, authority),
         (WakeLifecycle::Closed(_), _) => rejected(
             &WakeState::Present(contract.clone()),
             WakeRejection::AlreadyClosed,
@@ -1380,6 +1395,26 @@ fn advanced(
     next.head_transition_id = transition_id;
     next.head_command_fingerprint = WakeCommandFingerprint::for_command(command);
     next
+}
+
+fn command_timestamp(command: &WakeCommandKind) -> Option<Timestamp> {
+    match command {
+        WakeCommandKind::Register { registered_at, .. } => Some(*registered_at),
+        WakeCommandKind::ObserveTerminal { evidence, .. } => Some(evidence.occurred_at),
+        WakeCommandKind::Cancel { occurred_at, .. }
+        | WakeCommandKind::Reconcile {
+            observation:
+                ReconcileObservation::ResourceUnavailable { occurred_at, .. }
+                | ReconcileObservation::ProtocolFailure { occurred_at, .. },
+            ..
+        } => Some(*occurred_at),
+        WakeCommandKind::DeadlineElapsed { .. }
+        | WakeCommandKind::TransferDeliveryOwner { .. }
+        | WakeCommandKind::Reconcile {
+            observation: ReconcileObservation::ObservationAuthorityFenced(_),
+            ..
+        } => None,
+    }
 }
 
 fn observation_authority_matches(
