@@ -1050,6 +1050,7 @@ fn transition_present(
             transition_id,
             &committed_command,
             ProposedTerminal::Cancelled { cause, occurred_at },
+            true,
         ),
         (WakeLifecycle::Open(OpenWakeLifecycle::Observing), WakeCommandKind::Cancel { .. }) => {
             rejected(
@@ -1071,6 +1072,7 @@ fn transition_present(
                 ProposedTerminal::Expired {
                     deadline: contract.deadline,
                 },
+                false,
             )
         }
         (
@@ -1295,8 +1297,12 @@ fn propose(
     transition_id: TransitionId,
     command: &WakeCommandKind,
     proposal: ProposedTerminal,
+    bump_generation: bool,
 ) -> WakeTransition {
     let mut next = advanced(contract, transition_id, command);
+    if bump_generation {
+        next.generation = next.generation.next();
+    }
     next.lifecycle = WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(TerminalProposal {
         terminal: proposal.clone(),
         transition_id,

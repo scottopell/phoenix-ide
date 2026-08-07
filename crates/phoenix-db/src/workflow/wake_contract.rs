@@ -5,7 +5,8 @@ use super::{
 };
 use crate::{DbError, DbResult};
 use phoenix_workflow::wake_contract::{
-    transition, WakeCommand, WakeCommandKind, WakeDisposition, WakeEffectRole, WakeRejection,
+    transition, AuthorizedWakeSubject, RegisteringToolUseId, WakeCommand, WakeCommandKind,
+    WakeCondition, WakeContractId, WakeDisposition, WakeEffectRole, WakeOwner, WakeRejection,
     WakeState,
 };
 use phoenix_workflow::{
@@ -25,7 +26,12 @@ pub struct CommitWakeCommandInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterWakeContractInput {
-    pub command: WakeCommand,
+    pub registration_owner: WakeOwner,
+    pub registering_tool_use_id: RegisteringToolUseId,
+    pub subject: AuthorizedWakeSubject,
+    pub condition: WakeCondition,
+    pub registered_at: phoenix_workflow::Timestamp,
+    pub deadline: phoenix_workflow::Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,9 +71,12 @@ impl WakeContractRepository {
     ) -> DbResult<ReceiptAcceptanceResult> {
         let mut tx = self.workflow_repo.begin_immediate_tx().await?;
         let is_fence: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM workflow_effects
-             WHERE workflow_id = ?1 AND effect_id = ?2
-               AND kind = 'fence_observation_authority'",
+            "SELECT COUNT(*) FROM workflow_effects e
+             JOIN workflows w ON w.workflow_id = e.workflow_id
+             JOIN wake_contract_identity_bindings b ON b.workflow_id = e.workflow_id
+             WHERE e.workflow_id = ?1 AND e.effect_id = ?2
+               AND e.kind = 'fence_observation_authority'
+               AND w.profile_kind = 'wake.contract' AND w.profile_version = 1",
         )
         .bind(super::to_i64(input.authority.workflow_id.0, "workflow_id")?)
         .bind(super::to_i64(input.authority.effect_id.0, "effect_id")?)
@@ -94,42 +103,6 @@ impl WakeContractRepository {
         &self,
         input: &CommitWakeCommandInput,
     ) -> DbResult<CommitWakeCommandOutcome> {
-        if let WakeCommandKind::ObserveTerminal { authority, .. }
-        | WakeCommandKind::Reconcile {
-            observation:
-                phoenix_workflow::wake_contract::ReconcileObservation::ProtocolFailure {
-                    authority, ..
-                },
-            ..
-        } = &input.command.kind
-        {
-            let authoritative: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM workflow_attempts a
-                 JOIN workflow_effects e
-                   ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id
-                 WHERE a.workflow_id = ?1 AND a.attempt_id = ?2
-                   AND (
-                       a.status IN ('Begun', 'ObservationRecorded')
-                       OR (a.status = 'AuthorityLost' AND EXISTS (
-                           SELECT 1 FROM workflow_authoritative_observations o
-                           WHERE o.workflow_id = a.workflow_id
-                             AND o.attempt_id = a.attempt_id
-                       ))
-                   )
-                   AND e.generation = (
-                       SELECT generation FROM workflows WHERE workflow_id = ?1
-                   )",
-            )
-            .bind(super::to_i64(input.workflow_id.0, "workflow_id")?)
-            .bind(super::to_i64(authority.attempt_id().0, "attempt_id")?)
-            .fetch_one(&self.workflow_repo.pool)
-            .await?;
-            if authoritative != 1 {
-                return Ok(CommitWakeCommandOutcome::Rejected(
-                    WakeRejection::ObservationAuthorityMismatch,
-                ));
-            }
-        }
         #[cfg(not(test))]
         if matches!(
             input.command.kind,
@@ -139,7 +112,13 @@ impl WakeContractRepository {
                 "wake registration requires register_wake_contract".into(),
             ));
         }
-        let tx = self.workflow_repo.begin_immediate_tx().await?;
+        let mut tx = self.workflow_repo.begin_immediate_tx().await?;
+        if !validate_observation_authority_tx(&mut tx, input).await? {
+            tx.rollback().await?;
+            return Ok(CommitWakeCommandOutcome::Rejected(
+                WakeRejection::ObservationAuthorityMismatch,
+            ));
+        }
         self.commit_wake_command_in_tx(tx, input.workflow_id, &input.command)
             .await
     }
@@ -148,26 +127,34 @@ impl WakeContractRepository {
         &self,
         input: &RegisterWakeContractInput,
     ) -> DbResult<(WorkflowId, CommitWakeCommandOutcome)> {
-        let phoenix_workflow::wake_contract::WakeCommandKind::Register { id, .. } =
-            &input.command.kind
-        else {
-            return Err(DbError::Serialization(
-                "register_wake_contract requires a register command".into(),
-            ));
-        };
         let mut tx = self.workflow_repo.begin_immediate_tx().await?;
         let existing_workflow_id: Option<i64> = sqlx::query_scalar(
-            "SELECT workflow_id FROM wake_contract_identity_bindings WHERE contract_id = ?1",
+            "SELECT workflow_id FROM wake_contract_identity_bindings
+             WHERE registration_owner = ?1 AND registering_tool_use_id = ?2",
         )
-        .bind(id.as_str())
+        .bind(input.registration_owner.as_str())
+        .bind(input.registering_tool_use_id.as_str())
         .fetch_optional(&mut *tx.tx)
         .await?;
         let workflow_id = match existing_workflow_id {
             Some(value) => WorkflowId(super::to_u64(value, "workflow_id")?),
             None => next_global_workflow_id_tx(&mut tx).await?,
         };
+        let command = WakeCommand {
+            transition_id: TransitionId(1),
+            kind: WakeCommandKind::Register {
+                id: WakeContractId::new(format!("wake-{}", workflow_id.0))
+                    .ok_or_else(|| DbError::Serialization("allocated wake ID is empty".into()))?,
+                registration_owner: input.registration_owner.clone(),
+                registering_tool_use_id: input.registering_tool_use_id.clone(),
+                subject: input.subject.clone(),
+                condition: input.condition.clone(),
+                registered_at: input.registered_at,
+                deadline: input.deadline,
+            },
+        };
         let outcome = self
-            .commit_wake_command_in_tx(tx, workflow_id, &input.command)
+            .commit_wake_command_in_tx(tx, workflow_id, &command)
             .await?;
         Ok((workflow_id, outcome))
     }
@@ -404,6 +391,72 @@ impl WakeContractRepository {
             .lock()
             .expect("wake contract failpoint lock") = Some(workflow_id);
     }
+}
+
+async fn validate_observation_authority_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    input: &CommitWakeCommandInput,
+) -> DbResult<bool> {
+    let (authority, recorded_evidence) = match &input.command.kind {
+        WakeCommandKind::ObserveTerminal {
+            authority,
+            evidence,
+            ..
+        } => (authority, Some(evidence)),
+        WakeCommandKind::Reconcile {
+            observation:
+                phoenix_workflow::wake_contract::ReconcileObservation::ProtocolFailure {
+                    authority, ..
+                },
+            ..
+        } => (authority, None),
+        WakeCommandKind::Register { .. }
+        | WakeCommandKind::Cancel { .. }
+        | WakeCommandKind::DeadlineElapsed { .. }
+        | WakeCommandKind::TransferDeliveryOwner { .. }
+        | WakeCommandKind::Reconcile { .. } => return Ok(true),
+    };
+    let workflow_id = super::to_i64(input.workflow_id.0, "workflow_id")?;
+    let attempt_id = super::to_i64(authority.attempt_id().0, "attempt_id")?;
+    let now = super::to_i64(current_commit_time().0, "now")?;
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_attempts a
+         JOIN workflow_effects e
+           ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id
+         JOIN workflow_reclaimable_leases l
+           ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
+         WHERE a.workflow_id = ?1 AND a.attempt_id = ?2
+           AND a.status IN ('Begun', 'ObservationRecorded') AND l.lease_until > ?3
+           AND e.generation = (SELECT generation FROM workflows WHERE workflow_id = ?1)",
+    )
+    .bind(workflow_id)
+    .bind(attempt_id)
+    .bind(now)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    if live == 1 {
+        return Ok(true);
+    }
+    let Some(evidence) = recorded_evidence else {
+        return Ok(false);
+    };
+    let exact_recorded: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_attempts a
+         JOIN workflow_authoritative_observations o
+           ON o.workflow_id = a.workflow_id AND o.attempt_id = a.attempt_id
+         WHERE a.workflow_id = ?1 AND a.attempt_id = ?2 AND a.status = 'AuthorityLost'
+           AND o.observation_codec_family = ?3 AND o.observation_codec_version = ?4
+           AND o.observation_payload = ?5 AND o.observed_at = ?6",
+    )
+    .bind(workflow_id)
+    .bind(attempt_id)
+    .bind(evidence.value.codec.family.as_str())
+    .bind(i64::from(evidence.value.codec.version.get()))
+    .bind(&evidence.value.payload.0)
+    .bind(super::to_i64(evidence.occurred_at.0, "observed_at")?)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    Ok(exact_recorded == 1)
 }
 
 async fn validate_authority_projection_tx(
@@ -1186,7 +1239,15 @@ mod tests {
 
     fn register_allocated() -> RegisterWakeContractInput {
         RegisterWakeContractInput {
-            command: register(WorkflowId(0)).command,
+            registration_owner: WakeOwner::new("conversation").unwrap(),
+            registering_tool_use_id: RegisteringToolUseId::new("tool-use").unwrap(),
+            subject: AuthorizedWakeSubject::work_scope_for_test(
+                subject(),
+                WakeOwner::new("conversation").unwrap(),
+            ),
+            condition: WakeCondition::Terminal,
+            registered_at: Timestamp(10),
+            deadline: Timestamp(100),
         }
     }
 
@@ -1343,7 +1404,7 @@ mod tests {
                 attempt_id: phoenix_workflow::AttemptId(1),
                 process_incarnation: ProcessIncarnation(1),
                 now: Timestamp(11),
-                lease_until: Some(phoenix_workflow::LeaseExpiry(100)),
+                lease_until: Some(phoenix_workflow::LeaseExpiry(i64::MAX as u64)),
             })
             .await
             .unwrap();
@@ -1366,8 +1427,11 @@ mod tests {
             .record_observation(&crate::workflow::RecordObservationInput {
                 authority,
                 observation_id: 1,
-                observation_codec: codec(),
-                observation_payload: vec![1],
+                observation_codec: LocalCodec {
+                    family: "bash.terminal".into(),
+                    version: 1,
+                },
+                observation_payload: b"done".to_vec(),
                 observed_at: Timestamp(19),
                 now: Timestamp(19),
             })
@@ -1876,6 +1940,63 @@ mod tests {
         assert_eq!(table_count(&repo, "barriers", 6).await, 0);
         assert_eq!(table_count(&repo, "barrier_members", 6).await, 0);
         assert_eq!(table_count(&repo, "deliveries", 6).await, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_observation_lease_cannot_terminalize() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(14);
+        let registered = repo
+            .commit_wake_command(&register(workflow_id))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        start_observation_attempt(&repo, workflow_id).await;
+        sqlx::query(
+            "UPDATE workflow_reclaimable_leases SET lease_until = 0 WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.commit_wake_command(&observe(&state, workflow_id))
+                .await
+                .unwrap(),
+            CommitWakeCommandOutcome::Rejected(WakeRejection::ObservationAuthorityMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fenced_observation_must_exactly_match_the_durable_evidence() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(15);
+        let registered = repo
+            .commit_wake_command(&register(workflow_id))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        persist_observation_before_fence(&repo, workflow_id).await;
+        let (proposal, _) = propose_cancel(&state, workflow_id);
+        let proposed = repo.commit_wake_command(&proposal).await.unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = proposed else {
+            panic!("cancellation proposal should apply")
+        };
+        assert!(matches!(
+            repo.commit_wake_command(&observe_at(
+                &state,
+                workflow_id,
+                TransitionId(3),
+                Timestamp(18),
+            ))
+            .await
+            .unwrap(),
+            CommitWakeCommandOutcome::Rejected(WakeRejection::ObservationAuthorityMismatch)
+        ));
     }
 
     #[tokio::test]

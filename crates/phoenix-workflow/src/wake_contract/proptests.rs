@@ -372,7 +372,7 @@ proptest! {
                     prop_assert!(applied_transition_ids.insert(command_transition_id));
                     for effect in &result.owed_effects {
                         prop_assert_eq!(effect.key.contract_id.clone(), identity.clone());
-                        prop_assert_eq!(effect.key.generation, before_contract.generation);
+                        prop_assert_eq!(effect.key.generation, contract(&result.new_state).generation);
                         prop_assert_eq!(effect.key.transition_id, command_transition_id);
                     }
                 }
@@ -969,6 +969,32 @@ fn cancellation_is_observation_only() {
     assert!(matches!(
         result.owed_effects[0].kind,
         WakeOwedEffectKind::FenceObservationAuthority { .. }
+    ));
+}
+
+#[test]
+fn cancellation_bumps_generation_and_fences_prior_observation_authority() {
+    let state = registered(10);
+    let prior_authority = observation_authority(&state);
+    let result = cancel(&state, 2, 5);
+    assert_eq!(
+        contract(&result.new_state).generation,
+        contract(&state).generation.next()
+    );
+    assert!(matches!(
+        transition(
+            &result.new_state,
+            command(
+                3,
+                WakeCommandKind::ObserveTerminal {
+                    expected_head: contract(&result.new_state).head(),
+                    authority: prior_authority,
+                    evidence: evidence(4, 1),
+                },
+            ),
+        )
+        .disposition,
+        WakeDisposition::Rejected(WakeRejection::ObservationAuthorityMismatch)
     ));
 }
 

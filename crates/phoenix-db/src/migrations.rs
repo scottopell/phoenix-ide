@@ -362,6 +362,7 @@ CREATE TABLE wake_contract_identity_bindings (
             'SubagentHandleMissing', 'TmuxHandleMissing'
         )
     ),
+    UNIQUE (registration_owner, registering_tool_use_id),
     CHECK ((lifecycle_kind IN ('Observing', 'TerminalProposed')) = (terminal_occurred_at IS NULL)),
     CHECK ((lifecycle_kind = 'Forgotten') = (forgotten_reason IS NOT NULL)),
     CHECK (lifecycle_kind != 'Fired' OR terminal_occurred_at <= deadline),
