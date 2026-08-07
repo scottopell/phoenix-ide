@@ -107,9 +107,11 @@ impl ClosePhase {
         match self {
             Self::AwaitingBlockerResolution => matches!(
                 next,
-                Self::AwaitingStopWorkConfirmation | Self::SettlingActiveWork
+                Self::AwaitingStopWorkConfirmation | Self::SettlingActiveWork | Self::Completed
             ),
-            Self::AwaitingStopWorkConfirmation => next == Self::SettlingActiveWork,
+            Self::AwaitingStopWorkConfirmation => {
+                matches!(next, Self::SettlingActiveWork | Self::Completed)
+            }
             Self::SettlingActiveWork => matches!(
                 next,
                 Self::CancelRequestedDuringSettlement | Self::AwaitingRetirementInspection
@@ -117,14 +119,14 @@ impl ClosePhase {
             Self::CancelRequestedDuringSettlement => next == Self::Completed,
             Self::AwaitingRetirementInspection => matches!(
                 next,
-                Self::AwaitingLossConfirmation | Self::RetirementRequested
+                Self::AwaitingLossConfirmation | Self::RetirementRequested | Self::Completed
             ),
             Self::AwaitingLossConfirmation => matches!(
                 next,
-                Self::AwaitingRetirementInspection | Self::RetirementRequested
+                Self::AwaitingRetirementInspection | Self::RetirementRequested | Self::Completed
             ),
             Self::RetirementRequested => matches!(next, Self::NeedsRepair | Self::Completed),
-            Self::NeedsRepair => matches!(next, Self::RetirementRequested | Self::Completed),
+            Self::NeedsRepair => next == Self::RetirementRequested,
             Self::Completed => false,
         }
     }
@@ -328,9 +330,10 @@ mod tests {
         assert!(
             ClosePhase::AwaitingBlockerResolution.can_transition_to(ClosePhase::SettlingActiveWork)
         );
-        assert!(!ClosePhase::AwaitingBlockerResolution.can_transition_to(ClosePhase::Completed));
+        assert!(ClosePhase::AwaitingBlockerResolution.can_transition_to(ClosePhase::Completed));
         assert!(ClosePhase::AwaitingStopWorkConfirmation
             .can_transition_to(ClosePhase::SettlingActiveWork));
+        assert!(ClosePhase::AwaitingStopWorkConfirmation.can_transition_to(ClosePhase::Completed));
         assert!(ClosePhase::SettlingActiveWork
             .can_transition_to(ClosePhase::CancelRequestedDuringSettlement));
         assert!(ClosePhase::SettlingActiveWork
@@ -350,7 +353,7 @@ mod tests {
         assert!(ClosePhase::RetirementRequested.can_transition_to(ClosePhase::NeedsRepair));
         assert!(ClosePhase::RetirementRequested.can_transition_to(ClosePhase::Completed));
         assert!(ClosePhase::NeedsRepair.can_transition_to(ClosePhase::RetirementRequested));
-        assert!(ClosePhase::NeedsRepair.can_transition_to(ClosePhase::Completed));
+        assert!(!ClosePhase::NeedsRepair.can_transition_to(ClosePhase::Completed));
         assert!(!ClosePhase::Completed.can_transition_to(ClosePhase::Completed));
     }
 

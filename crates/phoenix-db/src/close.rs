@@ -141,6 +141,26 @@ impl Database {
         Ok(row)
     }
 
+    pub async fn latest_close_obligation_for_product(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<CloseObligation>> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT attempt_id, root_conversation_id, phase,
+                    inspection_generation, inspection_fingerprint,
+                    created_at, updated_at, completed_at
+             FROM close_obligations
+             WHERE root_conversation_id = ?1
+             ORDER BY created_at DESC, attempt_id DESC
+             LIMIT 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        row.map(parse_close_obligation_row).transpose()
+    }
+
     pub async fn list_pending_close_restart_attempts(&self) -> DbResult<Vec<CloseObligation>> {
         let rows = sqlx::query(
             "SELECT attempt_id, root_conversation_id, phase, inspection_generation, inspection_fingerprint, created_at, updated_at, completed_at
@@ -338,8 +358,10 @@ impl Database {
     pub async fn confirm_inspection(
         &self,
         attempt_id: &str,
-        inspection_generation: &str,
-        inspection_fingerprint: &str,
+        confirmed_generation: &str,
+        confirmed_fingerprint: &str,
+        fresh_generation: &str,
+        fresh_fingerprint: &str,
     ) -> DbResult<ConfirmInspectionOutcome> {
         let mut tx = self.pool.begin().await?;
         let stored = get_close_obligation_tx(&mut tx, attempt_id).await?;
@@ -350,17 +372,12 @@ impl Database {
                 actual: stored.phase.as_str().to_string(),
             });
         }
-        let recomputed = recompute_inspection_aggregate_tx(&mut tx, attempt_id).await?;
-        let supplied_matches_recomputed =
-            recomputed
-                .as_ref()
-                .is_some_and(|(generation, fingerprint)| {
-                    generation == inspection_generation && fingerprint == inspection_fingerprint
-                });
-        let stored_matches_supplied = stored.inspection_generation.as_deref()
-            == Some(inspection_generation)
-            && stored.inspection_fingerprint.as_deref() == Some(inspection_fingerprint);
-        let matches = supplied_matches_recomputed && stored_matches_supplied;
+        let confirmed_matches_fresh =
+            confirmed_generation == fresh_generation && confirmed_fingerprint == fresh_fingerprint;
+        let stored_matches_confirmed = stored.inspection_generation.as_deref()
+            == Some(confirmed_generation)
+            && stored.inspection_fingerprint.as_deref() == Some(confirmed_fingerprint);
+        let matches = confirmed_matches_fresh && stored_matches_confirmed;
         let (next_phase, next_generation, next_fingerprint) = if matches {
             (
                 ClosePhase::RetirementRequested,
@@ -516,13 +533,10 @@ impl Database {
     ) -> DbResult<ProductConversationTopology> {
         let mut tx = self.pool.begin().await?;
         let obligation = get_close_obligation_tx(&mut tx, attempt_id).await?;
-        if !matches!(
-            obligation.phase,
-            ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
-        ) {
+        if obligation.phase != ClosePhase::RetirementRequested {
             return Err(DbError::ClosePhaseConflict {
                 attempt_id: attempt_id.to_string(),
-                expected: "retirement_requested|needs_repair".to_string(),
+                expected: ClosePhase::RetirementRequested.as_str().to_string(),
                 actual: obligation.phase.as_str().to_string(),
             });
         }
@@ -826,35 +840,6 @@ fn validate_inspection_shape(
         _ => unreachable!("pairing checked by caller"),
     }
     Ok(())
-}
-
-async fn recompute_inspection_aggregate_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    attempt_id: &str,
-) -> DbResult<Option<(String, String)>> {
-    let rows = sqlx::query(
-        "SELECT generation, fingerprint
-         FROM close_retirement_inspections
-         WHERE attempt_id = ?1
-         ORDER BY scope",
-    )
-    .bind(attempt_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let first_generation: String = rows[0].try_get("generation")?;
-    let mut fingerprints = Vec::with_capacity(rows.len());
-    for row in rows {
-        let generation: String = row.try_get("generation")?;
-        let fingerprint: String = row.try_get("fingerprint")?;
-        if generation != first_generation {
-            return Ok(None);
-        }
-        fingerprints.push(fingerprint);
-    }
-    Ok(Some((first_generation, fingerprints.join("\n"))))
 }
 
 async fn validate_scope_membership(
@@ -1251,7 +1236,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let outcome = db.confirm_inspection("a1", "g2", "fp1").await.unwrap();
+        let outcome = db
+            .confirm_inspection("a1", "g2", "fp1", "g2", "fp1")
+            .await
+            .unwrap();
         assert!(matches!(outcome, ConfirmInspectionOutcome::Mismatch { .. }));
         assert_eq!(
             obligation_phase(&db, "a1").await,
@@ -1283,7 +1271,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let mismatch = db.confirm_inspection("a1", "stale", "fp1").await.unwrap();
+        let mismatch = db
+            .confirm_inspection("a1", "stale", "fp1", "g1", "fp1")
+            .await
+            .unwrap();
         assert!(matches!(
             mismatch,
             ConfirmInspectionOutcome::Mismatch { .. }
@@ -1497,7 +1488,10 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        let outcome = db.confirm_inspection("a1", "g1", "fp1").await.unwrap();
+        let outcome = db
+            .confirm_inspection("a1", "g1", "fp1", "g1", "fp2")
+            .await
+            .unwrap();
         assert!(matches!(outcome, ConfirmInspectionOutcome::Mismatch { .. }));
         let obligation = db.get_close_obligation("a1").await.unwrap().unwrap();
         assert_eq!(obligation.phase, ClosePhase::AwaitingRetirementInspection);

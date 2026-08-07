@@ -379,7 +379,7 @@ CREATE TABLE close_obligations (
     updated_at TEXT NOT NULL,
     completed_at TEXT,
     CHECK ((inspection_generation IS NULL) = (inspection_fingerprint IS NULL)),
-    CHECK ((phase IN ('awaiting_retirement_inspection', 'awaiting_loss_confirmation', 'retirement_requested', 'needs_repair')) >= (inspection_generation IS NOT NULL)),
+    CHECK ((phase IN ('awaiting_blocker_resolution', 'awaiting_stop_work_confirmation', 'settling_active_work', 'cancel_requested_during_settlement')) <= (inspection_generation IS NULL)),
     CHECK ((phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair')) <= (inspection_generation IS NOT NULL)),
     CHECK ((phase = 'completed') = (completed_at IS NOT NULL))
 );

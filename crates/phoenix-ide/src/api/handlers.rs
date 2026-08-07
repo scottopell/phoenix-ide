@@ -8,6 +8,10 @@ use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
 };
+use super::close_handlers::{
+    cancel_close_attempt, confirm_close_loss, confirm_close_stop_work, delete_closed_history,
+    finalize_close_history, get_close_status, request_close, retry_close_attempt,
+};
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
     get_conversation_git_status, get_conversation_pr_status, list_git_branches, pin_associated_pr,
@@ -188,6 +192,32 @@ pub fn create_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route("/api/conversations/:id/cancel", post(cancel_conversation))
+        .route("/api/conversations/:id/close/request", post(request_close))
+        .route("/api/conversations/:id/close/status", get(get_close_status))
+        .route(
+            "/api/conversations/:id/close/confirm-stop",
+            post(confirm_close_stop_work),
+        )
+        .route(
+            "/api/conversations/:id/close/cancel",
+            post(cancel_close_attempt),
+        )
+        .route(
+            "/api/conversations/:id/close/confirm-loss",
+            post(confirm_close_loss),
+        )
+        .route(
+            "/api/conversations/:id/close/retry",
+            post(retry_close_attempt),
+        )
+        .route(
+            "/api/conversations/:id/close/finalize-history",
+            post(finalize_close_history),
+        )
+        .route(
+            "/api/conversations/:id/close/delete-history",
+            post(delete_closed_history),
+        )
         .route("/api/conversations/:id/wake", get(get_wake_status))
         .route(
             "/api/conversations/:id/wake/:contract_id/cancel",
@@ -5338,7 +5368,7 @@ async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::
     }
 }
 
-async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
+pub(super) async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
     if let Some(handle) = state.runtime.try_get_handle(id).await {
         let conv_id = id.to_string();
         let _ = handle

@@ -8,6 +8,7 @@ mod assets;
 pub mod auth;
 mod browser_view;
 mod chains;
+mod close_handlers;
 pub mod codex_login;
 mod deployment;
 mod discovery;
@@ -15,7 +16,7 @@ mod git_handlers;
 pub(crate) mod global_read;
 pub(crate) mod handlers;
 mod installation_ownership;
-mod lifecycle_handlers;
+pub(crate) mod lifecycle_handlers;
 mod local_reveal;
 pub(crate) mod pr_monitoring;
 mod process_sample;
@@ -104,6 +105,16 @@ struct AgentFacingWakeRegistrationAvailable(bool);
 
 const AGENT_FACING_WAKE_REGISTRATION: AgentFacingWakeRegistrationAvailable =
     AgentFacingWakeRegistrationAvailable(false);
+
+async fn resume_pending_close_attempts(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    let resumed = close_handlers::resume_pending_close_attempts(state)
+        .await
+        .map_err(std::io::Error::other)?;
+    if resumed > 0 {
+        tracing::info!(resumed, "resumed pending close attempts");
+    }
+    Ok(())
+}
 
 async fn reconcile_startup_continuations(
     runtime: &Arc<RuntimeManager>,
@@ -220,7 +231,7 @@ impl AppState {
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
         let resource_monitor = resource_monitor::ResourceMonitor::new();
-        Ok(Self {
+        let state = Self {
             runtime,
             llm_registry,
             db,
@@ -239,6 +250,10 @@ impl AppState {
             suggest_token,
             discovery,
             resource_monitor,
-        })
+        };
+        if let Err(error) = resume_pending_close_attempts(&state).await {
+            tracing::warn!(%error, "durable Close resumption encountered an error; server startup continues");
+        }
+        Ok(state)
     }
 }
