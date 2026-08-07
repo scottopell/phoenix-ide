@@ -973,7 +973,7 @@ fn cancellation_is_observation_only() {
 }
 
 #[test]
-fn cancellation_bumps_generation_and_fences_prior_observation_authority() {
+fn cancellation_bumps_generation_and_preserves_prior_evidence_arbitration() {
     let state = registered(10);
     let prior_authority = observation_authority(&state);
     let result = cancel(&state, 2, 5);
@@ -994,7 +994,7 @@ fn cancellation_bumps_generation_and_fences_prior_observation_authority() {
             ),
         )
         .disposition,
-        WakeDisposition::Rejected(WakeRejection::ObservationAuthorityMismatch)
+        WakeDisposition::Applied { .. }
     ));
 }
 

@@ -136,6 +136,7 @@ impl WakeContractRepository {
         .bind(input.registering_tool_use_id.as_str())
         .fetch_optional(&mut *tx.tx)
         .await?;
+        let replaying = existing_workflow_id.is_some();
         let workflow_id = match existing_workflow_id {
             Some(value) => WorkflowId(super::to_u64(value, "workflow_id")?),
             None => next_global_workflow_id_tx(&mut tx).await?,
@@ -153,6 +154,39 @@ impl WakeContractRepository {
                 deadline: input.deadline,
             },
         };
+        if replaying {
+            let current = self.load_state_tx(&mut tx, workflow_id).await?;
+            let expected = transition(&WakeState::Absent, command.clone());
+            let registrations_match = match (&current, &expected.new_state) {
+                (WakeState::Present(current), WakeState::Present(expected)) => {
+                    current.id == expected.id
+                        && current.registration_owner == expected.registration_owner
+                        && current.registering_tool_use_id == expected.registering_tool_use_id
+                        && current.subject == expected.subject
+                        && current.delivery_transferability == expected.delivery_transferability
+                        && current.condition == expected.condition
+                        && current.registered_at == expected.registered_at
+                        && current.deadline == expected.deadline
+                }
+                _ => false,
+            };
+            if !registrations_match {
+                tx.rollback().await?;
+                return Ok((
+                    workflow_id,
+                    CommitWakeCommandOutcome::Rejected(WakeRejection::ConflictingTransitionReuse),
+                ));
+            }
+            validate_replay_artifacts_tx(&mut tx, workflow_id, &current).await?;
+            tx.rollback().await?;
+            return Ok((
+                workflow_id,
+                CommitWakeCommandOutcome::Replayed {
+                    state: current,
+                    transition_id: TransitionId(1),
+                },
+            ));
+        }
         let outcome = self
             .commit_wake_command_in_tx(tx, workflow_id, &command)
             .await?;
@@ -397,19 +431,36 @@ async fn validate_observation_authority_tx(
     tx: &mut super::WorkflowTx<'_>,
     input: &CommitWakeCommandInput,
 ) -> DbResult<bool> {
+    enum PersistedObservation {
+        Terminal(phoenix_workflow::wake_contract::TerminalEvidence),
+        ProtocolFailure(phoenix_workflow::wake_contract::ProtocolFailureEvidence),
+    }
     let (authority, recorded_evidence) = match &input.command.kind {
         WakeCommandKind::ObserveTerminal {
             authority,
             evidence,
             ..
-        } => (authority, Some(evidence)),
+        } => (
+            authority,
+            Some(PersistedObservation::Terminal(evidence.clone())),
+        ),
         WakeCommandKind::Reconcile {
             observation:
                 phoenix_workflow::wake_contract::ReconcileObservation::ProtocolFailure {
-                    authority, ..
+                    authority,
+                    cause,
+                    occurred_at,
                 },
             ..
-        } => (authority, None),
+        } => (
+            authority,
+            Some(PersistedObservation::ProtocolFailure(
+                phoenix_workflow::wake_contract::ProtocolFailureEvidence {
+                    cause: cause.clone(),
+                    occurred_at: *occurred_at,
+                },
+            )),
+        ),
         WakeCommandKind::Register { .. }
         | WakeCommandKind::Cancel { .. }
         | WakeCommandKind::DeadlineElapsed { .. }
@@ -440,6 +491,20 @@ async fn validate_observation_authority_tx(
     let Some(evidence) = recorded_evidence else {
         return Ok(false);
     };
+    let (codec_family, codec_version, payload, observed_at) = match evidence {
+        PersistedObservation::Terminal(evidence) => (
+            evidence.value.codec.family.as_str().to_owned(),
+            evidence.value.codec.version.get(),
+            evidence.value.payload.0,
+            evidence.occurred_at,
+        ),
+        PersistedObservation::ProtocolFailure(evidence) => (
+            WAKE_CONTRACT_CODEC_FAMILY.to_owned(),
+            WAKE_CONTRACT_CODEC_VERSION,
+            encode(&evidence)?,
+            evidence.occurred_at,
+        ),
+    };
     let exact_recorded: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM workflow_attempts a
          JOIN workflow_authoritative_observations o
@@ -450,10 +515,10 @@ async fn validate_observation_authority_tx(
     )
     .bind(workflow_id)
     .bind(attempt_id)
-    .bind(evidence.value.codec.family.as_str())
-    .bind(i64::from(evidence.value.codec.version.get()))
-    .bind(&evidence.value.payload.0)
-    .bind(super::to_i64(evidence.occurred_at.0, "observed_at")?)
+    .bind(codec_family)
+    .bind(i64::from(codec_version))
+    .bind(payload)
+    .bind(super::to_i64(observed_at.0, "observed_at")?)
     .fetch_one(&mut *tx.tx)
     .await?;
     Ok(exact_recorded == 1)
@@ -1315,6 +1380,25 @@ mod tests {
         observe_at(state, workflow_id, TransitionId(2), Timestamp(20))
     }
 
+    fn observe_with_authority(
+        state: &WakeState,
+        workflow_id: WorkflowId,
+        transition_id: TransitionId,
+        occurred_at: Timestamp,
+        authority: phoenix_workflow::wake_contract::WakeObservationAuthority,
+    ) -> CommitWakeCommandInput {
+        let mut input = observe_at(state, workflow_id, transition_id, occurred_at);
+        let WakeCommandKind::ObserveTerminal {
+            authority: command_authority,
+            ..
+        } = &mut input.command.kind
+        else {
+            unreachable!("observe_at creates a terminal observation")
+        };
+        *command_authority = authority;
+        input
+    }
+
     fn observe_at(
         state: &WakeState,
         workflow_id: WorkflowId,
@@ -1439,6 +1523,32 @@ mod tests {
             .unwrap();
     }
 
+    async fn persist_protocol_failure_before_fence(
+        repo: &WakeContractRepository,
+        workflow_id: WorkflowId,
+        evidence: &phoenix_workflow::wake_contract::ProtocolFailureEvidence,
+    ) {
+        start_observation_attempt(repo, workflow_id).await;
+        repo.workflow_repo
+            .record_observation(&crate::workflow::RecordObservationInput {
+                authority: crate::workflow::LocalAttemptAuthority {
+                    workflow_id,
+                    effect_id: EffectId(9),
+                    attempt_id: phoenix_workflow::AttemptId(1),
+                    declared_workflow_version: Version(1),
+                    generation: Generation(0),
+                    process_incarnation: ProcessIncarnation(1),
+                },
+                observation_id: 1,
+                observation_codec: codec(),
+                observation_payload: encode(evidence).unwrap(),
+                observed_at: evidence.occurred_at,
+                now: evidence.occurred_at,
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn registration_allocates_from_the_shared_workflow_sequence_atomically() {
         let (_dir, repo, _) = open_repo_pair().await;
@@ -1512,6 +1622,27 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(transitions, 1);
+    }
+
+    #[tokio::test]
+    async fn registration_replays_after_later_transitions_advance_the_head() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let registration = register_allocated();
+        let (workflow_id, registered) = repo.register_wake_contract(&registration).await.unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        assert!(matches!(
+            repo.commit_wake_command(&transfer(&state, workflow_id, TransitionId(2)))
+                .await
+                .unwrap(),
+            CommitWakeCommandOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            repo.register_wake_contract(&registration).await.unwrap(),
+            (replayed_workflow_id, CommitWakeCommandOutcome::Replayed { .. })
+                if replayed_workflow_id == workflow_id
+        ));
     }
 
     #[tokio::test]
@@ -1708,6 +1839,13 @@ mod tests {
             panic!("registration should apply")
         };
         persist_observation_before_fence(&repo, WorkflowId(11)).await;
+        let WakeState::Present(contract) = &state else {
+            unreachable!("registration produced a present contract")
+        };
+        let prior_authority = phoenix_workflow::wake_contract::WakeObservationAuthority::for_test(
+            contract,
+            phoenix_workflow::AttemptId(1),
+        );
         let (proposal, _) = propose_cancel(&state, WorkflowId(11));
         let proposed = repo.commit_wake_command(&proposal).await.unwrap();
         let CommitWakeCommandOutcome::Applied {
@@ -1719,11 +1857,12 @@ mod tests {
         };
 
         assert!(matches!(
-            repo.commit_wake_command(&observe_at(
+            repo.commit_wake_command(&observe_with_authority(
                 &proposed_state,
                 WorkflowId(11),
                 TransitionId(3),
                 Timestamp(19),
+                prior_authority,
             ))
             .await
             .unwrap(),
@@ -1996,6 +2135,66 @@ mod tests {
             .await
             .unwrap(),
             CommitWakeCommandOutcome::Rejected(WakeRejection::ObservationAuthorityMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_protocol_failure_survives_cancellation_fencing() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(16);
+        let registered = repo
+            .commit_wake_command(&register(workflow_id))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        let evidence = phoenix_workflow::wake_contract::ProtocolFailureEvidence {
+            cause: ForgottenCause::CascadeDestroyedHandle,
+            occurred_at: Timestamp(19),
+        };
+        persist_protocol_failure_before_fence(&repo, workflow_id, &evidence).await;
+        let WakeState::Present(contract) = &state else {
+            unreachable!("registration produced a present contract")
+        };
+        let prior_authority = phoenix_workflow::wake_contract::WakeObservationAuthority::for_test(
+            contract,
+            phoenix_workflow::AttemptId(1),
+        );
+        let (proposal, _) = propose_cancel(&state, workflow_id);
+        let proposed = repo.commit_wake_command(&proposal).await.unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = proposed else {
+            panic!("cancellation proposal should apply")
+        };
+        let WakeState::Present(contract) = &state else {
+            unreachable!("proposal produced a present contract")
+        };
+        let reconcile = CommitWakeCommandInput {
+            workflow_id,
+            command: WakeCommand {
+                transition_id: TransitionId(3),
+                kind: WakeCommandKind::Reconcile {
+                    expected_head: contract.head(),
+                    observation:
+                        phoenix_workflow::wake_contract::ReconcileObservation::ProtocolFailure {
+                            authority: prior_authority,
+                            cause: evidence.cause,
+                            occurred_at: evidence.occurred_at,
+                        },
+                },
+            },
+        };
+        assert!(matches!(
+            repo.commit_wake_command(&reconcile).await.unwrap(),
+            CommitWakeCommandOutcome::Applied {
+                state: WakeState::Present(phoenix_workflow::wake_contract::WakeContract {
+                    lifecycle: phoenix_workflow::wake_contract::WakeLifecycle::Closed(
+                        phoenix_workflow::wake_contract::CanonicalTerminal::Forgotten { .. }
+                    ),
+                    ..
+                }),
+                ..
+            }
         ));
     }
 

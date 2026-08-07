@@ -374,6 +374,12 @@ pub struct TerminalEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolFailureEvidence {
+    pub cause: ForgottenCause,
+    pub occurred_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CanonicalTerminal {
     Fired {
         evidence: TerminalEvidence,
@@ -1427,8 +1433,13 @@ fn observation_authority_matches(
     contract: &WakeContract,
     authority: &WakeObservationAuthority,
 ) -> bool {
+    let generation_matches = authority.generation == contract.generation
+        || (matches!(
+            contract.lifecycle,
+            WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_))
+        ) && authority.generation.next() == contract.generation);
     authority.contract_id == contract.id
-        && authority.generation == contract.generation
+        && generation_matches
         && authority.resource == contract.subject.resource
         && authority.attempt_id.0 > 0
 }
