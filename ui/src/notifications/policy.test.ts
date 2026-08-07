@@ -209,7 +209,13 @@ describe('notification policy reducer', () => {
         type: 'conversation_state_changed',
         conversation: {
           ...failed,
-          state: { ...failed.state!, attempt: 2 },
+          state: {
+            type: 'recoverable_continuation_failure',
+            message: 'Selected model is at capacity',
+            error_kind: 'server_overloaded',
+            operation_id: 'continuation-operation-1',
+            attempt: 2,
+          },
         },
         previousState: retrying.state,
         nextState: failed.state!,
