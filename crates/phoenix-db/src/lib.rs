@@ -8230,6 +8230,13 @@ impl Database {
         .bind(conversation_id)
         .fetch_one(&mut *tx)
         .await?;
+        let hidden = display_data
+            .get("hidden")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if hidden {
+            retrieval::fts_delete_message_tx(&mut tx, message_id).await?;
+        }
         tx.commit().await?;
         Ok(transcript_generation)
     }
@@ -13603,6 +13610,38 @@ mod tests {
             after.transcript_generation,
             before.transcript_generation + 1
         );
+    }
+
+    #[tokio::test]
+    async fn hiding_message_removes_retrieval_row_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("hidden-index", "hidden-index", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "hidden-index-message",
+            "hidden-index",
+            &MessageContent::user("searchable before hidden"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.update_message_display_data(
+            "hidden-index-message",
+            &serde_json::json!({ "hidden": true }),
+        )
+        .await
+        .unwrap();
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE message_id = ?")
+                .bind("hidden-index-message")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[tokio::test]

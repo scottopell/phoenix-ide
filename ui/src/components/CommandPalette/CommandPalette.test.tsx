@@ -462,6 +462,47 @@ describe('CommandPalette conversation scope', () => {
     expect(screen.getByText('New Conversation')).toBeInTheDocument();
   });
 
+  it('does not restart content search when conversation polling refreshes props', async () => {
+    let resolveContent: ((value: { hits: [] }) => void) | null = null;
+    let searchSignal: AbortSignal | null = null;
+    mocks.searchConversationContent.mockImplementation((_, __, signal?: AbortSignal) => {
+      searchSignal = signal ?? null;
+      return new Promise(resolve => {
+        resolveContent = resolve as (value: { hits: [] }) => void;
+      });
+    });
+
+    const conversation = makeConversation();
+    const rendered = renderPalette(conversation);
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'c pending' } });
+    await waitFor(() => expect(mocks.searchConversationContent).toHaveBeenCalledOnce());
+
+    rendered.rerender(
+      <MemoryRouter initialEntries={[`/c/${conversation.slug}`]}>
+        <FileExplorerContext.Provider value={{
+          openFile: mocks.openFile,
+          activeFile: null,
+          closeFile: vi.fn(),
+          openFileState: null,
+        }}>
+          <CommandPalette
+            conversations={[{ ...conversation, updated_at: '2026-01-01T00:00:05Z' }]}
+            activeConversation={conversation}
+          />
+          <LocationProbe />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(mocks.searchConversationContent).toHaveBeenCalledOnce();
+    const activeSignal = searchSignal as AbortSignal | null;
+    expect(activeSignal?.aborted).toBe(false);
+    const finishContent = resolveContent as ((value: { hits: [] }) => void) | null;
+    finishContent?.({ hits: [] });
+  });
+
   it('suppresses stale out-of-order content responses', async () => {
     const firstSignal = { current: null as AbortSignal | null };
     let firstReject: ((reason?: unknown) => void) | null = null;

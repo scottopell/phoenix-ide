@@ -125,6 +125,10 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
       }),
     [navigate, currentSlug, activeConvId, conversations],
   );
+  const actionsRef = useRef(actions);
+  useEffect(() => {
+    actionsRef.current = actions;
+  }, [actions]);
 
   // Dispatch helper — state machine only needs actions now (sources are async)
   const dispatch = useCallback(
@@ -162,11 +166,11 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
     const query = searchQuery ?? '';
 
     if (searchScope === 'conversation-content' && query.trim().length === 0) {
-      setState(prev => transition(prev, { type: 'SEARCH_AWAITING_QUERY' }, actions));
+      setState(prev => transition(prev, { type: 'SEARCH_AWAITING_QUERY' }, actionsRef.current));
       return;
     }
 
-    setState(prev => transition(prev, { type: 'SEARCH_DEBOUNCING' }, actions));
+    setState(prev => transition(prev, { type: 'SEARCH_DEBOUNCING' }, actionsRef.current));
 
     debounceRef.current = setTimeout(async () => {
       const controller = new AbortController();
@@ -180,7 +184,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
           ? sourcesRef.current.filter(source => source.id === 'conversations')
           : sourcesRef.current.filter(source => source.id !== 'conversation-content');
 
-      setState(prev => transition(prev, { type: 'SEARCH_LOADING' }, actions));
+      setState(prev => transition(prev, { type: 'SEARCH_LOADING' }, actionsRef.current));
 
       try {
         const allResults = await Promise.all(
@@ -188,18 +192,18 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
         );
 
         if (!controller.signal.aborted) {
-          setState(prev => transition(prev, { type: 'SET_RESULTS', results: allResults.flat() }, actions));
+          setState(prev => transition(prev, { type: 'SET_RESULTS', results: allResults.flat() }, actionsRef.current));
         }
       } catch (error) {
         if (controller.signal.aborted) return;
         if (error instanceof ConversationSearchWarmingError) {
-          setState(prev => transition(prev, { type: 'SEARCH_WARMING', message: error.message }, actions));
+          setState(prev => transition(prev, { type: 'SEARCH_WARMING', message: error.message }, actionsRef.current));
           return;
         }
         setState(prev => transition(prev, {
           type: 'SEARCH_ERROR',
           message: error instanceof Error ? error.message : 'Search failed',
-        }, actions));
+        }, actionsRef.current));
       }
     }, SEARCH_DEBOUNCE_MS);
 
@@ -207,7 +211,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
       if (debounceRef.current) clearTimeout(debounceRef.current);
       searchAbortRef.current?.abort();
     };
-  }, [isOpen, searchMode, searchScope, searchQuery, actions]);
+  }, [isOpen, searchMode, searchScope, searchQuery]);
 
   // Global Cmd/Ctrl+P shortcut (REQ-CP-001)
   useEffect(() => {

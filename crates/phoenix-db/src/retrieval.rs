@@ -770,6 +770,13 @@ pub async fn fts_reconcile_upsert(
     Ok(true)
 }
 
+pub(crate) async fn fts_delete_message_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: &str,
+) -> Result<(), sqlx::Error> {
+    delete_message_rows(tx, message_id).await
+}
+
 /// Remove all index rows for one message id.
 ///
 /// # Errors
