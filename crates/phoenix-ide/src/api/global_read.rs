@@ -1090,13 +1090,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         DbError::ConversationNotFound(_) => {
             AppError::NotFound("reference target not found".to_string())
         }
-        other @ (DbError::Sqlx(_)
-        | DbError::MessageNotFound(_)
-        | DbError::SlugExists(_)
-        | DbError::ConversationAlreadyExists(_)
-        | DbError::Serialization(_)
-        | DbError::ForkProposalConflict(_)
-        | DbError::DirectTurnConflict(_)) => AppError::Internal(other.to_string()),
+        other => AppError::Internal(other.to_string()),
     }
 }
 

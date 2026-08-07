@@ -1567,12 +1567,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
     match e {
         DbError::ForkProposalConflict(m) => ForkResolveError::Conflict(m),
         DbError::ConversationNotFound(m) => ForkResolveError::NotFound(m),
-        DbError::Sqlx(_)
-        | DbError::MessageNotFound(_)
-        | DbError::SlugExists(_)
-        | DbError::Serialization(_)
-        | DbError::ConversationAlreadyExists(_)
-        | DbError::DirectTurnConflict(_) => ForkResolveError::Internal(e.to_string()),
+        _ => ForkResolveError::Internal(e.to_string()),
     }
 }
 

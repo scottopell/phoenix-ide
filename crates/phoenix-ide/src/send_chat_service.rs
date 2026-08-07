@@ -547,13 +547,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         crate::db::DbError::Sqlx(sqlx::Error::RowNotFound) => {
             SendChatServiceError::NotFound("conversation not found".to_string())
         }
-        other @ (crate::db::DbError::Sqlx(_)
-        | crate::db::DbError::MessageNotFound(_)
-        | crate::db::DbError::SlugExists(_)
-        | crate::db::DbError::ConversationAlreadyExists(_)
-        | crate::db::DbError::Serialization(_)
-        | crate::db::DbError::ForkProposalConflict(_)
-        | crate::db::DbError::DirectTurnConflict(_)) => map_db_internal_error(&other),
+        other => map_db_internal_error(&other),
     }
 }
 
@@ -572,13 +566,7 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
             | TurnConflict::MaterializationIdentityChanged { .. }
             | TurnConflict::CorruptAggregate(_),
         ) => SendChatServiceError::Internal(error.to_string()),
-        other @ (crate::db::DbError::Sqlx(_)
-        | crate::db::DbError::ConversationNotFound(_)
-        | crate::db::DbError::ConversationAlreadyExists(_)
-        | crate::db::DbError::MessageNotFound(_)
-        | crate::db::DbError::SlugExists(_)
-        | crate::db::DbError::Serialization(_)
-        | crate::db::DbError::ForkProposalConflict(_)) => map_db_internal_error(&other),
+        other => map_db_internal_error(&other),
     }
 }
 
