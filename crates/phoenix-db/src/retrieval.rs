@@ -169,6 +169,7 @@ pub struct RetrievedChunk {
     /// Relevance score (lower BM25 = more relevant).
     pub score: f64,
     pub transcript_generation: i64,
+    pub message_count: i64,
 }
 
 /// Error from a retrieval or index-maintenance operation.
@@ -384,6 +385,7 @@ impl Fts5Retriever {
             "WITH ranked_hits AS (\
                  SELECT meta.message_id, meta.chunk_ordinal, meta.conversation_id, \
                         meta.message_type, meta.created_at, c.transcript_generation, \
+                        (SELECT COUNT(*) FROM messages count_source WHERE count_source.conversation_id = c.id) AS message_count, \
                         snippet(message_fts, 0, '', '', '…', 24) AS snippet, \
                         bm25(message_fts) AS score",
         );
@@ -434,7 +436,7 @@ impl Fts5Retriever {
         match request.grouping {
             RetrievalGrouping::None => {
                 sql.push_str(
-                    " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, snippet, score \
+                    " SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score \
                       FROM ranked_hits \
                       ORDER BY score, created_at DESC \
                       LIMIT ?",
@@ -443,14 +445,14 @@ impl Fts5Retriever {
             RetrievalGrouping::BestPerConversation => {
                 sql.push_str(
                     ", grouped_hits AS (\
-                         SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, snippet, score, \
+                         SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score, \
                                 ROW_NUMBER() OVER (\
                                     PARTITION BY conversation_id \
                                     ORDER BY score, created_at DESC, message_id\
                                 ) AS conversation_rank \
                          FROM ranked_hits\
                      ) \
-                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, snippet, score \
+                     SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, transcript_generation, message_count, snippet, score \
                      FROM grouped_hits \
                      WHERE conversation_rank = 1 \
                      ORDER BY score, created_at DESC, conversation_id \
@@ -882,6 +884,7 @@ fn parse_chunk_row(row: sqlx::sqlite::SqliteRow) -> Result<RetrievedChunk, sqlx:
         snippet: truncate_chars(&snippet, MAX_SNIPPET_CHARS),
         score: row.try_get("score")?,
         transcript_generation: row.try_get("transcript_generation")?,
+        message_count: row.try_get("message_count")?,
     })
 }
 

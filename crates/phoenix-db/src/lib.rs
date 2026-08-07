@@ -3362,19 +3362,30 @@ impl Database {
     pub async fn conversation_transcript_generations(
         &self,
         conversation_ids: &[String],
-    ) -> DbResult<std::collections::HashMap<String, i64>> {
+    ) -> DbResult<std::collections::HashMap<String, (i64, i64)>> {
         if conversation_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
         let mut query = sqlx::QueryBuilder::new(
-            "SELECT id, transcript_generation FROM conversations WHERE id IN ",
+            "SELECT c.id, c.transcript_generation, COUNT(m.message_id) AS message_count \
+             FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id \
+             WHERE c.id IN ",
         );
         query.push_tuples(conversation_ids.iter(), |mut tuple, id| {
             tuple.push_bind(id);
         });
+        query.push(" GROUP BY c.id, c.transcript_generation");
         let rows = query.build().fetch_all(&self.pool).await?;
         rows.into_iter()
-            .map(|row| Ok((row.try_get("id")?, row.try_get("transcript_generation")?)))
+            .map(|row| {
+                Ok((
+                    row.try_get("id")?,
+                    (
+                        row.try_get("transcript_generation")?,
+                        row.try_get("message_count")?,
+                    ),
+                ))
+            })
             .collect()
     }
 
@@ -7740,8 +7751,8 @@ impl Database {
             insert_message_attachments(&mut conn, message_id, content).await?;
         }
 
-        // Update conversation timestamp and search-result version.
-        sqlx::query("UPDATE conversations SET updated_at = ?1, transcript_generation = transcript_generation + 1 WHERE id = ?2")
+        // Update conversation timestamp
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(now.to_rfc3339())
             .bind(conversation_id)
             .execute(&self.pool)
@@ -13612,7 +13623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcript_generation_changes_on_append() {
+    async fn transcript_generation_does_not_change_on_append() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-append", "slug-append", "/tmp", true, None, None)
             .await
@@ -13631,10 +13642,7 @@ mod tests {
         let after = db.get_conversation("conv-append").await.unwrap();
 
         assert_eq!(before.transcript_generation, 1);
-        assert_eq!(
-            after.transcript_generation,
-            before.transcript_generation + 1
-        );
+        assert_eq!(after.transcript_generation, before.transcript_generation);
     }
 
     #[tokio::test]

@@ -1246,7 +1246,9 @@ async fn search_conversations(
                 );
                 return None;
             }
-            if current_generations.get(&hit.conversation_id) != Some(&hit.transcript_generation) {
+            if current_generations.get(&hit.conversation_id)
+                != Some(&(hit.transcript_generation, hit.message_count))
+            {
                 tracing::debug!(
                     conversation_id = %hit.conversation_id,
                     message_id = %hit.message_id,
