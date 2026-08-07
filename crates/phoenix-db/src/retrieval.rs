@@ -770,6 +770,25 @@ pub async fn fts_reconcile_upsert(
     Ok(true)
 }
 
+pub(crate) async fn fts_index_message_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message: &Message,
+) -> Result<(), sqlx::Error> {
+    delete_message_rows(tx, &message.message_id).await?;
+    let text = index_text(message);
+    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
+        .bind(&text)
+        .execute(&mut **tx)
+        .await?;
+    record_fts_row(
+        tx,
+        inserted.last_insert_rowid(),
+        message,
+        &content_fingerprint(&text),
+    )
+    .await
+}
+
 pub(crate) async fn fts_hide_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,

@@ -8230,7 +8230,8 @@ impl Database {
     ) -> DbResult<i64> {
         let display_str = serde_json::to_string(display_data)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let message = self.get_message_by_id(message_id).await?;
+        let mut message = self.get_message_by_id(message_id).await?;
+        message.display_data = Some(display_data.clone());
         let mut tx = self.pool.begin().await?;
         let conversation_id: Option<String> = sqlx::query_scalar(
             "UPDATE messages
@@ -8261,6 +8262,8 @@ impl Database {
             .unwrap_or(false);
         if hidden {
             retrieval::fts_hide_message_tx(&mut tx, &message).await?;
+        } else {
+            retrieval::fts_index_message_tx(&mut tx, &message).await?;
         }
         tx.commit().await?;
         Ok(transcript_generation)
@@ -13677,6 +13680,23 @@ mod tests {
         .await
         .unwrap();
         assert!(indexed_text.is_empty());
+
+        db.update_message_display_data(
+            "hidden-index-message",
+            &serde_json::json!({ "hidden": false }),
+        )
+        .await
+        .unwrap();
+        let restored_text: String = sqlx::query_scalar(
+            "SELECT f.text FROM message_fts f \
+             JOIN message_fts_rows r ON r.fts_rowid = f.rowid \
+             WHERE r.message_id = ?",
+        )
+        .bind("hidden-index-message")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(restored_text.contains("searchable before hidden"));
     }
 
     #[tokio::test]
