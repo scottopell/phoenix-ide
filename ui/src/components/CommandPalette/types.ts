@@ -1,4 +1,5 @@
 import type React from 'react';
+import type { ConversationContentSearchHit } from '../../api';
 
 // --- State Machine Types ---
 
@@ -44,7 +45,7 @@ export type PaletteEvent =
 
 // --- Source & Action Interfaces ---
 
-export interface PaletteItem {
+interface BasePaletteItem {
   id: string;
   title: string;
   subtitle?: string;
@@ -53,11 +54,20 @@ export interface PaletteItem {
   snippet?: string;
   icon?: React.ReactNode;
   category: string;
-  sourceId: string;
-  metadata?: unknown;
+
   /** Match score for ranking (higher = better) */
   score?: number;
 }
+
+export type PaletteItem =
+  | (BasePaletteItem & {
+      sourceId: 'conversation-content';
+      metadata: ConversationContentSearchHit;
+    })
+  | (BasePaletteItem & {
+      sourceId: 'conversations' | 'code' | 'files' | 'actions';
+      metadata?: unknown;
+    });
 
 export interface PaletteSource {
   id: string;

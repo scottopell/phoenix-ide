@@ -7740,8 +7740,8 @@ impl Database {
             insert_message_attachments(&mut conn, message_id, content).await?;
         }
 
-        // Update conversation timestamp
-        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+        // Update conversation timestamp and search-result version.
+        sqlx::query("UPDATE conversations SET updated_at = ?1, transcript_generation = transcript_generation + 1 WHERE id = ?2")
             .bind(now.to_rfc3339())
             .bind(conversation_id)
             .execute(&self.pool)
@@ -13612,7 +13612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcript_generation_does_not_change_on_append() {
+    async fn transcript_generation_changes_on_append() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-append", "slug-append", "/tmp", true, None, None)
             .await
@@ -13631,7 +13631,10 @@ mod tests {
         let after = db.get_conversation("conv-append").await.unwrap();
 
         assert_eq!(before.transcript_generation, 1);
-        assert_eq!(after.transcript_generation, before.transcript_generation);
+        assert_eq!(
+            after.transcript_generation,
+            before.transcript_generation + 1
+        );
     }
 
     #[tokio::test]

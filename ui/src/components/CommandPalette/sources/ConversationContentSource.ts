@@ -4,18 +4,6 @@ import type { PaletteItem, PaletteSource } from '../types';
 
 const SEARCH_LIMIT = 20;
 
-function isConversationContentItem(item: PaletteItem): item is PaletteItem & { metadata: ConversationContentSearchHit } {
-  const metadata = item.metadata;
-  return typeof metadata === 'object'
-    && metadata !== null
-    && 'slug' in metadata
-    && typeof metadata.slug === 'string'
-    && 'message_id' in metadata
-    && typeof metadata.message_id === 'string'
-    && 'conversation_id' in metadata
-    && typeof metadata.conversation_id === 'string';
-}
-
 function toConversationContentItem(hit: ConversationContentSearchHit): PaletteItem {
   const item: PaletteItem = {
     id: `${hit.conversation_id}:${hit.message_id}`,
@@ -44,8 +32,9 @@ export function createConversationContentSource(
     },
 
     onSelect(item: PaletteItem) {
-      if (!isConversationContentItem(item)) return;
-      onNavigate(item.metadata.slug);
+      if (item.sourceId === 'conversation-content') {
+        onNavigate(item.metadata.slug);
+      }
     },
   };
 }
