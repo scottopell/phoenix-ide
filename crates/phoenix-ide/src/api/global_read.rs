@@ -1,6 +1,6 @@
 use super::AppState;
 use crate::db::MessageContent;
-use crate::db::{Conversation, DbError, MessageType, RetrievalScope};
+use crate::db::{Conversation, DbError, MessageType, RetrievalRequest, RetrievalScope};
 use axum::{extract::State, Json};
 use phoenix_llm::ContentBlock;
 use serde::{Deserialize, Serialize};
@@ -316,11 +316,11 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
         let coordinator_chain = self.coordinator_chain_ids().await?;
         let hits = self
             .message_retriever
-            .retrieve(
+            .retrieve(RetrievalRequest::natural_language(
                 query,
                 RetrievalScope::GlobalExcluding(coordinator_chain),
                 SEARCH_TOP_K,
-            )
+            ))
             .await
             .map_err(|e| format!("search failed: {e}"))?;
         if hits.is_empty() {

@@ -27,7 +27,8 @@ pub use coordinator_query::{
 };
 pub use migrations::run_pending_migrations;
 pub use retrieval::{
-    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope, RetrievedChunk,
+    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
+    RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
 };
 pub use schema::*;
 pub use workflow::*;
@@ -143,6 +144,12 @@ pub enum DbError {
 }
 
 pub type DbResult<T> = Result<T, DbError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSearchMetadata {
+    pub slug: String,
+    pub archived: bool,
+}
 
 pub(crate) async fn persist_continuation_start_tx(
     tx: &mut Transaction<'_, Sqlite>,
@@ -3308,7 +3315,127 @@ impl Database {
         })
     }
 
-    /// List active (non-archived) user-initiated conversations
+    /// Load the navigation metadata for a bounded set of conversation search hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_conversation_search_metadata(
+        &self,
+        conversation_ids: &[String],
+    ) -> DbResult<std::collections::HashMap<String, ConversationSearchMetadata>> {
+        if conversation_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT c.id, c.slug, c.archived FROM conversations c WHERE c.id IN ",
+        );
+        query.push_tuples(conversation_ids.iter(), |mut tuple, conversation_id| {
+            tuple.push_bind(conversation_id);
+        });
+        query.push(
+            " AND c.user_initiated = 1 AND c.runtime_role = 'user' \
+              AND c.parent_conversation_id IS NULL \
+              AND NOT (c.archived = 1 AND EXISTS (\
+                  SELECT 1 FROM conversation_creation_jobs j \
+                  WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
+              ))",
+        );
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut metadata = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let slug: String = row.try_get("slug")?;
+            let archived: bool = row.try_get("archived")?;
+            metadata.insert(id, ConversationSearchMetadata { slug, archived });
+        }
+        Ok(metadata)
+    }
+
+    /// Return current transcript generations for a bounded conversation set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn conversation_transcript_generations(
+        &self,
+        conversation_ids: &[String],
+    ) -> DbResult<std::collections::HashMap<String, (i64, i64)>> {
+        if conversation_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT c.id, c.transcript_generation, COUNT(m.message_id) AS message_count \
+             FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id \
+             WHERE c.id IN ",
+        );
+        query.push_tuples(conversation_ids.iter(), |mut tuple, id| {
+            tuple.push_bind(id);
+        });
+        query.push(" GROUP BY c.id, c.transcript_generation");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("id")?,
+                    (
+                        row.try_get("transcript_generation")?,
+                        row.try_get("message_count")?,
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    /// Return the subset of message ids that remain visible to retrieval callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn visible_retrieval_message_ids(
+        &self,
+        message_ids: &[String],
+    ) -> DbResult<std::collections::HashSet<String>> {
+        if message_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT message_id FROM messages WHERE COALESCE(json_extract(display_data, '$.hidden'), 0) != 1 AND message_id IN ",
+        );
+        query.push_tuples(message_ids.iter(), |mut tuple, message_id| {
+            tuple.push_bind(message_id);
+        });
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| row.try_get("message_id").map_err(DbError::from))
+            .collect()
+    }
+
+    /// List conversation ids eligible for command-palette content search.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_conversation_search_ids(&self) -> DbResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT c.id FROM conversations c \
+             WHERE c.user_initiated = 1 AND c.runtime_role = 'user' \
+               AND c.parent_conversation_id IS NULL \
+               AND NOT (c.archived = 1 AND EXISTS (\
+                   SELECT 1 FROM conversation_creation_jobs j \
+                   WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'\
+               ))",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get("id").map_err(DbError::from))
+            .collect()
+    }
+
+    /// List active (non-archived) user-initiated conversations.
     ///
     /// # Errors
     ///
@@ -3325,7 +3452,7 @@ impl Database {
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.archived = 0 AND c.user_initiated = 1
-               AND c.runtime_role != 'coordinator'
+               AND c.runtime_role = 'user'
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
@@ -3539,7 +3666,7 @@ impl Database {
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
-             WHERE c.archived = 1 AND c.user_initiated = 1
+             WHERE c.archived = 1 AND c.user_initiated = 1 AND c.runtime_role = 'user'
                AND NOT EXISTS (
                    SELECT 1 FROM conversation_creation_jobs j
                    WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'
@@ -8138,6 +8265,8 @@ impl Database {
     ) -> DbResult<i64> {
         let display_str = serde_json::to_string(display_data)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let mut message = self.get_message_by_id(message_id).await?;
+        message.display_data = Some(display_data.clone());
         let mut tx = self.pool.begin().await?;
         let conversation_id: Option<String> = sqlx::query_scalar(
             "UPDATE messages
@@ -8162,6 +8291,15 @@ impl Database {
         .bind(conversation_id)
         .fetch_one(&mut *tx)
         .await?;
+        let hidden = display_data
+            .get("hidden")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if hidden {
+            retrieval::fts_hide_message_tx(&mut tx, &message).await?;
+        } else {
+            retrieval::fts_index_message_tx(&mut tx, &message).await?;
+        }
         tx.commit().await?;
         Ok(transcript_generation)
     }
@@ -10541,6 +10679,22 @@ mod tests {
             .iter()
             .all(|conversation| conversation.id != "conv-hidden-delete"));
         assert!(db.get_conversation("conv-hidden-delete").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn deletion_pending_creation_is_hidden_from_search_metadata() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-hidden-search", "conv-hidden-search").await;
+        db.request_conversation_creation_deletion("conv-hidden-search", Utc::now())
+            .await
+            .unwrap();
+
+        let metadata = db
+            .get_conversation_search_metadata(&["conv-hidden-search".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!metadata.contains_key("conv-hidden-search"));
     }
 
     #[tokio::test]
@@ -13519,6 +13673,65 @@ mod tests {
             after.transcript_generation,
             before.transcript_generation + 1
         );
+    }
+
+    #[tokio::test]
+    async fn hiding_message_removes_retrieval_row_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("hidden-index", "hidden-index", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "hidden-index-message",
+            "hidden-index",
+            &MessageContent::user("searchable before hidden"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.update_message_display_data(
+            "hidden-index-message",
+            &serde_json::json!({ "hidden": true }),
+        )
+        .await
+        .unwrap();
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE message_id = ?")
+                .bind("hidden-index-message")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+        let indexed_text: String = sqlx::query_scalar(
+            "SELECT f.text FROM message_fts f \
+             JOIN message_fts_rows r ON r.fts_rowid = f.rowid \
+             WHERE r.message_id = ?",
+        )
+        .bind("hidden-index-message")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(indexed_text.is_empty());
+
+        db.update_message_display_data(
+            "hidden-index-message",
+            &serde_json::json!({ "hidden": false }),
+        )
+        .await
+        .unwrap();
+        let restored_text: String = sqlx::query_scalar(
+            "SELECT f.text FROM message_fts f \
+             JOIN message_fts_rows r ON r.fts_rowid = f.rowid \
+             WHERE r.message_id = ?",
+        )
+        .bind("hidden-index-message")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(restored_text.contains("searchable before hidden"));
     }
 
     #[tokio::test]

@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import type { Conversation } from '../../api';
 import { api } from '../../api';
+import { ConversationSearchWarmingError } from '../../api';
+import './CommandPalette.css';
 import type { PaletteState, PaletteSource, PaletteAction } from './types';
 import { transition, initialState } from './stateMachine';
 import { CommandPaletteInput } from './CommandPaletteInput';
@@ -9,6 +11,7 @@ import { CommandPaletteResults } from './CommandPaletteResults';
 import { createConversationSource } from './sources/ConversationSource';
 import { createFileSource } from './sources/FileSource';
 import { createCodeSource } from './sources/CodeSource';
+import { createConversationContentSource } from './sources/ConversationContentSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import { computeChainRoots } from '../../utils/chains';
@@ -55,6 +58,10 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [conversationIdsKey, navigate],
   );
+  const conversationContentSource = useMemo(
+    () => createConversationContentSource((slug) => navigate(`/c/${slug}`)),
+    [navigate],
+  );
 
   // FileSource and CodeSource — recomputed only when conversation id or file root actually changes.
   const fileSource = useMemo(
@@ -76,9 +83,9 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
   const sources: PaletteSource[] = useMemo(
     () => {
       const scopedSources = fileSource && codeSource ? [fileSource, codeSource] : [];
-      return [...scopedSources, conversationSource];
+      return [...scopedSources, conversationSource, conversationContentSource];
     },
-    [conversationSource, fileSource, codeSource],
+    [conversationSource, conversationContentSource, fileSource, codeSource],
   );
 
   // Keep a ref so the search effect always sees the latest sources without
@@ -118,6 +125,10 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
       }),
     [navigate, currentSlug, activeConvId, conversations],
   );
+  const actionsRef = useRef(actions);
+  useEffect(() => {
+    actionsRef.current = actions;
+  }, [actions]);
 
   // Dispatch helper — state machine only needs actions now (sources are async)
   const dispatch = useCallback(
@@ -147,12 +158,19 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
   const searchQuery = state.status === 'open' ? state.query : null;
 
   useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
+
     if (!isOpen || searchMode !== 'search') return;
     const query = searchQuery ?? '';
 
-    // Cancel previous debounce + in-flight request
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    searchAbortRef.current?.abort();
+    if (searchScope === 'conversation-content' && query.trim().length === 0) {
+      setState(prev => transition(prev, { type: 'SEARCH_AWAITING_QUERY' }, actionsRef.current));
+      return;
+    }
+
+    setState(prev => transition(prev, { type: 'SEARCH_DEBOUNCING' }, actionsRef.current));
 
     debounceRef.current = setTimeout(async () => {
       const controller = new AbortController();
@@ -160,22 +178,40 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
 
       // Read sources via ref — latest value without making sources a dep.
       // This prevents the 5s conversation-poll from re-aborting in-flight requests.
-      const eligibleSources = searchScope === 'conversations'
-        ? sourcesRef.current.filter(source => source.id === 'conversations')
-        : sourcesRef.current;
-      const allResults = await Promise.all(
-        eligibleSources.map(source => source.search(query, controller.signal))
-      );
+      const eligibleSources = searchScope === 'conversation-content'
+        ? sourcesRef.current.filter(source => source.id === 'conversation-content')
+        : searchScope === 'conversation-slugs'
+          ? sourcesRef.current.filter(source => source.id === 'conversations')
+          : sourcesRef.current.filter(source => source.id !== 'conversation-content');
 
-      if (!controller.signal.aborted) {
-        setState(prev => transition(prev, { type: 'SET_RESULTS', results: allResults.flat() }, actions));
+      setState(prev => transition(prev, { type: 'SEARCH_LOADING' }, actionsRef.current));
+
+      try {
+        const allResults = await Promise.all(
+          eligibleSources.map(source => source.search(query, controller.signal))
+        );
+
+        if (!controller.signal.aborted) {
+          setState(prev => transition(prev, { type: 'SET_RESULTS', results: allResults.flat() }, actionsRef.current));
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        if (error instanceof ConversationSearchWarmingError) {
+          setState(prev => transition(prev, { type: 'SEARCH_WARMING', message: error.message }, actionsRef.current));
+          return;
+        }
+        setState(prev => transition(prev, {
+          type: 'SEARCH_ERROR',
+          message: error instanceof Error ? error.message : 'Search failed',
+        }, actionsRef.current));
       }
     }, SEARCH_DEBOUNCE_MS);
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
+      searchAbortRef.current?.abort();
     };
-  }, [isOpen, searchMode, searchScope, searchQuery, actions]);
+  }, [isOpen, searchMode, searchScope, searchQuery]);
 
   // Global Cmd/Ctrl+P shortcut (REQ-CP-001)
   useEffect(() => {
@@ -307,6 +343,9 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
           results={state.results}
           selectedIndex={effectiveIndex}
           mode={state.mode}
+          searchStatus={state.searchStatus}
+          query={state.query}
+          scope={state.scope}
           onHover={handleHover}
           onClick={handleClick}
         />

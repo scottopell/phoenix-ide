@@ -18,8 +18,8 @@ export function CommandPaletteInput({ value, mode, hasActiveConversation, onChan
   const placeholder = mode === 'action'
     ? 'Type a command...'
     : hasActiveConversation
-      ? 'Search conversations and files...'
-      : 'Search conversations...';
+      ? 'Search conversations, files, or use c / cs scopes...'
+      : 'Search conversations or use c / cs scopes...';
 
   // In action mode, show > as styled indicator, strip from input
   const displayValue = mode === 'action' && value.startsWith('>') ? value.slice(1) : value;
