@@ -356,7 +356,16 @@ CREATE TABLE wake_contract_identity_bindings (
         lifecycle_kind IN ('Observing', 'TerminalProposed', 'Fired', 'Expired', 'Cancelled', 'Forgotten')
     ),
     terminal_occurred_at INTEGER CHECK (terminal_occurred_at IS NULL OR terminal_occurred_at >= 0),
-    CHECK ((lifecycle_kind IN ('Observing', 'TerminalProposed')) = (terminal_occurred_at IS NULL))
+    forgotten_reason TEXT CHECK (
+        forgotten_reason IS NULL OR forgotten_reason IN (
+            'PhoenixRestart', 'CascadeDestroyedHandle',
+            'SubagentHandleMissing', 'TmuxHandleMissing'
+        )
+    ),
+    CHECK ((lifecycle_kind IN ('Observing', 'TerminalProposed')) = (terminal_occurred_at IS NULL)),
+    CHECK ((lifecycle_kind = 'Forgotten') = (forgotten_reason IS NOT NULL)),
+    CHECK (lifecycle_kind != 'Fired' OR terminal_occurred_at <= deadline),
+    CHECK (lifecycle_kind != 'Expired' OR terminal_occurred_at = deadline)
 ) WITHOUT ROWID;
 ";
 

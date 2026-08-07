@@ -120,7 +120,7 @@ fn finalize(state: &WakeState, transition_id: u64, proof: ObservationFenceProof)
 enum GeneratedAction {
     Observe { at: u16, payload: u8 },
     Cancel { at: u16 },
-    Deadline { at: u16 },
+    Deadline,
     Transfer { owner: u8 },
     Forget { at: u16 },
     Fail { at: u16 },
@@ -134,7 +134,7 @@ fn action_strategy() -> impl Strategy<Value = GeneratedAction> {
         (any::<u16>(), any::<u8>())
             .prop_map(|(at, payload)| GeneratedAction::Observe { at, payload }),
         any::<u16>().prop_map(|at| GeneratedAction::Cancel { at }),
-        any::<u16>().prop_map(|at| GeneratedAction::Deadline { at }),
+        Just(GeneratedAction::Deadline),
         any::<u8>().prop_map(|owner| GeneratedAction::Transfer { owner }),
         any::<u16>().prop_map(|at| GeneratedAction::Forget { at }),
         any::<u16>().prop_map(|at| GeneratedAction::Fail { at }),
@@ -159,9 +159,9 @@ fn generated_command(state: &WakeState, action: GeneratedAction, next_id: u64) -
             cause: CancellationCause::UserRequested,
             occurred_at: Timestamp(u64::from(at)),
         },
-        GeneratedAction::Deadline { at } => WakeCommandKind::DeadlineElapsed {
+        GeneratedAction::Deadline => WakeCommandKind::DeadlineElapsed {
             expected_head: current_head,
-            observed_at: Timestamp(u64::from(at)),
+            authority: WakeDeadlineAuthority::for_test(contract(state)),
         },
         GeneratedAction::Transfer { owner } => WakeCommandKind::TransferDeliveryOwner {
             expected_head: current_head,
@@ -170,7 +170,7 @@ fn generated_command(state: &WakeState, action: GeneratedAction, next_id: u64) -
         GeneratedAction::Forget { at } => WakeCommandKind::Reconcile {
             expected_head: current_head,
             observation: ReconcileObservation::ResourceUnavailable {
-                authority: observation_authority(state),
+                authority: WakeRecoveryAuthority::for_test(contract(state)),
                 cause: ForgottenCause::PhoenixRestart,
                 occurred_at: Timestamp(u64::from(at)),
             },
@@ -270,14 +270,13 @@ proptest! {
     #[test]
     fn expiry_admits_evidence_at_deadline_but_not_after(
         deadline in 1u64..=1_800,
-        delta in 1u64..10_000,
     ) {
         let state = registered(deadline);
         let proposed = transition(
             &state,
             command(2, WakeCommandKind::DeadlineElapsed {
                 expected_head: contract(&state).head(),
-                observed_at: Timestamp(deadline.saturating_add(delta)),
+                authority: WakeDeadlineAuthority::for_test(contract(&state)),
             }),
         );
         let at_deadline = transition(
@@ -300,7 +299,7 @@ proptest! {
             &state,
             command(4, WakeCommandKind::DeadlineElapsed {
                 expected_head: contract(&state).head(),
-                observed_at: Timestamp(deadline.saturating_add(delta)),
+                authority: WakeDeadlineAuthority::for_test(contract(&state)),
             }),
         );
         let after_deadline = transition(
@@ -549,7 +548,7 @@ fn prior_transition_ids_cannot_be_reused_after_the_head_advances() {
 }
 
 #[test]
-fn resource_loss_after_deadline_is_rejected_before_expiry_tick() {
+fn restart_resource_loss_after_deadline_is_still_forgotten() {
     let state = registered(10);
     let result = transition(
         &state,
@@ -558,7 +557,7 @@ fn resource_loss_after_deadline_is_rejected_before_expiry_tick() {
             WakeCommandKind::Reconcile {
                 expected_head: contract(&state).head(),
                 observation: ReconcileObservation::ResourceUnavailable {
-                    authority: observation_authority(&state),
+                    authority: WakeRecoveryAuthority::for_test(contract(&state)),
                     cause: ForgottenCause::TmuxHandleMissing,
                     occurred_at: Timestamp(11),
                 },
@@ -566,13 +565,56 @@ fn resource_loss_after_deadline_is_rejected_before_expiry_tick() {
         ),
     );
     assert!(matches!(
-        result.disposition,
-        WakeDisposition::Rejected(WakeRejection::EvidenceAfterDeadline)
+        result.new_state,
+        WakeState::Present(WakeContract {
+            lifecycle: WakeLifecycle::Closed(CanonicalTerminal::Forgotten {
+                cause: ForgottenCause::TmuxHandleMissing,
+                occurred_at: Timestamp(11),
+            }),
+            ..
+        })
     ));
 }
 
 #[test]
-fn evidence_after_deadline_cannot_beat_later_cancellation() {
+fn closed_work_scope_delivery_can_transfer_before_runtime_acceptance() {
+    let state = registered(10);
+    let fired = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::ObserveTerminal {
+                expected_head: contract(&state).head(),
+                authority: observation_authority(&state),
+                evidence: evidence(5, 1),
+            },
+        ),
+    );
+    let transferred = transition(
+        &fired.new_state,
+        command(
+            3,
+            WakeCommandKind::TransferDeliveryOwner {
+                expected_head: contract(&fired.new_state).head(),
+                authority: transfer_authority(
+                    &fired.new_state,
+                    WakeOwner::new("successor").unwrap(),
+                ),
+            },
+        ),
+    );
+    assert_eq!(
+        contract(&transferred.new_state).delivery_owner,
+        WakeOwner::new("successor").unwrap()
+    );
+    assert!(matches!(
+        contract(&transferred.new_state).lifecycle,
+        WakeLifecycle::Closed(CanonicalTerminal::Fired { .. })
+    ));
+}
+
+#[test]
+fn cancellation_after_deadline_is_rejected_for_expiry_to_settle() {
     let state = registered(10);
     let proposed = transition(
         &state,
@@ -585,20 +627,9 @@ fn evidence_after_deadline_cannot_beat_later_cancellation() {
             },
         ),
     );
-    let observed = transition(
-        &proposed.new_state,
-        command(
-            3,
-            WakeCommandKind::ObserveTerminal {
-                expected_head: contract(&proposed.new_state).head(),
-                authority: observation_authority(&proposed.new_state),
-                evidence: evidence(15, 1),
-            },
-        ),
-    );
     assert!(matches!(
-        observed.disposition,
-        WakeDisposition::Rejected(WakeRejection::EvidenceDidNotPrecedeProposal)
+        proposed.disposition,
+        WakeDisposition::Rejected(WakeRejection::EvidenceAfterDeadline)
     ));
 }
 
@@ -623,7 +654,7 @@ fn earlier_resource_loss_wins_while_cancellation_is_proposed() {
             WakeCommandKind::Reconcile {
                 expected_head: contract(&proposed.new_state).head(),
                 observation: ReconcileObservation::ResourceUnavailable {
-                    authority: observation_authority(&proposed.new_state),
+                    authority: WakeRecoveryAuthority::for_test(contract(&proposed.new_state)),
                     cause: ForgottenCause::CascadeDestroyedHandle,
                     occurred_at: Timestamp(4),
                 },
@@ -754,7 +785,7 @@ fn zero_transition_identity_is_rejected_before_registration() {
 #[test]
 fn crossed_reconciliation_authority_cannot_forget_a_contract() {
     let state = registered(10);
-    let mut authority = observation_authority(&state);
+    let mut authority = WakeRecoveryAuthority::for_test(contract(&state));
     authority.resource.payload = WakePayload(b"other-resource".to_vec());
     let result = transition(
         &state,
@@ -883,7 +914,7 @@ fn finalization_requires_matching_observation_fence_proof() {
             WakeCommandKind::Reconcile {
                 expected_head: contract(&proposed_state).head(),
                 observation: ReconcileObservation::ResourceUnavailable {
-                    authority: observation_authority(&proposed_state),
+                    authority: WakeRecoveryAuthority::for_test(contract(&proposed_state)),
                     cause: ForgottenCause::TmuxHandleMissing,
                     occurred_at: Timestamp(6),
                 },

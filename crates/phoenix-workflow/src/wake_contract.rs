@@ -300,6 +300,51 @@ impl WakeObservationAuthority {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WakeDeadlineAuthority {
+    contract_id: WakeContractId,
+    generation: Generation,
+    deadline: Timestamp,
+}
+
+impl WakeDeadlineAuthority {
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test(contract: &WakeContract) -> Self {
+        Self {
+            contract_id: contract.id.clone(),
+            generation: contract.generation,
+            deadline: contract.deadline,
+        }
+    }
+}
+
+impl WakeObservationAuthority {
+    #[must_use]
+    pub fn attempt_id(&self) -> AttemptId {
+        self.attempt_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WakeRecoveryAuthority {
+    contract_id: WakeContractId,
+    generation: Generation,
+    resource: EncodedWakeValue,
+}
+
+impl WakeRecoveryAuthority {
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test(contract: &WakeContract) -> Self {
+        Self {
+            contract_id: contract.id.clone(),
+            generation: contract.generation,
+            resource: contract.subject.resource.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeCondition {
     Terminal,
@@ -488,7 +533,7 @@ pub struct ObservationFenceProof {
 pub enum ReconcileObservation {
     ObservationAuthorityFenced(ObservationFenceProof),
     ResourceUnavailable {
-        authority: WakeObservationAuthority,
+        authority: WakeRecoveryAuthority,
         cause: ForgottenCause,
         occurred_at: Timestamp,
     },
@@ -522,7 +567,7 @@ pub enum WakeCommandKind {
     },
     DeadlineElapsed {
         expected_head: WakeHeadToken,
-        observed_at: Timestamp,
+        authority: WakeDeadlineAuthority,
     },
     TransferDeliveryOwner {
         expected_head: WakeHeadToken,
@@ -659,6 +704,7 @@ pub enum WakeRejection {
     DeliveryOwnerTransferForbidden,
     DeliveryOwnerTransferAuthorityMismatch,
     ObservationAuthorityMismatch,
+    DeadlineAuthorityMismatch,
     ConflictingTransitionReuse,
     NonMonotonicTransitionId,
 }
@@ -911,19 +957,42 @@ fn transition_present(
     }
 
     let committed_command = command.clone();
-    if let WakeCommandKind::Reconcile {
-        observation:
-            ReconcileObservation::ResourceUnavailable { authority, .. }
-            | ReconcileObservation::ProtocolFailure { authority, .. },
-        ..
-    } = &command
-    {
-        if !observation_authority_matches(contract, authority) {
+    match &command {
+        WakeCommandKind::Reconcile {
+            observation: ReconcileObservation::ResourceUnavailable { authority, .. },
+            ..
+        } if !recovery_authority_matches(contract, authority) => {
             return rejected(
                 &WakeState::Present(contract.clone()),
                 WakeRejection::ObservationAuthorityMismatch,
             );
         }
+        WakeCommandKind::Reconcile {
+            observation: ReconcileObservation::ProtocolFailure { authority, .. },
+            ..
+        } if !observation_authority_matches(contract, authority) => {
+            return rejected(
+                &WakeState::Present(contract.clone()),
+                WakeRejection::ObservationAuthorityMismatch,
+            );
+        }
+        WakeCommandKind::Reconcile {
+            observation: ReconcileObservation::ResourceUnavailable { .. },
+            ..
+        }
+        | WakeCommandKind::Reconcile {
+            observation: ReconcileObservation::ProtocolFailure { .. },
+            ..
+        }
+        | WakeCommandKind::Register { .. }
+        | WakeCommandKind::ObserveTerminal { .. }
+        | WakeCommandKind::Cancel { .. }
+        | WakeCommandKind::DeadlineElapsed { .. }
+        | WakeCommandKind::TransferDeliveryOwner { .. }
+        | WakeCommandKind::Reconcile {
+            observation: ReconcileObservation::ObservationAuthorityFenced(_),
+            ..
+        } => {}
     }
     match (&contract.lifecycle, command) {
         (
@@ -966,29 +1035,40 @@ fn transition_present(
             WakeCommandKind::Cancel {
                 cause, occurred_at, ..
             },
-        ) => propose(
+        ) if occurred_at <= contract.deadline => propose(
             contract,
             transition_id,
             &committed_command,
             ProposedTerminal::Cancelled { cause, occurred_at },
         ),
+        (WakeLifecycle::Open(OpenWakeLifecycle::Observing), WakeCommandKind::Cancel { .. }) => {
+            rejected(
+                &WakeState::Present(contract.clone()),
+                WakeRejection::EvidenceAfterDeadline,
+            )
+        }
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
-            WakeCommandKind::DeadlineElapsed { observed_at, .. },
-        ) if observed_at >= contract.deadline => propose(
-            contract,
-            transition_id,
-            &committed_command,
-            ProposedTerminal::Expired {
-                deadline: contract.deadline,
-            },
-        ),
+            WakeCommandKind::DeadlineElapsed { authority, .. },
+        ) if authority.contract_id == contract.id
+            && authority.generation == contract.generation
+            && authority.deadline == contract.deadline =>
+        {
+            propose(
+                contract,
+                transition_id,
+                &committed_command,
+                ProposedTerminal::Expired {
+                    deadline: contract.deadline,
+                },
+            )
+        }
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
             WakeCommandKind::DeadlineElapsed { .. },
         ) => rejected(
             &WakeState::Present(contract.clone()),
-            WakeRejection::DeadlineNotReached,
+            WakeRejection::DeadlineAuthorityMismatch,
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)),
@@ -1097,7 +1177,7 @@ fn transition_present(
                     },
                 ..
             },
-        ) if occurred_at <= contract.deadline => close(
+        ) => close(
             contract,
             transition_id,
             &committed_command,
@@ -1133,9 +1213,7 @@ fn transition_present(
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),
             WakeCommandKind::Reconcile {
-                observation:
-                    ReconcileObservation::ResourceUnavailable { .. }
-                    | ReconcileObservation::ProtocolFailure { .. },
+                observation: ReconcileObservation::ProtocolFailure { .. },
                 ..
             },
         ) => rejected(
@@ -1154,6 +1232,9 @@ fn transition_present(
             &WakeState::Present(contract.clone()),
             WakeRejection::TerminalArbitrationPending,
         ),
+        (WakeLifecycle::Closed(_), WakeCommandKind::TransferDeliveryOwner { authority, .. }) => {
+            transfer_delivery_owner(contract, transition_id, &committed_command, authority)
+        }
         (WakeLifecycle::Closed(_), _) => rejected(
             &WakeState::Present(contract.clone()),
             WakeRejection::AlreadyClosed,
@@ -1309,6 +1390,12 @@ fn observation_authority_matches(
         && authority.generation == contract.generation
         && authority.resource == contract.subject.resource
         && authority.attempt_id.0 > 0
+}
+
+fn recovery_authority_matches(contract: &WakeContract, authority: &WakeRecoveryAuthority) -> bool {
+    authority.contract_id == contract.id
+        && authority.generation == contract.generation
+        && authority.resource == contract.subject.resource
 }
 
 fn observation_fence_proof(

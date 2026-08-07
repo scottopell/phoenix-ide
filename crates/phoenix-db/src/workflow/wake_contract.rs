@@ -377,7 +377,7 @@ async fn validate_authority_projection_tx(
     let WakeState::Present(contract) = &state else {
         return Ok(state);
     };
-    let (lifecycle_kind, terminal_at) = lifecycle_columns(&contract.lifecycle);
+    let (lifecycle_kind, terminal_at, forgotten_reason) = lifecycle_columns(&contract.lifecycle);
     let matches: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM wake_contract_identity_bindings
          WHERE workflow_id = ?1 AND contract_id = ?2 AND generation = ?3 AND version = ?4
@@ -387,7 +387,7 @@ async fn validate_authority_projection_tx(
            AND resource_codec_version = ?12 AND resource_payload = ?13
            AND evidence_codec_family = ?14 AND evidence_codec_version = ?15
            AND registered_at = ?16 AND deadline = ?17 AND lifecycle_kind = ?18
-           AND terminal_occurred_at IS ?19",
+           AND terminal_occurred_at IS ?19 AND forgotten_reason IS ?20",
     )
     .bind(super::to_i64(workflow_id.0, "workflow_id")?)
     .bind(contract.id.as_str())
@@ -414,6 +414,7 @@ async fn validate_authority_projection_tx(
             .map(|time| super::to_i64(time.0, "terminal_occurred_at"))
             .transpose()?,
     )
+    .bind(forgotten_reason)
     .fetch_one(&mut *tx.tx)
     .await?;
     if matches != 1 {
@@ -429,14 +430,15 @@ async fn insert_contract_identity_tx(
     workflow_id: WorkflowId,
     contract: &phoenix_workflow::wake_contract::WakeContract,
 ) -> DbResult<()> {
-    let (lifecycle_kind, terminal_at) = lifecycle_columns(&contract.lifecycle);
+    let (lifecycle_kind, terminal_at, forgotten_reason) = lifecycle_columns(&contract.lifecycle);
     sqlx::query(
         "INSERT INTO wake_contract_identity_bindings
          (contract_id, workflow_id, generation, version, registration_owner, delivery_owner,
           registering_tool_use_id, delivery_transferability, profile_kind, profile_version,
           resource_codec_family, resource_codec_version, resource_payload, evidence_codec_family,
-          evidence_codec_version, registered_at, deadline, lifecycle_kind, terminal_occurred_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+          evidence_codec_version, registered_at, deadline, lifecycle_kind, terminal_occurred_at,
+          forgotten_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
     )
     .bind(contract.id.as_str())
     .bind(super::to_i64(workflow_id.0, "workflow_id")?)
@@ -463,6 +465,7 @@ async fn insert_contract_identity_tx(
             .map(|time| super::to_i64(time.0, "terminal_occurred_at"))
             .transpose()?,
     )
+    .bind(forgotten_reason)
     .execute(&mut *tx.tx)
     .await?;
     Ok(())
@@ -476,11 +479,11 @@ async fn update_contract_identity_tx(
     let WakeState::Present(contract) = state else {
         return Ok(());
     };
-    let (lifecycle_kind, terminal_at) = lifecycle_columns(&contract.lifecycle);
+    let (lifecycle_kind, terminal_at, forgotten_reason) = lifecycle_columns(&contract.lifecycle);
     let updated = sqlx::query(
         "UPDATE wake_contract_identity_bindings
          SET generation = ?2, version = ?3, delivery_owner = ?4,
-             lifecycle_kind = ?5, terminal_occurred_at = ?6
+             lifecycle_kind = ?5, terminal_occurred_at = ?6, forgotten_reason = ?7
          WHERE workflow_id = ?1",
     )
     .bind(super::to_i64(workflow_id.0, "workflow_id")?)
@@ -493,6 +496,7 @@ async fn update_contract_identity_tx(
             .map(|time| super::to_i64(time.0, "terminal_occurred_at"))
             .transpose()?,
     )
+    .bind(forgotten_reason)
     .execute(&mut *tx.tx)
     .await?;
     if updated.rows_affected() != 1 {
@@ -514,23 +518,42 @@ fn transferability_str(
 
 fn lifecycle_columns(
     lifecycle: &phoenix_workflow::wake_contract::WakeLifecycle,
-) -> (&'static str, Option<phoenix_workflow::Timestamp>) {
+) -> (
+    &'static str,
+    Option<phoenix_workflow::Timestamp>,
+    Option<&'static str>,
+) {
     use phoenix_workflow::wake_contract::{CanonicalTerminal, OpenWakeLifecycle, WakeLifecycle};
     match lifecycle {
-        WakeLifecycle::Open(OpenWakeLifecycle::Observing) => ("Observing", None),
-        WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)) => ("TerminalProposed", None),
+        WakeLifecycle::Open(OpenWakeLifecycle::Observing) => ("Observing", None, None),
+        WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)) => {
+            ("TerminalProposed", None, None)
+        }
         WakeLifecycle::Closed(CanonicalTerminal::Fired { evidence }) => {
-            ("Fired", Some(evidence.occurred_at))
+            ("Fired", Some(evidence.occurred_at), None)
         }
         WakeLifecycle::Closed(CanonicalTerminal::Expired { deadline }) => {
-            ("Expired", Some(*deadline))
+            ("Expired", Some(*deadline), None)
         }
         WakeLifecycle::Closed(CanonicalTerminal::Cancelled { occurred_at, .. }) => {
-            ("Cancelled", Some(*occurred_at))
+            ("Cancelled", Some(*occurred_at), None)
         }
-        WakeLifecycle::Closed(CanonicalTerminal::Forgotten { occurred_at, .. }) => {
-            ("Forgotten", Some(*occurred_at))
-        }
+        WakeLifecycle::Closed(CanonicalTerminal::Forgotten { cause, occurred_at }) => (
+            "Forgotten",
+            Some(*occurred_at),
+            Some(match cause {
+                phoenix_workflow::wake_contract::ForgottenCause::PhoenixRestart => "PhoenixRestart",
+                phoenix_workflow::wake_contract::ForgottenCause::CascadeDestroyedHandle => {
+                    "CascadeDestroyedHandle"
+                }
+                phoenix_workflow::wake_contract::ForgottenCause::SubagentHandleMissing => {
+                    "SubagentHandleMissing"
+                }
+                phoenix_workflow::wake_contract::ForgottenCause::TmuxHandleMissing => {
+                    "TmuxHandleMissing"
+                }
+            }),
+        ),
     }
 }
 
@@ -1568,9 +1591,8 @@ mod tests {
                     observation:
                         phoenix_workflow::wake_contract::ReconcileObservation::ResourceUnavailable {
                             authority:
-                                phoenix_workflow::wake_contract::WakeObservationAuthority::for_test(
+                                phoenix_workflow::wake_contract::WakeRecoveryAuthority::for_test(
                                     contract,
-                                    phoenix_workflow::AttemptId(1),
                                 ),
                             cause: ForgottenCause::CascadeDestroyedHandle,
                             occurred_at: Timestamp(19),
@@ -1600,6 +1622,13 @@ mod tests {
                 ..
             })
         ));
+        let forgotten_reason: String = sqlx::query_scalar(
+            "SELECT forgotten_reason FROM wake_contract_identity_bindings WHERE workflow_id = 12",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(forgotten_reason, "CascadeDestroyedHandle");
     }
 
     #[tokio::test]
