@@ -1,10 +1,10 @@
 //! Scope-filtered message retrieval over an FTS5 index
 //! (`specs/conversation-retrieval/`).
 //!
-//! One index (`message_fts`) over every conversation's messages; callers
-//! differ only in the [`RetrievalScope`] they pass. The ranking backend sits
-//! behind the [`MessageRetriever`] trait so a vector/hybrid backend can be
-//! substituted without touching callers (REQ-RET-005). The index is a
+//! One index (`message_fts`) over every conversation's messages. Typed requests
+//! select scope, visibility, grouping, and lexical matching policy. The ranking
+//! backend sits behind the [`MessageRetriever`] trait so a vector/hybrid backend
+//! can be substituted without touching callers (REQ-RET-005). The index is a
 //! rebuildable derived cache over `messages` (REQ-RET-003): kept current by
 //! the persist/mutate/delete hooks the `Database` calls, and reconciled at
 //! startup by [`Fts5Retriever::reconcile`].
