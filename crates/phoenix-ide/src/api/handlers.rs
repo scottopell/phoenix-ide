@@ -3810,12 +3810,18 @@ async fn stream_conversation(
 
     init_trace.record_ms("stream.metadata_hydration_ms", metadata_started.elapsed());
     // Create init event with typed data -- serialization deferred to SSE layer
+    let transcript = match transcript_coverage {
+        crate::runtime::TranscriptCoverage::Complete => {
+            crate::runtime::InitTranscript::Complete(messages)
+        }
+        crate::runtime::TranscriptCoverage::Tail => crate::runtime::InitTranscript::Tail(messages),
+        crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
+    };
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
-        transcript_coverage,
-        messages,
+        transcript,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
@@ -7615,12 +7621,18 @@ async fn shared_sse_stream(
         None
     };
 
+    let transcript = match transcript_coverage {
+        crate::runtime::TranscriptCoverage::Complete => {
+            crate::runtime::InitTranscript::Complete(messages)
+        }
+        crate::runtime::TranscriptCoverage::Tail => crate::runtime::InitTranscript::Tail(messages),
+        crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
+    };
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
-        transcript_coverage,
-        messages,
+        transcript,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,

@@ -1171,6 +1171,7 @@ export function conversationReducer(
       const preservesTranscript = p.transcriptCoverage === 'preserve' && knownGenerationMatches;
       const mergesMessageSuffix = p.transcriptCoverage === 'tail' && knownGenerationMatches;
       const nextTranscriptCoverage: 'tail' | 'complete' = preservesTranscript
+        || (mergesMessageSuffix && atom.transcriptCoverage === 'complete')
         ? atom.transcriptCoverage
         : p.transcriptCoverage === 'complete'
           ? 'complete'

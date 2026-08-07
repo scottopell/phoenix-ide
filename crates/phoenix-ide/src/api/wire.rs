@@ -436,32 +436,34 @@ impl From<SseEvent> for SseWireEvent {
             SseEvent::Init {
                 sequence_id,
                 conversation,
-                messages,
+                transcript,
                 agent_working,
                 presentation_mode,
                 last_sequence_id,
                 context_window_size,
                 project_name,
                 transcript_generation,
-                transcript_coverage,
                 pending_anchor_sequence_id,
                 pending_events,
                 pending_truncated,
-            } => SseWireEvent::Init {
-                sequence_id,
-                conversation,
-                messages: messages.iter().map(EnrichedMessage::from).collect(),
-                agent_working,
-                presentation_mode,
-                last_sequence_id,
-                context_window_size,
-                project_name,
-                transcript_generation,
-                transcript_coverage,
-                pending_anchor_sequence_id,
-                pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
-                pending_truncated,
-            },
+            } => {
+                let (messages, transcript_coverage) = transcript.into_parts();
+                SseWireEvent::Init {
+                    sequence_id,
+                    conversation,
+                    messages: messages.iter().map(EnrichedMessage::from).collect(),
+                    agent_working,
+                    presentation_mode,
+                    last_sequence_id,
+                    context_window_size,
+                    project_name,
+                    transcript_generation,
+                    transcript_coverage,
+                    pending_anchor_sequence_id,
+                    pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
+                    pending_truncated,
+                }
+            }
             SseEvent::Message { message } => {
                 // The envelope `sequence_id` equals `message.sequence_id` —
                 // this is what the client already expects (see

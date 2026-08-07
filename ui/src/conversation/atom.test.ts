@@ -247,7 +247,7 @@ describe('conversationReducer', () => {
       expect(next.transcriptCoverage).toBe('complete');
     });
 
-    it('marks a generation-matched reconnect tail as tail-covered', () => {
+    it('preserves complete coverage when merging a generation-matched tail', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         conversationId: testConversation.id,
@@ -265,7 +265,7 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.messages.map((message) => message.sequence_id)).toEqual([1, 2, 3]);
-      expect(next.transcriptCoverage).toBe('tail');
+      expect(next.transcriptCoverage).toBe('complete');
     });
 
     it('replaces a REST tail when the SSE transcript generation changed', () => {
