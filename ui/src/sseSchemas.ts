@@ -165,7 +165,7 @@ export const SseInitDataSchema = v.looseObject({
   sequence_id: v.number(),
   conversation: ConversationSchema,
   transcript_generation: v.number(),
-  message_snapshot: v.picklist(['full', 'suffix']),
+  transcript_coverage: v.picklist(['complete', 'tail', 'preserve']),
   messages: v.array(MessageSchema),
   agent_working: v.boolean(),
   last_sequence_id: v.number(),

@@ -1,3 +1,6 @@
 
 # Use bd merge for beads JSONL files
 .beads/issues.jsonl merge=beads
+
+# ts-rs emits trailing spaces around generated union fields.
+ui/src/generated/*.ts whitespace=-blank-at-eol

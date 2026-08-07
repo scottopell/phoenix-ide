@@ -108,16 +108,16 @@ describe('parseEvent', () => {
   });
 
   describe('init schema', () => {
-    // Task 02677 tightened the init schema so that fields the Rust side
-    // always sets (presentation_mode, context_window_size,
-    // project_name) are required here too. The generated TS type in
+    // Fields the Rust side always sets (presentation_mode,
+    // context_window_size, project_name, and transcript_coverage) are
+    // required here too. The generated TS type in
     // `./generated/sse` is the source of truth; the schema
     // `satisfies v.GenericSchema<unknown, WireInitData>` would fail to
     // compile if these were still marked optional.
     const validInit = {
       sequence_id: 0,
       transcript_generation: 1,
-      message_snapshot: 'full',
+        transcript_coverage: 'complete',
       conversation: { id: 'conv-1' },
       messages: [],
       agent_working: false,

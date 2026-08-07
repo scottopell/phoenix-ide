@@ -74,6 +74,8 @@
 value InitSnapshot {
     product_conversation_lifecycle: ProductConversationLifecycleUpdate
     last_sequence_id: Integer
+    transcript_generation: Integer
+    transcript_coverage: TranscriptCoverage
     pending_anchor_sequence_id: Integer
     pending_events: List<PendingEventEntry>
     pending_truncated: Boolean
@@ -297,6 +299,8 @@ enum AggregateBoundLiveCarrierKind {
 }
 
 
+enum TranscriptCoverage { complete | tail | preserve }
+
 ------------------------------------------------------------
 -- Config
 ------------------------------------------------------------
@@ -328,25 +332,35 @@ config {
 -- conversation metadata, etc.) AND the current ReplayRing contents
 -- so that a reconnect during an in-flight turn can resume the UI's
 -- mid-stream view rather than blanking out until the next checkpoint.
+-- A ProductConversation stream is rooted at its durable product identity. Its
+-- fresh init projects authoritative aggregate metadata and the newest bounded
+-- History transcript tail from persisted rows. `complete` means the bounded
+-- selection contains all History; `tail` means older History remains available
+-- through lazy server retrieval. Exact continuation boundaries in the selected
+-- range are projected once, and the default Open member follows topology.
+--
+-- On cursor reconnect with a matching transcript generation, `preserve` means
+-- persisted transcript rows may be omitted and the client retains its existing
+-- History coverage. Event replay correctness remains owned by the root event
+-- cursor and ReplayRing.
 rule RootConversationStreamOpened {
     when: ClientSubscribes(root_conversation_id, snapshot)
 
     requires: SnapshotIsForRootConversationAggregate(snapshot, root_conversation_id)
     requires: SnapshotUsesPersistedMessagesAsTranscriptAuthority(snapshot, root_conversation_id)
-    requires: SnapshotProjectsTranscriptRowsChronologically(snapshot, root_conversation_id)
+    requires: SnapshotProjectsNewestBoundedHistory(snapshot, root_conversation_id)
+    requires: SnapshotDeclaresExactTranscriptCoverage(snapshot)
     requires: SnapshotProjectsContinuationBoundariesExactlyOnce(snapshot, root_conversation_id)
-    requires: SnapshotDerivesDefaultLiveTargetFromTopology(snapshot, root_conversation_id)
+    requires: SnapshotDerivesDefaultOpenTargetFromTopology(snapshot, root_conversation_id)
     requires: SnapshotWatermarkDerivedFromRootStreamLedger(snapshot, RootStreamLedger{root_conversation_id: root_conversation_id})
 
     ensures: RootConversationInitDelivered(root_conversation_id, snapshot)
 
     @guidance
-        -- The stable SSE/read route is keyed by the durable root product-conversation
-        -- identity. Init/replay projects the entire root-to-latest transcript from
-        -- persisted rows in chronological order, including exact continuation
-        -- boundaries, rather than letting the client synthesize transcript authority.
+        -- The stable SSE/read route is keyed by durable ProductConversation
+        -- identity. Init owns aggregate metadata and newest bounded History;
+        -- earlier History remains server-owned and is acquired lazily.
 }
-
 rule StreamOpened {
     when: ClientSubscribes(conversation_id, snapshot)
 

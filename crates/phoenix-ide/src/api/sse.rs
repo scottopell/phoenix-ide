@@ -176,7 +176,7 @@ mod tests {
             SseEvent::Init {
                 sequence_id,
                 conversation,
-                messages,
+                transcript,
                 agent_working,
                 presentation_mode,
                 last_sequence_id,
@@ -186,10 +186,13 @@ mod tests {
                 pending_events,
                 pending_truncated,
                 transcript_generation,
-                message_snapshot,
             } => {
-                let enriched_msgs: Vec<Value> =
-                    messages.iter().map(enrich_message_for_api).collect();
+                let transcript_coverage = transcript.coverage();
+                let enriched_msgs: Vec<Value> = transcript
+                    .messages()
+                    .iter()
+                    .map(enrich_message_for_api)
+                    .collect();
                 // Mirror the typed-path conversion: each pending entry is
                 // recursively rendered via the legacy JSON producer so this
                 // function remains the gold-standard reference for the
@@ -203,7 +206,7 @@ mod tests {
                     "sequence_id": sequence_id,
                     "conversation": conversation,
                     "transcript_generation": transcript_generation,
-                    "message_snapshot": message_snapshot,
+                    "transcript_coverage": transcript_coverage,
                     "messages": enriched_msgs,
                     "agent_working": agent_working,
                     "presentation_mode": presentation_mode,
@@ -526,8 +529,10 @@ mod tests {
             sequence_id: 42,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
-            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
-            messages: vec![fixture_user_message(), fixture_agent_message_with_bash()],
+            transcript: crate::runtime::InitTranscript::Complete(vec![
+                fixture_user_message(),
+                fixture_agent_message_with_bash(),
+            ]),
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: 42,
@@ -575,8 +580,7 @@ mod tests {
             sequence_id: 45,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
-            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
-            messages: vec![fixture_user_message()],
+            transcript: crate::runtime::InitTranscript::Complete(vec![fixture_user_message()]),
             agent_working: true,
             presentation_mode: "working".to_string(),
             last_sequence_id: 45,
@@ -621,8 +625,7 @@ mod tests {
             sequence_id: 99,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
-            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
-            messages: vec![fixture_user_message()],
+            transcript: crate::runtime::InitTranscript::Complete(vec![fixture_user_message()]),
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: 99,
@@ -1037,8 +1040,7 @@ mod tests {
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
-            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
-            messages: Vec::new(),
+            transcript: crate::runtime::InitTranscript::Complete(Vec::new()),
             agent_working: true,
             presentation_mode: "working".to_string(),
             last_sequence_id: init_seq,
@@ -1135,8 +1137,7 @@ mod tests {
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
-            message_snapshot: crate::runtime::MessageSnapshotMode::Full,
-            messages: Vec::new(),
+            transcript: crate::runtime::InitTranscript::Complete(Vec::new()),
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: init_seq,

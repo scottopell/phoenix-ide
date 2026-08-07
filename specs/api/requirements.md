@@ -45,16 +45,12 @@ THE SYSTEM SHALL return error without creating conversation
 
 ### REQ-API-003: Message Retrieval
 
-WHEN client requests conversation messages
+WHEN client requests complete conversation history for lazy expansion or deep-link navigation
 THE SYSTEM SHALL return all messages in sequence order
 AND include message type, content, timestamps, and display data
 AND include current conversation state and context window usage
 
-WHEN client specifies after_sequence parameter
-THE SYSTEM SHALL return only messages with sequence_id greater than specified
-AND include current state for reconnection sync
-
-**Rationale:** Full retrieval for initial load; partial retrieval for reconnection after SSE interruption.
+**Rationale:** SSE init owns initial metadata and the newest bounded transcript tail. REST retrieval remains available for older server-owned history when the reader or a deep link requires it; reconnect synchronization is owned by the SSE event cursor rather than transcript message floors.
 
 ---
 
@@ -81,8 +77,10 @@ AND return acknowledgment
 
 ### REQ-API-005: Real-time Streaming
 
-WHEN client connects to conversation SSE stream
-THE SYSTEM SHALL send init event with current state, agent_working status, and last_sequence_id
+WHEN client connects to conversation SSE stream without a replay cursor
+THE SYSTEM SHALL send an init event containing authoritative conversation metadata, current state, agent_working status, the newest bounded transcript tail, exact transcript coverage, and the last applied event sequence
+AND mark transcript coverage `complete` when the bounded selection contains the entire transcript
+AND mark transcript coverage `tail` when older persisted messages precede the bounded selection
 AND stream new messages as they are persisted
 AND stream state changes as they occur
 
@@ -90,8 +88,10 @@ WHEN LLM is generating a response
 THE SYSTEM SHALL stream token events to connected clients as text is produced
 AND include a request identifier so clients can correlate tokens with the in-flight request
 
-WHEN client connects with `after` query parameter
-THE SYSTEM SHALL include only messages with sequence_id > after in init event
+WHEN client reconnects with `after_event_sequence` and a matching transcript generation
+THE SYSTEM SHALL replay events after that event cursor
+AND MAY omit persisted transcript messages from init
+AND SHALL mark transcript coverage `preserve` when the client must retain its existing transcript coverage
 AND then stream new messages normally
 
 WHEN multiple clients connect to same conversation
@@ -108,7 +108,7 @@ THE SYSTEM SHALL include the in-flight assistant message (containing the LLM's t
 AND SHALL surface the current tool execution state via the state_change event delivered in init's pending_events
 SO THAT the user sees the active tool render in the main message list rather than a blank gap until the tool round completes
 
-**Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The `after` parameter enables seamless reconnection without a separate fetch request, eliminating race conditions. Reconnection correctness ensures dropped connections during long generations never leave users with stale or broken views. The in-flight-assistant-message coverage on reconnect closes the symmetric gap during tool execution: without it, a reconnect between "LLM finished, tool started" and "tool finished, checkpoint persisted" would blank out the assistant's message and the tool card.
+**Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The event cursor enables seamless reconnection without a separate fetch request, while transcript generation proves whether existing client coverage can be preserved. Exact coverage keeps lazy older-history loading correct. The in-flight-assistant-message coverage on reconnect closes the symmetric gap during tool execution: without it, a reconnect between "LLM finished, tool started" and "tool finished, checkpoint persisted" would blank out the assistant's message and the tool card.
 
 ---
 
@@ -158,14 +158,14 @@ THE SYSTEM SHALL update the slug if it is not already taken
 
 ### REQ-API-007: Slug Resolution
 
-WHEN client requests conversation by slug
-THE SYSTEM SHALL resolve slug to conversation ID
-AND return conversation details with messages
+WHEN client resolves a conversation route by slug or ID
+THE SYSTEM SHALL return the authoritative conversation ID and canonical slug
+AND SHALL NOT duplicate conversation metadata or transcript content in the route response
 
 WHEN slug does not exist
 THE SYSTEM SHALL return 404 error
 
-**Rationale:** Human-readable URLs in browser improve usability over opaque IDs.
+**Rationale:** Human-readable URLs improve usability over opaque IDs. Narrow route resolution chooses the SSE stream identity while SSE init remains the single authoritative owner of initial metadata and transcript content.
 
 ---
 

@@ -73,6 +73,10 @@ AND automatically acquire the complete earlier history as the reader approaches 
 AND preserve the reader's viewport position, chronological order, and message identity without gaps or duplicates
 AND conceal transcript batching and acquisition progress while acquisition succeeds
 
+The initial conversation metadata and newest bounded transcript tail SHALL be authoritative only after a validated SSE init event. Route resolution SHALL select the conversation identity without duplicating conversation metadata or transcript content. Browser-cached transcript data MAY render provisionally but SHALL NOT authorize stream identity, archive status, runtime actions, or transcript coverage.
+
+Earlier transcript history SHALL remain server-owned and SHALL be requested lazily when reading or deep-link navigation requires it.
+
 IF automatic earlier-history acquisition fails
 THEN THE SYSTEM SHALL present a transcript-local action to retry the acquisition
 
@@ -188,15 +192,15 @@ AND resume normal "ready" state
 ### REQ-CONV-006: Reconnection Data Integrity
 
 WHEN reconnecting to SSE stream
-THE SYSTEM SHALL track `last_sequence_id` from all received messages
-AND reconnect with `?after={last_sequence_id}` parameter
-AND deduplicate any messages by `sequence_id` as safety net
+THE SYSTEM SHALL track the last applied SSE event sequence
+AND reconnect with that event cursor and the transcript generation that the current view represents
+AND deduplicate replayed events and messages by their stable sequence and message identities
 
 WHEN reconnection succeeds
 THE SYSTEM SHALL seamlessly merge missed messages into the view
 AND NOT show duplicate messages
 
-**Rationale:** Users should never see duplicate messages or miss messages due to reconnection. The sequence_id mechanism ensures consistency.
+**Rationale:** Users should never see duplicate messages or miss messages due to reconnection. Event-cursor replay owns reconnect correctness; transcript coverage is independent of the event cursor and older persisted history remains lazy.
 
 ---
 

@@ -2,8 +2,8 @@
 import type { BashToolProgress } from "./BashToolProgress";
 import type { ErrorPresentation } from "./ErrorPresentation";
 import type { LlmAttemptReason } from "./LlmAttemptReason";
-import type { MessageSnapshotMode } from "./MessageSnapshotMode";
 import type { QuotaDetails } from "./QuotaDetails";
+import type { TranscriptCoverage } from "./TranscriptCoverage";
 import type { WorkScopeInventory } from "./WorkScopeInventory";
 
 /**
@@ -35,7 +35,7 @@ conversation: unknown,
  * valibot schema validates each element against `MessageSchema`
  * and transforms to `Message` at that boundary.
  */
-messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, project_name: string | null, transcript_generation: number, message_snapshot: MessageSnapshotMode, 
+messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, project_name: string | null, transcript_generation: number, 
 /**
  * `ReplayRing` anchor: the seq of the last persisted Message at
  * subscribe time. Every entry in `pending_events` has
@@ -64,7 +64,7 @@ pending_events: Array<unknown>,
  * should fall back to DB-only state and wait for the next live
  * event. Q3 resolution in `sse_wire.allium`.
  */
-pending_truncated: boolean, } | { "type": "message", sequence_id: number, 
+pending_truncated: boolean, transcript_coverage: TranscriptCoverage, } | { "type": "message", sequence_id: number, 
 /**
  * See the note on `Init.messages` — the message payload is
  * validated against `MessageSchema` and transformed to the UI's

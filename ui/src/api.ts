@@ -619,11 +619,9 @@ export interface Message {
   created_at: string;
 }
 
-export interface ConversationMetaResponse {
-  conversation: Conversation;
-  agent_working: boolean;
-  presentation_mode: string;
-  context_window_size: number;
+export interface ConversationRouteResponse {
+  id: string;
+  slug: string | null;
 }
 
 export interface ConversationMessageTombstone {
@@ -1606,20 +1604,20 @@ export const api = {
     return resp.json();
   },
 
-  async getConversationMeta(id: string): Promise<ConversationMetaResponse> {
-    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/meta`);
+  async getConversationRoute(id: string): Promise<ConversationRouteResponse> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/route`);
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
-      throw new Error('Failed to get conversation metadata');
+      throw new Error('Failed to resolve conversation route');
     }
     return resp.json();
   },
 
-  async getConversationMetaBySlug(slug: string): Promise<ConversationMetaResponse> {
-    const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/meta`);
+  async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {
+    const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/route`);
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
-      throw new Error('Failed to get conversation metadata');
+      throw new Error('Failed to resolve conversation route');
     }
     return resp.json();
   },

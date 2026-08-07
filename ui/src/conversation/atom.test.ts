@@ -56,7 +56,7 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     pendingAnchorSequenceId: lastAppliedEventSeq,
     pendingEvents: [],
     pendingTruncated: false,
-    messageSnapshot: 'full',
+    transcriptCoverage: overrides.transcriptCoverage ?? 'complete',
     ...overrides,
   };
 }
@@ -87,6 +87,7 @@ describe('conversationReducer', () => {
       const existing = makeMessage(3);
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        conversationId: testConversation.id,
         lastAppliedEventSeq: 3,
         messages: [existing],
         transcriptGeneration: 1,
@@ -95,7 +96,7 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [newMsg],
         lastAppliedEventSeq: 4,
-        messageSnapshot: 'suffix',
+        transcriptCoverage: 'tail',
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -103,6 +104,30 @@ describe('conversationReducer', () => {
       expect(next.messages).toHaveLength(2);
       expect(next.messages[0]!.sequence_id).toBe(3);
       expect(next.messages[1]!.sequence_id).toBe(4);
+    });
+
+    it('replaces cached transcript when authoritative route ownership changes', () => {
+      const cached = makeMessage(3, { conversation_id: 'stale-conversation' });
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'stale-conversation',
+        lastAppliedEventSeq: 3,
+        messages: [cached],
+        transcriptGeneration: 1,
+        transcriptCoverage: 'complete',
+      };
+      const authoritative = makeMessage(4, { conversation_id: testConversation.id });
+      const payload = makeInitPayload({
+        messages: [authoritative],
+        transcriptGeneration: 1,
+        transcriptCoverage: 'tail',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.conversationId).toBe(testConversation.id);
+      expect(next.messages).toEqual([authoritative]);
+      expect(next.messages).not.toContain(cached);
     });
 
     it('replaces and sorts a full snapshot on reconnect', () => {
@@ -115,8 +140,7 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(2), makeMessage(1)],
         lastAppliedEventSeq: 10,
-        messageSnapshot: 'full',
-      });
+          });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
@@ -135,13 +159,14 @@ describe('conversationReducer', () => {
     it('merges a generation-matched suffix into a REST tail on first SSE connect', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        conversationId: testConversation.id,
         messages: [makeMessage(40), makeMessage(50)],
         transcriptGeneration: 3,
       };
       const payload = makeInitPayload({
         messages: [makeMessage(51)],
         transcriptGeneration: 3,
-        messageSnapshot: 'suffix',
+        transcriptCoverage: 'tail',
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -158,7 +183,7 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(51)],
         transcriptGeneration: 3,
-        messageSnapshot: 'suffix',
+        transcriptCoverage: 'tail',
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -178,7 +203,7 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(51)],
         transcriptGeneration: 3,
-        messageSnapshot: 'suffix',
+        transcriptCoverage: 'tail',
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -197,7 +222,7 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(51)],
         transcriptGeneration: 3,
-        messageSnapshot: 'suffix',
+        transcriptCoverage: 'tail',
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -215,17 +240,17 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(1), makeMessage(2)],
         transcriptGeneration: 3,
-        messageSnapshot: 'full',
-      });
+          });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.transcriptCoverage).toBe('complete');
     });
 
-    it('preserves known complete coverage on reconnect suffix init', () => {
+    it('preserves complete coverage when merging a generation-matched tail', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        conversationId: testConversation.id,
         lastAppliedEventSeq: 7,
         messages: [makeMessage(1), makeMessage(2)],
         transcriptGeneration: 3,
@@ -234,7 +259,7 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(3)],
         transcriptGeneration: 3,
-        messageSnapshot: 'suffix',
+        transcriptCoverage: 'tail',
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -252,8 +277,7 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(1)],
         transcriptGeneration: 3,
-        messageSnapshot: 'full',
-      });
+          });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
@@ -371,7 +395,9 @@ describe('conversationReducer', () => {
     it('never regresses lastAppliedEventSeq when init lags live events', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        conversationId: testConversation.id,
         lastAppliedEventSeq: 105,
+        transcriptGeneration: 1,
       };
       const stalePayload = makeInitPayload({ lastAppliedEventSeq: 100 });
 

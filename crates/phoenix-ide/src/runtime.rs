@@ -1008,12 +1008,52 @@ pub struct EnrichedConversation {
     pub cached_pr: Option<CachedPrSummary>,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub enum MessageSnapshotMode {
-    Full,
-    Suffix,
+pub enum TranscriptCoverage {
+    /// The init snapshot contains the complete persisted transcript.
+    Complete,
+    /// The init snapshot contains only the newest persisted transcript suffix.
+    Tail,
+    /// The init intentionally omits persisted messages because the reconnect
+    /// cursor proves the client already has them. The client must retain its
+    /// existing complete-or-tail coverage state.
+    Preserve,
+}
+
+#[derive(Debug, Clone)]
+pub enum InitTranscript {
+    Complete(Vec<crate::db::Message>),
+    Tail(Vec<crate::db::Message>),
+    Preserve,
+}
+
+impl InitTranscript {
+    pub fn into_parts(self) -> (Vec<crate::db::Message>, TranscriptCoverage) {
+        match self {
+            Self::Complete(messages) => (messages, TranscriptCoverage::Complete),
+            Self::Tail(messages) => (messages, TranscriptCoverage::Tail),
+            Self::Preserve => (Vec::new(), TranscriptCoverage::Preserve),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn messages(&self) -> &[crate::db::Message] {
+        match self {
+            Self::Complete(messages) | Self::Tail(messages) => messages,
+            Self::Preserve => &[],
+        }
+    }
+
+    #[cfg(test)]
+    pub const fn coverage(&self) -> TranscriptCoverage {
+        match self {
+            Self::Complete(_) => TranscriptCoverage::Complete,
+            Self::Tail(_) => TranscriptCoverage::Tail,
+            Self::Preserve => TranscriptCoverage::Preserve,
+        }
+    }
 }
 
 /// Events sent to SSE clients.
@@ -1031,7 +1071,7 @@ pub enum SseEvent {
         /// `last_sequence_id` — the snapshot is itself an event.
         sequence_id: i64,
         conversation: Box<EnrichedConversation>,
-        messages: Vec<crate::db::Message>,
+        transcript: InitTranscript,
         agent_working: bool,
         /// Presentation mode for UI display (`idle`/`working`/`needs_action`/`error`/`done`)
         presentation_mode: String,
@@ -1046,7 +1086,6 @@ pub enum SseEvent {
         /// Conversation-level transcript/replica generation for invalidating
         /// stale incremental transcript state on reconnect.
         transcript_generation: i64,
-        message_snapshot: MessageSnapshotMode,
         /// `sequence_id` of the most recent persisted Message at subscribe
         /// time. Every entry in `pending_events` has `sequence_id` strictly
         /// greater than this. Equals `initial_last_seq` for a fresh
