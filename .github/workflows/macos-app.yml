@@ -1,0 +1,51 @@
+name: macOS app
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - "macos/Phoenix/**"
+      - ".github/workflows/macos-app.yml"
+  push:
+    branches: [main]
+    paths:
+      - "macos/Phoenix/**"
+      - ".github/workflows/macos-app.yml"
+
+concurrency:
+  group: macos-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test typed macOS core
+        run: swift test --package-path macos/Phoenix
+      - name: Build attached-capable Debug app
+        run: |
+          xcodebuild \
+            -project macos/Phoenix/Phoenix.xcodeproj \
+            -scheme Phoenix \
+            -configuration Debug \
+            -derivedDataPath "$RUNNER_TEMP/phoenix-macos-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Verify Release requires a sidecar
+        run: |
+          set +e
+          xcodebuild \
+            -project macos/Phoenix/Phoenix.xcodeproj \
+            -scheme Phoenix \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/phoenix-macos-release" \
+            CODE_SIGNING_ALLOWED=NO \
+            build > "$RUNNER_TEMP/release-without-sidecar.log" 2>&1
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -F "Release builds require PHOENIX_SIDECAR_PATH" "$RUNNER_TEMP/release-without-sidecar.log"
