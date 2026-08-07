@@ -57,6 +57,8 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     pendingEvents: [],
     pendingTruncated: false,
     messageSnapshot: 'full',
+    transcriptCoverage: overrides.transcriptCoverage
+      ?? (overrides.messageSnapshot === 'suffix' ? 'tail' : 'complete'),
     ...overrides,
   };
 }
@@ -223,7 +225,7 @@ describe('conversationReducer', () => {
       expect(next.transcriptCoverage).toBe('complete');
     });
 
-    it('preserves known complete coverage on reconnect suffix init', () => {
+    it('marks a generation-matched reconnect tail as tail-covered', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         lastAppliedEventSeq: 7,
@@ -240,7 +242,7 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.messages.map((message) => message.sequence_id)).toEqual([1, 2, 3]);
-      expect(next.transcriptCoverage).toBe('complete');
+      expect(next.transcriptCoverage).toBe('tail');
     });
 
     it('replaces a REST tail when the SSE transcript generation changed', () => {

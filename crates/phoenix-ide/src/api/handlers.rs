@@ -9545,7 +9545,7 @@ pub(crate) mod hard_delete_cascade_tests {
             other => panic!("expected typed bad request, got {other:?}"),
         }
 
-        let (_last_sequence_id, selection, stream_messages, _, _coverage) =
+        let (_last_sequence_id, selection, stream_messages, _, coverage) =
             read_stream_init_messages_with_tail(
                 state.runtime.db(),
                 "conv-history-over-ceiling-turn",
@@ -9558,7 +9558,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("SSE init falls back to a bounded unaligned suffix");
         assert_eq!(selection, StreamDbMessageSelection::Latest);
-        assert_eq!(_coverage.coverage, crate::runtime::TranscriptCoverage::Tail);
+        assert_eq!(coverage.coverage, crate::runtime::TranscriptCoverage::Tail);
         assert_eq!(
             stream_messages.len(),
             usize::try_from(DEFAULT_MESSAGE_HISTORY_LIMIT).unwrap()
@@ -10506,7 +10506,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 .expect("add message");
         }
 
-        let (last_sequence_id, selection, messages, _server_message_tail, _coverage) =
+        let (last_sequence_id, selection, messages, server_message_tail, coverage) =
             read_stream_init_messages_with_tail(
                 state.runtime.db(),
                 "stream-bounded-latest",
@@ -10520,11 +10520,8 @@ pub(crate) mod hard_delete_cascade_tests {
 
         assert_eq!(last_sequence_id, DEFAULT_MESSAGE_HISTORY_LIMIT + 7);
         assert_eq!(selection, StreamDbMessageSelection::Latest);
-        assert_eq!(
-            _server_message_tail,
-            Some(DEFAULT_MESSAGE_HISTORY_LIMIT + 7)
-        );
-        assert_eq!(_coverage.coverage, crate::runtime::TranscriptCoverage::Tail);
+        assert_eq!(server_message_tail, Some(DEFAULT_MESSAGE_HISTORY_LIMIT + 7));
+        assert_eq!(coverage.coverage, crate::runtime::TranscriptCoverage::Tail);
         assert_eq!(
             messages.len(),
             usize::try_from(DEFAULT_MESSAGE_HISTORY_LIMIT).unwrap()

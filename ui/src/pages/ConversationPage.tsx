@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -155,23 +155,6 @@ async function getCachedConversationForRoute(routeSegment: string): Promise<Conv
     : await cacheDB.getConversationBySlug(routeSegment) ?? await cacheDB.getConversation(routeSegment);
 }
 
-async function getConversationForRoute(routeSegment: string) {
-  if (prefersConversationIdRoute(routeSegment)) {
-    try {
-      return await api.getConversation(routeSegment);
-    } catch (err) {
-      if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-      return api.getConversationBySlug(routeSegment);
-    }
-  }
-  try {
-    return await api.getConversationBySlug(routeSegment);
-  } catch (err) {
-    if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-    return api.getConversation(routeSegment);
-  }
-}
-
 async function getConversationByResolvedId(route: ConversationRouteResponse) {
   return api.getConversation(route.id);
 }
@@ -247,33 +230,6 @@ function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKi
 
 function latestMessageSequenceId(messages: { sequence_id: number }[]): number | null {
   return messages.length > 0 ? messages[messages.length - 1]?.sequence_id ?? null : null;
-}
-
-function mergeConversationMessages<T extends { message_id: string; sequence_id: number }>(existing: T[], incoming: T[]): T[] {
-  const byMessageId = new Map<string, T>();
-  const bySequenceId = new Map<number, T>();
-
-  const upsert = (message: T) => {
-    const priorByMessageId = byMessageId.get(message.message_id);
-    if (priorByMessageId && priorByMessageId.sequence_id <= message.sequence_id) {
-      bySequenceId.delete(priorByMessageId.sequence_id);
-    }
-
-    const priorBySequenceId = bySequenceId.get(message.sequence_id);
-    if (priorBySequenceId && priorBySequenceId.message_id !== message.message_id) {
-      byMessageId.delete(priorBySequenceId.message_id);
-    }
-
-    if (!priorByMessageId || priorByMessageId.sequence_id <= message.sequence_id) {
-      byMessageId.set(message.message_id, message);
-      bySequenceId.set(message.sequence_id, message);
-    }
-  };
-
-  existing.forEach(upsert);
-  incoming.forEach(upsert);
-
-  return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
 }
 
 function ConversationPageContent({
@@ -885,7 +841,7 @@ function ConversationPageContent({
     return () => {
       cancelled = true;
     };
-  }, [slug, navigate, dispatch, eventCursorRef]);
+  }, [slug, navigate, dispatch, eventCursorRef, routePrefix]);
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;

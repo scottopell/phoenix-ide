@@ -1163,7 +1163,6 @@ export function conversationReducer(
       // `specs/conversation_atom/conversation_atom.allium`.
       const knownGenerationMatches = atom.transcriptGeneration !== null
         && atom.transcriptGeneration === p.transcriptGeneration;
-      const hadMessagesBeforeInit = atom.messages.length > 0;
       const generationChanged = atom.transcriptGeneration !== null && atom.transcriptGeneration !== p.transcriptGeneration;
       const isFreshConnect = atom.lastAppliedEventSeq === 0 || generationChanged;
       const preservesTranscript = p.transcriptCoverage === 'preserve' && knownGenerationMatches;

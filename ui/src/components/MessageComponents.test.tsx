@@ -209,6 +209,7 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     sequence_id: 100,
     transcript_generation: 1,
     message_snapshot: 'full',
+    transcript_coverage: 'complete',
     conversation,
     messages,
     agent_working: false,
