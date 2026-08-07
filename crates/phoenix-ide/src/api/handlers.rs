@@ -3803,7 +3803,25 @@ async fn stream_conversation(
             .get_conversation_creation_job_for_conversation(&conversation.id)
             .await
         {
-            init_conversation.creation_prompt = Some(job.intent.text.clone());
+            let file_count = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_files(&job.id)
+                .await
+                .map(|files| files.len())
+                .unwrap_or(0);
+            let image_count = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_images(&job.id)
+                .await
+                .map(|images| images.len())
+                .unwrap_or(0);
+            init_conversation.creation_prompt = Some(creation_intent_display_text(
+                &job.intent,
+                image_count,
+                file_count,
+            ));
             init_conversation.creation_error = job.error;
         }
     }
