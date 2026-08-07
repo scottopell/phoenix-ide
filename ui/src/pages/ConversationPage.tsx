@@ -266,10 +266,8 @@ function ConversationPageContent({
   const archiveStatusConfirmed =
     conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
   const serverArchived = conversation?.archived === true;
-  const offlineCachedConversation = !navigator.onLine && resolvedRouteConversationId === null && !!conversationId;
-  const cachedIsSafeOffline = offlineCachedConversation && conversation?.archived !== true && !archiveStatusConfirmed;
-  const isArchived = serverArchived || (!archiveStatusConfirmed && !cachedIsSafeOffline);
-  const confirmedLive = !!conversationId && (archiveStatusConfirmed || cachedIsSafeOffline) && !serverArchived;
+  const isArchived = serverArchived || !archiveStatusConfirmed;
+  const confirmedLive = !!conversationId && archiveStatusConfirmed && !serverArchived;
   const prStatusHandle = useConversationPrStatus({
     conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
@@ -802,7 +800,11 @@ function ConversationPageContent({
       if (cancelled) return;
       setResolvedRouteConversationId(route.id);
       if (route.slug && route.slug !== slug && routePrefix === '/c') {
-        navigate(`/c/${route.slug}`, { replace: true });
+        navigate({
+          pathname: `/c/${route.slug}`,
+          search: location.search,
+          hash: location.hash,
+        }, { replace: true });
       }
     };
 
@@ -861,7 +863,7 @@ function ConversationPageContent({
       cancelled = true;
       window.removeEventListener('online', handleOnline);
     };
-  }, [slug, navigate, dispatch, eventCursorRef, routePrefix]);
+  }, [slug, navigate, dispatch, eventCursorRef, routePrefix, location.search, location.hash]);
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;

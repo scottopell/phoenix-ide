@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { useEffect, useRef } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { ConversationPage } from './ConversationPage';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import { DesktopLayout } from '../components/DesktopLayout';
@@ -233,6 +233,11 @@ const catchUpMessage: Message = {
   created_at: '2024-01-01T00:00:02Z',
 };
 
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="route-location">{location.pathname}{location.search}{location.hash}</output>;
+}
+
 function renderPage(
   conversation: Conversation,
   routeSegment: string = conversation.slug,
@@ -283,7 +288,7 @@ function renderPage(
             <Routes>
               <Route
                 path={`${routePrefix}/:slug`}
-                element={<DesktopLayout><ConversationPage routePrefix={routePrefix} /></DesktopLayout>}
+                element={<><DesktopLayout><ConversationPage routePrefix={routePrefix} /></DesktopLayout><LocationProbe /></>}
               />
             </Routes>
           </MemoryRouter>
@@ -1005,6 +1010,19 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
   });
 
+  it('preserves query and message target when canonicalizing an ID route', async () => {
+    const uuidRoute = '123e4567-e89b-42d3-a456-426614174002';
+    const conversation = makeConversation({ id: uuidRoute, slug: 'canonical-route' });
+
+    renderPage(conversation, uuidRoute, '?keep=route-state#message-missing-target');
+
+    await waitFor(() => expect(api.getConversationRoute).toHaveBeenCalledWith(uuidRoute));
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('route-location')).toHaveTextContent(
+      '/c/canonical-route?keep=route-state#message-missing-target',
+    ));
+  });
+
   it('keeps commission review actions available for non-terminal narrow layouts', async () => {
     viewportFlags.isWideDesktop = false;
     renderPage(makeConversation());
@@ -1113,6 +1131,8 @@ describe('ConversationPage archived read-only rendering', () => {
     renderPage(conversation);
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     expect(api.getConversationRouteBySlug).not.toHaveBeenCalled();
+
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
 
     online.mockReturnValue(true);
     act(() => window.dispatchEvent(new Event('online')));
