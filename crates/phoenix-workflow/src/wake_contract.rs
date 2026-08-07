@@ -651,24 +651,35 @@ pub enum WakeEventKind {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum WakePublicEventType {
+macro_rules! wake_public_event_types {
+    ($($event_type:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum WakePublicEventType {
+            $($event_type),+
+        }
+
+        pub struct WakePublicEventRegistry;
+
+        impl WakePublicEventRegistry {
+            pub const ALL: [WakePublicEventType; wake_public_event_types!(@count $($event_type),+)] = [
+                $(WakePublicEventType::$event_type),+
+            ];
+        }
+    };
+    (@count $($event_type:ident),+) => {
+        <[()]>::len(&[$(wake_public_event_types!(@unit $event_type)),+])
+    };
+    (@unit $event_type:ident) => { () };
+}
+
+wake_public_event_types!(
     Registered,
     DeliveryOwnerTransferred,
     TerminalProposed,
     Terminalized,
-}
-
-pub struct WakePublicEventRegistry;
+);
 
 impl WakePublicEventRegistry {
-    pub const ALL: [WakePublicEventType; 4] = [
-        WakePublicEventType::Registered,
-        WakePublicEventType::DeliveryOwnerTransferred,
-        WakePublicEventType::TerminalProposed,
-        WakePublicEventType::Terminalized,
-    ];
-
     #[must_use]
     pub fn classify(event: &WakeEventKind) -> WakePublicEventType {
         match event {

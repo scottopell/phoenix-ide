@@ -819,7 +819,8 @@ async fn validate_registration_replay_artifacts_tx(
              (SELECT COUNT(*) FROM workflow_effects
               WHERE workflow_id = ?1 AND effect_id = ?2 AND kind = 'begin_observation'
                 AND intent_codec_family = ?3 AND intent_codec_version = ?4
-                AND intent_payload = ?6 AND generation = 0 AND role = 'Required'
+                AND intent_payload = ?6 AND generation = 0
+                AND declared_workflow_version = ?7 AND role = 'Required'
                 AND capability_kind = 'ReclaimableObservation')",
     )
     .bind(workflow_id)
@@ -828,6 +829,10 @@ async fn validate_registration_replay_artifacts_tx(
     .bind(i64::from(WAKE_CONTRACT_CODEC_VERSION))
     .bind(expected_transition_payload)
     .bind(expected_effect.intent_payload)
+    .bind(super::to_i64(
+        expected_effect.declared_workflow_version.0,
+        "declared_workflow_version",
+    )?)
     .fetch_one(&mut *tx.tx)
     .await?;
     if registration_rows != 2 {
@@ -1010,6 +1015,44 @@ async fn validate_replay_artifacts_tx(
             .await?;
             let terminal_event: phoenix_workflow::wake_contract::WakeContractEvent =
                 decode(&terminal_event_payload)?;
+            let WakeState::Present(closed_contract) = state else {
+                unreachable!("terminal bundle validation requires a present contract")
+            };
+            let phoenix_workflow::wake_contract::WakeLifecycle::Closed(canonical_terminal) =
+                &closed_contract.lifecycle
+            else {
+                unreachable!("terminal bundle validation requires a closed contract")
+            };
+            let expected_terminal_owner = match &command.kind {
+                WakeCommandKind::TransferDeliveryOwner { authority, .. } => {
+                    authority.current_owner()
+                }
+                WakeCommandKind::Register { .. }
+                | WakeCommandKind::ObserveTerminal { .. }
+                | WakeCommandKind::Cancel { .. }
+                | WakeCommandKind::DeadlineElapsed { .. }
+                | WakeCommandKind::Reconcile { .. } => &closed_contract.delivery_owner,
+            };
+            let historical_event_matches_state = matches!(
+                &terminal_event.kind,
+                phoenix_workflow::wake_contract::WakeEventKind::Terminalized {
+                    terminal,
+                    delivery_owner,
+                    resume_policy,
+                } if terminal == canonical_terminal
+                    && delivery_owner == expected_terminal_owner
+                    && resume_policy == &canonical_terminal.resume_policy()
+            ) && terminal_event.contract_id
+                == closed_contract.id
+                && terminal_event.transition_id.0
+                    == u64::try_from(*terminal_id).unwrap_or_default()
+                && terminal_event.registering_tool_use_id
+                    == closed_contract.registering_tool_use_id;
+            if !historical_event_matches_state {
+                return Err(DbError::Serialization(
+                    "wake historical terminal event disagrees with closed aggregate".into(),
+                ));
+            }
             terminal_bundle(&terminal_event, state)?.ok_or_else(|| {
                 DbError::Serialization(
                     "wake replay terminal receipt has no canonical bundle".into(),
