@@ -943,7 +943,18 @@ fn local_effect(
         intent_payload: encode(effect)?,
         generation: effect.key.generation,
         role: EffectRole::Required,
-        capability: ExecutionCapability::SafelyRepeatable,
+        capability: match effect.kind {
+            phoenix_workflow::wake_contract::WakeOwedEffectKind::BeginObservation { .. }
+            | phoenix_workflow::wake_contract::WakeOwedEffectKind::FenceObservationAuthority {
+                ..
+            } => ExecutionCapability::ReclaimableObservation,
+            phoenix_workflow::wake_contract::WakeOwedEffectKind::CommitTerminalization {
+                ..
+            }
+            | phoenix_workflow::wake_contract::WakeOwedEffectKind::TransferDeliveryOwner {
+                ..
+            } => ExecutionCapability::SafelyRepeatable,
+        },
         next_eligible_at: None,
         destructive_resource: None,
         status: EffectStatus::Eligible,
@@ -1252,6 +1263,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(next, 2);
+        let capability: String = sqlx::query_scalar(
+            "SELECT capability_kind FROM workflow_effects
+             WHERE workflow_id = ?1 AND kind = 'begin_observation'",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(capability, "ReclaimableObservation");
         assert!(sqlx::query(
             "UPDATE wake_contract_identity_bindings
              SET deadline = registered_at + 1801 WHERE workflow_id = ?1",
@@ -1428,7 +1448,7 @@ mod tests {
                 attempt_id: phoenix_workflow::AttemptId(1),
                 process_incarnation: ProcessIncarnation(1),
                 now: Timestamp(6),
-                lease_until: None,
+                lease_until: Some(phoenix_workflow::LeaseExpiry(100)),
             })
             .await
             .unwrap();

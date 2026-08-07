@@ -1097,7 +1097,7 @@ fn transition_present(
                     },
                 ..
             },
-        ) => close(
+        ) if occurred_at <= contract.deadline => close(
             contract,
             transition_id,
             &committed_command,
@@ -1114,7 +1114,7 @@ fn transition_present(
                     },
                 ..
             },
-        ) => close(
+        ) if occurred_at <= contract.deadline => close(
             contract,
             transition_id,
             &committed_command,
@@ -1129,6 +1129,18 @@ fn transition_present(
         ) => rejected(
             &WakeState::Present(contract.clone()),
             WakeRejection::TerminalArbitrationPending,
+        ),
+        (
+            WakeLifecycle::Open(OpenWakeLifecycle::Observing),
+            WakeCommandKind::Reconcile {
+                observation:
+                    ReconcileObservation::ResourceUnavailable { .. }
+                    | ReconcileObservation::ProtocolFailure { .. },
+                ..
+            },
+        ) => rejected(
+            &WakeState::Present(contract.clone()),
+            WakeRejection::EvidenceAfterDeadline,
         ),
         (
             WakeLifecycle::Open(OpenWakeLifecycle::Observing),

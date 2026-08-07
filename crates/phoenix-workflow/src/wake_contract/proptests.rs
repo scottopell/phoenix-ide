@@ -549,6 +549,29 @@ fn prior_transition_ids_cannot_be_reused_after_the_head_advances() {
 }
 
 #[test]
+fn resource_loss_after_deadline_is_rejected_before_expiry_tick() {
+    let state = registered(10);
+    let result = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::Reconcile {
+                expected_head: contract(&state).head(),
+                observation: ReconcileObservation::ResourceUnavailable {
+                    authority: observation_authority(&state),
+                    cause: ForgottenCause::TmuxHandleMissing,
+                    occurred_at: Timestamp(11),
+                },
+            },
+        ),
+    );
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::EvidenceAfterDeadline)
+    ));
+}
+
+#[test]
 fn evidence_after_deadline_cannot_beat_later_cancellation() {
     let state = registered(10);
     let proposed = transition(
