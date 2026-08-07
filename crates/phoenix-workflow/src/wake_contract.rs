@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
 const MAX_WAKE_DURATION_SECONDS: u64 = 1_800;
+const MAX_WAKE_TRANSITION_ID: u64 = (i64::MAX as u64 - 4) / 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -748,7 +749,7 @@ pub fn finalize_proposed_terminal(
 #[must_use]
 pub fn transition(state: &WakeState, command: WakeCommand) -> WakeTransition {
     let command_kind = command.kind.clone();
-    if command.transition_id.0 == 0 {
+    if command.transition_id.0 == 0 || command.transition_id.0 > MAX_WAKE_TRANSITION_ID {
         return rejected(state, WakeRejection::InvalidTransitionId);
     }
     match (state, command.kind) {
@@ -992,12 +993,16 @@ fn transition_present(
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)),
             WakeCommandKind::ObserveTerminal { evidence, .. },
-        ) if proposal.terminal.admits_evidence_at(evidence.occurred_at) => close(
-            contract,
-            transition_id,
-            &committed_command,
-            CanonicalTerminal::Fired { evidence },
-        ),
+        ) if evidence.occurred_at <= contract.deadline
+            && proposal.terminal.admits_evidence_at(evidence.occurred_at) =>
+        {
+            close(
+                contract,
+                transition_id,
+                &committed_command,
+                CanonicalTerminal::Fired { evidence },
+            )
+        }
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)),
             WakeCommandKind::ObserveTerminal { .. },
@@ -1038,12 +1043,16 @@ fn transition_present(
                     },
                 ..
             },
-        ) if proposal.terminal.admits_evidence_at(occurred_at) => close(
-            contract,
-            transition_id,
-            &committed_command,
-            CanonicalTerminal::Forgotten { cause, occurred_at },
-        ),
+        ) if occurred_at <= contract.deadline
+            && proposal.terminal.admits_evidence_at(occurred_at) =>
+        {
+            close(
+                contract,
+                transition_id,
+                &committed_command,
+                CanonicalTerminal::Forgotten { cause, occurred_at },
+            )
+        }
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(proposal)),
             WakeCommandKind::Reconcile {
@@ -1055,12 +1064,16 @@ fn transition_present(
                     },
                 ..
             },
-        ) if proposal.terminal.admits_evidence_at(occurred_at) => close(
-            contract,
-            transition_id,
-            &committed_command,
-            CanonicalTerminal::Forgotten { cause, occurred_at },
-        ),
+        ) if occurred_at <= contract.deadline
+            && proposal.terminal.admits_evidence_at(occurred_at) =>
+        {
+            close(
+                contract,
+                transition_id,
+                &committed_command,
+                CanonicalTerminal::Forgotten { cause, occurred_at },
+            )
+        }
         (
             WakeLifecycle::Open(OpenWakeLifecycle::TerminalProposed(_)),
             WakeCommandKind::Reconcile {

@@ -111,16 +111,24 @@ impl WakeContractRepository {
         &self,
         input: &RegisterWakeContractInput,
     ) -> DbResult<(WorkflowId, CommitWakeCommandOutcome)> {
-        if !matches!(
-            input.command.kind,
-            phoenix_workflow::wake_contract::WakeCommandKind::Register { .. }
-        ) {
+        let phoenix_workflow::wake_contract::WakeCommandKind::Register { id, .. } =
+            &input.command.kind
+        else {
             return Err(DbError::Serialization(
                 "register_wake_contract requires a register command".into(),
             ));
-        }
+        };
         let mut tx = self.workflow_repo.begin_immediate_tx().await?;
-        let workflow_id = next_global_workflow_id_tx(&mut tx).await?;
+        let existing_workflow_id: Option<i64> = sqlx::query_scalar(
+            "SELECT workflow_id FROM wake_contract_identity_bindings WHERE contract_id = ?1",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut *tx.tx)
+        .await?;
+        let workflow_id = match existing_workflow_id {
+            Some(value) => WorkflowId(super::to_u64(value, "workflow_id")?),
+            None => next_global_workflow_id_tx(&mut tx).await?,
+        };
         let outcome = self
             .commit_wake_command_in_tx(tx, workflow_id, &input.command)
             .await?;
@@ -578,7 +586,7 @@ async fn validate_replay_artifacts_tx(
                 WakeEffectRole::CommitTerminalization
             }
         },
-    ));
+    )?);
     if let Some(effect_id) = expected_effect_id {
         let effect_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM workflow_effects
@@ -662,7 +670,7 @@ fn terminal_bundle(
     let terminal_effect = EffectId(effect_id(
         event.transition_id,
         WakeEffectRole::CommitTerminalization,
-    ));
+    )?);
     let receipt_payload = encode(event)?;
     let origin = match terminal {
         phoenix_workflow::wake_contract::CanonicalTerminal::Expired { .. } => {
@@ -752,7 +760,7 @@ async fn validate_fence_receipt_tx(
     let fence_effect_id = effect_id(
         proposal.transition_id,
         WakeEffectRole::FenceObservationAuthority,
-    );
+    )?;
     let proposal_payload: Vec<u8> = sqlx::query_scalar(
         "SELECT event_payload FROM workflow_transitions
          WHERE workflow_id = ?1 AND transition_id = ?2",
@@ -925,7 +933,7 @@ fn local_effect(
         WakeEffectRole::CommitTerminalization => "commit_terminalization",
         WakeEffectRole::TransferDeliveryOwner => "transfer_delivery_owner",
     };
-    let effect_id = EffectId(effect_id(effect.key.transition_id, effect.key.role));
+    let effect_id = EffectId(effect_id(effect.key.transition_id, effect.key.role)?);
     Ok(LocalEffectDecl {
         effect_id,
         declared_workflow_version,
@@ -964,14 +972,19 @@ fn contract_version(state: &WakeState) -> Version {
     }
 }
 
-fn effect_id(transition_id: TransitionId, role: WakeEffectRole) -> u64 {
+fn effect_id(transition_id: TransitionId, role: WakeEffectRole) -> DbResult<u64> {
     let role = match role {
         WakeEffectRole::BeginObservation => 1,
         WakeEffectRole::FenceObservationAuthority => 2,
         WakeEffectRole::CommitTerminalization => 3,
         WakeEffectRole::TransferDeliveryOwner => 4,
     };
-    transition_id.0.saturating_mul(8).saturating_add(role)
+    transition_id
+        .0
+        .checked_mul(8)
+        .and_then(|value| value.checked_add(role))
+        .filter(|value| i64::try_from(*value).is_ok())
+        .ok_or_else(|| DbError::Serialization("wake effect identity overflow".into()))
 }
 
 fn current_commit_time() -> phoenix_workflow::Timestamp {
@@ -1223,6 +1236,15 @@ mod tests {
             .unwrap();
         assert_eq!(workflow_id, WorkflowId(1));
         assert!(matches!(outcome, CommitWakeCommandOutcome::Applied { .. }));
+        let (replayed_workflow_id, replayed) = repo
+            .register_wake_contract(&register_allocated())
+            .await
+            .unwrap();
+        assert_eq!(replayed_workflow_id, workflow_id);
+        assert!(matches!(
+            replayed,
+            CommitWakeCommandOutcome::Replayed { .. }
+        ));
         let next: i64 = sqlx::query_scalar(
             "SELECT next_value FROM workflow_global_sequences WHERE sequence_name = 'workflow'",
         )
@@ -1230,6 +1252,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(next, 2);
+        assert!(sqlx::query(
+            "UPDATE wake_contract_identity_bindings
+             SET deadline = registered_at + 1801 WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .is_err());
         assert!(matches!(
             repo.load_state(workflow_id).await.unwrap(),
             WakeState::Present(_)

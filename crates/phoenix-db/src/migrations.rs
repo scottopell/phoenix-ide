@@ -349,7 +349,9 @@ CREATE TABLE wake_contract_identity_bindings (
     evidence_codec_family TEXT NOT NULL CHECK (evidence_codec_family <> ''),
     evidence_codec_version INTEGER NOT NULL CHECK (evidence_codec_version >= 1),
     registered_at INTEGER NOT NULL CHECK (registered_at >= 0),
-    deadline INTEGER NOT NULL CHECK (deadline > registered_at),
+    deadline INTEGER NOT NULL CHECK (
+        deadline > registered_at AND deadline - registered_at <= 1800
+    ),
     lifecycle_kind TEXT NOT NULL CHECK (
         lifecycle_kind IN ('Observing', 'TerminalProposed', 'Fired', 'Expired', 'Cancelled', 'Forgotten')
     ),

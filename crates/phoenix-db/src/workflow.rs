@@ -1304,10 +1304,14 @@ impl WorkflowRepository {
         &self,
         input: &CreateWorkflowWithExternalAcceptance,
     ) -> DbResult<ExternalAcceptanceOutcome<Vec<u8>>> {
-        if input.profile.profile_kind == DIRECT_TURN_PROFILE_KIND {
-            return Err(DbError::Serialization(
-                "direct-turn workflows require accept_authoritative_turn".to_string(),
-            ));
+        if matches!(
+            input.profile.profile_kind.as_str(),
+            DIRECT_TURN_PROFILE_KIND | "wake.contract"
+        ) {
+            return Err(DbError::Serialization(format!(
+                "{} workflows require their profile-specific creation path",
+                input.profile.profile_kind
+            )));
         }
         let mut tx = self.begin_tx().await?;
         if let Some(replay) = tx.fetch_external_acceptance_binding(input).await? {
@@ -2797,6 +2801,35 @@ mod tests {
             WorkflowRepository::new(pool)
         };
         (dir, open().await, open().await)
+    }
+
+    #[tokio::test]
+    async fn generic_external_acceptance_rejects_wake_contract_creation() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let mut wake_profile = profile();
+        wake_profile.profile_kind = "wake.contract".into();
+        let result = repo
+            .create_workflow_with_external_acceptance(&CreateWorkflowWithExternalAcceptance {
+                workflow_id: WorkflowId(10),
+                profile: wake_profile,
+                acceptance: acceptance(),
+                target_scope: ScopeId::new("scope-wake").unwrap(),
+                idempotency_key: NonEmptyExternalKey::new("key-wake").unwrap(),
+                intent_fingerprint: "fp-wake".into(),
+                snapshot_codec: codec("snapshot"),
+                snapshot_payload: vec![1],
+                receipt_handle: vec![2],
+                disposition_handle: vec![3],
+                now: Timestamp(10),
+            })
+            .await;
+        assert!(matches!(result, Err(DbError::Serialization(_))));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE workflow_id = 10")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

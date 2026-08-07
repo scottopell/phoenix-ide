@@ -549,6 +549,37 @@ fn prior_transition_ids_cannot_be_reused_after_the_head_advances() {
 }
 
 #[test]
+fn evidence_after_deadline_cannot_beat_later_cancellation() {
+    let state = registered(10);
+    let proposed = transition(
+        &state,
+        command(
+            2,
+            WakeCommandKind::Cancel {
+                expected_head: contract(&state).head(),
+                cause: CancellationCause::UserRequested,
+                occurred_at: Timestamp(20),
+            },
+        ),
+    );
+    let observed = transition(
+        &proposed.new_state,
+        command(
+            3,
+            WakeCommandKind::ObserveTerminal {
+                expected_head: contract(&proposed.new_state).head(),
+                authority: observation_authority(&proposed.new_state),
+                evidence: evidence(15, 1),
+            },
+        ),
+    );
+    assert!(matches!(
+        observed.disposition,
+        WakeDisposition::Rejected(WakeRejection::EvidenceDidNotPrecedeProposal)
+    ));
+}
+
+#[test]
 fn registration_rejects_deadlines_beyond_the_profile_bound() {
     let result = transition(&WakeState::Absent, register_command(1_801));
     assert_eq!(result.new_state, WakeState::Absent);
@@ -671,6 +702,18 @@ fn wake_profile_deserialization_rejects_invalid_identities() {
 fn wake_codec_deserialization_rejects_invalid_identities() {
     assert!(serde_json::from_str::<WakeCodecFamily>("\"\"").is_err());
     assert!(serde_json::from_str::<WakeCodecVersion>("0").is_err());
+}
+
+#[test]
+fn transition_identity_must_fit_the_persisted_effect_namespace() {
+    let mut command = register_command(10);
+    command.transition_id = TransitionId(MAX_WAKE_TRANSITION_ID + 1);
+    let result = transition(&WakeState::Absent, command);
+    assert!(matches!(
+        result.disposition,
+        WakeDisposition::Rejected(WakeRejection::InvalidTransitionId)
+    ));
+    assert_eq!(result.new_state, WakeState::Absent);
 }
 
 #[test]
