@@ -34,7 +34,7 @@ time. Their schema and backfills are introduced through migrations.
 
 Retrieval is exposed behind a `MessageRetriever` trait. The first
 backend is FTS5/BM25 (lexical), chosen because the bundled SQLite ships
-FTS5 plus a local Porter-stemming helper — no embedding provider and no
+FTS5 with bounded query-side Porter suffix handling — no embedding provider and no
 network on the query path. The trait is the seam: a vector backend (embeddings +
 similarity) or a hybrid backend (rank-fused lexical + vector) drops in
 behind it without changing any caller. Scope is an enum (`Conversations(set)` / `Global` / `GlobalExcluding(set)`) and the typed request also selects visibility, result grouping, and lexical match mode. Scope and visibility are applied as query predicates, and best-per-conversation grouping is applied in SQL before the final limit, so the requested bound is honored after all eligibility and grouping rules.

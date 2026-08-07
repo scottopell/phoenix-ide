@@ -8206,6 +8206,7 @@ impl Database {
     ) -> DbResult<i64> {
         let display_str = serde_json::to_string(display_data)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let message = self.get_message_by_id(message_id).await?;
         let mut tx = self.pool.begin().await?;
         let conversation_id: Option<String> = sqlx::query_scalar(
             "UPDATE messages
@@ -8235,7 +8236,7 @@ impl Database {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if hidden {
-            retrieval::fts_delete_message_tx(&mut tx, message_id).await?;
+            retrieval::fts_hide_message_tx(&mut tx, &message).await?;
         }
         tx.commit().await?;
         Ok(transcript_generation)
@@ -13641,7 +13642,17 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(rows, 0);
+        assert_eq!(rows, 1);
+        let indexed_text: String = sqlx::query_scalar(
+            "SELECT f.text FROM message_fts f \
+             JOIN message_fts_rows r ON r.fts_rowid = f.rowid \
+             WHERE r.message_id = ?",
+        )
+        .bind("hidden-index-message")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(indexed_text.is_empty());
     }
 
     #[tokio::test]

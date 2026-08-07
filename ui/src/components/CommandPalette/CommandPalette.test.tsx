@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { ConversationSearchWarmingError } from '../../api';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { CommandPalette } from './CommandPalette';
 import { activeConversationFileRoot } from './fileRoot';
@@ -500,7 +500,9 @@ describe('CommandPalette conversation scope', () => {
     const activeSignal = searchSignal as AbortSignal | null;
     expect(activeSignal?.aborted).toBe(false);
     const finishContent = resolveContent as ((value: { hits: [] }) => void) | null;
-    finishContent?.({ hits: [] });
+    await act(async () => {
+      finishContent?.({ hits: [] });
+    });
   });
 
   it('suppresses stale out-of-order content responses', async () => {

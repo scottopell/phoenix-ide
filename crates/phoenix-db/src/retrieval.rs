@@ -770,11 +770,21 @@ pub async fn fts_reconcile_upsert(
     Ok(true)
 }
 
-pub(crate) async fn fts_delete_message_tx(
+pub(crate) async fn fts_hide_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    message_id: &str,
+    message: &Message,
 ) -> Result<(), sqlx::Error> {
-    delete_message_rows(tx, message_id).await
+    delete_message_rows(tx, &message.message_id).await?;
+    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES ('')")
+        .execute(&mut **tx)
+        .await?;
+    record_fts_row(
+        tx,
+        inserted.last_insert_rowid(),
+        message,
+        &content_fingerprint(""),
+    )
+    .await
 }
 
 /// Remove all index rows for one message id.
@@ -911,22 +921,35 @@ fn build_fts_query(natural: &str, match_mode: RetrievalMatchMode) -> Option<Stri
 
 fn porter_fallback_stems(term: &str) -> Vec<String> {
     const MIN_STEM_PREFIX_CHARS: usize = 4;
-    const COMPLETIONS: &[&str] = &[
-        "n", "ng", "on", "tion", "ation", "ization", "ness", "iness", "s", "ed", "er", "ly",
+    const SUFFIX_RULES: &[(&str, &str)] = &[
+        ("izatio", ""),
+        ("ational", "ate"),
+        ("tional", "tion"),
+        ("enci", "ence"),
+        ("anci", "ance"),
+        ("abli", "able"),
+        ("izer", "ize"),
+        ("alli", "al"),
+        ("entli", "ent"),
+        ("eli", "e"),
+        ("ousli", "ous"),
+        ("nni", "n"),
+        ("ing", ""),
+        ("ie", "i"),
+        ("i", ""),
     ];
     if !term.is_ascii() || term.len() < MIN_STEM_PREFIX_CHARS {
         return Vec::new();
     }
-    let stemmer = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
-    let mut stems = Vec::new();
-    for completion in COMPLETIONS {
-        let completed = format!("{term}{completion}");
-        let stem = stemmer.stem(&completed).into_owned();
-        if stem != term && !stems.contains(&stem) {
-            stems.push(stem);
-        }
-    }
-    stems
+    SUFFIX_RULES
+        .iter()
+        .filter_map(|(suffix, replacement)| {
+            term.strip_suffix(suffix).and_then(|base| {
+                let stem = format!("{base}{replacement}");
+                (stem.len() >= 3 && stem != term).then_some(stem)
+            })
+        })
+        .collect()
 }
 
 fn raw_prefix_guard(term: &str) -> Option<String> {
@@ -1473,7 +1496,7 @@ mod tests {
         db.add_message(
             "m1",
             "c1",
-            &MessageContent::user("Review the running optimization happiness conversation"),
+            &MessageContent::user("Review the running optimization skies conversation"),
             None,
             None,
         )
@@ -1482,7 +1505,7 @@ mod tests {
         let retriever = Fts5Retriever::new(db.pool().clone());
         retriever.reconcile().await.unwrap();
 
-        for query in ["runni", "optimizatio"] {
+        for query in ["runni", "optimizatio", "skie"] {
             let hits = retriever
                 .retrieve(RetrievalRequest::palette_conversation_search(query, 10))
                 .await
