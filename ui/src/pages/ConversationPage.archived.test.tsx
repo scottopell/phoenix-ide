@@ -1057,6 +1057,73 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(api.getConversationBySlug).not.toHaveBeenCalled();
   });
 
+  it('does not send cached reconnect credentials to a different route owner', async () => {
+    const staleConversation = makeConversation({ id: 'stale-owner', transcript_generation: 9 });
+    const authoritativeConversation = makeConversation({ id: 'authoritative-owner' });
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(staleConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([{ ...historyMessage, conversation_id: staleConversation.id }]);
+    vi.mocked(api.getConversationRouteBySlug).mockResolvedValue({
+      id: authoritativeConversation.id,
+      slug: authoritativeConversation.slug,
+    });
+    authoritativeConversations.set(authoritativeConversation.id, authoritativeConversation);
+    const store = new ConversationStore();
+    store.dispatch(slug, {
+      type: 'set_initial_data',
+      conversationId: staleConversation.id,
+      conversation: staleConversation,
+      messages: [{ ...historyMessage, conversation_id: staleConversation.id }],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+      transcriptGeneration: 9,
+      eventCursorFloor: 7,
+    });
+
+    render(
+      <ConversationContext.Provider value={store}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    await waitFor(() => {
+      const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions & {
+        getLastAppliedEventSeq?: () => number;
+        getTranscriptGeneration?: () => number | null;
+      };
+      expect(options.conversationId).toBe(authoritativeConversation.id);
+      expect(options.getLastAppliedEventSeq?.()).toBe(0);
+      expect(options.getTranscriptGeneration?.()).toBeNull();
+    });
+  });
+
+  it('resolves an offline route when connectivity returns', async () => {
+    const online = vi.spyOn(window.navigator, 'onLine', 'get').mockReturnValue(false);
+    const conversation = makeConversation();
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(conversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+
+    renderPage(conversation);
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(api.getConversationRouteBySlug).not.toHaveBeenCalled();
+
+    online.mockReturnValue(true);
+    act(() => window.dispatchEvent(new Event('online')));
+
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledWith(slug));
+    await waitFor(() => {
+      const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
+      expect(options.conversationId).toBe(conversation.id);
+    });
+  });
+
   it('keeps cached history provisional until authoritative SSE init replaces it', async () => {
     const cachedConversation = makeConversation({ transcript_generation: 7 });
     const authoritativeMessage = {
@@ -1085,6 +1152,35 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(await screen.findByText('authoritative SSE tail')).toBeInTheDocument();
     expect(screen.queryByText('keep this history visible')).not.toBeInTheDocument();
     expect(store.getSnapshot(slug).transcriptGeneration).toBe(8);
+    expect(screen.getByTestId('history-has-older')).toHaveTextContent('yes');
+  });
+
+  it('preserves lazy older-history availability across cursor reconnect', async () => {
+    const conversation = makeConversation();
+    const { store } = renderPage(conversation);
+    await screen.findByText('keep this history visible');
+    const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
+    const tailPayload = {
+      ...makeConnectionInit(conversation),
+      transcriptCoverage: 'tail' as const,
+    };
+    act(() => {
+      options.dispatch({ type: 'sse_init', payload: tailPayload });
+      options.onValidatedInit?.(tailPayload);
+    });
+    expect(screen.getByTestId('history-has-older')).toHaveTextContent('yes');
+
+    const preservePayload = {
+      ...makeConnectionInit(conversation),
+      messages: [],
+      transcriptCoverage: 'preserve' as const,
+    };
+    act(() => {
+      options.dispatch({ type: 'sse_init', payload: preservePayload });
+      options.onValidatedInit?.(preservePayload);
+    });
+
+    expect(store.getSnapshot(slug).transcriptCoverage).toBe('tail');
     expect(screen.getByTestId('history-has-older')).toHaveTextContent('yes');
   });
 

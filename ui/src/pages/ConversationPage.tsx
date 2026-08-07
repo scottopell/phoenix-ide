@@ -624,8 +624,12 @@ function ConversationPageContent({
   const connectionInfo = useConnection({
     conversationId: resolvedRouteConversationId ?? undefined,
     dispatch,
-    getLastAppliedEventSeq: () => eventCursorRef.current,
-    getTranscriptGeneration: () => atomRef.current.transcriptGeneration,
+    getLastAppliedEventSeq: () => atomRef.current.conversationId === resolvedRouteConversationId
+      ? eventCursorRef.current
+      : 0,
+    getTranscriptGeneration: () => atomRef.current.conversationId === resolvedRouteConversationId
+      ? atomRef.current.transcriptGeneration
+      : null,
     onValidatedInit: (payload) => {
       setArchiveStatusConfirmedConversationId(payload.conversation.id);
       historyGenerationRef.current += 1;
@@ -636,7 +640,9 @@ function ConversationPageContent({
           generation: historyGenerationRef.current,
           transcriptGeneration: payload.transcriptGeneration,
         },
-        hasEarlierHistory: payload.transcriptCoverage === 'tail',
+        hasEarlierHistory: payload.transcriptCoverage === 'tail'
+          || (payload.transcriptCoverage === 'preserve'
+            && atomRef.current.transcriptCoverage === 'tail'),
       });
     },
   });
@@ -791,6 +797,15 @@ function ConversationPageContent({
 
     let cancelled = false;
 
+    const resolveAuthoritativeRoute = async () => {
+      const route = await resolveConversationRoute(slug);
+      if (cancelled) return;
+      setResolvedRouteConversationId(route.id);
+      if (route.slug && route.slug !== slug && routePrefix === '/c') {
+        navigate(`/c/${route.slug}`, { replace: true });
+      }
+    };
+
     const loadConversation = async () => {
       try {
         let cached = atomRef.current.conversation;
@@ -818,13 +833,7 @@ function ConversationPageContent({
         // Resolve the route before opening the stream. Cached data is provisional:
         // it may paint immediately, but it never chooses the stream identity.
         if (navigator.onLine && !cancelled) {
-          const route = await resolveConversationRoute(slug);
-          if (cancelled) return;
-          setResolvedRouteConversationId(route.id);
-          if (route.slug && route.slug !== slug && routePrefix === '/c') {
-            navigate(`/c/${route.slug}`, { replace: true });
-            return;
-          }
+          await resolveAuthoritativeRoute();
         } else if (!cancelled && !cached) {
           setError('Conversation not found in cache and offline');
         }
@@ -836,10 +845,21 @@ function ConversationPageContent({
       }
     };
 
-    loadConversation();
+    const handleOnline = () => {
+      setError(null);
+      void resolveAuthoritativeRoute().catch((err: unknown) => {
+        if (!cancelled) {
+          console.error('Failed to resolve conversation route after reconnect:', err);
+          setError(err instanceof Error ? err.message : 'Failed to resolve conversation route');
+        }
+      });
+    };
+    window.addEventListener('online', handleOnline);
+    void loadConversation();
 
     return () => {
       cancelled = true;
+      window.removeEventListener('online', handleOnline);
     };
   }, [slug, navigate, dispatch, eventCursorRef, routePrefix]);
 
