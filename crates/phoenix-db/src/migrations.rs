@@ -316,7 +316,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "enforce_conversation_state_kind_consistency",
         sql: MIGRATION_060,
     },
+    Migration {
+        version: 61,
+        name: "project_conversation_work_scope_attachments",
+        sql: MIGRATION_061,
+    },
 ];
+
+const MIGRATION_061: &str = r"
+CREATE VIEW IF NOT EXISTS conversation_work_scope_attachments AS
+SELECT id AS conversation_id, work_scope_id
+FROM conversations
+WHERE work_scope_id IS NOT NULL;
+";
 
 const MIGRATION_058: &str = r"
 ALTER TABLE conversations ADD COLUMN effort TEXT
@@ -3242,6 +3254,83 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    #[tokio::test]
+    async fn migration_061_projects_attachments_without_moving_scope_ownership() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE work_scopes (
+                 id TEXT PRIMARY KEY,
+                 worktree_path TEXT
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 work_scope_id TEXT REFERENCES work_scopes(id),
+                 continued_in_conv_id TEXT REFERENCES conversations(id)
+             );
+             CREATE TABLE bash_processes (
+                 handle TEXT PRIMARY KEY,
+                 work_scope_id TEXT NOT NULL REFERENCES work_scopes(id)
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO work_scopes (id, worktree_path) VALUES ('scope-a', '/repo/.phoenix/worktrees/a')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations (id, work_scope_id) VALUES ('root', 'scope-a'), ('next', 'scope-a')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'next' WHERE id = 'root'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO bash_processes (handle, work_scope_id) VALUES ('bash-1', 'scope-a')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 61).await;
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        let attachments: Vec<(String, String)> = sqlx::query_as(
+            "SELECT conversation_id, work_scope_id FROM conversation_work_scope_attachments ORDER BY conversation_id",
+        )
+        .fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            attachments,
+            vec![
+                ("next".to_string(), "scope-a".to_string()),
+                ("root".to_string(), "scope-a".to_string()),
+            ]
+        );
+        let successor: String =
+            sqlx::query_scalar("SELECT continued_in_conv_id FROM conversations WHERE id = 'root'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(successor, "next");
+        let scope: (String, String) =
+            sqlx::query_as("SELECT id, worktree_path FROM work_scopes WHERE id = 'scope-a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            scope,
+            (
+                "scope-a".to_string(),
+                "/repo/.phoenix/worktrees/a".to_string()
+            )
+        );
+        let bash_owner: String =
+            sqlx::query_scalar("SELECT work_scope_id FROM bash_processes WHERE handle = 'bash-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bash_owner, "scope-a");
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
     }
 
     #[tokio::test]

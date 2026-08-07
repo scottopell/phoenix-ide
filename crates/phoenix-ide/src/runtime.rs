@@ -1265,7 +1265,7 @@ fn sub_agent_registry_for_conv_mode(
     }
 }
 
-pub(crate) fn conversation_owns_work_scope(conv: &crate::db::Conversation) -> bool {
+pub(crate) fn conversation_attachment_retains_work_scope(conv: &crate::db::Conversation) -> bool {
     use phoenix_core::domain::sm_state::ConvState;
 
     if conv.archived {
@@ -1284,7 +1284,7 @@ fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) ->
     Some(format!("task-pending-{id_prefix}"))
 }
 
-pub(crate) fn cleanup_branch_for_unowned_work_scope<'a>(
+pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     worktree_path: &std::path::Path,
     conversations: impl IntoIterator<Item = &'a crate::db::Conversation>,
 ) -> Option<String> {
@@ -1590,7 +1590,7 @@ impl RuntimeManager {
                     let Ok(conv) = manager.db().get_conversation(&conv_id).await else {
                         continue;
                     };
-                    let conv_scope = match conv.work_scope_id.clone() {
+                    let conv_scope = match conv.attached_work_scope_id.clone() {
                         Some(scope) => ResourceScopeKey::Work(scope),
                         None if conv.runtime_role
                             == crate::work_scope::RuntimeRole::Coordinator =>
@@ -2000,7 +2000,7 @@ impl RuntimeManager {
             let Ok(conv) = self.db().get_conversation(&conv_id).await else {
                 continue;
             };
-            let Some(scope_id) = conv.work_scope_id.clone() else {
+            let Some(scope_id) = conv.attached_work_scope_id.clone() else {
                 continue;
             };
             let conv_scope = ResourceScopeKey::Work(scope_id);
@@ -2080,8 +2080,10 @@ impl RuntimeManager {
             return Ok(false);
         };
         let conversation = self.db().get_conversation(conversation_id).await?;
-        Ok(conversation.work_scope_id.as_ref() == Some(work_scope_id)
-            && conversation_owns_work_scope(&conversation))
+        Ok(
+            conversation.attached_work_scope_id.as_ref() == Some(work_scope_id)
+                && conversation_attachment_retains_work_scope(&conversation),
+        )
     }
 
     pub(crate) async fn scope_has_live_conversation(
@@ -2136,10 +2138,10 @@ impl RuntimeManager {
             if conv.archived {
                 continue;
             }
-            if !conversation_owns_work_scope(&conv) {
+            if !conversation_attachment_retains_work_scope(&conv) {
                 continue;
             }
-            if conv.work_scope_id.as_ref() == Some(work_scope_id) {
+            if conv.attached_work_scope_id.as_ref() == Some(work_scope_id) {
                 return Ok(true);
             }
         }
@@ -2528,7 +2530,7 @@ impl RuntimeManager {
             .llm_registry
             .effective_effort(&spec.model_id, conv.effort);
         conv_context.resource_scope = crate::work_scope::ResourceScopeKey::Work(
-            conv.work_scope_id
+            conv.attached_work_scope_id
                 .clone()
                 .expect("sub-agent conversations always have a work scope"),
         );
@@ -2948,7 +2950,7 @@ impl RuntimeManager {
                 context_window,
             )
         };
-        context.resource_scope = match conv.work_scope_id.clone() {
+        context.resource_scope = match conv.attached_work_scope_id.clone() {
             Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
             None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
                 crate::work_scope::ResourceScopeKey::Coordinator
@@ -4680,7 +4682,7 @@ mod scope_liveness_tests {
             .expect("create work conv");
         ResourceScopeKey::Work(
             conversation
-                .work_scope_id
+                .attached_work_scope_id
                 .expect("created conversation has work scope"),
         )
     }
@@ -4691,7 +4693,7 @@ mod scope_liveness_tests {
                 .get_conversation(id)
                 .await
                 .expect("get conversation")
-                .work_scope_id
+                .attached_work_scope_id
                 .expect("conversation has work scope"),
         )
     }

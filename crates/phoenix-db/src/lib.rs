@@ -2990,7 +2990,7 @@ impl Database {
         let now_str = now.to_rfc3339();
         let (inherited_scope, inherited_effort) = if let Some(parent_id) = parent_id {
             let row = sqlx::query(
-                "SELECT work_scope_id, effort FROM conversations WHERE id = ?1 AND work_scope_id IS NOT NULL",
+                "SELECT work_scope_id AS work_scope_id, effort FROM conversations WHERE id = ?1 AND work_scope_id IS NOT NULL",
             )
             .bind(parent_id)
             .fetch_optional(&self.pool)
@@ -3119,7 +3119,7 @@ impl Database {
             effort: inherited_effort,
             conv_mode: conv_mode.clone(),
             runtime_role,
-            work_scope_id: Some(created_work_scope_id),
+            attached_work_scope_id: Some(created_work_scope_id),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
             transcript_generation: 1,
@@ -3437,6 +3437,41 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    /// List conversation-to-scope attachments for one `WorkScope`.
+    ///
+    /// The returned rows are participants attached to the scope, never resource owners.
+    /// Work-affine resources remain owned solely by the `work_scopes` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the attachment projection cannot be read or a
+    /// persisted conversation row cannot be decoded.
+    pub async fn conversation_work_scope_attachments(
+        &self,
+        work_scope_id: &WorkScopeId,
+    ) -> DbResult<Vec<Conversation>> {
+        sqlx::query(
+            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort,
+                    c.project_id, c.desired_base_branch,
+                    c.runtime_role, attachment.work_scope_id,
+                    c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c
+             JOIN conversation_work_scope_attachments attachment
+               ON attachment.conversation_id = c.id
+             LEFT JOIN work_scope_environments e ON e.work_scope_id = attachment.work_scope_id
+             WHERE attachment.work_scope_id = ?1
+             ORDER BY c.created_at, c.id",
+        )
+        .bind(work_scope_id.as_str())
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
     /// Conversations with persisted Phoenix-created worktree paths, including
     /// archived and terminal rows for disk disposition.
     ///
@@ -3689,7 +3724,7 @@ impl Database {
             conv_mode: conv_mode.clone(),
             runtime_role: RuntimeRole::User,
             effort: job.intent.effort,
-            work_scope_id: Some(created_work_scope_id),
+            attached_work_scope_id: Some(created_work_scope_id),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
             seed_parent_id: seed_parent_id.map(String::from),
@@ -5215,7 +5250,7 @@ impl Database {
         let cm = conv_mode_columns(mode);
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT c.work_scope_id, e.cwd
+            "SELECT c.work_scope_id AS work_scope_id, e.cwd
              FROM conversations c
              JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.id = ?1",
@@ -5496,7 +5531,7 @@ impl Database {
                 .expect("approved task title is non-empty"),
         };
         let cm = conv_mode_columns(&work_mode);
-        let work_scope_id = parent.work_scope_id.clone().ok_or_else(|| {
+        let work_scope_id = parent.attached_work_scope_id.clone().ok_or_else(|| {
             DbError::Serialization("task handoff parent has no work scope".into())
         })?;
         let seed_message_id = uuid::Uuid::new_v4().to_string();
@@ -5681,7 +5716,7 @@ impl Database {
             project_id: parent.project_id,
             conv_mode: work_mode,
             runtime_role: phoenix_core::work_scope::RuntimeRole::User,
-            work_scope_id: Some(work_scope_id),
+            attached_work_scope_id: Some(work_scope_id),
             effort: parent.effort,
             desired_base_branch: parent.desired_base_branch,
             message_count: 1,
@@ -5810,7 +5845,7 @@ impl Database {
                 .await?;
             Some(scope_id)
         } else {
-            parent.work_scope_id.clone()
+            parent.attached_work_scope_id.clone()
         };
 
         if parent.runtime_role == RuntimeRole::Coordinator {
@@ -5973,7 +6008,7 @@ impl Database {
             project_id: parent.project_id,
             conv_mode: parent.conv_mode,
             runtime_role: parent.runtime_role,
-            work_scope_id: continuation_work_scope_id,
+            attached_work_scope_id: continuation_work_scope_id,
             effort: parent.effort,
             desired_base_branch: parent.desired_base_branch,
             message_count: 0,
@@ -8865,7 +8900,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
             .unwrap_or(None),
         conv_mode,
         runtime_role,
-        work_scope_id,
+        attached_work_scope_id: work_scope_id,
         desired_base_branch,
         message_count: row.try_get("message_count")?,
         transcript_generation: row
@@ -9168,7 +9203,7 @@ async fn insert_conversation_tx(
             .await?
             != 0;
     let generated_scope = if conv.runtime_role == RuntimeRole::Coordinator
-        || conv.work_scope_id.is_some()
+        || conv.attached_work_scope_id.is_some()
         || conversation_exists
     {
         None
@@ -9185,7 +9220,10 @@ async fn insert_conversation_tx(
         .await?;
         Some(scope_id)
     };
-    let work_scope_id = conv.work_scope_id.as_ref().or(generated_scope.as_ref());
+    let work_scope_id = conv
+        .attached_work_scope_id
+        .as_ref()
+        .or(generated_scope.as_ref());
 
     // A forked/copied conversation starts with an empty steering queue (pending
     // steers are not inherited), so the steering_messages tables are not written
@@ -15634,7 +15672,7 @@ mod tests {
             }
         };
 
-        assert_ne!(child.work_scope_id, parent.work_scope_id);
+        assert_ne!(child.attached_work_scope_id, parent.attached_work_scope_id);
         assert_eq!(child.cwd, parent.cwd);
     }
 
@@ -15865,9 +15903,12 @@ mod tests {
         assert_eq!(persisted_successor.effort, Some(ModelEffort::High));
 
         let parent_before_reload = db.get_conversation("handoff-parent").await.unwrap();
-        assert_eq!(successor.work_scope_id, parent_before_reload.work_scope_id);
-        assert_handoff_scope_promoted(&db, successor.work_scope_id.as_ref().unwrap(), &approval)
-            .await;
+        assert_eq!(
+            successor.attached_work_scope_id,
+            parent_before_reload.attached_work_scope_id
+        );
+        let attached_scope = successor.attached_work_scope_id.as_ref().unwrap();
+        assert_handoff_scope_promoted(&db, attached_scope, &approval).await;
 
         let parent = db.get_conversation("handoff-parent").await.unwrap();
         assert_eq!(
@@ -16503,7 +16544,7 @@ mod tests {
             .await
             .unwrap();
         let work_scope_id = conversation
-            .work_scope_id
+            .attached_work_scope_id
             .expect("ordinary conversation scope");
         let wake_repo = crate::workflow::wake::WakeRepository::new(db.pool.clone());
         let workflow_id = phoenix_workflow::WorkflowId(9_101);
@@ -17549,7 +17590,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        conv.work_scope_id.unwrap()
+        conv.attached_work_scope_id.unwrap()
     }
 
     fn no_live_resource(scope: WorkScopeId) -> WorkScopeRetirementPrecondition {
@@ -17698,6 +17739,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachment_projection_preserves_shared_scope_participants_without_owners() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = setup_exhausted_parent(
+            &db,
+            "work-root",
+            "work-root",
+            "/tmp/work",
+            &work_mode_fixture(),
+        )
+        .await;
+        let successor = match db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
+        };
+        let scope = root.attached_work_scope_id.as_ref().unwrap();
+
+        assert_eq!(successor.attached_work_scope_id.as_ref(), Some(scope));
+        let attachments = db.conversation_work_scope_attachments(scope).await.unwrap();
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work-root", successor.id.as_str()]
+        );
+
+        let view_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('conversation_work_scope_attachments') ORDER BY cid",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            view_columns,
+            vec!["conversation_id".to_string(), "work_scope_id".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn mode_and_cwd_promotion_updates_normalized_environment_atomically() {
         let db = Database::open_in_memory().await.unwrap();
         let scope =
@@ -17716,7 +17799,7 @@ mod tests {
 
         let conv = db.get_conversation("legacy-explore").await.unwrap();
         assert_eq!(conv.cwd, "/tmp/promoted-worktree");
-        assert_eq!(conv.work_scope_id.as_ref(), Some(&scope));
+        assert_eq!(conv.attached_work_scope_id.as_ref(), Some(&scope));
         let environment: (String, Option<String>, Option<String>) = sqlx::query_as(
             "SELECT environment_kind, cwd, worktree_path
              FROM work_scopes WHERE id = ?1",

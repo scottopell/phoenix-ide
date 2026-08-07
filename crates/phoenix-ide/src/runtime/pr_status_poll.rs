@@ -166,7 +166,7 @@ async fn collect_targets(db: &Database) -> Result<Vec<PollTarget>, String> {
             _ => continue,
         };
         let work_scope = conv
-            .work_scope_id
+            .attached_work_scope_id
             .clone()
             .expect("persisted conversation has work scope");
         if !seen.insert(work_scope.clone()) {

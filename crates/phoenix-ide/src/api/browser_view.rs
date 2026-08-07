@@ -208,7 +208,7 @@ async fn resolve_viewer_work_scope(
                 }
             };
             Some((
-                crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id?),
+                crate::work_scope::ResourceScopeKey::Work(conv.attached_work_scope_id?),
                 crate::work_scope::EffectiveResourceAccess::new(conversation_id, authority),
             ))
         }
