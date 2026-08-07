@@ -2,6 +2,7 @@
 //!
 //! Provides persistence for conversations and messages.
 
+pub mod close;
 mod coordinator_query;
 mod ddl;
 mod migrations;
@@ -22,6 +23,7 @@ use phoenix_core::work_scope::{
     WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
 
+pub use close::*;
 pub use coordinator_query::{
     execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
 };
@@ -140,6 +142,28 @@ pub enum DbError {
     /// from the idempotent no-op case (same child id), which returns `Ok`.
     #[error("Fork proposal conflict: {0}")]
     ForkProposalConflict(String),
+    #[error("Close conversation not found: {0}")]
+    CloseConversationNotFound(String),
+    #[error("Close attempt not found: {0}")]
+    CloseAttemptNotFound(String),
+    #[error("Close attempt conflict: {0}")]
+    CloseAttemptConflict(String),
+    #[error("Close phase conflict: attempt {attempt_id} expected {expected} actual {actual}")]
+    ClosePhaseConflict {
+        attempt_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("Invalid close transition for attempt {attempt_id}: {from} -> {to}")]
+    InvalidCloseTransition {
+        attempt_id: String,
+        from: String,
+        to: String,
+    },
+    #[error("Close scope does not belong to aggregate: attempt {attempt_id} scope {scope}")]
+    CloseScopeOutsideAggregate { attempt_id: String, scope: String },
+    #[error("Close delete blocked: {0}")]
+    CloseDeleteBlocked(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
