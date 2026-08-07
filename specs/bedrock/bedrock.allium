@@ -202,8 +202,7 @@ entity Conversation {
     -- root-owned product conversation, not independently to each transcript row.
     -- Bedrock derives the live/latest row from topology: the latest row is the
     -- row with no continuation successor.
-    root: Conversation?
-    predecessor: Conversation?
+    seed_parent: Conversation?
 
     -- Core status transitions (shared)
     transitions core_status {
@@ -329,7 +328,8 @@ variant Parent : Conversation {
 
     open_row_condition: parent_status in { context_exhausted, handed_off }
     is_latest_row: continued_in_conv_id = absent
-    root_conversation: this when root = absent else root
+    predecessor: continuation_predecessor(product_conversation, this)
+    root_conversation: continuation_root(product_conversation, this)
     product_lifecycle: open | history when product_conversation.kind = ordinary
     row_accepts_user_messages:
         if product_conversation.kind = coordinator:
@@ -1332,8 +1332,6 @@ rule UserStartsContinuationConversation {
         conversation.product_conversation.kind = coordinator
         or conversation.product_lifecycle = open
     ensures: conversation.continued_in_conv_id = new_conv
-    ensures: new_conv.predecessor = conversation
-    ensures: new_conv.root = conversation.root_conversation
     ensures: new_conv.product_conversation = conversation.product_conversation
     ensures: new_conv.mode = conversation.mode
     ensures: new_conv.working_dir = conversation.working_dir
@@ -1900,7 +1898,9 @@ rule UserHardDeletesConversationRule {
         --      registry entry.
         --   4. cascade_projects_on_delete — aggregate-scoped worktree cleanup if
         --      applicable.
-        --   5. db.delete_product_conversation(product_conversation_id) — remove
+        --   5. cascade_browser_on_delete — drop aggregate-scoped browser sessions
+        --      unless another live owner retains the same WorkScope.
+        --   6. db.delete_product_conversation(product_conversation_id) — remove
         --      every transcript row and solely-owned child row in the History
         --      aggregate, including message rows, tool-call rows, approval rows,
         --      attachment rows, retrieval chunk rows, retrieval locator rows,
@@ -1909,8 +1909,8 @@ rule UserHardDeletesConversationRule {
         --      pull-request relations untouched.
         --      Re-running the same delete after rows are already gone still
         --      returns the same idempotent success post-state.
-        --   6. Broadcast ConversationHardDeleted SSE wire event.
-        --   7. Return success to the user.
+        --   7. Broadcast ConversationHardDeleted SSE wire event.
+        --   8. Return success to the user.
         --
         -- Each cascade step (2-4) logs failures at WARN with structured
         -- fields sufficient for manual cleanup (pids, socket paths,
