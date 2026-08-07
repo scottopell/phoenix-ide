@@ -40,6 +40,10 @@ Five perspectives—durable workflow/state machine, SQLite recovery, concurrency
 - **Forgotten reasons:** forgotten terminals use only the normative finite reasons: Phoenix restart, cascade-destroyed handle, missing sub-agent handle, or missing tmux handle.
 - **Wake-specific settlement:** the wake repository owns terminal runtime acceptance and fence receipt acknowledgement. Terminal acceptance atomically settles the exact owed delivery; fence acknowledgement persists the receipt without exposing an internal reducer delivery.
 - **Transition identity:** transition zero is rejected by the pure model before persistence.
+- **Repository-derived acceptance:** wake terminal acceptance accepts only the repository-discovered owed delivery and derives generation, status, codecs, event, and snapshot from the loaded closed aggregate.
+- **Cancellation settlement:** non-resuming cancellation deliveries are accepted atomically with terminalization and never remain pending.
+- **Transactional identity allocation:** wake registration allocates its workflow identity from the shared global sequence inside the same transaction that inserts the workflow and authority binding.
+- **Receipt rollback:** rejected fence acknowledgement rolls back all attempted effect and receipt mutations.
 
 ## Authoritative aggregate
 
