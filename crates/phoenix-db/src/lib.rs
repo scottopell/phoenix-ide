@@ -3439,8 +3439,7 @@ impl Database {
 
     /// List conversation-to-scope attachments for one `WorkScope`.
     ///
-    /// The returned rows are participants attached to the scope, never resource owners.
-    /// Work-affine resources remain owned solely by the `work_scopes` row.
+    /// Each returned row is a conversation attachment projected by the schema view.
     ///
     /// # Errors
     ///
