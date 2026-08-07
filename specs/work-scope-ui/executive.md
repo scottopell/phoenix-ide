@@ -70,9 +70,9 @@ correct weight (see `design.md`, "Why No Allium Spec").
 | **REQ-WSUI-006:** Inventory Pull Endpoint | Complete | `GET /api/work-scope/:scope_key/inventory`; `get_conversation` shape |
 | **REQ-WSUI-006b:** Browser Session Stop Endpoint | Complete | Queue-only stop for current scope plus the pre-rekey conversation scope during Explore-to-Work approval |
 | **REQ-WSUI-007:** Inventory Push Event | Complete | `WorkScopeUpdate` `SseWireEvent`; full snapshot, no deltas |
-| **REQ-WSUI-008:** Push Event Routing | Complete | Runtime routes scope updates by attached WorkScope to the root ProductConversation stream |
-| **REQ-WSUI-009:** Unified Conversation Surface Resolves Aggregate Scope Once | Complete (legacy current reality) | Shipped chain dock still uses the active chain scope |
+| **REQ-WSUI-008:** Push Event Routing | Pending migration | Shipped runtime broadcasts by attached WorkScope to matching live transcript-row broadcasters; root ProductConversation stream routing is the normative target, not implemented current behavior |
+| **REQ-WSUI-009:** Unified Conversation Surface Resolves Aggregate Scope Once | Legacy current reality | Shipped chain dock still uses the active chain scope; unified aggregate resolution remains a normative migration target |
 | **REQ-WSUI-010:** Conversation Page Section | Complete | `WorkScopeSection` in left `FileExplorerPanel`, stacked with Files/Skills/Tasks; collapsed-rail badge; atom `workScope` field |
 | **REQ-WSUI-011:** CLI Client Not a Visualization Surface | Complete | `phoenix-client.py` text-only; CLI subcommand is future work |
 
-**Progress:** 12 of 12 implemented.
+**Current implementation:** 10 requirements complete, 1 legacy surface present, and 1 root-routing migration pending.

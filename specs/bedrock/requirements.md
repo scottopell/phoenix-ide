@@ -677,8 +677,10 @@ AND record exactly one visible typed source relation of kind `approved_task` on 
 AND SHALL treat that typed source relation as the sole current authority for visible provenance, deleted-source status, and source breadcrumb derivation for the spawned conversation
 AND SHALL NOT treat any legacy raw source-conversation-id field as current writer or reader authority for approved-task provenance
 AND keep the source conversation Open rather than linking it through `continued_in_conv_id`
+AND SHALL exit the source conversation from AwaitingTaskApproval once the start-fresh approval is accepted
 AND dispatch the next LLM request only in the spawned conversation
 AND SHALL gate that dispatch on successful durable typed provisioning completion for the spawned ProductConversation and its attached `WorkScope`/worktree
+AND SHALL materialize the exact approved artifact in the spawned worktree before that first dispatch
 AND seed that conversation's first LLM-visible context from the approved task brief
   and approval metadata, excluding the source transcript
 AND SHALL treat the spawned conversation as a separate Open conversation derived from the source conversation rather than as an in-place continuation of the predecessor's runtime environment
@@ -719,6 +721,11 @@ happen when the approved task artifact is committed; approval itself does not im
 ---
 
 ### REQ-BED-029: Close Conversation Finalizes Open Work into History
+
+WHEN the latest transcript row of an ordinary Open ProductConversation is running work
+THE SYSTEM SHALL expose the initial Close conversation action
+AND SHALL create the durable Close attempt without stopping work immediately
+AND SHALL require explicit stop-work confirmation before settlement begins
 
 WHEN Close conversation completes for an Open conversation that owns a `WorkScope`
 THE SYSTEM SHALL transition the product conversation to History state
@@ -815,12 +822,11 @@ continuing — without it, the only cleanup path is to create an unwanted
 continuation and then abandon that, which is clunky and produces a
 stranded continuation record. When a continuation exists, the live
 conversation is the continuation; operating on the parent would be
-ambiguous about which conversation the action affects. The landed durable
-architecture also means parent lifecycle settlement cannot rely on ad hoc
-callbacks mutating the parent row directly after child completion; wake,
-child, tool, sub-agent, and other direct-turn-owned effects must reconcile
-through their typed durable profile boundaries so restart/replay and close
-settlement share one authority.
+ambiguous about which conversation the action affects. Parent lifecycle
+settlement uses typed durable profile boundaries rather than ad hoc callbacks
+that mutate the parent row directly after child completion; wake, child, tool,
+sub-agent, and other direct-turn-owned effects reconcile through those
+boundaries so restart/replay and Close settlement share one authority.
 
 **Dependencies:** REQ-BED-021, REQ-BED-030, REQ-PROJ-015, work-lifecycle REQ-WL-001/REQ-WL-002
 

@@ -28,17 +28,26 @@ surface TaskApprovalDecisionImport {
         -- one local typed import surface instead of inventing an unrelated trigger.
 }
 
-surface ProvisioningCompletedImport {
+surface FreshWorkConversationProvisioningRequestImport {
     facing conversation: bedrock/Conversation
 
     provides:
-        FreshGitWorktreeProvisioningCompleted(target_product_conversation, target_conversation, provisioned)
-            when bedrock/FreshGitWorktreeProvisioningCompleted(target_product_conversation, target_conversation, provisioned)
+        FreshWorkConversationProvisioningRequestImported(
+            source_conversation,
+            target_conversation,
+            target_product_conversation,
+            repository_identity
+        )
+            when bedrock/FreshWorkConversationProvisioningRequested(
+                source_conversation,
+                target_conversation,
+                target_product_conversation,
+                repository_identity
+            )
 
-    @guarantee TypedProvisioningCompletionBridge
-        -- Projects consumes one durable typed provisioning-completed event carrying
-        -- the target ProductConversation, the concrete target transcript conversation,
-        -- and the attached WorkScope/worktree tuple that successful provisioning established.
+    @guarantee TypedProvisioningRequestBridge
+        -- Projects consumes the exact bedrock approval boundary and owns all
+        -- subsequent WorkScope/worktree provisioning results.
 }
 
 ------------------------------------------------------------
@@ -80,7 +89,6 @@ value LsRemoteCache {
 }
 
 value ApprovedTaskIdentity {
-    task_kind: taskmd | plain_brief
     task_id: String?
     priority: String?
     slug: String?
@@ -104,7 +112,7 @@ value ApprovedTaskSource {
 }
 
 value ProvisionedWorkScope {
-    scope: bedrock/WorkScope
+    scope: WorkScope
     worktree_path: String
 }
 
@@ -421,7 +429,7 @@ rule TaskApprovalExecuted {
 }
 
 rule TaskApprovalNewConversationExecuted {
-    when: FreshWorkConversationProvisioningRequested(source_conversation, target_conversation, target_product_conversation, repository_identity)
+    when: FreshWorkConversationProvisioningRequestImported(source_conversation, target_conversation, target_product_conversation, repository_identity)
     requires: repository_identity = source_conversation.project.repo
 
     let approved_source = ApprovedTaskSource {
@@ -452,7 +460,7 @@ rule TaskApprovalNewConversationExecuted {
     ensures: ApprovedTaskSourceRecorded(target, approved_source)
     ensures: ApprovedTaskDerivedFromRecorded(source_conversation.product_conversation, target, bedrock/ApprovedTaskObjective { source: approved_source })
     ensures: CreatedFromApprovedTask(target, approved_source)
-    ensures: FreshGitWorktreeProvisioningRequested(target, repository_identity)
+    ensures: FreshGitWorktreeProvisioningRequested(target, target_conversation, repository_identity)
 
     @guidance
         -- Start in new conversation is owned by one typed provisioning request emitted
@@ -462,21 +470,67 @@ rule TaskApprovalNewConversationExecuted {
         -- once for that exact target.
 }
 
+rule FreshGitWorktreeProvisioningProducesTypedCompletion {
+    when: FreshGitWorktreeProvisioningRequested(target, target_conversation, repository_identity)
+    requires: target_conversation.product_conversation = target
+    requires: detached_default_resolution(Project{repo: repository_identity}).outcome = resolved
+
+    let resolved_start = detached_default_resolution(Project{repo: repository_identity}).resolved
+    let worktree = Worktree{product_conversation: target}
+    let scope = WorkScope{
+        product_conversation: target,
+        project: Project{repo: repository_identity},
+        worktree_path: worktree.path,
+        canonical_default_branch: resolved_start.default_identity.branch_name,
+        detached_start_commit: resolved_start.starting_commit
+    }
+    let provisioned = ProvisionedWorkScope {
+        scope: scope,
+        worktree_path: worktree.path.absolute_path
+    }
+
+    ensures: worktree.attached_scope = scope
+    ensures: FreshGitWorktreeProvisioningCompleted(target, target_conversation, provisioned)
+
+    @guidance
+        -- Projects owns the typed success event because Projects owns WorkScope and
+        -- worktree provisioning. An unresolved detached-default result records the
+        -- existing ProvisioningFailure and emits no success event.
+}
+
 rule StartInNewConversationDispatchesOnlyAfterSuccessfulProvisioning {
     when: FreshGitWorktreeProvisioningCompleted(target, target_conversation, provisioned)
     requires: target_conversation.product_conversation = target
+
+    let approved_source = approved_task_source_recorded_for(target)
+    let worktree = Worktree{product_conversation: target}
+
     requires: exists CreatedFromApprovedTask(target, approved_source)
     requires: exists ApprovedTaskSourceRecorded(target, approved_source)
+
+    requires: provisioned.scope = worktree.attached_scope
+    requires: provisioned.worktree_path = worktree.path.absolute_path
     ensures: ProvisionedWorkScopeAttached(target, target_conversation, provisioned)
+    ensures: worktree.approved_task = approved_source
+    ensures:
+        if approved_source.kind = taskmd:
+            TaskFileCommittedInWorkspace(worktree, approval_task_id(approved_source.task_path))
+        else:
+            BriefCommittedInWorkspace(worktree, approved_source.task_path, approved_source.body)
+    ensures: target_conversation.approved_task_objective = bedrock/ApprovedTaskObjective {
+        source: approved_source
+    }
+    ensures: target_conversation.approved_task_write_authority = bedrock/ApprovedTaskWriteAuthority {
+        objective: target_conversation.approved_task_objective
+    }
+    ensures: ApprovedArtifactMaterializedBeforeDispatch(target_conversation, worktree, approved_source)
     ensures: LlmRequestDispatched(target_conversation)
 
     @guidance
-        -- The durable provisioning-completed event is the only success boundary that
-        -- may dispatch the spawned conversation. It carries the target ProductConversation,
-        -- the concrete target transcript conversation, and the attached WorkScope/worktree
-        -- path established by provisioning, so downstream resume uses typed provisioning
-        -- output rather than timing or emit order. Failed provisioning emits no completion
-        -- event and therefore cannot dispatch the target conversation.
+        -- The Projects-owned durable completion event is the only success boundary
+        -- that may attach and dispatch the spawned conversation. The exact reviewed
+        -- artifact, typed objective, and write authority are materialized first;
+        -- unresolved provisioning emits no completion and cannot dispatch.
 }
 
 rule WorktreeTransferredOnContinuation {
@@ -654,7 +708,7 @@ surface ProjectManagement {
     context conversation: bedrock/Conversation
         where exists Worktree{product_conversation: conversation.product_conversation}
           and conversation.continued_in_conv_id = absent
-          and core_status in { idle, error }
+          and conversation.close_eligible
 
     let worktree = Worktree{product_conversation: conversation.product_conversation}
 

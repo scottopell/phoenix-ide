@@ -287,7 +287,7 @@ Append a completion note with these headings:
 - Combined check:
   - `allium check specs/bedrock/bedrock.allium specs/projects/projects.allium specs/work-lifecycle/work-lifecycle.allium specs/pr-association/pr-association.allium specs/sse_wire/sse_wire.allium specs/durable-workflows/durable-workflows.allium specs/durable-workflows/wake-profile.allium specs/durable-workflows/creation-profile.allium specs/subagents/subagents.allium` → parsed `errors=0`
 - Repository/task validation:
-  - `python3 scripts/spec_shape_check.py` → pass
+  - `./dev.py check --lanes spec-shape` → pass
   - `./dev.py tasks validate` → pass
 
 **Review / evidence ledger**

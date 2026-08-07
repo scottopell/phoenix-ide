@@ -1145,11 +1145,13 @@ rule UserApprovesTaskNewConversation {
         target_product_conversation: target_product_conversation,
         repository_identity: conversation.project.repo
     )
+    ensures: conversation.core_status = idle
 
     @guidance
         -- Starting fresh for approved task work creates a separate product
-        -- conversation boundary. It is not a continuation: the source stays open,
-        -- no continuation edge is written, and no handed_off row condition is introduced.
+        -- conversation boundary. It is not a continuation: the source returns to
+        -- ordinary Open/idle, no continuation edge is written, and no handed_off
+        -- row condition is introduced.
         -- Typed provisioning owns when the spawned conversation becomes runnable:
         -- approval requests fresh provisioning, and only a later successful durable
         -- provisioning-completed event may dispatch the first LLM request. Failed
@@ -1320,6 +1322,7 @@ rule IgnoreStaleOrDuplicateContinuationResult {
         or conversation.continuation_operation_id != operation_id
     ensures: conversation.core_status = previous(conversation.core_status)
     ensures: ContinuationResultIgnored(conversation, operation_id)
+}
 
 rule UserStartsContinuationConversation {
     when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
@@ -1334,7 +1337,6 @@ rule UserStartsContinuationConversation {
     ensures: new_conv.mode = conversation.mode
     ensures: new_conv.working_dir = conversation.working_dir
     ensures: SuccessorFirstUserMessageAccepted(new_conv, handoff_text, first_message_id)
-}
 }
 
 rule ContinuationHandoffBecomesBoundary {
@@ -1808,7 +1810,7 @@ rule SubAgentTurnLimitHardStop {
 -- Lifecycle announcement: fires once from the singular root-owned product lifecycle.
 rule ConversationLifecycleEnteredHistory {
     when: ProductConversationEnteredHistory(product_conversation, attempt_id)
-    ensures: ConversationBecameHistory(product_conversation)
+    ensures: ConversationBecameHistory(product_conversation, attempt_id)
 
     @guidance
         -- Downstream specs consume one aggregate lifecycle transition from the
@@ -2108,6 +2110,24 @@ surface UserConversation {
             when conversation.parent_status = context_exhausted
                  and conversation.continued_in_conv_id = absent
                  and conversation.product_lifecycle = open
+        UserRequestsCloseConversation(
+            conversation,
+            next_close_attempt_id(conversation.product_conversation)
+        )
+            when conversation.close_eligible
+                 and conversation.parent_status != awaiting_task_approval
+                 and conversation.core_status != awaiting_continuation
+                 and not exists CloseObligation{product_conversation: conversation.product_conversation}
+                     where phase in {
+                        awaiting_blocker_resolution,
+                        awaiting_stop_work_confirmation,
+                        settling_active_work,
+                        cancel_requested_during_settlement,
+                        awaiting_retirement_inspection,
+                        awaiting_loss_confirmation,
+                        retirement_requested,
+                        needs_repair
+                     }
 
         UserCancelsClose(conversation.product_conversation, close.attempt_id)
             when exists close in CloseObligation{product_conversation: conversation.product_conversation}

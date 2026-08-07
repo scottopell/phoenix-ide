@@ -147,9 +147,10 @@ AND provision a fresh detached-default-branch disposable worktree for the spawne
 AND SHALL treat that spawned conversation as an independent ProductConversation with its own fresh `WorkScope`, not as a sub-agent attachment to the source conversation's worktree
 AND seed only the exact approved task as the spawned conversation's starting context
 AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
+AND SHALL complete that materialization before dispatching the spawned conversation's first LLM request
 AND record exactly one source relation of kind `approved_task` on the spawned conversation that points to the source conversation
-AND dispatch execution in the spawned conversation only after successful durable typed provisioning completion for that spawned ProductConversation, concrete spawned transcript conversation, and attached `WorkScope`/worktree
-AND leave the source conversation Open
+AND dispatch execution in the spawned conversation only after successful durable typed provisioning completion for that spawned ProductConversation, concrete spawned transcript conversation, attached `WorkScope`/worktree, and approved-artifact materialization
+AND leave the source conversation Open and no longer blocked in task-approval state
 AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
 AND SHALL NOT copy, summarize, or inject the source conversation transcript into the spawned conversation as part of approval placement
 AND SHALL NOT dispatch the spawned conversation when provisioning finishes in an unresolved failure result

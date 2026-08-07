@@ -16,8 +16,9 @@ use "../bedrock/bedrock.allium" as bedrock
 surface BedrockCloseSettlementImport {
     facing product_conversation: bedrock/ProductConversation
 
-    demonstrates:
+    provides:
         bedrock_close_settlement_request(product_conversation, attempt_id)
+            when bedrock/CloseSettlementRequested(product_conversation, attempt_id)
 
     @guarantee TypedImportBridge
         -- This surface names the exact bedrock-produced close-settlement event
