@@ -851,7 +851,8 @@ describe('ConversationPage context exhausted handoff', () => {
       continued_in_conv_id: 'successor-pending',
     }));
 
-    fireEvent.click(await screen.findByTestId('continuation-link'));
+    const continuation = await screen.findByTestId('continuation-link');
+    await act(async () => fireEvent.click(continuation));
     expect(await screen.findByText('Still unavailable')).toBeInTheDocument();
     expect(screen.getByTestId('continuation-link')).toBeInTheDocument();
   });
@@ -871,7 +872,7 @@ describe('ConversationPage context exhausted handoff', () => {
 
     expect(await screen.findByText('Generated summary')).toBeInTheDocument();
     expect(screen.queryByTestId('context-exhausted-handoff')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTestId('continuation-link'));
+    await act(async () => fireEvent.click(screen.getByTestId('continuation-link')));
 
     await waitFor(() => expect(api.continueConversation).toHaveBeenCalledWith(
       conversationId,
