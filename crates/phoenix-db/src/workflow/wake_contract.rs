@@ -217,7 +217,7 @@ impl WakeContractRepository {
                 Ok(CommitWakeCommandOutcome::Rejected(rejection))
             }
             WakeDisposition::Replayed { transition_id, .. } => {
-                validate_replay_artifacts_tx(&mut tx, workflow_id, &current).await?;
+                validate_replay_artifacts_tx(&mut tx, workflow_id, &current, command).await?;
                 tx.rollback().await?;
                 Ok(CommitWakeCommandOutcome::Replayed {
                     state: current,
@@ -792,6 +792,7 @@ async fn validate_replay_artifacts_tx(
     tx: &mut super::WorkflowTx<'_>,
     workflow_id: WorkflowId,
     state: &WakeState,
+    command: &WakeCommand,
 ) -> DbResult<()> {
     let WakeState::Present(contract) = state else {
         return Err(DbError::Serialization(
@@ -852,12 +853,19 @@ async fn validate_replay_artifacts_tx(
                 && resume_policy == &terminal.resume_policy()
         }
         (
-            phoenix_workflow::wake_contract::WakeLifecycle::Closed(_),
+            _,
             phoenix_workflow::wake_contract::WakeEventKind::DeliveryOwnerTransferred {
                 previous_owner,
                 new_owner,
             },
-        ) => new_owner == &contract.delivery_owner && previous_owner != new_owner,
+        ) => {
+            let WakeCommandKind::TransferDeliveryOwner { authority, .. } = &command.kind else {
+                return Err(DbError::Serialization(
+                    "wake replay transfer event has no transfer command".into(),
+                ));
+            };
+            new_owner == &contract.delivery_owner && previous_owner == authority.current_owner()
+        }
         _ => false,
     };
     if event.contract_id != contract.id
@@ -939,15 +947,56 @@ async fn validate_replay_artifacts_tx(
                 "wake replay terminal bundle is incomplete".into(),
             ));
         };
+        let expected_bundle = if let Some(bundle) = terminal_bundle(&event, state)? {
+            bundle
+        } else {
+            let terminal_event_payload: Vec<u8> = sqlx::query_scalar(
+                "SELECT receipt_payload FROM workflow_receipts
+                 WHERE workflow_id = ?1 AND receipt_id = ?2",
+            )
+            .bind(workflow_id)
+            .bind(terminal_id)
+            .fetch_one(&mut *tx.tx)
+            .await?;
+            let terminal_event: phoenix_workflow::wake_contract::WakeContractEvent =
+                decode(&terminal_event_payload)?;
+            terminal_bundle(&terminal_event, state)?.ok_or_else(|| {
+                DbError::Serialization(
+                    "wake replay terminal receipt has no canonical bundle".into(),
+                )
+            })?
+        };
+        let expected_codec = codec();
         let terminal_rows: i64 = sqlx::query_scalar(
             "SELECT
-                 (SELECT COUNT(*) FROM workflow_receipts WHERE workflow_id = ?1 AND receipt_id = ?2) +
-                 (SELECT COUNT(*) FROM workflow_barriers WHERE workflow_id = ?1 AND barrier_id = ?2) +
-                 (SELECT COUNT(*) FROM workflow_barrier_members WHERE workflow_id = ?1 AND barrier_id = ?2) +
-                 (SELECT COUNT(*) FROM workflow_deliveries WHERE workflow_id = ?1 AND delivery_id = ?2)",
+                 (SELECT COUNT(*) FROM workflow_receipts
+                  WHERE workflow_id = ?1 AND receipt_id = ?2 AND effect_id = ?3
+                    AND origin = ?4 AND receipt_codec_family = ?5
+                    AND receipt_codec_version = ?6 AND receipt_payload = ?7) +
+                 (SELECT COUNT(*) FROM workflow_barriers
+                  WHERE workflow_id = ?1 AND barrier_id = ?2 AND status = 'Satisfied'
+                    AND reducer_event_codec_family = ?5 AND reducer_event_codec_version = ?6
+                    AND reducer_event_payload = ?7) +
+                 (SELECT COUNT(*) FROM workflow_barrier_members
+                  WHERE workflow_id = ?1 AND barrier_id = ?2 AND effect_id = ?3
+                    AND receipt_family = 'CurrentGenerationEffect') +
+                 (SELECT COUNT(*) FROM workflow_deliveries
+                  WHERE workflow_id = ?1 AND delivery_id = ?2 AND effect_id IS NULL
+                    AND barrier_id = ?2 AND consumer_kind = 'reducer'
+                    AND event_codec_family = ?5 AND event_codec_version = ?6
+                    AND payload_kind = 'Barrier' AND payload_blob = ?7
+                    AND requires_runtime_acceptance = ?8)",
         )
         .bind(workflow_id)
         .bind(terminal_id)
+        .bind(super::to_i64(expected_bundle.effect_id.0, "effect_id")?)
+        .bind(receipt_origin_str(expected_bundle.origin))
+        .bind(&expected_codec.family)
+        .bind(i64::from(expected_codec.version))
+        .bind(&expected_bundle.receipt_payload)
+        .bind(i64::from(
+            expected_bundle.delivery.requires_runtime_acceptance,
+        ))
         .fetch_one(&mut *tx.tx)
         .await?;
         if terminal_rows != 4 {

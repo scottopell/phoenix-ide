@@ -1662,25 +1662,23 @@ impl WorkflowRepository {
     pub async fn renew_lease_exact(&self, input: &RenewLeaseInput) -> DbResult<AuthorityOutcome> {
         let mut tx = self.pool.begin().await?;
         #[cfg(not(test))]
-        let now = Timestamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_secs()),
-        );
-        #[cfg(test)]
-        let now = input.now;
-        let updated = sqlx::query(
-            "UPDATE workflow_reclaimable_leases
+        let statement = "UPDATE workflow_reclaimable_leases
              SET lease_until = ?4
-             WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until < ?4 AND lease_until > ?3",
-        )
-        .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
-        .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
-        .bind(to_i64(now.0, "now")?)
-        .bind(to_i64(input.new_lease_until.0, "new_lease_until")?)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+             WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until < ?4
+               AND lease_until > CAST(strftime('%s','now') AS INTEGER)";
+        #[cfg(test)]
+        let statement = "UPDATE workflow_reclaimable_leases
+             SET lease_until = ?4
+             WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until < ?4
+               AND lease_until > ?3";
+        let updated = sqlx::query(statement)
+            .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
+            .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
+            .bind(to_i64(input.now.0, "now")?)
+            .bind(to_i64(input.new_lease_until.0, "new_lease_until")?)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         if updated == 0 {
             tx.rollback().await?;
             return Ok(AuthorityOutcome::StaleAuthority);

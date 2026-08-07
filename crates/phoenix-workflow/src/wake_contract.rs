@@ -267,6 +267,11 @@ pub struct AuthorizedWakeOwnerTransfer {
 }
 
 impl AuthorizedWakeOwnerTransfer {
+    #[must_use]
+    pub fn current_owner(&self) -> &WakeOwner {
+        &self.current_owner
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn for_test(contract: &WakeContract, new_owner: WakeOwner) -> Self {
