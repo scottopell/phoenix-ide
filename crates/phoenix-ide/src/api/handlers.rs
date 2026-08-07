@@ -1224,9 +1224,23 @@ async fn search_conversations(
         .get_conversation_search_metadata(&conversation_ids)
         .await
         .map_err(|e| AppError::Internal(format!("search metadata lookup failed: {e}")))?;
+    let message_ids: Vec<String> = hits.iter().map(|hit| hit.message_id.clone()).collect();
+    let visible_message_ids = state
+        .db
+        .visible_retrieval_message_ids(&message_ids)
+        .await
+        .map_err(|e| AppError::Internal(format!("search visibility lookup failed: {e}")))?;
     let hits = hits
         .into_iter()
         .filter_map(|hit| {
+            if !visible_message_ids.contains(&hit.message_id) {
+                tracing::debug!(
+                    conversation_id = %hit.conversation_id,
+                    message_id = %hit.message_id,
+                    "conversation search hit omitted because its source message is hidden"
+                );
+                return None;
+            }
             if let Some(metadata) = metadata.get(&hit.conversation_id) {
                 Some(super::types::ConversationSearchHit {
                     conversation_id: hit.conversation_id,

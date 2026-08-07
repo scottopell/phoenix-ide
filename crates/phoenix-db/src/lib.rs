@@ -3354,6 +3354,30 @@ impl Database {
         Ok(metadata)
     }
 
+    /// Return the subset of message ids that remain visible to retrieval callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn visible_retrieval_message_ids(
+        &self,
+        message_ids: &[String],
+    ) -> DbResult<std::collections::HashSet<String>> {
+        if message_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT message_id FROM messages WHERE COALESCE(json_extract(display_data, '$.hidden'), 0) != 1 AND message_id IN ",
+        );
+        query.push_tuples(message_ids.iter(), |mut tuple, message_id| {
+            tuple.push_bind(message_id);
+        });
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| row.try_get("message_id").map_err(DbError::from))
+            .collect()
+    }
+
     /// List conversation ids eligible for command-palette content search.
     ///
     /// # Errors
