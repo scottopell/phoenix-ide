@@ -1052,6 +1052,9 @@ pub enum SseEvent {
         /// Conversation-level transcript/replica generation for invalidating
         /// stale incremental transcript state on reconnect.
         transcript_generation: i64,
+        /// Exact transcript ownership for this init: the full persisted
+        /// transcript, a newest tail with older server-owned history, or a
+        /// generation-proven reconnect that preserves client coverage.
         transcript_coverage: TranscriptCoverage,
         /// `sequence_id` of the most recent persisted Message at subscribe
         /// time. Every entry in `pending_events` has `sequence_id` strictly

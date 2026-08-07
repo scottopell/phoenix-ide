@@ -588,6 +588,8 @@ function ConversationPageContent({
 
   const atomRef = useRef(atom);
   atomRef.current = atom;
+  const locationRef = useRef(location);
+  locationRef.current = location;
   const conversationRouteIdentity = `${slug ?? ''}\u0000${conversationId ?? ''}`;
   const conversationRouteOwnerRef = useRef({ identity: conversationRouteIdentity, generation: 1 });
   if (conversationRouteOwnerRef.current.identity !== conversationRouteIdentity) {
@@ -802,8 +804,8 @@ function ConversationPageContent({
       if (route.slug && route.slug !== slug && routePrefix === '/c') {
         navigate({
           pathname: `/c/${route.slug}`,
-          search: location.search,
-          hash: location.hash,
+          search: locationRef.current.search,
+          hash: locationRef.current.hash,
         }, { replace: true });
       }
     };
@@ -868,7 +870,7 @@ function ConversationPageContent({
       cancelled = true;
       window.removeEventListener('online', handleOnline);
     };
-  }, [slug, navigate, dispatch, eventCursorRef, routePrefix, location.search, location.hash]);
+  }, [slug, navigate, dispatch, eventCursorRef, routePrefix]);
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
