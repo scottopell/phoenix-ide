@@ -1672,7 +1672,7 @@ impl WorkflowRepository {
         let updated = sqlx::query(
             "UPDATE workflow_reclaimable_leases
              SET lease_until = ?4
-             WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until < ?4 AND lease_until >= ?3",
+             WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until < ?4 AND lease_until > ?3",
         )
         .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)

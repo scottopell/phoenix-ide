@@ -544,7 +544,7 @@ async fn validate_observation_authority_tx(
     .bind(super::to_i64(observed_at.0, "observed_at")?)
     .fetch_one(&mut *tx.tx)
     .await?;
-    Ok(exact_recorded == 1)
+    Ok(exact_recorded > 0)
 }
 
 async fn validate_authority_projection_tx(
@@ -2267,6 +2267,18 @@ mod tests {
             panic!("registration should apply")
         };
         persist_observation_before_fence(&repo, workflow_id).await;
+        sqlx::query(
+            "INSERT INTO workflow_authoritative_observations
+             SELECT workflow_id, 2, effect_id, attempt_id, declared_workflow_version, generation,
+                    process_incarnation, observation_codec_family, observation_codec_version,
+                    observation_payload, observed_at, recorded_at
+             FROM workflow_authoritative_observations
+             WHERE workflow_id = ?1 AND observation_id = 1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE workflow_reclaimable_leases SET lease_until = 0 WHERE workflow_id = ?1",
         )
