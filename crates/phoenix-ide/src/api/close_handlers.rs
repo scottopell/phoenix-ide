@@ -49,6 +49,7 @@ struct ScopeRepresentative {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct ScopeInventorySnapshot {
     worktree_path: Option<String>,
     worktree_exists: bool,
@@ -444,7 +445,6 @@ async fn settle_attempt(
             .await?;
         }
         ClosePhase::SettlingActiveWork => {}
-        ClosePhase::AwaitingStopWorkConfirmation => return Ok(obligation),
         _ => return Ok(obligation),
     }
     cancel_all_direct_turns(state, &attempt_id).await?;
@@ -681,10 +681,13 @@ fn collect_worktree_scopes(conversations: &[Conversation]) -> Vec<WorktreeInspec
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
+    use std::fmt::Write as _;
     sha2::Sha256::digest(bytes)
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
 }
 
 fn aggregate_fingerprint(inspections: &[ScopeInspectionInput]) -> Result<String, AppError> {
@@ -856,6 +859,7 @@ async fn record_resource(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn record_retirement_evidence(
     state: &AppState,
     attempt_id: &str,
@@ -882,7 +886,7 @@ async fn record_retirement_evidence(
             attempt_id,
             scope,
             RetiredResourceKind::BashProcessGroup,
-            &format!("{}#bash:none", scope_key_identity),
+            &format!("{scope_key_identity}#bash:none"),
             RetirementOutcome::AbsenceAdopted,
             Some("no pre-cleanup bash handles".to_string()),
         )
@@ -899,9 +903,9 @@ async fn record_retirement_evidence(
             .unwrap_or_default();
         for handle_id in all_handle_ids {
             let outcome = match post_states.get(handle_id.as_str()) {
-                Some(phoenix_core::domain::work_scope_inventory::BashHandleState::Running)
-                | Some(
-                    phoenix_core::domain::work_scope_inventory::BashHandleState::KillPendingKernel,
+                Some(
+                    phoenix_core::domain::work_scope_inventory::BashHandleState::Running
+                    | phoenix_core::domain::work_scope_inventory::BashHandleState::KillPendingKernel,
                 ) => {
                     failures = true;
                     RetirementOutcome::Residual(RetirementFailureReason::ResidualProcessAlive)
@@ -928,7 +932,7 @@ async fn record_retirement_evidence(
         attempt_id,
         scope,
         RetiredResourceKind::TmuxServer,
-        &format!("{}#tmux", scope_key_identity),
+        &format!("{scope_key_identity}#tmux"),
         before_tmux,
         after_tmux,
     )
@@ -942,7 +946,7 @@ async fn record_retirement_evidence(
         attempt_id,
         scope,
         RetiredResourceKind::BrowserSession,
-        &format!("{}#browser", scope_key_identity),
+        &format!("{scope_key_identity}#browser"),
         before_browser,
         after_browser,
     )
@@ -956,7 +960,7 @@ async fn record_retirement_evidence(
         attempt_id,
         scope,
         RetiredResourceKind::PtySession,
-        &format!("{}#pty", scope_key_identity),
+        &format!("{scope_key_identity}#pty"),
         before_pty,
         after_pty,
     )
@@ -966,7 +970,7 @@ async fn record_retirement_evidence(
     let worktree_identity = pre
         .and_then(|snapshot| snapshot.worktree_path.clone())
         .or_else(|| post.and_then(|snapshot| snapshot.worktree_path.clone()))
-        .unwrap_or_else(|| format!("{}#worktree:none", scope_key_identity));
+        .unwrap_or_else(|| format!("{scope_key_identity}#worktree:none"));
     let before_worktree = pre.is_some_and(|snapshot| snapshot.worktree_exists);
     let after_worktree = post.is_some_and(|snapshot| snapshot.worktree_exists);
     record_simple_resource_outcome(

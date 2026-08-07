@@ -1085,6 +1085,7 @@ async fn resolve_work(
     })
 }
 
+#[allow(clippy::wildcard_enum_match_arm)]
 fn map_db_not_found(e: DbError) -> AppError {
     match e {
         DbError::ConversationNotFound(_) => {

@@ -1563,6 +1563,7 @@ fn sanitize_stem(stem: &str) -> String {
 
 /// Map the atomic DB resolve error to a typed resolve error. A divergent prior
 /// resolution is a 409; everything else is internal.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn map_db_resolve_error(e: DbError) -> ForkResolveError {
     match e {
         DbError::ForkProposalConflict(m) => ForkResolveError::Conflict(m),

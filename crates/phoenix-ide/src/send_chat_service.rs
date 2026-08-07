@@ -539,6 +539,7 @@ fn now_timestamp() -> Timestamp {
     Timestamp(u64::try_from(now).unwrap_or_default())
 }
 
+#[allow(clippy::wildcard_enum_match_arm)]
 fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
         crate::db::DbError::ConversationNotFound(message) => {
@@ -551,6 +552,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
     }
 }
 
+#[allow(clippy::wildcard_enum_match_arm)]
 fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
         crate::db::DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged {

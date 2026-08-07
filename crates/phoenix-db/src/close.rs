@@ -60,6 +60,7 @@ pub struct LossRowInput {
     pub item_identity: String,
 }
 
+#[allow(clippy::missing_errors_doc)]
 impl Database {
     pub async fn product_conversation_topology(
         &self,
@@ -877,6 +878,7 @@ fn no_worktree_fingerprint() -> &'static str {
     "no-worktree"
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn parse_close_obligation_row(row: sqlx::sqlite::SqliteRow) -> DbResult<CloseObligation> {
     let phase_raw: String = row.try_get("phase")?;
     let phase = ClosePhase::from_db_str(&phase_raw)
@@ -899,6 +901,7 @@ fn parse_close_obligation_row(row: sqlx::sqlite::SqliteRow) -> DbResult<CloseObl
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn parse_close_inspection_row(row: sqlx::sqlite::SqliteRow) -> DbResult<CloseInspection> {
     Ok(CloseInspection {
         attempt_id: row.try_get("attempt_id")?,
@@ -909,6 +912,7 @@ fn parse_close_inspection_row(row: sqlx::sqlite::SqliteRow) -> DbResult<CloseIns
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn parse_close_inspection_loss_row(row: sqlx::sqlite::SqliteRow) -> DbResult<CloseInspectionLoss> {
     let category_raw: String = row.try_get("category")?;
     let category = match category_raw.as_str() {
@@ -933,6 +937,7 @@ fn parse_close_inspection_loss_row(row: sqlx::sqlite::SqliteRow) -> DbResult<Clo
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn parse_close_retired_resource_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> DbResult<CloseRetiredResource> {
@@ -996,6 +1001,7 @@ async fn get_close_retired_resource_tx(
     parse_close_retired_resource_row(row)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn parse_runtime_role(raw: String) -> DbResult<RuntimeRole> {
     RuntimeRole::from_db_str(&raw)
         .ok_or_else(|| DbError::Serialization(format!("unknown runtime role {raw}")))
@@ -1024,6 +1030,7 @@ fn parse_failure_reason(reason: &str) -> DbResult<RetirementFailureReason> {
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn parse_dt(raw: String) -> DbResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&raw)
         .map(|dt| dt.with_timezone(&Utc))

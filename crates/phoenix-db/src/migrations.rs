@@ -3520,6 +3520,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn migration_062_enforces_close_retirement_constraints() {
         let pool = test_pool().await;

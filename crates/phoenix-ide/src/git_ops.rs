@@ -1290,7 +1290,7 @@ fn worktree_content_state_digest(repo_root: &Path) -> Result<String, String> {
     let mut paths = untracked
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .map(|path| path.to_vec())
+        .map(<[u8]>::to_vec)
         .collect::<Vec<_>>();
     paths.sort();
     for path in paths {
