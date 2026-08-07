@@ -903,31 +903,21 @@ fn build_fts_query(natural: &str, match_mode: RetrievalMatchMode) -> Option<Stri
 }
 
 fn raw_prefix_guard(term: &str) -> Option<String> {
-    if term.ends_with("ization") {
-        Some(term.to_string())
-    } else if term.ends_with("izatio") {
-        Some(term.trim_end_matches("izatio").to_string())
-    } else {
-        term.strip_suffix('i')
-            .filter(|base| base.len() >= 3)
-            .map(str::to_string)
-    }
+    (term.is_ascii() && term.len() > 3).then(|| term.to_string())
 }
 
 fn build_prefix_alternatives(term: &str) -> String {
-    let fallback_stem = term
-        .strip_suffix("izatio")
-        .map(str::to_string)
-        .filter(|base| base.len() >= 3)
-        .or_else(|| {
-            term.strip_suffix('i')
-                .filter(|base| base.len() >= 3)
-                .map(|base| base.strip_suffix('n').unwrap_or(base).to_string())
-        });
-    match fallback_stem {
-        Some(stem) => format!("(\"{term}\"* OR \"{stem}\")"),
-        None => format!("\"{term}\"*"),
+    const MIN_PORTER_PREFIX_CHARS: usize = 3;
+    if !term.is_ascii() {
+        return format!("\"{term}\"*");
     }
+    let chars: Vec<char> = term.chars().collect();
+    let shortest = MIN_PORTER_PREFIX_CHARS.min(chars.len());
+    let terms = (shortest..=chars.len())
+        .rev()
+        .map(|length| format!("\"{}\"*", chars[..length].iter().collect::<String>()))
+        .collect::<Vec<_>>();
+    format!("({})", terms.join(" OR "))
 }
 
 /// Stable, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used to
@@ -984,7 +974,7 @@ mod tests {
     #[test]
     fn build_query_prefixes_only_for_palette_mode() {
         let q = build_fts_query("observed runni", RetrievalMatchMode::FinalTokenPrefix).unwrap();
-        assert_eq!(q, "\"observed\" OR (\"runni\"* OR \"run\")");
+        assert_eq!(q, "\"observed\" OR (\"runni\"* OR \"runn\"* OR \"run\"*)");
     }
 
     #[test]
@@ -1455,7 +1445,7 @@ mod tests {
         db.add_message(
             "m1",
             "c1",
-            &MessageContent::user("Review the running optimization conversation"),
+            &MessageContent::user("Review the running optimization happiness conversation"),
             None,
             None,
         )
@@ -1464,7 +1454,7 @@ mod tests {
         let retriever = Fts5Retriever::new(db.pool().clone());
         retriever.reconcile().await.unwrap();
 
-        for query in ["runni", "optimizatio"] {
+        for query in ["runni", "optimizatio", "happin"] {
             let hits = retriever
                 .retrieve(RetrievalRequest::palette_conversation_search(query, 10))
                 .await

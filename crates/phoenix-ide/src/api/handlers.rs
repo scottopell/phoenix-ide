@@ -1201,24 +1201,21 @@ async fn search_conversations(
         .retrieve(RetrievalRequest::palette_conversation_search(q, limit))
         .await
         .map_err(|e| AppError::Internal(format!("search failed: {e}")))?;
-    if hits.is_empty() {
-        let eligible_ids = state
-            .db
-            .list_conversation_search_ids()
-            .await
-            .map_err(|e| AppError::Internal(format!("search freshness scope failed: {e}")))?;
-        let fresh = state
-            .message_retriever
-            .is_fresh_for(&eligible_ids)
-            .await
-            .map_err(|e| AppError::Internal(format!("search freshness check failed: {e}")))?;
-        if !fresh {
-            return Err(AppError::TypedBadRequest {
-                message: "the global message index is catching up; try the search again"
-                    .to_string(),
-                error_type: "conversation_search_warming".to_string(),
-            });
-        }
+    let eligible_ids = state
+        .db
+        .list_conversation_search_ids()
+        .await
+        .map_err(|e| AppError::Internal(format!("search freshness scope failed: {e}")))?;
+    let fresh = state
+        .message_retriever
+        .is_fresh_for(&eligible_ids)
+        .await
+        .map_err(|e| AppError::Internal(format!("search freshness check failed: {e}")))?;
+    if !fresh {
+        return Err(AppError::TypedBadRequest {
+            message: "the global message index is catching up; try the search again".to_string(),
+            error_type: "conversation_search_warming".to_string(),
+        });
     }
     let conversation_ids: Vec<String> =
         hits.iter().map(|hit| hit.conversation_id.clone()).collect();
@@ -14836,6 +14833,61 @@ mod wake_handler_tests {
                 Request::builder()
                     .method("GET")
                     .uri("/api/conversations/search?q=absentterm")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["error_type"], "conversation_search_warming");
+    }
+
+    #[tokio::test]
+    async fn conversation_search_rejects_partial_results_when_live_index_is_stale() {
+        let mut state = make_test_state().await;
+        seed_conversation(&state, "conv-indexed-search").await;
+        seed_conversation(&state, "conv-stale-search").await;
+        state
+            .db
+            .add_message(
+                "m-indexed-search",
+                "conv-indexed-search",
+                &crate::db::MessageContent::user("shared searchable phrase"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        retriever.reconcile().await.unwrap();
+        state.message_retriever = Arc::new(retriever);
+        state
+            .db
+            .add_message(
+                "m-stale-search",
+                "conv-stale-search",
+                &crate::db::MessageContent::user("shared searchable phrase"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?")
+            .bind("m-stale-search")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=shared")
                     .body(Body::empty())
                     .expect("request"),
             )
