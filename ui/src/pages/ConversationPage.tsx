@@ -835,7 +835,12 @@ function ConversationPageContent({
         // Resolve the route before opening the stream. Cached data is provisional:
         // it may paint immediately, but it never chooses the stream identity.
         if (navigator.onLine && !cancelled) {
-          await resolveAuthoritativeRoute();
+          try {
+            await resolveAuthoritativeRoute();
+          } catch (routeError) {
+            if (!cached) throw routeError;
+            console.warn('Failed to resolve conversation route; keeping cached transcript provisional', routeError);
+          }
         } else if (!cancelled && !cached) {
           setError('Conversation not found in cache and offline');
         }

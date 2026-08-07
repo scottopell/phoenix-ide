@@ -154,6 +154,18 @@ describe('useConnection epoch stamping (task 08683)', () => {
     );
   });
 
+  it('closes and schedules recovery when init identity differs from the route', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const { result } = renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+    const stream = FakeEventSource.instances[0]!;
+
+    act(() => stream.emit('init', makeInitPayload('conv-B', 'slug-B')));
+
+    expect(stream.closed).toBe(true);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: 'sse_error' }));
+    expect(result.current.state).toBe('reconnecting');
+  });
+
   it('uses the exact transcript coverage reported in init payloads', () => {
     const captured: SSEAction[] = [];
     const dispatch = (action: SSEAction) => captured.push(action);

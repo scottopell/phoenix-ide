@@ -206,11 +206,12 @@ function transformInitData(raw: SseInitData): InitPayload {
  * Hook for managing SSE connection lifecycle with reconnection handling.
  *
  * Socket lifecycle manager only. Receives `dispatch` from the conversation
- * atom and calls it with SSEActions. The server always returns the full
- * message list on /stream init — update-in-place mutations arrive via the
- * typed `message_updated` SSE event — so this hook carries no event-cursor
- * state of its own. Ordering, replay drop, and gap buffering all live in the
- * atom reducer.
+ * atom and calls it with SSEActions. A fresh init carries the authoritative
+ * newest bounded transcript selection; a generation-proven reconnect may
+ * preserve existing coverage without persisted messages. Update-in-place
+ * mutations arrive via the typed `message_updated` SSE event. This hook carries
+ * no event-cursor state of its own: ordering, replay drop, and gap buffering all
+ * live in the atom reducer.
  */
 export function useConnection({
   conversationId,
@@ -405,10 +406,13 @@ export function useConnection({
 
             const payload = transformInitData(res.data);
             if (payload.conversation.id !== convId) {
+              es.close();
+              if (eventSourceRef.current === es) eventSourceRef.current = null;
               stampedDispatch({
                 type: 'sse_error',
                 error: { type: 'BackendError', message: 'SSE init conversation did not match the resolved route' },
               });
+              dispatchMachineRef.current({ type: 'SSE_ERROR' });
               return;
             }
             dispatchMachineRef.current({ type: 'SSE_OPEN' });

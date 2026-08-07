@@ -1075,6 +1075,44 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(api.getConversationBySlug).not.toHaveBeenCalled();
   });
 
+  it('keeps cached history visible and read-only when route resolution fails', async () => {
+    const conversation = makeConversation();
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(conversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    const routeFailure = deferred<{ id: string; slug: string | null }>();
+    vi.mocked(api.getConversationRouteBySlug).mockReturnValue(routeFailure.promise);
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+    await waitFor(() => expect(cacheDB.getMessages).toHaveBeenCalledWith(conversation.id));
+    routeFailure.reject(new Error('temporary route failure'));
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(screen.queryByText('temporary route failure')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+
+    vi.mocked(api.getConversationRouteBySlug).mockResolvedValue({
+      id: conversation.id,
+      slug: conversation.slug,
+    });
+    act(() => window.dispatchEvent(new Event('online')));
+    await waitFor(() => {
+      const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
+      expect(options.conversationId).toBe(conversation.id);
+    });
+  });
+
   it('does not send cached reconnect credentials to a different route owner', async () => {
     const staleConversation = makeConversation({ id: 'stale-owner', transcript_generation: 9 });
     const authoritativeConversation = makeConversation({ id: 'authoritative-owner' });
