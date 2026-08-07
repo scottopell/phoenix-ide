@@ -788,25 +788,19 @@ async fn validate_registration_replay_artifacts_tx(
             },
         })?;
     let expected_effect = local_effect(
-        &transition(
-            &WakeState::Absent,
-            WakeCommand {
+        &phoenix_workflow::wake_contract::WakeOwedEffect {
+            key: phoenix_workflow::wake_contract::WakeEffectKey {
+                contract_id: expected_contract.id.clone(),
+                generation: Generation(0),
                 transition_id: TransitionId(1),
-                kind: WakeCommandKind::Register {
-                    id: expected_contract.id.clone(),
-                    registration_owner: expected_contract.registration_owner.clone(),
-                    registering_tool_use_id: expected_contract.registering_tool_use_id.clone(),
-                    subject: AuthorizedWakeSubject::work_scope_for_test(
-                        expected_contract.subject.clone(),
-                        expected_contract.registration_owner.clone(),
-                    ),
-                    condition: expected_contract.condition.clone(),
-                    registered_at: expected_contract.registered_at,
-                    deadline: expected_contract.deadline,
-                },
+                role: WakeEffectRole::BeginObservation,
             },
-        )
-        .owed_effects[0],
+            kind: phoenix_workflow::wake_contract::WakeOwedEffectKind::BeginObservation {
+                subject: expected_contract.subject.clone(),
+                condition: expected_contract.condition.clone(),
+                deadline: expected_contract.deadline,
+            },
+        },
         Version(1),
     )?;
     let workflow_id = super::to_i64(workflow_id.0, "workflow_id")?;
