@@ -74,12 +74,16 @@ impl WakeContractRepository {
             "SELECT COUNT(*) FROM workflow_effects e
              JOIN workflows w ON w.workflow_id = e.workflow_id
              JOIN wake_contract_identity_bindings b ON b.workflow_id = e.workflow_id
+             JOIN workflow_reclaimable_leases l
+               ON l.workflow_id = e.workflow_id AND l.attempt_id = ?3
              WHERE e.workflow_id = ?1 AND e.effect_id = ?2
-               AND e.kind = 'fence_observation_authority'
+               AND e.kind = 'fence_observation_authority' AND l.lease_until > ?4
                AND w.profile_kind = 'wake.contract' AND w.profile_version = 1",
         )
         .bind(super::to_i64(input.authority.workflow_id.0, "workflow_id")?)
         .bind(super::to_i64(input.authority.effect_id.0, "effect_id")?)
+        .bind(super::to_i64(input.authority.attempt_id.0, "attempt_id")?)
+        .bind(super::to_i64(current_commit_time().0, "now")?)
         .fetch_one(&mut *tx.tx)
         .await?;
         if is_fence != 1 {
@@ -177,7 +181,7 @@ impl WakeContractRepository {
                     CommitWakeCommandOutcome::Rejected(WakeRejection::ConflictingTransitionReuse),
                 ));
             }
-            validate_replay_artifacts_tx(&mut tx, workflow_id, &current).await?;
+            validate_registration_replay_artifacts_tx(&mut tx, workflow_id).await?;
             tx.rollback().await?;
             return Ok((
                 workflow_id,
@@ -374,7 +378,21 @@ impl WakeContractRepository {
                 workflow_id.0
             )));
         }
-        let state = decode(&head.snapshot_payload)?;
+        let state: WakeState = decode(&head.snapshot_payload)?;
+        let WakeState::Present(contract) = &state else {
+            return Err(DbError::Serialization(
+                "persisted wake workflow cannot have an absent aggregate".into(),
+            ));
+        };
+        let expected_status = workflow_status_for_state(contract);
+        if head.version != contract.version
+            || head.generation != contract.generation
+            || head.status != expected_status
+        {
+            return Err(DbError::Serialization(
+                "wake workflow head disagrees with aggregate snapshot".into(),
+            ));
+        }
         validate_authority_projection_tx(tx, workflow_id, state).await
     }
 
@@ -478,6 +496,7 @@ async fn validate_observation_authority_tx(
            ON l.workflow_id = a.workflow_id AND l.attempt_id = a.attempt_id
          WHERE a.workflow_id = ?1 AND a.attempt_id = ?2
            AND a.status IN ('Begun', 'ObservationRecorded') AND l.lease_until > ?3
+           AND e.kind = 'begin_observation'
            AND e.generation = (SELECT generation FROM workflows WHERE workflow_id = ?1)",
     )
     .bind(workflow_id)
@@ -509,7 +528,10 @@ async fn validate_observation_authority_tx(
         "SELECT COUNT(*) FROM workflow_attempts a
          JOIN workflow_authoritative_observations o
            ON o.workflow_id = a.workflow_id AND o.attempt_id = a.attempt_id
+         JOIN workflow_effects e
+           ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id
          WHERE a.workflow_id = ?1 AND a.attempt_id = ?2 AND a.status = 'AuthorityLost'
+           AND e.kind = 'begin_observation'
            AND o.observation_codec_family = ?3 AND o.observation_codec_version = ?4
            AND o.observation_payload = ?5 AND o.observed_at = ?6",
     )
@@ -712,6 +734,33 @@ fn lifecycle_columns(
     }
 }
 
+async fn validate_registration_replay_artifacts_tx(
+    tx: &mut super::WorkflowTx<'_>,
+    workflow_id: WorkflowId,
+) -> DbResult<()> {
+    let workflow_id = super::to_i64(workflow_id.0, "workflow_id")?;
+    let registration_rows: i64 = sqlx::query_scalar(
+        "SELECT
+             (SELECT COUNT(*) FROM workflow_transitions
+              WHERE workflow_id = ?1 AND transition_id = 1) +
+             (SELECT COUNT(*) FROM workflow_effects
+              WHERE workflow_id = ?1 AND effect_id = ?2 AND kind = 'begin_observation')",
+    )
+    .bind(workflow_id)
+    .bind(super::to_i64(
+        effect_id(TransitionId(1), WakeEffectRole::BeginObservation)?,
+        "effect_id",
+    )?)
+    .fetch_one(&mut *tx.tx)
+    .await?;
+    if registration_rows != 2 {
+        return Err(DbError::Serialization(
+            "wake registration replay artifacts are incomplete".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_replay_artifacts_tx(
     tx: &mut super::WorkflowTx<'_>,
     workflow_id: WorkflowId,
@@ -824,6 +873,21 @@ struct TerminalBundle {
     barrier: LocalBarrierDecl,
     barrier_member: LocalBarrierMemberDecl,
     delivery: LocalDeliveryDecl,
+}
+
+fn workflow_status_for_state(
+    contract: &phoenix_workflow::wake_contract::WakeContract,
+) -> WorkflowStatus {
+    match &contract.lifecycle {
+        phoenix_workflow::wake_contract::WakeLifecycle::Closed(terminal)
+            if terminal.resume_policy()
+                == phoenix_workflow::wake_contract::WakeResumePolicy::SuppressAutomaticResume =>
+        {
+            WorkflowStatus::Completed
+        }
+        phoenix_workflow::wake_contract::WakeLifecycle::Open(_)
+        | phoenix_workflow::wake_contract::WakeLifecycle::Closed(_) => WorkflowStatus::Active,
+    }
 }
 
 fn workflow_status_after_event(
@@ -1035,6 +1099,13 @@ async fn revoke_observation_authority_tx(
         .bind(workflow_id)
         .execute(&mut *tx.tx)
         .await?;
+    sqlx::query(
+        "UPDATE workflow_effects SET status = 'Invalidated'
+         WHERE workflow_id = ?1 AND kind = 'begin_observation' AND status = 'Eligible'",
+    )
+    .bind(workflow_id)
+    .execute(&mut *tx.tx)
+    .await?;
     Ok(())
 }
 
@@ -1742,6 +1813,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wake_head_projection_drift_is_rejected() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(17);
+        repo.commit_wake_command(&register(workflow_id))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflows SET generation = generation + 1 WHERE workflow_id = ?1")
+            .bind(i64::try_from(workflow_id.0).unwrap())
+            .execute(&repo.workflow_repo.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.load_state(workflow_id).await,
+            Err(DbError::Serialization(message))
+                if message.contains("head disagrees with aggregate")
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_proposal_invalidates_unclaimed_observation_effect() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(18);
+        let registered = repo
+            .commit_wake_command(&register(workflow_id))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        let (proposal, _) = propose_cancel(&state, workflow_id);
+        repo.commit_wake_command(&proposal).await.unwrap();
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM workflow_effects
+             WHERE workflow_id = ?1 AND kind = 'begin_observation'",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "Invalidated");
+    }
+
+    #[tokio::test]
     async fn terminalization_requires_a_durable_fence_receipt() {
         let (_dir, repo, _) = open_repo_pair().await;
         let registered = repo
@@ -1789,10 +1903,42 @@ mod tests {
                 attempt_id: phoenix_workflow::AttemptId(2),
                 process_incarnation: ProcessIncarnation(1),
                 now: Timestamp(6),
-                lease_until: Some(phoenix_workflow::LeaseExpiry(100)),
+                lease_until: Some(phoenix_workflow::LeaseExpiry(i64::MAX as u64)),
             })
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE workflow_reclaimable_leases SET lease_until = 0
+             WHERE workflow_id = 10 AND attempt_id = 2",
+        )
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        let expired_receipt = repo
+            .accept_fence_receipt(&AcceptReceiptInput {
+                authority: begun.authority.clone().unwrap(),
+                receipt_id: ReceiptId(98),
+                delivery_id: DeliveryId(98),
+                attempt_id: Some(phoenix_workflow::AttemptId(2)),
+                origin: ReceiptOrigin::Execution,
+                receipt_codec: codec(),
+                receipt_payload: vec![0],
+                receipt_event_codec: codec(),
+                receipt_event_payload: vec![0],
+                receipt_event_requires_runtime_acceptance: false,
+                request_runtime_acceptance_for_cancellation: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(expired_receipt.outcome, AuthorityOutcome::StaleAuthority);
+        sqlx::query(
+            "UPDATE workflow_reclaimable_leases SET lease_until = ?1
+             WHERE workflow_id = 10 AND attempt_id = 2",
+        )
+        .bind(i64::MAX)
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
         let receipt = repo
             .accept_fence_receipt(&AcceptReceiptInput {
                 authority: begun.authority.unwrap(),
