@@ -1736,6 +1736,17 @@ impl WorkflowRepository {
         &self,
         input: &AcceptReceiptInput,
     ) -> DbResult<ReceiptAcceptanceResult> {
+        if workflow_profile_kind(&self.pool, input.authority.workflow_id)
+            .await?
+            .as_deref()
+            == Some("wake.contract")
+        {
+            return Ok(ReceiptAcceptanceResult {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                delivery: None,
+            });
+        }
         for _ in 0..5 {
             match self.accept_receipt_once(input).await {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
@@ -3101,6 +3112,65 @@ mod tests {
             first.list_deliveries(WorkflowId(32)).await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn generic_receipt_acceptance_rejects_wake_contract_workflow() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        create_workflow(&repo, WorkflowId(324)).await;
+        install_effect_plan(
+            &repo,
+            WorkflowId(324),
+            EffectId(1),
+            ExecutionCapability::SafelyRepeatable,
+        )
+        .await;
+        let authority = repo
+            .begin_attempt(&BeginAttemptInput {
+                workflow_id: WorkflowId(324),
+                effect_id: EffectId(1),
+                attempt_id: AttemptId(1),
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(3),
+                lease_until: None,
+            })
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        sqlx::query("UPDATE workflows SET profile_kind = 'wake.contract' WHERE workflow_id = 324")
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+
+        let result = repo
+            .accept_receipt(&AcceptReceiptInput {
+                authority,
+                receipt_id: ReceiptId(1),
+                delivery_id: DeliveryId(1),
+                attempt_id: Some(AttemptId(1)),
+                origin: ReceiptOrigin::Execution,
+                receipt_codec: local_codec_owned("receipt"),
+                receipt_payload: vec![1],
+                receipt_event_codec: local_codec_owned("event"),
+                receipt_event_payload: vec![2],
+                receipt_event_requires_runtime_acceptance: false,
+                request_runtime_acceptance_for_cancellation: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, AuthorityOutcome::StaleAuthority);
+        assert!(repo
+            .list_receipts(WorkflowId(324))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .list_deliveries(WorkflowId(324))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -1,8 +1,7 @@
 use super::{
-    next_global_workflow_id_tx, AcceptReceiptInput, CommitTransitionPlanCas,
-    DeliveryResolutionDecision, DeliveryResolutionPlan, LocalBarrierDecl, LocalBarrierMemberDecl,
-    LocalCodec, LocalDeliveryDecl, LocalDeliveryPayloadKind, LocalEffectDecl,
-    ReceiptAcceptanceResult, WorkflowRepository,
+    next_global_workflow_id_tx, AcceptReceiptInput, CommitTransitionPlanCas, LocalBarrierDecl,
+    LocalBarrierMemberDecl, LocalCodec, LocalDeliveryDecl, LocalDeliveryPayloadKind,
+    LocalEffectDecl, ReceiptAcceptanceResult, WorkflowRepository,
 };
 use crate::{DbError, DbResult};
 use phoenix_workflow::wake_contract::{
@@ -42,11 +41,6 @@ pub enum CommitWakeCommandOutcome {
     VersionConflict,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AcceptWakeTerminalInput {
-    pub workflow_id: WorkflowId,
-}
-
 #[derive(Clone)]
 pub struct WakeContractRepository {
     workflow_repo: WorkflowRepository,
@@ -62,74 +56,6 @@ impl WakeContractRepository {
             #[cfg(test)]
             fail_after_transition_once: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
-    }
-
-    pub async fn accept_terminal_delivery(
-        &self,
-        input: &AcceptWakeTerminalInput,
-    ) -> DbResult<CommitOutcome> {
-        let mut tx = self.workflow_repo.begin_immediate_tx().await?;
-        let state = self.load_state_tx(&mut tx, input.workflow_id).await?;
-        let WakeState::Present(contract) = &state else {
-            tx.rollback().await?;
-            return Ok(CommitOutcome::InvalidPlan);
-        };
-        if !matches!(
-            contract.lifecycle,
-            phoenix_workflow::wake_contract::WakeLifecycle::Closed(_)
-        ) {
-            tx.rollback().await?;
-            return Ok(CommitOutcome::InvalidPlan);
-        }
-        let expected_delivery: Option<i64> = sqlx::query_scalar(
-            "SELECT delivery_id FROM workflow_deliveries
-             WHERE workflow_id = ?1 AND status = 'Pending'
-               AND runtime_acceptance_status = 'Owed'",
-        )
-        .bind(super::to_i64(input.workflow_id.0, "workflow_id")?)
-        .fetch_optional(&mut *tx.tx)
-        .await?;
-        let Some(expected_delivery) = expected_delivery else {
-            tx.rollback().await?;
-            return Ok(CommitOutcome::InvalidPlan);
-        };
-        let delivery_id = DeliveryId(super::to_u64(expected_delivery, "delivery_id")?);
-        let transition_id = TransitionId(
-            contract
-                .head_transition_id
-                .0
-                .checked_add(1)
-                .ok_or_else(|| {
-                    DbError::Serialization("wake transition identity overflow".into())
-                })?,
-        );
-        let codec = codec();
-        let event_payload = encode(&state)?;
-        let snapshot_payload = event_payload.clone();
-        let exact_delivery_ids = [delivery_id];
-        let outcome = tx
-            .resolve_deliveries_exact(DeliveryResolutionPlan {
-                workflow_id: input.workflow_id,
-                expected_version: contract.version,
-                transition_id,
-                generation: contract.generation,
-                next_status: WorkflowStatus::Completed,
-                event_codec: &codec,
-                event_payload: &event_payload,
-                next_snapshot_codec: &codec,
-                next_snapshot_payload: &snapshot_payload,
-                committed_at: current_commit_time(),
-                exact_delivery_ids: &exact_delivery_ids,
-                decision: DeliveryResolutionDecision::Accept,
-            })
-            .await?;
-        match outcome {
-            CommitOutcome::Committed => tx.commit().await?,
-            CommitOutcome::VersionConflict
-            | CommitOutcome::InvalidPlan
-            | CommitOutcome::UnsupportedCodec => tx.rollback().await?,
-        }
-        Ok(outcome)
     }
 
     pub async fn accept_fence_receipt(
@@ -727,7 +653,7 @@ fn terminal_bundle(
 ) -> DbResult<Option<TerminalBundle>> {
     let phoenix_workflow::wake_contract::WakeEventKind::Terminalized {
         terminal,
-        delivery_owner,
+        delivery_owner: _,
         resume_policy,
     } = &event.kind
     else {
@@ -778,7 +704,7 @@ fn terminal_bundle(
             delivery_id,
             effect_id: None,
             barrier_id: Some(barrier_id),
-            consumer_kind: delivery_owner.as_str().to_owned(),
+            consumer_kind: "reducer".to_owned(),
             event_codec: codec(),
             payload_kind: LocalDeliveryPayloadKind::Barrier,
             payload_blob: payload,
@@ -1674,24 +1600,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(acceptance_status, "Owed");
-        let state_before_acceptance = restarted.load_state(WorkflowId(5)).await.unwrap();
-        assert!(matches!(state_before_acceptance, WakeState::Present(_)));
-        assert_eq!(
-            repo.accept_terminal_delivery(&AcceptWakeTerminalInput {
-                workflow_id: WorkflowId(5),
-            })
-            .await
-            .unwrap(),
-            CommitOutcome::Committed
-        );
-        let accepted: (String, String) = sqlx::query_as(
-            "SELECT status, runtime_acceptance_status
-             FROM workflow_deliveries WHERE workflow_id = 5",
-        )
-        .fetch_one(&repo.workflow_repo.pool)
-        .await
-        .unwrap();
-        assert_eq!(accepted, ("Accepted".into(), "Accepted".into()));
         assert!(matches!(
             restarted.load_state(WorkflowId(5)).await.unwrap(),
             WakeState::Present(phoenix_workflow::wake_contract::WakeContract {

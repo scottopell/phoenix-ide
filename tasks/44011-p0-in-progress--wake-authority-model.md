@@ -4,6 +4,22 @@
 
 PR #559 is closed as superseded. Its branch and all commits remain available as evidence and cherry-pick sources. This task defines the model before production integration.
 
+This task is a bounded design foundation, not a usable wake feature. It defines and tests the semantic authority and transactional seams needed to judge whether production integration is justified. It does not register a Bash wait, observe a real handle, expose wake status, or resume a conversation.
+
+## Concrete user problem
+
+An agent that starts long-running work must currently spend turns and tokens polling for completion. The desired experience is one explicit request—“deliver the terminal result of this handle when it becomes known”—after which the conversation remains available for user input and eventually receives one correlated terminal tool result without polling.
+
+The harmful failures this foundation prevents are narrower and concrete:
+
+- silently losing the wait or its terminal result across a Phoenix crash;
+- delivering a crossed or stale handle observation to the wrong contract;
+- producing two canonical terminal outcomes when observation races cancellation or expiry;
+- resuming the wrong conversation after continuation;
+- persisting terminal truth while omitting or corrupting its delivery obligation.
+
+This task does **not** prove that users need a generic multi-handle wake platform. It proves a candidate authority model against those failure classes so downstream work can be accepted or rejected with evidence.
+
 ## Panel synthesis
 
 Five perspectives—durable workflow/state machine, SQLite recovery, concurrency/cancellation, SSE/projection, and product/runtime semantics—converged on one boundary:
@@ -17,6 +33,29 @@ Five perspectives—durable workflow/state machine, SQLite recovery, concurrency
 - Public API, transcript, live SSE, replay, generated TypeScript, and UI status are projections. They are rebuildable and never become parallel authorities.
 - Explicit `wait_until` registers a contract. A successful whole tool round then settles normally from `ToolExecuting` to `Idle`; the aggregate does not add a conversation "waiting" state.
 - Exactly-once means one durable terminal materialization and at-most-once automatic resumption. SSE is advisory/replayable projection traffic.
+
+## Foundation boundary
+
+The foundation owns four things only:
+
+1. a pure, total lifecycle model with one canonical terminal outcome;
+2. sealed authorization boundaries for registration, observation, and delivery-owner transfer;
+3. a wake-specific repository transaction that is the only semantic mutation path for wake workflows;
+4. tests and traceability showing how historical race, recovery, and authority findings constrain the model.
+
+The generic workflow engine supplies storage primitives, IDs, attempts, receipts, and exact deliveries, but it is not a parallel semantic authority. Public generic mutation wrappers reject wake profiles; wake repository operations derive semantic fields from persisted wake state rather than caller-provided snapshots.
+
+Explicitly outside this task:
+
+- production capability minting or observation in Bash, tmux, or sub-agent adapters;
+- `wait_until` tool behavior or descriptions;
+- router loops, timers, polling cadence, or process control;
+- API, SSE, transcript, CLI, or UI projections;
+- automatic conversation resumption;
+- migration or compatibility of the superseded PR #559 implementation;
+- evidence that the broader multi-substrate product scope is worth building.
+
+A test-support constructor demonstrates a model transition; it is not production authorization. Downstream adapters must define where real capabilities are minted and prove that their resource ownership cannot be forged.
 
 ## Resolved product policy
 
@@ -44,6 +83,21 @@ Five perspectives—durable workflow/state machine, SQLite recovery, concurrency
 - **Cancellation settlement:** non-resuming cancellation deliveries are accepted atomically with terminalization and never remain pending.
 - **Transactional identity allocation:** wake registration allocates its workflow identity from the shared global sequence inside the same transaction that inserts the workflow and authority binding.
 - **Receipt rollback:** rejected fence acknowledgement rolls back all attempted effect and receipt mutations.
+
+## Cancellation and expiry policy
+
+Cancellation is a request to stop the wait, not a command to stop the underlying resource. Killing a Bash process, closing tmux, or cancelling a sub-agent remains a separate explicit operation.
+
+Cancellation and expiry use the same bounded arbitration protocol:
+
+1. the repository records a proposed terminal cutoff and fences this contract generation's observation attempt;
+2. terminal evidence or authoritative resource-loss evidence whose occurrence time is at or before the cutoff may supersede the proposal;
+3. evidence occurring after the cutoff cannot supersede it;
+4. after the fence receipt proves the attempt cannot produce undiscovered earlier evidence, the repository finalizes the proposed cancellation or expiry;
+5. finalization and its synthetic delivery settlement commit atomically;
+6. cancellation's delivery is settled without scheduling an LLM turn, while fired, expired, and forgotten deliveries remain owed until the runtime accepts them.
+
+The fence is local to cancellation/expiry arbitration. It is not required for an already-authoritative earlier `Fired` or `Forgotten` outcome, and it is not permission to kill the watched resource. If downstream integration cannot mint, receipt, and recover this fence without a second semantic authority, the adapter is not admissible under this foundation.
 
 ## Authoritative aggregate
 
@@ -127,6 +181,22 @@ Each branch starts from the merged predecessor. PR #559 is never merged; useful 
 ## Historical finding matrix
 
 Every inline P1/P2 is an obligation even when its thread was resolved or outdated. Classification determines its required test form; the original comment id and reviewed commit remain exact traceability.
+
+### Foundation-review closure
+
+Codex reviewed the evolving foundation in five rounds and reported twenty-one actionable threads. The comments were not independent edge cases; they exposed five missing boundary statements now made explicit above.
+
+| Boundary exposed | Review threads | Foundation decision | Evidence surface |
+|---|---|---|---|
+| Terminal truth is distinct from runtime admission and delivery settlement | `PRRT_kwDORKxuOM6XHG60`, `PRRT_kwDORKxuOM6XHw-H`, `PRRT_kwDORKxuOM6XINE-`, `PRRT_kwDORKxuOM6XINFB`, `PRRT_kwDORKxuOM6XIsGn` | The foundation creates an exact reducer delivery and leaves it `Owed`; production runtime admission/acceptance is deliberately deferred rather than simulated in the repository. Cancellation settles without resume. | Repository terminalization, cancellation, and restart reload tests; no foundation acceptance API |
+| Generic workflow storage is not wake semantic authority | `PRRT_kwDORKxuOM6XHG64`, `PRRT_kwDORKxuOM6XIsGt` | Generic transition, delivery, and receipt wrappers reject wake profiles; wake repository operations derive writes from loaded aggregate state. | Generic-wrapper/receipt rejection and projection-consistency tests |
+| IDs and transferability are not authorization | `PRRT_kwDORKxuOM6XHG6-`, `PRRT_kwDORKxuOM6XHG7A`, `PRRT_kwDORKxuOM6XHw-O`, `PRRT_kwDORKxuOM6XINFD` | Registration, observation, reconciliation, transfer, and workflow allocation require resource/repository authority rather than caller-selected identifiers. | Crossed/stale capability tests and shared-sequence registration test |
+| Persisted events, effects, and types must be total | `PRRT_kwDORKxuOM6XHG67`, `PRRT_kwDORKxuOM6XHG6_`, `PRRT_kwDORKxuOM6XHw-Q`, `PRRT_kwDORKxuOM6XHw-U`, `PRRT_kwDORKxuOM6XHw-X`, `PRRT_kwDORKxuOM6XIsGo` | Registration events retain transfer policy; effect intents round-trip for restart decoding; closed enums match requirements; nominal identities reject SQL-invalid values before transition. | Event/effect rebuildability, serde rejection, and migration tests |
+| Cancellation/expiry fencing is an internal transaction protocol | `PRRT_kwDORKxuOM6XHw-L`, `PRRT_kwDORKxuOM6XINFA` | Fence acknowledgement creates no reducer delivery and rejected acknowledgement rolls back every mutation; the receipt gates only proposal finalization. | Fence lifecycle, rollback, no-delivery, and occurrence-precedence tests |
+| Generic delivery schema and wake ownership are separate dimensions | `PRRT_kwDORKxuOM6XIsGu` | Generic `consumer_kind` remains the supported `reducer` discriminator; mutable wake delivery ownership stays in the normalized wake authority row and terminal event. | Terminal bundle insertion and delivery-owner projection tests |
+| The foundation cannot claim a production lifecycle | `PRRT_kwDORKxuOM6XIsGp` | Registration is intentionally unreachable outside test support until an adapter owns capability minting; the task and PR describe this as a bounded model, not a working wake feature. | Production API surface review and downstream decision gate |
+
+This closure table is the review-facing index. The larger matrix below preserves the complete historical evidence from superseded PR #559 so downstream work can select regressions without reviving its distributed authority model.
 
 ### Aggregate invariant (11)
 
@@ -406,12 +476,31 @@ The disposition is intentionally conservative: tests and types may be extracted;
 | `f49488938b9f0e7d352535475949e49e00b0beb1` | fix: close readiness windows after completion |
 | `91c4f65d029780e45f3d35446f65d759ffc95e5f` | tasks: track host-load check flakes |
 
-## PR 1 acceptance before production integration
+## Downstream decision gate
 
-- Pure transition model is total and has no I/O, timers, locks, or ambient runtime state.
-- Property tests cover arbitrary command sequences, replay, stale generations, and exactly one closed lifecycle.
-- Interleaving tests cover observation/cancel/expiry/restart/transfer with occurrence-wins policy.
-- Crash-cut tests prove atomic terminalization and owed-delivery recovery.
-- Migration tests prove fresh and upgraded databases enforce the same closed schema.
-- A compile-time public-event registry type exists at the model boundary, but server/UI projection integration remains PR 3.
-- No Bash, tmux, SSE, UI, or conversation-state integration is added except reusable types/test fixtures required to prove the model.
+Completion of this foundation is not approval to build the full wake roadmap. Downstream implementation remains paused by default.
+
+A Bash-only integration proposal may proceed for review only when it can answer all of the following without changing the foundation's authority model:
+
+1. **User value:** name the concrete polling journey being replaced and the terminal result the original tool invocation must receive.
+2. **Capability origin:** identify the existing Bash resource owner that mints registration and observation capabilities; no public constructor or caller-supplied handle description substitutes for ownership.
+3. **Single transaction path:** use the wake repository for registration, observation, cancellation, expiry, and terminal acceptance; do not reopen generic workflow mutation paths.
+4. **Restart behavior:** accept that an in-memory Bash handle becomes `Forgotten(PhoenixRestart)` and prove the result is delivered rather than silently lost.
+5. **Bounded proof:** add one end-to-end Bash journey and only the adapter-specific regressions selected from the historical matrix; do not add UI, tmux, or sub-agent abstractions.
+6. **Complexity budget:** show that the adapter is substantially smaller than the foundation and does not introduce a second scheduler, authority record, delivery queue, or continuation protocol.
+
+UI/projection work remains paused until the Bash journey proves a durable status is needed by users. Tmux and sub-agent adapters remain paused until Bash demonstrates that the common contract abstraction pays for itself without substrate-specific exceptions. Continuation transfer should be evaluated as a separate product decision, not assumed by the first adapter.
+
+Absent that evidence, the recommended outcome after this task is to merge the bounded foundation as documented design and keep tasks 44012–44014 blocked rather than treating sunk implementation cost as justification for the platform.
+
+## Foundation acceptance
+
+- The concrete user problem, harmful failure classes, foundation boundary, and non-goals are explicit.
+- The authoritative aggregate and repository are the only semantic mutation boundary; adapters, generic workflow primitives, and projections cannot become parallel authorities.
+- Cancellation is observation-only, and its occurrence-precedence/fence/settlement policy is stated independently of any substrate adapter.
+- Pure transition tests cover arbitrary command sequences, replay, stale generations, crossed authority, and exactly one closed lifecycle.
+- Repository tests cover atomic terminalization, exact owed-delivery recovery, fence rollback, cancellation settlement, restart reload, and transactional workflow-ID allocation.
+- Migration tests prove fresh and upgraded databases enforce the same closed schema and nominal types reject invalid values before SQL.
+- The twenty-one Codex foundation findings are mapped to decisions and evidence; a fresh exact-head Codex review must produce no actionable thread (👍).
+- No Bash, tmux, sub-agent, router, SSE, UI, transcript, or conversation-state integration is included.
+- Downstream work is governed by the explicit decision gate above and remains paused unless a bounded Bash proposal satisfies it.

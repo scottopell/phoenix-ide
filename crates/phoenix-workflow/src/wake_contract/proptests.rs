@@ -463,6 +463,33 @@ fn transition_id_reuse_requires_the_exact_semantic_command() {
 }
 
 #[test]
+fn owed_effects_round_trip_for_restart_recovery() {
+    let registered = transition(&WakeState::Absent, register_command(10));
+    for effect in &registered.owed_effects {
+        let encoded = serde_json::to_vec(effect).unwrap();
+        let decoded: WakeOwedEffect = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(&decoded, effect);
+    }
+
+    let proposed = transition(
+        &registered.new_state,
+        command(
+            2,
+            WakeCommandKind::Cancel {
+                expected_head: contract(&registered.new_state).head(),
+                cause: CancellationCause::UserRequested,
+                occurred_at: Timestamp(5),
+            },
+        ),
+    );
+    for effect in &proposed.owed_effects {
+        let encoded = serde_json::to_vec(effect).unwrap();
+        let decoded: WakeOwedEffect = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(&decoded, effect);
+    }
+}
+
+#[test]
 fn registration_event_is_rebuildable_and_registry_is_exhaustive() {
     let result = transition(&WakeState::Absent, register_command(10));
     let WakeDisposition::Applied { event } = result.disposition else {

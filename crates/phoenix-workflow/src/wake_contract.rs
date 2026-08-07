@@ -476,7 +476,7 @@ pub enum WakeState {
     Present(WakeContract),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationFenceProof {
     contract_id: WakeContractId,
     proposal_generation: Generation,
@@ -690,7 +690,7 @@ pub struct WakeEffectKey {
     pub role: WakeEffectRole,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeOwedEffectKind {
     BeginObservation {
         subject: WakeSubject,
@@ -709,7 +709,7 @@ pub enum WakeOwedEffectKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeOwedEffect {
     pub key: WakeEffectKey,
     pub kind: WakeOwedEffectKind,
