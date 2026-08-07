@@ -170,12 +170,9 @@ pub struct ConversationResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ConversationMetaResponse {
-    pub conversation: serde_json::Value,
-    pub agent_working: bool,
-    /// Presentation mode: `idle`, `working`, `needs_action`, `error`, `done`
-    pub presentation_mode: String,
-    pub context_window_size: u64,
+pub struct ConversationRouteResponse {
+    pub id: String,
+    pub slug: Option<String>,
 }
 
 /// Response with conversation and messages

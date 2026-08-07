@@ -1008,7 +1008,21 @@ pub struct EnrichedConversation {
     pub cached_pr: Option<CachedPrSummary>,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum TranscriptCoverage {
+    /// The init snapshot contains the complete persisted transcript.
+    Complete,
+    /// The init snapshot contains only the newest persisted transcript suffix.
+    Tail,
+    /// The init intentionally omits persisted messages because the reconnect
+    /// cursor proves the client already has them. The client must retain its
+    /// existing complete-or-tail coverage state.
+    Preserve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum MessageSnapshotMode {
@@ -1047,6 +1061,7 @@ pub enum SseEvent {
         /// stale incremental transcript state on reconnect.
         transcript_generation: i64,
         message_snapshot: MessageSnapshotMode,
+        transcript_coverage: TranscriptCoverage,
         /// `sequence_id` of the most recent persisted Message at subscribe
         /// time. Every entry in `pending_events` has `sequence_id` strictly
         /// greater than this. Equals `initial_last_seq` for a fresh
