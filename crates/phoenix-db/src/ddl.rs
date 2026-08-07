@@ -18,6 +18,16 @@ CREATE TABLE IF NOT EXISTS conversations (
     parent_conversation_id TEXT,
     user_initiated BOOLEAN NOT NULL,
     state TEXT NOT NULL DEFAULT '{"type":"idle"}',
+    state_kind TEXT NOT NULL DEFAULT 'idle'
+        CHECK (state_kind IN (
+            'idle', 'llm_requesting', 'tool_executing', 'cancelling_tool',
+            'awaiting_sub_agents', 'cancelling_sub_agents', 'error',
+            'awaiting_continuation', 'recoverable_continuation_failure',
+            'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response',
+            'awaiting_commission_review_approval', 'context_exhausted',
+            'handed_off', 'terminal', 'completed', 'failed', 'provisioning',
+            'creation_failed', 'creation_cancelled', 'seeded_llm_requesting'
+        )),
     state_updated_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,

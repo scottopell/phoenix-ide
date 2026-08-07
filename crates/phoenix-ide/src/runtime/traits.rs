@@ -47,6 +47,26 @@ pub struct ActiveDirectTurnSettlement {
     pub state_updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ContinuationDirectTurnSettlement {
+    pub turn: ActiveDirectTurn,
+    pub terminal: ActiveDirectTurnTerminal,
+    pub operation_id: String,
+    pub message: Message,
+    pub state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContinuationStartRecoverySettlement {
+    pub turn: Option<ActiveDirectTurn>,
+    pub terminal: Option<ActiveDirectTurnTerminal>,
+    pub operation_id: String,
+    pub message: Message,
+    pub state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthoritativeUserMessageAdoptionInput {
     pub authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
@@ -166,6 +186,14 @@ pub trait MessageStore: Send + Sync {
         settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String>;
 
+    async fn settle_continuation_direct_turn(
+        &self,
+        settlement: &ContinuationDirectTurnSettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        let _ = settlement;
+        Ok(crate::db::ContinuationCommitOutcome::Stale)
+    }
+
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
         &self,
@@ -210,6 +238,12 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<(), String>;
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistedStateSnapshot {
+    pub state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+}
+
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
@@ -227,6 +261,31 @@ pub trait StateStore: Send + Sync {
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
+
+    async fn get_state_snapshot(&self, conv_id: &str) -> Result<PersistedStateSnapshot, String>;
+
+    async fn begin_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        awaiting_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String>;
+
+    async fn recover_continuation_start(
+        &self,
+        settlement: &ContinuationStartRecoverySettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String>;
+
+    async fn commit_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String>;
 
     /// Atomically update mode, cwd, and normalized environment during promotion.
     async fn update_conversation_mode_and_cwd(
@@ -497,6 +556,13 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).settle_active_direct_turn(settlement).await
     }
 
+    async fn settle_continuation_direct_turn(
+        &self,
+        settlement: &ContinuationDirectTurnSettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        (**self).settle_continuation_direct_turn(settlement).await
+    }
+
     async fn update_message_display_data(
         &self,
         message_id: &str,
@@ -561,6 +627,55 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
+    }
+
+    async fn get_state_snapshot(&self, conv_id: &str) -> Result<PersistedStateSnapshot, String> {
+        (**self).get_state_snapshot(conv_id).await
+    }
+
+    async fn begin_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        awaiting_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        (**self)
+            .begin_continuation(
+                conv_id,
+                operation_id,
+                message,
+                awaiting_state,
+                state_updated_at,
+            )
+            .await
+    }
+
+    async fn recover_continuation_start(
+        &self,
+        settlement: &ContinuationStartRecoverySettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        (**self).recover_continuation_start(settlement).await
+    }
+
+    async fn commit_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        (**self)
+            .commit_continuation(
+                conv_id,
+                operation_id,
+                message,
+                completed_state,
+                state_updated_at,
+            )
+            .await
     }
 
     async fn update_conversation_mode_and_cwd(
@@ -951,6 +1066,28 @@ impl MessageStore for DatabaseStorage {
         .map_err(|error| error.to_string())
     }
 
+    async fn settle_continuation_direct_turn(
+        &self,
+        settlement: &ContinuationDirectTurnSettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        repo.settle_continuation_direct_turn_atomically(
+            &phoenix_db::workflow::AtomicContinuationSettlementInput {
+                conversation_id: settlement.message.conversation_id.clone(),
+                operation_id: settlement.operation_id.clone(),
+                message: settlement.message.clone(),
+                completed_state: settlement.state.clone(),
+                state_updated_at: settlement.state_updated_at,
+                command: direct_turn_terminal_command(
+                    &settlement.turn,
+                    settlement.terminal.clone(),
+                ),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
     async fn update_message_display_data(
         &self,
         message_id: &str,
@@ -1042,6 +1179,90 @@ impl StateStore for DatabaseStorage {
             .await
             .map_err(|e| e.to_string())?;
         Ok(conv.state)
+    }
+
+    async fn get_state_snapshot(&self, conv_id: &str) -> Result<PersistedStateSnapshot, String> {
+        let conv = self
+            .db
+            .get_conversation(conv_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(PersistedStateSnapshot {
+            state: conv.state,
+            state_updated_at: conv.state_updated_at,
+        })
+    }
+
+    async fn begin_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        awaiting_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        self.db
+            .begin_continuation(
+                conv_id,
+                operation_id,
+                message,
+                awaiting_state,
+                state_updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn recover_continuation_start(
+        &self,
+        settlement: &ContinuationStartRecoverySettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if let (Some(turn), Some(terminal)) = (&settlement.turn, &settlement.terminal) {
+            let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+            repo.settle_failed_continuation_start_atomically(
+                &phoenix_db::workflow::AtomicContinuationSettlementInput {
+                    conversation_id: settlement.message.conversation_id.clone(),
+                    operation_id: settlement.operation_id.clone(),
+                    message: settlement.message.clone(),
+                    completed_state: settlement.state.clone(),
+                    state_updated_at: settlement.state_updated_at,
+                    command: direct_turn_terminal_command(turn, terminal.clone()),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+        } else {
+            self.db
+                .recover_continuation_start(
+                    &settlement.message.conversation_id,
+                    &settlement.operation_id,
+                    &settlement.message,
+                    &settlement.state,
+                    settlement.state_updated_at,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    async fn commit_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        self.db
+            .commit_continuation(
+                conv_id,
+                operation_id,
+                message,
+                completed_state,
+                state_updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn update_conversation_mode_and_cwd(

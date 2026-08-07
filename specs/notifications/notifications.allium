@@ -181,12 +181,22 @@ rule DetectAgentError {
     )
 
     @guidance
-        -- Also fires for context_exhausted state, except when the
-        -- conversation has continued elsewhere (continued_in_conv_id set) --
-        -- that predecessor is no longer actionable.
-        -- Implementation: check for both "error" and "context_exhausted"
-        -- in the SSE state_change handler; skip context_exhausted with a
-        -- continuation.
+        -- Also fires for context_exhausted, except when the conversation has
+        -- continued elsewhere (continued_in_conv_id set) -- that predecessor
+        -- is no longer actionable. The SSE state_change handler checks both
+        -- statuses and skips context_exhausted with a continuation.
+}
+
+rule DetectRecoverableContinuationFailure {
+    when: conversation: bedrock/Conversation.status
+        transitions_to recoverable_continuation_failure
+
+    ensures: NotificationEvent(
+        type: agent_error,
+        conversation: conversation,
+        title: "Agent error",
+        body: conversation.slug
+    )
 }
 
 rule DetectAgentFinished {
@@ -216,7 +226,7 @@ rule DetectAgentFinished {
 -- check all conversations for states that need attention. Fire
 -- notifications for any that were missed while the tab was suspended.
 
--- Three sibling rules cover the three notify-worthy states the catch-up
+-- Sibling rules cover each notify-worthy state the catch-up
 -- pass observes. v3 grammar does not allow `ensures: X if cond` so each
 -- conversation-state branch is its own rule with `requires:` filtering.
 -- Intentionally does NOT notify for idle conversations on reconnect:
@@ -258,6 +268,7 @@ rule EmitQuestionCatchupNotification {
 rule EmitErrorCatchupNotification {
     when: CatchupCheckTaskApproval(conversation)
     requires: conversation.status = error
+        or conversation.status = recoverable_continuation_failure
         or conversation.status = context_exhausted
     -- A context_exhausted conversation that already continued elsewhere is
     -- no longer actionable, so it is not notification-worthy.
@@ -355,11 +366,25 @@ rule ClearBlockingDedupeOnResolution {
     @guidance
         -- Any settled non-blocking state clears the key — idle (the dominant
         -- resolution), terminal, handed_off, or a context_exhausted that has
-        -- continued elsewhere. A transition back into a busy state
-        -- intentionally preserves the key (a brief busy blip mid-attention
-        -- must not re-arm a notification). Implementation: clearAttentionSeen
+        -- continued elsewhere. A transition back into a busy state preserves
+        -- the key unless it is the explicit continuation retry modeled by
+        -- ClearBlockingDedupeOnContinuationRetry. A brief busy blip
+        -- mid-attention must not re-arm a notification. Implementation:
+        -- clearAttentionSeen
         -- runs on the idle-from-busy branch and on the settled-else branch of
         -- notifyConversationStateChange.
+}
+
+rule ClearBlockingDedupeOnContinuationRetry {
+    when: conversation: bedrock/Conversation.status
+        transitions_to awaiting_continuation
+
+    requires: conversation.previous_status = recoverable_continuation_failure
+    ensures: not exists AttentionSeen{conversation_id: conversation.id}
+
+    @guidance
+        -- An explicit retry resolves the prior failure occurrence. Clearing its
+        -- key allows a later failed retry to notify as a new actionable event.
 }
 
 rule NotificationClicked {

@@ -22,6 +22,7 @@
 //! Single-member roots and non-root members are not chains.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -42,6 +43,7 @@ use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
 use crate::db::{ChainQaRow, Conversation, DbError};
+use crate::state_machine::ConvState;
 
 /// Maximum length (in chars) of a user-set chain name. The cap is arbitrary
 /// — short enough that the value comfortably fits as a sidebar label and the
@@ -358,6 +360,10 @@ fn normalize_chain_name(name: Option<&str>) -> Result<Option<String>, AppError> 
     Ok(normalized)
 }
 
+fn chain_member_blocks_cascade(state: &ConvState) -> bool {
+    state.is_busy() || matches!(state, ConvState::AwaitingContinuation { .. })
+}
+
 /// `POST /api/chains/:rootId/archive` — archive every member of the chain.
 /// Single-member roots are not chains; the per-conversation `/archive`
 /// endpoint owns those.
@@ -387,13 +393,14 @@ pub async fn archive_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
+    let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "archive").await?;
     }
 
     for id in &member_ids {
         let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
-        if conv.state.is_busy() {
+        if chain_member_blocks_cascade(&conv.state) {
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 format!(
                     "Cannot archive chain: member {id} is busy. Cancel the in-flight \
@@ -417,15 +424,26 @@ pub async fn archive_chain_handler(
         }
     }
 
-    // TOCTOU note: the busy precheck is best-effort. Same shape as the
-    // delete-chain handler — a member can transition to busy after the
-    // loop and before its cascade runs, in which case `run_archive_cascade`
-    // returns 409 mid-iteration with earlier members already cleaned up.
     for id in &member_ids {
         run_archive_cascade(&state, id).await?;
     }
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+async fn lock_chain_admissions(
+    state: &AppState,
+    member_ids: &[String],
+) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    let mut sorted_ids = member_ids.to_vec();
+    sorted_ids.sort();
+    let mut guards = Vec::with_capacity(sorted_ids.len());
+    for id in sorted_ids {
+        let admission: Arc<tokio::sync::Mutex<()>> =
+            state.runtime.conversation_admission(&id).await;
+        guards.push(admission.lock_owned().await);
+    }
+    guards
 }
 
 /// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
@@ -449,13 +467,14 @@ pub async fn delete_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
+    let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
     }
 
     for id in &member_ids {
         let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
-        if conv.state.is_busy() {
+        if chain_member_blocks_cascade(&conv.state) {
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 format!(
                     "Cannot delete chain: member {id} is busy. Cancel the in-flight \
@@ -1265,6 +1284,19 @@ mod tests {
         assert!(!by_id["hw-b"].has_worktree, "Direct has no worktree");
         assert!(by_id["hw-c"].has_worktree, "Work has a worktree");
         assert!(by_id["hw-d"].has_worktree, "Branch has a worktree");
+    }
+
+    #[test]
+    fn pending_continuation_blocks_chain_cascade() {
+        let state = ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: "chain-pending-continuation".to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        };
+        assert!(chain_member_blocks_cascade(&state));
+        assert!(!chain_member_blocks_cascade(&ConvState::Idle));
     }
 
     // ----- name editing semantics ----------------------------------------

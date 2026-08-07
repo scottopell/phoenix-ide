@@ -73,7 +73,9 @@ pub async fn assemble_inspection(
         registered
             .owner
             .work_scope_id()
-            .is_some_and(|work_scope_id| conversation.work_scope_id.as_ref() == Some(work_scope_id))
+            .is_some_and(|work_scope_id| {
+                conversation.attached_work_scope_id.as_ref() == Some(work_scope_id)
+            })
     });
     if (actor.is_some() || conversation.is_some()) && !controller_visible && !owner_visible {
         return None;
@@ -194,7 +196,7 @@ mod tests {
                 task_title: phoenix_core::domain::db_schema::NonEmptyString::new("Owner").unwrap(),
             },
             runtime_role: phoenix_core::work_scope::RuntimeRole::User,
-            work_scope_id: Some(work_scope_id),
+            attached_work_scope_id: Some(work_scope_id),
             desired_base_branch: None,
             message_count: 0,
             transcript_generation: 0,

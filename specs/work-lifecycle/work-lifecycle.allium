@@ -1,306 +1,590 @@
 -- allium: 3
 -- work-lifecycle.allium
 --
--- Phoenix Work Lifecycle: Behavioural Specification
+-- Phoenix WorkScope Retirement: Behavioural Specification
 --
--- Scope: Terminal actions on Work and Branch conversations and their git
---        side effects.
--- Includes: Abandon (confirmation gate, diff snapshot, worktree + branch
---             cleanup with mode-dependent disposition),
---           Mark as merged (worktree + branch cleanup, mode-dependent
---             disposition, no squash, no push),
---           PR merge state as the advisory cleanup-affordance gate for one
---             task/worktree lifecycle even when multiple associated PRs exist.
--- Excludes: the canonical scope boundary is stated in requirements.md and
---           executive.md (transition legality is bedrock's TaskResolved rule
---           and TerminalActionRequiresNoContinuation invariant; PR freshness/
---           auto-fix is the pr-association spec; UI surface composition is the
---           work-actions-bar spec). Not re-duplicated here.
+-- Scope: Git-backed Close retirement inspection, exact loss classification,
+--        WorkScope-owned resource retirement, and PR-state advisory guidance.
+--
+-- Includes:
+--   - classification of exact worktree-loss categories for an attached
+--     Git-backed WorkScope;
+--   - generation/fingerprint-bound discard confirmation;
+--   - stepwise idempotent retirement of owned worktree and WorkScope resources;
+--   - PR-state guidance that may encourage Close but never blocks it.
+--
+-- Excludes:
+--   - root lifecycle legality, close-obligation orchestration, and ProductConversation
+--     Open/History transitions (bedrock owns those authorities);
+--   - PR identity selection, feedback freshness, and remediation context
+--     (pr-association owns those authorities);
+--   - UI layout and copy.
 --
 -- Requirement traceability: REQ-WL-001 through REQ-WL-003
--- Increment-1 clarification: plural PR association belongs to
--- pr-association; this spec remains singular in ownership of cleanup. Multiple
--- associated PRs may be summarized by sibling surfaces, and one explicit active
--- PR may be named for clarity, but cleanup is still one user-initiated
--- task/worktree action and never mutates PRs.
 
 use "../bedrock/bedrock.allium" as bedrock
 
 ------------------------------------------------------------
--- External Entities
+-- Value Types
 ------------------------------------------------------------
 
--- The git worktree managed by Phoenix for a Work or Branch conversation.
--- One worktree per conversation; path is deterministic from conversation id.
--- A worktree exists only for mode in { work, branch } (Direct and Explore
--- conversations are not subjects of the terminal actions here).
-external entity Worktree {
-    conversation: bedrock/Conversation
+value WorkScope {
+    kind: WorkScopeKind
+    inner: String
+}
+
+value WorktreeIdentity {
     path: String
-    branch_name: String            -- task-{ID}-{slug} (managed) or existing branch (branch mode)
+}
+
+value RetirementInspection {
+    generation: String
+    fingerprint: String
+}
+
+value RetirementResidual {
+    resource_kind: RetiredResourceKind
+    resource_identity: String
+    reason: RetirementFailureReason
+    detail: String?
 }
 
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
 
--- bedrock's TaskResolved(conversation, outcome) carries an untyped outcome
--- identifier. The two user-initiated terminal actions in this spec resolve a
--- Work/Branch conversation with one of exactly two outcomes: `merged` (Mark
--- as merged) or `abandoned` (Abandon), passed as bare identifiers below.
-
-enum PrDisplayState  { open | draft | merged | closed }
-enum PrCheckState    { passing | pending | failing | unknown }
-
-------------------------------------------------------------
--- Helpers
-------------------------------------------------------------
---
--- Allium has no formal helper-function declaration; the rules below call
--- these by bare identifier. This block is the single source of truth for
--- their signatures and semantics.
---
---   is_managed_mode(conversation: Conversation) -> Boolean
---       True when conversation.mode = work (Managed mode). Phoenix created
---       the task branch (task-{ID}-{slug}), so Phoenix must also delete it.
---       False for branch mode (user-owned PR branch; kept on cleanup).
---
---   has_live_worktree_co_owner(conversation: Conversation) -> Boolean
---       True when at least one live conversation (non-terminal AND not
---       archived), other than this one, resolves to the same work scope:
---       a context continuation that inherited the worktree (REQ-BED-030),
---       or a Work-mode sub-agent sharing the parent's worktree_path
---       (REQ-PROJ-008). Liveness is derived from persisted conversation
---       rows, not runtime handle presence. Prevents destroying a worktree
---       still in use by another live conversation. This is the same
---       any-live-owner signal that gates the bedrock terminal cascade
---       (cascade_projects_on_delete, REQ-BED-032).
-
-------------------------------------------------------------
--- Value Types
-------------------------------------------------------------
-
--- Best-effort capture of "what this branch has done relative to its base",
--- taken before worktree removal so the abandoned work survives in the
--- conversation record after the worktree is gone. Captured relative to the
--- effective base ref (origin/{base} when it resolves, else the bare base).
--- Each diff section is bounded by a per-section byte cap; `truncated` is
--- set when any section saturated that cap.
-value DiffSnapshot {
-    commit_log: String       -- subjects of commits on the branch not in base
-    committed_diff: String   -- base...HEAD, bounded per-section
-    uncommitted_diff: String -- working-tree changes (incl. untracked), bounded per-section
-    truncated: Boolean       -- a section hit its byte cap; content was dropped
+enum WorkScopeKind {
+    worktree
+    | conversation
 }
 
-value PrStatusResult {
-    found: Boolean
-    display_state: PrDisplayState?  -- present when found
-    check_state: PrCheckState?      -- present when found
-    number: Integer?                -- present when found
-    unavailable_reason: String?     -- present when not found
+enum LossCategory {
+    staged_tracked_paths
+    | unstaged_tracked_paths
+    | untracked_non_ignored_paths
+    | initialized_submodule_state
+    | detached_unreachable_commits
+}
+
+enum RetiredResourceKind {
+    worktree
+    | bash_process_group
+    | tmux_server
+    | pty_session
+    | browser_session
+    | equivalent_live_resource
+}
+
+enum RetirementFailureReason {
+    removal_failed
+    | still_shared_by_live_owner
+    | residual_process_alive
+    | identity_not_proven
+    | manual_repair_required
+}
+
+enum PrDisplayState {
+    open
+    | draft
+    | merged
+    | closed
+}
+
+enum PrCheckState {
+    passing
+    | pending
+    | failing
+    | unknown
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity AttachedWorkScope {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    owns_git_worktree: Boolean
+}
+
+external entity CloseRetirementAuthority {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+}
+
+external entity RetirementAttempt {
+    attempt_id: String
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    inspection: RetirementInspection?
+}
+
+external entity Worktree {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    identity: WorktreeIdentity
+}
+
+external entity RetirementLossCategoryRow {
+    attempt: RetirementAttempt
+    inspection: RetirementInspection
+    category: LossCategory
+    item_identity: String
+}
+
+external entity RetiredResource {
+    attempt: RetirementAttempt
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    kind: RetiredResourceKind
+    resource_identity: String
+}
+
+external entity RetirementResidualResource {
+    attempt: RetirementAttempt
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    residual: RetirementResidual
+}
+
+external entity RetirementAbsenceEvidence {
+    attempt: RetirementAttempt
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScope
+    resource_kind: RetiredResourceKind
+    resource_identity: String
 }
 
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
 
--- ===========================================================
--- 1. ABANDON (REQ-WL-001)
--- ===========================================================
---
--- Abandon is a two-step user action: initiate (shows a confirmation
--- dialog), then confirm (captures the diff snapshot and runs the git
--- sequence) or cancel (no-op). Legality preconditions (mode, core_status,
--- parent_status, continued_in_conv_id) are enforced by bedrock's
--- TaskResolved rule and the TerminalActionRequiresNoContinuation invariant
--- in projects; this spec models the confirmation gate and git side effects.
-
-rule InitiateAbandon {
-    when: UserInitiatesAbandon(conversation)
-    requires: exists Worktree{conversation: conversation}
-    ensures: AbandonConfirmationPending(conversation)
-
-    @guidance
-        -- Show a confirmation dialog warning that the worktree will be
-        -- deleted and uncommitted work lost (a diff snapshot is saved to
-        -- conversation history first). The dialog offers Confirm and Cancel.
-}
-
-rule ConfirmAbandon {
-    when: UserConfirmsAbandon(conversation)
-
-    let worktree = Worktree{conversation: conversation}
-
-    requires: AbandonConfirmationPending(conversation)
-    requires: exists worktree
-
-    ensures: not AbandonConfirmationPending(conversation)
-
-    -- Worktree/branch removal is conditional, not gated: a live co-owner (a
-    -- context continuation or a Work sub-agent sharing this worktree) preserves
-    -- the worktree and branch. The conversation resolves either way — the
-    -- co-owner guard is an outcome on cleanup, not a precondition on the action.
-    ensures:
-        if not has_live_worktree_co_owner(conversation):
-            not exists worktree
-
-    ensures:
-        if is_managed_mode(conversation) and not has_live_worktree_co_owner(conversation):
-            BranchDeleted(worktree.branch_name)
-        -- Branch mode: branch kept (user's PR branch, not ours to delete)
-
-    -- The diff snapshot is best-effort, not a guaranteed postcondition: capture
-    -- can fail or find no diff, and abandon still succeeds. The capture-before-
-    -- delete ordering and bounds are in @guidance, not a hard `ensures`.
-
-    ensures: bedrock/TaskResolved(conversation, abandoned)
-    ensures: SystemMessageEmitted(
-        conversation,
-        if is_managed_mode(conversation):
-            "Task abandoned. Worktree and branch deleted."
-        else:
-            "Conversation abandoned. Worktree deleted, branch kept."
+rule ChatOnlyCloseSkipsWorktreeInspection {
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    requires:
+        not exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
+    ensures: RetirementInspectionCompletedWithoutConfirmation(
+        product_conversation,
+        attempt_id,
+        inspection_generation: "no-worktree",
+        inspection_fingerprint: "no-worktree"
     )
 
     @guidance
-        -- Sequence:
-        --   1. Validate legality (same gate as MarkAsMerged) — HTTP 409
-        --      on failure.
-        --   2. Capture the DiffSnapshot from the worktree (committed +
-        --      uncommitted, relative to the effective base ref) and persist
-        --      it to conversation history. Best-effort: a failure here is
-        --      logged at debug and does not block step 3. Each section is
-        --      bounded by a per-section byte cap; saturation sets `truncated`.
-        --   3. Check has_live_worktree_co_owner — skip worktree/branch
-        --      removal if a live co-owner exists.
-        --   4. `git worktree remove {path} --force`
-        --      On failure: remove the directory directly + `git worktree prune`.
-        --   5. If managed: `git branch -D {branch_name}` (non-fatal; log at
-        --      debug and continue). If branch mode: skip branch deletion.
-        --   6. Send TaskResolved(conversation, abandoned) (bedrock transitions
-        --      parent_status -> terminal) and emit the system message.
-        --
-        -- All uncommitted work is permanently lost after step 4. The diff
-        -- snapshot from step 2 is the recovery artifact.
+        -- Skip inspection only when NO attached scope owns a Git-backed worktree.
+        -- The presence of other attached non-worktree scopes does not bypass
+        -- inspection for a mixed-attachment aggregate that still owns a worktree.
 }
 
-rule CancelAbandon {
-    when: UserCancelsAbandon(conversation)
-    requires: AbandonConfirmationPending(conversation)
-    ensures: not AbandonConfirmationPending(conversation)
-    -- No git operations. The conversation remains in its current state.
-}
-
--- ===========================================================
--- 2. MARK AS MERGED (REQ-WL-002)
--- ===========================================================
---
--- User initiates "Mark as merged" on a Work or Branch conversation: a
--- single-step assertion that the work shipped via the user's own PR
--- workflow. Phoenix performs worktree cleanup only — it never squash-merges
--- and never pushes. Same legality gate as abandon (bedrock's TaskResolved).
-
-rule MarkAsMerged {
-    when: UserMarksAsMerged(conversation)
-
-    let worktree = Worktree{conversation: conversation}
-
-    -- Existence implies mode in { work, branch } — Direct and Explore
-    -- conversations have no worktree.
-    requires: exists worktree
-
-    -- Worktree/branch removal is conditional, not gated: a live co-owner (a
-    -- context continuation or a Work sub-agent sharing this worktree) preserves
-    -- the worktree and branch. The conversation resolves either way — the
-    -- co-owner guard is an outcome on cleanup, not a precondition on the action.
+rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     ensures:
-        if not has_live_worktree_co_owner(conversation):
-            not exists worktree
-
-    ensures:
-        if is_managed_mode(conversation) and not has_live_worktree_co_owner(conversation):
-            BranchDeleted(worktree.branch_name)
-        -- Branch mode: branch kept (user's PR branch, not ours to delete)
-
-    ensures: bedrock/TaskResolved(conversation, merged)
-    ensures: SystemMessageEmitted(conversation, "Marked as merged. Worktree deleted.")
+        for scope_binding in attached_worktree_scopes(product_conversation):
+            RetirementAttempt.created(
+                attempt_id: attempt_id,
+                product_conversation: product_conversation,
+                scope: scope_binding.scope,
+                inspection: RetirementInspection {
+                    generation: current_retirement_inspection_generation(product_conversation, scope_binding.scope),
+                    fingerprint: current_retirement_inspection_fingerprint(product_conversation, scope_binding.scope)
+                }
+            )
+            and for category in current_retirement_loss_categories(product_conversation, scope_binding.scope):
+                for item_identity in current_retirement_loss_item_identities(product_conversation, scope_binding.scope, category):
+                    RetirementLossCategoryRow.created(
+                        attempt: RetirementAttempt{
+                            attempt_id: attempt_id,
+                            product_conversation: product_conversation,
+                            scope: scope_binding.scope,
+                            inspection: RetirementInspection {
+                                generation: current_retirement_inspection_generation(product_conversation, scope_binding.scope),
+                                fingerprint: current_retirement_inspection_fingerprint(product_conversation, scope_binding.scope)
+                            }
+                        },
+                        inspection: RetirementInspection {
+                            generation: current_retirement_inspection_generation(product_conversation, scope_binding.scope),
+                            fingerprint: current_retirement_inspection_fingerprint(product_conversation, scope_binding.scope)
+                        },
+                        category: category,
+                        item_identity: item_identity
+                    )
 
     @guidance
-        -- Sequence:
-        --   1. Validate legality (mode, core_status, parent_status,
-        --      continued_in_conv_id) — HTTP 409 on failure.
-        --   2. Check has_live_worktree_co_owner — skip worktree/branch
-        --      removal if a live co-owner exists.
-        --   3. `git worktree remove {path} --force`
-        --      On failure: remove the directory directly + `git worktree prune`.
-        --   4. If managed: `git branch -D {branch_name}` (non-fatal; log at
-        --      debug and continue). If branch mode: skip branch deletion.
-        --   5. Send TaskResolved(conversation, merged) (bedrock transitions
-        --      parent_status -> terminal) and emit the system message.
-        --
-        -- Never squash-merge to base; never push to origin. Push is the
-        -- agent's responsibility via the bash tool when the user requests it.
+        -- Before selecting the with-loss or without-loss inspection outcome, Phoenix
+        -- materializes one exact RetirementAttempt plus its exact RetirementInspection
+        -- and categorized loss inventory for every attached Git-backed scope bound
+        -- to this Close attempt_id. Each RetirementLossCategoryRow is one exact
+        -- (scope, category, item_identity) row, so every at-risk path or detached commit
+        -- becomes distinct evidence rather than collapsing multiple items into one
+        -- category summary. Outcome selection then reads this attempt-bound evidence
+        -- rather than recomputing from an untyped side channel.
 }
 
--- ===========================================================
--- 3. PR MERGE STATE AS CLEANUP GATE (REQ-WL-003)
--- ===========================================================
---
--- Phoenix queries `gh` for the branch's PR state. The result is advisory:
--- it labels the cleanup affordance but does not by itself trigger a
--- lifecycle transition. Cleanup occurs only when the user initiates
--- UserMarksAsMerged or UserInitiatesAbandon.
-
-rule PrStatusObserved {
-    when: PrStatusQueried(conversation)
-
-    let worktree = Worktree{conversation: conversation}
-
-    requires: exists worktree
-    ensures: PrStatusResultDelivered(conversation, result: PrStatusResult)
+rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    requires: not exists AttachedWorkScope{product_conversation: product_conversation}
+    ensures: ResourceRetirementCompleted(product_conversation, attempt_id)
 
     @guidance
-        -- Implementation: query `gh` for the PR on the worktree's branch,
-        -- off the request thread, from the conversation's worktree. gh
-        -- failures (unavailable, unauthenticated, non-git directory,
-        -- command failure) yield found: false with an unavailable_reason,
-        -- are logged at debug, and surface as compact non-blocking UI hints;
-        -- the conversation page stays fully usable.
-        --
-        -- The work-actions-bar spec maps PrStatusResult to UI:
-        --   display_state = merged  -> cleanup is the happy path
-        --   display_state in { open, draft, closed }, or
-        --     check_state in { pending, failing }
-        --                          -> cleanup discouraged + note
-        --   found = false           -> cleanup without PR confirmation remains available
-        --
-        -- No auto-transition: observing a merged PR does NOT call
-        -- UserMarksAsMerged automatically. The user initiates.
+        -- A Close on a chat-only or otherwise no-scope aggregate has no owned
+        -- retirement resources. Emit completion idempotently so Close can progress
+        -- without inventing residual work or requiring a synthetic WorkScope.
+}
+
+rule GitBackedInspectionWithoutLossRequestsRetirement {
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
+    requires:
+        for scope_binding in attached_worktree_scopes(product_conversation):
+            exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
+    requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
+    ensures: RetirementInspectionCompletedWithoutConfirmation(
+        product_conversation,
+        attempt_id,
+        inspection_generation: aggregate_inspection_generation(product_conversation, attempt_id),
+        inspection_fingerprint: aggregate_inspection_fingerprint(product_conversation, attempt_id)
+    )
+
+    @guidance
+        -- The inspection must classify exactly five independent loss categories:
+        -- staged tracked paths; unstaged tracked/conflicted/unmerged paths;
+        -- untracked non-ignored paths; dirty or untracked state inside
+        -- initialized submodules; and detached commits unreachable from
+        -- refs/heads/*, refs/remotes/*, refs/tags/*, or refs/stash.
+        -- Ignored paths are excluded. LFS-tracked edits are ordinary tracked
+        -- changes. Local branches, tags, remotes, and stash are durable refs.
+        -- Reflog-only detached commits are at-risk detached commits.
+}
+
+rule GitBackedInspectionWithLossRequiresConfirmation {
+    when: RetirementInspectionRequested(product_conversation, attempt_id)
+    requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
+    requires:
+        for scope_binding in attached_worktree_scopes(product_conversation):
+            exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
+    requires:
+        exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: initialized_submodule_state}
+        or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: detached_unreachable_commits}
+    ensures: RetirementInspectionRequiresConfirmation(
+        product_conversation,
+        attempt_id,
+        inspection_generation: aggregate_inspection_generation(product_conversation, attempt_id),
+        inspection_fingerprint: aggregate_inspection_fingerprint(product_conversation, attempt_id)
+    )
+
+    @guidance
+        -- Each RetirementLossCategoryRow is one exact (category, item_identity) row
+        -- in the inventory, bound both to one exact RetirementInspection and to the
+        -- RetirementAttempt for the product conversation plus attached WorkScope being
+        -- retired.
+        -- Categories coexist independently. Paths and detached-commit identities
+        -- are surfaced without synthesizing a branch, tag, stash, patch, or diff
+        -- snapshot as a recovery artifact.
+}
+
+rule LossConfirmationRecomputesInspectionBeforeRetirement {
+    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
+    requires: current_retirement_inspection_generation(product_conversation) = inspection_generation
+    requires: current_retirement_inspection_fingerprint(product_conversation) = inspection_fingerprint
+    ensures: RetirementInspectionRecomputed(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- The only user-facing discard-confirmation control is bound to the exact
+        -- active Close obligation plus its stored inspection generation/fingerprint.
+        -- The click re-runs the authoritative retirement inspection inside the same
+        -- atomic decision boundary that decides whether Close may enter
+        -- retirement_requested. Phoenix compares the freshly recomputed generation and
+        -- fingerprint against the stored inspection evidence from the outstanding Close
+        -- obligation before requesting destructive retirement, so an async watcher
+        -- notification cannot race ahead or lag behind the decision.
+}
+
+rule LossConfirmationDetectsChangedInspection {
+    when: UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
+    requires:
+        bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation != inspection_generation
+        or bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint != inspection_fingerprint
+        or current_retirement_inspection_generation(product_conversation) != inspection_generation
+        or current_retirement_inspection_fingerprint(product_conversation) != inspection_fingerprint
+    ensures: RetirementInspectionChanged(product_conversation, attempt_id)
+
+    @guidance
+        -- If the confirmation payload no longer matches either the active Close
+        -- obligation's stored inspection evidence or the just-in-time recomputation,
+        -- Close does not cross into retirement_requested. The typed mismatch event
+        -- sends the flow back through inspection so the user sees the new loss set.
+}
+
+rule RetirementRequestedRetiresOwnedResources {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires:
+        for scope_binding in attached_owned_scopes(product_conversation):
+            exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+            and not blocked_by_distinct_open_product_or_identity_conflict(product_conversation, scope_binding.scope)
+            and all_owned_resources_retired(product_conversation, scope_binding.scope)
+    ensures: ResourceRetirementCompleted(product_conversation, attempt_id)
+
+    @guidance
+        -- Retirement completion is the final aggregate gate only after per-resource
+        -- retirement has already produced exact-attempt, exact-scope evidence for
+        -- every owned resource of every attached owned scope, or exact-attempt
+        -- absence evidence where applicable.
+}
+
+rule RetirementRequestedCreatesPerResourceEvidence {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    ensures:
+        for scope_binding in attached_owned_scopes_with_pending_resources(product_conversation):
+            if exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+               and not blocked_by_distinct_open_product_or_identity_conflict(product_conversation, scope_binding.scope)
+               and retirement_step_succeeds_for_pending_resource(product_conversation, scope_binding.scope):
+                RetiredResource.created(
+                    attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+                    product_conversation: product_conversation,
+                    scope: scope_binding.scope,
+                    kind: retired_resource_kind_for_pending_step(product_conversation, scope_binding.scope),
+                    resource_identity: retired_resource_identity_for_pending_step(product_conversation, scope_binding.scope)
+                )
+                and ResourceRetirementProgressRecorded(product_conversation, attempt_id, scope_binding.scope)
+
+    @guidance
+        -- Resource retirement is stepwise and idempotent. Each successful step creates
+        -- typed RetiredResource evidence for the exact RetirementAttempt before the
+        -- all-owned-resources completion gate can fire.
+}
+
+rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- Continuation rows and subordinate execution conversations inside the same
+        -- ProductConversation do not block retirement of that aggregate's attached
+        -- WorkScope. Destructive teardown stops only when Phoenix sees a genuinely
+        -- distinct open ProductConversation sharing the scope, or cannot resolve
+        -- whether such a distinct aggregate exists because identity evidence conflicts.
+}
+
+rule RetirementStepSuccessRecordsTypedEvidence {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists RetiredResource{
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        kind: retired_resource_kind_for_completed_step(product_conversation, scope_binding.scope),
+        resource_identity: retired_resource_identity_for_completed_step(product_conversation, scope_binding.scope)
+    }
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+
+    @guidance
+        -- Progress reporting consumes already-created exact-attempt RetiredResource
+        -- evidence for the bound attached scope; it does not stand in for creating
+        -- that evidence.
+}
+
+rule RetirementAlreadyRetiredIsIdempotentNoOp {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists RetiredResource{
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        kind: retired_resource_kind_for_retried_step(product_conversation, scope_binding.scope),
+        resource_identity: retired_resource_identity_for_retried_step(product_conversation, scope_binding.scope)
+    }
+    requires: exact_attempt_retries_same_resource(product_conversation, scope_binding.scope, retired_resource_identity_for_retried_step(product_conversation, scope_binding.scope))
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+
+    @guidance
+        -- A retry that encounters the same exact attempt/resource already retired is
+        -- a no-op adoption of prior evidence, not a second completion and not a failure.
+}
+
+rule RetirementProgressTriggersNextExactAttemptStep {
+    when: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: owned_resource_pending_retirement(product_conversation, AttachedWorkScope.scope)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- Every exact-attempt progress record immediately drives the next retirement
+        -- pass for that same attempt while owned resources remain.
+}
+
+rule RetirementProgressReevaluatesCompletionForExactAttempt {
+    when: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: all_owned_resources_retired(product_conversation)
+    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+
+    @guidance
+        -- Progress also reissues the exact attempt request when the last owned
+        -- resource retires so the aggregate completion gate can fire from the same
+        -- attempt-bound path.
+}
+
+rule ResourceRetirementFailureProducesResidualRepairState {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    let scope_binding = failing_retirement_scope(product_conversation, attempt_id)
+    let resource_identity = residual_resource_identity_for_attempt(product_conversation, scope_binding.scope)
+    ensures: RetirementResidualResource.created(
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        residual: RetirementResidual{
+            resource_kind: residual_resource_kind_for_attempt(product_conversation, scope_binding.scope),
+            resource_identity: resource_identity,
+            reason: residual_reason_for_attempt(product_conversation, scope_binding.scope),
+            detail: residual_repair_detail_for_attempt(product_conversation, scope_binding.scope)
+        }
+    )
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- Failure is typed and residual: report the exact remaining resource and
+        -- repair information rather than silently succeeding. Residual rows are bound
+        -- to the same exact RetirementAttempt as any earlier RetiredResource evidence,
+        -- so partial completion remains visible across retries.
+}
+
+rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: worktree_already_absent(product_conversation)
+    requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- An already-absent worktree is accepted only when retained identity and
+        -- evidence show this retirement is adopting that exact absence rather than
+        -- guessing over a missing path. Without that exact-attempt absence evidence,
+        -- report typed residual state instead of silently treating absence as success.
+}
+
+rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: worktree_already_absent(product_conversation)
+    requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+
+    @guidance
+        -- Exact-attempt absence evidence lets retirement adopt an already-absent
+        -- worktree idempotently without synthesizing a new success shape.
+}
+
+
+rule PrStatusObservedAsAdvisoryCloseGuidance {
+    when: PrStatusQueried(product_conversation)
+    ensures: PrStatusResultDelivered(product_conversation, found: Boolean, display_state: PrDisplayState?, check_state: PrCheckState?, number: Integer?, unavailable_reason: String?)
+
+    @guidance
+        -- PR observation may guide the user toward Close, especially when a PR is
+        -- merged, but it never blocks Close, retirement inspection, or retirement,
+        -- and never closes, mutates, or retargets a PR.
 }
 
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
 
--- A terminal Work/Branch conversation with no surviving live co-owner has
--- no worktree on disk: the terminal cascade removes the worktree before the
--- conversation settles into terminal state, unless a live co-owner (a
--- continuation that inherited the worktree, or a sub-agent sharing it) still
--- needs it. When a co-owner exists the worktree may persist on disk.
-invariant TerminalConversationHasNoWorktree {
-    for w in Worktree:
-        w.conversation.parent_status = terminal
-        and not has_live_worktree_co_owner(w.conversation) implies
-            not exists Worktree{conversation: w.conversation}
+invariant CleanupAuthorityComesFromCommittedCloseOperation {
+    for a in AttachedWorkScope:
+        exists CloseRetirementAuthority{product_conversation: a.product_conversation, scope: a.scope}
+        implies a.owns_git_worktree or a.scope.kind = conversation
 }
 
--- A terminal Managed (Work) conversation with no live co-owner has no task
--- branch: Phoenix created the branch, so cleanup deletes it.
-invariant TerminalManagedConversationHasNoBranch {
-    for w in Worktree:
-        w.conversation.parent_status = terminal
-        and is_managed_mode(w.conversation)
-        and not has_live_worktree_co_owner(w.conversation) implies
-            BranchDeleted(w.branch_name)
+invariant NoAutomaticRecoveryArtifactFromRetirement {
+    for a in AttachedWorkScope:
+        exists CloseRetirementAuthority{product_conversation: a.product_conversation, scope: a.scope}
+        implies not AutomaticRetirementSnapshotCreated(a.product_conversation)
 }

@@ -115,19 +115,19 @@ cache-invalidation surface (see REQ-AG-008).
 
 WHEN a `spawn_agents` task names an `agent_type` that matches a discovered
 agent
-THE SYSTEM SHALL resolve the sub-agent's mode, model, and persona from the
+THE SYSTEM SHALL resolve the sub-agent's execution authority, model, and persona from the
 agent definition
 
 THE SYSTEM SHALL apply field precedence, highest first: an explicit value on
-the task spec, then the agent definition's value, then the mode-based default
+the task spec, then the agent definition's value, then the execution-authority-based default
 
 WHEN a task omits `agent_type`
-THE SYSTEM SHALL resolve the sub-agent exactly as today (no persona; mode and
-model from the task spec or mode-based defaults)
+THE SYSTEM SHALL resolve the sub-agent without a persona, using execution authority and
+model from the task spec or execution-authority-based defaults
 
 **Rationale:** Precedence makes the agent definition a *default-bearing* layer
-between the LLM's explicit per-call overrides and the system's mode defaults.
-The LLM can still override an agent's default model or mode for a one-off
+between the LLM's explicit per-call overrides and the system's execution-authority defaults.
+The LLM can still override an agent's default model or execution authority for a one-off
 without editing the file, and the existing anonymous-spawn path is untouched.
 
 ---
@@ -190,20 +190,21 @@ ordering is what makes the cache hold.
 
 ---
 
-### REQ-AG-009: Capability from Mode, Not Definition
+### REQ-AG-009: Capability from Spawn Authority, Not Definition
 
-THE SYSTEM SHALL derive a sub-agent's tool registry from its resolved mode
-(Explore or Work), independent of which agent definition produced it
+THE SYSTEM SHALL derive a sub-agent's tool registry from the spawn request's
+resolved execution authority (read-only or write-capable), independent of which
+agent definition produced it
 
 WHEN an agent definition declares a `tools` field
 THE SYSTEM SHALL preserve it during parsing without acting on it
 
-**Rationale:** Tool capability is governed solely by the Explore/Work mode
-registries (`for_subagent_explore` / `for_subagent_work`); a named agent
-changes persona and defaults, never which tools exist. Keeping capability
-single-sourced in mode means there is exactly one registry-construction path to
-reason about. The `tools` field is part of the on-disk format and is parsed and
-preserved so the format can carry a capability declaration, but it is not part
-of this contract: the resolved registry is a function of mode alone. (A
-capability-restriction pass that consults `tools` is tracked as follow-up work,
-not described here.)
+**Rationale:** Tool capability is governed by the parent's attached `WorkScope`
+and the spawn request's read-only versus write-capable authority, not by a
+named agent definition. A named agent changes persona and defaults, never which
+tools exist. Keeping capability single-sourced in spawn authority means there
+is exactly one registry-construction path to reason about. The `tools` field is
+part of the on-disk format and is parsed and preserved so the format can carry
+a capability declaration, but it is not part of this contract: the resolved
+registry is a function of spawn authority alone. (A capability-restriction pass
+that consults `tools` is follow-up work, not described here.)

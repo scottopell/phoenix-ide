@@ -65,7 +65,7 @@ THE SYSTEM SHALL include enough context in the toast for the user to know which 
 
 ### REQ-NOTIF-003: Pull Me Back When the Agent Needs Me
 
-WHEN a conversation transitions into a state that blocks the agent on me (`awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted`)
+WHEN a conversation transitions into a state that blocks the agent on me (`awaiting_task_approval`, `awaiting_user_response`, `error`, `recoverable_continuation_failure`, `context_exhausted`)
 AND the Phoenix tab is not focused (REQ-NOTIF-005)
 AND notifications for that event type are enabled (REQ-NOTIF-006)
 AND I have granted browser notification permission
@@ -150,7 +150,7 @@ THE SYSTEM SHALL NOT dismiss live desktop notifications for other conversations 
 ### REQ-NOTIF-008: Catch Me Up When I Reconnect After a Disconnect
 
 WHEN the SSE connection re-establishes after a disconnect (network blip, laptop wake, server restart)
-THE SYSTEM SHALL scan the conversation list for any non-sub-agent conversation in a notification-worthy state (`awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted`)
+THE SYSTEM SHALL scan the conversation list for any non-sub-agent conversation in a notification-worthy state (`awaiting_task_approval`, `awaiting_user_response`, `error`, `recoverable_continuation_failure`, `context_exhausted`)
 AND for each match SHALL emit a desktop notification per the same gating rules (REQ-NOTIF-005, REQ-NOTIF-006)
 
 THE SYSTEM SHALL NOT emit catch-up notifications for `idle` (which is ambiguous — may have been idle for hours) or for sub-agent conversations (which the user doesn't manage directly)

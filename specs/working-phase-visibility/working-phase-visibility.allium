@@ -542,10 +542,10 @@ rule WatchdogResetOnAnyEvent {
         -- `crates/phoenix-ide/src/api/wire.rs`:
         --
         --   init, message, message_updated, state_change, token,
-        --   agent_done, conversation_became_terminal,
-        --   conversation_update, error, browser_session_state,
-        --   steer_message_queued, rate_limit_snapshot,
-        --   conversation_hard_deleted
+        --   agent_done, conversation_update,
+        --   product_conversation_lifecycle, continuation_boundary,
+        --   work_scope_update, error, browser_session_state, steer_message_queued,
+        --   rate_limit_snapshot, conversation_hard_deleted
         --
         -- Plus the new variants this spec introduces:
         --
@@ -553,6 +553,10 @@ rule WatchdogResetOnAnyEvent {
         --   llm_attempt    (llm-retry-visibility, sibling spec)
         --   ping           (server keep-alive, see design.md
         --                   "Server keep-alive observation")
+        --
+        -- The product_conversation_lifecycle and continuation_boundary listeners
+        -- dispatch their typed actions to ConversationAtom; native EventSource has
+        -- no wildcard listener that could make either carrier reachable implicitly.
         --
         -- A small wrapper helper in the SSE-client layer (one place,
         -- not duplicated per listener) avoids per-listener drift. New
@@ -749,13 +753,15 @@ rule InflightToolTimerRemovedOnResult {
 -- structurally; the implementation discards the inline DOM timer on
 -- the same edges.
 
--- Conversation reaches a terminal state (Archived, etc.): every
--- in-flight tool timer for the view is removed. The conversation
--- can no longer produce a tool result, so the timer cannot complete
--- via the normal path.
--- Event shape: SseConversationBecameTerminal(view).
-rule InflightToolTimerRemovedOnConversationTerminal {
-    when: SseConversationBecameTerminal(view)
+-- Aggregate lifecycle enters History: every in-flight tool timer for the view is
+-- removed. The root lifecycle carrier is the authoritative terminalization fact
+-- for Open/History placement and working-phase visibility; no row-local terminal
+-- SSE consumer remains here.
+-- Event shape: SseProductConversationLifecycleReceived(view, lifecycle, sequence_id).
+rule InflightToolTimerRemovedOnConversationHistory {
+    when: SseProductConversationLifecycleReceived(view, lifecycle, sequence_id)
+
+    requires: lifecycle = history
 
     ensures: for t in InflightToolTimer{view: view}:
         not exists t

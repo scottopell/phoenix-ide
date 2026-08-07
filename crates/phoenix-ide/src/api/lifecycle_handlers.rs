@@ -56,6 +56,18 @@ fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError
     Ok(())
 }
 
+fn ensure_terminal_action_legal(conv: &Conversation, action: &str) -> Result<(), AppError> {
+    reject_if_continued(conv, action)?;
+
+    if !conv.state.allows_terminal_action() {
+        return Err(AppError::BadRequest(format!(
+            "Conversation must be idle, context-exhausted, or in a recoverable error state to {action}"
+        )));
+    }
+
+    Ok(())
+}
+
 // ============================================================
 // Task Approval (REQ-BED-028)
 // ============================================================
@@ -373,6 +385,8 @@ pub(crate) async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(&id)
         .await
@@ -385,6 +399,16 @@ pub(crate) async fn abandon_task(
             ),
         )));
     }
+    if state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .is_some_and(|runtime_state| !runtime_state.allows_terminal_action())
+    {
+        return Err(AppError::BadRequest(
+            "Conversation has active work; wait for it to settle before abandoning".to_string(),
+        ));
+    }
     // 1. Validate conversation exists, is Work or Branch mode, Idle state, project-scoped
     let conv = state
         .runtime
@@ -393,24 +417,9 @@ pub(crate) async fn abandon_task(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    // REQ-BED-031: reject if the conversation has already been continued.
-    // The live conversation is the continuation; terminal actions belong there.
-    reject_if_continued(&conv, "abandon")?;
-
-    // REQ-BED-031: abandon is permitted from Idle, ContextExhausted, *and*
-    // Error. A parent with no continuation that is stuck (context-exhausted
-    // or errored, e.g. a usage-limit window) is the canonical "user is done;
-    // tear it down" path — the gate above already ensured no continuation
-    // exists, so the worktree/branch are still ours to destroy.
-    if !matches!(
-        conv.state,
-        ConvState::Idle | ConvState::ContextExhausted { .. } | ConvState::Error { .. },
-    ) {
-        return Err(AppError::BadRequest(
-            "Conversation must be idle, context-exhausted, or in an error state to abandon a task"
-                .to_string(),
-        ));
-    }
+    // REQ-BED-031: terminal actions belong on the live continuation when one
+    // exists, and otherwise are limited to settled disposable states.
+    ensure_terminal_action_legal(&conv, "abandon a task")?;
 
     // Accept both Work and Branch mode
     let (worktree_path, base_branch, branch_name, is_work_mode) = match &conv.conv_mode {
@@ -581,7 +590,7 @@ pub(crate) async fn abandon_task(
     };
 
     let pr_scope = conv
-        .work_scope_id
+        .attached_work_scope_id
         .as_ref()
         .expect("persisted conversation has work scope");
     if StdPath::new(&worktree_path).is_dir() {
@@ -649,12 +658,13 @@ pub(crate) async fn abandon_task(
     );
     if let Err(error) = state
         .runtime
-        .send_event(
+        .send_event_and_wait_for_state(
             &id,
             Event::TaskResolved {
                 system_message,
                 repo_root: repo_root_str,
             },
+            |settled| matches!(settled, ConvState::Terminal),
         )
         .await
     {
@@ -676,6 +686,8 @@ pub(crate) async fn mark_merged(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(&id)
         .await
@@ -688,6 +700,16 @@ pub(crate) async fn mark_merged(
             ),
         )));
     }
+    if state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .is_some_and(|runtime_state| !runtime_state.allows_terminal_action())
+    {
+        return Err(AppError::BadRequest(
+            "Conversation has active work; wait for it to settle before marking merged".to_string(),
+        ));
+    }
     // 1. Validate conversation exists, is Work or Branch mode, Idle state
     let conv = state
         .runtime
@@ -696,24 +718,9 @@ pub(crate) async fn mark_merged(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    // REQ-BED-031: reject if the conversation has already been continued.
-    // The live conversation is the continuation; terminal actions belong there.
-    reject_if_continued(&conv, "mark as merged")?;
-
-    // REQ-BED-031: mark-as-merged is permitted from Idle, ContextExhausted,
-    // *and* Error. A parent whose work has already been merged externally
-    // needs a way to dispose of the worktree without forcing a continuation
-    // or a successful LLM turn first — and a conversation stuck in Error
-    // (e.g. a usage-limit window) is exactly such a case.
-    if !matches!(
-        conv.state,
-        ConvState::Idle | ConvState::ContextExhausted { .. } | ConvState::Error { .. },
-    ) {
-        return Err(AppError::BadRequest(
-            "Conversation must be idle, context-exhausted, or in an error state to mark as merged"
-                .to_string(),
-        ));
-    }
+    // REQ-BED-031: terminal actions belong on the live continuation when one
+    // exists, and otherwise are limited to settled disposable states.
+    ensure_terminal_action_legal(&conv, "mark as merged")?;
 
     let is_work_mode = match &conv.conv_mode {
         ConvMode::Work { .. } => true,
@@ -762,12 +769,13 @@ pub(crate) async fn mark_merged(
 
     if let Err(error) = state
         .runtime
-        .send_event(
+        .send_event_and_wait_for_state(
             &id,
             Event::TaskResolved {
                 system_message,
                 repo_root: repo_root_str,
             },
+            |settled| matches!(settled, ConvState::Terminal),
         )
         .await
     {
@@ -804,7 +812,9 @@ mod tests {
     fn fixture(id: &str, continued_in_conv_id: Option<String>) -> Conversation {
         let ts = Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap();
         Conversation {
-            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            attached_work_scope_id: Some(
+                crate::work_scope::WorkScopeId::parse("test-work").unwrap(),
+            ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: id.to_string(),
             slug: Some(format!("slug-{id}")),
@@ -949,6 +959,83 @@ mod tests {
             }
             _ => panic!("expected AppError::Conflict, got a different variant"),
         }
+    }
+
+    #[test]
+    fn terminal_action_gate_accepts_exactly_disposable_settled_states() {
+        let legal_states = [
+            ConvState::Idle,
+            ConvState::Error {
+                message: "usage window".into(),
+                error_kind: crate::db::ErrorKind::UsageLimitReached,
+                resets_at: None,
+            },
+            ConvState::RecoverableContinuationFailure {
+                failure: crate::state_machine::state::RecoverableContinuationFailure {
+                    request: crate::state_machine::state::ContinuationSummaryRequest {
+                        operation_id: "op-1".into(),
+                        rejected_tool_calls: vec![],
+                        attempt: 2,
+                    },
+                    error_kind: crate::db::ErrorKind::ServerError,
+                    message: "summary failed".into(),
+                },
+            },
+            ConvState::ContextExhausted {
+                summary: "continue from here".into(),
+            },
+        ];
+
+        for state in legal_states {
+            let mut conv = fixture("terminal-legal", None);
+            conv.state = state;
+            assert!(
+                ensure_terminal_action_legal(&conv, "abandon a task").is_ok(),
+                "expected state {} to permit terminal action",
+                conv.state.variant_name()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_action_gate_rejects_non_disposable_or_continued_states() {
+        let illegal_states = [
+            ConvState::LlmRequesting { attempt: 1 },
+            ConvState::AwaitingContinuation {
+                request: crate::state_machine::state::ContinuationSummaryRequest {
+                    operation_id: "op-2".into(),
+                    rejected_tool_calls: vec![],
+                    attempt: 1,
+                },
+            },
+            commission_review_state(),
+            ConvState::HandedOff {
+                successor_conv_id: "next".into(),
+            },
+        ];
+
+        for state in illegal_states {
+            let mut conv = fixture("terminal-illegal", None);
+            conv.state = state;
+            let err = ensure_terminal_action_legal(&conv, "mark as merged")
+                .expect_err("non-disposable state must reject terminal action");
+            match err {
+                AppError::BadRequest(message) => assert!(
+                    message.contains("Conversation must be idle, context-exhausted, or in a recoverable error state"),
+                    "unexpected message: {message}"
+                ),
+                other => panic!("expected bad request, got {other:?}"),
+            }
+        }
+
+        let mut conv = fixture("terminal-continued", Some("child-conv-id".to_string()));
+        conv.state = ConvState::ContextExhausted {
+            summary: "continued elsewhere".into(),
+        };
+        let err = ensure_terminal_action_legal(&conv, "mark as merged").expect_err(
+            "continued conversation must reject terminal action even from ContextExhausted",
+        );
+        assert!(matches!(err, AppError::Conflict(_)));
     }
 
     #[test]

@@ -791,7 +791,7 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
 fn conversation_resource_scope(
     conv: &crate::db::Conversation,
 ) -> crate::work_scope::ResourceScopeKey {
-    match conv.work_scope_id.clone() {
+    match conv.attached_work_scope_id.clone() {
         Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
         None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
             crate::work_scope::ResourceScopeKey::Coordinator
@@ -803,7 +803,7 @@ fn conversation_resource_scope(
 fn conversation_work_scope(
     conv: &crate::db::Conversation,
 ) -> Result<crate::work_scope::ResourceScopeKey, AppError> {
-    conv.work_scope_id
+    conv.attached_work_scope_id
         .clone()
         .map(crate::work_scope::ResourceScopeKey::Work)
         .ok_or_else(|| AppError::Forbidden("conversation has no work scope".to_string()))
@@ -827,7 +827,7 @@ async fn cached_pr_summary_for_conversation(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> Result<Option<crate::runtime::CachedPrSummary>, AppError> {
-    let Some(scope) = conv.work_scope_id.as_ref() else {
+    let Some(scope) = conv.attached_work_scope_id.as_ref() else {
         return Ok(None);
     };
     Ok(state
@@ -845,7 +845,7 @@ async fn cached_pr_summaries_for_conversations(
 ) -> Result<HashMap<String, crate::runtime::CachedPrSummary>, AppError> {
     let scopes: Vec<_> = conversations
         .iter()
-        .filter_map(|conv| conv.work_scope_id.clone())
+        .filter_map(|conv| conv.attached_work_scope_id.clone())
         .collect();
     let associations = state
         .runtime
@@ -3267,7 +3267,7 @@ async fn work_scope_actor(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let conversation_scope = conversation
-        .work_scope_id
+        .attached_work_scope_id
         .clone()
         .map(crate::work_scope::ResourceScopeKey::Work);
     if conversation_scope.as_ref() != Some(work_scope) {
@@ -3846,6 +3846,8 @@ async fn send_chat(
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     let service = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
         state.runtime.clone(),
@@ -4157,8 +4159,8 @@ async fn cancel_conversation(
 }
 
 /// Upgrade a conversation's model (e.g., from 200k to 1M context).
-/// Allowed from `Idle` or `Error` -- cannot upgrade while an LLM request,
-/// tool execution, or other operation is in flight (see
+/// Allowed from `Idle`, `Error`, or `RecoverableContinuationFailure` -- cannot
+/// upgrade while an LLM request, tool execution, or other operation is in flight (see
 /// `ConvState::allows_model_change`).
 async fn upgrade_conversation_model(
     State(state): State<AppState>,
@@ -4166,6 +4168,9 @@ async fn upgrade_conversation_model(
     Json(req): Json<UpgradeModelRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     // Validate the target model exists
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
+
     if state.llm_registry.get(&req.model).is_none() {
         return Err(AppError::BadRequest(format!(
             "Unknown model '{}'. Available: {:?}",
@@ -4190,10 +4195,15 @@ async fn upgrade_conversation_model(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !conv.state.allows_model_change() {
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or_else(|| conv.state.clone());
+    if !effective_state.allows_model_change() {
         return Err(AppError::BadRequest(format!(
             "Cannot change model while conversation is {} -- finish or cancel the current operation first",
-            conv.state.variant_name()
+            effective_state.variant_name()
         )));
     }
 
@@ -4236,18 +4246,73 @@ async fn upgrade_conversation_model(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+fn continuation_operation_id(state: ConvState) -> String {
+    match state {
+        ConvState::RecoverableContinuationFailure { failure } => failure.request.operation_id,
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 /// Manually trigger context continuation (REQ-BED-023)
 async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if conversation.archived {
+        return Err(AppError::BadRequest(
+            "Cannot retry continuation for an archived conversation".to_string(),
+        ));
+    }
+    let effective_state = match state.runtime.effective_conversation_state(&id).await {
+        Some(runtime_state) => runtime_state,
+        None => {
+            state
+                .runtime
+                .db()
+                .get_conversation(&id)
+                .await
+                .map_err(|error| AppError::NotFound(error.to_string()))?
+                .state
+        }
+    };
+    let operation_id = continuation_operation_id(effective_state);
     state
         .runtime
-        .send_event(&id, Event::UserTriggerContinuation)
+        .admit_continuation_retry(&id, operation_id)
         .await
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+#[cfg(test)]
+mod continuation_operation_id_tests {
+    use super::*;
+
+    #[test]
+    fn retained_failure_reuses_durable_operation_id() {
+        let state = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "durable-operation".to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "failed".to_string(),
+            },
+        };
+
+        assert_eq!(continuation_operation_id(state), "durable-operation");
+    }
 }
 
 /// Cancel a specific queued steering message (task 01001).
@@ -4428,7 +4493,7 @@ async fn continue_conversation(
                 .map_err(|error| AppError::Internal(error.to_string()))?;
             let wake_repo =
                 crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
-            if parent.work_scope_id == new_conv.work_scope_id {
+            if parent.attached_work_scope_id == new_conv.attached_work_scope_id {
                 wake_repo
                     .transfer_active_for_continuation(
                         &id,
@@ -4488,7 +4553,7 @@ async fn continue_conversation(
                 .map_err(|error| AppError::Internal(error.to_string()))?;
             let wake_repo =
                 crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
-            if parent.work_scope_id == existing.work_scope_id {
+            if parent.attached_work_scope_id == existing.attached_work_scope_id {
                 wake_repo
                     .transfer_active_for_continuation(
                         &id,
@@ -4720,6 +4785,8 @@ async fn archive_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "archive").await?;
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     run_archive_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -4751,6 +4818,13 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if matches!(conv.state, ConvState::AwaitingContinuation { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot archive while a continuation summary is pending",
+            "cancel_first",
+        ))));
+    }
 
     if conv.state.is_busy() {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -4847,7 +4921,7 @@ async fn scope_still_owned_after_delete(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(conversations.into_iter().any(|candidate| {
-        candidate.id != id && crate::runtime::conversation_owns_work_scope(&candidate)
+        candidate.id != id && crate::runtime::conversation_attachment_retains_work_scope(&candidate)
     }))
 }
 
@@ -4901,7 +4975,7 @@ pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
     let Ok(persisted) = state.runtime.db().get_conversation(&conversation.id).await else {
         return;
     };
-    if !crate::runtime::conversation_owns_work_scope(&persisted) {
+    if !crate::runtime::conversation_attachment_retains_work_scope(&persisted) {
         return;
     }
     let Some(generation) = cleanup.bash_teardown_generation else {
@@ -5085,6 +5159,8 @@ async fn delete_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "delete").await?;
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     run_hard_delete_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -5142,6 +5218,12 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot hard-delete a busy conversation. Cancel the in-flight \
              operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+    if matches!(conv.state, ConvState::AwaitingContinuation { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot hard-delete while a continuation summary is pending",
             "cancel_first",
         ))));
     }
@@ -5212,7 +5294,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
 async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::db::Conversation) {
     use phoenix_core::domain::work_scope_inventory::{BrowserSessionLiveness, TmuxServerStatus};
 
-    let Some(scope_id) = deleted.work_scope_id.clone() else {
+    let Some(scope_id) = deleted.attached_work_scope_id.clone() else {
         return;
     };
     let scope = crate::work_scope::ResourceScopeKey::Work(scope_id.clone());
@@ -5357,7 +5439,7 @@ async fn cascade_project_target(
             {
                 conversations.push(conv.clone());
             }
-            crate::runtime::cleanup_branch_for_unowned_work_scope(
+            crate::runtime::cleanup_branch_for_unretained_work_scope(
                 std::path::Path::new(wt.as_str()),
                 &conversations,
             )
@@ -8215,7 +8297,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 .get_conversation(id)
                 .await
                 .expect("get conversation")
-                .work_scope_id
+                .attached_work_scope_id
                 .expect("conversation has work scope"),
         )
     }
@@ -10653,7 +10735,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .get_conversation("c-cached-pr")
             .await
             .expect("conversation")
-            .work_scope_id
+            .attached_work_scope_id
             .expect("work scope id");
         state
             .db
@@ -10829,7 +10911,8 @@ pub(crate) mod hard_delete_cascade_tests {
             .get_conversation("conv-empty")
             .await
             .expect("conversation");
-        let scope = crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id.expect("scope"));
+        let scope =
+            crate::work_scope::ResourceScopeKey::Work(conv.attached_work_scope_id.expect("scope"));
         let Json(inv) = super::get_work_scope_inventory(
             State(state),
             Path(scope.stable_key()),
@@ -10946,7 +11029,8 @@ pub(crate) mod hard_delete_cascade_tests {
             .get_conversation("conv-no-browser")
             .await
             .expect("conversation");
-        let scope = crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id.expect("scope"));
+        let scope =
+            crate::work_scope::ResourceScopeKey::Work(conv.attached_work_scope_id.expect("scope"));
 
         let Json(resp) = super::stop_work_scope_browser_session(
             State(state.clone()),
@@ -10996,7 +11080,9 @@ pub(crate) mod hard_delete_cascade_tests {
             )
             .await
             .expect("create actor conversation");
-        crate::work_scope::ResourceScopeKey::Work(actor.work_scope_id.expect("actor work scope"))
+        crate::work_scope::ResourceScopeKey::Work(
+            actor.attached_work_scope_id.expect("actor work scope"),
+        )
     }
 
     /// REQ-PINSP-001/002/003/004: a live handle's inspection reports identity
@@ -11461,8 +11547,11 @@ pub(crate) mod hard_delete_cascade_tests {
             .update_conversation_state(
                 "c-continuation",
                 &ConvState::AwaitingContinuation {
-                    rejected_tool_calls: vec![],
-                    attempt: 1,
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "cancel-test-op".to_string(),
+                        rejected_tool_calls: vec![],
+                        attempt: 1,
+                    },
                 },
             )
             .await
@@ -11484,7 +11573,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("conversation still exists");
         assert!(matches!(
             conv.state,
-            ConvState::AwaitingContinuation { attempt: 1, .. }
+            ConvState::AwaitingContinuation { request } if request.attempt == 1
         ));
     }
 
@@ -14646,7 +14735,7 @@ mod wake_handler_tests {
             .get_conversation(conversation_id)
             .await
             .expect("load conversation")
-            .work_scope_id
+            .attached_work_scope_id
             .expect("ordinary conversation scope");
         let wake_scope =
             phoenix_workflow::wake_profile::WorkScopeIdentity(work_scope_id.as_str().to_string());
@@ -14758,7 +14847,7 @@ mod wake_handler_tests {
                             .get_conversation("conv-fired")
                             .await
                             .expect("load conversation")
-                            .work_scope_id
+                            .attached_work_scope_id
                             .expect("ordinary conversation scope")
                             .as_str()
                             .to_string(),

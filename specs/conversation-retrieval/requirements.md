@@ -318,11 +318,27 @@ frozen list — e.g. "the members of chain root X," re-resolved at each
 tool call — so that membership changes during a run are reflected. What
 is fixed at construction is the *boundary the model cannot cross*, not
 necessarily a static set; liveness within that boundary is permitted and,
-for chain Q&A, required (see chains REQ-CHN-009).
+for unified-conversation transcript Q&A, required. The conversation scope is continuation-topology-based, not `WorkScope`-ownership-based: retrieval follows the live member set of one product conversation while successive execution rows may all have the same `WorkScope` attached. A conversation-scoped host binding SHALL exclude sibling derived conversations, follow-up conversations, and the global Coordinator unless the host explicitly constructs a different scope for them.
 
 WHEN a tool call names a conversation outside the bound scope (e.g. a
 read for a conversation not in the bound set)
 THE SYSTEM SHALL refuse it rather than serving out-of-scope content
+
+WHEN a host-bound conversation-read or retrieval tool targets a conversation whose source relation resolves to a deleted conversation
+THE SYSTEM SHALL return a typed unavailable-or-deleted-source outcome rather than silently omitting the relation or substituting a different conversation
+
+WHEN a host-bound conversation-read or retrieval tool resolves a source relation
+THE SYSTEM SHALL treat the source relation kind as a typed closed set that includes at least `approved_task` and `follow_up`
+AND SHALL preserve the recorded direction on the target conversation so the retrieved target can say which source conversation it points to
+AND SHALL treat that typed source relation as the only current provenance authority for source breadcrumbing and deleted-source reporting rather than consulting continuation topology or any legacy raw source-conversation-id field
+
+WHEN a reader presents predecessor/successor conversation relations
+THE SYSTEM SHALL derive those continuation relations directly from the authoritative `continued_in_conv_id` topology
+AND SHALL NOT persist a second continuation relation row or infer provenance from that topology
+
+WHEN the source conversation named by that relation has been permanently deleted
+THE SYSTEM SHALL preserve tombstone-grade source identity sufficient to distinguish a deleted source from an absent or never-recorded source
+AND SHALL return a typed deleted-source outcome that still identifies the deleted root and relation kind so surviving UI or retrieval consumers can render **Deleted source** rather than behaving as though no source existed
 
 WHEN the read-content tool is asked for a conversation whose full
 content would not safely fit a single tool result (chain members can be
@@ -341,15 +357,7 @@ offset), so one huge message cannot exceed the bound
 THE SYSTEM SHALL NOT return a single read result large enough to push
 the next bounded-loop model call past its context window
 
-**Rationale:** An agentic consumer (chains' read-only Q&A, or an
-application-wide Q&A surface) drives retrieval as a tool and iterates. If the
-model could choose its own scope, a chain Q&A agent could read
-conversations outside the chain — the scope would be a suggestion, not a
-boundary. Making the host fix the scope at tool-construction time makes
-the boundary structural: the same agent code becomes chain Q&A or global
-Q&A purely by which scope the host binds, and neither can escape its
-binding. This is the correct-by-construction form of "the model can dig
-as deep as it wants, but only within the conversations it was given."
+**Rationale:** An agentic consumer (the unified conversation page's read-only transcript Q&A, or an application-wide Q&A surface) drives retrieval as a tool and iterates. If the model could choose its own scope, a conversation Q&A agent could read conversations outside its host-bound transcript family — the scope would be a suggestion, not a boundary. Making the host fix the scope at tool-construction time makes the boundary structural: the same agent code becomes unified-conversation Q&A or global Q&A purely by which scope the host binds, and neither can escape its binding. This is the correct-by-construction form of "the model can dig as deep as it wants, but only within the conversations it was given."
 
 ---
 

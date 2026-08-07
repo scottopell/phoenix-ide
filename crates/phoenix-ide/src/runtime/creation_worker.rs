@@ -757,7 +757,7 @@ async fn provision_conversation(
                 work_scope_key: Some(
                     crate::work_scope::ResourceScopeKey::Work(
                         persisted_conversation
-                            .work_scope_id
+                            .attached_work_scope_id
                             .clone()
                             .expect("persisted conversation has work scope"),
                     )

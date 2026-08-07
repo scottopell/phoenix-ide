@@ -392,7 +392,7 @@ async fn cleanup_managed_worktree_inner(
     })?;
     if owners
         .iter()
-        .any(|conv| crate::runtime::conversation_owns_work_scope(conv))
+        .any(|conv| crate::runtime::conversation_attachment_retains_work_scope(conv))
     {
         return Err((
             StatusCode::CONFLICT,
@@ -407,7 +407,7 @@ async fn cleanup_managed_worktree_inner(
     }
 
     let branch_to_delete =
-        crate::runtime::cleanup_branch_for_unowned_work_scope(worktree, owners.iter().copied());
+        crate::runtime::cleanup_branch_for_unretained_work_scope(worktree, owners.iter().copied());
     let cleanup_repo_root = repo_root.clone();
     let cleanup_worktree = worktree.to_path_buf();
     let removed = tokio::task::spawn_blocking(move || {
@@ -628,7 +628,7 @@ fn managed_worktree_detail(
     let live = path_conversations
         .iter()
         .copied()
-        .find(|conv| crate::runtime::conversation_owns_work_scope(conv));
+        .find(|conv| crate::runtime::conversation_attachment_retains_work_scope(conv));
     let owner = live.unwrap_or(source);
     ManagedWorktreeDiskEntry {
         path: path.to_string(),
@@ -675,6 +675,9 @@ fn conv_state_name(state: &phoenix_core::domain::sm_state::ConvState) -> &'stati
         phoenix_core::domain::sm_state::ConvState::AwaitingRecovery { .. } => "AwaitingRecovery",
         phoenix_core::domain::sm_state::ConvState::AwaitingContinuation { .. } => {
             "AwaitingContinuation"
+        }
+        phoenix_core::domain::sm_state::ConvState::RecoverableContinuationFailure { .. } => {
+            "RecoverableContinuationFailure"
         }
         phoenix_core::domain::sm_state::ConvState::AwaitingTaskApproval { .. } => {
             "AwaitingTaskApproval"
@@ -1139,7 +1142,9 @@ mod tests {
     ) -> Conversation {
         let now = Utc::now();
         Conversation {
-            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            attached_work_scope_id: Some(
+                crate::work_scope::WorkScopeId::parse("test-work").unwrap(),
+            ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: id.to_string(),
             slug: Some(format!("slug-{id}")),
@@ -1452,7 +1457,7 @@ mod tests {
         };
 
         assert_eq!(
-            crate::runtime::cleanup_branch_for_unowned_work_scope(
+            crate::runtime::cleanup_branch_for_unretained_work_scope(
                 Path::new("/repo/.phoenix/worktrees/abcdef123456"),
                 [&conv],
             ),
@@ -1474,7 +1479,7 @@ mod tests {
         };
 
         assert_eq!(
-            crate::runtime::cleanup_branch_for_unowned_work_scope(
+            crate::runtime::cleanup_branch_for_unretained_work_scope(
                 Path::new("/repo/.phoenix/worktrees/branchy"),
                 [&conv],
             ),

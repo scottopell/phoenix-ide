@@ -100,7 +100,7 @@ describe('visibility (REQ-WAB-001)', () => {
   });
 
   it('visible for each disposable phase', () => {
-    for (const phaseType of ['idle', 'error']) {
+    for (const phaseType of ['idle', 'error', 'recoverable_continuation_failure']) {
       const d = deriveWorkDisposition(input({ phaseType, prStatus: notFound('fresh') }));
       expect(d.visible).toBe(true);
     }

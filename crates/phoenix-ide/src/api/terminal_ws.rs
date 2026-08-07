@@ -69,7 +69,7 @@ pub async fn terminal_ws_handler(
                 }
                 // Scope comes from the conversation's persisted durable identity.
                 let scope = ResourceScopeKey::Work(
-                    conv.work_scope_id
+                    conv.attached_work_scope_id
                         .expect("persisted conversation has work scope"),
                 );
                 let legacy_worktree_path = conv

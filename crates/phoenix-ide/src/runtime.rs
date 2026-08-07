@@ -186,6 +186,7 @@ pub struct RuntimeManager {
     /// materialize concurrently, while callers for one conversation observe the
     /// same typed success or failure.
     runtime_creations: AsyncMutex<HashMap<String, RuntimeMaterializationSender>>,
+    conversation_admissions: AsyncMutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
@@ -284,6 +285,8 @@ enum BashLifecycleBridgeAction {
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
+    pub acknowledged_event_tx:
+        mpsc::Sender<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
     /// the turn the event starts can link back to it.
@@ -791,6 +794,18 @@ impl SseBroadcaster {
         gate.reserved_until = None;
     }
 
+    /// Emit an ephemeral event at a sequence allocated by
+    /// [`Self::reserve_next_persisted_message_range`]. This fills the reserved
+    /// slot when the persistence operation resolves without a message, so live
+    /// clients never observe an unfillable sequence gap.
+    pub fn send_reserved_seq(
+        &self,
+        sequence_id: i64,
+        build: impl FnOnce(i64) -> SseEvent,
+    ) -> Result<usize, ()> {
+        self.send_with_ring(build(sequence_id), sequence_id, RingOp::Append)
+    }
+
     /// Allocate the next `sequence_id`, pass it to `build`, broadcast the
     /// resulting event, and append it to the `ReplayRing` so reconnects
     /// can replay it. The closure's signature forces the caller to place
@@ -1250,7 +1265,7 @@ fn sub_agent_registry_for_conv_mode(
     }
 }
 
-pub(crate) fn conversation_owns_work_scope(conv: &crate::db::Conversation) -> bool {
+pub(crate) fn conversation_attachment_retains_work_scope(conv: &crate::db::Conversation) -> bool {
     use phoenix_core::domain::sm_state::ConvState;
 
     if conv.archived {
@@ -1269,7 +1284,7 @@ fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) ->
     Some(format!("task-pending-{id_prefix}"))
 }
 
-pub(crate) fn cleanup_branch_for_unowned_work_scope<'a>(
+pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     worktree_path: &std::path::Path,
     conversations: impl IntoIterator<Item = &'a crate::db::Conversation>,
 ) -> Option<String> {
@@ -1370,6 +1385,7 @@ impl RuntimeManager {
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
+            conversation_admissions: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
@@ -1574,7 +1590,7 @@ impl RuntimeManager {
                     let Ok(conv) = manager.db().get_conversation(&conv_id).await else {
                         continue;
                     };
-                    let conv_scope = match conv.work_scope_id.clone() {
+                    let conv_scope = match conv.attached_work_scope_id.clone() {
                         Some(scope) => ResourceScopeKey::Work(scope),
                         None if conv.runtime_role
                             == crate::work_scope::RuntimeRole::Coordinator =>
@@ -1984,7 +2000,7 @@ impl RuntimeManager {
             let Ok(conv) = self.db().get_conversation(&conv_id).await else {
                 continue;
             };
-            let Some(scope_id) = conv.work_scope_id.clone() else {
+            let Some(scope_id) = conv.attached_work_scope_id.clone() else {
                 continue;
             };
             let conv_scope = ResourceScopeKey::Work(scope_id);
@@ -2064,8 +2080,10 @@ impl RuntimeManager {
             return Ok(false);
         };
         let conversation = self.db().get_conversation(conversation_id).await?;
-        Ok(conversation.work_scope_id.as_ref() == Some(work_scope_id)
-            && conversation_owns_work_scope(&conversation))
+        Ok(
+            conversation.attached_work_scope_id.as_ref() == Some(work_scope_id)
+                && conversation_attachment_retains_work_scope(&conversation),
+        )
     }
 
     pub(crate) async fn scope_has_live_conversation(
@@ -2120,14 +2138,68 @@ impl RuntimeManager {
             if conv.archived {
                 continue;
             }
-            if !conversation_owns_work_scope(&conv) {
+            if !conversation_attachment_retains_work_scope(&conv) {
                 continue;
             }
-            if conv.work_scope_id.as_ref() == Some(work_scope_id) {
+            if conv.attached_work_scope_id.as_ref() == Some(work_scope_id) {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Materialize persisted continuation operations so restart recovery does
+    /// not depend on a browser reconnecting to each conversation.
+    pub async fn resume_pending_continuations(self: &Arc<Self>) -> Result<usize, String> {
+        let conversation_ids = self
+            .db
+            .list_pending_continuation_conversation_ids()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut resumed = 0;
+        for conversation_id in &conversation_ids {
+            match self.get_or_create(conversation_id).await {
+                Ok(_) => resumed += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        %conversation_id,
+                        %error,
+                        "failed to materialize persisted continuation operation"
+                    );
+                }
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// Reconcile legacy half-committed continuation rows left behind by older
+    /// builds that wrote the continuation message but crashed before flipping
+    /// the conversation state to `ContextExhausted`.
+    pub async fn reconcile_legacy_half_committed_continuations(
+        self: &Arc<Self>,
+    ) -> Result<usize, String> {
+        let conversation_ids = self
+            .db
+            .list_pending_continuation_conversation_ids()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut reconciled = 0;
+        for conversation_id in &conversation_ids {
+            let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+            let Some(_summary) = repository
+                .reconcile_legacy_continuation_atomically(conversation_id, Utc::now())
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            tracing::info!(
+                %conversation_id,
+                "reconciled legacy half-committed continuation to context exhausted"
+            );
+            reconciled += 1;
+        }
+        Ok(reconciled)
     }
 
     pub async fn start_creation_worker(self: &Arc<Self>) {
@@ -2458,7 +2530,7 @@ impl RuntimeManager {
             .llm_registry
             .effective_effort(&spec.model_id, conv.effort);
         conv_context.resource_scope = crate::work_scope::ResourceScopeKey::Work(
-            conv.work_scope_id
+            conv.attached_work_scope_id
                 .clone()
                 .expect("sub-agent conversations always have a work scope"),
         );
@@ -2491,6 +2563,7 @@ impl RuntimeManager {
         // so the first non-message event is ordered strictly after it.
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1);
+        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         // 5. Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
@@ -2528,6 +2601,7 @@ impl RuntimeManager {
         )
         .with_wake_registrar(self.wake_registrar())
         .with_parent(parent_event_tx.clone())
+        .with_acknowledged_event_receiver(acknowledged_event_rx)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
@@ -2553,6 +2627,7 @@ impl RuntimeManager {
             conv.id.clone(),
             ConversationHandle {
                 event_tx: event_tx.clone(),
+                acknowledged_event_tx,
                 turn_trigger,
                 broadcast_tx: broadcaster.clone(),
                 identity: sub_agent_identity.clone(),
@@ -2875,7 +2950,7 @@ impl RuntimeManager {
                 context_window,
             )
         };
-        context.resource_scope = match conv.work_scope_id.clone() {
+        context.resource_scope = match conv.attached_work_scope_id.clone() {
             Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
             None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
                 crate::work_scope::ResourceScopeKey::Coordinator
@@ -2928,6 +3003,7 @@ impl RuntimeManager {
         }
 
         let (event_tx, event_rx) = mpsc::channel(32);
+        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
         tracing::debug!(
             conv_id = %conversation_id,
             receivers = broadcaster.receiver_count(),
@@ -3132,6 +3208,7 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         );
+        let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
         let runtime = if is_coordinator {
             runtime.with_coordinator_read_service(crate::api::global_read::GlobalReadService::new(
                 self.db.clone(),
@@ -3218,6 +3295,7 @@ impl RuntimeManager {
         let cleanup_identity = identity.clone();
         let handle = ConversationHandle {
             event_tx: event_tx.clone(),
+            acknowledged_event_tx: acknowledged_event_tx.clone(),
             turn_trigger: turn_trigger.clone(),
             broadcast_tx: broadcaster.clone(),
             identity: identity.clone(),
@@ -3242,6 +3320,7 @@ impl RuntimeManager {
                 conversation_id.to_string(),
                 ConversationHandle {
                     event_tx,
+                    acknowledged_event_tx,
                     turn_trigger,
                     broadcast_tx: broadcaster,
                     identity,
@@ -3290,6 +3369,7 @@ impl RuntimeManager {
     #[cfg(test)]
     pub(crate) async fn inject_handle_for_test(&self, conv_id: &str, live_state: ConvState) {
         let (event_tx, event_rx) = mpsc::channel(32);
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
         // Keep the receiver alive so sends into event_tx succeed (a dropped
         // receiver closes the channel and causes `enqueue_steer_message` to err).
         tokio::spawn(async move {
@@ -3301,6 +3381,7 @@ impl RuntimeManager {
             conv_id.to_string(),
             ConversationHandle {
                 event_tx,
+                acknowledged_event_tx,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
@@ -3374,6 +3455,56 @@ impl RuntimeManager {
             .send(event)
             .await
             .map_err(|e| format!("Failed to send event: {e}"))
+    }
+
+    pub async fn send_event_and_wait_for_state(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+        _accepted: impl Fn(&ConvState) -> bool,
+    ) -> Result<(), String> {
+        let handle = self.get_or_create(conversation_id).await?;
+        deposit_turn_trigger(&handle);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        handle
+            .acknowledged_event_tx
+            .send((event, ack_tx))
+            .await
+            .map_err(|error| error.to_string())?;
+        ack_rx
+            .await
+            .map_err(|_| "runtime stopped before event settled".to_string())?
+    }
+
+    pub async fn admit_continuation_retry(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        operation_id: String,
+    ) -> Result<(), String> {
+        let handle = self.get_or_create(conversation_id).await?;
+        let initial_state = handle.state_rx.borrow().clone();
+        let eligible = matches!(initial_state, ConvState::Idle)
+            || matches!(
+                &initial_state,
+                ConvState::RecoverableContinuationFailure { failure }
+                    if failure.request.operation_id == operation_id
+            );
+        if !eligible {
+            return Err(format!(
+                "Cannot trigger continuation while conversation is {}",
+                initial_state.variant_name()
+            ));
+        }
+        deposit_turn_trigger(&handle);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        handle
+            .acknowledged_event_tx
+            .send((Event::UserTriggerContinuation { operation_id }, ack_tx))
+            .await
+            .map_err(|error| format!("Failed to send continuation admission: {error}"))?;
+        ack_rx
+            .await
+            .map_err(|_| "Continuation runtime stopped before admission settled".to_string())?
     }
 
     /// Queue a steering message to be delivered when the conversation next
@@ -3456,6 +3587,7 @@ impl RuntimeManager {
         let runtimes = self.runtimes.read().await;
         runtimes.get(conversation_id).map(|h| ConversationHandle {
             event_tx: h.event_tx.clone(),
+            acknowledged_event_tx: h.acknowledged_event_tx.clone(),
             turn_trigger: h.turn_trigger.clone(),
             broadcast_tx: h.broadcast_tx.clone(),
             identity: h.identity.clone(),
@@ -3605,6 +3737,9 @@ impl RuntimeManager {
 
         match &conv.state {
             ConvState::Provisioning { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::RecoverableContinuationFailure { .. }
+            | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -3682,6 +3817,23 @@ impl RuntimeManager {
     }
 
     /// Get the database handle
+    pub(crate) async fn conversation_admission(
+        &self,
+        conversation_id: &str,
+    ) -> Arc<AsyncMutex<()>> {
+        let mut admissions = self.conversation_admissions.lock().await;
+        if let Some(admission) = admissions
+            .get(conversation_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return admission;
+        }
+        let admission = Arc::new(AsyncMutex::new(()));
+        admissions.insert(conversation_id.to_string(), Arc::downgrade(&admission));
+        admissions.retain(|_, entry| entry.strong_count() > 0);
+        admission
+    }
+
     pub fn db(&self) -> &Database {
         &self.db
     }
@@ -4530,7 +4682,7 @@ mod scope_liveness_tests {
             .expect("create work conv");
         ResourceScopeKey::Work(
             conversation
-                .work_scope_id
+                .attached_work_scope_id
                 .expect("created conversation has work scope"),
         )
     }
@@ -4541,7 +4693,7 @@ mod scope_liveness_tests {
                 .get_conversation(id)
                 .await
                 .expect("get conversation")
-                .work_scope_id
+                .attached_work_scope_id
                 .expect("conversation has work scope"),
         )
     }
@@ -4557,6 +4709,213 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_legacy_half_committed_continuation_without_dup_message() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "legacy-half-commit";
+        manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id:
+                            phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID
+                                .to_string(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .add_message(
+                "existing-summary",
+                conversation_id,
+                &crate::db::MessageContent::continuation("exact persisted summary"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .reconcile_legacy_half_committed_continuations()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::ContextExhausted {
+                summary: "exact persisted summary".to_string()
+            }
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(conversation_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "startup reconciliation must reuse the existing continuation message"
+        );
+        assert_eq!(
+            manager
+                .reconcile_legacy_half_committed_continuations()
+                .await
+                .unwrap(),
+            0,
+            "reconciliation must be idempotent once the state is finalized"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_materializes_persisted_continuation_operations() {
+        let manager = Arc::new(test_manager().await);
+        for (id, state) in [
+            (
+                "awaiting-continuation",
+                ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "op-awaiting".to_string(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            ),
+            (
+                "recoverable-continuation",
+                ConvState::RecoverableContinuationFailure {
+                    failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                        request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                            operation_id: "op-recoverable".to_string(),
+                            rejected_tool_calls: Vec::new(),
+                            attempt: 1,
+                        },
+                        error_kind: crate::db::ErrorKind::ServerError,
+                        message: "summary failed".to_string(),
+                    },
+                },
+            ),
+            (
+                "awaiting-continuation-auth",
+                ConvState::AwaitingRecovery {
+                    message: "authentication required".to_string(),
+                    error_kind: crate::db::ErrorKind::Auth,
+                    recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+                    resume:
+                        phoenix_core::domain::sm_state::RecoveryResumeTarget::ContinuationSummary {
+                            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                                operation_id: "op-auth".to_string(),
+                                rejected_tool_calls: Vec::new(),
+                                attempt: 2,
+                            },
+                        },
+                },
+            ),
+        ] {
+            manager
+                .db()
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            manager
+                .db()
+                .update_conversation_state(id, &state)
+                .await
+                .unwrap();
+        }
+        manager
+            .db()
+            .create_conversation("idle", "idle", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let coordinator = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                &coordinator.id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "op-coordinator".to_string(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.resume_pending_continuations().await.unwrap(), 4);
+        let runtimes = manager.runtimes.read().await;
+        assert!(runtimes.contains_key("awaiting-continuation"));
+        assert!(runtimes.contains_key("recoverable-continuation"));
+        assert!(runtimes.contains_key("awaiting-continuation-auth"));
+        assert!(runtimes.contains_key(&coordinator.id));
+        assert!(!runtimes.contains_key("idle"));
+    }
+
+    #[tokio::test]
+    async fn continuation_retry_admission_waits_for_executor_acknowledgement() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "retry-admission";
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "retry-operation".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let recoverable = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: request.clone(),
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "summary failed".to_string(),
+            },
+        };
+        manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &recoverable)
+            .await
+            .unwrap();
+        let handle = manager.get_or_create(conversation_id).await.unwrap();
+        let mut state_rx = handle.state_rx.clone();
+
+        manager
+            .admit_continuation_retry(conversation_id, request.operation_id.clone())
+            .await
+            .unwrap();
+        state_rx.changed().await.unwrap();
+        assert!(
+            matches!(state_rx.borrow().clone(), ConvState::AwaitingContinuation { request: persisted } if persisted.operation_id == request.operation_id)
+        );
+        assert!(
+            matches!(manager.db().get_conversation(conversation_id).await.unwrap().state, ConvState::AwaitingContinuation { request: persisted } if persisted.operation_id == request.operation_id)
+        );
     }
 
     #[tokio::test]
@@ -4594,11 +4953,13 @@ mod scope_liveness_tests {
     /// real conversation runtime — mirrors the handle the executor inserts.
     async fn register_lingering_handle(mgr: &RuntimeManager, conv_id: &str) {
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
         mgr.runtimes.write().await.insert(
             conv_id.to_string(),
             ConversationHandle {
                 event_tx,
+                acknowledged_event_tx,
                 turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),

@@ -12,6 +12,19 @@ use "../bedrock/bedrock.allium" as bedrock
 use "../bash/bash.allium" as bash
 use "../tmux-integration/tmux-integration.allium" as tmux
 
+surface BedrockCloseSettlementImport {
+    facing product_conversation: bedrock/ProductConversation
+
+    provides:
+        bedrock_close_settlement_request(product_conversation, attempt_id)
+            when bedrock/CloseSettlementRequested(product_conversation, attempt_id)
+
+    @guarantee TypedImportBridge
+        -- This surface names the exact bedrock-produced close-settlement event
+        -- consumed by the wake profile without inventing a second local producer
+        -- or reshaping the root ProductConversation payload.
+}
+
 ------------------------------------------------------------
 -- Types
 ------------------------------------------------------------
@@ -214,6 +227,7 @@ config {
 -- successor_safe_delivery_identity(item, successor), transfer_is_atomic(predecessor, successor)
 -- predecessor_history_unchanged(predecessor), registering_conversation_owns_child(conversation, resource)
 -- subagent_resource_matches_child_conversation(resource), terminal_receipt_already_exists(binding)
+-- wake_close_settlement_request(product_conversation, attempt_id)
 
 ------------------------------------------------------------
 -- Rules
@@ -385,6 +399,21 @@ rule WakeCancellationProducesCancelledReceiptWithoutResumeTurn {
     ensures: no_llm_resume_scheduled_only_for_wake_cancellation(binding)
 }
 
+rule CloseWakeCancellationProducesReceiptAndExactAttemptProgress {
+    when: CloseWakeCancellationRequested(manager, binding, product_conversation, attempt_id)
+    let payload = cancellation_terminal_payload(binding)
+    ensures: dwf/Receipt.created(effect: binding.observe_effect, payload: exact_terminal_receipt(binding, payload).payload)
+    ensures: no_llm_resume_scheduled_only_for_wake_cancellation(binding)
+    ensures:
+        if all_close_attempt_wake_receipts_terminal(product_conversation, attempt_id):
+            bedrock/CloseSettlementProgressed(product_conversation, attempt_id)
+
+    @guidance
+        -- The exact-attempt cancellation event owns receipt production and emits
+        -- progress only when that receipt makes the attempt's entire attributed
+        -- wake set terminal. A cancellation request by itself is not progress.
+}
+
 rule PendingWakeBlocksDestructiveLifecycleWithoutBusyState {
     when: ConversationLifecycleActionRequested(manager, conversation, action)
     requires: lifecycle_action_is_destructive(action)
@@ -394,6 +423,24 @@ rule PendingWakeBlocksDestructiveLifecycleWithoutBusyState {
     @guidance
         -- Pending wake work blocks destructive lifecycle actions, but it does not
         -- fabricate runtime-busy state for an otherwise idle conversation.
+}
+
+rule CloseSettlementCancelsPendingWakeBindings {
+    when: bedrock_close_settlement_request(product_conversation, attempt_id)
+    let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
+    let manager = WakeLifecycleManager{identified_by: latest_parent}
+    requires: pending_wake_count(latest_parent) > 0
+    ensures:
+        for binding in pending_bindings(latest_parent):
+            CloseAttemptWakeBindingRecorded(product_conversation, attempt_id, binding)
+            and CloseWakeCancellationRequested(manager, binding, product_conversation, attempt_id)
+
+    @guidance
+        -- Bedrock emits one root CloseSettlementRequested(product_conversation, attempt_id).
+        -- The wake profile derives the exact latest Parent row in that aggregate
+        -- and reuses its existing WakeLifecycleManager/binding authority to issue
+        -- one exact-attempt CloseWakeCancellationRequested for each pending binding
+        -- associated with that latest-row execution target.
 }
 
 rule ContinuationTransfersPendingWakeStateAtomically {

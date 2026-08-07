@@ -473,7 +473,9 @@ export function useConnection({
                 ? { ...parsedPhase, error: res.data.error }
                 : parsedPhase;
             notifyConversationStateChange(
-              latestConversationRef.current,
+              latestConversationRef.current
+                ? { ...latestConversationRef.current, state: nextPhase }
+                : null,
               latestPhaseRef.current,
               nextPhase,
             );

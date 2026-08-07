@@ -203,7 +203,7 @@ WHERE leaves.root_id NOT IN (
   SELECT id FROM conversations WHERE coordinator_head = 1
 )
 ORDER BY CASE WHEN json_extract(c.state, '$.type') IN
-  ('llm_request','llm_stream','tool_execution','executing','sub_agents_running')
+  ('llm_requesting','tool_executing','awaiting_sub_agents')
   THEN 0 ELSE 1 END,
   c.updated_at DESC
 LIMIT 41
@@ -1149,7 +1149,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET state = '{\"type\":\"tool_execution\"}', state_updated_at = '2026-07-21T12:00:00Z', updated_at = '2026-07-21T12:01:00Z', cm_task_id = '44008', cm_task_title = 'done task' WHERE id = 'leaf'")
+        sqlx::query("UPDATE conversations SET state = '{\"type\":\"tool_executing\",\"current_tool\":null,\"remaining_tools\":[]}', state_kind = 'tool_executing', state_updated_at = '2026-07-21T12:00:00Z', updated_at = '2026-07-21T12:01:00Z', cm_task_id = '44008', cm_task_title = 'done task' WHERE id = 'leaf'")
             .execute(db.pool())
             .await
             .unwrap();
@@ -1166,7 +1166,7 @@ mod tests {
             .unwrap();
         assert!(snapshot.contains("root_conversation_id"));
         assert!(snapshot.contains("current_conversation_id"));
-        assert!(snapshot.contains("tool_execution"));
+        assert!(snapshot.contains("tool_executing"));
         assert!(snapshot.contains("44008"));
         assert!(snapshot.contains("done task"));
         assert!(snapshot.contains("\"work_scope_id\""));
@@ -1175,7 +1175,7 @@ mod tests {
         assert!(snapshot.len() < super::SNAPSHOT_BYTE_LIMIT + 2_000);
         assert!(snapshot.contains("\"truncated\": true"));
         assert!(!snapshot.contains(&"x".repeat(1_000)));
-        let active = snapshot.find("tool_execution").unwrap();
+        let active = snapshot.find("tool_executing").unwrap();
         assert!(snapshot.contains("\"current_conversation_id\": \"leaf\""));
         assert!(
             active < snapshot.find("done task").unwrap(),
@@ -1212,7 +1212,7 @@ mod tests {
             .get_conversation("scope-owner")
             .await
             .unwrap()
-            .work_scope_id
+            .attached_work_scope_id
             .unwrap();
 
         let binding = service
@@ -1243,7 +1243,8 @@ mod tests {
 
         sqlx::query(
             "UPDATE conversations
-             SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue me\"}'
+             SET state = '{\"type\":\"context_exhausted\",\"summary\":\"continue me\"}',
+                 state_kind = 'context_exhausted'
              WHERE id = 'scope-owner'",
         )
         .execute(db.pool())
@@ -1254,7 +1255,9 @@ mod tests {
             .await
             .is_ok());
         sqlx::query(
-            "UPDATE conversations SET state = '{\"type\":\"idle\"}' WHERE id = 'scope-owner'",
+            "UPDATE conversations
+             SET state = '{\"type\":\"idle\"}', state_kind = 'idle'
+             WHERE id = 'scope-owner'",
         )
         .execute(db.pool())
         .await

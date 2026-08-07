@@ -203,6 +203,22 @@ pub enum Effect {
     /// Request continuation summary from LLM (no tools) - REQ-BED-020
     RequestContinuation { request: ContinuationSummaryRequest },
 
+    /// Atomically persist the threshold-crossing assistant response and the
+    /// durable continuation operation before summary generation begins.
+    BeginContinuation {
+        request: ContinuationSummaryRequest,
+        content: MessageContent,
+        display_data: Option<Value>,
+        usage_data: UsageData,
+        message_id: String,
+    },
+
+    /// Atomically persist the accepted continuation summary for an operation.
+    ContinuationCommit {
+        request: ContinuationSummaryRequest,
+        summary: String,
+    },
+
     /// Notify client of context exhaustion - REQ-BED-021
     NotifyContextExhausted { summary: String },
 
@@ -394,15 +410,59 @@ impl Effect {
         Effect::ExecuteTool { tool }
     }
 
-    /// Create a continuation message effect
+    /// Persist a fallback summary when an ordinary turn is rejected for context
+    /// exhaustion before a continuation operation exists.
     pub fn persist_continuation_message(summary: impl Into<String>) -> Self {
         let summary = summary.into();
         Effect::PersistMessage {
             content: MessageContent::continuation(summary.clone()),
-            display_data: Some(serde_json::json!({ "summary": summary })),
+            display_data: None,
             usage_data: None,
             message_id: uuid::Uuid::new_v4().to_string(),
             idempotent: false,
+        }
+    }
+
+    #[must_use]
+    pub fn begin_continuation(
+        request: ContinuationSummaryRequest,
+        blocks: Vec<ContentBlock>,
+        usage_data: UsageData,
+        cwd: Option<&Path>,
+        message_id: String,
+        final_attempt: u32,
+    ) -> Self {
+        let Effect::PersistMessage {
+            content,
+            display_data,
+            ..
+        } = Self::persist_agent_message(
+            blocks,
+            Some(usage_data.clone()),
+            cwd,
+            message_id.clone(),
+            final_attempt,
+        )
+        else {
+            unreachable!("agent message constructor always persists a message")
+        };
+        Effect::BeginContinuation {
+            request,
+            content,
+            display_data,
+            usage_data,
+            message_id,
+        }
+    }
+
+    /// Create an atomic continuation commit effect.
+    pub fn continuation_commit(
+        request: ContinuationSummaryRequest,
+        summary: impl Into<String>,
+    ) -> Self {
+        Effect::ContinuationCommit {
+            request,
+            summary: summary.into(),
         }
     }
 }

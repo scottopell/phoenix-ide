@@ -797,17 +797,32 @@ mod tests {
         assert_eq!(request.attempt, 1);
     }
 
-    /// Task 02713: model change is allowed from `Idle` and `Error` only.
-    ///
     /// The `match` below is intentionally wildcard-free: adding a new
     /// `ConvState` variant breaks this test's compilation, forcing an
     /// explicit decision about whether a mid-state model swap is safe
     /// for that variant (correct-by-construction guard).
     #[test]
+    fn legacy_awaiting_continuation_deserializes_with_stable_operation_identity() {
+        let legacy = serde_json::json!({
+            "type": "awaiting_continuation",
+            "rejected_tool_calls": [],
+            "attempt": 2
+        });
+        let state: ConvState =
+            serde_json::from_value(legacy).expect("legacy state must deserialize");
+        assert!(matches!(
+            state,
+            ConvState::AwaitingContinuation { request }
+                if request.operation_id == LEGACY_CONTINUATION_OPERATION_ID
+                    && request.attempt == 2
+        ));
+    }
+
+    #[test]
     // reason: exhaustive per-variant ConvState construction is inherently long;
     // splitting it would scatter the correct-by-construction guard described above.
     #[allow(clippy::too_many_lines)]
-    fn allows_model_change_only_from_idle_and_error() {
+    fn allows_model_change_only_from_settled_recoverable_states() {
         fn err() -> ConvState {
             ConvState::Error {
                 message: "overloaded".into(),
@@ -876,8 +891,11 @@ mod tests {
                 resume: RecoveryResumeTarget::ConversationTurn,
             },
             ConvState::AwaitingContinuation {
-                rejected_tool_calls: vec![],
-                attempt: 1,
+                request: ContinuationSummaryRequest {
+                    operation_id: "test-operation".into(),
+                    rejected_tool_calls: vec![],
+                    attempt: 1,
+                },
             },
             ConvState::AwaitingTaskApproval {
                 task_file: "tasks/x.md".into(),
@@ -906,7 +924,9 @@ mod tests {
             // Independent restatement of the predicate. Exhaustive (no
             // `_` arm) so a new variant fails to compile here.
             let expected = match state {
-                ConvState::Idle | ConvState::Error { .. } => true,
+                ConvState::Idle
+                | ConvState::Error { .. }
+                | ConvState::RecoverableContinuationFailure { .. } => true,
                 ConvState::LlmRequesting { .. }
                 | ConvState::SeededLlmRequesting { .. }
                 | ConvState::Provisioning { .. }
@@ -1071,13 +1091,31 @@ const fn first_continuation_attempt() -> u32 {
     1
 }
 
+pub const LEGACY_CONTINUATION_OPERATION_ID: &str = "legacy-continuation-operation";
+
+fn default_continuation_operation_id() -> String {
+    LEGACY_CONTINUATION_OPERATION_ID.to_string()
+}
+
 /// Operation-specific inputs for a continuation summary request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContinuationSummaryRequest {
+    // owned: pre-feature rows had no operation_id; a stable legacy sentinel lets
+    // recovered rows deserialize and participate in stale-event absorption.
+    #[serde(default = "default_continuation_operation_id")]
+    pub operation_id: String,
     pub rejected_tool_calls: Vec<ToolCall>,
     // owned: pre-feature recovery rows had no attempt; the initial attempt is correct.
     #[serde(default = "first_continuation_attempt")]
     pub attempt: u32,
+}
+
+/// A recoverable continuation failure that can be retried by the user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecoverableContinuationFailure {
+    pub request: ContinuationSummaryRequest,
+    pub error_kind: ErrorKind,
+    pub message: String,
 }
 
 /// LLM operation suspended while an external recovery mechanism runs.
@@ -1227,10 +1265,13 @@ pub enum ConvState {
 
     /// Awaiting continuation summary from LLM (tool-less request in flight)
     AwaitingContinuation {
-        /// Tool calls that were requested but not executed
-        rejected_tool_calls: Vec<ToolCall>,
-        /// Retry attempt for the continuation request
-        attempt: u32,
+        #[serde(flatten)]
+        request: ContinuationSummaryRequest,
+    },
+
+    /// Continuation summary request failed in a user-retryable way.
+    RecoverableContinuationFailure {
+        failure: RecoverableContinuationFailure,
     },
 
     /// Awaiting user approval of a proposed task plan (REQ-BED-028).
@@ -1342,8 +1383,10 @@ pub enum CoreState {
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     AwaitingContinuation {
-        rejected_tool_calls: Vec<ToolCall>,
-        attempt: u32,
+        request: ContinuationSummaryRequest,
+    },
+    RecoverableContinuationFailure {
+        failure: RecoverableContinuationFailure,
     },
 }
 
@@ -1526,13 +1569,12 @@ impl From<CoreState> for ConvState {
                 error_kind,
                 resets_at,
             },
-            CoreState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
-            } => ConvState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
-            },
+            CoreState::AwaitingContinuation { request } => {
+                ConvState::AwaitingContinuation { request }
+            }
+            CoreState::RecoverableContinuationFailure { failure } => {
+                ConvState::RecoverableContinuationFailure { failure }
+            }
         }
     }
 }
@@ -1623,13 +1665,14 @@ impl TryFrom<ConvState> for ParentState {
                 error_kind,
                 resets_at,
             })),
-            ConvState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
-            } => Ok(ParentState::Core(CoreState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
-            })),
+            ConvState::AwaitingContinuation { request } => {
+                Ok(ParentState::Core(CoreState::AwaitingContinuation {
+                    request,
+                }))
+            }
+            ConvState::RecoverableContinuationFailure { failure } => Ok(ParentState::Core(
+                CoreState::RecoverableContinuationFailure { failure },
+            )),
             // Parent-only states
             ConvState::AwaitingRecovery {
                 message,
@@ -1757,13 +1800,14 @@ impl TryFrom<ConvState> for SubAgentState {
                 error_kind,
                 resets_at,
             })),
-            ConvState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
-            } => Ok(SubAgentState::Core(CoreState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
-            })),
+            ConvState::AwaitingContinuation { request } => {
+                Ok(SubAgentState::Core(CoreState::AwaitingContinuation {
+                    request,
+                }))
+            }
+            ConvState::RecoverableContinuationFailure { failure } => Ok(SubAgentState::Core(
+                CoreState::RecoverableContinuationFailure { failure },
+            )),
             // Sub-agent-only states
             ConvState::Completed { result } => Ok(SubAgentState::Completed { result }),
             ConvState::Failed { error, error_kind } => {
@@ -1800,6 +1844,7 @@ impl CoreState {
             CoreState::CancellingSubAgents { .. } => "CancellingSubAgents",
             CoreState::Error { .. } => "Error",
             CoreState::AwaitingContinuation { .. } => "AwaitingContinuation",
+            CoreState::RecoverableContinuationFailure { .. } => "RecoverableContinuationFailure",
         }
     }
 }
@@ -1985,12 +2030,29 @@ impl ConvState {
         )
     }
 
-    /// True only for `Idle` and `Error` — the states with nothing in
-    /// flight that a model swap would race. Error-state recovery
-    /// ("pick another model") is specified by REQ-LLM-006.
+    /// True only for settled states with nothing in flight that a model swap
+    /// would race. Error-state recovery ("pick another model") is specified by
+    /// REQ-LLM-006; continuation failures also permit choosing another model
+    /// before explicitly retrying the retained operation.
     #[must_use]
     pub fn allows_model_change(&self) -> bool {
-        matches!(self, ConvState::Idle | ConvState::Error { .. })
+        matches!(
+            self,
+            ConvState::Idle
+                | ConvState::Error { .. }
+                | ConvState::RecoverableContinuationFailure { .. }
+        )
+    }
+
+    #[must_use]
+    pub fn allows_terminal_action(&self) -> bool {
+        matches!(
+            self,
+            ConvState::Idle
+                | ConvState::Error { .. }
+                | ConvState::RecoverableContinuationFailure { .. }
+                | ConvState::ContextExhausted { .. }
+        )
     }
 
     #[must_use]
@@ -2000,6 +2062,7 @@ impl ConvState {
             | Self::Error { error_kind, .. }
             | Self::Failed { error_kind, .. }
             | Self::AwaitingRecovery { error_kind, .. } => Some(error_kind),
+            Self::RecoverableContinuationFailure { failure } => Some(&failure.error_kind),
             Self::Idle
             | Self::LlmRequesting { .. }
             | Self::SeededLlmRequesting { .. }
@@ -2044,6 +2107,7 @@ impl ConvState {
             ConvState::Error { .. } => "Error",
             ConvState::AwaitingRecovery { .. } => "AwaitingRecovery",
             ConvState::AwaitingContinuation { .. } => "AwaitingContinuation",
+            ConvState::RecoverableContinuationFailure { .. } => "RecoverableContinuationFailure",
             ConvState::ContextExhausted { .. } => "ContextExhausted",
             ConvState::HandedOff { .. } => "HandedOff",
             ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
@@ -2090,6 +2154,7 @@ impl ConvState {
             | ConvState::Error { .. }
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }
+            | ConvState::RecoverableContinuationFailure { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. } => StepResult::Continue,
@@ -2106,7 +2171,9 @@ impl ConvState {
     pub fn presentation_mode(&self) -> &'static str {
         match self {
             ConvState::Idle => "idle",
-            ConvState::CreationFailed { .. } | ConvState::Error { .. } => "error",
+            ConvState::CreationFailed { .. }
+            | ConvState::Error { .. }
+            | ConvState::RecoverableContinuationFailure { .. } => "error",
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -2134,7 +2201,9 @@ impl ConvState {
     pub fn display_state(&self) -> DisplayState {
         match self {
             ConvState::Idle => DisplayState::Idle,
-            ConvState::CreationFailed { .. } | ConvState::Error { .. } => DisplayState::Error,
+            ConvState::CreationFailed { .. }
+            | ConvState::Error { .. }
+            | ConvState::RecoverableContinuationFailure { .. } => DisplayState::Error,
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. } => DisplayState::AwaitingApproval,

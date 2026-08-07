@@ -1656,6 +1656,13 @@ fn parent_tool_cycle_cap_from_env() -> u32 {
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ContinuationEffectDisposition {
+    #[default]
+    Continue,
+    AbortRemaining,
+}
+
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
 where
@@ -1707,6 +1714,8 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
+    acknowledged_event_rx:
+        mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -1872,6 +1881,7 @@ where
     pending_direct_turn_terminal: Option<Box<crate::runtime::traits::ActiveDirectTurnTerminal>>,
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
+    continuation_effect_disposition: ContinuationEffectDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
     /// a system message. `0` disables the cap. Read once at construction
     /// time from `PHOENIX_PARENT_TOOL_CYCLE_CAP`, with
@@ -1945,6 +1955,7 @@ where
         let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
+        let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
         let clearable_names = Arc::new(tool_executor.clearable_tool_names());
@@ -1969,6 +1980,7 @@ where
             event_rx,
             event_tx,
             broadcast_tx,
+            acknowledged_event_rx,
             tool_cancel_token: None,
             llm_task_handle: None,
             active_llm_attempt: None,
@@ -1999,6 +2011,7 @@ where
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
+            continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             active_direct_turn: None,
             pending_direct_turn_terminal: None,
             direct_turn_cancellation_initiated: false,
@@ -2092,6 +2105,14 @@ where
     }
 
     /// Set the parent event channel (for sub-agents)
+    pub fn with_acknowledged_event_receiver(
+        mut self,
+        receiver: mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    ) -> Self {
+        self.acknowledged_event_rx = receiver;
+        self
+    }
+
     pub fn with_parent(mut self, parent_tx: mpsc::Sender<Event>) -> Self {
         self.parent_event_tx = Some(parent_tx);
         self
@@ -2163,6 +2184,16 @@ where
         }
 
         // REQ-BED-030: crash recovery for AwaitingRecovery.
+
+        if let ConvState::AwaitingContinuation { request } = &self.state {
+            tracing::info!(
+                conv_id = %self.context.conversation_id,
+                operation_id = %request.operation_id,
+                "resuming interrupted continuation summary"
+            );
+            self.request_continuation(request.clone());
+        }
+
         // If the credential helper is still running, the select loop will pick it up.
         // If it already settled, handle it immediately.
         if matches!(self.state, ConvState::AwaitingRecovery { .. }) {
@@ -2210,6 +2241,17 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
+                Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
+                    let result = self.process_event(event).await;
+                    let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
+                    if terminal {
+                        self.emit_terminal_lifecycle_event().await;
+                    }
+                    let _ = acknowledgement.send(result);
+                    if terminal {
+                        return;
+                    }
+                }
                 Some(event) = self.event_rx.recv() => {
                     // Eviction shutdown signal — exit cleanly so the broadcaster
                     // is dropped and connected SSE clients detect the closed
@@ -2850,6 +2892,7 @@ where
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
+        self.continuation_effect_disposition = ContinuationEffectDisposition::Continue;
 
         // Update state. Bump the entry timestamp on phase change so every
         // SseEvent::StateChange the executor subsequently emits carries a
@@ -3003,10 +3046,28 @@ where
             for effect in result.effects {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-                if let Some(gen_event) = self.execute_effect(effect).await? {
+                let is_state_persist = matches!(effect, Effect::PersistState);
+                let effect_result = self.execute_effect(effect).await;
+                let effect_result = match effect_result {
+                    Ok(effect_result) => effect_result,
+                    Err(error) if is_state_persist => {
+                        let failed_state = std::mem::replace(&mut self.state, old_state.clone());
+                        self.state_updated_at = old_state_updated_at;
+                        self.manage_deadline(&failed_state);
+                        if let Some(tx) = &self.state_watcher {
+                            let _ = tx.send(self.state.clone());
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
                 }
-                if is_authoritative_persist && self.direct_turn_materialization_aborted {
+                if (is_authoritative_persist && self.direct_turn_materialization_aborted)
+                    || self.continuation_effect_disposition
+                        == ContinuationEffectDisposition::AbortRemaining
+                {
                     break;
                 }
             }
@@ -3146,11 +3207,31 @@ where
                 state_updated_at: self.state_updated_at,
             };
             if let Err(error) = self.storage.settle_active_direct_turn(&settlement).await {
-                self.pending_direct_turn_terminal = Some(terminal);
-                return Err(error);
+                let snapshot = self
+                    .storage
+                    .get_state_snapshot(&self.context.conversation_id)
+                    .await?;
+                let active = self
+                    .storage
+                    .load_active_direct_turn(&self.context.conversation_id)
+                    .await?;
+                let committed = snapshot.state == settlement.state
+                    && active
+                        .as_ref()
+                        .is_none_or(|loaded| loaded.active != settlement.turn);
+                if committed {
+                    self.state = snapshot.state;
+                    self.state_updated_at = snapshot.state_updated_at;
+                    self.active_direct_turn = None;
+                    self.direct_turn_cancellation_initiated = false;
+                } else {
+                    self.pending_direct_turn_terminal = Some(terminal);
+                    return Err(error);
+                }
+            } else {
+                self.active_direct_turn = None;
+                self.direct_turn_cancellation_initiated = false;
             }
-            self.active_direct_turn = None;
-            self.direct_turn_cancellation_initiated = false;
         } else {
             self.storage
                 .update_state(
@@ -4038,6 +4119,14 @@ where
             ));
             return;
         }
+        if let ConvState::RecoverableContinuationFailure { failure } = new_state {
+            self.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: failure.message.clone(),
+                },
+            ));
+            return;
+        }
         if let ConvState::ContextExhausted { summary } = new_state {
             self.pending_direct_turn_terminal = Some(Box::new(
                 crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
@@ -4164,6 +4253,437 @@ where
 
                 // Broadcast to clients (display_data already computed at effect creation)
                 let _ = self.broadcast_tx.send_message(msg);
+                Ok(None)
+            }
+
+            Effect::BeginContinuation {
+                request,
+                content,
+                display_data,
+                usage_data,
+                message_id,
+            } => {
+                let (reserved_range, reserved_sequences) =
+                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let sequence_id = reserved_sequences[0];
+                let message = crate::db::Message {
+                    message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id,
+                    message_type: content.message_type(),
+                    content,
+                    display_data,
+                    usage_data: Some(usage_data),
+                    created_at: Utc::now(),
+                };
+                let outcome = match self
+                    .storage
+                    .begin_continuation(
+                        &self.context.conversation_id,
+                        &request.operation_id,
+                        &message,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let failure =
+                            phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                                request: request.clone(),
+                                error_kind: crate::db::ErrorKind::ServerError,
+                                message: format!("Failed to start continuation summary: {error}"),
+                            };
+                        self.state = ConvState::RecoverableContinuationFailure { failure };
+                        self.state_updated_at = Utc::now();
+                        let terminal = self.active_direct_turn.as_ref().map(|_| {
+                            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                reason: error,
+                            }
+                        });
+                        let recovery_outcome = match self
+                            .storage
+                            .recover_continuation_start(
+                                &crate::runtime::traits::ContinuationStartRecoverySettlement {
+                                    turn: self.active_direct_turn.as_deref().cloned(),
+                                    terminal,
+                                    operation_id: request.operation_id.clone(),
+                                    message: message.clone(),
+                                    state: self.state.clone(),
+                                    state_updated_at: self.state_updated_at,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(recovery_error) => {
+                                let persisted = self
+                                    .storage
+                                    .get_state_snapshot(&self.context.conversation_id)
+                                    .await?;
+                                self.state = persisted.state;
+                                self.state_updated_at = persisted.state_updated_at;
+                                if matches!(
+                                    &self.state,
+                                    ConvState::RecoverableContinuationFailure { failure }
+                                        if failure.request.operation_id == request.operation_id
+                                ) {
+                                    self.active_direct_turn = None;
+                                    self.pending_direct_turn_terminal = None;
+                                    self.direct_turn_cancellation_initiated = false;
+                                    let _ = self.broadcast_tx.send_message(message.clone());
+                                    let _ = self.broadcast_tx.send_seq(|sequence_id| {
+                                        SseEvent::StateChange {
+                                            sequence_id,
+                                            state: self.state.clone(),
+                                            state_updated_at: self.state_updated_at,
+                                            presentation_mode: self
+                                                .state
+                                                .presentation_mode()
+                                                .to_string(),
+                                        }
+                                    });
+                                }
+                                if matches!(
+                                    &self.state,
+                                    ConvState::AwaitingContinuation { request: persisted }
+                                        if persisted.operation_id == request.operation_id
+                                ) {
+                                    tracing::warn!(
+                                        %recovery_error,
+                                        operation_id = %request.operation_id,
+                                        "continuation start committed ambiguously; resuming persisted operation"
+                                    );
+                                    let _ = self.broadcast_tx.send_message(message.clone());
+                                    drop(reserved_range);
+                                    return Ok(None);
+                                }
+                                self.continuation_effect_disposition =
+                                    ContinuationEffectDisposition::AbortRemaining;
+                                drop(reserved_range);
+                                tracing::error!(
+                                    %recovery_error,
+                                    operation_id = %request.operation_id,
+                                    "continuation start and recovery transactions both failed; restored durable state"
+                                );
+                                return Ok(None);
+                            }
+                        };
+                        if recovery_outcome == crate::db::ContinuationCommitOutcome::Duplicate {
+                            let persisted = self
+                                .storage
+                                .get_state_snapshot(&self.context.conversation_id)
+                                .await?;
+                            self.state = persisted.state;
+                            self.state_updated_at = persisted.state_updated_at;
+                            if matches!(
+                                &self.state,
+                                ConvState::AwaitingContinuation { request: persisted_request }
+                                    if persisted_request.operation_id == request.operation_id
+                            ) {
+                                let _ = self.broadcast_tx.send_message(message);
+                                drop(reserved_range);
+                                let _ = self.broadcast_tx.send_seq(|sequence_id| {
+                                    SseEvent::StateChange {
+                                        sequence_id,
+                                        state: self.state.clone(),
+                                        presentation_mode: self
+                                            .state
+                                            .presentation_mode()
+                                            .to_string(),
+                                        state_updated_at: self.state_updated_at,
+                                    }
+                                });
+                                return Ok(None);
+                            }
+                        }
+                        if self.active_direct_turn.is_some()
+                            && recovery_outcome == crate::db::ContinuationCommitOutcome::Applied
+                        {
+                            self.active_direct_turn = None;
+                            self.pending_direct_turn_terminal = None;
+                            self.direct_turn_cancellation_initiated = false;
+                        }
+                        self.continuation_effect_disposition =
+                            ContinuationEffectDisposition::AbortRemaining;
+                        let _ = self.broadcast_tx.send_message(message);
+                        drop(reserved_range);
+                        let _ = self
+                            .broadcast_tx
+                            .send_seq(|sequence_id| SseEvent::StateChange {
+                                sequence_id,
+                                state: self.state.clone(),
+                                presentation_mode: self.state.presentation_mode().to_string(),
+                                state_updated_at: self.state_updated_at,
+                            });
+                        return Ok(None);
+                    }
+                };
+                match outcome {
+                    crate::db::ContinuationCommitOutcome::Applied => {
+                        let _ = self.broadcast_tx.send_message(message);
+                        drop(reserved_range);
+                    }
+                    crate::db::ContinuationCommitOutcome::Duplicate
+                    | crate::db::ContinuationCommitOutcome::Stale => {
+                        let persisted = self
+                            .storage
+                            .get_state_snapshot(&self.context.conversation_id)
+                            .await?;
+                        self.state = persisted.state;
+                        self.state_updated_at = persisted.state_updated_at;
+                        if outcome == crate::db::ContinuationCommitOutcome::Stale {
+                            self.continuation_effect_disposition =
+                                ContinuationEffectDisposition::AbortRemaining;
+                        }
+                        let _ = self
+                            .broadcast_tx
+                            .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
+                                sequence_id,
+                                state: self.state.clone(),
+                                presentation_mode: self.state.presentation_mode().to_string(),
+                                state_updated_at: self.state_updated_at,
+                            });
+                        drop(reserved_range);
+                    }
+                }
+                Ok(None)
+            }
+
+            Effect::ContinuationCommit { request, summary } => {
+                let operation_id = request.operation_id.clone();
+                let (reserved_range, reserved_sequences) =
+                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let seq = reserved_sequences[0];
+                let content = crate::db::MessageContent::continuation(summary.clone());
+                let message = crate::db::Message {
+                    message_id: format!(
+                        "continuation-{}-{operation_id}",
+                        self.context.conversation_id
+                    ),
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: seq,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                };
+                let used_direct_turn_settlement = self.active_direct_turn.is_some();
+                let direct_turn_terminal = self.active_direct_turn.as_ref().map(|_| {
+                    self.pending_direct_turn_terminal
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                reason: summary.clone(),
+                            }
+                        })
+                });
+                let continuation_result = if let Some(turn) = self.active_direct_turn.as_ref() {
+                    self.storage
+                        .settle_continuation_direct_turn(
+                            &crate::runtime::traits::ContinuationDirectTurnSettlement {
+                                turn: (**turn).clone(),
+                                terminal: direct_turn_terminal
+                                    .clone()
+                                    .expect("active direct turn has terminal settlement"),
+                                operation_id: operation_id.clone(),
+                                message: message.clone(),
+                                state: self.state.clone(),
+                                state_updated_at: self.state_updated_at,
+                            },
+                        )
+                        .await
+                } else {
+                    self.storage
+                        .commit_continuation(
+                            &self.context.conversation_id,
+                            &operation_id,
+                            &message,
+                            &self.state,
+                            self.state_updated_at,
+                        )
+                        .await
+                };
+                let continuation_outcome = match continuation_result {
+                    Ok(outcome) => outcome,
+                    Err(first_error) => {
+                        let reconciled = if let (Some(turn), Some(terminal)) = (
+                            self.active_direct_turn.as_ref(),
+                            direct_turn_terminal.as_ref(),
+                        ) {
+                            self.storage
+                                .settle_continuation_direct_turn(
+                                    &crate::runtime::traits::ContinuationDirectTurnSettlement {
+                                        turn: (**turn).clone(),
+                                        terminal: terminal.clone(),
+                                        operation_id: operation_id.clone(),
+                                        message: message.clone(),
+                                        state: self.state.clone(),
+                                        state_updated_at: self.state_updated_at,
+                                    },
+                                )
+                                .await
+                                .ok()
+                        } else {
+                            self.storage
+                                .commit_continuation(
+                                    &self.context.conversation_id,
+                                    &operation_id,
+                                    &message,
+                                    &self.state,
+                                    self.state_updated_at,
+                                )
+                                .await
+                                .ok()
+                        }
+                        .filter(|outcome| {
+                            matches!(
+                                outcome,
+                                crate::db::ContinuationCommitOutcome::Applied
+                                    | crate::db::ContinuationCommitOutcome::Duplicate
+                            )
+                        });
+                        if let Some(outcome) = reconciled {
+                            outcome
+                        } else {
+                            if let Ok(snapshot) = self
+                                .storage
+                                .get_state_snapshot(&self.context.conversation_id)
+                                .await
+                            {
+                                if matches!(
+                                    &snapshot.state,
+                                    ConvState::ContextExhausted { .. }
+                                        | ConvState::RecoverableContinuationFailure { .. }
+                                ) {
+                                    self.state = snapshot.state;
+                                    self.state_updated_at = snapshot.state_updated_at;
+                                    let _ = self.broadcast_tx.send_seq(|sequence_id| {
+                                        SseEvent::StateChange {
+                                            sequence_id,
+                                            state: self.state.clone(),
+                                            state_updated_at: self.state_updated_at,
+                                            presentation_mode: self
+                                                .state
+                                                .presentation_mode()
+                                                .to_string(),
+                                        }
+                                    });
+                                    return Ok(None);
+                                }
+                            }
+                            let error = first_error;
+                            let failure =
+                                phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                                    request: request.clone(),
+                                    error_kind: crate::db::ErrorKind::ServerError,
+                                    message: format!(
+                                        "Failed to commit continuation summary: {error}"
+                                    ),
+                                };
+                            self.state = ConvState::RecoverableContinuationFailure { failure };
+                            self.state_updated_at = Utc::now();
+                            if let Some(turn) = self.active_direct_turn.as_deref() {
+                                self.storage
+                                    .settle_active_direct_turn(
+                                        &crate::runtime::traits::ActiveDirectTurnSettlement {
+                                            turn: turn.clone(),
+                                            terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                                reason: error.clone(),
+                                            },
+                                            state: self.state.clone(),
+                                            state_updated_at: self.state_updated_at,
+                                        },
+                                    )
+                                    .await?;
+                                self.active_direct_turn = None;
+                                self.pending_direct_turn_terminal = None;
+                                self.direct_turn_cancellation_initiated = false;
+                            } else {
+                                self.storage
+                                    .update_state(
+                                        &self.context.conversation_id,
+                                        &self.state,
+                                        self.state_updated_at,
+                                    )
+                                    .await?;
+                            }
+                            let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
+                                SseEvent::StateChange {
+                                    sequence_id,
+                                    state: self.state.clone(),
+                                    presentation_mode: self.state.presentation_mode().to_string(),
+                                    state_updated_at: self.state_updated_at,
+                                }
+                            });
+                            drop(reserved_range);
+                            return Ok(None);
+                        }
+                    }
+                };
+                match continuation_outcome {
+                    crate::db::ContinuationCommitOutcome::Applied => {
+                        let _ = self.broadcast_tx.send_message(message);
+                        drop(reserved_range);
+                        let _ = self
+                            .broadcast_tx
+                            .send_seq(|sequence_id| SseEvent::StateChange {
+                                sequence_id,
+                                state: self.state.clone(),
+                                presentation_mode: self.state.presentation_mode().to_string(),
+                                state_updated_at: self.state_updated_at,
+                            });
+                        self.active_direct_turn = None;
+                        self.pending_direct_turn_terminal = None;
+                        self.direct_turn_cancellation_initiated = false;
+                    }
+                    crate::db::ContinuationCommitOutcome::Duplicate
+                    | crate::db::ContinuationCommitOutcome::Stale => {
+                        tracing::debug!(%operation_id, ?continuation_outcome, "ignoring rejected continuation commit");
+                        if used_direct_turn_settlement
+                            && continuation_outcome
+                                == crate::db::ContinuationCommitOutcome::Duplicate
+                        {
+                            self.active_direct_turn = None;
+                            self.pending_direct_turn_terminal = None;
+                            self.direct_turn_cancellation_initiated = false;
+                        }
+                        let persisted = self
+                            .storage
+                            .get_state_snapshot(&self.context.conversation_id)
+                            .await?;
+                        self.state = persisted.state;
+                        self.state_updated_at = persisted.state_updated_at;
+                        if continuation_outcome == crate::db::ContinuationCommitOutcome::Duplicate {
+                            let _ = self.broadcast_tx.send_message(message);
+                            drop(reserved_range);
+                            let _ =
+                                self.broadcast_tx
+                                    .send_seq(|sequence_id| SseEvent::StateChange {
+                                        sequence_id,
+                                        state: self.state.clone(),
+                                        presentation_mode: self
+                                            .state
+                                            .presentation_mode()
+                                            .to_string(),
+                                        state_updated_at: self.state_updated_at,
+                                    });
+                            return Ok(None);
+                        }
+                        let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
+                            SseEvent::StateChange {
+                                sequence_id,
+                                state: self.state.clone(),
+                                presentation_mode: self.state.presentation_mode().to_string(),
+                                state_updated_at: self.state_updated_at,
+                            }
+                        });
+                        drop(reserved_range);
+                    }
+                }
                 Ok(None)
             }
 
@@ -4444,7 +4964,18 @@ where
             } => self.persist_sub_agent_results(results, spawn_tool_id).await,
 
             Effect::RequestContinuation { request } => {
-                self.request_continuation(request.rejected_tool_calls, request.attempt);
+                if matches!(
+                    &self.state,
+                    ConvState::AwaitingContinuation { request: active }
+                        if active.operation_id == request.operation_id
+                ) {
+                    self.request_continuation(request);
+                } else {
+                    tracing::debug!(
+                        operation_id = %request.operation_id,
+                        "skipping continuation request that no longer owns state"
+                    );
+                }
                 Ok(None)
             }
 
@@ -5664,7 +6195,13 @@ where
 
     /// Request continuation summary from LLM (REQ-BED-020)
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
-    fn request_continuation(&mut self, rejected_tool_calls: Vec<ToolCall>, retry_attempt: u32) {
+    fn request_continuation(
+        &mut self,
+        request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
+    ) {
+        let operation_id = request.operation_id;
+        let rejected_tool_calls = request.rejected_tool_calls;
+        let retry_attempt = request.attempt;
         let llm_client = Arc::clone(&self.llm_client);
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
@@ -5681,7 +6218,13 @@ where
                     format!("Persisted effort '{effort}' is not supported by model '{model_id}'");
                 let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
-                    let _ = event_tx.send(Event::ContinuationFailed { error }).await;
+                    let _ = event_tx
+                        .send(Event::ContinuationFailed {
+                            operation_id,
+                            error,
+                            error_kind: crate::db::ErrorKind::InvalidRequest,
+                        })
+                        .await;
                 });
                 return;
             }
@@ -5714,7 +6257,13 @@ where
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build messages for continuation");
-                    let _ = event_tx.send(Event::ContinuationFailed { error: e }).await;
+                    let _ = event_tx
+                        .send(Event::ContinuationFailed {
+                            operation_id,
+                            error: e,
+                            error_kind: crate::db::ErrorKind::ServerError,
+                        })
+                        .await;
                     return;
                 }
             };
@@ -5821,37 +6370,48 @@ where
                         .join("\n");
 
                     if summary.trim().is_empty() {
-                        // An empty summary is indistinguishable to the user from
-                        // "no summary" but silently seeds a blank continuation.
-                        // Route it through the same fallback path as a failure
-                        // so the terminal state carries an explanatory message.
+                        // An empty summary is a retryable continuation failure;
+                        // preserve the operation so the user can retry it.
                         tracing::warn!(
                             conv_id = %conv_id,
-                            "continuation: model returned an empty summary; using fallback"
+                            "continuation: model returned an empty summary; preserving retryable failure"
                         );
                         let _ = event_tx
                             .send(Event::ContinuationFailed {
+                                operation_id,
                                 error: "the model returned an empty summary".to_string(),
+                                error_kind: crate::db::ErrorKind::ContextExhausted,
                             })
                             .await;
                         return;
                     }
 
-                    let _ = event_tx.send(Event::ContinuationResponse { summary }).await;
+                    let _ = event_tx
+                        .send(Event::ContinuationResponse {
+                            operation_id,
+                            summary,
+                        })
+                        .await;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Continuation LLM request failed");
-                    // Send LlmError so the state machine's AwaitingContinuation retry logic fires.
-                    // The attempt field is ignored by that arm (tracked in state), so 0 is fine.
-                    let _ = event_tx
-                        .send(Event::LlmError {
+                    let event = if e.recovery_in_progress {
+                        Event::LlmError {
                             message: e.message.clone(),
                             error_kind: llm_error_to_db_error(e.kind),
-                            attempt: 0,
-                            recovery_in_progress: e.recovery_in_progress,
-                            resets_at: e.quota.as_ref().and_then(|q| q.resets_at),
-                        })
-                        .await;
+                            attempt: retry_attempt,
+                            recovery_in_progress: true,
+                            resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
+                        }
+                    } else {
+                        Event::ContinuationError {
+                            operation_id,
+                            message: e.message.clone(),
+                            error_kind: llm_error_to_db_error(e.kind),
+                            resets_at: e.quota.as_ref().and_then(|quota| quota.resets_at),
+                        }
+                    };
+                    let _ = event_tx.send(event).await;
                 }
             }
         });
@@ -9083,6 +9643,417 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn continuation_start_failure_persists_visible_recovery_state() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "start-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+
+        rt.apply_transition_result(
+            crate::state_machine::transition::TransitionResult::new(rt.state.clone())
+                .with_effect(Effect::BeginContinuation {
+                    request: request.clone(),
+                    content: crate::db::MessageContent::agent(vec![ContentBlock::text("response")]),
+                    display_data: None,
+                    usage_data: phoenix_core::domain::llm_types::Usage::default(),
+                    message_id: request.operation_id.clone(),
+                })
+                .with_effect(Effect::RequestContinuation {
+                    request: request.clone(),
+                }),
+        )
+        .await
+        .expect("start failure should become visible recovery state");
+
+        assert!(
+            rt.llm_task_handle.is_none(),
+            "failed continuation start must abort the remaining request effect"
+        );
+        assert!(matches!(
+            storage.get_state(&rt.context.conversation_id).await.unwrap(),
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.request == request
+        ));
+        let messages = storage.get_all_messages(&rt.context.conversation_id);
+        assert!(messages.iter().any(|message| {
+            message.message_id == request.operation_id
+                && matches!(&message.content, crate::db::MessageContent::Agent(blocks)
+                    if blocks == &vec![ContentBlock::text("response")])
+        }));
+        let SseEvent::Message { message } = rx.try_recv().expect("retained response broadcast")
+        else {
+            panic!("expected retained response before recovery state")
+        };
+        assert_eq!(message.message_id, request.operation_id);
+        assert!(matches!(
+            rx.try_recv().expect("recoverable state broadcast"),
+            SseEvent::StateChange {
+                state: ConvState::RecoverableContinuationFailure { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn continuation_start_recovery_failure_restores_durable_state_and_aborts_dispatch() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "double-start-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+        storage.set_continuation_start_recovery_error(true);
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+
+        rt.apply_transition_result(
+            crate::state_machine::transition::TransitionResult::new(rt.state.clone())
+                .with_effect(Effect::BeginContinuation {
+                    request: request.clone(),
+                    content: crate::db::MessageContent::agent(vec![ContentBlock::text("response")]),
+                    display_data: None,
+                    usage_data: phoenix_core::domain::llm_types::Usage::default(),
+                    message_id: request.operation_id.clone(),
+                })
+                .with_effect(Effect::RequestContinuation { request }),
+        )
+        .await
+        .expect("recovery transaction failure must reconcile to durable authority");
+
+        assert_eq!(rt.state, ConvState::LlmRequesting { attempt: 1 });
+        assert!(rt.llm_task_handle.is_none());
+        assert_eq!(
+            storage.get_all_messages(&rt.context.conversation_id).len(),
+            0,
+            "neither failed transaction may materialize the threshold response"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_continuation_start_commit_resumes_persisted_operation() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "ambiguous-start".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let awaiting = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        storage
+            .update_state(&rt.context.conversation_id, &awaiting, Utc::now())
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+        storage.set_continuation_start_recovery_outcome(
+            crate::db::ContinuationCommitOutcome::Duplicate,
+        );
+        rt.state = awaiting.clone();
+
+        rt.apply_transition_result(
+            crate::state_machine::transition::TransitionResult::new(awaiting.clone())
+                .with_effect(Effect::BeginContinuation {
+                    request: request.clone(),
+                    content: crate::db::MessageContent::agent(vec![ContentBlock::text("response")]),
+                    display_data: None,
+                    usage_data: phoenix_core::domain::llm_types::Usage::default(),
+                    message_id: request.operation_id.clone(),
+                })
+                .with_effect(Effect::RequestContinuation {
+                    request: request.clone(),
+                }),
+        )
+        .await
+        .expect("duplicate recovery should resume the persisted operation");
+
+        assert_eq!(rt.state, awaiting);
+        assert!(rt.llm_task_handle.is_some());
+        assert!(matches!(rx.try_recv().unwrap(), SseEvent::Message { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::AwaitingContinuation { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_continuation_commit_retries_idempotently() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "ambiguous-commit".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let awaiting = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        storage
+            .update_state(&rt.context.conversation_id, &awaiting, Utc::now())
+            .await
+            .unwrap();
+        storage.set_continuation_commit_error_once();
+        rt.state = ConvState::ContextExhausted {
+            summary: "summary".to_string(),
+        };
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request,
+            summary: "summary".to_string(),
+        })
+        .await
+        .expect("ambiguous commit should reconcile idempotently");
+
+        assert!(matches!(
+            storage.get_state(&rt.context.conversation_id).await.unwrap(),
+            ConvState::ContextExhausted { summary } if summary == "summary"
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), SseEvent::Message { .. }));
+    }
+
+    #[tokio::test]
+    async fn continuation_commit_failure_persists_visible_recovery_state() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let operation_id = "operation-failure".to_string();
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: operation_id.clone(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: request.clone(),
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+        rt.state = ConvState::ContextExhausted {
+            summary: "generated summary".to_string(),
+        };
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request: request.clone(),
+            summary: "generated summary".to_string(),
+        })
+        .await
+        .expect("commit failure should become visible recovery state");
+
+        assert!(matches!(
+            rt.state,
+            ConvState::RecoverableContinuationFailure { ref failure }
+                if failure.request == request
+                    && failure.error_kind == crate::db::ErrorKind::ServerError
+        ));
+        assert!(matches!(
+            storage
+                .get_state(&rt.context.conversation_id)
+                .await
+                .unwrap(),
+            ConvState::RecoverableContinuationFailure { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_continuation_commit_fills_reserved_sequence_and_restores_state() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        storage
+            .update_state(&rt.context.conversation_id, &ConvState::Idle, Utc::now())
+            .await
+            .unwrap();
+        rt.state = ConvState::ContextExhausted {
+            summary: "stale summary".to_string(),
+        };
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: "stale-operation".to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+            summary: "stale summary".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(rt.state, ConvState::Idle);
+        let event = rx.try_recv().expect("reserved sequence must be filled");
+        assert!(matches!(
+            event,
+            SseEvent::StateChange {
+                sequence_id: 1,
+                state: ConvState::Idle,
+                ..
+            }
+        ));
+        assert_eq!(rt.broadcast_tx.next_seq(), 2);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_direct_turn_continuation_commit_reconciles_duplicate() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "ambiguous-direct-commit".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(12),
+            generation: 0,
+        }));
+        rt.state = ConvState::ContextExhausted {
+            summary: "summary".to_string(),
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: request.clone(),
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        storage.set_continuation_commit_error_once();
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request,
+            summary: "summary".to_string(),
+        })
+        .await
+        .expect("ambiguous direct-turn commit should reconcile");
+
+        assert!(rt.active_direct_turn.is_none());
+        assert!(matches!(rx.try_recv().unwrap(), SseEvent::Message { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::ContextExhausted { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn continuation_commit_settles_active_direct_turn_atomically_before_broadcast() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let operation_id = "direct-turn-continuation-op".to_string();
+        let summary = "preserved continuation summary".to_string();
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(11),
+            generation: 0,
+        }));
+        rt.state = ConvState::ContextExhausted {
+            summary: summary.clone(),
+        };
+        rt.state_updated_at = Utc::now();
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::AwaitingContinuation {
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: operation_id.clone(),
+                        rejected_tool_calls: Vec::new(),
+                        attempt: 1,
+                    },
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: operation_id.clone(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+            summary: summary.clone(),
+        })
+        .await
+        .unwrap();
+
+        let settlements = storage.recorded_settle_continuation_direct_turn_calls();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].operation_id, operation_id);
+        assert_eq!(settlements[0].state, rt.state);
+        assert!(rt.active_direct_turn.is_none());
+        assert!(matches!(
+            storage.get_current_state(&rt.context.conversation_id),
+            Some(ConvState::ContextExhausted { .. })
+        ));
+        assert_eq!(
+            storage.get_all_messages(&rt.context.conversation_id).len(),
+            1
+        );
+
+        let first = rx.try_recv().expect("message broadcasted after commit");
+        assert!(matches!(first, SseEvent::Message { .. }));
+        let second = rx
+            .try_recv()
+            .expect("state change broadcasted after commit");
+        assert!(matches!(
+            second,
+            SseEvent::StateChange {
+                state: ConvState::ContextExhausted { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn active_direct_turn_terminal_classification_releases_exactly_once() {
         for (event, new_state, expected) in [
             (
@@ -9124,8 +10095,32 @@ mod authoritative_user_message_effect_tests {
                 },
             ),
             (
+                Event::ContinuationError {
+                    operation_id: "direct-turn-continuation-op".to_string(),
+                    message: "continuation capacity".to_string(),
+                    error_kind: crate::db::ErrorKind::ServerOverloaded,
+                    resets_at: None,
+                },
+                ConvState::RecoverableContinuationFailure {
+                    failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                        request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                            operation_id: "direct-turn-continuation-op".to_string(),
+                            rejected_tool_calls: Vec::new(),
+                            attempt: 3,
+                        },
+                        error_kind: crate::db::ErrorKind::ServerOverloaded,
+                        message: "continuation capacity".to_string(),
+                    },
+                },
+                crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                    reason: "continuation capacity".to_string(),
+                },
+            ),
+            (
                 Event::ContinuationFailed {
+                    operation_id: "direct-turn-continuation-op".to_string(),
                     error: "continuation failed".to_string(),
+                    error_kind: crate::db::ErrorKind::ContextExhausted,
                 },
                 ConvState::ContextExhausted {
                     summary: "preserved continuation summary".to_string(),
@@ -9159,6 +10154,54 @@ mod authoritative_user_message_effect_tests {
             assert_eq!(settlements[0].terminal, expected);
             assert_eq!(settlements[0].state, new_state);
         }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recoverable_failure_settlement_reconciles_committed_authority() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(19),
+            generation: 0,
+        };
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &ConvState::Idle,
+                rt.state_updated_at,
+            )
+            .await
+            .unwrap();
+        storage.set_active_direct_turn(Some(turn.clone()));
+        storage.set_settle_active_direct_turn_commit_error_once();
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                reason: "continuation failed".to_string(),
+            },
+        ));
+        rt.state = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "ambiguous-settlement".to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "continuation failed".to_string(),
+            },
+        };
+
+        rt.persist_state_effect(false).await.unwrap();
+
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert!(matches!(
+            storage.get_current_state(&rt.context.conversation_id),
+            Some(ConvState::RecoverableContinuationFailure { .. })
+        ));
     }
 
     #[tokio::test]
@@ -10814,9 +11857,11 @@ mod steer_drain_detector_tests {
             build_runtime_with_state_and_queue("conv-manual-continuation", ConvState::Idle, vec![]);
         let mut rx = rt.broadcast_tx.subscribe();
 
-        rt.process_event(Event::UserTriggerContinuation)
-            .await
-            .expect("manual continuation trigger must be accepted from idle");
+        rt.process_event(Event::UserTriggerContinuation {
+            operation_id: "manual-continuation-op".to_string(),
+        })
+        .await
+        .expect("manual continuation trigger must be accepted from idle");
 
         let persisted = storage
             .get_state("conv-manual-continuation")
@@ -10825,12 +11870,12 @@ mod steer_drain_detector_tests {
         assert!(
             matches!(
                 persisted,
-                ConvState::AwaitingContinuation { attempt: 1, .. }
+                ConvState::AwaitingContinuation { ref request } if request.attempt == 1
             ),
             "manual continuation must persist AwaitingContinuation, got {persisted:?}"
         );
         assert!(
-            matches!(rt.state, ConvState::AwaitingContinuation { attempt: 1, .. }),
+            matches!(rt.state, ConvState::AwaitingContinuation { ref request } if request.attempt == 1),
             "manual continuation must enter AwaitingContinuation, got {:?}",
             rt.state
         );
@@ -10838,7 +11883,8 @@ mod steer_drain_detector_tests {
         let mut saw_awaiting_continuation = false;
         while let Ok(ev) = rx.try_recv() {
             if let SseEvent::StateChange { state, .. } = ev {
-                if matches!(state, ConvState::AwaitingContinuation { attempt: 1, .. }) {
+                if matches!(state, ConvState::AwaitingContinuation { ref request } if request.attempt == 1)
+                {
                     saw_awaiting_continuation = true;
                     break;
                 }
@@ -10848,6 +11894,56 @@ mod steer_drain_detector_tests {
             saw_awaiting_continuation,
             "manual continuation must broadcast AwaitingContinuation state_change"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_continuation_retry_persistence_restores_recoverable_state() {
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "retry-persist-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let failure = phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+            request: request.clone(),
+            error_kind: crate::db::ErrorKind::ServerError,
+            message: "summary request failed".to_string(),
+        };
+        let recoverable = ConvState::RecoverableContinuationFailure {
+            failure: failure.clone(),
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-retry-persist-failure",
+            recoverable.clone(),
+            vec![],
+        );
+        storage
+            .update_state(
+                "conv-retry-persist-failure",
+                &recoverable,
+                rt.state_updated_at,
+            )
+            .await
+            .expect("seed recoverable state");
+        storage.set_fail_state_update(true);
+
+        let error = rt
+            .process_event(Event::UserTriggerContinuation {
+                operation_id: request.operation_id,
+            })
+            .await
+            .expect_err("failed retry persistence must reject the transition");
+
+        assert!(error.contains("injected state update failure"));
+        assert_eq!(rt.state, recoverable);
+        assert!(rt.llm_task_handle.is_none());
+        assert!(matches!(
+            storage
+                .get_state("conv-retry-persist-failure")
+                .await
+                .expect("persisted state"),
+            ConvState::RecoverableContinuationFailure { failure: persisted }
+                if persisted == failure
+        ));
     }
 
     /// Mid-turn drain from `ToolExecuting` → `LlmRequesting`: persists run

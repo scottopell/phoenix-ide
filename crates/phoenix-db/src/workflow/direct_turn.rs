@@ -177,6 +177,16 @@ pub struct TerminalizeAuthoritativeTurnInput {
     pub projection: Option<PersistedConversationProjection>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AtomicContinuationSettlementInput {
+    pub conversation_id: String,
+    pub operation_id: String,
+    pub message: Message,
+    pub completed_state: ConvState,
+    pub state_updated_at: DateTime<Utc>,
+    pub command: TurnCommand,
+}
+
 fn authority_event(
     authority: &super::LocalAttemptAuthority,
     turn_id: TurnAuthorityId,
@@ -992,6 +1002,130 @@ impl WorkflowRepository {
             .await
     }
 
+    pub async fn settle_failed_continuation_start_atomically(
+        &self,
+        input: &AtomicContinuationSettlementInput,
+    ) -> DbResult<crate::ContinuationCommitOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let outcome = crate::persist_continuation_start_tx(
+            &mut tx.tx,
+            &input.conversation_id,
+            &input.operation_id,
+            &input.message,
+            &input.completed_state,
+            input.state_updated_at,
+        )
+        .await?;
+        match outcome {
+            crate::ContinuationCommitOutcome::Applied => {
+                self.terminalize_authoritative_turn_in_tx(
+                    &mut tx,
+                    &TerminalizeAuthoritativeTurnInput {
+                        command: input.command.clone(),
+                        projection: Some(PersistedConversationProjection {
+                            state: input.completed_state.clone(),
+                            state_updated_at: input.state_updated_at,
+                        }),
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+            }
+            crate::ContinuationCommitOutcome::Duplicate
+            | crate::ContinuationCommitOutcome::Stale => tx.rollback().await?,
+        }
+        Ok(outcome)
+    }
+
+    pub async fn reconcile_legacy_continuation_atomically(
+        &self,
+        conversation_id: &str,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<Option<String>> {
+        let mut tx = self.begin_tx().await?;
+        let summary = crate::reconcile_legacy_half_committed_continuation_tx(
+            &mut tx.tx,
+            conversation_id,
+            state_updated_at,
+        )
+        .await?;
+        let Some(summary) = summary else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        let conversation = ConversationAuthority(conversation_id.to_string());
+        if let Some(turn) =
+            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, &conversation).await?
+        {
+            self.terminalize_authoritative_turn_in_tx(
+                &mut tx,
+                &TerminalizeAuthoritativeTurnInput {
+                    command: TurnCommand::Fail {
+                        turn_id: turn.id,
+                        expected_generation: turn.generation,
+                        reason:
+                            "legacy continuation operation interrupted after summary persistence"
+                                .to_string(),
+                    },
+                    projection: None,
+                },
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(summary))
+    }
+
+    pub async fn settle_continuation_direct_turn_atomically(
+        &self,
+        input: &AtomicContinuationSettlementInput,
+    ) -> DbResult<crate::ContinuationCommitOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let outcome = crate::commit_continuation_tx(
+            &mut tx.tx,
+            &input.conversation_id,
+            &input.operation_id,
+            &input.message,
+            &input.completed_state,
+            input.state_updated_at,
+        )
+        .await?;
+        match outcome {
+            crate::ContinuationCommitOutcome::Applied => {
+                self.terminalize_authoritative_turn_in_tx(
+                    &mut tx,
+                    &TerminalizeAuthoritativeTurnInput {
+                        command: input.command.clone(),
+                        projection: Some(PersistedConversationProjection {
+                            state: input.completed_state.clone(),
+                            state_updated_at: input.state_updated_at,
+                        }),
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(crate::ContinuationCommitOutcome::Applied)
+            }
+            crate::ContinuationCommitOutcome::Duplicate => {
+                self.terminalize_authoritative_turn_in_tx(
+                    &mut tx,
+                    &TerminalizeAuthoritativeTurnInput {
+                        command: input.command.clone(),
+                        projection: None,
+                    },
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(crate::ContinuationCommitOutcome::Duplicate)
+            }
+            crate::ContinuationCommitOutcome::Stale => {
+                tx.rollback().await?;
+                Ok(crate::ContinuationCommitOutcome::Stale)
+            }
+        }
+    }
+
     #[cfg(test)]
     async fn terminate_authoritative_turn_at_cut(
         &self,
@@ -1012,6 +1146,19 @@ impl WorkflowRepository {
         &self,
         input: &TerminalizeAuthoritativeTurnInput,
         cut: TransactionCut,
+    ) -> DbResult<TurnStep> {
+        let mut tx = self.begin_tx().await?;
+        let step = self
+            .terminalize_authoritative_turn_in_tx(&mut tx, input)
+            .await?;
+        finish_workflow_transaction_at_cut(tx, cut).await?;
+        Ok(step)
+    }
+
+    async fn terminalize_authoritative_turn_in_tx(
+        &self,
+        tx: &mut super::WorkflowTx<'_>,
+        input: &TerminalizeAuthoritativeTurnInput,
     ) -> DbResult<TurnStep> {
         let command = input.command.clone();
         let (turn_id, expected_generation, terminal) = match &command {
@@ -1040,7 +1187,6 @@ impl WorkflowRepository {
                 ));
             }
         };
-        let mut tx = self.begin_tx().await?;
         let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
             .bind(to_i64(turn_id.0, "turn_id")?)
             .fetch_optional(&mut *tx.tx)
@@ -1056,7 +1202,6 @@ impl WorkflowRepository {
             phoenix_workflow::DurableTurnModel::from_turns([turn.clone()]).map_err(conflict)?;
         let step = model.apply(command).map_err(conflict)?;
         if matches!(step.outcome, TurnOutcome::TerminalReplay { .. }) {
-            tx.rollback().await?;
             return Ok(step);
         }
         let (terminal_kind, reason) = terminal_sql(&terminal);
@@ -1089,7 +1234,6 @@ impl WorkflowRepository {
             )
             .await?;
         if !committed {
-            tx.rollback().await?;
             return Err(conflict(TurnConflict::StaleGeneration {
                 actual: turn.generation,
             }));
@@ -1107,18 +1251,16 @@ impl WorkflowRepository {
         .execute(&mut *tx.tx)
         .await?;
         if updated.rows_affected() != 1 {
-            tx.rollback().await?;
             return Err(conflict(TurnConflict::StaleGeneration {
                 actual: turn.generation,
             }));
         }
         if let Some(projection) = &input.projection {
-            update_conversation_projection_tx(&mut tx, &turn.conversation, projection).await?;
+            update_conversation_projection_tx(tx, &turn.conversation, projection).await?;
         }
-        mark_active_attempts_authority_lost_tx(&mut tx, workflow_id).await?;
-        delete_reclaimable_leases_tx(&mut tx, workflow_id).await?;
+        mark_active_attempts_authority_lost_tx(tx, workflow_id).await?;
+        delete_reclaimable_leases_tx(tx, workflow_id).await?;
         tx.invalidate_nonterminal_effects(workflow_id).await?;
-        finish_workflow_transaction_at_cut(tx, cut).await?;
         Ok(step)
     }
 }
@@ -1568,9 +1710,12 @@ async fn update_conversation_projection_tx(
     let state_json = serde_json::to_string(&projection.state)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let updated = sqlx::query(
-        "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+        "UPDATE conversations
+         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+         WHERE id = ?4",
     )
     .bind(state_json)
+    .bind(crate::conv_state_kind(&projection.state))
     .bind(projection.state_updated_at.to_rfc3339())
     .bind(&conversation.0)
     .execute(&mut *tx.tx)
@@ -1590,9 +1735,12 @@ async fn update_conversation_state_for_adoption_tx(
     let state_json = serde_json::to_string(&input.accepted_state)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let updated = sqlx::query(
-        "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+        "UPDATE conversations
+         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+         WHERE id = ?4",
     )
     .bind(state_json)
+    .bind(crate::conv_state_kind(&input.accepted_state))
     .bind(input.state_updated_at.to_rfc3339())
     .bind(&conversation.0)
     .execute(&mut *tx.tx)
@@ -2758,7 +2906,9 @@ mod tests {
         let TurnOutcome::Created { turn_id, .. } = created.outcome else {
             panic!("expected created turn")
         };
-        sqlx::query("UPDATE conversations SET state = ?1 WHERE id = 'conv-a'")
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = 'llm_requesting' WHERE id = 'conv-a'",
+        )
             .bind(serde_json::to_string(&ConvState::LlmRequesting { attempt: 0 }).unwrap())
             .execute(&repo.pool)
             .await
@@ -2812,6 +2962,102 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ConvState>(&state_after_commit).unwrap(),
             projection.state
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_message_projection_and_owner_release_commit_atomically() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "continuation-terminal", 8))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let operation_id = "continuation-operation";
+        let awaiting = ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: operation_id.to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        };
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'conv-a'")
+            .bind(serde_json::to_string(&awaiting).unwrap())
+            .bind("awaiting_continuation")
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let completed = ConvState::ContextExhausted {
+            summary: "durable summary".to_string(),
+        };
+        let content = crate::MessageContent::continuation("durable summary");
+        let message = crate::Message {
+            message_id: format!("continuation-conv-a-{operation_id}"),
+            conversation_id: "conv-a".to_string(),
+            sequence_id: 1,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let input = AtomicContinuationSettlementInput {
+            conversation_id: "conv-a".to_string(),
+            operation_id: operation_id.to_string(),
+            message,
+            completed_state: completed.clone(),
+            state_updated_at: Utc::now(),
+            command: TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            },
+        };
+
+        assert_eq!(
+            repo.settle_continuation_direct_turn_atomically(&input)
+                .await
+                .unwrap(),
+            crate::ContinuationCommitOutcome::Applied
+        );
+        let turn = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.generation, 1);
+        assert!(!turn.owns_conversation());
+        let (state_json, state_kind): (String, String) =
+            sqlx::query_as("SELECT state, state_kind FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConvState>(&state_json).unwrap(),
+            completed
+        );
+        assert_eq!(state_kind, "context_exhausted");
+        let message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = 'conv-a'")
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(message_count, 1);
+
+        assert_eq!(
+            repo.settle_continuation_direct_turn_atomically(&input)
+                .await
+                .unwrap(),
+            crate::ContinuationCommitOutcome::Duplicate
+        );
+        assert_eq!(
+            repo.load_authoritative_turn(turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            1
         );
     }
 

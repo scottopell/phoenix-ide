@@ -1615,15 +1615,10 @@ function ConversationPageContent({
 
     try {
       await api.triggerContinuation(conversationId);
-      dispatch({
-        type: 'local_phase_change',
-        phase: { type: 'awaiting_continuation', attempt: 1 },
-        expectedConversationId: conversationId,
-      });
     } catch (err) {
-      console.error('Failed to trigger continuation:', err);
+      showError(err instanceof Error ? err.message : 'Failed to trigger continuation');
     }
-  }, [conversationId, isArchived, dispatch]);
+  }, [conversationId, isArchived, showError]);
 
   const handleUpgradeModel = useCallback(async (newModelId: string, effort?: import('../api').ModelEffort | null) => {
     if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
@@ -2442,6 +2437,24 @@ function ConversationPageContent({
             {creationCancelledPrompt && (
               <pre className="context-exhausted-content">{creationCancelledPrompt}</pre>
             )}
+          </div>
+        </div>
+      )}
+      {convStateForChildren.type === 'recoverable_continuation_failure' && (
+        <div className="context-exhausted-banner context-exhausted-banner--expanded">
+          <div className="context-exhausted-summary">
+            <div className="error-body-title">Continuation summary failed</div>
+            <p>{convStateForChildren.message}</p>
+            <div className="context-exhausted-actions">
+              <button
+                type="button"
+                className="context-exhausted-continue"
+                disabled={isArchived}
+                onClick={() => void handleTriggerContinuation()}
+              >
+                Retry summary
+              </button>
+            </div>
           </div>
         </div>
       )}

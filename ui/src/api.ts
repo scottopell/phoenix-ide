@@ -501,6 +501,7 @@ export type ConversationState =
   | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
   | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }
   | { type: 'awaiting_continuation'; attempt: number }
+  | { type: 'recoverable_continuation_failure'; message: string; error_kind: ErrorKind; operation_id: string; attempt: number }
   | { type: 'cancelling' }
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
@@ -523,7 +524,9 @@ export type ConversationState =
 
 /** Mirror of the backend `ConvState::allows_model_change`. */
 export function canChangeModelInState(state: ConversationState): boolean {
-  return state.type === 'idle' || state.type === 'error';
+  return state.type === 'idle'
+    || state.type === 'error'
+    || state.type === 'recoverable_continuation_failure';
 }
 
 /** A conversation in a terminal state can no longer act on its pending fork
@@ -554,6 +557,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'awaiting_commission_review_approval':
     case 'awaiting_user_response':
     case 'error':
+    case 'recoverable_continuation_failure':
     case 'awaiting_recovery':
     case 'provisioning':
       return false;

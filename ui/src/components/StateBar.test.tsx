@@ -538,6 +538,22 @@ describe('StateBar PR badge', () => {
 
     rerender(
       <MemoryRouter>
+        <StateBar
+          {...props}
+          convState={{
+            type: 'recoverable_continuation_failure',
+            message: 'Selected model is at capacity',
+            error_kind: 'server_overloaded',
+            operation_id: 'continuation-operation-1',
+            attempt: 1,
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
         <StateBar {...props} convState={{ type: 'llm_requesting', attempt: 1 }} />
       </MemoryRouter>,
     );

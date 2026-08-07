@@ -518,6 +518,7 @@ pub struct MaterializeAuthoritativeUserMessageCall {
 pub struct InMemoryStorage {
     messages: Mutex<HashMap<String, Vec<Message>>>,
     states: Mutex<HashMap<String, ConvState>>,
+    state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     cwds: Mutex<HashMap<String, String>>,
     next_msg_id: Mutex<u64>,
@@ -536,6 +537,14 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    settle_active_direct_turn_commit_error_once: Mutex<bool>,
+    settle_continuation_direct_turn_calls:
+        Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
+    fail_continuation_commit: Mutex<bool>,
+    fail_state_update: Mutex<bool>,
+    continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
+    continuation_start_recovery_error: Mutex<bool>,
+    continuation_commit_error_once: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -547,6 +556,7 @@ impl InMemoryStorage {
         Self {
             messages: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
+            state_updated_ats: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
@@ -562,9 +572,46 @@ impl InMemoryStorage {
             settle_active_direct_turn_calls: Mutex::new(Vec::new()),
             settle_active_direct_turn_started: Mutex::new(None),
             settle_active_direct_turn_release: Mutex::new(None),
+            settle_active_direct_turn_commit_error_once: Mutex::new(false),
+            settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
+            fail_continuation_commit: Mutex::new(false),
+            fail_state_update: Mutex::new(false),
+            continuation_start_recovery_outcome: Mutex::new(None),
+            continuation_start_recovery_error: Mutex::new(false),
+            continuation_commit_error_once: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
+    }
+
+    pub fn set_fail_continuation_commit(&self, fail: bool) {
+        *self.fail_continuation_commit.lock().unwrap() = fail;
+    }
+
+    pub fn set_continuation_start_recovery_error(&self, error: bool) {
+        *self.continuation_start_recovery_error.lock().unwrap() = error;
+    }
+
+    pub fn set_fail_state_update(&self, fail: bool) {
+        *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn set_continuation_start_recovery_outcome(
+        &self,
+        outcome: crate::db::ContinuationCommitOutcome,
+    ) {
+        *self.continuation_start_recovery_outcome.lock().unwrap() = Some(outcome);
+    }
+
+    pub fn set_continuation_commit_error_once(&self) {
+        *self.continuation_commit_error_once.lock().unwrap() = true;
+    }
+
+    pub fn set_settle_active_direct_turn_commit_error_once(&self) {
+        *self
+            .settle_active_direct_turn_commit_error_once
+            .lock()
+            .unwrap() = true;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -671,6 +718,15 @@ impl InMemoryStorage {
         &self,
     ) -> Vec<crate::runtime::traits::ActiveDirectTurnSettlement> {
         self.settle_active_direct_turn_calls.lock().unwrap().clone()
+    }
+
+    pub fn recorded_settle_continuation_direct_turn_calls(
+        &self,
+    ) -> Vec<crate::runtime::traits::ContinuationDirectTurnSettlement> {
+        self.settle_continuation_direct_turn_calls
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     pub fn gate_active_direct_turn_settlement(
@@ -931,8 +987,102 @@ impl MessageStore for InMemoryStorage {
         if let Some(release) = release {
             let _ = release.await;
         }
+        if std::mem::take(
+            &mut *self
+                .settle_active_direct_turn_commit_error_once
+                .lock()
+                .unwrap(),
+        ) {
+            let conversation_id = self
+                .states
+                .lock()
+                .unwrap()
+                .keys()
+                .next()
+                .cloned()
+                .expect("test settlement requires seeded conversation state");
+            self.states
+                .lock()
+                .unwrap()
+                .insert(conversation_id, settlement.state.clone());
+            *self.active_direct_turn.lock().unwrap() = None;
+            return Err("ambiguous active direct turn settlement".to_string());
+        }
         *self.active_direct_turn.lock().unwrap() = None;
         Ok(())
+    }
+
+    async fn settle_continuation_direct_turn(
+        &self,
+        settlement: &crate::runtime::traits::ContinuationDirectTurnSettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if std::mem::take(&mut *self.continuation_commit_error_once.lock().unwrap()) {
+            let mut states = self.states.lock().unwrap();
+            self.messages
+                .lock()
+                .unwrap()
+                .entry(settlement.message.conversation_id.clone())
+                .or_default()
+                .push(settlement.message.clone());
+            states.insert(
+                settlement.message.conversation_id.clone(),
+                settlement.state.clone(),
+            );
+            *self.active_direct_turn.lock().unwrap() = None;
+            return Err("ambiguous continuation commit failure".to_string());
+        }
+        if *self.fail_continuation_commit.lock().unwrap() {
+            return Err("injected continuation commit failure".to_string());
+        }
+        self.settle_continuation_direct_turn_calls
+            .lock()
+            .unwrap()
+            .push(settlement.clone());
+        let mut states = self.states.lock().unwrap();
+        let persisted = states
+            .get(&settlement.message.conversation_id)
+            .cloned()
+            .unwrap_or_default();
+        if matches!(
+            &persisted,
+            ConvState::ContextExhausted { summary }
+                if matches!(&settlement.state, ConvState::ContextExhausted { summary: completed } if summary == completed)
+        ) {
+            let duplicate = self
+                .messages
+                .lock()
+                .unwrap()
+                .get(&settlement.message.conversation_id)
+                .is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|item| item.message_id == settlement.message.message_id)
+                });
+            return Ok(if duplicate {
+                crate::db::ContinuationCommitOutcome::Duplicate
+            } else {
+                crate::db::ContinuationCommitOutcome::Stale
+            });
+        }
+        if !matches!(
+            &persisted,
+            ConvState::AwaitingContinuation { request }
+                if request.operation_id == settlement.operation_id
+        ) {
+            return Ok(crate::db::ContinuationCommitOutcome::Stale);
+        }
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(settlement.message.conversation_id.clone())
+            .or_default()
+            .push(settlement.message.clone());
+        states.insert(
+            settlement.message.conversation_id.clone(),
+            settlement.state.clone(),
+        );
+        *self.active_direct_turn.lock().unwrap() = None;
+        Ok(crate::db::ContinuationCommitOutcome::Applied)
     }
 
     async fn update_message_display_data(
@@ -1013,10 +1163,15 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
         state: &ConvState,
-        _state_updated_at: chrono::DateTime<chrono::Utc>,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
-        // In-memory test storage tracks only the state value, not its entry
-        // timestamp, so the threaded stamp is intentionally unused here.
+        if *self.fail_state_update.lock().unwrap() {
+            return Err("injected state update failure".to_string());
+        }
+        self.state_updated_ats
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), state_updated_at);
         self.states
             .lock()
             .unwrap()
@@ -1032,6 +1187,143 @@ impl StateStore for InMemoryStorage {
             .get(conv_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn get_state_snapshot(
+        &self,
+        conv_id: &str,
+    ) -> Result<crate::runtime::traits::PersistedStateSnapshot, String> {
+        Ok(crate::runtime::traits::PersistedStateSnapshot {
+            state: self
+                .states
+                .lock()
+                .unwrap()
+                .get(conv_id)
+                .cloned()
+                .unwrap_or_default(),
+            state_updated_at: self
+                .state_updated_ats
+                .lock()
+                .unwrap()
+                .get(conv_id)
+                .copied()
+                .unwrap_or_else(chrono::Utc::now),
+        })
+    }
+
+    async fn begin_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &Message,
+        awaiting_state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if *self.fail_continuation_commit.lock().unwrap() {
+            return Err("injected continuation start failure".to_string());
+        }
+        let mut states = self.states.lock().unwrap();
+        if matches!(
+            states.get(conv_id),
+            Some(ConvState::AwaitingContinuation { request }) if request.operation_id == operation_id
+        ) {
+            return Ok(crate::db::ContinuationCommitOutcome::Duplicate);
+        }
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(message.clone());
+        states.insert(conv_id.to_string(), awaiting_state.clone());
+        self.state_updated_ats
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), state_updated_at);
+        Ok(crate::db::ContinuationCommitOutcome::Applied)
+    }
+
+    async fn recover_continuation_start(
+        &self,
+        settlement: &crate::runtime::traits::ContinuationStartRecoverySettlement,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if *self.continuation_start_recovery_error.lock().unwrap() {
+            return Err("injected continuation start recovery failure".to_string());
+        }
+        if let Some(outcome) = *self.continuation_start_recovery_outcome.lock().unwrap() {
+            return Ok(outcome);
+        }
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(settlement.message.conversation_id.clone())
+            .or_default()
+            .push(settlement.message.clone());
+        self.states.lock().unwrap().insert(
+            settlement.message.conversation_id.clone(),
+            settlement.state.clone(),
+        );
+        self.state_updated_ats.lock().unwrap().insert(
+            settlement.message.conversation_id.clone(),
+            settlement.state_updated_at,
+        );
+        if settlement.turn.is_some() {
+            *self.active_direct_turn.lock().unwrap() = None;
+        }
+        Ok(crate::db::ContinuationCommitOutcome::Applied)
+    }
+
+    async fn commit_continuation(
+        &self,
+        conv_id: &str,
+        operation_id: &str,
+        message: &Message,
+        completed_state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::ContinuationCommitOutcome, String> {
+        if std::mem::take(&mut *self.continuation_commit_error_once.lock().unwrap()) {
+            return Err("ambiguous continuation commit failure".to_string());
+        }
+        if *self.fail_continuation_commit.lock().unwrap() {
+            return Err("injected continuation commit failure".to_string());
+        }
+        let mut states = self.states.lock().unwrap();
+        let persisted = states.get(conv_id).cloned().unwrap_or_default();
+        if matches!(
+            &persisted,
+            ConvState::ContextExhausted { summary }
+                if matches!(completed_state, ConvState::ContextExhausted { summary: completed } if summary == completed)
+        ) {
+            let duplicate = self
+                .messages
+                .lock()
+                .unwrap()
+                .get(conv_id)
+                .is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|item| item.message_id == message.message_id)
+                });
+            return Ok(if duplicate {
+                crate::db::ContinuationCommitOutcome::Duplicate
+            } else {
+                crate::db::ContinuationCommitOutcome::Stale
+            });
+        }
+        if !matches!(
+            &persisted,
+            ConvState::AwaitingContinuation { request } if request.operation_id == operation_id
+        ) {
+            return Ok(crate::db::ContinuationCommitOutcome::Stale);
+        }
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(message.clone());
+        states.insert(conv_id.to_string(), completed_state.clone());
+        Ok(crate::db::ContinuationCommitOutcome::Applied)
     }
 
     async fn update_conversation_mode_and_cwd(
