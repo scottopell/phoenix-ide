@@ -1212,7 +1212,7 @@ mod tests {
             .get_conversation("scope-owner")
             .await
             .unwrap()
-            .work_scope_id
+            .attached_work_scope_id
             .unwrap();
 
         let binding = service

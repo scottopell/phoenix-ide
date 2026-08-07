@@ -875,7 +875,7 @@ mod tests {
             .unwrap();
         let scope = WorkScopeIdentity(
             conversation
-                .work_scope_id
+                .attached_work_scope_id
                 .expect("created conversation has work scope")
                 .as_str()
                 .to_string(),

@@ -1355,7 +1355,7 @@ pub(crate) async fn get_conversation_pr_status(
             branch_name.to_string(),
             base_branch.to_string(),
             worktree_path.to_string(),
-            conv.work_scope_id
+            conv.attached_work_scope_id
                 .clone()
                 .expect("persisted conversation has work scope"),
         ),
@@ -1775,7 +1775,7 @@ pub(crate) async fn create_pr_auto_fix_context(
         } => (
             branch_name.to_string(),
             worktree_path.to_string(),
-            conv.work_scope_id
+            conv.attached_work_scope_id
                 .clone()
                 .expect("persisted conversation has work scope"),
         ),
@@ -1952,7 +1952,7 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
         return Ok(());
     }
     let work_scope = conv
-        .work_scope_id
+        .attached_work_scope_id
         .clone()
         .expect("persisted conversation has work scope");
     let artifact = crate::api::pr_monitoring::read_pr_auto_fix_context_artifact(
@@ -1986,7 +1986,7 @@ pub(crate) async fn pin_associated_pr(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let work_scope = match &conv.conv_mode {
         ConvMode::Work { .. } | ConvMode::Branch { .. } => conv
-            .work_scope_id
+            .attached_work_scope_id
             .clone()
             .expect("persisted conversation has work scope"),
         _ => {
@@ -2030,7 +2030,7 @@ pub(crate) async fn resume_associated_pr_inference(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let work_scope = match &conv.conv_mode {
         ConvMode::Work { .. } | ConvMode::Branch { .. } => conv
-            .work_scope_id
+            .attached_work_scope_id
             .clone()
             .expect("persisted conversation has work scope"),
         _ => {
@@ -2103,7 +2103,7 @@ pub(crate) async fn get_active_pr_diff(
         }
     };
     let work_scope = conv
-        .work_scope_id
+        .attached_work_scope_id
         .clone()
         .expect("persisted conversation has work scope");
     let active_pr = active_selection_target_for_scope(state.runtime.db(), &work_scope)
@@ -2434,7 +2434,9 @@ mod tests {
     ) -> crate::db::Conversation {
         let now = chrono::Utc::now();
         crate::db::Conversation {
-            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            attached_work_scope_id: Some(
+                crate::work_scope::WorkScopeId::parse("test-work").unwrap(),
+            ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: "conv-test".to_string(),
             slug: None,

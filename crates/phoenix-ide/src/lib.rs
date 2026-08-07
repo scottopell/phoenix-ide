@@ -1392,7 +1392,7 @@ async fn reclaim_unowned_worktrees(db: &Database) {
     for (path, owners) in by_path {
         if owners
             .iter()
-            .any(crate::runtime::conversation_owns_work_scope)
+            .any(crate::runtime::conversation_attachment_retains_work_scope)
         {
             continue;
         }
@@ -1403,7 +1403,7 @@ async fn reclaim_unowned_worktrees(db: &Database) {
         let branch = if owners.is_empty() {
             None
         } else {
-            crate::runtime::cleanup_branch_for_unowned_work_scope(&worktree, &owners)
+            crate::runtime::cleanup_branch_for_unretained_work_scope(&worktree, &owners)
         };
         let worktree_for_cleanup = worktree.clone();
         match tokio::task::spawn_blocking(move || {

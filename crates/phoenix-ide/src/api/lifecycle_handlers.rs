@@ -590,7 +590,7 @@ pub(crate) async fn abandon_task(
     };
 
     let pr_scope = conv
-        .work_scope_id
+        .attached_work_scope_id
         .as_ref()
         .expect("persisted conversation has work scope");
     if StdPath::new(&worktree_path).is_dir() {
@@ -812,7 +812,9 @@ mod tests {
     fn fixture(id: &str, continued_in_conv_id: Option<String>) -> Conversation {
         let ts = Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap();
         Conversation {
-            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            attached_work_scope_id: Some(
+                crate::work_scope::WorkScopeId::parse("test-work").unwrap(),
+            ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: id.to_string(),
             slug: Some(format!("slug-{id}")),
