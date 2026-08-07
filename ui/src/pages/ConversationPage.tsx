@@ -1848,6 +1848,12 @@ function ConversationPageContent({
           <section id="chat-view" className="view active">
             <div id="messages">
               <MessageListSkeleton count={4} />
+              {atom.uiError ? (
+                <div className="error-state" role="alert">
+                  <p>{atom.uiError.type === 'BackendError' ? atom.uiError.message : 'Connection error'}</p>
+                  <button type="button" onClick={connectionInfo.retryNow}>Retry connection</button>
+                </div>
+              ) : null}
             </div>
           </section>
         </main>
