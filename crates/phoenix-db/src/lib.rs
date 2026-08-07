@@ -3454,7 +3454,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort,
                     c.project_id, c.desired_base_branch,
-                    c.runtime_role, attachment.work_scope_id,
+                    c.runtime_role, attachment.work_scope_id, c.transcript_generation,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
@@ -17759,6 +17759,11 @@ mod tests {
         let scope = root.attached_work_scope_id.as_ref().unwrap();
 
         assert_eq!(successor.attached_work_scope_id.as_ref(), Some(scope));
+        sqlx::query("UPDATE conversations SET transcript_generation = 7 WHERE id = ?1")
+            .bind(&successor.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         let attachments = db.conversation_work_scope_attachments(scope).await.unwrap();
         assert_eq!(
             attachments
@@ -17767,6 +17772,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["work-root", successor.id.as_str()]
         );
+        assert_eq!(attachments[1].transcript_generation, 7);
 
         let view_columns: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM pragma_table_info('conversation_work_scope_attachments') ORDER BY cid",
