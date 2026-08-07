@@ -560,8 +560,8 @@ rule MessageUpdatedBroadcast {
 -- Rules — ReplayRing lifecycle
 ------------------------------------------------------------
 
--- Every persisted Message broadcast resets the conversation's
--- ReplayRing: the anchor advances to the new message's seq, the
+-- Every persisted Message broadcast resets the durable root's
+-- ReplayRing: the anchor advances to the message's allocated root seq, the
 -- entries list clears, the truncated flag clears.
 --
 -- The narrow guarantee this captures: every event the client could
@@ -571,15 +571,24 @@ rule MessageUpdatedBroadcast {
 rule PersistedMessageClearsReplayRing {
     when: msg: PersistedMessage.created
 
-    let ring = ReplayRing{conversation_id: msg.conversation_id}
+    let root_conversation_id = DurableRootOf(msg.conversation_id)
+    let root_sequence_id = root_sequence_for_persisted_message(msg)
+    let ring = ReplayRing{conversation_id: root_conversation_id}
 
-    ensures: ring.anchor_sequence_id = msg.sequence_id
+    requires: exists RootProjectedEventCommitted(
+        root_conversation_id: root_conversation_id,
+        projected_kind: "message",
+        payload_identity: msg.message_id,
+        root_sequence_id: root_sequence_id
+    )
+    ensures: ring.anchor_sequence_id = root_sequence_id
     ensures: ring.entries = empty_list
     ensures: ring.truncated = false
 
     @guidance
-        -- Implementation: SseBroadcaster.send_persisted_message clears
-        -- the ring before publishing. Order matters: clearing first
+        -- The root broadcaster clears the root-keyed ring before publishing the
+        -- projected message. The member sequence remains row-local identity and
+        -- never becomes the aggregate replay anchor. Order matters: clearing first
         -- ensures that any concurrent subscribe seeing the ring will
         -- either see the prior state (entries above the old anchor) or
         -- the cleared state (entries above the new anchor) — never a
