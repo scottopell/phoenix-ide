@@ -548,10 +548,10 @@ async fn validate_observation_authority_tx(
     };
     let (exact_recorded, all_recorded): (i64, i64) = sqlx::query_as(
         "SELECT
-             SUM(CASE WHEN o.observation_codec_family = ?3
+             COALESCE(SUM(CASE WHEN o.observation_codec_family = ?3
                            AND o.observation_codec_version = ?4
                            AND o.observation_payload = ?5 AND o.observed_at = ?6
-                      THEN 1 ELSE 0 END),
+                      THEN 1 ELSE 0 END), 0),
              COUNT(*)
          FROM workflow_attempts a
          JOIN workflow_authoritative_observations o
@@ -810,6 +810,66 @@ async fn validate_replay_artifacts_tx(
     .fetch_one(&mut *tx.tx)
     .await?;
     let event: phoenix_workflow::wake_contract::WakeContractEvent = decode(&event_payload)?;
+    let event_matches_state = match (&contract.lifecycle, &event.kind) {
+        (
+            phoenix_workflow::wake_contract::WakeLifecycle::Open(
+                phoenix_workflow::wake_contract::OpenWakeLifecycle::Observing,
+            ),
+            phoenix_workflow::wake_contract::WakeEventKind::Registered {
+                registration_owner,
+                subject,
+                delivery_transferability,
+                condition,
+                registered_at,
+                deadline,
+            },
+        ) => {
+            registration_owner == &contract.registration_owner
+                && subject == &contract.subject
+                && delivery_transferability == &contract.delivery_transferability
+                && condition == &contract.condition
+                && registered_at == &contract.registered_at
+                && deadline == &contract.deadline
+        }
+        (
+            phoenix_workflow::wake_contract::WakeLifecycle::Open(
+                phoenix_workflow::wake_contract::OpenWakeLifecycle::TerminalProposed(proposal),
+            ),
+            phoenix_workflow::wake_contract::WakeEventKind::TerminalProposed {
+                proposal: event_proposal,
+            },
+        ) => event_proposal == &proposal.terminal,
+        (
+            phoenix_workflow::wake_contract::WakeLifecycle::Closed(terminal),
+            phoenix_workflow::wake_contract::WakeEventKind::Terminalized {
+                terminal: event_terminal,
+                delivery_owner,
+                resume_policy,
+            },
+        ) => {
+            event_terminal == terminal
+                && delivery_owner == &contract.delivery_owner
+                && resume_policy == &terminal.resume_policy()
+        }
+        (
+            phoenix_workflow::wake_contract::WakeLifecycle::Closed(_),
+            phoenix_workflow::wake_contract::WakeEventKind::DeliveryOwnerTransferred {
+                previous_owner,
+                new_owner,
+            },
+        ) => new_owner == &contract.delivery_owner && previous_owner != new_owner,
+        _ => false,
+    };
+    if event.contract_id != contract.id
+        || event.head != contract.head()
+        || event.transition_id != contract.head_transition_id
+        || event.registering_tool_use_id != contract.registering_tool_use_id
+        || !event_matches_state
+    {
+        return Err(DbError::Serialization(
+            "wake replay event disagrees with aggregate snapshot".into(),
+        ));
+    }
     let codec_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM workflow_supported_codecs
          WHERE workflow_id = ?1 AND codec_family = ?2 AND codec_version = ?3",
