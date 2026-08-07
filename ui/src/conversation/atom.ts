@@ -198,7 +198,6 @@ export interface InitPayload {
     *  applied unseen events contiguously across the missing gap. */
 
   pendingTruncated: boolean;
-  messageSnapshot?: 'full' | 'suffix';
   transcriptCoverage: 'complete' | 'tail' | 'preserve';
 }
 
@@ -1161,10 +1160,14 @@ export function conversationReducer(
       // append genuinely new); fresh-connect replaces entirely. See
       // `SseInitReconnectMerge` / `SseInitFreshConnect` in
       // `specs/conversation_atom/conversation_atom.allium`.
-      const knownGenerationMatches = atom.transcriptGeneration !== null
+      const ownsIncomingTranscript = atom.conversationId === p.conversation.id;
+      const knownGenerationMatches = ownsIncomingTranscript
+        && atom.transcriptGeneration !== null
         && atom.transcriptGeneration === p.transcriptGeneration;
       const generationChanged = atom.transcriptGeneration !== null && atom.transcriptGeneration !== p.transcriptGeneration;
-      const isFreshConnect = atom.lastAppliedEventSeq === 0 || generationChanged;
+      const isFreshConnect = !ownsIncomingTranscript
+        || atom.lastAppliedEventSeq === 0
+        || generationChanged;
       const preservesTranscript = p.transcriptCoverage === 'preserve' && knownGenerationMatches;
       const mergesMessageSuffix = p.transcriptCoverage === 'tail' && knownGenerationMatches;
       const nextTranscriptCoverage: 'tail' | 'complete' = preservesTranscript

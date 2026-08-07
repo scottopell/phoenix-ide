@@ -8,6 +8,7 @@ A blocked, stale, corrupt, or absent legacy IndexedDB transcript cannot delay or
 - Remove warm cache catch-up loops, cache generation reconciliation, cache write effects/refs/helpers, dead APIs/types/tests.
 - Keep in-memory atom history, server transcript generation, REST older-history generation/cursor guards, and SSE reconnect semantics.
 - Leave physical legacy IDB stores untouched to avoid mixed-tab upgrade and rollback risk.
+- Do not change sidebar metadata persistence, identity, ordering, or grouping in this task. Those surfaces remain held behind task 92013 and task 98005.
 - Ensure legacy storage initialization cannot gate route/network/SSE readiness.
 
 ## Acceptance
@@ -16,3 +17,6 @@ A blocked, stale, corrupt, or absent legacy IndexedDB transcript cannot delay or
 - Latest tail and upward-scroll/deep-link history work from server sources.
 - Reload intentionally forgets previously expanded history.
 - Existing pending operations remain intact pending the journal migration.
+
+## Dependency
+May proceed before task 98005 only if the implementation removes transcript-message and replica persistence without changing sidebar metadata behavior. Any conversation-metadata cache removal waits for task 92013's unified presentation and task 98005's replacement snapshot.

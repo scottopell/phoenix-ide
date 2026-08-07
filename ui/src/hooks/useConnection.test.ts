@@ -110,7 +110,6 @@ function makeInitPayload(convId: string, slug: string) {
       work_scope_key: 'worktree:/tmp/worktree',
       conv_mode_label: 'Explore',
     },
-    message_snapshot: 'full',
     transcript_coverage: 'complete',
     messages: [],
     agent_working: false,
@@ -155,7 +154,7 @@ describe('useConnection epoch stamping (task 08683)', () => {
     );
   });
 
-  it('uses the server snapshot mode reported in init payloads', () => {
+  it('uses the exact transcript coverage reported in init payloads', () => {
     const captured: SSEAction[] = [];
     const dispatch = (action: SSEAction) => captured.push(action);
 
@@ -168,13 +167,11 @@ describe('useConnection epoch stamping (task 08683)', () => {
       FakeEventSource.instances[0]!.emit('init', {
         ...makeInitPayload('conv-A', 'slug-A'),
         transcript_generation: 4,
-        message_snapshot: 'full',
         transcript_coverage: 'complete',
       });
     });
 
     const init = captured.find((action) => action.type === 'sse_init');
-    expect(init?.type === 'sse_init' ? init.payload.messageSnapshot : undefined).toBe('full');
     expect(init?.type === 'sse_init' ? init.payload.transcriptCoverage : undefined).toBe('complete');
   });
 

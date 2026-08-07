@@ -18,4 +18,4 @@ A returning user sees provisional conversation labels immediately instead of a b
 - Snapshot stays under explicit row/byte limits and contains no volatile operational state.
 
 ## Dependency
-Land before retiring the legacy conversation-metadata sidebar cache, so no intermediate release regresses to a blank startup sidebar.
+Blocked on task 92013's unified conversation presentation. Snapshot identity, ordering, and Open/History grouping must follow that product model rather than preserve the legacy active/archived sidebar shape. After 92013 lands, this task must land before task 98004 retires the legacy conversation-metadata sidebar cache.

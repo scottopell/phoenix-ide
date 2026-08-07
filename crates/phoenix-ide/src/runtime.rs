@@ -1022,14 +1022,6 @@ pub enum TranscriptCoverage {
     Preserve,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub enum MessageSnapshotMode {
-    Full,
-    Suffix,
-}
-
 /// Events sent to SSE clients.
 ///
 /// Every variant carries a `sequence_id` drawn from the conversation's single
@@ -1060,7 +1052,6 @@ pub enum SseEvent {
         /// Conversation-level transcript/replica generation for invalidating
         /// stale incremental transcript state on reconnect.
         transcript_generation: i64,
-        message_snapshot: MessageSnapshotMode,
         transcript_coverage: TranscriptCoverage,
         /// `sequence_id` of the most recent persisted Message at subscribe
         /// time. Every entry in `pending_events` has `sequence_id` strictly

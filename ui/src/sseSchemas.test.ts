@@ -117,8 +117,7 @@ describe('parseEvent', () => {
     const validInit = {
       sequence_id: 0,
       transcript_generation: 1,
-      message_snapshot: 'full',
-      transcript_coverage: 'complete',
+        transcript_coverage: 'complete',
       conversation: { id: 'conv-1' },
       messages: [],
       agent_working: false,

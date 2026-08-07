@@ -2504,11 +2504,7 @@ enum StreamDbMessageSelection {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StreamTranscriptCoverage {
-    snapshot_mode: crate::runtime::MessageSnapshotMode,
-    coverage: crate::runtime::TranscriptCoverage,
-}
+type StreamTranscriptCoverage = crate::runtime::TranscriptCoverage;
 
 const STREAM_LAST_SEQUENCE_READ_FAILED: &str = "stream_last_sequence_read_failed";
 
@@ -3581,28 +3577,15 @@ fn latest_stream_transcript_coverage(
     has_older_messages: bool,
 ) -> StreamTranscriptCoverage {
     let loaded_tail = messages.last().map(|message| message.sequence_id);
-    let coverage = if has_older_messages || loaded_tail != server_message_tail {
+    if has_older_messages || loaded_tail != server_message_tail {
         crate::runtime::TranscriptCoverage::Tail
     } else {
         crate::runtime::TranscriptCoverage::Complete
-    };
-    StreamTranscriptCoverage {
-        snapshot_mode: match coverage {
-            crate::runtime::TranscriptCoverage::Complete => {
-                crate::runtime::MessageSnapshotMode::Full
-            }
-            crate::runtime::TranscriptCoverage::Tail => crate::runtime::MessageSnapshotMode::Suffix,
-            crate::runtime::TranscriptCoverage::Preserve => unreachable!(),
-        },
-        coverage,
     }
 }
 
 fn preserved_stream_transcript_coverage() -> StreamTranscriptCoverage {
-    StreamTranscriptCoverage {
-        snapshot_mode: crate::runtime::MessageSnapshotMode::Suffix,
-        coverage: crate::runtime::TranscriptCoverage::Preserve,
-    }
+    crate::runtime::TranscriptCoverage::Preserve
 }
 
 async fn read_stream_init_messages_with_tail(
@@ -3831,8 +3814,7 @@ async fn stream_conversation(
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
-        message_snapshot: transcript_coverage.snapshot_mode,
-        transcript_coverage: transcript_coverage.coverage,
+        transcript_coverage,
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -7637,8 +7619,7 @@ async fn shared_sse_stream(
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
-        message_snapshot: transcript_coverage.snapshot_mode,
-        transcript_coverage: transcript_coverage.coverage,
+        transcript_coverage,
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -9558,7 +9539,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("SSE init falls back to a bounded unaligned suffix");
         assert_eq!(selection, StreamDbMessageSelection::Latest);
-        assert_eq!(coverage.coverage, crate::runtime::TranscriptCoverage::Tail);
+        assert_eq!(coverage, crate::runtime::TranscriptCoverage::Tail);
         assert_eq!(
             stream_messages.len(),
             usize::try_from(DEFAULT_MESSAGE_HISTORY_LIMIT).unwrap()
@@ -10130,11 +10111,7 @@ pub(crate) mod hard_delete_cascade_tests {
     #[test]
     fn transcript_coverage_reports_complete_for_empty_and_exact_tail_snapshots() {
         let empty = latest_stream_transcript_coverage(&[], None, false);
-        assert_eq!(
-            empty.snapshot_mode,
-            crate::runtime::MessageSnapshotMode::Full
-        );
-        assert_eq!(empty.coverage, crate::runtime::TranscriptCoverage::Complete);
+        assert_eq!(empty, crate::runtime::TranscriptCoverage::Complete);
 
         let exact = latest_stream_transcript_coverage(
             &[crate::db::Message {
@@ -10150,11 +10127,7 @@ pub(crate) mod hard_delete_cascade_tests {
             Some(1),
             false,
         );
-        assert_eq!(
-            exact.snapshot_mode,
-            crate::runtime::MessageSnapshotMode::Full
-        );
-        assert_eq!(exact.coverage, crate::runtime::TranscriptCoverage::Complete);
+        assert_eq!(exact, crate::runtime::TranscriptCoverage::Complete);
     }
 
     #[test]
@@ -10173,11 +10146,7 @@ pub(crate) mod hard_delete_cascade_tests {
             Some(3),
             false,
         );
-        assert_eq!(
-            short.snapshot_mode,
-            crate::runtime::MessageSnapshotMode::Suffix
-        );
-        assert_eq!(short.coverage, crate::runtime::TranscriptCoverage::Tail);
+        assert_eq!(short, crate::runtime::TranscriptCoverage::Tail);
 
         let long = latest_stream_transcript_coverage(
             &[crate::db::Message {
@@ -10193,24 +10162,13 @@ pub(crate) mod hard_delete_cascade_tests {
             Some(99),
             true,
         );
-        assert_eq!(
-            long.snapshot_mode,
-            crate::runtime::MessageSnapshotMode::Suffix
-        );
-        assert_eq!(long.coverage, crate::runtime::TranscriptCoverage::Tail);
+        assert_eq!(long, crate::runtime::TranscriptCoverage::Tail);
     }
 
     #[test]
     fn cursor_replay_without_db_messages_preserves_existing_transcript_coverage() {
         let preserved = preserved_stream_transcript_coverage();
-        assert_eq!(
-            preserved.snapshot_mode,
-            crate::runtime::MessageSnapshotMode::Suffix
-        );
-        assert_eq!(
-            preserved.coverage,
-            crate::runtime::TranscriptCoverage::Preserve
-        );
+        assert_eq!(preserved, crate::runtime::TranscriptCoverage::Preserve);
     }
 
     #[test]
@@ -10521,7 +10479,7 @@ pub(crate) mod hard_delete_cascade_tests {
         assert_eq!(last_sequence_id, DEFAULT_MESSAGE_HISTORY_LIMIT + 7);
         assert_eq!(selection, StreamDbMessageSelection::Latest);
         assert_eq!(server_message_tail, Some(DEFAULT_MESSAGE_HISTORY_LIMIT + 7));
-        assert_eq!(coverage.coverage, crate::runtime::TranscriptCoverage::Tail);
+        assert_eq!(coverage, crate::runtime::TranscriptCoverage::Tail);
         assert_eq!(
             messages.len(),
             usize::try_from(DEFAULT_MESSAGE_HISTORY_LIMIT).unwrap()

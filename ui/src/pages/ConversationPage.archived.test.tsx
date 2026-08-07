@@ -81,7 +81,6 @@ function makeConnectionInit(conversation: Conversation): InitPayload {
     pendingAnchorSequenceId: 0,
     pendingEvents: [],
     pendingTruncated: false,
-    messageSnapshot: 'full',
     transcriptCoverage: 'complete',
   };
 }
@@ -989,6 +988,21 @@ describe('ConversationPage archived read-only rendering', () => {
       const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
       expect(options.conversationId).toBe(uuidConversation.id);
     });
+  });
+
+  it('keeps a direct ID route when the authoritative conversation has no slug', async () => {
+    const uuidRoute = '123e4567-e89b-42d3-a456-426614174001';
+    const uuidConversation = makeConversation({ id: uuidRoute, slug: uuidRoute });
+    vi.mocked(api.getConversationRoute).mockResolvedValue({
+      id: uuidConversation.id,
+      slug: null,
+    });
+
+    renderPage(uuidConversation, uuidRoute);
+
+    await waitFor(() => expect(api.getConversationRoute).toHaveBeenCalledWith(uuidRoute));
+    expect(api.getConversationRouteBySlug).not.toHaveBeenCalled();
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
   });
 
   it('keeps commission review actions available for non-terminal narrow layouts', async () => {

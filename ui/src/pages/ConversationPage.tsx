@@ -821,7 +821,7 @@ function ConversationPageContent({
           const route = await resolveConversationRoute(slug);
           if (cancelled) return;
           setResolvedRouteConversationId(route.id);
-          if (route.slug !== slug && routePrefix === '/c') {
+          if (route.slug && route.slug !== slug && routePrefix === '/c') {
             navigate(`/c/${route.slug}`, { replace: true });
             return;
           }

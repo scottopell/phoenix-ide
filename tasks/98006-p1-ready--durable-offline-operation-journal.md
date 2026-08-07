@@ -19,4 +19,4 @@ A supported operation committed during unreliable connectivity survives reload, 
 - Journal unavailability is explicit when durability is promised but never blocks ordinary online app startup.
 
 ## Dependency
-Separate project after transcript/cache critical-path work. Server replay audit required per operation: messages first; rename needs CAS/idempotency; archive/delete/chain operations need reconciliation.
+Deferred until lifecycle-command authority and per-operation idempotency/reconciliation authority are settled. Server replay audit remains required for each operation: messages first; rename needs CAS/idempotency; Open/Close/Delete and aggregate operations need authoritative lifecycle reconciliation. This task does not block transport-only transcript/cache work.

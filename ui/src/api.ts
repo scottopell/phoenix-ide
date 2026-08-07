@@ -621,7 +621,7 @@ export interface Message {
 
 export interface ConversationRouteResponse {
   id: string;
-  slug: string;
+  slug: string | null;
 }
 
 export interface ConversationMessageTombstone {
