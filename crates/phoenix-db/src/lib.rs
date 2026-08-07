@@ -3354,6 +3354,30 @@ impl Database {
         Ok(metadata)
     }
 
+    /// Return current transcript generations for a bounded conversation set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn conversation_transcript_generations(
+        &self,
+        conversation_ids: &[String],
+    ) -> DbResult<std::collections::HashMap<String, i64>> {
+        if conversation_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT id, transcript_generation FROM conversations WHERE id IN ",
+        );
+        query.push_tuples(conversation_ids.iter(), |mut tuple, id| {
+            tuple.push_bind(id);
+        });
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("transcript_generation")?)))
+            .collect()
+    }
+
     /// Return the subset of message ids that remain visible to retrieval callers.
     ///
     /// # Errors

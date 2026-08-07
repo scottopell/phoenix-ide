@@ -1230,6 +1230,11 @@ async fn search_conversations(
         .visible_retrieval_message_ids(&message_ids)
         .await
         .map_err(|e| AppError::Internal(format!("search visibility lookup failed: {e}")))?;
+    let current_generations = state
+        .db
+        .conversation_transcript_generations(&conversation_ids)
+        .await
+        .map_err(|e| AppError::Internal(format!("search generation lookup failed: {e}")))?;
     let hits = hits
         .into_iter()
         .filter_map(|hit| {
@@ -1238,6 +1243,14 @@ async fn search_conversations(
                     conversation_id = %hit.conversation_id,
                     message_id = %hit.message_id,
                     "conversation search hit omitted because its source message is hidden"
+                );
+                return None;
+            }
+            if current_generations.get(&hit.conversation_id) != Some(&hit.transcript_generation) {
+                tracing::debug!(
+                    conversation_id = %hit.conversation_id,
+                    message_id = %hit.message_id,
+                    "conversation search hit omitted because its transcript changed"
                 );
                 return None;
             }
