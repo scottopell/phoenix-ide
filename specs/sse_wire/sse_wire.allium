@@ -941,7 +941,10 @@ rule AggregateBoundLiveCarrierEnvelopeAllocated {
 }
 
 rule AggregateBoundMemberLiveCarrierClaimsRootSequence {
-    when: AggregateBoundMemberEventProduced(member_conversation_id, carrier_kind, payload_identity, seq)
+    when: AggregateBoundMemberEventProduced(member_conversation_id, carrier_kind, payload_identity, member_sequence_id)
+
+    let root_conversation_id = DurableRootOf(member_conversation_id)
+    let root_sequence_id = allocate_next_root_sequence(root_conversation_id)
 
     requires: carrier_kind in {
         "state_change", "token", "message_updated", "agent_done",
@@ -949,22 +952,24 @@ rule AggregateBoundMemberLiveCarrierClaimsRootSequence {
         "steer_message_queued", "rate_limit_snapshot", "llm_first_byte",
         "llm_attempt"
     }
-    requires: seq > 0
+    requires: member_sequence_id > 0
 
     ensures: RootProjectedEventCommitted(
-        root_conversation_id: DurableRootOf(member_conversation_id),
+        root_conversation_id: root_conversation_id,
         projected_kind: carrier_kind,
         payload_identity: payload_identity,
-        root_sequence_id: seq
+        root_sequence_id: root_sequence_id
     )
+    ensures: MemberLocalSequenceIdentityPreserved(member_conversation_id, payload_identity, member_sequence_id)
 
     @guidance
         -- This generic rule covers the authoritative set of aggregate-bound live
         -- carriers that originate from one transcript member and are emitted through the
         -- same root SSE stream. Each concrete producer in code (`send_seq` at the member
         -- broadcaster, bridged onto the root stream) must instantiate one of these closed
-        -- carrier kinds, so root allocation, replay residency, and live broadcast cannot
-        -- silently diverge per carrier.
+        -- carrier kinds. The incoming member_sequence_id remains row-local identity;
+        -- every root-stream envelope allocates a fresh monotonic root_sequence_id so
+        -- successor rows cannot reuse or regress below the aggregate watermark.
 }
 
 rule ContinuationBoundaryBroadcast {
