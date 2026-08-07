@@ -89,6 +89,18 @@ value UIError {
     message: String
 }
 
+value ProductConversationLifecycle {
+    root_conversation_id: String
+    lifecycle: String
+}
+
+value ContinuationBoundary {
+    root_conversation_id: String
+    predecessor_conversation_id: String
+    successor_conversation_id: String
+    boundary_summary: String
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -97,6 +109,8 @@ value UIError {
 -- actions.
 entity ConversationAtom {
     conversationId: String?
+    productLifecycle: ProductConversationLifecycle?
+    continuationBoundaries: List<ContinuationBoundary>
     phase: Phase
     messages: List<Message>
     transcriptGeneration: Integer?
@@ -174,7 +188,9 @@ rule WireActionStaleEpochDropped {
         -- atom.ts:256-280 (isStaleEpoch). Applies to:
         -- sse_init, sse_message, sse_message_updated, sse_state_change,
         -- sse_agent_done, sse_token, sse_conversation_update,
-        -- sse_browser_session_state, sse_error, connection_state.
+        -- sse_product_conversation_lifecycle, sse_continuation_boundary,
+        -- sse_work_scope_update, sse_browser_session_state, sse_error,
+        -- connection_state.
         -- Bypassed for: connection_opened (which carries the epoch as
         -- DATA, not as a stamp — the rule's monotonic check is the
         -- guard there), connection_reset (no epoch, mount-only),
@@ -204,6 +220,7 @@ rule SseInitFreshConnect {
     -- so the per-event rules below can apply each pending entry via
     -- their normal applyIfNewer guard.
     ensures: atom.messages = reconcile_snapshot(atom.messages, payload.messages, payload.message_snapshot, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.productLifecycle = payload.product_conversation_lifecycle
     ensures: atom.phase = payload.phase
     ensures: atom.lastSequenceId = payload.pending_anchor_sequence_id
     ensures: atom.streamingBuffer = null
@@ -270,6 +287,7 @@ rule SseInitReconnectMerge {
     -- observed tokens). Cleared when payload.phase is anything
     -- else, because the turn ended while disconnected.
     ensures: atom.messages = reconcile_snapshot(atom.messages, payload.messages, payload.message_snapshot, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.productLifecycle = payload.product_conversation_lifecycle
     ensures: atom.phase = payload.phase
     ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase, payload.pending_truncated)
     ensures: atom.uiError = null
@@ -512,6 +530,39 @@ rule SseConversationUpdateApplied {
         -- Shallow merge into atom.conversation. If atom.conversation is
         -- null (before init), the rule applies lastSequenceId but leaves
         -- the merge as a no-op.
+}
+
+-- `product_conversation_lifecycle` — authoritative Open/History lifecycle fact
+-- for the stable root subscriber. Applied through the same root-sequence replay
+-- guard as every other aggregate-bound event.
+rule SseProductConversationLifecycleApplied {
+    when: SseProductConversationLifecycleDispatched(atom, lifecycle_update, seq)
+
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.productLifecycle = lifecycle_update
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- The conversation page consumes this typed lifecycle carrier to keep
+        -- Open/History placement and any lifecycle-derived affordances in sync for
+        -- continuously connected clients and reconnecting clients alike. It replaces
+        -- any row-local terminal event consumer.
+}
+
+rule SseContinuationBoundaryApplied {
+    when: SseContinuationBoundaryDispatched(atom, boundary, seq)
+
+    requires: seq > atom.lastSequenceId
+    requires: boundary.root_conversation_id = atom.conversationId
+
+    ensures: atom.continuationBoundaries = upsert_boundary(atom.continuationBoundaries, boundary)
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- The dispatcher registers the named continuation_boundary carrier and
+        -- applies the durable predecessor/successor join idempotently on live and
+        -- replay delivery. It does not infer continuation topology from lifecycle.
 }
 
 -- `sse_error` with a sequence_id (wire-originated) routes through

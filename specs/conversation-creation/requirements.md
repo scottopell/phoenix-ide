@@ -12,6 +12,8 @@ WHEN a structurally valid creation request is accepted
 THE SYSTEM SHALL atomically persist a navigable conversation shell and its complete creation intent before acknowledging acceptance
 AND filesystem, Git, reference expansion, attachment finalization, and runtime bootstrap SHALL occur after acceptance
 
+A created ordinary ProductConversation SHALL begin in Open state. The lifecycle-free Coordinator SHALL preserve its Coordinator identity when its singleton aggregate is created on demand and SHALL NOT receive Open/History state. Moving an ordinary ProductConversation to History is the Close action owned by the conversation lifecycle; provisioning, retries, cancellation, and deletion SHALL NOT invent a parallel lifecycle label.
+
 ### REQ-CCR-002: Exclusive Provisioning Authority
 
 WHEN a worker begins or resumes provisioning

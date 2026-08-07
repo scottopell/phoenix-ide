@@ -2,118 +2,74 @@
 
 ## Requirements Summary
 
-The Projects feature gives PhoenixIDE a structured, git-backed workspace model with
-three conversation modes. Direct mode is the default for all conversations: full tool
-access, no worktrees, no ceremony. Managed mode is opt-in for git repositories and
-provides a two-phase lifecycle: conversations start in Explore (read-only worktree
-created on first message), then upgrade to Work when the user approves a task proposed
-via `propose_task`. The plan is presented for human review; users can annotate, request
-revisions, or approve. On approval, the temporary branch is renamed to the chosen execution
-branch, a task file is committed on that branch, and write tools are enabled. Branch
-mode lets users work directly on an existing branch with no Explore phase and no task
-file. A branch picker with local listing (sorted by recency, with staleness counts) and
-on-demand remote search (cached `git ls-remote`) supports both Managed and Branch mode
-branch selection. When work is complete, the agent pushes the branch to origin and the
-user merges via PR on their hosting platform. Phoenix observes PR state through
-GitHub CLI when available: merged PRs get a first-class cleanup affordance,
-unmerged PRs are discouraged from cleanup, and manual "Mark as merged" remains a
-fallback when PR state is unavailable. In Managed mode, abandon deletes the worktree and
-branch; in Branch mode, abandon deletes only the worktree, keeping the user's branch.
+Projects covers how Phoenix detects Git-backed directories, provisions repository-backed conversations, exposes branch discovery, and presents current repository/worktree context in the UI. It also remains the main compatibility home for the shipped mode-based product model while unified Open/History lifecycle work is still spec-first.
+
+## Current Reality
+
+The shipped product still uses mode-driven conversation creation and execution. Git-backed repos can enter Direct, Managed, or Branch flows in the new-conversation composer and sidebar/context surfaces, with Managed splitting into Explore then Work after task approval. Worktrees are still created from branch-oriented flows, task approval still upgrades mode in-place for Continue-here behavior, and writing-mode `propose_task` follow-on placement is not yet the unified fresh-derived conversation flow. Branches and PRs are still heavily surfaced in product UI even though the new normative model treats them as observed repository facts rather than conversation-owned lifecycle state.
+
+Concrete shipped anchors include `ConvMode` persistence and reconstruction in `crates/phoenix-db/src/lib.rs:8147-8255`, mode-specific transition/property tests in `crates/phoenix-state-machine/src/project_proptests.rs`, mode-aware routing in `ui/src/components/ConversationSettings.tsx`, and mode badges/labels in `ui/src/utils/conversationIdentity.ts` and `ui/src/components/ConversationList.tsx`.
 
 ## Technical Summary
 
-`ConvMode` is a four-variant enum stored as a JSON column on the conversation: Direct
-(default, no git metadata), Explore (`worktree_path: Option`), Work (`worktree_path`,
-`branch_name`, `base_branch`, `task_id`, `task_title`), and Branch (`worktree_path`,
-`branch_name`, `base_branch`; no `task_id`). Managed conversations start in Explore: a
-worktree is created on first message using a temporary branch (`task-pending-{id}`),
-with a best-effort single-branch fetch of the base branch. The agent drafts a task file
-under the project's tasks directory with `patch`; on `propose_task` + approval the temp
-branch is renamed to `task-{NNNN}-{slug}` unless that name already exists locally or at
-`origin`, in which case Phoenix uses a suffixed execution branch. The task file's status is
-promoted to `in-progress`, committed on that branch (never main), and the mode upgrades to
-Work.
-Branch mode creates a worktree on the user's chosen branch immediately, with no Explore
-phase and no task file. Worktree paths are derived from conversation IDs -- collision is
-structurally impossible. `propose_task` is intercepted like submit_result and serves two
-shapes by mode: in Explore it is the blocking Explore→Work gateway; in the writing modes
-(Work, Branch, Direct-in-a-git-repo) it is a non-blocking **fork proposal** that spawns a
-fully decoupled top-level Work conversation off the repository default branch (REQ-PROJ-033
-through 036). It is withheld only from Direct-not-in-a-repo and from sub-agents. Tool
-registry is configured by mode: Explore exposes read-only/planning tools plus `bash` only
-when `nono` reports an enforceable OS sandbox that can block network; sandboxed
-bash can read local files broadly like other Explore read tools, while writes are
-limited to scratch, synthetic-home, and platform-temp locations, network is blocked, and ambient credential variables are
-stripped. `patch` is scoped
-to the discovered taskmd directory so the agent can draft/revise a task file
-(REQ-PROJ-003 and REQ-PROJ-037). Write tools are enabled in Work and Branch. Push is a regular bash command with no
-lifecycle side effects. Phoenix can observe PR state through `gh` to guide the
-user-visible cleanup affordance, but does not push, merge, or run unattended
-cleanup. Terminal actions remain user-initiated: verified merged PR cleanup / manual
-Mark as Merged and Abandon. Managed mode deletes the branch on terminal; Branch mode keeps it.
-Branch discovery uses local `git for-each-ref` for instant listing and cached `git ls-remote`
-for on-demand remote search (5-minute TTL). Startup reconciliation resolves ownership by canonical `WorkScope`: an uncontinued
-context-exhausted row preserves its checkout, while continued and handed-off predecessors
-permanently cede ownership to independently-scored successors. Clean on-disk scopes with no
-persisted live owner are reclaimed with mode-appropriate branch disposition; scopes with
-tracked, untracked, or unreadable status remain in place for manual recovery. Terminal
-fallback cleanup likewise removes only `WorkScope::Worktree(path)`, so Direct conversations
-and Explore sub-agents cannot remove a checkout merely because they use it as their cwd.
-Diff review observes the worktree's live checkout rather than trusting persisted conversation
-metadata. Named branches include configured-upstream or locally cached matching-remote
-relationships with ahead/behind counts; detached HEADs retain their commit identity and may
-show exact pointing refs. This inspection is read-only and uses last-fetched local refs without
-network access.
+Phoenix persists mode-derived Git context through `cm_*` conversation columns reconstructed into `ConvMode`, provisions/continues repository-backed conversations through the DB/runtime path, and exposes branch discovery plus project suggestions through the HTTP API and React composer/settings surfaces. Chain-era compatibility data such as `chain_name` and `continued_in_conv_id` still exists because the current UI still exposes chain and archived/current-era projections.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-----------|
-| **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Git-backed directories resolve to a project at the repository root and start in Explore only when the user explicitly chooses Managed mode |
-| **REQ-PROJ-001A:** Suggest Known Projects for New Conversations | ✅ Complete | `/new` consumes `/api/projects`, ranks by active conversation count then project recency, and offers canonical paths as quick selections |
-| **REQ-PROJ-002:** Default Conversation Mode Selection | ✅ Complete | Direct is the default for every new conversation; Managed is opt-in for git repositories and Branch requires an explicit existing branch |
-| **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | `propose_task` is intercepted, not executed as a side-effecting tool; the proposed file may be taskmd-named or any other markdown brief inside the worktree |
-| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Approval is a permission upgrade in the existing worktree (REQ-PROJ-028): rename temp branch to the chosen execution branch, promote+commit the agent's task file on it |
-| **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Worktree paths are derived from the conversation id under `.phoenix/worktrees/`, making collisions structural rather than lock-coordinated |
-| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd 1.0 (filename is metadata, no frontmatter) is the default; agent drafts the file via `patch` in Explore; committed on the execution branch, not main (work-lifecycle REQ-WL-002). A plain `.md` file (no taskmd metadata, no on-approve status rename, desired branch `task-{stem}-{conv-id8}`) works too, behind the `TaskSource` seam |
-| **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Work mode enables writes only inside the conversation worktree; writes outside it are rejected descriptively |
-| **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ✅ Complete | Mode parameter, model override, max_turns, one-writer constraint, MCP access, cwd-scoping guard all implemented; spec normative in `specs/subagents/subagents.allium`. Explore-search-restricted MCP subset stays deferred (see subagents executive.md). |
-| **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
-| **REQ-PROJ-010:** Abandon a Conversation | Moved | Relocated to work-lifecycle REQ-WL-001 |
-| **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | Moved | Relocated to work-lifecycle REQ-WL-003 |
-| **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore, Work, Branch, and Direct-in-a-git-repo expose `propose_task` per the requirements, but only the Explore parking gateway is implemented; the writing-mode fork flow remains spec-only |
-| **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Uses `nono::Sandbox::support_info()` plus network-block enforcement probing to decide whether top-level Explore can expose sandboxed bash |
-| **REQ-PROJ-014:** Project UI | ✅ Complete | The UI exposes project grouping, mode badges, and task/worktree context without collapsing Direct, Managed, and Branch into one undifferentiated state |
-| **REQ-PROJ-015:** Project Worktree Registry | Descoped | `ConvMode` paths form the de facto registry; `conversation_owns_work_scope`, lifecycle cleanup, deployment disk accounting, and startup reconciliation share persisted owner semantics. Clean unowned scopes are reclaimed; dirty/unreadable scopes are retained. |
-| **REQ-PROJ-016:** Standalone Conversation Mode | ⏭️ Superseded | Superseded by REQ-PROJ-018 (Direct Mode). `Standalone` was folded into `Direct` via migration 001; the `ConvMode::Standalone` variant no longer exists |
-| **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete | Work and Branch modes persist `base_branch`; Work additionally persists `task_id` and `task_title`, while Explore and Direct keep their narrower shapes |
-| **REQ-PROJ-018:** Direct Mode | ✅ Complete | Default for all conversations |
-| **REQ-PROJ-019:** Conversation List Filtering | ✅ Complete | Mode/project filters, auto-archive |
-| **REQ-PROJ-020:** Branch Discovery (Local, No Network) | ✅ Complete | Branch picker with search, staleness counts, recency sort |
-| **REQ-PROJ-021:** Remote Branch Search (On-Demand) | ✅ Complete | Cached `git ls-remote` with 5-min TTL, substring filter |
-| **REQ-PROJ-022:** Branch Materialization (Single-Branch Fetch) | ✅ Complete | Best-effort single-branch fetch at worktree creation |
-| **REQ-PROJ-023:** Reserved | Removed | Commits-behind polling removed; PR status is the branch health signal |
-| **REQ-PROJ-024:** Work Directly on an Existing Branch (Branch Mode) | ✅ Complete | Worktree on existing branch, no task file, no Explore phase |
-| **REQ-PROJ-025:** One Active Work Conversation Per Branch | ✅ Complete | Conflict detection with redirect/delete/fresh-start options |
-| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | Moved | Relocated to work-lifecycle REQ-WL-001 (abandon) and REQ-WL-002 (mark-merged) |
-| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | Moved | Relocated to work-lifecycle REQ-WL-002 |
-| **REQ-PROJ-028:** Managed Mode Worktree from First Message | ✅ Complete | Worktree created on first message with temp branch |
-| **REQ-PROJ-029:** Branch Mode in the Mode Picker | ✅ Complete | Mode picker offers Direct, Managed, and Branch |
-| **REQ-PROJ-030:** PR Feedback Freshness Indicator | Moved | Relocated to pr-association REQ-PRA-001 |
-| **REQ-PROJ-031:** Agent-Facing PR Context Baseline | Moved | Relocated to pr-association REQ-PRA-002 |
-| **REQ-PROJ-032:** Bounded PR Feedback Refresh | Moved | Relocated to pr-association REQ-PRA-003 |
-| **REQ-PROJ-033:** Propose a Decoupled Task Fork from a Writing Mode | 📐 Spec only | Non-blocking `propose_task` in Work/Branch/Direct-in-git; snapshots the task and continues |
-| **REQ-PROJ-034:** Approve a Fork Proposal — Spawn an Independent Conversation | 📐 Spec only | Async approval spawns a fresh top-level Work conversation cut from the repository default branch (`main_ref`), never the origin's `base_branch`/HEAD |
-| **REQ-PROJ-035:** Fork Provenance and Decoupling Guarantees | 📐 Spec only | `spawned_from_conversation_id` breadcrumb; no lifecycle notifications; proposal bound to origin |
-| **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode matrix; Direct gated on git repo; Explore keeps its parking gateway |
-| **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only (not implemented yet) | Third review action promotes a pending proposal into a fresh Explore conversation seeded with the brief + change note; refinement runs via the Explore propose/feedback loop, decoupled from the origin |
-| **REQ-PROJ-038:** Show the Live Worktree Checkout in Diff Review | ✅ Complete | Diff endpoints observe live named/detached/unborn/unavailable checkout state; named branches show last-fetched upstream/matching-remote ahead and behind counts, and the shared diff viewer presents this context independently of its comparator |
+| **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete (legacy current reality) | Git-backed directories resolve to projects and still enter the shipped mode-based creation flow |
+| **REQ-PROJ-001A:** Suggest Known Projects for New Conversations | ✅ Complete | `/new` consumes `/api/projects`, ranks by active conversation count then project recency |
+| **REQ-PROJ-002:** Default Conversation Mode Selection | ✅ Complete (legacy current reality) | Direct/Managed/Branch selection is still exposed in the composer and settings UI |
+| **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete (legacy current reality) | `propose_task` still acts as the Explore→Work gateway in the existing worktree |
+| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete (legacy current reality) | Approval still upgrades the same conversation/worktree into Work mode rather than offering the unified placement model |
+| **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Worktree paths remain conversation-derived under `.phoenix/worktrees/` |
+| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd/plain markdown proposal sources are still supported and persisted |
+| **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete (legacy current reality) | Write authority remains mode-gated to Work / Branch |
+| **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ✅ Complete | Shipped sub-agent execution still inherits parent worktree/scope |
+| **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted |
+| **REQ-PROJ-010:** Abandon a Conversation | Moved | Legacy implementation lives under `work-lifecycle`; current user surface still uses `/abandon-task` |
+| **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | Moved | See `pr-association` / `work-lifecycle` |
+| **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Tool is exposed in shipped eligible modes, but the unified approval-placement model is not implemented |
+| **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Explore-mode sandbox gating remains shipped |
+| **REQ-PROJ-014:** Project UI | ✅ Complete (legacy current reality) | UI still exposes mode badges, branch/base/task context, and branch-oriented entry points |
+| **REQ-PROJ-015:** Project Worktree Registry | Descoped | Persisted work-scope/conversation ownership is the effective authority |
+| **REQ-PROJ-016:** Standalone Conversation Mode | ⏭️ Superseded | Superseded by Direct |
+| **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete (legacy current reality) | Work/Branch still persist base-branch metadata |
+| **REQ-PROJ-018:** Direct Mode | ✅ Complete (legacy current reality) | Direct remains the default shipped mode |
+| **REQ-PROJ-019:** Conversation List Filtering | ✅ Complete (legacy current reality) | Sidebar still filters around active/archived and project groupings, not Open/History aggregates |
+| **REQ-PROJ-020:** Branch Discovery (Local, No Network) | ✅ Complete | Branch picker remains shipped |
+| **REQ-PROJ-021:** Remote Branch Search (On-Demand) | ✅ Complete | Cached `git ls-remote` search remains shipped |
+| **REQ-PROJ-022:** Branch Materialization (Single-Branch Fetch) | ✅ Complete | Existing worktree provisioning still does bounded branch fetch/materialization |
+| **REQ-PROJ-023:** Reserved | Removed | Removed |
+| **REQ-PROJ-024:** Work Directly on an Existing Branch (Branch Mode) | ✅ Complete (legacy current reality) | Branch mode remains a shipped product path |
+| **REQ-PROJ-025:** One Active Work Conversation Per Branch | ✅ Complete (legacy current reality) | Current branch/worktree conflict handling still enforces the pre-unification invariant |
+| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | Moved | Current UX still exposes legacy mark-merged / abandon via sibling lifecycle surfaces |
+| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | Moved | See `work-lifecycle`; current product still couples completion to legacy terminal actions |
+| **REQ-PROJ-028:** Managed Mode Worktree from First Message | ✅ Complete (legacy current reality) | Managed still provisions on first message with the shipped branch-oriented flow |
+| **REQ-PROJ-029:** Branch Mode in the Mode Picker | ✅ Complete (legacy current reality) | Mode picker still offers Direct / Managed / Branch |
+| **REQ-PROJ-030:** PR Feedback Freshness Indicator | Moved | See `pr-association` |
+| **REQ-PROJ-031:** Agent-Facing PR Context Baseline | Moved | See `pr-association` |
+| **REQ-PROJ-032:** Bounded PR Feedback Refresh | Moved | See `pr-association` |
+| **REQ-PROJ-033:** Propose a Decoupled Task Fork from a Writing Mode | 📐 Spec only | Unified fresh-derived writing-mode follow-on flow is not shipped |
+| **REQ-PROJ-034:** Approve a Fork Proposal — Spawn an Independent Conversation | 📐 Spec only | No shipped approval path yet spawns the new normalized independent conversation flow |
+| **REQ-PROJ-035:** Fork Provenance and Decoupling Guarantees | 📐 Spec only | Typed derived provenance is not yet the product behavior |
+| **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode fork eligibility remains unimplemented |
+| **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only | Not implemented |
+| **REQ-PROJ-038:** Show the Live Worktree Checkout in Diff Review | ✅ Complete | Diff/review still reads live checkout state rather than persisted assumptions |
 
-Of 35 active requirements, 29 are complete, REQ-PROJ-012 is partially implemented because the Explore parking gateway ships while the writing-mode fork flow does not, and REQ-PROJ-033 through REQ-PROJ-037 remain specified but unimplemented. REQ-PROJ-009 and REQ-PROJ-023 are removed, REQ-PROJ-015 is descoped, and REQ-PROJ-016 is superseded by REQ-PROJ-018.
+## Verification Notes
+
+Current-reality checks for this reconciliation used code anchors rather than normative speculation:
+
+- `crates/phoenix-db/src/lib.rs` for `ConvMode`, continuation wiring, archived/current listing, and chain metadata
+- `crates/phoenix-state-machine/src/project_proptests.rs` and `transition.rs` for mode transitions and task approval/terminal flows
+- `ui/src/components/ConversationSettings.tsx`, `ui/src/components/ConversationList.tsx`, and `ui/src/utils/conversationIdentity.ts` for mode picker and mode-badge UX
 
 ## Dependencies
 
-- `specs/bedrock/` -- REQ-BED-027, REQ-BED-028, REQ-BED-029 (mode state, approval states)
-- `specs/bash/` -- REQ-BASH-012, REQ-BASH-013 (Explore mode read-only bash enforcement)
-- `specs/patch/` -- REQ-PATCH-009 (patch disabled in Explore mode)
-- `specs/prose-feedback/` -- REQ-PF-015, REQ-PF-016 (programmatic task approval trigger)
+- `specs/bedrock/` — reducer/runtime lifecycle and approval states still underpin the current mode-based behavior
+- `specs/work-lifecycle/` — current mark-merged / abandon surfaces live there while Close→History remains unimplemented
+- `specs/pr-association/` — PR observation, freshness, and active-selection behavior
+- `specs/work-scope-ui/` — resource visibility for the attached work scope
+- `specs/chains/` — chain-era compatibility surface still depends on continuation topology retained here

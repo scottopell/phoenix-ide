@@ -3,8 +3,9 @@
 --
 -- Phoenix Work Actions Bar: Behavioural Specification
 --
--- Scope: The Work Actions surface rendered on Work and Branch conversations
---        while the conversation is idle, errored, or context-exhausted.
+-- Scope: The Work Actions surface rendered on Open product conversations
+--        with an attached Git-backed WorkScope while execution is idle,
+--        errored, or context-exhausted.
 --        Governs visibility, compact and active-PR rail presentation, the
 --        single-primary rule, WorkDisposition derivation, verb labels, tooltip
 --        copy, and the no-disabled-as-status / no-two-step-toggle principles.
@@ -16,15 +17,18 @@
 -- which verbs are present, given those inputs.
 --
 -- Includes:
---   - Bar visibility (mode + phase gate).
+--   - Bar visibility (Open-lifecycle + Git-capability + execution-phase gate).
 --   - WorkDisposition: the single derived state selecting the primary verb,
 --     total over every open-PR and stuck-with-PR case.
 --   - Three-zone layout: REVIEW (View Diff), RESOLVE (push-forward), FINISH
---     (terminal verbs Clean up and Abandon).
+--     (the single terminal verb Close conversation).
 --   - RESOLVE suppression in the error phase.
 --   - Single primary across the whole bar, encoded structurally.
 --   - View Browser exclusion from this bar.
 --   - Tooltip semantics for terminal verbs.
+--   - Close emits the bedrock-owned typed UserRequestsCloseConversation command;
+--     any local user_close_started-style state is only a projection/acknowledgement,
+--     never an independent lifecycle mutation path.
 --
 -- Excludes:
 --   - PR status derivation, primary PR selection, the check-state and
@@ -32,7 +36,7 @@
 --     PrStatusView, PrCheckState, PrFeedbackFreshness, PrAutoFixAffordance,
 --     WorkScopePrStatusContract, WorkActionsPrAffordanceContract).
 --   - Terminal action git semantics: worktree deletion, diff snapshot,
---     mode-dependent branch disposition, confirmation gate (work-lifecycle:
+--     Close confirmation gate, and resource retirement (work-lifecycle:
 --     REQ-WL-001/002/003).
 --   - Action legality gate: when a terminal action may fire (bedrock
 --     TaskResolved: REQ-BED-029 for terminal-on-resolution, REQ-BED-031 for
@@ -47,6 +51,7 @@
 use "../bedrock/bedrock.allium" as bedrock
 use "../pr-association/pr-association.allium" as pra
 
+
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
@@ -57,8 +62,9 @@ use "../pr-association/pr-association.allium" as pra
 -- inside pra/PrStatusView; the address-vs-merge split reads those, not the raw
 -- provider wire.
 value BarInputs {
+    lifecycle: LifecycleState
+    work_capability: WorkCapability
     phase: BarPhase
-    mode: ConvMode
     continued_in_conv_id: String?
     work_change: WorkChangeState
     pr_status: pra/PrStatusView?
@@ -105,8 +111,7 @@ value ResolveZone {
 }
 
 value FinishZone {
-    show_clean_up: Boolean
-    show_abandon: Boolean
+    show_close: Boolean
 }
 
 value RailPrEntry {
@@ -166,9 +171,14 @@ enum WorkChangeState {
     | unavailable
 }
 
-enum ConvMode {
-    work
-    | branch
+enum LifecycleState {
+    open
+    | history
+}
+
+enum WorkCapability {
+    git_attached
+    | none
 }
 
 -- The single derived state that selects the primary verb and which verbs are
@@ -180,8 +190,8 @@ enum WorkDisposition {
     | address_feedback  -- idle, PR open, affordance enabled (any check state); a merge_link secondary rides along when checks pass
     | merge_ready       -- idle, PR open, checks passing, affordance disabled
     | pr_open_other     -- idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not green)
-    | clean_up_merged   -- idle, PR merged
-    | pr_closed         -- idle, PR closed unmerged
+    | ready_to_close_after_merge -- idle, PR merged
+    | ready_to_close_closed_pr -- idle, PR closed unmerged
     | no_pr_clean       -- idle, no PR found, work-change summary clean
     | no_pr_create_pr   -- idle, no PR found, dirty committed work pushed to GitHub remote branch
     | no_pr_review      -- idle, no PR found, dirty/unknown work state needs diff review
@@ -207,17 +217,16 @@ enum BarPrimary {
     none                -- continued: no glowing verb anywhere
     | review            -- the REVIEW View Diff verb glows
     | resolve           -- the RESOLVE verb glows (idle, push-forward available)
-    | clean_up          -- the FINISH Clean up verb glows
-    | abandon           -- the FINISH Abandon verb glows
+    | close             -- the FINISH Close conversation verb glows
 }
 
 -- At most one inline note is shown per render.
 enum InlineNote {
     continued_note          -- "Continued — actions belong on the continuation."
-    | pr_open_stuck_note     -- "PR #N still open — merge on GitHub, or abandon."
-    | pr_closed_note        -- "PR closed — abandon to clean up."
-    | gh_unavailable_note   -- "gh unavailable — manual cleanup."
-    | no_pr_dirty_note     -- dirty no-PR work needs review or PR creation before cleanup
+    | pr_open_stuck_note     -- "PR #N still open — resolve on GitHub or review the diff before closing."
+    | pr_closed_note        -- "PR closed — close when you're done with this thread of work."
+    | gh_unavailable_note   -- "GitHub status unavailable — close only if you're satisfied from local review."
+    | no_pr_dirty_note     -- dirty no-PR work needs review or PR creation before closing
 }
 
 ------------------------------------------------------------
@@ -225,8 +234,20 @@ enum InlineNote {
 ------------------------------------------------------------
 
 -- The rendered bar for one conversation. One per conversation; present only
--- when the conversation is in an eligible phase and mode (phase_is_eligible).
--- Non-eligible conversations have no bar entity at all.
+-- when the conversation is Open, Git-capable, and in an eligible execution
+-- phase (phase_is_eligible). Non-eligible conversations have no bar entity at all.
+surface WorkActionsBarUi {
+    facing conversation: bedrock/Conversation
+
+    provides:
+        UserClicksClose(conversation)
+            when phase_is_eligible(conversation)
+
+    @guarantee TypedCloseCommandOnly
+        -- The UI surface only emits user intents. Any Close lifecycle mutation remains
+        -- bedrock-owned and is not initiated by a local work-actions state machine.
+}
+
 entity WorkActionsBar {
     conversation: bedrock/Conversation
 
@@ -242,14 +263,20 @@ entity WorkActionsBar {
 -- source of truth for their signatures and semantics.
 --
 --   phase_is_eligible(conv: bedrock/Conversation) -> Boolean
---       True when conv.mode in { work, branch } AND the conversation is in a
+--       True when the projected ProductConversation lifecycle is Open, the
+--       attached WorkScope is Git-backed, and the live execution phase is a
 --       disposable, non-running condition: conv.core_status in
---       { idle, error, recoverable_continuation_failure }.
---       Context exhaustion uses bedrock's focused handoff surface instead.
+--       { idle, error, recoverable_continuation_failure }. Context exhaustion
+--       uses bedrock's focused handoff surface instead.
 --
---   conv_mode(conv: bedrock/Conversation) -> ConvMode
---       Maps conv.mode: work -> ConvMode.work, branch -> ConvMode.branch. Not
---       called for other modes (the bar is hidden for them).
+--   lifecycle_state(conv: bedrock/Conversation) -> LifecycleState
+--       Returns open for the projected Open aggregate and history for a retained
+--       History aggregate.
+--
+--   work_capability(conv: bedrock/Conversation) -> WorkCapability
+--       Returns git_attached exactly when the conversation has an attached
+--       Git-backed WorkScope whose capabilities support diff review, PR
+--       guidance, and Close retirement. Returns none otherwise.
 --
 --   derive_bar_phase(conv: bedrock/Conversation) -> BarPhase
 --       core_status = idle                             -> BarPhase.idle
@@ -263,10 +290,10 @@ entity WorkActionsBar {
 --
 --   resolve_work_change(conv: bedrock/Conversation) -> WorkChangeState
 --       Cheap git summary for the conversation branch/worktree. clean permits terminal
---       no-PR cleanup. dirty_pr_ready means committed work exists, the branch is pushed
+--       no-PR Close. dirty_pr_ready means committed work exists, the branch is pushed
 --       to a matching GitHub remote branch, and no uncommitted/ahead/diverged state would
 --       make the create-PR link dishonest. dirty_needs_review, loading, and unavailable
---       all require View Diff before cleanup.
+--       all require View Diff before closing.
 --
 --   resolve_auto_fix_affordance(conv: bedrock/Conversation) -> pra/PrAutoFixAffordance
 --       The PrAutoFixAffordance derived via pr-association's
@@ -306,18 +333,12 @@ entity WorkActionsBar {
 --   finish_primary_for_disposition(d: WorkDisposition, status: pra/PrStatusView?) -> BarPrimary
 --       The SINGLE source of FINISH-primary selection, shared by the stuck and
 --       idle paths so the PR-state logic is not duplicated. Total over the
---       FINISH-primary dispositions:
---         PR merged           -> clean_up
---         PR closed unmerged  -> abandon
---         PR open/draft       -> abandon   (stuck only: merge on GitHub or abandon)
---         no PR (refresh ok)  -> clean_up
---         gh unavailable      -> clean_up
---       Returns clean_up for stuck-with-no-PR and stuck-with-gh-unavailable.
---       Never returns resolve or none.
+--       FINISH-primary dispositions and always returns close when the Close
+--       action is the honest primary. Never returns resolve or none.
 --
 --   inline_note_for(d: WorkDisposition, status: pra/PrStatusView?) -> InlineNote?
 --       Returns the InlineNote for the disposition, or null when no note is
---       needed (continued -> continued_note, pr_closed -> pr_closed_note,
+--       needed (continued -> continued_note, ready_to_close_closed_pr -> pr_closed_note,
 --       gh_unavailable -> gh_unavailable_note, stuck-with-open-PR ->
 --       pr_open_stuck_note, otherwise null).
 
@@ -348,6 +369,11 @@ entity WorkActionsBar {
 --   same_pr(left: pra/PrIdentity, right: pra/PrIdentity) -> Boolean
 --       Compares repository owner, repository name, and PR number.
 --
+--   next_close_attempt_id(conv: bedrock/Conversation) -> String
+--       Allocates a fresh close attempt identity for one user-initiated Close click.
+--       The Work Actions bar never mutates lifecycle locally; it emits the typed
+--       bedrock command carrying this fresh attempt_id.
+--
 --------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
@@ -364,8 +390,9 @@ rule BarRenderedWhenEligible {
     ensures: WorkActionsBar.created(
         conversation: conversation,
         inputs: BarInputs{
+            lifecycle: lifecycle_state(conversation),
+            work_capability: work_capability(conversation),
             phase: derive_bar_phase(conversation),
-            mode: conv_mode(conversation),
             continued_in_conv_id: conversation.continued_in_conv_id,
             pr_status: resolve_pr_status(conversation),
             work_change: resolve_work_change(conversation),
@@ -404,15 +431,14 @@ rule DispositionContinued {
 
     ensures: bar.presentation.disposition = continued
     ensures: bar.presentation.resolve_zone.visible = false
-    ensures: bar.presentation.finish_zone.show_clean_up = false
-    ensures: bar.presentation.finish_zone.show_abandon = false
+    ensures: bar.presentation.finish_zone.show_close = false
     ensures: bar.presentation.primary = none
     ensures: bar.presentation.inline_note = continued_note
 }
 
 -- Row 2. Stuck failure: RESOLVE always suppressed
--- (REQ-WAB-005); the primary collapses to a FINISH verb selected by PR state
--- through the shared helper. View Diff and Abandon remain present.
+-- (REQ-WAB-005); the primary collapses to the FINISH Close verb selected by
+-- PR state through the shared helper. View Diff remains present.
 rule DispositionStuck {
     when: WorkActionsBarRendered(bar)
 
@@ -421,8 +447,7 @@ rule DispositionStuck {
 
     ensures: bar.presentation.disposition = stuck
     ensures: bar.presentation.resolve_zone.visible = false
-    ensures: bar.presentation.finish_zone.show_clean_up = true
-    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.finish_zone.show_close = true
     ensures: bar.presentation.primary = finish_primary_for_disposition(stuck, bar.inputs.pr_status)
     ensures: bar.presentation.inline_note = inline_note_for(stuck, bar.inputs.pr_status)
 }
@@ -446,8 +471,7 @@ rule DispositionAddressFeedback {
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = address_feedback
     ensures: bar.presentation.resolve_zone.secondary = address_secondary_for(bar.inputs.pr_status)
-    ensures: bar.presentation.finish_zone.show_clean_up = false
-    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.finish_zone.show_close = true
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = null
 }
@@ -470,8 +494,7 @@ rule DispositionMergeReady {
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = merge_link
     ensures: bar.presentation.resolve_zone.secondary = null
-    ensures: bar.presentation.finish_zone.show_clean_up = false
-    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.finish_zone.show_close = true
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = null
 }
@@ -494,14 +517,13 @@ rule DispositionPrOpenOther {
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = open_pr_link
     ensures: bar.presentation.resolve_zone.secondary = null
-    ensures: bar.presentation.finish_zone.show_clean_up = false
-    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.finish_zone.show_close = true
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = null
 }
 
--- Row 6. PR merged: Clean up primary.
-rule DispositionCleanUpMerged {
+-- Row 6. PR merged: Close primary.
+rule DispositionReadyToCloseAfterMerge {
     when: WorkActionsBarRendered(bar)
 
     requires: bar.inputs.continued_in_conv_id = null
@@ -510,15 +532,14 @@ rule DispositionCleanUpMerged {
     requires: bar.inputs.pr_status.pr != null
     requires: bar.inputs.pr_status.pr.display_state = merged
 
-    ensures: bar.presentation.disposition = clean_up_merged
+    ensures: bar.presentation.disposition = ready_to_close_after_merge
     ensures: bar.presentation.resolve_zone.visible = false
-    ensures: bar.presentation.finish_zone.show_clean_up = true
-    ensures: bar.presentation.finish_zone.show_abandon = true
-    ensures: bar.presentation.primary = finish_primary_for_disposition(clean_up_merged, bar.inputs.pr_status)
+    ensures: bar.presentation.finish_zone.show_close = true
+    ensures: bar.presentation.primary = finish_primary_for_disposition(ready_to_close_after_merge, bar.inputs.pr_status)
     ensures: bar.presentation.inline_note = null
 }
 
--- Row 7. PR closed unmerged: Abandon primary; Clean up suppressed.
+-- Row 7. PR closed unmerged: Close primary with note.
 rule DispositionPrClosed {
     when: WorkActionsBarRendered(bar)
 
@@ -528,15 +549,14 @@ rule DispositionPrClosed {
     requires: bar.inputs.pr_status.pr != null
     requires: bar.inputs.pr_status.pr.display_state = closed
 
-    ensures: bar.presentation.disposition = pr_closed
+    ensures: bar.presentation.disposition = ready_to_close_closed_pr
     ensures: bar.presentation.resolve_zone.visible = false
-    ensures: bar.presentation.finish_zone.show_clean_up = false
-    ensures: bar.presentation.finish_zone.show_abandon = true
-    ensures: bar.presentation.primary = finish_primary_for_disposition(pr_closed, bar.inputs.pr_status)
+    ensures: bar.presentation.finish_zone.show_close = true
+    ensures: bar.presentation.primary = finish_primary_for_disposition(ready_to_close_closed_pr, bar.inputs.pr_status)
     ensures: bar.presentation.inline_note = pr_closed_note
 }
 
--- Row 8a. No PR found, refresh not unavailable, clean work: Clean up primary.
+-- Row 8a. No PR found, refresh not unavailable, clean work: Close primary.
 rule DispositionNoPrClean {
     when: WorkActionsBarRendered(bar)
 
@@ -549,9 +569,8 @@ rule DispositionNoPrClean {
 
     ensures: bar.presentation.disposition = no_pr_clean
     ensures: bar.presentation.resolve_zone.visible = false
-    ensures: bar.presentation.finish_zone.show_clean_up = true
-    ensures: bar.presentation.finish_zone.show_abandon = true
-    ensures: bar.presentation.primary = clean_up
+    ensures: bar.presentation.finish_zone.show_close = true
+    ensures: bar.presentation.primary = close
     ensures: bar.presentation.inline_note = null
 }
 
@@ -570,8 +589,7 @@ rule DispositionNoPrCreatePr {
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = create_pr_link
     ensures: bar.presentation.resolve_zone.secondary = null
-    ensures: bar.presentation.finish_zone.show_clean_up = false
-    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.finish_zone.show_close = false
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = no_pr_dirty_note
 }
@@ -589,13 +607,12 @@ rule DispositionNoPrReview {
 
     ensures: bar.presentation.disposition = no_pr_review
     ensures: bar.presentation.resolve_zone.visible = false
-    ensures: bar.presentation.finish_zone.show_clean_up = false
-    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.finish_zone.show_close = false
     ensures: bar.presentation.primary = review
     ensures: bar.presentation.inline_note = no_pr_dirty_note
 }
 
--- Row 9. gh unavailable, no persisted PR identity: Clean up primary, warning
+-- Row 9. gh unavailable, no persisted PR identity: Close primary, warning
 -- note, single click — never a two-step enable-then-confirm toggle (REQ-WAB-008).
 rule DispositionGhUnavailable {
     when: WorkActionsBarRendered(bar)
@@ -608,8 +625,7 @@ rule DispositionGhUnavailable {
 
     ensures: bar.presentation.disposition = gh_unavailable
     ensures: bar.presentation.resolve_zone.visible = false
-    ensures: bar.presentation.finish_zone.show_clean_up = true
-    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.finish_zone.show_close = true
     ensures: bar.presentation.primary = finish_primary_for_disposition(gh_unavailable, bar.inputs.pr_status)
     ensures: bar.presentation.inline_note = gh_unavailable_note
 }
@@ -705,11 +721,33 @@ rule ResolveLinkVerbNavigatesToGitHub {
     @guidance
         -- The link verbs render as
         -- <a href="{url}" target="_blank" rel="noopener noreferrer">.
-        -- Phoenix has no merge API (work-lifecycle REQ-WL-002): it never merges
+        -- Phoenix has no merge API (work-lifecycle REQ-WL-002b): it never merges
         -- or pushes on the user's behalf. Neither merge_link nor open_pr_link
         -- calls a Phoenix endpoint.
 }
 
+-- ===========================================================
+-- WAB 6. CLOSE EMITS BEDROCK COMMAND (REQ-WAB-009)
+-- ===========================================================
+
+rule CloseClickDispatchesTypedBedrockCommand {
+    when: UserClicksClose(conversation)
+
+    let bar = WorkActionsBar{conversation: conversation}
+    requires: bar.presentation.finish_zone.show_close = true
+
+    ensures: bedrock/UserRequestsCloseConversation(conversation, next_close_attempt_id(conversation))
+
+    @guidance
+        -- The Close button dispatches the bedrock-owned terminal command with a fresh
+        -- attempt_id. The bar does not start or advance any local close lifecycle; any
+        -- user_close_started-style UI is only an acknowledgement of downstream bedrock
+        -- state after that typed command is accepted.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
@@ -739,8 +777,7 @@ invariant ResolveHiddenWhenStuck {
 invariant ContinuedSuppressesTerminalVerbs {
     for b in WorkActionsBar:
         b.presentation.disposition = continued implies
-            (b.presentation.finish_zone.show_clean_up = false
-             and b.presentation.finish_zone.show_abandon = false
+            (b.presentation.finish_zone.show_close = false
              and b.presentation.primary = none)
 }
 
@@ -792,8 +829,6 @@ actor ConversationUser {
 ------------------------------------------------------------
 
 surface WorkActionsBarSurface {
-    facing user: ConversationUser
-
     context bar: WorkActionsBar
 
     exposes:

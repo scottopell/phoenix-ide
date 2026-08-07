@@ -189,9 +189,10 @@ THE endpoint SHALL follow the existing `get_conversation` handler shape (path
 parameter, `State(AppState)`, `Json<…>` response).
 
 **Rationale:** The conversation page needs the inventory at first paint, before
-any push event has fired; the chain page needs it as its only data source
-(REQ-WSUI-009). A plain JSON GET keyed by `stable_key()` serves both and is
-also the natural surface for any future non-UI client (REQ-WSUI-011).
+any push event has fired; the unified conversation surface also needs a direct
+pull path before live updates arrive. A plain JSON GET keyed by `stable_key()`
+serves both and is also the natural surface for any future non-UI client
+(REQ-WSUI-011).
 
 ---
 
@@ -225,8 +226,17 @@ conversation's terminal panel attaches), its `ServerStatus` transitions on a
 later `ensure_live` (`live`→`gone` and back), or it is removed by the cleanup
 cascade — OR a browser session for the scope crosses a liveness edge (up or
 down)
-THE SYSTEM SHALL emit a `WorkScopeUpdate` SSE event carrying a `sequence_id`
-and the full refreshed `WorkScopeInventory` for that scope.
+THE SYSTEM SHALL emit exactly one `WorkScopeUpdate` SSE event per affected open
+product-conversation aggregate carrying:
+- the aggregate root `product_conversation` identifier
+- a root-stream `root_sequence_id`
+- the full refreshed `WorkScopeInventory` for that attached scope
+- an inventory payload identity suitable for the aggregate-bound carrier envelope
+
+THE `WorkScopeUpdate` event SHALL be routed on the aggregate root stream rather
+than on any individual transcript-row stream
+AND SHALL use the stable attached `WorkScope` relation to decide which open
+product-conversation aggregate receives the event.
 
 THE first-materialization emission SHALL carry the tmux entry's status as
 settled by the probe/spawn (`live` or `gone`) — never the transient
@@ -254,42 +264,47 @@ on-mount snapshot indefinitely.
 ### REQ-WSUI-008: Push Event Routing
 
 WHEN a `WorkScopeUpdate` is emitted for a `WorkScope`
-THE SYSTEM SHALL deliver it to the single non-terminal conversation that
-resolves to that scope.
+THE SYSTEM SHALL resolve the owning open product-conversation aggregate from the
+attached `WorkScope` relation
+AND SHALL deliver one update to that aggregate's root SSE stream.
 
-**Rationale:** `specs/projects/` REQ-PROJ-025 (`OneBranchOneActiveWorktree`)
-guarantees at most one non-terminal conversation per `WorkScope`, so a single
-target is well-defined; there is no fan-out ambiguity. The routing reuses the
-conversation→scope resolution the browser lifecycle bridge already performs
-(see `design.md`).
+WHEN that open product conversation spans continuation members or subordinate
+execution rows
+THE SYSTEM SHALL treat those rows as readers of the same aggregate-scoped
+projection rather than as independent routing targets
+AND SHALL NOT derive the SSE target, owner, or scope identity from whichever
+transcript row most recently executed.
+
+**Rationale:** `WorkScope` attachment is aggregate state owned by the stable
+product conversation, while transcript rows are merely members of that
+aggregate. Routing by the attached scope relation keeps continuation members and
+other subordinate rows from inventing row-local ownership or fan-out rules, and
+matches the root-stream lifecycle model used by other aggregate projections.
 
 ---
 
-### REQ-WSUI-009: Chain Page Active-Member Scope Query
+### REQ-WSUI-009: Unified Conversation Surface Resolves Aggregate Scope Once
 
-WHEN the chain page renders the work-scope panel
-THE SYSTEM SHALL query the one `scope_key` of the chain's leaf member — the
-last member in chain order — falling back to the root when the chain has a
-single member, and render a standalone right-adjacent dock that shares the
-per-resource row vocabulary of the conversation page's section (REQ-WSUI-010)
-AND SHALL NOT aggregate per-member inventories.
+WHEN the unified conversation surface renders the work-scope panel for a
+ProductConversation that spans continuation members
+THE SYSTEM SHALL resolve the attached `WorkScope` from that ProductConversation
+AND SHALL derive live execution-state fields from only the latest execution row
+for that ProductConversation
+AND SHALL render one work-scope panel that shares the per-resource row
+vocabulary of the conversation page's section (REQ-WSUI-010)
+AND SHALL consume the aggregate-scoped `WorkScopeUpdate` stream using the root
+`product_conversation` identity and root `root_sequence_id`
+AND SHALL NOT aggregate per-member inventories
+AND SHALL NOT model any transcript row as the owner of the `WorkScope`.
 
-**Rationale:** A chain's members do not all share one scope. Worktree, Branch,
-and Work chains share a single worktree scope across every member, but Direct
-continuation chains resolve each member to a distinct
-`WorkScope::Conversation(<member id>)` — so the leaf's live resources live under
-its own scope, not the root's. The leaf is identified by chain order (the last
-member), not by the `latest` recency label: `latest` is the max-`updated_at`
-non-root member, which can be an intermediate, so it is not a reliable leaf
-pointer. Querying the leaf is correct for both kinds: for shared-worktree chains
-the leaf's scope *is* the shared worktree scope, and for Direct chains it is the
-leaf's own conversation scope where the running resources actually reside.
-Querying the root would show an empty inventory for a Direct chain whose work is
-on the leaf. A single query against the leaf's `WorkScope` key is complete; a
-hypothetical fan-out across every member and merge would add divergence risk
-for no gain. The chain page has no left file-explorer panel to host a section,
-so it uses a standalone collapsible dock; both surfaces render the same
-resource rows from shared code.
+**Rationale:** A unified conversation can contain multiple durable transcript
+rows, but the ProductConversation carries the attached `WorkScope` while only
+the latest execution row carries the live execution state that can differ across
+continuations. Resolving scope from the ProductConversation, routing updates on
+the root stream, and using the latest row only for live execution state avoids
+inventing a row-owner model, keeps the panel aligned with the single-surface
+conversation model, and avoids showing an empty or stale inventory from an
+earlier member.
 
 ---
 

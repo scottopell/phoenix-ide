@@ -737,7 +737,7 @@ AND the tool description SHALL include a clear explanation of sandbox
 constraints
 
 WHEN the Coordinator exposes `bash`
-THE SYSTEM SHALL reuse the same Explore read-only sandbox execution path
+THE SYSTEM SHALL reuse the same read-only planning sandbox execution path
 AND SHALL require each `op="run"` call to provide an active persisted `WorkScope` ID
 AND SHALL resolve and canonicalize that `WorkScope`'s execution directory server-side
 AND SHALL NOT assign the Coordinator a default cwd
@@ -748,9 +748,10 @@ AND SHALL keep Coordinator-controlled terminal events from triggering branch-obs
 AND SHALL include the process in the owning WorkScope's inventory, lifecycle broadcasts, inspection, health attribution, and teardown
 AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
 
-WHEN conversation is in Direct, Work, or Branch mode
+WHEN conversation bash is authorized with write capability
 THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
-AND bash commands SHALL retain the existing writable behavior for that mode
+AND bash commands SHALL retain their writable behavior inside the attached
+  `WorkScope` or chat-only working directory, as applicable
 
 **Rationale:** Explore bash is useful for local code investigation (`git log`,
 `git blame`, `rg`, `cat`) only if the read-only promise is enforced below the
@@ -779,8 +780,8 @@ AND SHALL continue to expose the remaining read-only/planning tools for those mo
 WHEN degraded mode is active
 THE SYSTEM SHALL still apply command safety checks (REQ-BASH-011) to modes that
 expose bash
-AND the absence of Explore bash SHALL NOT prevent Direct, Work, or Branch mode
-from functioning
+AND the absence of Explore bash SHALL NOT prevent write-capable or chat-only
+conversation execution from functioning
 
 **Rationale:** A tool-level read-only convention is not a security boundary. If
 Phoenix cannot enforce the Explore bash policy at the OS boundary, Explore mode

@@ -3,10 +3,10 @@
 --
 -- Phoenix WorkScope-owned PR Association: Behavioural Specification
 --
--- Scope: durable association between a WorkScope and observed task branches and
+-- Scope: durable association between a WorkScope and observed settled local branches and
 --        GitHub pull requests; explicit active-PR selection; freshness-aware PR
 --        status; the Address-CI auto-fix affordance target selection; and
---        abandon-time best-effort refresh.
+--        Close-triggered best-effort refresh.
 --
 -- Includes:
 --   - WorkScope-keyed observed-branch history and PR observation history.
@@ -18,7 +18,7 @@
 --     auto-fix target rendered by the work actions bar: the StateBar shows the
 --     PR identity, the work actions bar shows the Address-CI auto-fix
 --     affordance, and they must target the same explicit active PR.
---   - Bounded, non-fatal abandon refresh before worktree cleanup.
+--   - Bounded, non-fatal PR refresh at Close-triggered retirement boundaries.
 --
 -- Excludes:
 --   - GitHub CLI internals and GraphQL/REST wire formats.
@@ -31,10 +31,11 @@
 -- Design basis:
 --   WorkScope-owned PR association is a standing runtime invariant: settled
 --   branch observations and PR identity are learned from authoritative local and
---   provider observations, persisted by WorkScope, and reused by status/action
---   surfaces until fresher facts replace them. PR-specific surfaces target one
---   explicit active PR whose provenance is either inferred or pinned; any
---   singular primary-PR ranking that remains is compatibility projection only.
+--   provider observations, persisted by WorkScope, and reused across
+--   continuations and fresh Work handoffs until fresher facts replace them.
+--   PR-specific surfaces target one explicit active PR whose provenance is
+--   either inferred or pinned; any singular primary-PR ranking that remains is
+--   compatibility projection only.
 --
 -- Requirement traceability: REQ-PRA-000 through REQ-PRA-004. The rules below
 --   model durable WorkScope-owned association, explicit active-PR targeting,
@@ -55,7 +56,8 @@ use "../bedrock/bedrock.allium" as bedrock
 
 -- The durable-owner key for work-affine resources. The runtime resolves a
 -- conversation to either a worktree scope or a conversation scope; continuations
--- that inherit a worktree resolve to the same WorkScope as their predecessor.
+-- and fresh Work handoffs that inherit a worktree resolve to the same WorkScope
+-- as their predecessor.
 value WorkScope {
     kind: WorkScopeKind
     inner: String
@@ -331,7 +333,7 @@ entity PrAutoFixAffordanceResult {
 ------------------------------------------------------------
 
 config {
-    abandon_refresh_deadline_ms: Integer = 10000
+    close_refresh_deadline_ms: Integer = 10000
 }
 
 ------------------------------------------------------------
@@ -341,12 +343,13 @@ config {
 -- Helper names used below are documented here with their signatures and
 -- semantics so rule references stay unambiguous.
 --
---   resolve_work_scope(conversation: bedrock/Conversation) -> WorkScope
---       Returns the durable WorkScope key for a conversation. Work and Branch
---       conversations with a managed worktree resolve to a worktree scope;
---       conversations without a worktree resolve to a conversation scope.
---       Continuations that inherit a worktree resolve to the same scope as the
---       predecessor.
+--   attached_git_work_scope(conversation: bedrock/Conversation) -> WorkScope?
+--       Returns the durable attached Git-backed WorkScope key for a conversation
+--       when one actually exists. Conversations without an attached Git-backed
+--       WorkScope return null, including provisioning-failure and repair states.
+--       PR-specific surfaces are unavailable in that case; they do not fall back
+--       to a conversation scope. Continuations that inherit a worktree resolve to
+--       the same attached scope as the predecessor.
 --
 --   identity_from_fact(fact: observed PR fact) -> PrIdentity
 --       Converts one provider observation into the canonical PR identity stored
@@ -426,6 +429,20 @@ rule ReadOnlyLookupDoesNotCreateScopeRecord {
     ensures: not WorkScopeRecord.created
 }
 
+rule PrSurfacesUnavailableWithoutAttachedGitWorkScope {
+    when: ConversationRendered(conversation)
+
+    requires: conversation.environment_kind = git_backed
+    requires: not exists attached_git_work_scope(conversation)
+
+    ensures: UserInformedAutoFixUnavailable("Git-backed worktree unavailable")
+
+    @guidance
+        -- PR status and auto-fix require both Git-backed intent and an actually
+        -- attached Git-backed WorkScope capability. Provisioning-failure and
+        -- repair states do not fall back to a conversation-scoped lookup.
+}
+
 rule NewObservationCreatesAssociation {
     when: PrFactsObserved(scope, fact)
 
@@ -487,9 +504,10 @@ rule ActivePrDerivedAfterObservation {
 rule PrStatusFreshResponseUsesExplicitActivePr {
     when: PrStatusRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
+    requires: exists scope
     requires: refresh.state = fresh
 
     ensures: PrFactsObserved(scope, refresh.facts)
@@ -504,9 +522,10 @@ rule PrStatusFreshResponseUsesExplicitActivePr {
 rule PrStatusStalePersistedActivePrOnNotFound {
     when: PrStatusRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
+    requires: exists scope
     requires: refresh.state = not_found
     requires: exists active_pr(scope)
 
@@ -521,9 +540,10 @@ rule PrStatusStalePersistedActivePrOnNotFound {
 rule PrStatusUnavailableWithPersistedActivePr {
     when: PrStatusRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
+    requires: exists scope
     requires: refresh.state = unavailable
     requires: exists active_pr(scope)
 
@@ -538,9 +558,10 @@ rule PrStatusUnavailableWithPersistedActivePr {
 rule PrStatusUnavailableWithoutActivePr {
     when: PrStatusRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
+    requires: exists scope
     requires: refresh.state = unavailable
     requires: not exists active_pr(scope)
 
@@ -555,10 +576,11 @@ rule PrStatusUnavailableWithoutActivePr {
 rule AssociatedAutoFixTargetsExplicitActivePrByNumber {
     when: PrAutoFixContextRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let target = active_pr(scope)
     let refresh = provider_refresh_by_number(target)
 
+    requires: exists scope
     requires: exists target
     requires: target.display_state = open
     requires: refresh.state != unavailable
@@ -579,10 +601,11 @@ rule AssociatedAutoFixTargetsExplicitActivePrByNumber {
 rule AutoFixUnavailableWhenProviderUnavailable {
     when: PrAutoFixContextRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let target = active_pr(scope)
     let refresh = provider_refresh_by_number(target)
 
+    requires: exists scope
     requires: exists target
     requires: refresh.state = unavailable
 
@@ -593,10 +616,11 @@ rule AutoFixUnavailableWhenProviderUnavailable {
 rule BranchAutoFixFallbackWithoutExplicitActivePr {
     when: PrAutoFixContextRequested(conversation)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
     let target = branch_primary(refresh.facts)
 
+    requires: exists scope
     requires: not exists active_pr(scope)
     requires: refresh.state = fresh
     requires: target.display_state = open
@@ -666,20 +690,22 @@ rule WorkActionsDisablesAutoFixForNonOpenActivePr {
     )
 }
 
-rule AbandonBestEffortRefreshIsBoundedAndNonFatal {
-    when: ConversationAbandoned(conversation)
+rule CloseTriggeredBestEffortRefreshIsBoundedAndNonFatal {
+    when: CloseRetirementBoundaryReached(conversation, attempt_id)
 
-    let scope = resolve_work_scope(conversation)
+    let scope = attached_git_work_scope(conversation)
 
-    requires: conversation.mode in { work, branch }
+    requires: conversation.environment_kind = git_backed
+    requires: exists scope
 
-    ensures: BestEffortPrRefreshAttempted(scope, config.abandon_refresh_deadline_ms)
+    ensures: BestEffortPrRefreshAttempted(scope, config.close_refresh_deadline_ms)
     ensures: CleanupContinues(conversation)
 
     @guidance
-        -- The refresh happens while the worktree still exists. Any failure,
-        -- unavailable provider, not_found result, or deadline expiry is logged
-        -- and cannot prevent worktree/branch cleanup from completing.
+        -- The refresh happens while the Git-backed WorkScope still exists. Any
+        -- failure, unavailable provider, not_found result, or deadline expiry is
+        -- logged and cannot prevent Close, retirement inspection, or resource
+        -- retirement from continuing.
 }
 
 ------------------------------------------------------------
@@ -730,7 +756,8 @@ surface PrStatusApi {
 
     provides:
         PrStatusRequested(conversation)
-            when conversation.mode in { work, branch }
+            when conversation.environment_kind = git_backed
+                 and exists attached_git_work_scope(conversation)
 
     contracts:
         fulfils WorkScopePrStatusContract
@@ -746,7 +773,8 @@ surface PrAutoFixApi {
 
     provides:
         PrAutoFixContextRequested(conversation)
-            when conversation.mode in { work, branch }
+            when conversation.environment_kind = git_backed
+                 and exists attached_git_work_scope(conversation)
 
     contracts:
         fulfils WorkScopePrAutoFixContract
@@ -767,18 +795,21 @@ surface WorkActionsPrAffordance {
         fulfils WorkActionsPrAffordanceContract
 }
 
-surface AbandonCleanup {
+surface CloseRetirementBoundary {
     facing user: ConversationUser
 
     context conversation: bedrock/Conversation
 
     provides:
-        ConversationAbandoned(conversation)
-            when conversation.mode in { work, branch }
+        CloseRetirementBoundaryReached(conversation, attempt_id)
+            when conversation.environment_kind = git_backed
+                 and exists attached_git_work_scope(conversation)
+                 and bedrock/RetirementInspectionRequested(conversation.product_conversation, attempt_id)
 
     @guarantee PrRefreshNeverBlocksCleanup
-        -- Abandon may attempt to enrich PR association history before cleanup,
-        -- but cleanup completion does not depend on PR provider success.
+        -- Close-triggered retirement may attempt to enrich PR association history
+        -- before resource teardown, but Close and cleanup completion do not depend
+        -- on PR provider success.
 }
 
 deferred WorkScopeObservedBranchHistory
@@ -811,7 +842,7 @@ deferred ExplicitActivePrSelection
 ------------------------------------------------------------
 --
 -- The rules above model the singular current-reality PR identity, freshness-
--- aware PR status, the Address-CI auto-fix affordance, and abandon refresh.
+-- aware PR status, the Address-CI auto-fix affordance, and Close-triggered refresh.
 -- The plural branch-observation and explicit-active-selection model introduced
 -- by REQ-PRA-000..000c is deferred immediately above so the normative direction
 -- is explicit even before implementation lands. The agent-facing PR feedback
@@ -822,12 +853,13 @@ deferred ExplicitActivePrSelection
 
 deferred PrFeedbackFreshnessAdvisory
     -- Location: `ui/src/components/WorkActions.tsx` (`PrRemediationActions`)
-    -- REQ-PRA-001. WHEN a Work or Branch conversation has an open associated PR
+    -- REQ-PRA-001. WHEN a Git-backed conversation with an attached WorkScope has
+    -- an open associated PR
     -- AND PR feedback changed since Phoenix last captured agent-facing PR
     -- remediation context, a compact advisory count marker (`{N} new` or
     -- `{N} edited`) is shown near the Address-CI Work Action. PR feedback freshness
-    -- is NOT the StateBar branch-health signal (that is PR merge state, owned by
-    -- the work-lifecycle spec) and it never blocks cleanup, abandon, or ordinary
+    -- is NOT the StateBar branch-health signal and it never blocks Close,
+    -- retirement inspection, retirement, or ordinary
     -- conversation use. The advisory composes the PrStatusResult freshness
     -- metadata modelled above with a feedback-identity comparison against the
     -- baseline captured by PrRemediationContextBaseline below.

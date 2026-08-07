@@ -2,116 +2,114 @@
 
 ## User Story
 
-As a Phoenix user, I run long streams of related work as continuation
-chains — for example, an "auth refactor" stream where conv #41 was
-"continued in new conversation" into #42, which was continued into #44.
-Days or weeks later I want to recall something specific from that chain
-("What were the top optimizations we applied?") without:
+As a Phoenix user, I sometimes continue one workstream across multiple
+stored conversation rows. Later, I reopen the conversation from the
+normal conversation list and want one place where I can:
 
-- Continuing #44 just to ask, which pollutes ongoing work and spends
-  context on retrieval rather than progress
-- Starting a fresh conversation and re-explaining the entire scope
-  before I can ask my actual question
+- read the full transcript history in the order the work actually
+  happened
+- understand what work this conversation is attached to now
+- ask a recall question across the whole workstream without reopening
+  old rows or re-explaining the context
 
-I want to think of the chain as a unit — give it a recognizable name
-("auth refactor"), find it nested in my sidebar, navigate to it as a
-place, and ask it questions whose answers see all of the work that's
-happened across its members.
+I do not want Phoenix to make me manage a separate product object for
+that lineage. The durable root conversation is the product identity, and
+continuation-linked rows are implementation topology Phoenix uses to
+preserve the history of that one product conversation.
 
 ## Why the User Cares
 
-- **Recall without re-explanation** saves tokens and cognitive cost. A
-  chain that contains weeks of work would otherwise require copying
-  context manually or paying to replay it.
-- **A named, navigable chain** is easier to find, share across browser
-  tabs, and return to than a list of opaque conversation ids. The name
-  is the hook the user remembers.
-- **Asking a recall question without continuing** keeps work
-  conversations focused on work, not retrieval. The user does not have
-  to choose between "ask cheaply but pollute" and "ask cleanly but pay
-  to re-explain."
+- **One conversation identity is easier to find and trust.** The user
+  remembers a conversation title, not a separate chain object with its
+  own lifecycle.
+- **Recall without re-explanation** saves tokens and cognitive cost.
+  Weeks of prior work should remain explorable without replaying the
+  whole context manually.
+- **Work stays on the normal page.** The user should not have to decide
+  whether to visit a transcript page or a separate lineage page to keep
+  working.
 
 ## Transparency Contract
 
 The user must be able to confidently answer:
 
-1. Which conversations are in this chain, and in what order?
-2. What work does this chain represent — which worktree, branch, task,
-   and pull request is it driving, and what is that PR's state?
-3. What questions have I already asked this chain, and what answers
-   did I get?
-4. Does a stored answer predate later chain activity (is it worth
-   re-asking)?
+1. Which stored conversation rows belong to this one product
+   conversation, and in what order?
+2. What work does this conversation represent right now — which
+   worktree, branch, task, and pull request is it attached to?
+3. What recall questions have I already asked from this conversation,
+   and what answers did I get?
+4. Does a stored answer predate later transcript activity and therefore
+   deserve re-checking?
 
 ## Requirements
 
 ### REQ-CHN-001: Recall Past Work Without Re-Explaining Context
 
-WHEN a user wants to recall information from a continuation chain
+WHEN a user wants to recall information from a product conversation that
+spans continuation-linked rows
 THE SYSTEM SHALL provide an interaction surface that returns an answer
-derived from the content of every member of that chain
-AND SHALL NOT require the user to extend any of those conversations or
-to re-supply their content as input
+derived from the content of every member row in that lineage
+AND SHALL NOT require the user to extend any of those rows or to
+re-supply their content as input
 
-**Rationale:** Headline benefit. Without it the user pays full token
-cost twice — once to do the work originally, and again to retrieve
-from it. Including every member of the chain prevents partial-recall
-failure modes: a "where did we leave off?" answer that ignores the
-latest conversation in the chain would be misleading.
+**Rationale:** The user already paid to create this work history.
+Retrieval should use the whole lineage as one conversation-level context
+rather than forcing the user to replay it manually.
 
 ---
 
-### REQ-CHN-002: Continuation Chains Surface as First-Class Entities
+### REQ-CHN-002: Continuation Lineage Is Navigation Topology, Not a Separate Product Entity
 
-WHEN two or more conversations share a linear handoff lineage through
-`continued_in_conv_id` (one was created via "continue in new conversation"
-from another, or a managed Explore task approval was handed off to a fresh
-Work conversation)
-THE SYSTEM SHALL present them as a grouped chain in conversation
-navigation surfaces, identifiable by the chain's root conversation as
-its identity
+WHEN two or more stored conversation rows share a linear handoff lineage
+through `continued_in_conv_id`
+THE SYSTEM SHALL treat them as one product conversation whose durable
+identity is the root conversation row
 
-THE SYSTEM SHALL render chain members visually nested under a
-collapsible chain header in the sidebar, in chain order (root → latest)
+THE SYSTEM SHALL render that product conversation as a single entry in
+conversation navigation surfaces keyed by the durable root conversation
+rather than as nested member rows under a separate chain header
 
-WHEN a conversation has not been continued and was not itself a
-continuation
-THE SYSTEM SHALL render it as a standalone (non-chain) navigation entry
+WHEN a conversation has no continuation lineage beyond its durable root
+row
+THE SYSTEM SHALL still render it as one product conversation entry using
+that same root-keyed identity model
 
-**Rationale:** Chain membership emerges automatically from how the
-user already structures work via continuations — no manual grouping
-action required. Visual nesting in the sidebar makes the chain a
-tangible thing the user can perceive without ceremony. Keeping
-standalone conversations ungrouped avoids visually inflating every
-conversation into a degenerate one-member chain.
+**Rationale:** Continuation rows preserve transcript topology and latest-row
+authority, but the user-facing product object remains one conversation.
+Showing a separate chain container with nested members would create a
+second product identity for the same work.
 
 ---
 
-### REQ-CHN-003: Chain Page as a Navigable Place
+### REQ-CHN-003: The Normal Conversation Surface Hosts Lineage History
 
-WHEN the user activates a chain header in the sidebar (or otherwise
-navigates to a chain)
-THE SYSTEM SHALL navigate to a chain page that lists the member
-conversations in chain order and provides an entry point for asking
-the chain questions
+WHEN the user opens a product conversation whose history spans
+continuation-linked rows
+THE SYSTEM SHALL navigate to the normal conversation surface for the
+root conversation
+AND that surface SHALL render the transcript history in lineage order
+and host any lineage-wide recall interaction on that same page
 
-THE SYSTEM SHALL support standard browser navigation (back button,
-deep linking, refresh) to and from the chain page
+THE SYSTEM SHALL support standard browser navigation (back button, deep
+linking, refresh) to and from that normal conversation surface
 
-**Rationale:** A named chain that you can see but cannot navigate to
-is a label, not a place. Deep-linkable URLs and browser-native
-navigation are the foundational guarantees of a place; absent them the
-chain has no stable destination for revisiting Q&A history or
-sharing across browser tabs.
+THE SYSTEM SHALL NOT require a dedicated chain route, chain page, or
+chain-only header to access lineage history or lineage Q&A
+
+**Rationale:** The user needs one stable place for the conversation, but
+that place is the ordinary conversation page. The lineage is part of the
+conversation's history, not a second destination.
 
 ---
 
-### REQ-CHN-004: Ask the Chain, Get a Streamed Answer
+### REQ-CHN-004: Lineage Q&A Streams on the Normal Conversation Surface
 
-WHEN the user submits a question on a chain page
-THE SYSTEM SHALL produce an answer derived from the chain's
-conversation content, streamed token-by-token to the user as it is
-generated
+WHEN the user submits a lineage recall question on the normal
+conversation surface
+THE SYSTEM SHALL produce an answer derived from the product
+conversation's lineage content, streamed token-by-token to the user as
+it is generated
 
 WHILE an answer is being prepared but no tokens have arrived
 THE SYSTEM SHALL display a progress indication that signals the request
@@ -121,321 +119,181 @@ WHILE tokens are arriving
 THE SYSTEM SHALL render them incrementally rather than waiting for the
 full answer
 
-**Rationale:** Q&A is the headline interaction; streaming and
-loading-state quality are explicit user requirements. A half-rendered
-loading state would undermine confidence even when the answer itself
-is good.
+**Rationale:** Streaming is part of the user-visible quality bar for
+recall. The page hosting the transcript should also host the live answer
+experience.
 
 ---
 
-### REQ-CHN-005: Q&A History Persists Per Chain
+### REQ-CHN-005: Q&A History Persists With the Product Conversation
 
-WHEN a user has previously asked questions on a chain
-THE SYSTEM SHALL display the prior questions and answers when the
-chain page is reopened
+WHEN a user has previously asked lineage-wide recall questions from a
+product conversation
+THE SYSTEM SHALL display the prior questions and answers when that same
+conversation surface is reopened
 
-THE SYSTEM SHALL render the Q&A panel as a vertical list of pair cards
-where each pair card displays an explicit `Q:` row and `A:` row. There
-SHALL always be exactly one **active pair card** at the top of the
-panel whose `Q:` row is an empty, autofocused textarea and whose `A:`
-row is a "waiting for question" placeholder. Persisted and currently
-streaming pairs SHALL render below the active card in reverse
-chronological order, with the most recent pair immediately below the
-active card.
+THE persisted Q&A history MAY remain attached to the durable root
+conversation row so long as the user experiences it as history belonging
+to that one product conversation rather than to a separate chain object
 
-WHEN a stored Q&A answer was produced before the chain grew (members
-were added, or members accumulated more messages, after the answer)
+WHEN a stored Q&A answer was produced before the lineage grew or later
+member rows accumulated additional messages
 THE SYSTEM SHALL show an age-of-answer freshness indicator on that
-stored answer, so the user can tell at a glance whether it predates
-later chain activity and might be worth re-asking
+stored answer so the user can tell it may predate later conversation
+activity
 
-WHEN a stored Q&A is in an incomplete or failed state (the stream
-ended without producing a complete answer)
-THE SYSTEM SHALL render the question and a clear failure indicator so
-the user sees their question wasn't lost and can re-ask if desired
+WHEN a stored Q&A is in an incomplete or failed state
+THE SYSTEM SHALL render the question and a clear failure indicator so the
+user sees their question was not lost and can re-ask if desired
 
-**Rationale:** Users return to chains. Without persistence they lose
-answers they paid to generate and have no record of what they have
-already asked. Pair cards reinforce REQ-CHN-006's independence
-guarantee structurally — each Q&A is a self-contained object, and the
-active card is visibly the same shape as past pairs (just unfilled), so
-the user understands their next question creates a new pair rather than
-continuing a thread. Reverse-chronological ordering keeps the freshest
-context next to the active card without requiring the user to scroll.
-Surfacing failed/incomplete Q&A preserves the user's question text
-rather than losing it on stream failure.
-
-The freshness indicator is an **age-of-answer** signal, not a
-correctness-snapshot the answer was computed against. Under REQ-CHN-009
-each answer is generated by an agent reading the chain's live content, so
-it is never stale relative to a during-answer snapshot. But a *stored*
-answer in the history can still predate later chain work, and the user
-needs to see that — so the indicator reports only that the chain has
-advanced since the answer was produced (e.g. "3 → 5 conversations"),
-computed from a cheap chain-size marker recorded at answer time, with no
-snapshot of conversation-graph state retained.
+**Rationale:** Users return to prior recall answers. Persisting that
+history on the root is acceptable if it preserves one conversation-level
+experience and does not invent a separate Q&A lifecycle.
 
 ---
 
-### REQ-CHN-006: Consistent Quality As Q&A Accumulates
+### REQ-CHN-006: Independent Q&A Quality As History Accumulates
 
-WHILE a user is asking questions on a chain page
+WHILE a user is asking lineage-wide recall questions from the normal
+conversation surface
 THE SYSTEM SHALL produce answers whose quality, latency, and content do
-not materially degrade as more questions and answers accumulate in
-that chain's Q&A history
+not materially degrade as more Q&A history accumulates for that product
+conversation
 
-**Rationale:** Each question is answered against the canonical chain
-content, not against the model's own prior answers. This prevents
-drift (early misunderstandings compounding into later answers) and
-bounds cost as Q&A history grows. The user-visible property is that
-the tenth question feels as fast and accurate as the first.
+**Rationale:** Each recall question should stand on the conversation's
+canonical transcript history, not on accumulated prior answers. The
+user-visible result is that later questions remain as trustworthy and
+responsive as early ones.
 
-**Implication:** v1 Q&A invocations are intentionally disjoint — the
-model does not see prior questions or answers from the same chain. A
-follow-up like "tell me more about #2" will not work unless the user
-restates the prior context in the new question. The Q&A panel
-communicates this independence visually (each Q&A is a self-contained
-card with no chat-style ligatures). See the non-requirements list for
-the v1.5 path that addresses this without breaking REQ-CHN-006.
+**Implication:** Q&A invocations are intentionally disjoint. The model
+does not see prior questions or answers unless the user restates them in
+a new question.
 
 ---
 
-### REQ-CHN-007: Chain Has a User-Editable Name
+### REQ-CHN-007: Conversation Title Belongs to the Root Product Conversation
 
-WHEN a chain is first surfaced in the UI
-THE SYSTEM SHALL display a name for it derived from the chain's root
-conversation title
+WHEN a continuation-linked lineage is surfaced to the user
+THE SYSTEM SHALL identify it using the root product conversation's title
+or rename value
 
-WHEN the user invokes a name-edit action on the chain page header
-THE SYSTEM SHALL allow inline editing of the chain name and persist
-the new value when the user commits (Enter, blur, or explicit confirm)
+THE SYSTEM SHALL treat conversation naming as part of the normal
+conversation title/rename behavior for that root product conversation
+rather than as a separate chain-specific naming action or lifecycle
 
-THE SYSTEM SHALL allow the user to populate the chain name either by
-typing it inline (above) or by invoking a regenerate action that derives
-a name from the chain's member content (REQ-CHN-010)
+THE SYSTEM SHALL apply the chosen title consistently anywhere this one
+product conversation is named
 
-THE SYSTEM SHALL display the user-set name (when present) consistently
-in every place the chain is identified — sidebar header, chain page
-header, and any other UI surface that names the chain
-
-**Rationale:** The chain is going to be a recognizable visual entity in
-the sidebar. Names are the hook users remember and search for. A
-user-set "auth refactor" is more findable than the auto-derived title
-of conv #41. Editing inline (rather than in a settings modal) keeps
-the chain feeling like a lightweight entity rather than a heavyweight
-configurable object.
+**Rationale:** The user names a conversation, not a second chain object.
+A separate chain-name affordance would duplicate the ordinary
+conversation title concept and risk divergence.
 
 ---
 
-### REQ-CHN-008: Chain Page Surfaces the Work Identity Alongside Runtime Resources
+### REQ-CHN-008: The Normal Conversation Surface Shows Work Identity for the Live Attached Scope
 
-The chain page already carries a **work-scope dock** showing the live
-runtime resources of the chain's scope — backgrounded bash, tmux, browser
-(`specs/work-scope-ui/` REQ-WSUI-009, keyed by the chain root's single
-`work_scope_key`). That dock answers "what is *running* on this work right
-now." It does not answer "what *unit of work* is this" — the worktree,
-branch, task, and pull request the chain is driving. REQ-CHN-008 adds
-that second, complementary facet to the chain page's work-scope surface.
-The two are different views of one `WorkScope`: runtime resources (the
-existing dock) and work identity + PR health (this requirement).
+WHEN the normal conversation surface is displayed for a product
+conversation with continuation-linked history
+THE SYSTEM SHALL surface, for the attached live work scope, its work
+identity — worktree path, current branch, base/default branch context,
+and any associated task context — and its pull-request health when an
+associated PR exists: `display_state` (open / draft / merged / closed),
+checks, and feedback-freshness signal
 
-WHEN the chain page is displayed
-THE SYSTEM SHALL surface, for the chain's work scope, its **work
-identity** — worktree path, branch, base branch, and the task (id and
-title) when the chain is doing Managed work — and its **pull-request
-health** when an associated PR exists: `display_state` (open / draft /
-merged / closed), checks, and feedback-freshness signal
+THE SYSTEM SHALL resolve this work identity from the attached
+`WorkScope` / latest live conversation-row authority and present it on
+the normal conversation surface rather than requiring a separate chain
+surface
 
-THE SYSTEM SHALL address this through the **same single `work_scope_key`**
-the runtime-resource dock uses (the chain root's scope; `specs/work-scope-ui/`
-REQ-WSUI-009), not by fanning out per member — a chain's members share one
-work scope, and at most one is non-terminal (`specs/projects/`
-REQ-PROJ-025), so one scope key is complete
+WHEN the conversation has no Git-backed work scope
+THE SYSTEM SHALL indicate the absence of a Git-backed work scope rather
+than rendering empty worktree/branch/PR fields
 
-THE work identity SHALL be sourced from the members' `ConvMode` git
-metadata, and the PR `display_state` / checks / feedback-freshness SHALL
-be sourced from the existing **PR-status / feedback pipeline** that drives
-the StateBar (work-lifecycle REQ-WL-003, pr-association REQ-PRA-001/REQ-PRA-002) — not from the PR
-association record alone (which carries PR identity and state but not live
-checks or freshness). This facet SHALL NOT be folded into
-`WorkScopeInventory`, whose contract is a full-snapshot read-projection
-over the in-memory runtime registries (`specs/work-scope-ui/`
-REQ-WSUI-001); externally-polled PR state and durable git metadata do not
-belong in that registry snapshot.
-
-WHEN the chain has no managed work scope (e.g. a chain of Direct
-conversations with no worktree)
-THE SYSTEM SHALL indicate the absence of a managed work scope rather than
-rendering empty worktree/branch/PR fields
-
-**Rationale:** The member list answers "what conversations happened"; the
-runtime-resource dock answers "what is running"; neither answers "what is
-this chain *for*." The worktree / branch / task / PR is the through-line
-that makes the chain a unit of work rather than a list of transcripts.
-Reusing the dock's single-scope-key model (rather than inventing a
-per-member aggregation) keeps the chain page's two work-scope facets
-addressed the same way and avoids the divergence a fan-out would invite.
-Keeping PR/git data out of `WorkScopeInventory` respects that
-projection's deliberate scope (in-memory registries, full-snapshot push
-on registry change) — PR state changes are not registry events, so they
-ride the PR-status pipeline that already models them. Keeping the chain
-concept while surfacing its work identity — rather than renaming the
-chain to a "work scope" — is deliberate: continuation lineage and
-resource ownership are distinct, and their near-1:1 correspondence is a
-strong default, not an invariant to hard-code.
+**Rationale:** The user needs to know what work this conversation is
+attached to now. That identity belongs beside the transcript on the
+ordinary page, even though the underlying authority resolves through the
+latest live row.
 
 ---
 
-### REQ-CHN-009: Chain Q&A Is a Read-Only Agentic Loop
+### REQ-CHN-009: Lineage Q&A Is a Read-Only Agentic Loop Scoped to One Product Conversation
 
-WHEN the user asks a chain a question
+WHEN the user asks a lineage-wide recall question
 THE SYSTEM SHALL answer it by running a read-only agent that is given
-tools to (a) search the chain's conversation content by relevance and
-(b) read the full content of any chain member, and that iterates —
-searching, reading, and reasoning — until it can answer, then streams
-the answer
+tools to (a) search the conversation content by relevance and (b) read
+the full content of any member row in that conversation's continuation
+lineage, and that iterates — searching, reading, and reasoning — until
+it can answer, then streams the answer
 
-THE agent's tools SHALL be **scope-bound to the chain** by the host
-(`specs/conversation-retrieval/` REQ-RET-008): the search tool retrieves
-only across the chain's member conversations, and the read tool can
-fetch only the content of conversations in that member set. The model
-SHALL NOT be able to widen its own scope to conversations outside the
-chain. The host SHALL bind the chain **root** and resolve the member set
-live per tool call (not freeze it at run start), so a member added by a
-continuation during the run is in scope — consistent with answering
-against the chain's current state.
+THE agent's tools SHALL be scope-bound to that one product conversation:
+the search tool retrieves only across that conversation's member rows,
+and the read tool can fetch only the content of rows in that lineage
 
-THE agent SHALL be **read-only**: it is given no tool that mutates
-state (no bash, no patch, no worktree access). Its only side effect is
-producing the streamed answer.
+THE host SHALL bind the durable root conversation identity and resolve
+the member-row set live per tool call rather than freezing it at run
+start
 
-THE SYSTEM SHALL NOT restrict non-leaf members to their trailing
-continuation summary; the agent can read any member's actual message
-content on demand.
+THE agent SHALL be read-only: it is given no tool that mutates state.
+Its only side effect is producing the streamed answer.
 
-THE read tool SHALL return the **full** content of the messages it
-returns — including tool-result bodies, build logs, and sub-agent output,
-not the size-capped excerpt the search index uses for ranking
-(`specs/conversation-retrieval/` REQ-RET-004) — because the answer to a
-question is often in a tool result. Because a chain member can be large,
-the read tool returns content in **bounded pages** (REQ-RET-008) and the
-agent pages forward as needed, so "full content" means "the actual
-content is reachable," not "the entire member in one unbounded result."
+THE SYSTEM SHALL NOT restrict non-leaf member rows to continuation
+summaries alone; the agent can read their actual message content on
+demand
 
-THE agent SHALL run against live message content (the read tool reads
-`messages` directly) and the current retrieval index at query time, so
-an answer reflects the chain's present state rather than a stored
-snapshot. REQ-CHN-005's freshness indicator is therefore an
-age-of-answer signal (did the chain grow *after* this answer), not a
-during-answer snapshot the answer was computed against.
+THE read tool SHALL return the full content of the messages it returns,
+including tool-result bodies, build logs, and sub-agent output, subject
+to bounded paging where needed
 
-WHEN the retrieval index has not caught up to the chain's messages (the
-retrieval freshness of `specs/conversation-retrieval/` REQ-RET-003
-reports the index still warming or behind)
-THE SYSTEM SHALL NOT present a Q&A answer as authoritative-complete as if
-the full chain had been searched; it SHALL either wait for the index to
-catch up for the chain's members before answering, or surface that
-search coverage was partial. (Reads remain exact regardless — they hit
-`messages` directly; only the *search* step depends on index freshness,
-so the gap is incomplete recall, never wrong content.)
+WHEN the retrieval index has not caught up to the conversation's
+messages
+THE SYSTEM SHALL NOT present a Q&A answer as if the full conversation
+had been searched authoritatively; it SHALL either wait for coverage to
+catch up or surface that recall coverage was partial
 
 THE agent SHALL NOT see prior Q&A questions or answers from the same
-chain (REQ-CHN-006 holds): each question is a fresh agent run that may
-iterate internally but carries no cross-question memory.
+conversation unless the user includes that context in the new question
 
-**Rationale:** A one-shot bundle — whether of summaries or of a single
-retrieval pass — caps the answer at whatever context was guessed up
-front. The capability the user actually wants is "go dig through the
-whole conversation": let the model search, decide what looks relevant,
-read it in full, and search again if the first pass missed. That is an
-agent loop, and it is the version that genuinely has access to the
-entire conversation rather than a pre-flattened slice of it. Binding
-the tools to the chain's member set by construction (the host fixes the
-scope; the model only supplies the query) keeps the agent from
-wandering outside the chain while still giving it full depth within it.
-Read-only because Q&A is recall, not work. Reusing the product-wide
-retrieval primitive as the search tool means the same agent, pointed at
-the `Global` scope, becomes an application-wide Q&A surface — chain Q&A
-and global Q&A differ only in the scope the host binds into the tools.
-Keeping each question a fresh run preserves REQ-CHN-006's
-no-cross-question-drift guarantee; the cost/latency now varies with
-question difficulty rather than chain size, which is the intended
-trade — a pointed question stays cheap, a deep one is allowed to work
-for it.
+**Rationale:** The user wants Phoenix to dig through the whole
+conversation lineage, not through a lossy summary bundle. Binding the
+agent to one root-keyed product conversation preserves that scope
+without inventing a second product entity.
 
 ---
 
-### REQ-CHN-010: Regenerate Chain Name From Member Content
+### REQ-CHN-010: No Separate Chain-Specific Lifecycle or Management Actions
 
-WHEN the user invokes a regenerate-name action on a chain
-THE SYSTEM SHALL derive a short human-readable name by summarizing the
-opening message of each member conversation (in chain order) via a
-cheap LLM, and persist it as the chain's name (the `chain_name` override
-on the root). A member's opening message is its earliest user-initiated
-message — a plain user message, or a skill invocation (whose original
-trigger text is the opening intent) — since a member may open either way
+WHEN a product conversation spans continuation-linked rows
+THE SYSTEM SHALL NOT introduce separate chain-specific rename,
+regenerate-name, archive, unarchive, delete, or dedicated management
+actions that duplicate ordinary conversation actions for the same root
+product conversation
 
-THE regenerate action SHALL be manual and user-initiated only; THE
-SYSTEM SHALL NOT rename chains automatically or in the background.
-Because the user explicitly requests each regeneration, the action may
-overwrite the current name without a separate clobber-guard — the
-overwrite is the user's own request, not a silent process competing with
-a deliberately-chosen name.
+THE SYSTEM SHALL treat continuation lineage as transcript/retrieval
+scope within the product conversation rather than as a separately named,
+archivable, or deletable object
 
-WHEN LLM generation fails or times out
-THE SYSTEM SHALL leave the existing name unchanged and surface that
-regeneration did not succeed, writing no partial or empty name
-
-THE regenerate action SHALL apply only to actual chains (members ≥ 2),
-consistent with REQ-CHN-002 — a single conversation is not a chain and
-has no chain name to regenerate
-
-**Rationale:** A chain's content drifts over time — an "auth refactor"
-chain may grow into broader work whose first member no longer
-characterizes the whole. A one-shot regenerate lets the name catch up to
-the chain's current content on demand, summarizing every member rather
-than just the root. Keeping it manual rather than automatic means it
-never surprises the user or fights a name they deliberately chose: the
-name only changes when the user asks for it, whether by typing
-(REQ-CHN-007) or by regenerating. Leaving the existing name untouched on
-failure preserves the prior name rather than degrading it to an empty or
-partial string.
+**Rationale:** Separate management actions would imply a second
+user-facing object with its own lifecycle. One root-keyed
+ProductConversation already carries the transcript history and recall
+scope for that work.
 
 ---
 
-## Non-Requirements (explicit out-of-scope for v1)
+## Non-Requirements
 
-- **Kickstart action / offshoots / tree-shaped chains.** Deferred
-  decision: the worktree-ownership invariant introduced when peer
-  conversations would share or fork a worktree is unspecified upstream
-  and warrants its own spec before kickstart can ship coherently. v1
-  chains are linear (continuation only).
-- **Resume as a first-class action.** Sidebar nesting already shows
-  the latest member at the bottom of the chain block, and the chain
-  page emphasizes the latest-active member visually. A separate
-  Resume button is redundant. The user clicks the latest member's
-  card to resume.
-- **Manual chain membership editing.** Adding or removing arbitrary
-  conversations from a chain. Membership stays derived from
-  `continued_in_conv_id`; supported edges are context continuation and
-  approved-task fresh Work handoff.
-- **Q&A editing or deletion.** Q&A history is append-only.
-- **Follow-up Q&A with prior-Q&A model context.** REQ-CHN-006 keeps
-  invocations stateless; the model never sees prior Q&A from the
-  same chain. Named v1.5 path: a "reply" affordance on each prior
-  Q&A pre-fills the input with a quoted snippet so the user's
-  question becomes self-contained, preserving the stateless contract
-  that protects REQ-CHN-006.
-- **Cross-chain linking or comparison.** No requirement defines it.
-- **Project-level summary or steering doc.** A separate concept,
-  explicitly deferred.
-
-## Future Direction (named, not v1)
-
-- **Kickstart (deferred from this spec).** "Spawn a related
-  conversation in a different direction" has real user value but
-  requires resolving the worktree-ownership invariant for peer
-  conversations first (a `specs/projects/` concern, not a chains
-  concern). **Trigger to pivot:** a worktree-peer-ownership spec
-  exists and defines coherent semantics for two long-lived
-  conversations sharing or forking a worktree.
+- **Tree-shaped continuation groups.** This spec covers linear
+  `continued_in_conv_id` lineage only.
+- **Manual lineage membership editing.** Membership remains derived from
+  continuation topology rather than hand-curated by the user.
+- **Separate chain page, route, or sidebar container.** The conversation
+  page is the surface; dedicated chain navigation is explicitly not part
+  of the product model.
+- **Separate chain rename or regenerate-name flow.** Conversation title
+  behavior on the root product conversation is sufficient.
+- **Separate chain archive or delete lifecycle.** Ordinary conversation
+  lifecycle rules apply; there is no second chain lifecycle.
+- **Follow-up Q&A with prior-answer model context.** Recall questions are
+  intentionally independent.
+- **Cross-conversation comparison outside one root-keyed product
+  conversation.** This spec scopes recall to one product conversation's
+  continuation lineage.

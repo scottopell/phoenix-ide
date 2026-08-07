@@ -6,7 +6,7 @@ Conversation creation returns a durable shell before filesystem, Git, expansion,
 
 ## Current Reality
 
-The branch includes the shell-first API and UI flow. The durable protocol vocabulary, pure transition function, and initial deterministic operation-sequence tests are present. Production persistence and worker orchestration still use the earlier unguarded phase-update model and remain to be migrated before the feature is mergeable.
+The branch includes the shell-first API and UI flow. The durable protocol vocabulary, pure transition function, `CreationClaim`/`CompleteCreation` state-machine hooks, and deterministic operation-sequence tests are present (`crates/phoenix-state-machine/src/creation_protocol.rs`, `transition.rs`). Production persistence and worker orchestration still use the earlier unguarded phase-update model and remain to be migrated before the feature is mergeable.
 
 ## Verification Coverage
 

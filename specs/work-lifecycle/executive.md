@@ -2,86 +2,53 @@
 
 ## What This Spec Covers
 
-The work lifecycle defines the user-facing **terminal actions** on Work and Branch
-conversations and the **git side effects** they produce. A Work or Branch conversation
-enters the lifecycle when the user declares the work shipped (mark as merged) or discards it
-(abandon). This spec owns:
+The work lifecycle spec now describes the intended user-facing **Close conversation** flow for Git-backed conversations, the worktree-loss inspection it requires, and the idempotent retirement of attached `WorkScope` resources without branch or PR mutation.
 
-- **Action semantics** — what each terminal action means, what git state it leaves behind,
-  and the disposition of the worktree and branch per conversation mode.
-- **Git side effects** — worktree removal, branch deletion (Managed/Work mode) or
-  preservation (Branch mode), the diff-snapshot captured on abandon, and the confirmation
-  that gates the irreversible abandon deletion.
-- **PR-state-as-cleanup-gate** — `gh`-observed PR merge state labels and guides which
-  cleanup affordance is presented, without ever creating an automatic lifecycle transition.
+## Current Reality
 
-It does **not** own:
-
-- **Transition legality** — when a terminal action is permitted based on conversation state
-  (`core_status`, `parent_status`, `mode`, continuation pointer). That is bedrock's
-  `TaskResolved` rule and its `TerminalActionRequiresNoContinuation` invariant (REQ-BED-029,
-  REQ-BED-031). This spec's handlers validate against that same gate but do not define it.
-- **PR feedback freshness, explicit active-PR targeting, auto-fix, or remediation context** —
-  the `pr-association` spec.
-- **UI surface composition** — button labels, action zones, disposition derivation, tooltips.
-  The `work-actions-bar` spec owns these.
-
-## User Need
-
-A developer using PhoenixIDE needs a clear, safe way to close out Work and Branch
-conversations. *Clear* means the user always knows what cleanup will happen before they
-commit to it. *Safe* means no irreversible git operation runs without confirmation, a
-worktree still in use by another live conversation is never destroyed, and the branch
-disposition matches the mode: Phoenix-created task branches are removed, user-owned PR
-branches are kept.
+That unified lifecycle is not yet the shipped product behavior. Phoenix still exposes legacy terminal actions instead of Close: `POST /api/conversations/:id/abandon-task` and `POST /api/conversations/:id/mark-merged` are live, and both continue to gate on the current conversation row plus `continued_in_conv_id` compatibility checks in `crates/phoenix-ide/src/api/lifecycle_handlers.rs`. Archive is still a separate ordinary API action (`POST /api/conversations/:id/archive`) backed by `archived` row state rather than the future Open/History aggregate transition. Legacy cleanup logic still captures abandon diff state and still distinguishes branch-disposition by legacy mode/worktree semantics.
 
 ## Requirements Summary
 
 | ID | Summary |
 |----|---------|
-| REQ-WL-001 | Abandon a conversation — confirmation, diff snapshot, mode-dependent branch disposition |
-| REQ-WL-002 | Mark as merged — worktree cleanup, mode-dependent branch disposition, no squash, no push |
-| REQ-WL-003 | PR merge state is the cleanup gate — advisory only, never a lifecycle trigger |
+| REQ-WL-001 | Close conversation is the only intended user-facing terminal lifecycle action for Git-backed conversations |
+| REQ-WL-002 | Retirement inspection classifies exact worktree-loss risk before destructive teardown |
+| REQ-WL-002a | Discard confirmation binds to one exact inspected workspace generation |
+| REQ-WL-002b | Retirement retires owned resources stepwise, idempotently, and without automatic recovery artifacts |
+| REQ-WL-003 | Pull-request state guides Close but never triggers it |
 
-Increment 1 clarifies that plural PR association does not create plural cleanup ownership.
-Cleanup remains one task/worktree action even when multiple associated PRs exist. Mixed PR states
-may be summarized by sibling UI surfaces, and an explicit active PR may be named for clarity, but
-cleanup does not merge, close, or retarget PRs and does not treat feedback freshness as a cleanup
-gate.
+## Normative Authority
 
-Both terminal actions (REQ-WL-001, REQ-WL-002) are organized by **action**, with conversation
-mode appearing as a row in each action's disposition table rather than as a separate
-requirement. The disposition is identical in shape across the two actions: the worktree is
-always deleted; the branch is deleted for Managed (Work) mode and kept for Branch mode.
+Current normative authority is `requirements.md`, `specs/bedrock/bedrock.allium`, and ADR-026. This executive intentionally reports current implementation drift instead of treating the normative Close model as shipped.
 
 ## Implementation Status
 
 | Requirement | Status | Surface |
 |-------------|--------|---------|
-| REQ-WL-001 | Implemented | `POST /api/conversations/:id/abandon-task`; `git_ops::CapturedDiff` |
-| REQ-WL-002 | Implemented | `POST /api/conversations/:id/mark-merged` |
-| REQ-WL-003 | Implemented | `GET /api/conversations/:id/pr-status` |
+| REQ-WL-001 | Not implemented | Shipped UX still uses legacy abandon / mark-merged endpoints instead of one Close action |
+| REQ-WL-002 | Partially implemented | Legacy flows already inspect/capture worktree state for cleanup paths, but the exact Close loss-inventory contract is not the shipped user flow |
+| REQ-WL-002a | Not implemented | No shipped fingerprint-bound discard confirmation for the unified Close obligation |
+| REQ-WL-002b | Partially implemented | Cleanup of worktree-owned resources exists, but it is still entered through legacy archive / abandon / mark-merged / hard-delete paths rather than a single durable Close obligation |
+| REQ-WL-003 | Partially implemented | Observed PR state already guides current cleanup affordances, but it still participates in legacy mark-merged UX rather than purely advisory Close guidance |
+
+## Legacy Surface Inventory
+
+The following legacy surfaces are still current reality and must remain called out as such until code changes land:
+
+- `/abandon-task` — shipped destructive terminal flow with diff capture and mode-dependent cleanup
+- `/mark-merged` — shipped cleanup flow keyed to current branch/PR completion UX
+- `/archive` — shipped archived/non-archived lifecycle split, separate from Close
+- continuation gating via `continued_in_conv_id` — shipped protection against closing/cleaning up predecessors after handoff
+
+## Validation Notes
+
+Current-reality verification for this reconciliation used:
+
+- `crates/phoenix-ide/src/api/lifecycle_handlers.rs`
+- `crates/phoenix-ide/src/api/handlers.rs`
+- `crates/phoenix-db/src/lib.rs` (`archive_conversation`, `archived` listings, continuation/ownership queries)
 
 ## Provenance
 
-Work-lifecycle requirements were previously expressed as project-scope requirements in the
-`projects` spec, carved out here so that action semantics and git side effects own their own
-spec independent of project detection, mode selection, and worktree creation. The standing
-mapping from the prior project-scope IDs is:
-
-| Prior ID | New ID | Mapping |
-|----------|--------|---------|
-| REQ-PROJ-010 | REQ-WL-001 | Abandon — confirmation and diff snapshot, both modes |
-| REQ-PROJ-026 (abandon rows) | REQ-WL-001 (Branch row) | Branch-mode abandon: worktree deleted, branch kept |
-| REQ-PROJ-027 (abandon rows) | REQ-WL-001 (Work row) | Managed-mode abandon: worktree and task branch deleted |
-| REQ-PROJ-026 (merge rows) | REQ-WL-002 (Branch row) | Branch-mode mark-merged: worktree deleted, branch kept |
-| REQ-PROJ-027 (merge rows) | REQ-WL-002 (Work row) | Managed-mode mark-merged: worktree and task branch deleted; no squash, no push |
-| REQ-PROJ-011 | REQ-WL-003 | PR merge state as the cleanup gate; freshness/auto-fix excluded (see `pr-association`) |
-
-REQ-PROJ-009 (Complete via squash merge) is deprecated and superseded by REQ-PROJ-027: the
-push-branch model under which the user merges through their own PR workflow. Work-lifecycle
-therefore carries the no-squash-merge prohibition (folded into REQ-WL-002) but defines no
-"Complete (squash merge)" action.
-
-REQ-PROJ-030 through REQ-PROJ-032 (PR feedback freshness, agent-facing context baseline,
-bounded refresh) are deliberately not carried here — they belong to the `pr-association` spec.
+This spec supersedes the older abandon / mark-merged design at the normative layer, but the implementation has not been reconciled yet. Executives must therefore distinguish intended authority from shipped behavior rather than marking the unified lifecycle complete early.

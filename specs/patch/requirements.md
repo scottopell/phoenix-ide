@@ -201,12 +201,13 @@ AND reject a patch operation targeting any path outside that directory
 AND return a descriptive error identifying the out-of-scope path and pointing at
   `propose_task` for work that requires editing source files
 
-WHEN conversation is in Direct mode, or in a sub-agent's Explore context (which has no
+WHEN conversation is chat-only, or in a sub-agent's read-only context (which has no
   worktree of its own)
-THE SYSTEM SHALL NOT register the patch tool's task-dir-restricted variant — Direct mode
-  gets the full unscoped patch tool, and Explore sub-agents get no patch tool at all
+THE SYSTEM SHALL NOT register the patch tool's task-dir-restricted variant — chat-only
+  conversations get the full unscoped patch tool, and read-only sub-agents get no patch
+  tool at all
 
-WHEN conversation is in Work mode
+WHEN conversation has write capability against an attached `WorkScope`
 THE SYSTEM SHALL enable full patch tool functionality
 AND the patch tool SHALL operate within the conversation's worktree directory
 
@@ -214,12 +215,12 @@ WHEN a patch operation targets a path outside the worktree directory
 THE SYSTEM SHALL reject the operation
 AND return a descriptive error identifying the out-of-scope path
 
-**Rationale:** Explore mode is read-only for *source* files, but the agent still needs to
-write the task file it proposes — so the patch tool is present in Explore, allowlisted to
-the tasks directory only (REQ-PROJ-003). Out-of-scope writes are rejected with a clear
-error. In Work mode the allowlist widens to the conversation's isolated worktree — a
-conversation cannot use patch to modify the main checkout or another conversation's
-worktree.
+**Rationale:** Read-only planning remains read-only for *source* files, but the agent still
+needs to write the task file it proposes — so the patch tool is present in that read-only
+planning context, allowlisted to the tasks directory only (REQ-PROJ-003). Out-of-scope
+writes are rejected with a clear error. When a conversation has write authority through an
+attached `WorkScope`, the allowlist widens to that isolated worktree — a conversation
+cannot use patch to modify the main checkout or another conversation's worktree.
 
 ---
 

@@ -3,16 +3,16 @@
 --
 -- Phoenix Sub-Agents: Behavioural Specification
 --
--- Scope: Spawn-time validation, per-mode configuration resolution, the
+-- Scope: Spawn-time validation, per-authority configuration resolution, the
 --        cross-domain seam between bedrock's sub-agent state space and
 --        projects' worktree ownership.
 -- Includes:
---   - SubAgentMode (explore/work) and parent-mode rules
+--   - SubAgentExecutionAuthority (read_only/write_capable) and parent-mode rules
 --   - One-writer invariant (per-call AND across calls per parent)
 --   - cwd-scoping invariant for Work sub-agents (incl. task.cwd overrides)
 --   - system-root cwd rejection for every sub-agent mode
 --   - Explore-sub-agent working_dir derivation
---   - Per-mode tool-registry selection (fresh spawn + resume path)
+--   - Per-authority tool-registry selection (fresh spawn + resume path)
 --   - Model and max-turns defaulting & validation (config in @guidance)
 --   - Sub-agent timeout (REQ-SA-006) at the spawn layer
 -- Excludes:
@@ -42,7 +42,7 @@ use "../projects/projects.allium" as projects
 value SubAgentTask {
     task: String                  -- task description, required, non-empty
     cwd: String?                  -- working-directory override
-    mode: SubAgentMode?           -- absent => agent default, else explore
+    execution_authority: SubAgentExecutionAuthority? -- absent => agent default, else read_only
     model: String?                -- explicit model id (must exist in registry)
     max_turns: Integer?           -- override per-mode default
     agent_type: String?           -- named agent persona (see specs/agents/);
@@ -57,7 +57,7 @@ value SubAgentSpec {
     task: String
     cwd: String                   -- absolute path on disk
     timeout: Duration             -- mandatory (REQ-SA-006)
-    mode: SubAgentMode
+    execution_authority: SubAgentExecutionAuthority
     model_id: String              -- exists in LLM registry
     max_turns: Integer            -- > 0
     agent_name: String?           -- named agent that produced this spec (see specs/agents/)
@@ -68,12 +68,12 @@ value SubAgentSpec {
 -- Enumerations
 ------------------------------------------------------------
 
-enum SubAgentMode { explore | work }
+enum SubAgentExecutionAuthority { read_only | write_capable }
 
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
 -- the two variants and which mode picks which.
-enum SubAgentToolRegistry { subagent_explore | subagent_work }
+enum SubAgentToolRegistry { subagent_read_only | subagent_write_capable }
 
 ------------------------------------------------------------
 -- Config
@@ -140,13 +140,13 @@ rule WorkSubAgentRequiresWriteableParent {
     @guidance
         -- Parent mode is read from `ConvContext.mode_context` at the
         -- call site. The only writeable-disqualifying mode is `explore`;
-        -- `parent.mode = explore` => reject. The error string also
+        -- `parent.execution_authority = read_only` => reject. The error string also
         -- instructs the LLM to use `mode: "explore"` or omit `mode` for
         -- read-only sub-agents.
 }
 
 -- One-writer-per-batch: a single `spawn_agents` call carries at most one
--- task with `mode = work`. Mixed batches with several Explore + one Work
+-- task with `execution_authority = write_capable`. Mixed batches with several Explore + one Work
 -- are allowed.
 rule SpawnRejectedMultipleWorkInBatch {
     when: SpawnAgentsToolInvoked(parent, tasks)
@@ -193,9 +193,9 @@ rule SpawnRejectedUnknownModel {
         -- available model ids from the registry.
         --
         -- Defaulting (resolved before this check) is config:
-        --   t.mode = explore, t.model absent =>
+        --   t.execution_authority = read_only, t.model absent =>
         --       LlmRegistry.cheap_model_for_provider(parent.model_id)
-        --   t.mode = work,    t.model absent => parent.model_id
+        --   t.execution_authority = write_capable, t.model absent => parent.model_id
         --   t.model present  => t.model (after this check)
 }
 
@@ -272,7 +272,7 @@ rule SpawnRejectedWorkCwdOutsideWorktree {
 -- for Explore sub-agents the cwd is the parent's working_dir (which is
 -- the worktree path when the parent has one, else the parent's cwd).
 rule SpawnedSubAgentCwdAssignment {
-    when: SubAgentSpawnSucceeded(parent, sub_agent, mode, cwd_override)
+    when: SubAgentSpawnSucceeded(parent, sub_agent, execution_authority, cwd_override)
     ensures:
         if cwd_override != absent:
             sub_agent.working_dir = cwd_override
@@ -330,30 +330,30 @@ rule SubAgentSpecsResolved {
         -- the parent conversation's once-discovered catalog (the same one that
         -- rendered the schema; agents.allium), not a fresh scan (REQ-AG-008).
         --
-        --   resolve_mode(t):
-        --     t.mode.present        => t.mode
-        --     resolve_agent(t).mode => agent.mode
-        --     else                  => explore   (REQ-PROJ-008 default)
+        --   resolve_execution_authority(t):
+        --     t.execution_authority.present        => t.execution_authority
+        --     resolve_agent(t).execution_authority => agent.execution_authority
+        --     else                  => read_only   (REQ-PROJ-008 default)
         --
         --   resolve_model_id(t, parent):
         --     t.model.nonblank       => t.model
         --     resolve_agent(t).model => agent.model
-        --     resolve_mode(t)=explore =>
+        --     resolve_execution_authority(t)=read_only =>
         --         LlmRegistry.cheap_model_for_provider(parent.model_id)
-        --     resolve_mode(t)=work    => parent.model_id
+        --     resolve_execution_authority(t)=write_capable => parent.model_id
         --
         --   resolve_persona(t)    => resolve_agent(t).body   (none when no agent)
         --   resolve_agent_name(t) => resolve_agent(t).name   (none when no agent)
         --   persona/agent_name populate SubAgentSpec; persona feeds
-        --   agents.allium ComposeSubAgentPersona. Mode validation
-        --   (WorkSubAgentRequiresWriteableParent) runs on the *resolved* mode,
-        --   so an agent defaulting to work from an Explore parent is rejected.
+        --   agents.allium ComposeSubAgentPersona. Execution-authority validation
+        --   (WorkSubAgentRequiresWriteableParent) runs on the *resolved* execution authority,
+        --   so an agent defaulting to write_capable from an Explore parent is rejected.
         --
         --   resolve_max_turns(t):
         --     t.max_turns.present => t.max_turns
-        --     resolve_mode(t)=explore =>
+        --     resolve_execution_authority(t)=read_only =>
         --         config.default_max_turns_explore (20)
-        --     resolve_mode(t)=work    =>
+        --     resolve_execution_authority(t)=write_capable =>
         --         config.default_max_turns_work (50)
         --
         --   resolve_cwd(t, parent):
@@ -382,26 +382,26 @@ rule SubAgentSpecsResolved {
 -- ===========================================================
 
 -- Fresh spawn: the registry is determined by the sub-agent's mode.
--- Explore => `subagent_explore` (read-only information tools + browser +
+-- Explore => `subagent_read_only` (read-only information tools + browser +
 -- sandboxed bash when the platform capability is available +
--- submit_result/submit_error). Work => `subagent_work`
+-- submit_result/submit_error). Work => `subagent_write_capable`
 -- (Explore set + Work bash + patch). Both modes get the parent's MCP tool set.
 --
 -- Top-level Explore delegation is independent of sandbox support: the parent may
 -- call `spawn_agents` even when platform capability omits bash. The spawned
--- Explore sub-agent then receives this same `subagent_explore` registry shape
+-- Explore sub-agent then receives this same `subagent_read_only` registry shape
 -- without bash.
 -- The Explore registry never grants write-capable `patch`, and its bash entry
 -- is the same OS-sandboxed, network-blocked, scratch-only bash available to a
 -- top-level Explore conversation. If the platform cannot enforce that sandbox,
 -- the Explore registry omits bash.
 rule SubAgentRegistryOnFreshSpawn {
-    when: SubAgentSpawnSucceeded(parent, sub_agent, mode, cwd_override)
+    when: SubAgentSpawnSucceeded(parent, sub_agent, execution_authority, cwd_override)
     ensures:
-        if mode = work:
-            sub_agent.tool_registry = subagent_work
+        if execution_authority = write_capable:
+            sub_agent.tool_registry = subagent_write_capable
         else:
-            sub_agent.tool_registry = subagent_explore
+            sub_agent.tool_registry = subagent_read_only
     ensures: sub_agent.mcp_enabled = true
 }
 
@@ -414,10 +414,10 @@ rule SubAgentRegistryOnFreshSpawn {
 rule SubAgentRegistryOnResume {
     when: SubAgentRuntimeResumed(sub_agent)
     ensures:
-        if sub_agent.mode = explore:
-            sub_agent.tool_registry = subagent_explore
+        if sub_agent.execution_authority = read_only:
+            sub_agent.tool_registry = subagent_read_only
         else:
-            sub_agent.tool_registry = subagent_work
+            sub_agent.tool_registry = subagent_write_capable
     ensures: sub_agent.mcp_enabled = true
     -- A named agent's persona is likewise restored on this path: it is
     -- persisted with the sub-agent conversation at spawn and re-read into the
@@ -435,8 +435,8 @@ rule SubAgentRegistryOnResume {
         --     parent cannot spawn a Work sub-agent; see
         --     WorkSubAgentRequiresWriteableParent).
         --
-        -- So the resume mapping is: Explore variant -> subagent_explore;
-        -- Direct / Work / Branch -> subagent_work. A Work sub-agent
+        -- So the resume mapping is: Explore variant -> subagent_read_only;
+        -- Direct / Work / Branch -> subagent_write_capable. A Work sub-agent
         -- spawned from a Direct parent therefore keeps `patch` across
         -- runtime re-creation despite being persisted as Direct.
 }
@@ -469,7 +469,7 @@ invariant OneWorkSubAgentPerParent {
 -- `parent.mode in { work, branch }` precondition). Explore sub-agents
 -- are read-only, so escape-via-cwd is not a write-safety concern.
 invariant WorkSubAgentCwdInsideWorktree {
-    for sa in SubAgents where sa.mode != explore and sa.parent.mode in { work, branch }:
+    for sa in SubAgents where sa.execution_authority = write_capable and sa.parent.mode in { work, branch }:
         is_within(sa.working_dir, sa.parent.worktree_path)
 }
 
@@ -483,9 +483,9 @@ invariant WorkSubAgentCwdInsideWorktree {
 -- Branch.)
 invariant ToolRegistryMatchesMode {
     for sa in SubAgents:
-        (sa.mode = explore
-            implies sa.tool_registry = subagent_explore)
+        (sa.execution_authority = read_only
+            implies sa.tool_registry = subagent_read_only)
         and
-        (sa.mode != explore
-            implies sa.tool_registry = subagent_work)
+        (sa.execution_authority = write_capable
+            implies sa.tool_registry = subagent_write_capable)
 }

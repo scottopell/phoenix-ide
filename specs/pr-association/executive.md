@@ -2,9 +2,7 @@
 
 ## What This Spec Covers
 
-PR association is the WorkScope-owned link between a Work or Branch conversation and the GitHub
-pull requests Phoenix has observed for it. Phoenix persists plural association history and one
-explicit active PR for PR-specific targeting. This spec owns:
+PR association is the WorkScope-owned link between the currently shipped Git-backed Work/Branch conversation surfaces and the GitHub pull requests Phoenix has observed for them. Phoenix persists plural association history and one explicit active PR for PR-specific targeting. This spec owns:
 
 - **Observed-branch history** — durable WorkScope-keyed history of settled task-branch heads
   observed at supported reconciliation boundaries.
@@ -55,6 +53,10 @@ history that led there, keep status fresh without rate-limiting itself, point PR
 at the correct explicit PR, show that PR's identity/status in one stable StateBar surface, and
 flag when review feedback has arrived since the last time it handed that feedback to the agent —
 without ever blocking ordinary work or treating feedback freshness as branch health.
+
+## Current Reality
+
+The PR-association layer itself is broadly implemented, but it still feeds legacy product surfaces: StateBar branch/PR badges, the Work/Branch actions rail, and cleanup guidance around mark-merged / abandon. The reconciliation in task 92030 corrected spec drift away from mode-gated product terminology, but the codebase still serves legacy Work/Branch UX while unified Close/Open/History behavior remains unimplemented.
 
 ## Requirements Summary
 

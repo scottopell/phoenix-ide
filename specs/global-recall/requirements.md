@@ -4,7 +4,7 @@
 
 As a Phoenix user, I often have several unrelated streams of work active across projects, continuation chains, and standalone conversations. I want one durable Phoenix-wide conversation where I can survey that work, inspect relevant history, and send useful text guidance to existing conversations without opening and operating each one manually.
 
-The Coordinator is an open-ended cross-conversation console, not ambient memory for ordinary coding conversations and not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer.
+The Coordinator is an open-ended cross-conversation console, not ambient memory for ordinary coding conversations and not a manager for one global objective. It receives deterministic current-work orientation from Phoenix, selectively reads source conversations, and may communicate through the same message acceptance path used by the ordinary chat composer. Structurally, Phoenix models Coordinator identity separately from ordinary product-conversation lifecycle rows: ordinary parent transcript rows participate in the Open/History product lifecycle and WorkScope model, while the Coordinator retains normal transcript persistence, continuation, and message runtime without any ProductConversation Open/History lifecycle or ordinary Close/Delete controls. Sub-agents remain a separate execution kind and are not Coordinators.
 
 ## Why the User Cares
 
@@ -37,14 +37,14 @@ THE SYSTEM SHALL provide bounded relational facts rather than application-inferr
 WHEN a user opens the Coordinator surface
 THE surface SHALL present only the normal Coordinator conversation
 
-THE facts SHALL distinguish continuation-root identity from current-conversation identity and SHALL include current state, state-update time, conversation-update time, available task metadata, WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
+THE facts SHALL distinguish durable root identity from latest execution-row identity and SHALL include current state, state-update time, conversation-update time, available task metadata, attached WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
 
 ---
 
 ### REQ-GR-002: Expose Continuation Identity Without Collapsing Evidence
 
 WHEN conversations form a continuation chain
-THE SYSTEM SHALL expose both the durable chain root and the current/latest conversation
+THE SYSTEM SHALL expose both the durable root conversation and the current/latest execution row
 
 WHEN the Coordinator requests current transcript evidence
 THE SYSTEM SHALL direct it to the current/latest conversation rather than silently reading only the historical root
@@ -100,7 +100,10 @@ THE SYSTEM SHALL create that Coordinator conversation on demand when it does not
 
 THE Coordinator SHALL use the normal transcript, composer, streaming, continuation, persistence, and user-message runtime
 
+THE SYSTEM SHALL structurally distinguish the Coordinator from ordinary product conversations rather than encoding that difference as omitted lifecycle fields or nullable product-conversation links
+
 THE SYSTEM SHALL NOT present the Coordinator as ordinary project coding work or as a user-created open-work item
+AND SHALL NOT give the Coordinator an ordinary ProductConversation Open/History lifecycle, WorkScope attachment, Close control, or Delete control
 
 THE SYSTEM SHALL reject archive and hard-delete operations targeting any member of the Coordinator continuation chain so its transcript and singleton identity remain durable
 
@@ -115,19 +118,20 @@ WHILE a normal coding conversation is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
 WHILE the Coordinator is answering a user request
-THE SYSTEM MAY provide host-bound tools for global message search, bounded conversation reads, bounded read-only database queries, reference resolution, and OS-sandboxed filesystem inspection
+THE SYSTEM MAY provide host-bound tools for global message search across Phoenix's own conversation/message corpus, bounded conversation reads, bounded read-only database queries, reference resolution, and OS-sandboxed filesystem inspection
+AND those tools SHALL remain host-bound capabilities that ordinary conversations cannot widen or invoke as Phoenix-wide ambient memory
 
 WHEN the Coordinator invokes sandboxed filesystem inspection
 THE SYSTEM SHALL require an explicit active `WorkScope` ID for every new command
-AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching the existing Explore-mode `nono` sandbox
+AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching the read-only planning `nono` sandbox
 AND SHALL NOT infer a default repository or cwd
-AND SHALL withhold the tool when the Explore sandbox is unavailable
+AND SHALL withhold the tool when the sandbox is unavailable
 
 THE SYSTEM MAY provide exactly one cross-conversation mutation capability to the Coordinator: sending non-empty text to one existing non-Coordinator conversation through the authoritative user-message acceptance path
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
-THE SYSTEM SHALL NOT provide writable filesystem, browser, MCP, task drafting, task approval, project, workspace, conversation creation, or other lifecycle mutation tools to the Coordinator
+THE SYSTEM SHALL NOT provide writable filesystem, browser, MCP, task drafting, task approval, project, workspace, conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other lifecycle mutation tools to the Coordinator
 
 ---
 
@@ -220,6 +224,7 @@ IF the target cannot accept the message
 THE SYSTEM SHALL report a rejected result with a stable reason code and explanatory message and SHALL NOT report it as delivered or queued
 
 THE SYSTEM SHALL reject the Coordinator conversation and every member of its continuation chain as message targets
+AND SHALL continue to treat sub-agent conversations as separately ineligible targets under the ordinary acceptance rules rather than by conflating them with Coordinator identity
 
 THE SYSTEM SHALL reject archived, deleted, unavailable, terminal, context-exhausted, awaiting-question, and awaiting-approval targets according to authoritative conversation state
 

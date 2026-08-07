@@ -17,25 +17,9 @@ resource reconciliation, and compensation.
 
 ## Current Reality
 
-The normative package has been rewritten to the one-scheduler, durable-
-acknowledgement model captured by the grand-vision review. The requirements,
-Allium package, and a superseding ADR now remove permanent selector,
-shadow-authority, rollback, exact-drain, and universal-lease machinery from the
-steady-state contract.
+The normalized engine foundation and wake vertical slice are implemented. Workflow attempts, receipts, deliveries, schedules, wake bindings, terminal evidence, and message links have normalized persisted authorities; wake is restart-safe for Bash/tmux obligations and remains the only profile with full end-to-end production coverage.
 
-The normalized foundation and wake vertical slice implement the one-scheduler
-SQLite contract. Workflow attempts, receipts, deliveries, schedules, wake
-bindings, terminal evidence, and message links have normalized persisted
-authorities. Attempt authority is universally fenced, leases are limited to
-reclaimable observation, canonical delivery and runtime acceptance are atomic,
-and incompatible persisted work is explicit.
-
-Wake is implemented end to end for durable Bash and tmux obligations:
-registration precedes acknowledgement, observation and deadline arbitration are
-restart-safe, terminal results materialize once as linked conversation messages,
-adoption atomically resolves exact delivery sets, and auto-resume is coalesced
-through durable runtime acceptance. Direct chat and conversation creation remain
-specified profiles without matching vertical-slice implementations.
+Direct-chat foundations have landed only partially. The pure aggregate/repository layer now contains accepted-turn identity, immutable prepared payload, runtime-acceptance, replay, and deterministic test foundations (see `crates/phoenix-db/src/workflow/direct_turn.rs` and the status row for REQ-DWF-CHAT-012–014), but Phoenix has not cut production chat submission/reconciliation over to that durable profile yet. Conversation creation is in a similar state: shell-first and protocol/model work exist, while production worker/orchestration cutover remains incomplete.
 
 ## Normative Shape
 
