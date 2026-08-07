@@ -186,6 +186,7 @@ entity Conversation {
 
     -- Mode (orthogonal to status)
     mode: explore | direct | work | branch
+    execution_authority: read_only | write_capable | chat_only
     mode_kind: ModeKind
     environment_kind: EnvironmentKind
     desired_base_branch: String?
@@ -285,7 +286,7 @@ entity Conversation {
 
     -- Relationships
     sub_agents: Conversation with parent = this
-    work_sub_agents: sub_agents where mode in { work, branch }
+    write_capable_sub_agents: sub_agents where execution_authority = write_capable
 
     -- Derived
     is_busy: core_status in { llm_requesting, executing_tools,
@@ -298,7 +299,7 @@ entity Conversation {
 
     -- Entity-level invariants
     invariant OneWorkSubAgent {
-        work_sub_agents.count <= 1
+        write_capable_sub_agents.count <= 1
     }
 }
 
@@ -1246,7 +1247,6 @@ rule ContinuationSummaryReceived {
         -- Persist the summary message and context-exhausted state atomically.
         -- Derive the summary message identity from operation_id so replay cannot
         -- create a second committed summary.
-    ensures: conversation.lifecycle = open
 }
 
 rule ContinuationFailureBecomesRecoverable {
@@ -1328,12 +1328,13 @@ rule UserStartsContinuationConversation {
     when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
-    requires: conversation.product_conversation.kind = ordinary
-    requires: conversation.product_lifecycle = open
+    requires:
+        conversation.product_conversation.kind = coordinator
+        or conversation.product_lifecycle = open
     ensures: conversation.continued_in_conv_id = new_conv
     ensures: new_conv.predecessor = conversation
     ensures: new_conv.root = conversation.root_conversation
-    ensures: new_conv.lifecycle = open
+    ensures: new_conv.product_conversation = conversation.product_conversation
     ensures: new_conv.mode = conversation.mode
     ensures: new_conv.working_dir = conversation.working_dir
     ensures: SuccessorFirstUserMessageAccepted(new_conv, handoff_text, first_message_id)
@@ -1343,8 +1344,9 @@ rule ContinuationHandoffBecomesBoundary {
     when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
-    requires: conversation.product_conversation.kind = ordinary
-    requires: conversation.product_lifecycle = open
+    requires:
+        conversation.product_conversation.kind = coordinator
+        or conversation.product_lifecycle = open
     ensures: conversation.parent_status = handed_off
     ensures: conversation.continuation_boundary_summary = conversation.continuation_summary
 
@@ -2109,7 +2111,10 @@ surface UserConversation {
         UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
             when conversation.parent_status = context_exhausted
                  and conversation.continued_in_conv_id = absent
-                 and conversation.product_lifecycle = open
+                 and (
+                    conversation.product_conversation.kind = coordinator
+                    or conversation.product_lifecycle = open
+                 )
         UserRequestsCloseConversation(
             conversation,
             next_close_attempt_id(conversation.product_conversation)

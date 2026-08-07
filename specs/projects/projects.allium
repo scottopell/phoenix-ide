@@ -582,12 +582,12 @@ rule WriteBlockedOutsideWorktree {
         reason: "Write target is outside the worktree")
 }
 
-rule WorkSubAgentInheritsWorktree {
-    when: SubAgentSpawned(parent, sub_agent, mode)
+rule WriteCapableSubAgentInheritsWorktree {
+    when: SubAgentSpawned(parent, sub_agent, execution_authority)
 
     requires: exists Worktree{product_conversation: parent.product_conversation}
     requires: parent.continued_in_conv_id = absent
-    requires: mode = work
+    requires: execution_authority = write_capable
 
     ensures: sub_agent.working_dir = parent.worktree_path
     ensures: SubAgentAttachedToSharedWorkScope(parent, sub_agent)
@@ -597,10 +597,10 @@ rule WorkSubAgentInheritsWorktree {
         -- acquire cleanup authority and do not cause separate teardown behaviour.
 }
 
-rule ExploreSubAgentDirectory {
-    when: SubAgentSpawned(parent, sub_agent, mode)
+rule ReadOnlySubAgentDirectory {
+    when: SubAgentSpawned(parent, sub_agent, execution_authority)
 
-    requires: mode = explore
+    requires: execution_authority = read_only
 
     ensures:
         if exists Worktree{product_conversation: parent.product_conversation}:

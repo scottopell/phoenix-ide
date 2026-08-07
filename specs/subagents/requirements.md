@@ -135,8 +135,8 @@ sub-agent work completes or fails within a bounded time.
 
 ### REQ-SA-007: Model Selection
 
-**Superseded by REQ-PROJ-008 (sub-agent modes).** The tier concept
-(`fast`/`capable`) is replaced by mode-based defaults with optional
+**Superseded by REQ-PROJ-008 (sub-agent execution authority).** The tier concept
+(`fast`/`capable`) is replaced by execution-authority-based defaults with optional
 explicit model override:
 
 - Read-only sub-agent execution defaults to the cheapest available model for the

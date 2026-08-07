@@ -72,10 +72,12 @@
 -- A truncated replay produces a partial in-flight view; the client can
 -- surface this to the user analogously to the broadcast-lag close path.
 value InitSnapshot {
+    product_conversation_lifecycle: ProductConversationLifecycleUpdate
     last_sequence_id: Integer
     pending_anchor_sequence_id: Integer
     pending_events: List<PendingEventEntry>
     pending_truncated: Boolean
+    -- product_conversation_lifecycle is the authoritative aggregate snapshot;
     -- conversation, messages, agent_working, display_state,
     -- context_window_size, model_context_window, project_name: opaque at this level.
 }
@@ -90,7 +92,7 @@ value InitSnapshot {
 -- is:
 --   "init", "message", "message_updated", "state_change", "token",
 --   "agent_done", "conversation_update", "product_conversation_lifecycle",
---   "continuation_boundary", "error", "browser_session_state",
+--   "continuation_boundary", "work_scope_update", "error", "browser_session_state",
 --   "steer_message_queued", "rate_limit_snapshot",
 --   "conversation_hard_deleted", "llm_first_byte", "llm_attempt"
 --
@@ -99,7 +101,7 @@ value InitSnapshot {
 --     (EagerAssistantMessageAppendedToReplayRing below).
 --   - "token", "state_change", "message_updated", "agent_done",
 --     "conversation_update", "product_conversation_lifecycle",
---     "continuation_boundary", "error", "browser_session_state",
+--     "continuation_boundary", "work_scope_update", "error", "browser_session_state",
 --     "steer_message_queued",
 --     "rate_limit_snapshot", "llm_first_byte", "llm_attempt" enter
 --     via the ephemeral path (EphemeralEventAppendedToReplayRing
@@ -667,7 +669,7 @@ rule EphemeralEventAppendedToReplayRing {
     requires: entry.event_type in {
         "token", "state_change", "message_updated", "agent_done",
         "conversation_update", "product_conversation_lifecycle",
-        "continuation_boundary", "error",
+        "continuation_boundary", "work_scope_update", "error",
         "browser_session_state", "steer_message_queued",
         "rate_limit_snapshot", "llm_first_byte", "llm_attempt"
     }

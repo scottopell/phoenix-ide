@@ -20,7 +20,7 @@ That unified lifecycle is not yet the shipped product behavior. Phoenix still ex
 
 ## Normative Authority
 
-Current normative authority is `requirements.md`, `specs/bedrock/bedrock.allium`, and ADR-025. This executive intentionally reports current implementation drift instead of treating the normative Close model as shipped.
+Current normative authority is `requirements.md`, `specs/bedrock/bedrock.allium`, and ADR-026. This executive intentionally reports current implementation drift instead of treating the normative Close model as shipped.
 
 ## Implementation Status
 

@@ -44,8 +44,10 @@ AND SHALL NOT expose those deprecated verbs as current writable lifecycle choice
 
 ### REQ-WL-002: Retirement Inspection Classifies Exact Worktree-Loss Risk Before Destructive Teardown
 
-WHEN bedrock requests retirement inspection for an attached Git-backed `WorkScope` for one exact Close attempt
-THE SYSTEM SHALL inspect only state whose durability depends on the attached worktree and its owned resources
+WHEN bedrock requests retirement inspection for one exact Close attempt
+THE SYSTEM SHALL inspect every attached `WorkScope` that owns a Git-backed worktree
+AND SHALL bind each evidence set to that exact Close attempt and exact attached `WorkScope` identity
+AND SHALL inspect only state whose durability depends on that scope's attached worktree and owned resources
 AND SHALL classify loss risk into these independent categories:
 - staged tracked paths
 - unstaged tracked paths, including conflicted or otherwise unmerged paths
@@ -60,12 +62,16 @@ AND SHALL treat reflog-only detached commits as at-risk detached commits
 AND SHALL scope nested-repository inspection only to declared submodules rather than recursively inventing preservation rules for arbitrary nested repositories
 
 WHEN any one or more of those categories are present
-THE SYSTEM SHALL return an exact categorized inventory with one materialized loss row per exact `(category, item_identity)`
+THE SYSTEM SHALL return an exact categorized inventory with one materialized loss row per exact `(attached_workscope_identity, category, item_identity)`
 AND SHALL include every relevant path row and every detached-commit identity rather than collapsing multiple items into one category summary
 AND SHALL require explicit discard confirmation before destructive retirement begins
 
 WHEN no category is present
 THE SYSTEM SHALL allow retirement to proceed without a discard confirmation
+
+WHEN multiple attached `WorkScope`s own Git-backed worktrees
+THE SYSTEM SHALL determine confirmation from the union of their exact per-scope inventories
+AND SHALL NOT treat missing inspection evidence for any attached worktree-owning scope as a no-loss result
 
 **Rationale:** Phoenix owns the disposable environment, not repository history. Loss inspection must warn exactly about worktree-only risk without conflating it with durable refs the user still owns.
 
@@ -73,8 +79,8 @@ THE SYSTEM SHALL allow retirement to proceed without a discard confirmation
 
 ### REQ-WL-002a: Retirement Inspection Binds Confirmation to One Exact Workspace Generation
 
-WHEN retirement inspection completes for an attached Git-backed `WorkScope`
-THE SYSTEM SHALL produce an inspection generation and workspace fingerprint together with the categorized results
+WHEN retirement inspection completes for attached Git-backed `WorkScope`s
+THE SYSTEM SHALL produce one inspection generation and workspace fingerprint with the categorized results for each exact attached worktree-owning scope
 
 WHEN that inspection requires discard confirmation
 THE SYSTEM SHALL expose one concrete user-facing discard-confirmation affordance that issues `UserConfirmsCloseAfterRetirementInspection(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)`
@@ -109,8 +115,8 @@ THE SYSTEM SHALL treat it as a typed inspection-mismatch path that returns the C
 
 ### REQ-WL-002b: Retirement Retires Owned Resources Stepwise, Idempotently, and Without Automatic Recovery Artifacts
 
-WHEN bedrock requests resource retirement for an attached Git-backed `WorkScope` for one exact Close attempt
-THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources, including the worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that same WorkScope
+WHEN bedrock requests resource retirement for one exact Close attempt
+THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources for every attached `WorkScope` targeted by that operation, including each worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that exact WorkScope
 
 THE SYSTEM SHALL treat the attached `WorkScope` as the owner of the retireable resources
 AND SHALL derive cleanup authority only from the root product conversation's committed Close retirement operation targeting that attached `WorkScope`
@@ -133,7 +139,7 @@ THE SYSTEM SHALL record `RetiredResource` evidence for that resource bound to th
 AND SHALL treat a later retry that encounters the same resource already retired as an idempotent no-op rather than as a failure or a second completion
 
 WHEN retirement succeeds overall
-THE SYSTEM SHALL emit success only after every owned resource has either produced `RetiredResource` evidence for that exact attempt or been accepted as an idempotent already-retired no-op for that exact attempt
+THE SYSTEM SHALL emit success only after every owned resource of every attached owned `WorkScope` has either produced `RetiredResource` evidence for that exact attempt and exact scope or been accepted as an idempotent already-retired no-op for that exact attempt and scope
 
 WHEN retirement cannot retire every owned resource
 THE SYSTEM SHALL report typed residual cleanup state and repair information rather than silently succeeding

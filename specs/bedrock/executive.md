@@ -4,7 +4,7 @@
 
 Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model: messages move through explicit idle, LLM, tool, cancellation, error, continuation, and approval states; tools execute serially; cancellation synthesizes tool results when needed to preserve transcript/API integrity; retryable versus non-retryable failures stay distinct; and committed transcript history survives restarts.
 
-Current normative authority is `requirements.md` for timeless rules, `bedrock.allium` for precise lifecycle/state-machine behavior, and ADR-025 for lifecycle-versus-WorkScope ownership.
+Current normative authority is `requirements.md` for timeless rules, `bedrock.allium` for precise lifecycle/state-machine behavior, and ADR-026 for lifecycle-versus-WorkScope ownership.
 
 ## Current Reality
 
@@ -49,6 +49,8 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-029:** Conversation Terminal State on Task Resolution | ✅ Complete (legacy current reality) | Task resolution still reaches terminal cleanup through legacy abandon / mark-merged flows (`crates/phoenix-ide/src/api/lifecycle_handlers.rs`, `crates/phoenix-state-machine/src/transition.rs`) rather than the future Close→History cutover |
 | **REQ-BED-030:** Context Continuation Inherits Parent Environment | ✅ Complete | Continuation still reuses the attached environment via `continued_in_conv_id` / transferred work-scope ownership (`crates/phoenix-db/src/lib.rs:5316-5537`) |
 | **REQ-BED-031:** Exhausted Parent Post-Handoff Behavior | ✅ Complete | Parent cleanup is already suppressed once continuation exists; legacy abandon / mark-merged endpoints reject when `continued_in_conv_id` is set (`crates/phoenix-ide/src/api/lifecycle_handlers.rs:908-918`) |
-| **REQ-BED-032:** Conversation Hard-Delete Cascade | ✅ Complete | `ConversationHardDeleted` lifecycle event emitted from `runtime.rs:426,1198`; bash + tmux subscribers wired; `RejectHardDeleteWhileBusy` enforced (see `bedrock.allium:899-958`) |
+| **REQ-BED-031A:** Start Follow-up Creates Fresh Open Conversation | Not implemented | Normative target requires a fresh ProductConversation/WorkScope, exact follow-up objective, no transcript injection, and typed `follow_up` provenance |
+| **REQ-BED-031B:** Permanent Delete Removes Aggregate Idempotently | Not implemented | Shipped hard delete removes a legacy row-oriented shape; complete ProductConversation aggregate deletion, normalized-child coverage, and typed surviving provenance tombstones remain migration targets |
+| **REQ-BED-032:** Conversation Terminal-Transition Cascade | ✅ Complete (legacy current reality) | Existing hard-delete cascade invokes bash/tmux/projects/browser cleanup and broadcasts `ConversationHardDeleted`; aggregate-aware Delete remains governed by REQ-BED-031B |
 
-**Progress:** 29 of 32 complete (3 deprecated, not counted)
+**Current implementation:** 29 requirements complete, 3 deprecated, and 2 aggregate lifecycle requirements not implemented.

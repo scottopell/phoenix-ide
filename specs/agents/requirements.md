@@ -115,19 +115,19 @@ cache-invalidation surface (see REQ-AG-008).
 
 WHEN a `spawn_agents` task names an `agent_type` that matches a discovered
 agent
-THE SYSTEM SHALL resolve the sub-agent's mode, model, and persona from the
+THE SYSTEM SHALL resolve the sub-agent's execution authority, model, and persona from the
 agent definition
 
 THE SYSTEM SHALL apply field precedence, highest first: an explicit value on
-the task spec, then the agent definition's value, then the mode-based default
+the task spec, then the agent definition's value, then the execution-authority-based default
 
 WHEN a task omits `agent_type`
-THE SYSTEM SHALL resolve the sub-agent exactly as today (no persona; mode and
-model from the task spec or mode-based defaults)
+THE SYSTEM SHALL resolve the sub-agent without a persona, using execution authority and
+model from the task spec or execution-authority-based defaults
 
 **Rationale:** Precedence makes the agent definition a *default-bearing* layer
-between the LLM's explicit per-call overrides and the system's mode defaults.
-The LLM can still override an agent's default model or mode for a one-off
+between the LLM's explicit per-call overrides and the system's execution-authority defaults.
+The LLM can still override an agent's default model or execution authority for a one-off
 without editing the file, and the existing anonymous-spawn path is untouched.
 
 ---

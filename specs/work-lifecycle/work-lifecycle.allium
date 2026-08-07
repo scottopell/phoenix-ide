@@ -178,44 +178,44 @@ rule ChatOnlyCloseSkipsWorktreeInspection {
 
 rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
     when: RetirementInspectionRequested(product_conversation, attempt_id)
-    let scope_binding = AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
-    ensures: RetirementAttempt.created(
-        attempt_id: attempt_id,
-        product_conversation: product_conversation,
-        scope: scope_binding.scope,
-        inspection: RetirementInspection {
-            generation: current_retirement_inspection_generation(product_conversation),
-            fingerprint: current_retirement_inspection_fingerprint(product_conversation)
-        }
-    )
     ensures:
-        for category in current_retirement_loss_categories(product_conversation):
-            for item_identity in current_retirement_loss_item_identities(product_conversation, category):
-                RetirementLossCategoryRow.created(
-                    attempt: RetirementAttempt{
-                        attempt_id: attempt_id,
-                        product_conversation: product_conversation,
-                        scope: scope_binding.scope,
+        for scope_binding in attached_worktree_scopes(product_conversation):
+            RetirementAttempt.created(
+                attempt_id: attempt_id,
+                product_conversation: product_conversation,
+                scope: scope_binding.scope,
+                inspection: RetirementInspection {
+                    generation: current_retirement_inspection_generation(product_conversation, scope_binding.scope),
+                    fingerprint: current_retirement_inspection_fingerprint(product_conversation, scope_binding.scope)
+                }
+            )
+            and for category in current_retirement_loss_categories(product_conversation, scope_binding.scope):
+                for item_identity in current_retirement_loss_item_identities(product_conversation, scope_binding.scope, category):
+                    RetirementLossCategoryRow.created(
+                        attempt: RetirementAttempt{
+                            attempt_id: attempt_id,
+                            product_conversation: product_conversation,
+                            scope: scope_binding.scope,
+                            inspection: RetirementInspection {
+                                generation: current_retirement_inspection_generation(product_conversation, scope_binding.scope),
+                                fingerprint: current_retirement_inspection_fingerprint(product_conversation, scope_binding.scope)
+                            }
+                        },
                         inspection: RetirementInspection {
-                            generation: current_retirement_inspection_generation(product_conversation),
-                            fingerprint: current_retirement_inspection_fingerprint(product_conversation)
-                        }
-                    },
-                    inspection: RetirementInspection {
-                        generation: current_retirement_inspection_generation(product_conversation),
-                        fingerprint: current_retirement_inspection_fingerprint(product_conversation)
-                    },
-                    category: category,
-                    item_identity: item_identity
-                )
+                            generation: current_retirement_inspection_generation(product_conversation, scope_binding.scope),
+                            fingerprint: current_retirement_inspection_fingerprint(product_conversation, scope_binding.scope)
+                        },
+                        category: category,
+                        item_identity: item_identity
+                    )
 
     @guidance
         -- Before selecting the with-loss or without-loss inspection outcome, Phoenix
         -- materializes one exact RetirementAttempt plus its exact RetirementInspection
-        -- and categorized loss inventory for the attached Git-backed scope bound to
-        -- this Close attempt_id. Each RetirementLossCategoryRow is one exact
-        -- (category, item_identity) row, so every at-risk path or detached commit
+        -- and categorized loss inventory for every attached Git-backed scope bound
+        -- to this Close attempt_id. Each RetirementLossCategoryRow is one exact
+        -- (scope, category, item_identity) row, so every at-risk path or detached commit
         -- becomes distinct evidence rather than collapsing multiple items into one
         -- category summary. Outcome selection then reads this attempt-bound evidence
         -- rather than recomputing from an untyped side channel.
@@ -241,7 +241,9 @@ rule CloseWithoutAttachedWorkScopeCompletesRetirementIdempotently {
 rule GitBackedInspectionWithoutLossRequestsRetirement {
     when: RetirementInspectionRequested(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
-    requires: exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
+    requires:
+        for scope_binding in attached_worktree_scopes(product_conversation):
+            exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
     requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
     requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
     requires: not exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: untracked_non_ignored_paths}
@@ -268,7 +270,9 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
 rule GitBackedInspectionWithLossRequiresConfirmation {
     when: RetirementInspectionRequested(product_conversation, attempt_id)
     requires: exists AttachedWorkScope{product_conversation: product_conversation, owns_git_worktree: true}
-    requires: exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}
+    requires:
+        for scope_binding in attached_worktree_scopes(product_conversation):
+            exists RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope, inspection: RetirementInspection}
     requires:
         exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: staged_tracked_paths}
         or exists RetirementLossCategoryRow{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: AttachedWorkScope.scope, inspection: RetirementInspection}, inspection: RetirementInspection, category: unstaged_tracked_paths}
@@ -338,17 +342,19 @@ rule RetirementRequestedRetiresOwnedResources {
         retirement_requested,
         needs_repair
     }
-    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
     requires: exists AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
-    requires: not blocked_by_distinct_open_product_or_identity_conflict(product_conversation)
-    requires: all_owned_resources_retired(product_conversation)
+    requires:
+        for scope_binding in attached_owned_scopes(product_conversation):
+            exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+            and not blocked_by_distinct_open_product_or_identity_conflict(product_conversation, scope_binding.scope)
+            and all_owned_resources_retired(product_conversation, scope_binding.scope)
     ensures: ResourceRetirementCompleted(product_conversation, attempt_id)
 
     @guidance
         -- Retirement completion is the final aggregate gate only after per-resource
-        -- retirement has already produced exact-attempt evidence for every owned
-        -- resource or exact-attempt absence evidence where applicable.
+        -- retirement has already produced exact-attempt, exact-scope evidence for
+        -- every owned resource of every attached owned scope, or exact-attempt
+        -- absence evidence where applicable.
 }
 
 rule RetirementRequestedCreatesPerResourceEvidence {
