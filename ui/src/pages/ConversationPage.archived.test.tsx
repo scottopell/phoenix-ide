@@ -1096,9 +1096,12 @@ describe('ConversationPage archived read-only rendering', () => {
       </ConversationContext.Provider>,
     );
     await waitFor(() => expect(cacheDB.getMessages).toHaveBeenCalledWith(conversation.id));
-    routeFailure.reject(new Error('temporary route failure'));
+    await act(async () => {
+      routeFailure.reject(new Error('temporary route failure'));
+      await routeFailure.promise.catch(() => undefined);
+    });
 
-    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(screen.getByText('keep this history visible')).toBeInTheDocument();
     expect(screen.queryByText('temporary route failure')).not.toBeInTheDocument();
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
 
