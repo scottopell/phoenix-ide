@@ -1739,7 +1739,18 @@ impl WorkflowRepository {
         input: &RecordObservationInput,
     ) -> DbResult<RecordObservationResult> {
         let mut tx = self.begin_tx().await?;
-        let result = tx.record_observation(input).await?;
+        #[cfg(not(test))]
+        let input = RecordObservationInput {
+            now: Timestamp(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs()),
+            ),
+            ..input.clone()
+        };
+        #[cfg(test)]
+        let input = input.clone();
+        let result = tx.record_observation(&input).await?;
         tx.commit().await?;
         Ok(result)
     }

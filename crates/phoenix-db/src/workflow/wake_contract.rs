@@ -117,7 +117,12 @@ impl WakeContractRepository {
             ));
         }
         let mut tx = self.workflow_repo.begin_immediate_tx().await?;
-        if !validate_observation_authority_tx(&mut tx, input).await? {
+        let current = self.load_state_tx(&mut tx, input.workflow_id).await?;
+        let exact_replay = matches!(
+            transition(&current, input.command.clone()).disposition,
+            WakeDisposition::Replayed { .. }
+        );
+        if !exact_replay && !validate_observation_authority_tx(&mut tx, input).await? {
             tx.rollback().await?;
             return Ok(CommitWakeCommandOutcome::Rejected(
                 WakeRejection::ObservationAuthorityMismatch,
@@ -293,6 +298,23 @@ impl WakeContractRepository {
                 if committed != CommitOutcome::Committed {
                     tx.rollback().await?;
                     return Ok(CommitWakeCommandOutcome::VersionConflict);
+                }
+                if matches!(
+                    event.kind,
+                    phoenix_workflow::wake_contract::WakeEventKind::DeliveryOwnerTransferred { .. }
+                ) {
+                    sqlx::query(
+                        "UPDATE workflow_effects SET status = 'Invalidated'
+                         WHERE workflow_id = ?1 AND effect_id = ?2
+                           AND kind = 'transfer_delivery_owner' AND status = 'Eligible'",
+                    )
+                    .bind(super::to_i64(workflow_id.0, "workflow_id")?)
+                    .bind(super::to_i64(
+                        effect_id(event.transition_id, WakeEffectRole::TransferDeliveryOwner)?,
+                        "effect_id",
+                    )?)
+                    .execute(&mut *tx.tx)
+                    .await?;
                 }
                 if let Some(bundle) = &terminal_bundle {
                     insert_terminal_receipt_tx(
@@ -524,17 +546,21 @@ async fn validate_observation_authority_tx(
             evidence.occurred_at,
         ),
     };
-    let exact_recorded: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM workflow_attempts a
+    let (exact_recorded, all_recorded): (i64, i64) = sqlx::query_as(
+        "SELECT
+             SUM(CASE WHEN o.observation_codec_family = ?3
+                           AND o.observation_codec_version = ?4
+                           AND o.observation_payload = ?5 AND o.observed_at = ?6
+                      THEN 1 ELSE 0 END),
+             COUNT(*)
+         FROM workflow_attempts a
          JOIN workflow_authoritative_observations o
            ON o.workflow_id = a.workflow_id AND o.attempt_id = a.attempt_id
          JOIN workflow_effects e
            ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id
          WHERE a.workflow_id = ?1 AND a.attempt_id = ?2
            AND a.status IN ('ObservationRecorded', 'AuthorityLost')
-           AND e.kind = 'begin_observation'
-           AND o.observation_codec_family = ?3 AND o.observation_codec_version = ?4
-           AND o.observation_payload = ?5 AND o.observed_at = ?6",
+           AND e.kind = 'begin_observation'",
     )
     .bind(workflow_id)
     .bind(attempt_id)
@@ -544,7 +570,7 @@ async fn validate_observation_authority_tx(
     .bind(super::to_i64(observed_at.0, "observed_at")?)
     .fetch_one(&mut *tx.tx)
     .await?;
-    Ok(exact_recorded > 0)
+    Ok(exact_recorded > 0 && exact_recorded == all_recorded)
 }
 
 async fn validate_authority_projection_tx(
@@ -816,12 +842,19 @@ async fn validate_replay_artifacts_tx(
         },
     )?);
     if let Some(effect_id) = expected_effect_id {
+        let required_status = matches!(
+            event.kind,
+            phoenix_workflow::wake_contract::WakeEventKind::DeliveryOwnerTransferred { .. }
+        )
+        .then_some("Invalidated");
         let effect_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM workflow_effects
-             WHERE workflow_id = ?1 AND effect_id = ?2",
+             WHERE workflow_id = ?1 AND effect_id = ?2
+               AND (?3 IS NULL OR status = ?3)",
         )
         .bind(super::to_i64(workflow_id.0, "workflow_id")?)
         .bind(super::to_i64(effect_id, "effect_id")?)
+        .bind(required_status)
         .fetch_one(&mut *tx.tx)
         .await?;
         if effect_count != 1 {
@@ -2387,6 +2420,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            repo.commit_wake_command(&reconcile).await.unwrap(),
+            CommitWakeCommandOutcome::Replayed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2417,6 +2454,15 @@ mod tests {
             repo.commit_wake_command(&transfer).await.unwrap(),
             CommitWakeCommandOutcome::Replayed { .. }
         ));
+        let transfer_status: String = sqlx::query_scalar(
+            "SELECT status FROM workflow_effects
+             WHERE workflow_id = ?1 AND kind = 'transfer_delivery_owner'",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(transfer_status, "Invalidated");
     }
 
     #[tokio::test]
