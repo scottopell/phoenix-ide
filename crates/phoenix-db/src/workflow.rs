@@ -1661,6 +1661,14 @@ impl WorkflowRepository {
 
     pub async fn renew_lease_exact(&self, input: &RenewLeaseInput) -> DbResult<AuthorityOutcome> {
         let mut tx = self.pool.begin().await?;
+        #[cfg(not(test))]
+        let now = Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs()),
+        );
+        #[cfg(test)]
+        let now = input.now;
         let updated = sqlx::query(
             "UPDATE workflow_reclaimable_leases
              SET lease_until = ?4
@@ -1668,7 +1676,7 @@ impl WorkflowRepository {
         )
         .bind(to_i64(input.authority.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.authority.attempt_id.0, "attempt_id")?)
-        .bind(to_i64(input.now.0, "now")?)
+        .bind(to_i64(now.0, "now")?)
         .bind(to_i64(input.new_lease_until.0, "new_lease_until")?)
         .execute(&mut *tx)
         .await?

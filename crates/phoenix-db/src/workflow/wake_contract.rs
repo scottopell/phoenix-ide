@@ -530,7 +530,8 @@ async fn validate_observation_authority_tx(
            ON o.workflow_id = a.workflow_id AND o.attempt_id = a.attempt_id
          JOIN workflow_effects e
            ON e.workflow_id = a.workflow_id AND e.effect_id = a.effect_id
-         WHERE a.workflow_id = ?1 AND a.attempt_id = ?2 AND a.status = 'AuthorityLost'
+         WHERE a.workflow_id = ?1 AND a.attempt_id = ?2
+           AND a.status IN ('ObservationRecorded', 'AuthorityLost')
            AND e.kind = 'begin_observation'
            AND o.observation_codec_family = ?3 AND o.observation_codec_version = ?4
            AND o.observation_payload = ?5 AND o.observed_at = ?6",
@@ -2251,6 +2252,38 @@ mod tests {
                 .await
                 .unwrap(),
             CommitWakeCommandOutcome::Rejected(WakeRejection::ObservationAuthorityMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_durable_observation_survives_lease_expiry_before_cleanup() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(19);
+        let registered = repo
+            .commit_wake_command(&register(workflow_id))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        persist_observation_before_fence(&repo, workflow_id).await;
+        sqlx::query(
+            "UPDATE workflow_reclaimable_leases SET lease_until = 0 WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.commit_wake_command(&observe_at(
+                &state,
+                workflow_id,
+                TransitionId(2),
+                Timestamp(19),
+            ))
+            .await
+            .unwrap(),
+            CommitWakeCommandOutcome::Applied { .. }
         ));
     }
 

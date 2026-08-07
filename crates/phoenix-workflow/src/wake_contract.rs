@@ -467,7 +467,6 @@ pub struct TerminalProposal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenWakeLifecycle {
     Observing,
-    // Observation authority is fenced while evidence that was already authoritative is reconciled.
     TerminalProposed(TerminalProposal),
 }
 
