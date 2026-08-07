@@ -396,7 +396,7 @@ impl Fts5Retriever {
         );
         if request.visibility == RetrievalVisibility::UserTopLevel {
             sql.push_str(
-                " AND c.user_initiated = 1 AND c.runtime_role != 'coordinator' \
+                " AND c.user_initiated = 1 AND c.runtime_role = 'user' \
                   AND c.parent_conversation_id IS NULL \
                   AND NOT (c.archived = 1 AND EXISTS (\
                       SELECT 1 FROM conversation_creation_jobs j \

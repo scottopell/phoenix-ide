@@ -3335,7 +3335,7 @@ impl Database {
             tuple.push_bind(conversation_id);
         });
         query.push(
-            " AND c.user_initiated = 1 AND c.runtime_role != 'coordinator' \
+            " AND c.user_initiated = 1 AND c.runtime_role = 'user' \
               AND c.parent_conversation_id IS NULL \
               AND NOT (c.archived = 1 AND EXISTS (\
                   SELECT 1 FROM conversation_creation_jobs j \
@@ -3386,7 +3386,7 @@ impl Database {
     pub async fn list_conversation_search_ids(&self) -> DbResult<Vec<String>> {
         let rows = sqlx::query(
             "SELECT c.id FROM conversations c \
-             WHERE c.user_initiated = 1 AND c.runtime_role != 'coordinator' \
+             WHERE c.user_initiated = 1 AND c.runtime_role = 'user' \
                AND c.parent_conversation_id IS NULL \
                AND NOT (c.archived = 1 AND EXISTS (\
                    SELECT 1 FROM conversation_creation_jobs j \
@@ -3417,7 +3417,7 @@ impl Database {
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.archived = 0 AND c.user_initiated = 1
-               AND c.runtime_role != 'coordinator'
+               AND c.runtime_role = 'user'
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
