@@ -3631,7 +3631,7 @@ impl Database {
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
-             WHERE c.archived = 1 AND c.user_initiated = 1
+             WHERE c.archived = 1 AND c.user_initiated = 1 AND c.runtime_role = 'user'
                AND NOT EXISTS (
                    SELECT 1 FROM conversation_creation_jobs j
                    WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'
