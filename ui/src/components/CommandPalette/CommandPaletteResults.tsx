@@ -25,7 +25,12 @@ export function CommandPaletteResults({ results, selectedIndex, mode, searchStat
 
   if (results.length === 0) {
     return (
-      <div className="cp-results-empty" data-testid="cp-empty-state">
+      <div
+        className="cp-results-empty"
+        data-testid="cp-empty-state"
+        role="status"
+        aria-live="polite"
+      >
         {mode === 'action'
           ? 'No matching commands'
           : searchStatus.kind === 'awaiting-query'
@@ -49,7 +54,6 @@ export function CommandPaletteResults({ results, selectedIndex, mode, searchStat
                       : scope === 'conversation-slugs'
                         ? 'Start typing to search conversations'
                         : 'Start typing to search'}
-
       </div>
     );
   }

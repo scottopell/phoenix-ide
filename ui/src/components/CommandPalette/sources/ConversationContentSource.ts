@@ -1,11 +1,15 @@
 import { api } from '../../../api';
 import type { ConversationContentSearchHit } from '../../../api';
-import type { PaletteItem, PaletteSource } from '../types';
+import type {
+  ConversationContentPaletteItem,
+  PaletteItem,
+  PaletteSource,
+} from '../types';
 
 const SEARCH_LIMIT = 20;
 
-function toConversationContentItem(hit: ConversationContentSearchHit): PaletteItem {
-  const item: PaletteItem = {
+function toConversationContentItem(hit: ConversationContentSearchHit): ConversationContentPaletteItem {
+  const item: ConversationContentPaletteItem = {
     id: `${hit.conversation_id}:${hit.message_id}`,
     title: hit.slug,
     snippet: hit.snippet,
@@ -20,21 +24,22 @@ function toConversationContentItem(hit: ConversationContentSearchHit): PaletteIt
 
 export function createConversationContentSource(
   onNavigate: (slug: string) => void,
-): PaletteSource {
+): PaletteSource<'conversation-content', ConversationContentSearchHit> {
   return {
     id: 'conversation-content',
     category: 'Conversation content',
 
-    async search(query: string, signal?: AbortSignal): Promise<PaletteItem[]> {
+    async search(
+      query: string,
+      signal?: AbortSignal,
+    ): Promise<ConversationContentPaletteItem[]> {
       if (!query.trim()) return [];
       const response = await api.searchConversationContent(query, SEARCH_LIMIT, signal);
       return response.hits.map(toConversationContentItem);
     },
 
-    onSelect(item: PaletteItem) {
-      if (item.sourceId === 'conversation-content') {
-        onNavigate(item.metadata.slug);
-      }
+    onSelect(item: PaletteItem<'conversation-content', ConversationContentSearchHit>) {
+      if (item.metadata) onNavigate(item.metadata.slug);
     },
   };
 }

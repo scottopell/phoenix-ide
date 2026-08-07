@@ -59,27 +59,27 @@ interface BasePaletteItem {
   score?: number;
 }
 
-export type PaletteItem =
-  | (BasePaletteItem & {
-      sourceId: 'conversation-content';
-      metadata: ConversationContentSearchHit;
-    })
-  | (BasePaletteItem & {
-      sourceId: 'conversations' | 'code' | 'files' | 'actions';
-      metadata?: unknown;
-    });
+export type PaletteItem<SourceId extends string = string, Metadata = unknown> = BasePaletteItem & {
+  sourceId: SourceId;
+  metadata?: Metadata;
+};
 
-export interface PaletteSource {
-  id: string;
+export interface PaletteSource<SourceId extends string = string, Metadata = unknown> {
+  id: SourceId;
   category: string;
   /**
    * Return items matching query. Empty query = defaults/recents.
    * Async — callers must await and handle cancellation via AbortSignal.
    */
-  search(query: string, signal?: AbortSignal): Promise<PaletteItem[]>;
+  search(query: string, signal?: AbortSignal): Promise<PaletteItem<SourceId, Metadata>[]>;
   /** Handle item selection */
-  onSelect(item: PaletteItem): void;
+  onSelect(item: PaletteItem<SourceId, Metadata>): void;
 }
+
+export type ConversationContentPaletteItem = PaletteItem<
+  'conversation-content',
+  ConversationContentSearchHit
+> & { metadata: ConversationContentSearchHit };
 
 export interface PaletteAction {
   id: string;
