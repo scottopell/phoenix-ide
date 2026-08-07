@@ -666,6 +666,18 @@ async fn validate_replay_artifacts_tx(
         contract.lifecycle,
         phoenix_workflow::wake_contract::WakeLifecycle::Closed(_)
     ) {
+        let workflow_id = super::to_i64(workflow_id.0, "workflow_id")?;
+        let delivery_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT delivery_id FROM workflow_deliveries WHERE workflow_id = ?1",
+        )
+        .bind(workflow_id)
+        .fetch_all(&mut *tx.tx)
+        .await?;
+        let [terminal_id] = delivery_ids.as_slice() else {
+            return Err(DbError::Serialization(
+                "wake replay terminal bundle is incomplete".into(),
+            ));
+        };
         let terminal_rows: i64 = sqlx::query_scalar(
             "SELECT
                  (SELECT COUNT(*) FROM workflow_receipts WHERE workflow_id = ?1 AND receipt_id = ?2) +
@@ -673,8 +685,8 @@ async fn validate_replay_artifacts_tx(
                  (SELECT COUNT(*) FROM workflow_barrier_members WHERE workflow_id = ?1 AND barrier_id = ?2) +
                  (SELECT COUNT(*) FROM workflow_deliveries WHERE workflow_id = ?1 AND delivery_id = ?2)",
         )
-        .bind(super::to_i64(workflow_id.0, "workflow_id")?)
-        .bind(super::to_i64(contract.head_transition_id.0, "terminal_id")?)
+        .bind(workflow_id)
+        .bind(terminal_id)
         .fetch_one(&mut *tx.tx)
         .await?;
         if terminal_rows != 4 {
@@ -1276,6 +1288,30 @@ mod tests {
         }
     }
 
+    fn transfer(
+        state: &WakeState,
+        workflow_id: WorkflowId,
+        transition_id: TransitionId,
+    ) -> CommitWakeCommandInput {
+        let WakeState::Present(contract) = state else {
+            panic!("expected present contract")
+        };
+        CommitWakeCommandInput {
+            workflow_id,
+            command: WakeCommand {
+                transition_id,
+                kind: WakeCommandKind::TransferDeliveryOwner {
+                    expected_head: contract.head(),
+                    authority:
+                        phoenix_workflow::wake_contract::AuthorizedWakeOwnerTransfer::for_test(
+                            contract,
+                            WakeOwner::new("successor").unwrap(),
+                        ),
+                },
+            },
+        }
+    }
+
     async fn table_count(
         repo: &WakeContractRepository,
         table: &'static str,
@@ -1840,6 +1876,36 @@ mod tests {
         assert_eq!(table_count(&repo, "barriers", 6).await, 0);
         assert_eq!(table_count(&repo, "barrier_members", 6).await, 0);
         assert_eq!(table_count(&repo, "deliveries", 6).await, 0);
+    }
+
+    #[tokio::test]
+    async fn closed_delivery_transfer_replays_against_the_original_terminal_bundle() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(13);
+        let registered = repo
+            .commit_wake_command(&register(workflow_id))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = registered else {
+            panic!("registration should apply")
+        };
+        start_observation_attempt(&repo, workflow_id).await;
+        let terminalized = repo
+            .commit_wake_command(&observe(&state, workflow_id))
+            .await
+            .unwrap();
+        let CommitWakeCommandOutcome::Applied { state, .. } = terminalized else {
+            panic!("terminal observation should apply")
+        };
+        let transfer = transfer(&state, workflow_id, TransitionId(3));
+        assert!(matches!(
+            repo.commit_wake_command(&transfer).await.unwrap(),
+            CommitWakeCommandOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            repo.commit_wake_command(&transfer).await.unwrap(),
+            CommitWakeCommandOutcome::Replayed { .. }
+        ));
     }
 
     #[tokio::test]
