@@ -622,7 +622,7 @@ function ConversationPageContent({
   }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
 
   const connectionInfo = useConnection({
-    conversationId: resolvedRouteConversationId ?? undefined,
+    conversationId: navigator.onLine ? resolvedRouteConversationId ?? undefined : undefined,
     dispatch,
     getLastAppliedEventSeq: () => atomRef.current.conversationId === resolvedRouteConversationId
       ? eventCursorRef.current
@@ -855,6 +855,8 @@ function ConversationPageContent({
     };
 
     const handleOnline = () => {
+      setResolvedRouteConversationId(null);
+      setArchiveStatusConfirmedConversationId(null);
       setError(null);
       void resolveAuthoritativeRoute().catch((err: unknown) => {
         if (!cancelled) {
@@ -1848,9 +1850,13 @@ function ConversationPageContent({
           <section id="chat-view" className="view active">
             <div id="messages">
               <MessageListSkeleton count={4} />
-              {atom.uiError ? (
+              {atom.uiError || connectionInfo.state === 'reconnecting' || connectionInfo.state === 'offline' ? (
                 <div className="error-state" role="alert">
-                  <p>{atom.uiError.type === 'BackendError' ? atom.uiError.message : 'Connection error'}</p>
+                  <p>{atom.uiError?.type === 'BackendError'
+                    ? atom.uiError.message
+                    : connectionInfo.state === 'offline'
+                      ? 'Offline — waiting to reconnect'
+                      : 'Connection failed — retrying'}</p>
                   <button type="button" onClick={connectionInfo.retryNow}>Retry connection</button>
                 </div>
               ) : null}
