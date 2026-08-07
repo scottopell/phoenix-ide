@@ -953,7 +953,7 @@ fn porter_fallback_stems(term: &str) -> Vec<String> {
 }
 
 fn raw_prefix_guard(term: &str) -> Option<String> {
-    (!porter_fallback_stems(term).is_empty()).then(|| term.to_string())
+    (term.is_ascii() && term.len() >= 4).then(|| term.to_string())
 }
 
 fn build_prefix_alternatives(term: &str) -> String {
