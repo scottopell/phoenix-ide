@@ -15,7 +15,7 @@ final class DiskStoreVersioningTests: XCTestCase {
             .appendingPathComponent("phoenix-versioning-tests-\(UUID().uuidString)")
     }
 
-    private struct Record: Codable, Equatable {
+    private struct Record: Codable, Equatable, Sendable {
         var name: String
         var count: Int
     }
@@ -119,5 +119,25 @@ final class DiskStoreVersioningTests: XCTestCase {
         freshDiskStore()
         XCTAssertTrue(DiskStore.saveVersioned(["a"], name: "records", version: 1))
         XCTAssertNil(DiskStore.loadVersioned([Record].self, name: "records", version: 2))
+    }
+
+    @MainActor
+    func testWriterHandlesShareOneDestinationRevisionFence() async {
+        freshDiskStore()
+        let first = DiskStore.versionedWriter(name: "records", version: 1)
+        let replacement = DiskStore.versionedWriter(name: "records", version: 1)
+        let oldRevision = first.reserveRevision()
+        let newRevision = replacement.reserveRevision()
+
+        let replacementSaved = await replacement.save(
+            [Record(name: "new", count: 2)], revision: newRevision)
+        let olderSaveWasFenced = await first.save(
+            [Record(name: "old", count: 1)], revision: oldRevision)
+        XCTAssertTrue(replacementSaved)
+        XCTAssertTrue(olderSaveWasFenced)
+
+        XCTAssertEqual(
+            DiskStore.loadVersioned([Record].self, name: "records", version: 1),
+            [Record(name: "new", count: 2)])
     }
 }

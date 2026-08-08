@@ -74,7 +74,7 @@ final class Outbox {
     private(set) var persistenceHealthy = true
     private var storageWritable = true
     private let writer: VersionedDiskWriter
-    private var persistenceRevision = 0
+    private var latestPersistenceRevision = 0
 
     /// v1 stores visible OutboxEntry values in a versioned envelope.
     static let schemaVersion = 1
@@ -132,11 +132,11 @@ final class Outbox {
             persistenceHealthy = false
             return false
         }
-        persistenceRevision += 1
-        let revision = persistenceRevision
+        let revision = writer.reserveRevision()
+        latestPersistenceRevision = revision
         let snapshot = entries.filter(\.isVisible)
         let saved = await writer.save(snapshot, revision: revision)
-        if persistenceRevision == revision {
+        if latestPersistenceRevision == revision {
             persistenceHealthy = saved
         }
         return saved
@@ -147,12 +147,12 @@ final class Outbox {
             persistenceHealthy = false
             return
         }
-        persistenceRevision += 1
-        let revision = persistenceRevision
+        let revision = writer.reserveRevision()
+        latestPersistenceRevision = revision
         let snapshot = entries.filter(\.isVisible)
         Task {
             let saved = await writer.save(snapshot, revision: revision)
-            guard persistenceRevision == revision else { return }
+            guard latestPersistenceRevision == revision else { return }
             persistenceHealthy = saved
         }
     }
@@ -173,8 +173,9 @@ final class Outbox {
         suppressedMessageIds.removeAll()
         persistenceHealthy = true
         storageWritable = false
-        persistenceRevision += 1
-        return persistenceRevision
+        let revision = writer.reserveRevision()
+        latestPersistenceRevision = revision
+        return revision
     }
 
     /// A hard-deleted conversation owns no remaining local delivery state.

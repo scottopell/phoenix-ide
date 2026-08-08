@@ -62,6 +62,10 @@ final class ConversationSession {
     private var viewIsActive = false
     private var replayFromPendingAnchor = false
     private var streamBlockedUntilConfigurationChange = false
+    private let snapshotWriter: VersionedDiskWriter
+    private var latestSnapshotRevision = 0
+    private var pendingAuthoritativeSyncedAt: Date?
+    private var snapshotPersistenceEnabled = true
     /// Init's persisted-message anchor. Live messages above it may be eager
     /// assistant output, so snapshot persistence excludes them until resync.
     private var durableMessageSequenceCeiling: Int64 = 0
@@ -82,7 +86,7 @@ final class ConversationSession {
     /// versioning rule). Additive-optional fields (syncedAt) need no bump.
     private static let snapshotSchemaVersion = 1
 
-    private struct Snapshot: Codable {
+    private struct Snapshot: Codable, Sendable {
         var conversation: Conversation?
         var messages: [Message]
         var lastSequenceId: Int64
@@ -94,10 +98,12 @@ final class ConversationSession {
     }
 
     static func hasCachedSnapshot(conversationId: String) -> Bool {
-        DiskStore.loadVersioned(
+        guard let snapshot = DiskStore.loadVersioned(
             Snapshot.self,
             name: "conv-\(conversationId)",
-            version: snapshotSchemaVersion) != nil
+            version: snapshotSchemaVersion)
+        else { return false }
+        return snapshot.conversation != nil && snapshot.syncedAt != nil
     }
 
     private var transcriptGeneration: Int64?
@@ -116,6 +122,8 @@ final class ConversationSession {
         self.onConversationUpdate = onConversationUpdate
         self.onHardDeleted = onHardDeleted
         self.outbox = Outbox(conversationId: conversationId)
+        self.snapshotWriter = DiskStore.versionedWriter(
+            name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)
 
         // Cached snapshot renders immediately; the stream refreshes it.
         if let snap = DiskStore.loadVersioned(
@@ -243,23 +251,73 @@ final class ConversationSession {
         connection = .offline
     }
 
+    private func snapshotForPersistence(authoritative: Bool) -> Snapshot {
+        let syncedAt: Date?
+        if authoritative {
+            let now = Date()
+            pendingAuthoritativeSyncedAt = now
+            syncedAt = now
+        } else {
+            syncedAt = pendingAuthoritativeSyncedAt ?? snapshotSyncedAt
+        }
+        return Snapshot(
+            conversation: conversation,
+            messages: Self.durableMessages(
+                messages, through: durableMessageSequenceCeiling),
+            lastSequenceId: lastSequenceId,
+            transcriptGeneration: transcriptGeneration,
+            syncedAt: syncedAt)
+    }
+
+    private func persistSnapshot(
+        authoritative: Bool = false,
+        reconcileOutboxOnSuccess: Bool = false,
+        drainOutboxAfter: Bool = false
+    ) {
+        guard !isHardDeleted, snapshotPersistenceEnabled else { return }
+        let snapshot = snapshotForPersistence(authoritative: authoritative)
+        let revision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = revision
+        Task { [weak self, snapshotWriter] in
+            let didSave = await snapshotWriter.save(snapshot, revision: revision)
+            guard let self, self.latestSnapshotRevision == revision,
+                  self.snapshotPersistenceEnabled, !self.isHardDeleted
+            else { return }
+            if didSave {
+                self.snapshotSyncedAt = snapshot.syncedAt
+                self.pendingAuthoritativeSyncedAt = nil
+                if reconcileOutboxOnSuccess {
+                    self.reconcileOutbox()
+                }
+            }
+            if drainOutboxAfter {
+                self.drainOutbox()
+            }
+        }
+    }
+
     @discardableResult
-    private func persistSnapshot(authoritative: Bool = false) -> Bool {
-        guard !isHardDeleted else { return false }
-        let syncedAt = authoritative ? Date() : snapshotSyncedAt
-        let didSave = DiskStore.saveVersioned(
-            Snapshot(
-                conversation: conversation,
-                messages: Self.durableMessages(
-                    messages, through: durableMessageSequenceCeiling),
-                lastSequenceId: lastSequenceId,
-                transcriptGeneration: transcriptGeneration,
-                syncedAt: syncedAt),
-            name: snapshotName, version: Self.snapshotSchemaVersion)
-        if didSave, authoritative {
-            snapshotSyncedAt = syncedAt
+    func flushSnapshotPersistence() async -> Bool {
+        guard !isHardDeleted, snapshotPersistenceEnabled else { return false }
+        let snapshot = snapshotForPersistence(authoritative: false)
+        let revision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = revision
+        let didSave = await snapshotWriter.save(snapshot, revision: revision)
+        guard latestSnapshotRevision == revision, snapshotPersistenceEnabled,
+              !isHardDeleted
+        else { return false }
+        if didSave {
+            snapshotSyncedAt = snapshot.syncedAt
+            pendingAuthoritativeSyncedAt = nil
         }
         return didSave
+    }
+
+    func clearCachedSnapshotAndWait() async {
+        snapshotPersistenceEnabled = false
+        let revision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = revision
+        await snapshotWriter.remove(revision: revision)
     }
 
     // MARK: - Sending
@@ -587,10 +645,10 @@ final class ConversationSession {
             // snapshot that justifies it is still memory-only — a crash
             // between the two writes would lose the user's text from both.
             outbox.suppress(authoritativeMessageIds: Set(snap.messages.map(\.message_id)))
-            if persistSnapshot(authoritative: true) {
-                reconcileOutbox()
-            }
-            drainOutbox()
+            persistSnapshot(
+                authoritative: true,
+                reconcileOutboxOnSuccess: true,
+                drainOutboxAfter: true)
 
         default:
             applyLive(event)
@@ -625,9 +683,7 @@ final class ConversationSession {
                 rebuildToolUseIndex()
             }
             // Snapshot before outbox prune — see the init branch.
-            if persistSnapshot(authoritative: true) {
-                reconcileOutbox()
-            }
+            persistSnapshot(authoritative: true, reconcileOutboxOnSuccess: true)
 
         case .messageUpdated(
             let seq, let messageId, let content, let displayData, let durationMs,
@@ -682,7 +738,6 @@ final class ConversationSession {
                     conversation.requires_action = mode == "needs_action"
                 }
                 self.conversation = conversation
-                snapshotSyncedAt = Date()
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conversation)
             }
@@ -749,10 +804,10 @@ final class ConversationSession {
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
             // Snapshot first — same ordering rule as the message branch.
-            if persistSnapshot(authoritative: true) {
-                reconcileOutbox()
-            }
-            drainOutbox()
+            persistSnapshot(
+                authoritative: true,
+                reconcileOutboxOnSuccess: true,
+                drainOutboxAfter: true)
 
         case .conversationUpdate(let seq, let update):
             guard applyIfNewer(seq) else { return }
@@ -822,7 +877,13 @@ final class ConversationSession {
         toolUseIndex = [:]
         actionAttempt = nil
         connection = .idle
+        snapshotPersistenceEnabled = false
+        let snapshotRemovalRevision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = snapshotRemovalRevision
         DiskStore.remove(name: snapshotName)
+        Task { [snapshotWriter] in
+            await snapshotWriter.remove(revision: snapshotRemovalRevision)
+        }
         outbox.clear()
         onHardDeleted(conversationId)
     }
@@ -928,9 +989,7 @@ final class ConversationSession {
                     durableMessageSequenceCeiling, message.sequence_id)
                 lastSequenceId = max(lastSequenceId, message.sequence_id)
                 rebuildToolUseIndex()
-                if persistSnapshot(authoritative: true) {
-                    reconcileOutbox()
-                }
+                persistSnapshot(authoritative: true, reconcileOutboxOnSuccess: true)
             case .steeringQueued:
                 outbox.markAccepted(localId, steering: true)
             case .absent:

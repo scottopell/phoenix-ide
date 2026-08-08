@@ -110,7 +110,7 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
-    func testHardDeleteClearsLocalTranscriptAndSignalsOwner() throws {
+    func testHardDeleteClearsLocalTranscriptAndSignalsOwner() async throws {
         var deletedId: String?
         let session = makeSession { deletedId = $0 }
         session.receive(.initSnapshot(.init(
@@ -118,6 +118,8 @@ final class ConversationSessionReducerTests: XCTestCase {
             messages: [try message(id: "m1", content: "[]")],
             agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
             pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+        let initialSnapshotSaved = await session.flushSnapshotPersistence()
+        XCTAssertTrue(initialSnapshotSaved)
         XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
@@ -128,6 +130,23 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertTrue(session.outbox.entries.isEmpty)
         XCTAssertEqual(deletedId, "c1")
         XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+    }
+
+    @MainActor
+    func testOfflineAvailabilityRequiresAnAuthoritativeCachedConversation() async throws {
+        let session = makeSession()
+        session.pauseForBackground()
+        let emptySnapshotSaved = await session.flushSnapshotPersistence()
+        XCTAssertTrue(emptySnapshotSaved)
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(), messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+        let authoritativeSnapshotSaved = await session.flushSnapshotPersistence()
+        XCTAssertTrue(authoritativeSnapshotSaved)
+        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor

@@ -21,7 +21,9 @@ struct QuestionCard: View {
     @State private var confirmDismiss = false
 
     private var busy: Bool { session.actionInFlight != nil }
-    private var actionable: Bool { model.connectivity.isOnline && !busy }
+    private var actionable: Bool {
+        model.connectivity.isOnline && session.acceptsConversationActions && !busy
+    }
     private var encodedAnswers: [String: String]? {
         QuestionAnswers.encode(
             questions: questions, selections: selections, otherTexts: otherTexts)

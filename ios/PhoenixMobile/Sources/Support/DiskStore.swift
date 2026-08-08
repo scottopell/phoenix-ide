@@ -1,18 +1,18 @@
 import Foundation
 
-/// Serial background writer for one versioned store. Revisions prevent an
-/// older suspended save from overwriting a newer snapshot.
-actor VersionedDiskWriter {
+/// Serial background sink for one destination. Every writer handle for the
+/// destination shares this revision fence.
+private actor VersionedDiskSink {
     private let destination: URL
-    private let version: Int
     private var latestRevision = 0
 
-    init(destination: URL, version: Int) {
+    init(destination: URL) {
         self.destination = destination
-        self.version = version
     }
 
-    func save<T: Encodable & Sendable>(_ value: T, revision: Int) -> Bool {
+    func save<T: Encodable & Sendable>(
+        _ value: T, version: Int, revision: Int
+    ) -> Bool {
         guard revision >= latestRevision else { return true }
         latestRevision = revision
         return DiskStore.writeVersioned(value, to: destination, version: version)
@@ -25,6 +25,46 @@ actor VersionedDiskWriter {
     }
 }
 
+@MainActor
+private final class VersionedDiskDestination {
+    let sink: VersionedDiskSink
+    private var nextRevision = 0
+
+    init(destination: URL) {
+        sink = VersionedDiskSink(destination: destination)
+    }
+
+    func reserveRevision() -> Int {
+        nextRevision += 1
+        return nextRevision
+    }
+}
+
+/// Main-actor handle that reserves logical revisions before work leaves the
+/// actor, while encoding and file I/O run in the shared background sink.
+@MainActor
+final class VersionedDiskWriter {
+    private let destination: VersionedDiskDestination
+    private let version: Int
+
+    fileprivate init(destination: VersionedDiskDestination, version: Int) {
+        self.destination = destination
+        self.version = version
+    }
+
+    func reserveRevision() -> Int {
+        destination.reserveRevision()
+    }
+
+    func save<T: Encodable & Sendable>(_ value: T, revision: Int) async -> Bool {
+        await destination.sink.save(value, version: version, revision: revision)
+    }
+
+    func remove(revision: Int) async {
+        await destination.sink.remove(revision: revision)
+    }
+}
+
 /// Main-actor JSON persistence under Application Support. Versioned loads
 /// decode matching envelopes, delegate older payloads to the supplied
 /// migration, reject newer envelopes, and accept bare legacy payloads as v0.
@@ -34,6 +74,8 @@ enum DiskStore {
     /// they never touch (or depend on) the app's real cache.
     static var baseDirectory: URL = FileManager.default.urls(
         for: .applicationSupportDirectory, in: .userDomainMask)[0]
+
+    private static var versionedDestinations: [URL: VersionedDiskDestination] = [:]
 
     private static var directory: URL {
         let dir = baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true)
@@ -134,7 +176,11 @@ enum DiskStore {
     }
 
     static func versionedWriter(name: String, version: Int) -> VersionedDiskWriter {
-        VersionedDiskWriter(destination: url(for: name), version: version)
+        let destinationURL = url(for: name)
+        let destination = versionedDestinations[destinationURL]
+            ?? VersionedDiskDestination(destination: destinationURL)
+        versionedDestinations[destinationURL] = destination
+        return VersionedDiskWriter(destination: destination, version: version)
     }
 
     /// Load a versioned store. `migrate` receives the stored version and
@@ -199,5 +245,15 @@ enum DiskStore {
 
     static func removeAll() {
         try? FileManager.default.removeItem(at: directory)
+    }
+
+    static func removeAllAndWait() async {
+        let removals = versionedDestinations.values.map { destination in
+            (destination.sink, destination.reserveRevision())
+        }
+        for (sink, revision) in removals {
+            await sink.remove(revision: revision)
+        }
+        removeAll()
     }
 }

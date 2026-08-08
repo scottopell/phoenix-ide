@@ -402,10 +402,11 @@ final class AppModel {
         apiGeneration += 1
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
         for session in ownedSessions { session.stop() }
+        for session in ownedSessions { await session.clearCachedSnapshotAndWait() }
         for session in ownedSessions { await session.outbox.clearAndWait() }
         sessions.removeAll()
         drainSessions.removeAll()
-        DiskStore.removeAll()
+        await DiskStore.removeAllAndWait()
         listStore.reset()
         attention.reset()
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
