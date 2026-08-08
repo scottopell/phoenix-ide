@@ -818,16 +818,12 @@ final class ConversationSession {
         origin: ConversationState?,
         current: ConversationState
     ) -> Bool {
-        _ = origin
         switch action {
         case .cancel:
             return current.isCancellable
-        case .dismissError:
-            if case .error = current { return true }
-        case .approveTask, .rejectTask, .provideTaskFeedback:
-            if case .awaitingTaskApproval = current { return true }
+        case .dismissError, .approveTask, .rejectTask, .provideTaskFeedback:
+            return current == origin
         }
-        return false
     }
 
     private func upsert(_ message: Message) {
