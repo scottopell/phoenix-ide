@@ -141,6 +141,7 @@ final class AppModel {
     let attention = AttentionMonitor()
     private let notificationRouter = NotificationRouter()
     private static let nudgesEnabledKey = "phoenix.backgroundNudges"
+    private var nudgePreferenceGeneration = 0
 
     private(set) var backgroundNudgesEnabled =
         UserDefaults.standard.bool(forKey: AppModel.nudgesEnabledKey)
@@ -149,9 +150,12 @@ final class AppModel {
     var pendingOpenConversationId: String?
 
     func setBackgroundNudges(_ enabled: Bool) async {
+        nudgePreferenceGeneration &+= 1
+        let generation = nudgePreferenceGeneration
         nudgeAuthorizationHint = nil
         if enabled {
             guard await AttentionMonitor.requestAuthorization() else {
+                guard generation == nudgePreferenceGeneration else { return }
                 nudgeAuthorizationHint =
                     "Notifications are off for Phoenix in iOS Settings — enable them there first."
                 backgroundNudgesEnabled = false
@@ -159,6 +163,7 @@ final class AppModel {
                 return
             }
         }
+        guard generation == nudgePreferenceGeneration else { return }
         backgroundNudgesEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: Self.nudgesEnabledKey)
         if enabled {
@@ -186,8 +191,7 @@ final class AppModel {
               listStore.canApplyExternal(startedAt: listToken)
         else { return false }
         guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
-        attention.checkAndNotify(fresh)
-        return true
+        return await attention.checkAndNotify(fresh)
     }
 
     // MARK: - Coordinator
@@ -197,6 +201,11 @@ final class AppModel {
     /// Per-server state — cleared on sign-out.
     private(set) var coordinatorConversationId: String? =
         UserDefaults.standard.string(forKey: AppModel.coordinatorIdKey)
+
+    var coordinatorAvailableOffline: Bool {
+        guard let id = coordinatorConversationId else { return false }
+        return ConversationSession.hasCachedSnapshot(conversationId: id)
+    }
 
     private func adoptCoordinatorIdentityFromList() {
         guard let coordinator = listStore.conversations.first(where: \.isCoordinator) else {
@@ -227,7 +236,8 @@ final class AppModel {
                 guard !Task.isCancelled, apiGeneration == startedGeneration else { return nil }
                 if let apiError = error as? APIError,
                    apiError.isTransport,
-                   let cached = coordinatorConversationId {
+                   let cached = coordinatorConversationId,
+                   ConversationSession.hasCachedSnapshot(conversationId: cached) {
                     return cached
                 }
                 lastActionError = (error as? APIError)?.errorDescription
@@ -235,8 +245,11 @@ final class AppModel {
                 return nil
             }
         }
-        if let cached = coordinatorConversationId { return cached }
-        lastActionError = "Opening the Coordinator for the first time needs a connection."
+        if let cached = coordinatorConversationId,
+           ConversationSession.hasCachedSnapshot(conversationId: cached) {
+            return cached
+        }
+        lastActionError = "Opening the Coordinator offline needs a cached conversation."
         return nil
     }
 
@@ -353,6 +366,11 @@ final class AppModel {
     /// working directory, and the pinned certificate are per-server state
     /// and must not leak across a server/account switch.
     func signOut() {
+        nudgePreferenceGeneration &+= 1
+        backgroundNudgesEnabled = false
+        nudgeAuthorizationHint = nil
+        UserDefaults.standard.removeObject(forKey: Self.nudgesEnabledKey)
+        BackgroundRefresh.cancelPending()
         clearCache()
         pendingOpenConversationId = nil
         let notificationCenter = UNUserNotificationCenter.current()

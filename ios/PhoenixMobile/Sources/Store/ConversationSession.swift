@@ -53,7 +53,6 @@ final class ConversationSession {
     private var drainTask: Task<Void, Never>?
     private var staleCheckTask: Task<Void, Never>?
     private var cancelNeedsAgentDoneFallback = false
-    private var actionOriginState: ConversationState?
     /// localIds with a POST in flight — prevents duplicate concurrent sends
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
@@ -92,6 +91,13 @@ final class ConversationSession {
         var transcriptGeneration: Int64?
         /// Missing in snapshots written before cache freshness was tracked.
         var syncedAt: Date?
+    }
+
+    static func hasCachedSnapshot(conversationId: String) -> Bool {
+        DiskStore.loadVersioned(
+            Snapshot.self,
+            name: "conv-\(conversationId)",
+            version: snapshotSchemaVersion) != nil
     }
 
     private var transcriptGeneration: Int64?
@@ -200,7 +206,9 @@ final class ConversationSession {
     }
 
     private func resumeLiveTasks() {
-        guard viewIsActive, !streamBlockedUntilConfigurationChange else { return }
+        guard viewIsActive, !isHardDeleted,
+              !streamBlockedUntilConfigurationChange
+        else { return }
         if streamTask == nil {
             streamTask = Task { await streamLoop() }
         }
@@ -212,11 +220,13 @@ final class ConversationSession {
     /// Called on scenePhase -> .active: the stream task was likely torn down
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {
+        guard !isHardDeleted else { return }
         resumeLiveTasks()
         drainOutbox()
     }
 
     private func connectivityRestored() {
+        guard !isHardDeleted else { return }
         if viewIsActive, !streamBlockedUntilConfigurationChange {
             // Wake the stream loop out of its backoff sleep by restarting it.
             streamTask?.cancel()
@@ -349,14 +359,19 @@ final class ConversationSession {
     /// The action currently being executed, or nil. Views use this to
     /// disable controls and show progress — approval buttons especially
     /// must not double-fire.
-    private(set) var actionInFlight: ConversationAction?
-    private var actionOriginState: ConversationState?
+    private struct ActionAttempt {
+        let action: ConversationAction
+        let originState: ConversationState?
+        let token: UUID
+    }
+    private var actionAttempt: ActionAttempt?
+    var actionInFlight: ConversationAction? { actionAttempt?.action }
 
     /// Execute a session-scoped action per its declared delivery policy
     /// (ConversationAction). Online-only actions fail fast with a toast
     /// when offline — deliberately not queued, see the policy doc.
     func perform(_ action: ConversationAction) {
-        guard acceptsConversationActions, actionInFlight == nil else { return }
+        guard acceptsConversationActions, actionAttempt == nil else { return }
         switch ClientOperation.conversationAction(action).policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
@@ -366,13 +381,15 @@ final class ConversationSession {
         case .outboxed:
             break  // never blocked on connectivity by definition
         }
-        actionOriginState = action.waitsForAuthoritativeStateChange ? typedState : nil
         if case .cancel = action,
            case .awaitingCommissionReviewApproval = typedState {
             cancelNeedsAgentDoneFallback = true
         }
-        actionInFlight = action
-        actionOriginState = typedState
+        let token = UUID()
+        actionAttempt = ActionAttempt(
+            action: action,
+            originState: typedState,
+            token: token)
         Task {
             do {
                 switch action {
@@ -395,11 +412,11 @@ final class ConversationSession {
                     try await api.dismissQuestion(conversationId: conversationId)
                 }
             } catch {
+                guard actionAttempt?.token == token else { return }
                 if case .cancel = action {
                     cancelNeedsAgentDoneFallback = false
                 }
-                actionInFlight = nil
-                actionOriginState = nil
+                actionAttempt = nil
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
             }
@@ -630,7 +647,11 @@ final class ConversationSession {
                 var patch = pendingMessagePatches[messageId]
                     ?? PendingMessagePatch(content: nil, displayData: nil, durationMs: nil)
                 if let content, content != .null { patch.content = content }
-                if let displayData, displayData != .null { patch.displayData = displayData }
+                if let displayData, displayData != .null {
+                    patch.displayData = Self.mergeDisplayData(
+                        existing: patch.displayData,
+                        patch: displayData)
+                }
                 if let durationMs { patch.durationMs = durationMs }
                 pendingMessagePatches[messageId] = patch
                 return
@@ -716,9 +737,8 @@ final class ConversationSession {
                 typedState: typedState,
                 cancelledCommissionApproval: cancelNeedsAgentDoneFallback)
             cancelNeedsAgentDoneFallback = false
-            if case .cancel = actionInFlight {
-                actionInFlight = nil
-                actionOriginState = nil
+            if case .cancel = actionAttempt?.action {
+                actionAttempt = nil
             }
             if shouldMoveToIdle {
                 conversation?.state = .string("idle")
@@ -765,9 +785,8 @@ final class ConversationSession {
         case .errorEvent(let seq, let message, let retryable):
             guard applyIfNewer(seq) else { return }
             lastErrorToast = message
-            if retryable, actionInFlight?.waitsForAuthoritativeStateChange == true {
-                actionInFlight = nil
-                actionOriginState = nil
+            if retryable, actionAttempt?.action.waitsForAuthoritativeStateChange == true {
+                actionAttempt = nil
             }
 
         case .conversationBecameTerminal(let seq):
@@ -805,6 +824,7 @@ final class ConversationSession {
         streamingRequestId = nil
         pendingMessagePatches.removeAll()
         toolUseIndex = [:]
+        actionAttempt = nil
         connection = .idle
         DiskStore.remove(name: snapshotName)
         outbox.clear()
@@ -846,16 +866,17 @@ final class ConversationSession {
     }
 
     private func clearResolvedActionIfStateAdvanced(currentState: ConversationState) {
-        guard let action = actionInFlight,
-              action.waitsForAuthoritativeStateChange
+        guard let attempt = actionAttempt,
+              attempt.action.waitsForAuthoritativeStateChange
         else {
             return
         }
-        guard !Self.actionStillAwaitsOriginalState(
-            action: action, origin: actionOriginState, current: currentState)
-        else { return }
-        actionInFlight = nil
-        actionOriginState = nil
+        guard Self.actionStillAwaitsOriginalState(
+            action: attempt.action, origin: attempt.originState, current: currentState)
+        else {
+            actionAttempt = nil
+            return
+        }
     }
 
     nonisolated static func actionStillAwaitsOriginalState(
@@ -866,7 +887,8 @@ final class ConversationSession {
         switch action {
         case .cancel:
             return current.isCancellable
-        case .dismissError, .approveTask, .rejectTask, .provideTaskFeedback:
+        case .dismissError, .approveTask, .rejectTask, .provideTaskFeedback,
+             .respondToQuestions, .dismissQuestion:
             return current == origin
         }
     }

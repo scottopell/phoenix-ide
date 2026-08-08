@@ -91,13 +91,17 @@ final class AttentionMonitor {
     /// Background path: diff, notify, then seed. One notification per
     /// conversation, keyed by conversation id so a newer nudge replaces a
     /// stale one instead of stacking.
-    func checkAndNotify(_ conversations: [Conversation]) {
+    func checkAndNotify(_ conversations: [Conversation]) async -> Bool {
         let events = Self.diff(previous: snapshot, current: conversations)
-        seed(with: conversations)
-        guard !events.isEmpty else { return }
+        guard !events.isEmpty else {
+            guard !Task.isCancelled else { return false }
+            seed(with: conversations)
+            return true
+        }
 
         let center = UNUserNotificationCenter.current()
         for event in events {
+            guard !Task.isCancelled else { return false }
             let content = UNMutableNotificationContent()
             switch event {
             case .needsAction(_, let title):
@@ -116,8 +120,17 @@ final class AttentionMonitor {
                 identifier: "attention-\(event.conversationId)",
                 content: content,
                 trigger: nil)
-            center.add(request) { _ in }
+            do {
+                try await center.add(request)
+            } catch is CancellationError {
+                return false
+            } catch {
+                continue
+            }
         }
+        guard !Task.isCancelled else { return false }
+        seed(with: conversations)
+        return true
     }
 
     static func requestAuthorization() async -> Bool {

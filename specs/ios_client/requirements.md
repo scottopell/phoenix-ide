@@ -362,6 +362,11 @@ WHEN an online-only action is rejected by the server (e.g. dismissing a
 non-resumable error)
 THE SYSTEM SHALL surface the server's explanation
 
+WHEN an earlier action request completes after authoritative state has
+already cleared it and a newer action has begun
+THE SYSTEM SHALL ignore the earlier request's completion
+AND SHALL NOT unlock or overwrite the newer action
+
 WHEN archive is requested while the conversation has a visible outbox entry
 THE SYSTEM SHALL block archive until the user retries or discards that entry
 SO THAT archive cannot delete the only durable copy of user-authored text
@@ -531,6 +536,7 @@ preserved until success
 WHEN an authoritative snapshot replaces an answered prompt with a different
 question payload
 THE SYSTEM SHALL treat it as a new decision and enable its controls
+AND SHALL discard selections and free text belonging to the previous prompt
 
 **Rationale:** A stalled agent is worth nothing until answered; this is
 the highest-value blocking state to resolve away from the desk. The
@@ -547,7 +553,8 @@ navigate to it as an ordinary conversation (standard transcript, caching,
 outbox, and actions apply unchanged)
 
 WHEN offline with a previously opened Coordinator
-THE SYSTEM SHALL open its cached transcript by the remembered id, with
+THE SYSTEM SHALL open its cached transcript only when a compatible local
+snapshot exists for the remembered id, with
 new questions queueing through the outbox
 AND first-time opening SHALL require connectivity
 
@@ -574,6 +581,13 @@ THE SYSTEM SHALL schedule opportunistic background refreshes
 AND on each run fetch the conversation list, fire one local notification
 per conversation that newly entered needs-action or error, or completed a
 working turn, and refresh the cached list
+
+WHEN a background nudge run reports completion
+THE SYSTEM SHALL have finished submitting its local notification requests
+
+WHEN the user disables nudges or signs out
+THE SYSTEM SHALL cancel pending refresh requests and prevent an earlier
+authorization request from re-enabling nudges
 
 WHEN diffing against the last-seen snapshot
 THE SYSTEM SHALL never notify for a conversation absent from the snapshot

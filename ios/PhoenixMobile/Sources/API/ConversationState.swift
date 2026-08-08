@@ -152,8 +152,8 @@ enum ConversationState: Equatable {
 /// One question from an awaiting_user_response state (mirror of
 /// `UserQuestion` in ui/src/api.ts). Answer encoding rules live in
 /// QuestionAnswers.
-struct UserQuestion: Equatable {
-    struct Option: Equatable {
+struct UserQuestion: Equatable, Hashable {
+    struct Option: Equatable, Hashable {
         var label: String
         var description: String
     }

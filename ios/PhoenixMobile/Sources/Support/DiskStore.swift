@@ -1,29 +1,8 @@
 import Foundation
 
-/// JSON file persistence under Application Support. All offline state —
-/// conversation list, per-conversation snapshots, outboxes — goes through
-/// here so the app renders instantly with no network.
-///
-/// ## The versioning rule (REQ-IOS-014)
-///
-/// Durable stores use `saveVersioned`/`loadVersioned`, which wrap the
-/// payload in `{schema_version, payload}`. **Changing any persisted struct
-/// requires one of:**
-///   1. bumping that store's schema version constant and adding a branch
-///      to its `migrate` closure that upgrades the old payload, OR
-///   2. a comment on the changed field noting it is additive-optional
-///      (old files decode it as nil/default — no bump owed).
-/// Without this, a shape change makes old files undecodable and `try?`
-/// silently wipes the cache — for the outbox, that is queued-message loss.
-///
-/// Load semantics: same version → decode; older version → the store's
-/// migrate hook; **newer** version (downgraded app) → refuse and treat as
-/// absent rather than misparse; a pre-envelope legacy file decodes as the
-/// bare payload (version 0).
-///
-/// MainActor-isolated: every caller (stores, sessions, AppModel) is already
-/// MainActor, and isolation is what makes the mutable `baseDirectory` test
-/// seam safe.
+/// Main-actor JSON persistence under Application Support. Versioned loads
+/// decode matching envelopes, delegate older payloads to the supplied
+/// migration, reject newer envelopes, and accept bare legacy payloads as v0.
 @MainActor
 enum DiskStore {
     /// Test seam: contract tests point this at a fresh temp directory so

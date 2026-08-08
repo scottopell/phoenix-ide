@@ -36,7 +36,7 @@ struct ConversationListView: View {
                     // The fleet Coordinator: one conversation that answers
                     // questions about all the others. Ordinary conversation
                     // underneath, so it inherits offline caching and the
-                    // outbox for free. Enabled offline once its id is known.
+                    // outbox for free. Enabled offline once its snapshot exists.
                     Button {
                         guard !openingCoordinator else { return }
                         openingCoordinator = true
@@ -56,7 +56,7 @@ struct ConversationListView: View {
                     .disabled(
                         openingCoordinator
                             || (!model.connectivity.isOnline
-                                && model.coordinatorConversationId == nil))
+                                && !model.coordinatorAvailableOffline))
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {

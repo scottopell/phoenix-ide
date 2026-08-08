@@ -37,10 +37,17 @@ struct Base64ImageView: View {
         .task(id: base64) {
             decodedImage = nil
             decodingFinished = false
-            let result = await Task.detached(priority: .utility) {
+            let worker = Task.detached(priority: .utility) {
+                guard !Task.isCancelled else { return DecodeResult(image: nil) }
                 let image = Data(base64Encoded: base64).flatMap { UIImage(data: $0) }
+                guard !Task.isCancelled else { return DecodeResult(image: nil) }
                 return DecodeResult(image: image)
-            }.value
+            }
+            let result = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
             guard !Task.isCancelled else { return }
             decodedImage = result.image
             decodingFinished = true

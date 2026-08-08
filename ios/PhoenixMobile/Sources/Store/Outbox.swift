@@ -144,6 +144,7 @@ final class Outbox {
         persist()
         return persistenceHealthy
     }
+
     /// A hard-deleted conversation owns no remaining local delivery state.
     func clear() {
         entries.removeAll()
@@ -244,7 +245,6 @@ final class Outbox {
     func suppress(authoritativeMessageIds: Set<String>) {
         suppressedMessageIds.formUnion(authoritativeMessageIds)
     }
-
     /// AuthoritativeMessageReconcilesQueueEntry: an entry reflected by the
     /// server's exact or conversation-scoped canonical identity is done.
     /// Applies to fresh sends, steering-queued sends, and rehydrated

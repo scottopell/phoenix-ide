@@ -42,6 +42,7 @@ struct StateDetailView: View {
                 emptyQuestionCard
             } else {
                 QuestionCard(session: session, questions: questions)
+                    .id(questions)
             }
 
         case .awaitingTaskApproval(let title, let priority, let plan):

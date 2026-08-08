@@ -45,10 +45,15 @@ final class ConversationSessionReducerTests: XCTestCase {
 
         session.receive(.messageUpdated(
             seq: 1, messageId: "m1", content: try json("[{\"type\":\"text\",\"text\":\"patched\"}]"),
-            displayData: try json("{\"status\":\"completed\"}"), durationMs: 321,
+            displayData: try json("{\"status\":\"running\",\"tool_starts\":{\"a\":1}}"),
+            durationMs: nil,
             transcriptGeneration: 2))
+        session.receive(.messageUpdated(
+            seq: 2, messageId: "m1", content: nil,
+            displayData: try json("{\"status\":\"completed\",\"tool_starts\":{\"b\":2}}"),
+            durationMs: 321, transcriptGeneration: 2))
         session.receive(.message(
-            seq: 2,
+            seq: 3,
             message: try message(
                 id: "m1", content: "[{\"type\":\"text\",\"text\":\"original\"}]")))
 
@@ -57,6 +62,8 @@ final class ConversationSessionReducerTests: XCTestCase {
             "patched")
         XCTAssertEqual(session.conversation?.transcript_generation, 2)
         XCTAssertEqual(session.messages[0].display_data?["status"]?.stringValue, "completed")
+        XCTAssertEqual(session.messages[0].display_data?["tool_starts"]?["a"]?.numberValue, 1)
+        XCTAssertEqual(session.messages[0].display_data?["tool_starts"]?["b"]?.numberValue, 2)
         XCTAssertEqual(session.messages[0].display_data?["duration_ms"]?.numberValue, 321)
     }
 
@@ -111,6 +118,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             messages: [try message(id: "m1", content: "[]")],
             agentWorking: false, presentationMode: "idle", lastSequenceId: 0,
             pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
 
@@ -119,6 +127,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertNil(session.conversation)
         XCTAssertTrue(session.outbox.entries.isEmpty)
         XCTAssertEqual(deletedId, "c1")
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor
