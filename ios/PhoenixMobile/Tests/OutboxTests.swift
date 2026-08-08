@@ -192,6 +192,32 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
+    func testReconcileRecognizesConversationScopedCanonicalMessageId() {
+        freshDiskStore()
+        let entry = makeEntry(
+            conversationId: "c1", status: .recoverableInconsistency,
+            acceptedByServer: true)
+        DiskStore.saveVersioned(
+            [entry], name: "outbox-c1", version: Outbox.schemaVersion)
+        let outbox = Outbox(conversationId: "c1")
+
+        outbox.reconcile(authoritativeMessageIds: ["c1:\(entry.localId)"])
+
+        XCTAssertTrue(outbox.visibleEntries.isEmpty)
+    }
+
+    @MainActor
+    func testCanonicalMessageIdFromAnotherConversationDoesNotReconcile() {
+        freshDiskStore()
+        let outbox = Outbox(conversationId: "c1")
+        let entry = outbox.enqueue(text: "scoped identity")
+
+        outbox.reconcile(authoritativeMessageIds: ["c2:\(entry.localId)"])
+
+        XCTAssertEqual(outbox.visibleEntries.map(\.localId), [entry.localId])
+    }
+
+    @MainActor
     func testReconcileAppliesToSteeringQueuedEntries() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
