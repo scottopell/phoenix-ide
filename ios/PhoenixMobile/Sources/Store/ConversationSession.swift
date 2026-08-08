@@ -48,6 +48,7 @@ final class ConversationSession {
     private var streamTask: Task<Void, Never>?
     private var drainTask: Task<Void, Never>?
     private var staleCheckTask: Task<Void, Never>?
+    private var cancelNeedsAgentDoneFallback = false
     /// localIds with a POST in flight — prevents duplicate concurrent sends
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
@@ -330,6 +331,10 @@ final class ConversationSession {
         case .outboxed:
             break  // never blocked on connectivity by definition
         }
+        if case .cancel = action,
+           case .awaitingCommissionReviewApproval = typedState {
+            cancelNeedsAgentDoneFallback = true
+        }
         actionInFlight = action
         Task {
             do {
@@ -353,6 +358,9 @@ final class ConversationSession {
                     actionInFlight = nil
                 }
             } catch {
+                if case .cancel = action {
+                    cancelNeedsAgentDoneFallback = false
+                }
                 actionInFlight = nil
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
@@ -474,6 +482,12 @@ final class ConversationSession {
             }
             convState = snap.conversation.state
             typedState = ConversationState.parse(snap.conversation.state)
+            switch typedState {
+            case .awaitingCommissionReviewApproval:
+                break
+            default:
+                cancelNeedsAgentDoneFallback = false
+            }
             clearResolvedActionIfStateAdvanced()
             messages = Self.reconcileTranscript(
                 existing: messages,
@@ -592,6 +606,7 @@ final class ConversationSession {
             guard applyIfNewer(seq) else { return }
             convState = state
             typedState = ConversationState.parse(state)
+            cancelNeedsAgentDoneFallback = false
             clearResolvedActionIfStateAdvanced()
             if let mode { presentationMode = mode }
             if var conversation {
@@ -646,9 +661,12 @@ final class ConversationSession {
             // agent_done can close a turn without a trailing idle
             // state_change; leave resting/needs-action states alone but
             // clear in-flight ones so the spinner doesn't outlive the turn.
-            if presentationMode == "working"
-                || (presentationMode == nil && typedState.isKnownWorkingState)
-            {
+            let shouldMoveToIdle = Self.shouldMoveToIdleOnAgentDone(
+                presentationMode: presentationMode,
+                typedState: typedState,
+                cancelledCommissionApproval: cancelNeedsAgentDoneFallback)
+            cancelNeedsAgentDoneFallback = false
+            if shouldMoveToIdle {
                 typedState = .idle
                 convState = .string("idle")
                 conversation?.state = .string("idle")
@@ -657,6 +675,8 @@ final class ConversationSession {
                 // the spinner back for a turn that already ended.
                 presentationMode = "idle"
                 conversation?.presentation_mode = "idle"
+                conversation?.requires_action = false
+                if let conversation { onConversationUpdate?(conversation) }
             }
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
@@ -758,6 +778,16 @@ final class ConversationSession {
             }
         }
         return .object(merged)
+    }
+
+    nonisolated static func shouldMoveToIdleOnAgentDone(
+        presentationMode: String?,
+        typedState: ConversationState,
+        cancelledCommissionApproval: Bool
+    ) -> Bool {
+        cancelledCommissionApproval
+            || presentationMode == "working"
+            || (presentationMode == nil && typedState.isKnownWorkingState)
     }
 
     private func clearResolvedActionIfStateAdvanced() {

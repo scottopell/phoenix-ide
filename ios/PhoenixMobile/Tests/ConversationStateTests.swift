@@ -199,4 +199,15 @@ final class ConversationStateTests: XCTestCase {
                 .waitsForAuthoritativeStateChange)
         XCTAssertFalse(ConversationAction.cancel.waitsForAuthoritativeStateChange)
     }
+
+    func testAgentDoneClearsCommissionApprovalOnlyAfterCancellation() {
+        XCTAssertFalse(ConversationSession.shouldMoveToIdleOnAgentDone(
+            presentationMode: "needs_action",
+            typedState: .awaitingCommissionReviewApproval,
+            cancelledCommissionApproval: false))
+        XCTAssertTrue(ConversationSession.shouldMoveToIdleOnAgentDone(
+            presentationMode: "needs_action",
+            typedState: .awaitingCommissionReviewApproval,
+            cancelledCommissionApproval: true))
+    }
 }
