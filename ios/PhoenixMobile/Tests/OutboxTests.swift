@@ -210,7 +210,7 @@ final class OutboxTests: XCTestCase {
     func testCanonicalMessageIdFromAnotherConversationDoesNotReconcile() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "scoped identity")
+        let entry = outbox.enqueue(text: "scoped identity")!
 
         outbox.reconcile(authoritativeMessageIds: ["c2:\(entry.localId)"])
 

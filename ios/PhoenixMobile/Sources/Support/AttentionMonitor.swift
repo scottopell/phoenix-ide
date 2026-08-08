@@ -1,20 +1,10 @@
 import Foundation
 import UserNotifications
 
-/// ⚠️ STOPGAP TIER — read before extending.
-///
 /// Best-effort local nudges driven by opportunistic background fetches
 /// (BGAppRefresh, OS-controlled cadence, typically ≥15 min and never
-/// guaranteed). This is deliberately the *cheap* tier of the notification
-/// architecture, NOT the end state: the intended goal is server-side APNs
-/// hung on the durable-workflow inbox observations
-/// (specs/durable-workflows REQ-DWF-031), which delivers real-time,
-/// at-least-once push without the phone polling. When that lands, this
-/// monitor's job shrinks to nothing — prefer deleting it over teaching it
-/// tricks. Tracked in tasks/ (apns-push-on-durable-inbox-observations).
-///
-/// What it does: diff the freshly fetched conversation list against the
-/// last-seen snapshot and fire a local notification for conversations that
+/// guaranteed). Diffs the freshly fetched conversation list against the
+/// last-seen snapshot and fires a local notification for conversations that
 /// newly need the user (needs_action, error) or just finished a turn.
 /// Foreground refreshes re-seed the snapshot silently so the user is never
 /// nudged about things they already saw.
@@ -91,6 +81,11 @@ final class AttentionMonitor {
     func seed(with conversations: [Conversation]) {
         snapshot = Self.entries(from: conversations)
         DiskStore.saveVersioned(snapshot, name: Self.storeName, version: Self.schemaVersion)
+    }
+
+    func reset() {
+        snapshot = [:]
+        DiskStore.remove(name: Self.storeName)
     }
 
     /// Background path: diff, notify, then seed. One notification per

@@ -33,7 +33,6 @@ final class ConversationListStoreTests: XCTestCase {
         XCTAssertEqual(byId["two"]?.title, "fresh")
         XCTAssertEqual(byId["three"]?.title, "new conversation")
     }
-
     func testRefreshMergeCannotResurrectArchivedRows() throws {
         let merged = ConversationListStore.merging(
             [
@@ -50,5 +49,30 @@ final class ConversationListStoreTests: XCTestCase {
             excluding: ["removed-during-refresh"])
 
         XCTAssertEqual(merged.map(\.id), ["active"])
+    }
+
+    @MainActor
+    func testExternalRefreshCannotOverwriteAnInterveningUpsert() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        let token = store.externalRefreshToken()
+        store.upsert(try conversation(id: "one", title: "SSE update"))
+
+        XCTAssertFalse(store.applyExternal(
+            [try conversation(id: "one", title: "stale response")], startedAt: token))
+        XCTAssertEqual(store.conversations.first?.title, "SSE update")
+    }
+
+    @MainActor
+    func testExternalRefreshAppliesWithoutAnInterveningMutation() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        let token = store.externalRefreshToken()
+
+        XCTAssertTrue(store.applyExternal(
+            [try conversation(id: "one", title: "fresh")], startedAt: token))
+        XCTAssertEqual(store.conversations.first?.title, "fresh")
     }
 }

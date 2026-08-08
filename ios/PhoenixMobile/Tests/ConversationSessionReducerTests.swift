@@ -45,7 +45,7 @@ final class ConversationSessionReducerTests: XCTestCase {
 
         session.receive(.messageUpdated(
             seq: 1, messageId: "m1", content: try json("[{\"type\":\"text\",\"text\":\"patched\"}]"),
-            displayData: nil))
+            displayData: nil, transcriptGeneration: 2))
         session.receive(.message(
             seq: 2,
             message: try message(
@@ -54,6 +54,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertEqual(
             session.messages[0].content.arrayValue?.first?["text"]?.stringValue,
             "patched")
+        XCTAssertEqual(session.conversation?.transcript_generation, 2)
     }
 
     @MainActor
@@ -66,7 +67,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         session.receive(.messageUpdated(
             seq: 1, messageId: "m1",
             content: try json("[{\"type\":\"text\",\"text\":\"stale patch\"}]"),
-            displayData: nil))
+            displayData: nil, transcriptGeneration: nil))
 
         session.receive(.initSnapshot(.init(
             conversation: try conversation(), messages: [], agentWorking: false,
@@ -120,7 +121,7 @@ final class ConversationSessionReducerTests: XCTestCase {
     @MainActor
     func testCanonicalAuthoritativeMessageReconcilesOptimisticEntry() throws {
         let session = makeSession()
-        let entry = session.outbox.enqueue(text: "sent once")
+        let entry = session.outbox.enqueue(text: "sent once")!
 
         session.receive(.initSnapshot(.init(
             conversation: try conversation(),

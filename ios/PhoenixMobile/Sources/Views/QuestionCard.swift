@@ -84,7 +84,7 @@ struct QuestionCard: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .confirmationDialog(
-            "Dismiss without answering? The agent will proceed on its own judgment.",
+            "Dismiss without answering? The conversation will return to idle.",
             isPresented: $confirmDismiss, titleVisibility: .visible
         ) {
             Button("Dismiss questions", role: .destructive) {

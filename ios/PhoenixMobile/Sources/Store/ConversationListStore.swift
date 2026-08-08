@@ -24,6 +24,9 @@ final class ConversationListStore {
     /// into its result so the refresh can still update unrelated rows.
     private var generation = 0
     private var refreshToken: UUID?
+    /// Changes on every list mutation, including non-destructive upserts.
+    /// Background fetches use this separately from foreground refresh merging.
+    private var externalMutationGeneration = 0
     /// Server-pushed rows received after the current full refresh began.
     private var upsertsDuringRefresh: [String: Conversation] = [:]
     /// Rows removed or archived after the current full refresh began.
@@ -88,16 +91,27 @@ final class ConversationListStore {
     /// Apply an externally fetched list (background attention check) so a
     /// cold open renders fresher data. Skipped while a foreground refresh
     /// is in flight; the generation guard semantics match refresh().
-    func applyExternal(_ fresh: [Conversation]) {
-        guard !isRefreshing else { return }
+    struct ExternalRefreshToken: Equatable {
+        fileprivate let generation: Int
+    }
+
+    func externalRefreshToken() -> ExternalRefreshToken {
+        ExternalRefreshToken(generation: externalMutationGeneration)
+    }
+
+    @discardableResult
+    func applyExternal(_ fresh: [Conversation], startedAt token: ExternalRefreshToken) -> Bool {
+        guard !isRefreshing, token.generation == externalMutationGeneration else { return false }
         apply(fresh)
         lastError = nil
+        return true
     }
 
     /// Merge a single updated conversation (e.g. after creation or an SSE
     /// update in an open session) without waiting for a full refresh.
     func upsert(_ conversation: Conversation) {
         if lastRefreshed == nil { lastRefreshed = Date() }
+        externalMutationGeneration += 1
         if conversation.archived == true {
             if isRefreshing {
                 upsertsDuringRefresh[conversation.id] = nil
@@ -128,6 +142,7 @@ final class ConversationListStore {
     }
 
     func remove(id: String) {
+        externalMutationGeneration += 1
         upsertsDuringRefresh[id] = nil
         if isRefreshing {
             exclusionsDuringRefresh.insert(id)
@@ -144,6 +159,7 @@ final class ConversationListStore {
     func reset() {
         generation += 1
         refreshToken = nil
+        externalMutationGeneration += 1
         upsertsDuringRefresh.removeAll()
         exclusionsDuringRefresh.removeAll()
         conversations = []

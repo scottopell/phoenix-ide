@@ -2,9 +2,7 @@ import XCTest
 
 @testable import PhoenixMobile
 
-// Contract tests for the stopgap nudge tier's diff (REQ-IOS-018): one test
-// per transition rule. The diff is pure; BGTask plumbing and notification
-// delivery stay untested per the project pattern.
+// Contract tests for attention-nudge transitions (REQ-IOS-018).
 final class AttentionDiffTests: XCTestCase {
 
     private func conv(_ id: String, mode: String?, title: String = "t") -> Conversation {
@@ -101,5 +99,18 @@ final class AttentionDiffTests: XCTestCase {
             from: [conv("c1", mode: "working", title: "fix login")])
         XCTAssertEqual(
             entries, ["c1": AttentionMonitor.Entry(mode: "working", title: "fix login")])
+    }
+
+    @MainActor
+    func testResetClearsTheInMemoryAndPersistedSnapshot() {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-attention-tests-\(UUID().uuidString)")
+        let monitor = AttentionMonitor()
+        monitor.seed(with: [conv("c1", mode: "working")])
+
+        monitor.reset()
+
+        XCTAssertTrue(monitor.snapshot.isEmpty)
+        XCTAssertTrue(AttentionMonitor().snapshot.isEmpty)
     }
 }

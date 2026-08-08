@@ -615,6 +615,10 @@ final class ConversationSession {
             // Stale guard applies here too: a replayed update from before
             // the floor must not clobber content a newer update already set.
             guard applyIfNewer(seq) else { return }
+            if let updatedGeneration {
+                transcriptGeneration = updatedGeneration
+                conversation?.transcript_generation = updatedGeneration
+            }
             guard let idx = messages.firstIndex(where: { $0.message_id == messageId }) else {
                 var patch = pendingMessagePatches[messageId]
                     ?? PendingMessagePatch(content: nil, displayData: nil)

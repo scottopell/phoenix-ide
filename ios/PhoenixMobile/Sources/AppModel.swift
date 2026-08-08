@@ -117,7 +117,6 @@ final class AppModel {
 
     private func handleHardDeleted(_ conversationId: String) {
         listStore.remove(id: conversationId)
-        sessions[conversationId] = nil
         if pendingOpenConversationId == conversationId {
             pendingOpenConversationId = nil
         }
@@ -135,7 +134,7 @@ final class AppModel {
         }
     }
 
-    // MARK: - Needs-attention nudges (STOPGAP tier — see AttentionMonitor)
+    // MARK: - Needs-attention nudges
 
     let attention = AttentionMonitor()
     private let notificationRouter = NotificationRouter()
@@ -173,6 +172,7 @@ final class AppModel {
     func runBackgroundAttentionCheck() async -> Bool {
         guard backgroundNudgesEnabled, let api else { return false }
         let startedGeneration = apiGeneration
+        let listToken = listStore.externalRefreshToken()
         guard let fresh = try? await api.listConversations() else { return false }
         guard !Task.isCancelled,
               backgroundNudgesEnabled,
@@ -183,7 +183,7 @@ final class AppModel {
               backgroundNudgesEnabled,
               apiGeneration == startedGeneration
         else { return false }
-        listStore.applyExternal(fresh)
+        _ = listStore.applyExternal(fresh, startedAt: listToken)
         return true
     }
 
@@ -339,6 +339,7 @@ final class AppModel {
         drainSessions.removeAll()
         DiskStore.removeAll()
         listStore.reset()
+        attention.reset()
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
         coordinatorConversationId = nil
     }

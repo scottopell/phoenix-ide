@@ -141,8 +141,9 @@ struct ComposerView: View {
             guard !Task.isCancelled, generation == attachmentLoadGeneration else { return }
             guard attachments.count + loaded.count < Self.maxAttachments else { break }
             if let data = try? await item.loadTransferable(type: Data.self),
-               let payload = ImageProcessing.payload(fromPickedData: data)
-            {
+               let payload = await Task.detached(priority: .userInitiated, operation: {
+                   ImageProcessing.payload(fromPickedData: data)
+               }).value {
                 loaded.append(payload)
             } else {
                 failed += 1

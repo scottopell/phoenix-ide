@@ -1,11 +1,8 @@
 import BackgroundTasks
 import Foundation
 
-/// BGAppRefresh plumbing for the stopgap nudge tier (see AttentionMonitor's
-/// header: APNs on durable inbox observations is the intended end state;
-/// this file exists to be deleted when that lands).
-///
-/// iOS owns the schedule: `earliestBeginDate` is a floor, not a promise,
+/// BGAppRefresh plumbing for best-effort local attention nudges. iOS owns
+/// the schedule: `earliestBeginDate` is a floor, not a promise,
 /// and runs are skipped entirely under low power or poor app-usage signal.
 /// Correctness never depends on a run happening — a missed window just
 /// means the user finds out when they next open the app, exactly as before
@@ -39,8 +36,7 @@ enum BackgroundRefresh {
     static func scheduleNext() {
         let request = BGAppRefreshTaskRequest(identifier: taskIdentifier)
         request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
-        // Submit failures (simulator, duplicate pending request) are
-        // non-fatal by design — see header.
+        // Submit failures (simulator, duplicate pending request) are non-fatal.
         try? BGTaskScheduler.shared.submit(request)
     }
 
