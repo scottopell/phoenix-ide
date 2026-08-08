@@ -14,6 +14,7 @@ final class ConnectivityMonitor {
     /// Weakly-held observation would be nicer, but the set of listeners is
     /// tiny (list store + active session) and they unregister on teardown.
     private var onRestore: [UUID: () -> Void] = [:]
+    private var onLoss: [UUID: () -> Void] = [:]
 
     private let monitor = NWPathMonitor()
 
@@ -33,7 +34,24 @@ final class ConnectivityMonitor {
         isOnline = nowOnline
         if !wasOnline && nowOnline {
             for callback in onRestore.values { callback() }
+        } else if wasOnline && !nowOnline {
+            for callback in onLoss.values { callback() }
         }
+    }
+
+    func addPathObserver(
+        onRestore restore: @escaping () -> Void,
+        onLoss loss: @escaping () -> Void
+    ) -> UUID {
+        let token = UUID()
+        onRestore[token] = restore
+        onLoss[token] = loss
+        return token
+    }
+
+    func removePathObserver(_ token: UUID) {
+        onRestore[token] = nil
+        onLoss[token] = nil
     }
 
     /// Register a connectivity-restored callback. Returns a token; call
@@ -47,4 +65,16 @@ final class ConnectivityMonitor {
     func removeRestoreObserver(_ token: UUID) {
         onRestore[token] = nil
     }
+
+    #if DEBUG
+    func setOnlineForTesting(_ online: Bool) {
+        let wasOnline = isOnline
+        isOnline = online
+        if !wasOnline && online {
+            for callback in onRestore.values { callback() }
+        } else if wasOnline && !online {
+            for callback in onLoss.values { callback() }
+        }
+    }
+    #endif
 }

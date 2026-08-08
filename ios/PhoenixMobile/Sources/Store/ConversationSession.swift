@@ -107,11 +107,23 @@ final class ConversationSession {
         guard !isHardDeleted else { return }
         viewIsActive = true
         if connectivityToken == nil {
-            connectivityToken = connectivity.addRestoreObserver { [weak self] in
-                self?.connectivityRestored()
-            }
+            connectivityToken = connectivity.addPathObserver(
+                onRestore: { [weak self] in self?.connectivityRestored() },
+                onLoss: { [weak self] in self?.connectivityLost() })
         }
         resumeLiveTasks()
+    }
+
+    func replaceAPI(_ api: PhoenixAPI) {
+        self.api = api
+        streamBlockedUntilConfigurationChange = false
+        if viewIsActive {
+            streamTask?.cancel()
+            streamTask = nil
+            connection = .idle
+            resumeLiveTasks()
+        }
+        drainOutbox()
     }
 
     func adoptOpenOwnership(
@@ -128,7 +140,7 @@ final class ConversationSession {
         drainTask?.cancel()
         drainTask = nil
         if let token = connectivityToken {
-            connectivity.removeRestoreObserver(token)
+            connectivity.removePathObserver(token)
             connectivityToken = nil
         }
     }
@@ -179,6 +191,14 @@ final class ConversationSession {
             streamTask = Task { await streamLoop() }
         }
         drainOutbox()
+    }
+
+    private func connectivityLost() {
+        streamTask?.cancel()
+        streamTask = nil
+        staleCheckTask?.cancel()
+        staleCheckTask = nil
+        connection = .offline
     }
 
     @discardableResult
@@ -404,7 +424,9 @@ final class ConversationSession {
                 coverage: snap.transcriptCoverage,
                 generationMatches: generationMatches)
             transcriptGeneration = snap.transcriptGeneration
-            durableMessageSequenceCeiling = snap.pendingAnchorSequenceId
+            durableMessageSequenceCeiling = Self.durableCeilingAfterInit(
+                anchor: snap.pendingAnchorSequenceId,
+                messages: snap.messages)
             snapshotSyncedAt = Date()
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
@@ -614,7 +636,7 @@ final class ConversationSession {
         staleCheckTask?.cancel()
         staleCheckTask = nil
         if let token = connectivityToken {
-            connectivity.removeRestoreObserver(token)
+            connectivity.removePathObserver(token)
             connectivityToken = nil
         }
         inFlight.removeAll()
@@ -748,6 +770,12 @@ final class ConversationSession {
         _ messages: [Message], through sequenceCeiling: Int64
     ) -> [Message] {
         messages.filter { $0.sequence_id <= sequenceCeiling }
+    }
+
+    nonisolated static func durableCeilingAfterInit(
+        anchor: Int64, messages: [Message]
+    ) -> Int64 {
+        max(anchor, messages.map(\.sequence_id).max() ?? 0)
     }
 
     nonisolated static func durableCeilingAfterLiveMessage(

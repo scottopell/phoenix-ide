@@ -66,17 +66,14 @@ final class AppModel {
             api = nil
             return
         }
-        api = PhoenixAPI(
+        let rebuiltAPI = PhoenixAPI(
             baseURL: url,
             password: password.isEmpty ? nil : password,
             allowSelfSigned: trustSelfSigned)
-        // Existing sessions hold the old client; drop them so reopened
-        // conversations pick up the new settings. Their outboxes are disk-
-        // backed, so nothing is lost.
-        for session in sessions.values { session.stop() }
-        sessions.removeAll()
-        for session in drainSessions.values { session.stop() }
-        drainSessions.removeAll()
+        api = rebuiltAPI
+        guard let rebuiltAPI else { return }
+        for session in sessions.values { session.replaceAPI(rebuiltAPI) }
+        for session in drainSessions.values { session.replaceAPI(rebuiltAPI) }
     }
 
     func configure(serverURL: String, password: String, trustSelfSigned: Bool) throws {

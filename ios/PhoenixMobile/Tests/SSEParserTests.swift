@@ -238,6 +238,14 @@ final class SSEParserTests: XCTestCase {
             [persisted])
     }
 
+    func testInitDurableCeilingIncludesMessagesReadAfterTheRingSnapshot() {
+        let committedAfterAnchor = message(id: "committed", sequence: 6, text: "saved")
+        XCTAssertEqual(
+            ConversationSession.durableCeilingAfterInit(
+                anchor: 4, messages: [committedAfterAnchor]),
+            6)
+    }
+
     func testCommittedLiveMessagesAdvanceDurableBoundaryButEagerAgentDoesNot() {
         let toolResult = Message(
             message_id: "tool", conversation_id: "c1", sequence_id: 6,
@@ -310,5 +318,25 @@ final class SSEParserTests: XCTestCase {
         }
         XCTAssertEqual(sequence, 11)
         XCTAssertEqual(conversationId, "c1")
+    }
+
+    @MainActor
+    func testNetworkLossImmediatelyMovesAnOpenSessionOffline() {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-connectivity-tests-\(UUID().uuidString)")
+        let connectivity = ConnectivityMonitor()
+        let session = ConversationSession(
+            conversationId: "c1",
+            api: PhoenixAPI(
+                baseURL: URL(string: "https://phoenix.invalid")!,
+                password: nil,
+                allowSelfSigned: false)!,
+            connectivity: connectivity)
+
+        session.start()
+        connectivity.setOnlineForTesting(false)
+
+        XCTAssertEqual(session.connection, .offline)
+        session.stop()
     }
 }
