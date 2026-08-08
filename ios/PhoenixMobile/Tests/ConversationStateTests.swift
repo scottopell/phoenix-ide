@@ -194,10 +194,16 @@ final class ConversationStateTests: XCTestCase {
                 handoff: .continueInCurrentConversation)
                 .waitsForAuthoritativeStateChange)
         XCTAssertTrue(ConversationAction.rejectTask.waitsForAuthoritativeStateChange)
+        let feedback = TaskFeedback("revise")!
         XCTAssertTrue(
-            ConversationAction.provideTaskFeedback(annotations: "revise")
+            ConversationAction.provideTaskFeedback(feedback)
                 .waitsForAuthoritativeStateChange)
         XCTAssertFalse(ConversationAction.cancel.waitsForAuthoritativeStateChange)
+    }
+
+    func testTaskFeedbackIsNonEmptyByConstruction() {
+        XCTAssertNil(TaskFeedback(" \n "))
+        XCTAssertEqual(TaskFeedback("  revise this  ")?.text, "revise this")
     }
 
     func testAgentDoneClearsCommissionApprovalOnlyAfterCancellation() {

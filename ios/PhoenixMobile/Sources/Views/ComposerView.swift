@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// Message input. Always enabled — sending offline or mid-turn is the
-/// normal case, not an error: the outbox holds the message until it can be
-/// delivered (or the server steers it into the running turn).
+/// Message input. Offline and supported mid-turn sends remain available;
+/// state decisions and archive operations disable submission.
 struct ComposerView: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
@@ -43,7 +42,7 @@ struct ComposerView: View {
                 }
                 .disabled(
                     draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || !session.typedState.acceptsChatMessage)
+                        || !session.acceptsChatMessage)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -52,7 +51,7 @@ struct ComposerView: View {
     }
 
     private func send() {
-        guard session.typedState.acceptsChatMessage else { return }
+        guard session.acceptsChatMessage else { return }
         if session.send(text: draft) {
             draft = ""
         }

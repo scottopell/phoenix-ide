@@ -24,17 +24,18 @@ final class ConversationSession {
     private(set) var messages: [Message] = []
     private(set) var agentWorking = false
     private(set) var presentationMode: String?
-    private(set) var convState: JSONValue?
-    /// Typed decode of convState, kept in lockstep by the reducer (and
-    /// seeded from the cached conversation on cold open). Views render
-    /// from this; the raw JSONValue exists only for persistence.
-    private(set) var typedState: ConversationState = .unknown
+    var convState: JSONValue? { conversation?.state }
+    var typedState: ConversationState { ConversationState.parse(conversation?.state) }
     private(set) var connection: ConnectionState = .idle
     /// In-flight LLM text accumulated from token events; cleared when the
     /// finalized message arrives or the turn ends.
     private(set) var streamingText = ""
     private(set) var lastErrorToast: String?
     private(set) var isHardDeleted = false
+    private(set) var isArchiving = false
+    var acceptsChatMessage: Bool {
+        !isHardDeleted && !isArchiving && typedState.acceptsChatMessage
+    }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
     /// renderer. Rebuilt on message changes, not per render.
@@ -101,7 +102,6 @@ final class ConversationSession {
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
             replayFromPendingAnchor = true
-            typedState = ConversationState.parse(snap.conversation?.state)
             presentationMode = snap.conversation?.presentation_mode
             // Busy flag follows the cached mode the same way live
             // state_change events derive it — a snapshot taken mid-turn
@@ -242,7 +242,7 @@ final class ConversationSession {
         guard !isHardDeleted else { return false }
         guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, typedState.acceptsChatMessage else { return false }
+        guard !trimmed.isEmpty, acceptsChatMessage else { return false }
         guard outbox.enqueue(text: trimmed) != nil else {
             lastErrorToast = "Message could not be saved on this device. Free storage and try again."
             return false
@@ -258,6 +258,16 @@ final class ConversationSession {
 
     func dismissEntry(_ localId: String) {
         outbox.dismiss(localId)
+    }
+
+    func beginArchiving() -> Bool {
+        guard !isArchiving, outbox.visibleEntries.isEmpty else { return false }
+        isArchiving = true
+        return true
+    }
+
+    func endArchiving() {
+        isArchiving = false
     }
 
     /// Attempt delivery of every sendable entry, oldest first. Safe to call
@@ -348,9 +358,9 @@ final class ConversationSession {
                         conversationId: conversationId, handoff: handoff)
                 case .rejectTask:
                     try await api.rejectTask(conversationId: conversationId)
-                case .provideTaskFeedback(let annotations):
+                case .provideTaskFeedback(let feedback):
                     try await api.sendTaskFeedback(
-                        conversationId: conversationId, annotations: annotations)
+                        conversationId: conversationId, annotations: feedback.text)
                 }
                 // Success needs no local state change: the server emits the
                 // resulting state_change over SSE and the reducer applies it.
@@ -480,8 +490,6 @@ final class ConversationSession {
             if let mode = snap.presentationMode {
                 conversation?.requires_action = mode == "needs_action"
             }
-            convState = snap.conversation.state
-            typedState = ConversationState.parse(snap.conversation.state)
             switch typedState {
             case .awaitingCommissionReviewApproval:
                 break
@@ -604,8 +612,6 @@ final class ConversationSession {
 
         case .stateChange(let seq, let state, let mode, let stateUpdatedAt):
             guard applyIfNewer(seq) else { return }
-            convState = state
-            typedState = ConversationState.parse(state)
             cancelNeedsAgentDoneFallback = false
             clearResolvedActionIfStateAdvanced()
             if let mode { presentationMode = mode }
@@ -667,8 +673,6 @@ final class ConversationSession {
                 cancelledCommissionApproval: cancelNeedsAgentDoneFallback)
             cancelNeedsAgentDoneFallback = false
             if shouldMoveToIdle {
-                typedState = .idle
-                convState = .string("idle")
                 conversation?.state = .string("idle")
                 // The mode must move with the state, or the snapshot
                 // persists idle-with-working-mode and a cold reopen seeds
@@ -744,7 +748,6 @@ final class ConversationSession {
         conversation = nil
         messages = []
         durableMessageSequenceCeiling = 0
-        convState = nil
         presentationMode = "done"
         agentWorking = false
         streamingText = ""

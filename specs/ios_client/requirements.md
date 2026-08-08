@@ -335,6 +335,10 @@ WHEN archive is requested while the conversation has a visible outbox entry
 THE SYSTEM SHALL block archive until the user retries or discards that entry
 SO THAT archive cannot delete the only durable copy of user-authored text
 
+WHEN an archive request is in flight
+THE SYSTEM SHALL disable new message submission for that conversation
+UNTIL archive fails or completes
+
 **Rationale:** Queuing an action against live server state fabricates a
 stale intent — an archive or cancel replayed minutes later can destroy
 work the user did in between. Only idempotency-keyed sends are safe to
@@ -349,6 +353,9 @@ THE SYSTEM SHALL render the proposed task's title, priority, and plan
 (plan collapsed with an expand affordance)
 AND offer approve, reject (with confirmation), and free-text
 request-changes resolutions
+
+WHEN request-changes feedback is constructed
+THE SYSTEM SHALL require non-empty text after trimming whitespace
 
 WHEN approval is chosen
 THE SYSTEM SHALL require an explicit placement choice between continuing in
@@ -370,7 +377,8 @@ AND, when offline, state that approval is never queued
 
 WHEN the server reports that a submitted resolution failed retryably while
 the conversation remains awaiting approval
-THE SYSTEM SHALL re-enable the resolution controls
+THE SYSTEM SHALL decode retryability from the typed error payload
+AND re-enable the resolution controls
 
 **Rationale:** Plan approval is the highest-value blocking decision to
 make away from the desk. The no-optimistic-state rule matters because

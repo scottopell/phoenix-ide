@@ -1,5 +1,15 @@
 import Foundation
 
+struct TaskFeedback: Equatable {
+    let text: String
+
+    init?(_ raw: String) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        self.text = text
+    }
+}
+
 /// Session-scoped operations invoked by conversation controls.
 enum ConversationAction: Equatable {
     /// Stop the in-flight agent turn.
@@ -14,7 +24,7 @@ enum ConversationAction: Equatable {
     case rejectTask
     /// Send the plan back with free-text change requests; the agent
     /// revises and re-proposes.
-    case provideTaskFeedback(annotations: String)
+    case provideTaskFeedback(TaskFeedback)
 
     var waitsForAuthoritativeStateChange: Bool {
         switch self {

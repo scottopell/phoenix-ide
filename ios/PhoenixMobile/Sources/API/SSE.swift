@@ -207,10 +207,14 @@ enum PhoenixEvent: Sendable {
             return .steerMessageQueued(seq: seq, messageId: messageId)
 
         case "error":
+            let typedError = json["error"]
             return .errorEvent(
                 seq: seq,
-                message: json["message"]?.stringValue ?? "Unknown error",
-                retryable: json["can_auto_retry"]?.boolValue ?? false)
+                message: json["message"]?.stringValue
+                    ?? typedError?["message"]?.stringValue
+                    ?? "Unknown error",
+                retryable: typedError?["kind"]?.stringValue == "retryable"
+                    || json["can_auto_retry"]?.boolValue == true)
 
         case "conversation_became_terminal":
             return .conversationBecameTerminal(seq: seq)

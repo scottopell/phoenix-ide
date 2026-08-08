@@ -342,7 +342,7 @@ final class SSEParserTests: XCTestCase {
     func testRetryableErrorSignalIsDecoded() {
         let frame = SSEFrame(
             event: "error",
-            data: #"{"sequence_id":9,"message":"approval failed","can_auto_retry":true}"#)
+            data: #"{"sequence_id":9,"error":{"kind":"retryable","message":"approval failed"}}"#)
 
         guard case .errorEvent(let seq, let message, let retryable) = PhoenixEvent.decode(
             frame: frame)

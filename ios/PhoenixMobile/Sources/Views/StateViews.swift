@@ -93,29 +93,12 @@ struct StateDetailView: View {
             }
 
         case .other(let type):
-            // Unhandled variant: label it rather than guessing. The server's
-            // presentation mode decides the family — an untyped variant that
-            // needs the user still gets a card, not silence.
-            if session.presentationMode == "error" {
-                errorCard(
-                    message: Self.fallbackErrorMessage(
-                        type: type, state: session.convState),
-                    dismissible: false)
-            } else if session.presentationMode == "needs_action" {
-                needsActionCard(
-                    icon: "person.crop.circle.badge.exclamationmark",
-                    title: "Action needed",
-                    detail: type.replacingOccurrences(of: "_", with: " "),
-                    footnote: "Handle this from the web UI.")
-            } else if session.agentWorking {
-                workingRow {
-                    Text(type.replacingOccurrences(of: "_", with: " "))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            fallbackState(type: type)
 
-        case .idle, .awaitingLlm, .awaitingContinuation, .terminal, .handedOff, .unknown:
+        case .unknown:
+            fallbackState(type: "Unknown state")
+
+        case .idle, .awaitingLlm, .awaitingContinuation, .terminal, .handedOff:
             if session.agentWorking {
                 workingRow {
                     Text("Working…")
@@ -131,6 +114,27 @@ struct StateDetailView: View {
             ?? state?["error"]?.stringValue
             ?? state?["failure"]?["message"]?.stringValue
             ?? type.replacingOccurrences(of: "_", with: " ")
+    }
+
+    @ViewBuilder
+    private func fallbackState(type: String) -> some View {
+        if session.presentationMode == "error" {
+            errorCard(
+                message: Self.fallbackErrorMessage(type: type, state: session.convState),
+                dismissible: false)
+        } else if session.presentationMode == "needs_action" {
+            needsActionCard(
+                icon: "person.crop.circle.badge.exclamationmark",
+                title: "Action needed",
+                detail: type.replacingOccurrences(of: "_", with: " "),
+                footnote: "Handle this from the web UI.")
+        } else if session.agentWorking {
+            workingRow {
+                Text(type.replacingOccurrences(of: "_", with: " "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private func progressSuffix(remaining: Int, completed: Int) -> String {
@@ -280,9 +284,8 @@ struct TaskApprovalCard: View {
 
                 Button(showFeedbackField ? "Send changes" : "Request changes") {
                     if showFeedbackField {
-                        let text = feedbackText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !text.isEmpty else { return }
-                        session.perform(.provideTaskFeedback(annotations: text))
+                        guard let feedback = TaskFeedback(feedbackText) else { return }
+                        session.perform(.provideTaskFeedback(feedback))
                         // Deliberately NOT cleared here: on success the
                         // state change unmounts this card (draft discarded
                         // with it); on failure the user's typed annotations

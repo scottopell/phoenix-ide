@@ -120,21 +120,26 @@ final class AppModel {
     @discardableResult
     func archive(conversationId: String) async -> Bool {
         guard ClientOperation.archive.policy == .onlineOnly else { return false }
-        let hasInMemoryMessages = sessions[conversationId]?.outbox.visibleEntries.isEmpty == false
-        guard !hasInMemoryMessages,
-              !Outbox.hasVisibleEntries(conversationId: conversationId)
+        guard let api, connectivity.isOnline else {
+            lastActionError = "Archiving needs a connection — it can't be queued."
+            return false
+        }
+        guard !Outbox.hasVisibleEntries(conversationId: conversationId),
+              let session = session(for: conversationId),
+              session.beginArchiving()
         else {
             lastActionError =
                 "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
             return false
         }
-        guard let api, connectivity.isOnline else {
-            lastActionError = "Archiving needs a connection — it can't be queued."
-            return false
+        var archived = false
+        defer {
+            if !archived { session.endArchiving() }
         }
         do {
             try await api.archive(conversationId: conversationId)
-            sessions[conversationId]?.stop()
+            archived = true
+            session.stop()
             sessions[conversationId] = nil
             listStore.remove(id: conversationId)
             DiskStore.remove(name: "outbox-\(conversationId)")

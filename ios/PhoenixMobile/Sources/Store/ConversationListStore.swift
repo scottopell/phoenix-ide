@@ -19,11 +19,8 @@ final class ConversationListStore {
         var lastRefreshed: Date
     }
 
-    /// Bumped by every local mutation (reset, upsert, remove); a refresh
-    /// started under an older generation discards its response. This keeps
-    /// an in-flight fetch from repopulating a cleared cache, resurrecting a
-    /// just-archived row, or dropping a just-created one — the discarded
-    /// refresh's data is strictly older than the mutation it would clobber.
+    /// Destructive mutations invalidate an in-flight refresh. Server-driven
+    /// upserts instead enter `upsertsDuringRefresh` and merge over its result.
     private var generation = 0
     private var refreshToken: UUID?
     /// Server-pushed rows received after the current full refresh began.
