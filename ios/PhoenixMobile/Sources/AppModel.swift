@@ -213,6 +213,12 @@ final class AppModel {
                 listStore.upsert(conversation)
                 return conversation.id
             } catch {
+                guard !Task.isCancelled, apiGeneration == startedGeneration else { return nil }
+                if let apiError = error as? APIError,
+                   apiError.isTransport,
+                   let cached = coordinatorConversationId {
+                    return cached
+                }
                 lastActionError = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
                 return nil
@@ -343,6 +349,19 @@ final class AppModel {
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
         coordinatorConversationId = nil
     }
+
+    #if DEBUG
+    static func resetPersistentStateForUITesting() {
+        if let bundleIdentifier = Bundle.main.bundleIdentifier {
+            UserDefaults.standard.removePersistentDomain(forName: bundleIdentifier)
+        }
+        Keychain.deletePassword(account: Self.passwordAccount)
+        DiskStore.removeAll()
+        let center = UNUserNotificationCenter.current()
+        center.removeAllDeliveredNotifications()
+        center.removeAllPendingNotificationRequests()
+    }
+    #endif
 }
 
 /// Routes notification taps into the app (deep link to the conversation)

@@ -21,6 +21,7 @@ final class PhoenixMobileUIQATests: XCTestCase {
         let seedMessage = "ios-ui-qa-\(runID) [[scenario:plain_text]]"
         let followUp = "canonical-\(runID) [[scenario:plain_text]]"
 
+        app.launchArguments = ["-ui-testing-reset"]
         app.launch()
 
         let serverField = element("setup.serverURL")
@@ -81,6 +82,7 @@ final class PhoenixMobileUIQATests: XCTestCase {
         attachScreenshot(named: "02-reconciled")
 
         app.terminate()
+        app.launchArguments = []
         app.launch()
 
         XCTAssertTrue(app.navigationBars["Conversations"].waitForExistence(timeout: 15))

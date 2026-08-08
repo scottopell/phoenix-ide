@@ -6,6 +6,11 @@ struct PhoenixMobileApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-ui-testing-reset") {
+            AppModel.resetPersistentStateForUITesting()
+        }
+        #endif
         let model = AppModel()
         _model = State(initialValue: model)
         // BGTask registration must complete before launch finishes.
