@@ -1,7 +1,9 @@
 # Wake public projections and exhaustive event registry
 
-Depends on tasks 44011 and 44012 and their merged PRs.
+Paused optional follow-up. This task is not part of the adapter experiment stack and is not a prerequisite for Bash, TmuxWindow, or Subagent.
 
-Project the authoritative wake aggregate into API inspection, durable transcript delivery, live SSE, replay, generated TypeScript, and UI hydration/status. Introduce one exhaustive public-event registry that drives Rust wire labels/conversion, replay class, sequence-barrier behavior, generated types/manifest, TS schema/router exhaustiveness, and UI reducer/cache invalidation obligations.
+Only resume if the three adapter journeys demonstrate value and require a shared public inspection surface. Any resumed scope must remain a typed projection of the authoritative wake aggregate, never a second lifecycle authority.
 
-Prove atomic message/lifecycle/barrier ordering, reconnect hydration equivalence, fast register+terminal visibility, stale-response suppression, projection idempotency, and exactly-once public materialization. Projections are rebuildable and never become a second wake authority.
+## Out of scope while paused
+
+Broad API inspection, SSE expansion, generated TypeScript, UI hydration/status, cache invalidation, and projection-driven ownership behavior.

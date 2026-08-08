@@ -1,7 +1,31 @@
-# Explicit Bash wait_until adapter
+# Explicit Bash `wait_until` adapter
 
-Depends on task 44011 and its merged authority/model PR.
+PR 2 in the wake experiment stack. Stack directly on PR #621; do not wait for the foundation to merge, and do not merge this adapter independently of the reviewed stack decision.
 
-Integrate explicit Bash `wait_until` as the first adapter to the authoritative wake aggregate. Background/synchronous Bash response paths remain outside wake contracts. Registration is explicit, produces one contract, parks only a fully successful tool round, and leaves normal `ToolExecuting -> Idle` settlement authoritative.
+## User journey
 
-Prove normal completion, sibling failure, typed user cancellation, deadline, waiter panic with real occurrence time, Phoenix restart resource loss, canonical terminal evidence, exactly-once transcript delivery, and at-most-once automatic resumption. Reuse/cherry-pick good #559 Bash tests and typed evidence commits; remove duplicate runtime/repository authorities as this slice lands.
+An agent starts a long Bash command, explicitly registers one tagged `wait_until` for that handle, returns the conversation to Idle, and later receives one durable typed terminal result without polling. A busy conversation stores the result without starting a competing turn. Automatic continuation is a separate acceptance path and proof.
+
+## Concrete scope
+
+- `crates/phoenix-tools/src/bash.rs` and `crates/phoenix-tools/src/bash/`: expose Bash handle identity and terminal evidence without implicit enrollment.
+- `crates/phoenix-tools/src/lib.rs`: register one narrow tagged `wait_until` surface with only the Bash variant enabled in this PR.
+- `crates/phoenix-ide/src/runtime/executor.rs`: mint registration and observation capabilities at the existing checked tool/runtime boundaries.
+- `crates/phoenix-ide/src/runtime/`: admit owed durable results only when the conversation can safely accept work.
+- `crates/phoenix-db/src/workflow/wake_contract.rs`: use the foundation repository; do not add another lifecycle authority.
+
+## Acceptance
+
+- Explicit registration only; ordinary Bash run/wait/peek paths never create a wake.
+- Prove condition truth, exactly one durable result delivery, busy-conversation behavior, cancellation, typed Phoenix-restart loss, and safe runtime admission.
+- Test durable result delivery independently from automatic continuation.
+- One end-to-end Bash journey passes through production capability minting and runtime admission.
+- `./dev.py check` passes and the PR receives exact-head review.
+
+## Stop gate
+
+Pause this adapter if it requires a second wake authority, a generic provider framework, broad UI, combinators, or unrelated ownership-transfer work. Do not start TmuxWindow until this PR is understandable and green.
+
+## Out of scope
+
+TmuxWindow, sub-agent waits, broad public projections/UI, multi-condition combinators, generic providers, and ownership transfer unrelated to the Bash journey.

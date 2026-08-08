@@ -166,17 +166,29 @@ One coarse `commit_transition(plan)` API validates expected generation/version a
 
 Projection rows are derived/rebuildable. Stale observations may be retained for audit but cannot create a second receipt.
 
-## Replacement PR ancestry
+## Stacked product experiment
+
+PR #621 remains the unmerged base. Each adapter stacks on the reviewed predecessor; the stack is merged or abandoned after product-evidence review rather than merging the foundation alone.
 
 ```text
-origin/main
-  └─ PR 1 / task 44011: wake authority + pure model
-       └─ PR 2 / task 44012: explicit Bash wait_until adapter
-            └─ PR 3 / task 44013: public projections/event registry
-                 └─ PR 4 / task 44014: later TmuxWindow adapter
+PR #621 / task 44011: authority foundation
+  -> task 44012: explicit Bash wait_until adapter
+    -> task 44014: TmuxWindow wait_until adapter
+      -> task 44015: Subagent wait_until adapter
 ```
 
-Each branch starts from the merged predecessor. PR #559 is never merged; useful commits/tests are cherry-picked selectively.
+Task 44013's broad public projections remain paused and are not a prerequisite. Each adapter owns only its substrate policy, extends one tagged `wait_until` surface, and separately proves durable result delivery and automatic continuation. An adapter pauses instead of expanding the foundation if it requires another generic subsystem. PR #559 remains unmerged; useful regressions may be cherry-picked selectively.
+
+## Historical deployed behavior
+
+Two earlier commits enrolled ordinary background operations implicitly:
+
+- `256692b6b13fae6787509ad0f13e1e0cac2a7ea6` registered durable Bash wakes from background run responses.
+- `03b9c9cd354321bdbe7fc34957d4a8a2b72e00c5` registered durable tmux wakes from live `tmux_run` responses.
+
+PR #555 / `27af8f1d1746109f3fccecd866794c84044a3710` removed both because the normal handle API could already consume the terminal result, so the implicit obligation later caused duplicate delivery and duplicate LLM turns. PR #603 / `bd1af7f7b238f34afc0b33d4cff3198550bb950e` removed a Bash producer accidentally resurrected during conflict resolution.
+
+The inspected production deployment is `v0.11.2` at `57bbe134a4dc`. It contains both removal commits and neither producer commit in its ancestry. Its database retains 174 legacy wake bindings, which proves substrate use but does not validate implicit enrollment or safe continuation; no recent wake traces were found. The useful evidence is narrower: long-running handles motivate the journey, while implicit enrollment specifically failed. The stack tests explicit intent and safe admission rather than treating the old deployment as feature validation.
 
 ## Historical finding matrix
 
