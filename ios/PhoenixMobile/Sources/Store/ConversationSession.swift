@@ -346,8 +346,9 @@ final class ConversationSession {
                     _ = try await api.cancel(conversationId: conversationId)
                 case .dismissError:
                     try await api.dismissError(conversationId: conversationId)
-                case .approveTask:
-                    try await api.approveTask(conversationId: conversationId)
+                case .approveTask(let handoff):
+                    try await api.approveTask(
+                        conversationId: conversationId, handoff: handoff)
                 case .rejectTask:
                     try await api.rejectTask(conversationId: conversationId)
                 case .provideTaskFeedback(let annotations):

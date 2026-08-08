@@ -68,6 +68,17 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
+    func testArchiveGuardSeesPersistedVisibleEntries() {
+        freshDiskStore()
+        let outbox = Outbox(conversationId: "c1")
+        let entry = outbox.enqueue(text: "do not lose me")
+        XCTAssertTrue(Outbox.hasVisibleEntries(conversationId: "c1"))
+
+        outbox.dismiss(entry.localId)
+        XCTAssertFalse(Outbox.hasVisibleEntries(conversationId: "c1"))
+    }
+
+    @MainActor
     func testDeliveryIsBlockedUntilQueueCanBePersisted() throws {
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-unwritable-store-\(UUID().uuidString)")

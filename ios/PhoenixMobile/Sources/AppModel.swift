@@ -123,6 +123,14 @@ final class AppModel {
 
     @discardableResult
     func archive(conversationId: String) async -> Bool {
+        let hasInMemoryMessages = sessions[conversationId]?.outbox.visibleEntries.isEmpty == false
+        guard !hasInMemoryMessages,
+              !Outbox.hasVisibleEntries(conversationId: conversationId)
+        else {
+            lastActionError =
+                "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+            return false
+        }
         guard let api, connectivity.isOnline else {
             lastActionError = "Archiving needs a connection — it can't be queued."
             return false
@@ -132,10 +140,6 @@ final class AppModel {
             sessions[conversationId]?.stop()
             sessions[conversationId] = nil
             listStore.remove(id: conversationId)
-            // Archiving abandons the conversation's local state, including
-            // any queued drafts: the server rejects chat to archived
-            // conversations, so a surviving outbox file would only feed the
-            // drain sweep undeliverable text (or an unreachable failure).
             DiskStore.remove(name: "outbox-\(conversationId)")
             DiskStore.remove(name: "conv-\(conversationId)")
             return true

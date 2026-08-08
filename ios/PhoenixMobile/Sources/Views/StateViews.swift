@@ -53,6 +53,27 @@ struct StateDetailView: View {
             TaskApprovalCard(
                 session: session, title: title, priority: priority, plan: plan)
 
+        case .awaitingCommissionReviewApproval:
+            needsActionCard(
+                icon: "checkmark.seal",
+                title: "Review approval needed",
+                detail: nil,
+                footnote: "Handle this review from the web UI.")
+
+        case .awaitingRecovery(let message):
+            workingRow {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+        case .provisioning:
+            workingRow {
+                Text("Preparing conversation…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
         case .error(let message):
             errorCard(message: message)
 
@@ -180,13 +201,7 @@ struct StateDetailView: View {
     }
 }
 
-/// Task plan approval — the first fully in-app blocking decision
-/// (REQ-IOS-013). Reviews the proposed title/priority/plan and resolves it
-/// with approve, reject, or free-text change requests. All three routes
-/// are online-only ConversationActions: the card never queues a decision,
-/// and the server's SSE state_change (not optimistic local state) clears
-/// it — so a decision made concurrently from the web UI wins cleanly and
-/// this client just sees the state move on.
+/// Reviews and resolves a proposed task plan.
 struct TaskApprovalCard: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
@@ -278,8 +293,17 @@ struct TaskApprovalCard: View {
 
                 Spacer()
 
-                Button("Approve") {
-                    session.perform(.approveTask)
+                Menu {
+                    Button("Start here") {
+                        session.perform(.approveTask(
+                            handoff: .continueInCurrentConversation))
+                    }
+                    Button("New chat") {
+                        session.perform(.approveTask(
+                            handoff: .startFreshWorkConversation))
+                    }
+                } label: {
+                    Label("Approve…", systemImage: "checkmark")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!actionable)

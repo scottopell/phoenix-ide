@@ -86,12 +86,24 @@ struct SkillRow: View {
     var body: some View {
         HStack {
             Spacer(minLength: 40)
-            Label(trigger, systemImage: "wand.and.stars")
-                .font(.callout.monospaced())
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Color.accentColor.opacity(0.15))
-                .clipShape(Capsule())
+            VStack(alignment: .trailing, spacing: 4) {
+                Label(trigger, systemImage: "wand.and.stars")
+                    .font(.callout.monospaced())
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.accentColor.opacity(0.15))
+                    .clipShape(Capsule())
+                if let files = content["files"]?.arrayValue {
+                    ForEach(Array(files.enumerated()), id: \.offset) { _, file in
+                        Label(
+                            file["original_name"]?.stringValue ?? "attachment",
+                            systemImage: "doc")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
         }
     }
 

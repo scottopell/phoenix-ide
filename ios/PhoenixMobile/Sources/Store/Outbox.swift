@@ -81,6 +81,12 @@ final class Outbox {
         entries.contains { $0.status == .pending && !$0.acceptedByServer }
     }
 
+    static func hasVisibleEntries(conversationId: String) -> Bool {
+        let name = "outbox-\(conversationId)"
+        return (DiskStore.load([OutboxEntry].self, name: name) ?? [])
+            .contains { $0.conversationId == conversationId && $0.isVisible }
+    }
+
     @discardableResult
     private func persist() -> Bool {
         // Terminal entries are pruned at persistence time; they carry no

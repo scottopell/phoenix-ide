@@ -71,6 +71,25 @@ final class ConversationStateTests: XCTestCase {
             .awaitingTaskApproval(title: "Fix login", priority: "p1", plan: "1. do it"))
     }
 
+    func testIncompleteTaskApprovalIsNonActionable() {
+        XCTAssertEqual(
+            parse("{\"type\":\"awaiting_task_approval\",\"title\":\"Hidden plan\"}"),
+            .other(type: "awaiting_task_approval"))
+    }
+
+    func testCancellableParentStatesRemainTyped() {
+        XCTAssertEqual(
+            parse("{\"type\":\"awaiting_commission_review_approval\"}"),
+            .awaitingCommissionReviewApproval)
+        XCTAssertEqual(
+            parse("{\"type\":\"awaiting_recovery\",\"message\":\"Retrying\"}"),
+            .awaitingRecovery(message: "Retrying"))
+        XCTAssertEqual(parse("{\"type\":\"provisioning\"}"), .provisioning)
+        XCTAssertTrue(ConversationState.awaitingCommissionReviewApproval.isCancellable)
+        XCTAssertTrue(ConversationState.awaitingRecovery(message: "Retrying").isCancellable)
+        XCTAssertTrue(ConversationState.provisioning.isCancellable)
+    }
+
     func testErrorCarriesMessage() {
         XCTAssertEqual(
             parse("{\"type\":\"error\",\"message\":\"rate limited\",\"error_kind\":\"llm_rate_limit\"}"),
@@ -118,8 +137,8 @@ final class ConversationStateTests: XCTestCase {
 
     func testUnhandledVariantBecomesOtherWithTypeName() {
         XCTAssertEqual(
-            parse("{\"type\":\"awaiting_commission_review_approval\",\"brief\":\"x\"}"),
-            .other(type: "awaiting_commission_review_approval"))
+            parse("{\"type\":\"recoverable_continuation_failure\",\"message\":\"x\"}"),
+            .other(type: "recoverable_continuation_failure"))
     }
 
     func testFutureUnknownVariantBecomesOther() {

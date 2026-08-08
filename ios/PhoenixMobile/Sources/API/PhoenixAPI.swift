@@ -329,10 +329,14 @@ struct PhoenixAPI: Sendable {
     // Task approval (awaiting_task_approval): the server 400s when the
     // conversation isn't in that state — e.g. another client decided first.
 
-    func approveTask(conversationId: String) async throws {
+    func approveTask(
+        conversationId: String,
+        handoff: TaskApprovalHandoff
+    ) async throws {
         struct ApprovalResponse: Codable { var success: Bool? }
         _ = try await post(
-            "api/conversations/\(conversationId)/approve-task", body: [:],
+            "api/conversations/\(conversationId)/approve-task",
+            body: ["handoff": handoff.rawValue],
             as: ApprovalResponse.self)
     }
 

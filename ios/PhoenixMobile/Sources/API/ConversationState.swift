@@ -29,6 +29,9 @@ enum ConversationState: Equatable {
     case awaitingContinuation
     case awaitingUserResponse(questionCount: Int, firstQuestion: String?)
     case awaitingTaskApproval(title: String, priority: String, plan: String)
+    case awaitingCommissionReviewApproval
+    case awaitingRecovery(message: String)
+    case provisioning
     case error(message: String)
     case contextExhausted
     case cancelling
@@ -72,10 +75,19 @@ enum ConversationState: Equatable {
                 questionCount: questions.count,
                 firstQuestion: questions.first?["question"]?.stringValue)
         case "awaiting_task_approval":
+            guard let title = json["title"]?.stringValue,
+                  let priority = json["priority"]?.stringValue,
+                  let plan = json["plan"]?.stringValue
+            else { return .other(type: type) }
             return .awaitingTaskApproval(
-                title: json["title"]?.stringValue ?? "",
-                priority: json["priority"]?.stringValue ?? "",
-                plan: json["plan"]?.stringValue ?? "")
+                title: title, priority: priority, plan: plan)
+        case "awaiting_commission_review_approval":
+            return .awaitingCommissionReviewApproval
+        case "awaiting_recovery":
+            return .awaitingRecovery(
+                message: json["message"]?.stringValue ?? "Recovery in progress")
+        case "provisioning":
+            return .provisioning
         case "error":
             return .error(message: json["message"]?.stringValue ?? "Unknown error")
         case "context_exhausted":
@@ -104,7 +116,9 @@ enum ConversationState: Equatable {
              .awaitingSubAgents, .cancellingTool, .cancellingSubAgents:
             return true
         case .awaitingLlm, .awaitingContinuation, .cancelling,
-             .awaitingUserResponse, .awaitingTaskApproval, .contextExhausted,
+             .awaitingUserResponse, .awaitingTaskApproval,
+             .awaitingCommissionReviewApproval, .awaitingRecovery, .provisioning,
+             .contextExhausted,
              .terminal, .handedOff, .other, .unknown:
             return false
         }
@@ -113,7 +127,8 @@ enum ConversationState: Equatable {
     var isCancellable: Bool {
         switch self {
         case .llmRequesting, .toolExecuting, .awaitingSubAgents,
-             .awaitingTaskApproval:
+             .awaitingTaskApproval, .awaitingCommissionReviewApproval,
+             .awaitingRecovery, .provisioning:
             return true
         case .idle, .awaitingLlm, .awaitingContinuation,
              .awaitingUserResponse, .error, .contextExhausted, .cancelling,
@@ -126,7 +141,8 @@ enum ConversationState: Equatable {
     var isKnownWorkingState: Bool {
         switch self {
         case .awaitingLlm, .llmRequesting, .toolExecuting,
-             .awaitingSubAgents, .awaitingContinuation, .cancelling,
+             .awaitingSubAgents, .awaitingContinuation, .awaitingRecovery,
+             .provisioning, .cancelling,
              .cancellingTool, .cancellingSubAgents:
             return true
         default:

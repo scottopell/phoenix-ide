@@ -291,6 +291,10 @@ detail area between transcript and composer:
 - the error state renders an error card carrying the message and the
   dismiss action
 
+WHEN the server state permits cancellation
+THE SYSTEM SHALL expose the cancel control, including while provisioning,
+awaiting recovery, or awaiting commission-review approval
+
 WHEN deciding whether the agent is busy
 THE SYSTEM SHALL use the server's presentation_mode, not re-derive it from
 the typed state
@@ -321,6 +325,10 @@ WHEN an online-only action is rejected by the server (e.g. dismissing a
 non-resumable error)
 THE SYSTEM SHALL surface the server's explanation
 
+WHEN archive is requested while the conversation has a visible outbox entry
+THE SYSTEM SHALL block archive until the user retries or discards that entry
+SO THAT archive cannot delete the only durable copy of user-authored text
+
 **Rationale:** Queuing an action against live server state fabricates a
 stale intent — an archive or cancel replayed minutes later can destroy
 work the user did in between. Only idempotency-keyed sends are safe to
@@ -335,6 +343,13 @@ THE SYSTEM SHALL render the proposed task's title, priority, and plan
 (plan collapsed with an expand affordance)
 AND offer approve, reject (with confirmation), and free-text
 request-changes resolutions
+
+WHEN approval is chosen
+THE SYSTEM SHALL require an explicit placement choice between continuing in
+the current conversation and starting a fresh work conversation
+
+WHEN the state omits the title, priority, or plan required for review
+THE SYSTEM SHALL render a non-actionable fallback rather than approval controls
 
 WHEN a resolution is submitted
 THE SYSTEM SHALL send it as an online-only action (REQ-IOS-012)
