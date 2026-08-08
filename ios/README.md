@@ -78,10 +78,10 @@ xcodegen generate
 xcrun simctl boot 'iPhone 16' 2>/dev/null || true
 xcrun simctl bootstatus 'iPhone 16' -b
 xcrun simctl uninstall 'iPhone 16' com.phoenix.mobile 2>/dev/null || true
-PHOENIX_UI_TEST_SERVER_URL=https://127.0.0.1:<port> \
-PHOENIX_UI_TEST_CWD=/tmp \
 xcodebuild test -project PhoenixMobile.xcodeproj -scheme PhoenixMobileUIQA \
-  -destination 'platform=iOS Simulator,name=iPhone 16'
+  -destination 'platform=iOS Simulator,name=iPhone 16' \
+  PHOENIX_UI_TEST_SERVER_URL_VALUE=https://127.0.0.1:<port> \
+  PHOENIX_UI_TEST_CWD_VALUE=/tmp
 ```
 
 The uninstall only clears Phoenix from that simulator, making the first-run

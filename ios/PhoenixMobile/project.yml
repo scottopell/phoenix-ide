@@ -98,3 +98,6 @@ schemes:
       config: Debug
       targets:
         - PhoenixMobileUITests
+      environmentVariables:
+        PHOENIX_UI_TEST_SERVER_URL: "$(PHOENIX_UI_TEST_SERVER_URL_VALUE)"
+        PHOENIX_UI_TEST_CWD: "$(PHOENIX_UI_TEST_CWD_VALUE)"
