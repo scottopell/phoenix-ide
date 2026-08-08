@@ -5122,24 +5122,23 @@ where
             }
 
             Effect::ClearSteeringQueueEntries { message_ids } => {
-                if let Err(e) = self
-                    .storage
+                self.storage
                     .remove_steering_entries(&self.context.conversation_id, &message_ids)
                     .await
-                {
-                    tracing::warn!(
-                        conversation_id = %self.context.conversation_id,
-                        message_ids = ?message_ids,
-                        error = %e,
-                        "Failed to remove drained steering entries"
-                    );
-                } else {
-                    tracing::info!(
-                        conversation_id = %self.context.conversation_id,
-                        message_ids = ?message_ids,
-                        "Removed drained steering entries"
-                    );
-                }
+                    .map_err(|error| {
+                        tracing::warn!(
+                            conversation_id = %self.context.conversation_id,
+                            message_ids = ?message_ids,
+                            %error,
+                            "Failed to remove drained steering entries"
+                        );
+                        format!("Failed to remove drained steering entries: {error}")
+                    })?;
+                tracing::info!(
+                    conversation_id = %self.context.conversation_id,
+                    message_ids = ?message_ids,
+                    "Removed drained steering entries"
+                );
                 Ok(None)
             }
         }
@@ -12748,6 +12747,28 @@ mod steer_drain_detector_tests {
         let remaining = storage.get_steering_queue("conv-clear-effect");
         assert_eq!(remaining.len(), 1, "concurrent enqueue must survive drain");
         assert_eq!(remaining[0].message_id, "c1");
+    }
+
+    #[tokio::test]
+    async fn failed_steering_removal_aborts_before_llm_dispatch() {
+        let queue = vec![mk_entry("s1", "must not dispatch yet")];
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-clear-failure",
+            ConvState::LlmRequesting { attempt: 1 },
+            queue,
+        );
+        storage.set_fail_steering_removal(true);
+
+        let error = rt
+            .apply_transition_result(TransitionResult::new(ConvState::Idle))
+            .await
+            .expect_err("durable queue removal failure must abort the drain");
+
+        assert!(error.contains("injected steering removal failure"));
+        assert!(
+            rt.llm_client.recorded_requests().is_empty(),
+            "RequestLlm must remain deferred when queue removal fails"
+        );
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the

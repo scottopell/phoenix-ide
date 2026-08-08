@@ -3701,7 +3701,6 @@ impl RuntimeManager {
         // executor loads the old queue, not the just-appended entry that it
         // will also receive through the channel below.
         let handle = self.get_or_create(conversation_id).await?;
-        let _projection_guard = self.lock_steering_projection(conversation_id).await;
 
         // Build SteerEntry and persist before touching the executor channel.
         let new_entry = crate::state_machine::event::SteerEntry {
@@ -3713,20 +3712,22 @@ impl RuntimeManager {
             user_agent: user_agent.clone(),
             skill_invocation: skill_invocation.clone(),
         };
-        let queue_position = self
-            .db()
-            .append_steering_entry(conversation_id, &new_entry)
-            .await
-            .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
-        let persisted_entry = new_entry;
-        let _ =
-            handle
-                .broadcast_tx
-                .send_live_projection(|sequence_id| SseEvent::SteerMessageQueued {
+        let queue_position = {
+            let _projection_guard = self.lock_steering_projection(conversation_id).await;
+            let queue_position = self
+                .db()
+                .append_steering_entry(conversation_id, &new_entry)
+                .await
+                .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
+            let _ = handle.broadcast_tx.send_live_projection(|sequence_id| {
+                SseEvent::SteerMessageQueued {
                     sequence_id,
-                    message: persisted_entry,
+                    message: new_entry,
                     queue_position,
-                });
+                }
+            });
+            queue_position
+        };
         tracing::info!(
             conversation_id,
             message_id,
@@ -3734,7 +3735,9 @@ impl RuntimeManager {
             "Persisted steering message before executor delivery"
         );
 
-        // DB is durable; now update the executor's in-memory queue via channel.
+        // DB and its live projection are settled. Do not hold the projection
+        // gate across this bounded send: the executor also takes that gate
+        // while draining, and a full channel would otherwise deadlock them.
         deposit_turn_trigger(&handle);
         handle
             .event_tx

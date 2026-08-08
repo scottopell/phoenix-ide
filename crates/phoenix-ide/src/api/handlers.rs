@@ -4499,30 +4499,36 @@ async fn cancel_steering_message(
     // Serialize removal and publication with queue admission. This preserves
     // one durable mutation order and prevents a cancel event from overtaking
     // an append event for the same conversation.
-    let _acceptance_guard = state.runtime.lock_message_acceptance(&id).await;
-    let _projection_guard = state.runtime.lock_steering_projection(&id).await;
+    let removed = {
+        let _acceptance_guard = state.runtime.lock_message_acceptance(&id).await;
+        let _projection_guard = state.runtime.lock_steering_projection(&id).await;
 
-    // Delete the entry directly (cascading its attachments). Idempotent retries
-    // return success but do not publish a second cancellation projection.
-    let removed = state
-        .runtime
-        .db()
-        .remove_steering_entry(&id, &message_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        // Delete the entry directly (cascading its attachments). Idempotent retries
+        // return success but do not publish a second cancellation projection.
+        let removed = state
+            .runtime
+            .db()
+            .remove_steering_entry(&id, &message_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    if removed {
-        let broadcaster = state.runtime.conversation_broadcaster(&id).await;
-        let cancelled_message_id = message_id.clone();
-        let _ = broadcaster.send_live_projection(|sequence_id| SseEvent::SteerMessageCancelled {
-            sequence_id,
-            message_id: cancelled_message_id,
-        });
-    }
+        if removed {
+            let broadcaster = state.runtime.conversation_broadcaster(&id).await;
+            let cancelled_message_id = message_id.clone();
+            let _ =
+                broadcaster.send_live_projection(|sequence_id| SseEvent::SteerMessageCancelled {
+                    sequence_id,
+                    message_id: cancelled_message_id,
+                });
+        }
+        removed
+    };
 
     // Executor removal is independently idempotent and runs even when the DB
     // row was already absent. This repairs an interrupted earlier handler that
-    // committed the delete but did not reach its in-memory notification.
+    // committed the delete but did not reach its in-memory notification. The
+    // projection gate is released before this bounded send because the executor
+    // takes the same gate while draining.
     if let Some(handle) = state.runtime.try_get_handle(&id).await {
         let _ = handle
             .event_tx

@@ -307,6 +307,8 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         --
         -- ClearSteeringQueueEntries removes only the drained ids (not the whole
         -- queue), so a concurrent enqueue during the drain window is preserved.
+        -- Removal failure aborts the inline effect sequence before RequestLlm;
+        -- it is never logged as success while delivery continues.
         -- Crash recovery: queue updated AFTER persist effects, so a crash
         -- mid-drain reloads the drained entries on restart; idempotent
         -- PersistMessage (gated by idempotent: bool, via storage.message_exists)
