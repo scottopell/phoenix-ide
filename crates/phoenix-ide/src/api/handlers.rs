@@ -4517,17 +4517,18 @@ async fn cancel_steering_message(
             sequence_id,
             message_id: cancelled_message_id,
         });
+    }
 
-        // DB is already authoritative; notify a live executor to remove its
-        // in-memory projection after every connected client has the same delta.
-        if let Some(handle) = state.runtime.try_get_handle(&id).await {
-            let _ = handle
-                .event_tx
-                .send(Event::CancelSteerMessage {
-                    message_id: message_id.clone(),
-                })
-                .await;
-        }
+    // Executor removal is independently idempotent and runs even when the DB
+    // row was already absent. This repairs an interrupted earlier handler that
+    // committed the delete but did not reach its in-memory notification.
+    if let Some(handle) = state.runtime.try_get_handle(&id).await {
+        let _ = handle
+            .event_tx
+            .send(Event::CancelSteerMessage {
+                message_id: message_id.clone(),
+            })
+            .await;
     }
 
     tracing::info!(conv_id = %id, %message_id, removed, "Steering cancellation settled");
@@ -14850,6 +14851,47 @@ mod chat_authority_tests {
                 .map(|entry| entry.message_id.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn idempotent_cancellation_retry_repairs_executor_without_false_sse() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-cancel-retry", "cancel retry", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let mut executor_events = state
+            .runtime
+            .inject_handle_with_event_capture_for_test(
+                "c-cancel-retry",
+                ConvState::LlmRequesting { attempt: 1 },
+            )
+            .await;
+        let mut sse = state
+            .runtime
+            .subscribe("c-cancel-retry")
+            .await
+            .expect("client");
+
+        let _ = cancel_steering_message(
+            State(state),
+            Path(("c-cancel-retry".to_string(), "already-removed".to_string())),
+        )
+        .await
+        .expect("idempotent retry");
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), executor_events.recv())
+                .await
+                .expect("executor notification timeout"),
+            Some(Event::CancelSteerMessage { message_id }) if message_id == "already-removed"
+        ));
+        if let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(25), sse.recv()).await
+        {
+            panic!("absent durable row published an unexpected SSE event: {event:?}");
+        }
     }
 }
 

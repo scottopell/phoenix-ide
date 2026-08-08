@@ -117,6 +117,9 @@ describe('conversationReducer', () => {
         lastAppliedEventSeq: 12,
         transcriptGeneration: 1,
         streamIncarnation: 'old-stream',
+        pendingMessagePatches: {
+          'old-message': { lastAppliedPatchEventSeq: 12, patches: [] },
+        },
         streamingBuffer: {
           text: 'pre-restart partial',
           lastSequence: 12,
@@ -139,6 +142,7 @@ describe('conversationReducer', () => {
 
       expect(restarted.lastAppliedEventSeq).toBe(4);
       expect(restarted.streamingBuffer).toBeNull();
+      expect(restarted.pendingMessagePatches).toEqual({});
       expect(afterLive.lastAppliedEventSeq).toBe(5);
     });
 

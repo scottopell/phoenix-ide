@@ -345,6 +345,8 @@ rule CancelAbsentSteeringMessage {
     @guidance
         -- HTTP returns 200 because the requested postcondition already holds.
         -- No false cancellation event is published for an absent row.
+        -- The idempotent in-memory executor removal is still delivered, repairing
+        -- an earlier cancellation interrupted after its durable delete.
 }
 
 -- REQ-STEER-004

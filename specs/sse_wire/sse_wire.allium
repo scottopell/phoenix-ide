@@ -789,6 +789,8 @@ rule DurableStateProjectionBroadcastLiveOnly {
         -- SseBroadcaster::send_live_projection stamps the event with the
         -- current stream watermark. Because it does not allocate a sequence,
         -- excluding the event from pending_events cannot create a replay gap.
+        -- The broadcaster gate is held from watermark observation through the
+        -- channel send, so a later sequenced event cannot be delivered first.
         -- Authorized init replaces steering state from SQLite. Shared init and
         -- live filtering omit private steering content. Hard deletion has no
         -- later init because the conversation row is gone.

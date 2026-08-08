@@ -1333,7 +1333,9 @@ export function conversationReducer(
         eventGap: null,
         transcriptGeneration: p.transcriptGeneration,
         transcriptCoverage: nextTranscriptCoverage,
-        pendingMessagePatches: isFreshConnect ? {} : atom.pendingMessagePatches,
+        pendingMessagePatches: isFreshConnect || streamIncarnationChanged
+          ? {}
+          : atom.pendingMessagePatches,
         ...deriveMessageSyncState(mergedMessages),
         messages: mergedMessages,
         steeringMessages,

@@ -346,13 +346,11 @@ pub struct ConversationHandle {
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
     /// the turn the event starts can link back to it.
     pub turn_trigger: TurnTriggerSlot,
-    /// SSE broadcaster. Owns the per-conversation monotonic `sequence_id` counter
-    /// that every emitted [`SseEvent`] must consume (task 02675). Callers never
-    /// hand-craft a `sequence_id` — they either go through [`SseBroadcaster::send_seq`]
-    /// (which allocates the next id from the counter) or [`SseBroadcaster::send_message`]
-    /// (which passes through the DB-allocated message id and advances the counter past
-    /// it). This makes the "every SSE event carries a monotonic `sequence_id`" contract
-    /// structurally enforceable rather than a matter of caller discipline.
+    /// SSE broadcaster. Owns the per-conversation monotonic `sequence_id`
+    /// counter. Replayable events allocate through [`SseBroadcaster::send_seq`]
+    /// or pass a DB-allocated message id through [`SseBroadcaster::send_message`];
+    /// durable live-only projections carry the current counter as an ordering
+    /// witness. Callers never hand-craft these values.
     pub broadcast_tx: SseBroadcaster,
     /// Opaque per-instance identity used by cleanup tasks to guard against
     /// removing a _replacement_ entry that was created after eviction. Each
@@ -884,17 +882,23 @@ impl SseBroadcaster {
     /// its potentially large payload in the reconnect ring; authoritative init
     /// reconstructs the represented state after a missed event.
     pub fn send_live_projection(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
-        let witnessed_seq = self.current_seq();
-        let event = build(witnessed_seq);
-        self.send_with_ring(event, witnessed_seq, RingOp::BroadcastOnly)
+        self.send_broadcast_only(build)
     }
 
     /// Broadcast a replaceable live-progress event without consuming the
     /// reconnect ring reserved for lifecycle-critical ephemeral events.
     pub fn send_live_progress(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
-        let witnessed_seq = self.current_seq();
+        self.send_broadcast_only(build)
+    }
+
+    /// Stamp and send a live-only event while holding the same gate used by
+    /// sequenced allocation. A later sequenced event therefore cannot allocate
+    /// and reach the channel before this event carrying the earlier witness.
+    fn send_broadcast_only(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let _gate = self.gate.lock().expect("BroadcastGate mutex");
+        let witnessed_seq = self.last_seq.load(Ordering::Acquire);
         let event = build(witnessed_seq);
-        self.send_with_ring(event, witnessed_seq, RingOp::BroadcastOnly)
+        self.send_with_ring_raw(event, witnessed_seq, RingOp::BroadcastOnly)
     }
 
     /// Broadcast a persisted `Message` event using the DB-allocated
@@ -3502,6 +3506,31 @@ impl RuntimeManager {
                 state_rx,
             },
         );
+    }
+
+    /// Inject a fake live handle and return its event receiver so a handler
+    /// test can assert executor notifications directly.
+    #[cfg(test)]
+    pub(crate) async fn inject_handle_with_event_capture_for_test(
+        &self,
+        conv_id: &str,
+        live_state: ConvState,
+    ) -> mpsc::Receiver<Event> {
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(live_state);
+        self.runtimes.write().await.insert(
+            conv_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+        event_rx
     }
 
     /// Evict an active runtime so it gets recreated with fresh config on next access.
