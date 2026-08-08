@@ -106,6 +106,23 @@ final class ConversationStateTests: XCTestCase {
             .cancellingSubAgents)
     }
 
+    func testContextExhaustedCarriesHandoffSummary() {
+        XCTAssertEqual(
+            parse("{\"type\":\"context_exhausted\",\"summary\":\"Continue from here\"}"),
+            .contextExhausted(summary: "Continue from here"))
+    }
+
+    func testActionLockUsesStableLifecycleFamilies() {
+        let origin = ConversationState.toolExecuting(
+            toolName: "first", remainingCount: 2, completedCount: 0)
+        let progress = ConversationState.toolExecuting(
+            toolName: "second", remainingCount: 1, completedCount: 1)
+        XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
+            action: .cancel, origin: origin, current: progress))
+        XCTAssertFalse(ConversationSession.actionStillAwaitsOriginalState(
+            action: .cancel, origin: origin, current: .cancelling))
+    }
+
     func testHandedOffCarriesSuccessorConversationId() {
         XCTAssertEqual(
             parse("{\"type\":\"handed_off\",\"successor_conv_id\":\"next-123\"}"),

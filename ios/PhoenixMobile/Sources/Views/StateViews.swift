@@ -73,12 +73,12 @@ struct StateDetailView: View {
         case .error(let message):
             errorCard(message: message)
 
-        case .contextExhausted:
+        case .contextExhausted(let summary):
             if session.presentationMode != "done" {
                 needsActionCard(
                     icon: "arrow.triangle.2.circlepath",
                     title: "Context exhausted",
-                    detail: nil,
+                    detail: summary,
                     footnote: "Continue this work from the web UI.")
             }
 
@@ -231,7 +231,9 @@ struct TaskApprovalCard: View {
     @State private var confirmReject = false
 
     private var busy: Bool { session.actionInFlight != nil }
-    private var actionable: Bool { model.connectivity.isOnline && !busy }
+    private var actionable: Bool {
+        model.connectivity.isOnline && session.acceptsConversationActions && !busy
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {

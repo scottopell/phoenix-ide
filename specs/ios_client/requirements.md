@@ -303,6 +303,13 @@ WHEN rendering context exhaustion from a legacy or cached payload
 THE SYSTEM SHALL keep the needs-action card visible unless presentation_mode
 explicitly reports done
 
+WHEN context exhaustion carries a continuation summary
+THE SYSTEM SHALL render that summary in the needs-action card
+
+WHEN a conversation snapshot is archived
+THE SYSTEM SHALL keep its transcript readable
+AND SHALL disable chat and state-transition actions
+
 WHEN a state variant is promoted from the catch-all to typed support
 THE SYSTEM SHALL update the typed case, wire parser, state-detail dispatcher,
 and a decoding test together

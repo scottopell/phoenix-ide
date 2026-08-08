@@ -34,7 +34,10 @@ final class ConversationSession {
     private(set) var isHardDeleted = false
     private(set) var isArchiving = false
     var acceptsChatMessage: Bool {
-        !isHardDeleted && !isArchiving && typedState.acceptsChatMessage
+        acceptsConversationActions && typedState.acceptsChatMessage
+    }
+    var acceptsConversationActions: Bool {
+        !isHardDeleted && !isArchiving && conversation?.archived != true
     }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
@@ -332,7 +335,7 @@ final class ConversationSession {
     /// (ConversationAction). Online-only actions fail fast with a toast
     /// when offline — deliberately not queued, see the policy doc.
     func perform(_ action: ConversationAction) {
-        guard actionInFlight == nil else { return }
+        guard acceptsConversationActions, actionInFlight == nil else { return }
         switch ClientOperation.conversationAction(action).policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
@@ -798,14 +801,33 @@ final class ConversationSession {
     }
 
     private func clearResolvedActionIfStateAdvanced(currentState: ConversationState) {
-        guard actionInFlight?.waitsForAuthoritativeStateChange == true,
-              let origin = actionOriginState
+        guard let action = actionInFlight,
+              action.waitsForAuthoritativeStateChange
         else {
             return
         }
-        guard currentState != origin else { return }
+        guard !Self.actionStillAwaitsOriginalState(
+            action: action, origin: actionOriginState, current: currentState)
+        else { return }
         actionInFlight = nil
         actionOriginState = nil
+    }
+
+    nonisolated static func actionStillAwaitsOriginalState(
+        action: ConversationAction,
+        origin: ConversationState?,
+        current: ConversationState
+    ) -> Bool {
+        _ = origin
+        switch action {
+        case .cancel:
+            return current.isCancellable
+        case .dismissError:
+            if case .error = current { return true }
+        case .approveTask, .rejectTask, .provideTaskFeedback:
+            if case .awaitingTaskApproval = current { return true }
+        }
+        return false
     }
 
     private func upsert(_ message: Message) {

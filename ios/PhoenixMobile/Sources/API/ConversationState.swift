@@ -27,7 +27,7 @@ enum ConversationState: Equatable {
     case awaitingRecovery(message: String)
     case provisioning
     case error(message: String)
-    case contextExhausted
+    case contextExhausted(summary: String?)
     case cancelling
     case cancellingTool
     case cancellingSubAgents
@@ -85,7 +85,7 @@ enum ConversationState: Equatable {
         case "error":
             return .error(message: json["message"]?.stringValue ?? "Unknown error")
         case "context_exhausted":
-            return .contextExhausted
+            return .contextExhausted(summary: json["summary"]?.stringValue)
         case "cancelling":
             return .cancelling
         case "cancelling_tool":
