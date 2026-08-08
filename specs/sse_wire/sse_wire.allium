@@ -310,7 +310,7 @@ enum AggregateBoundLiveCarrierKind {
     message | state_change | token | message_updated | agent_done |
     conversation_update | product_conversation_lifecycle |
     continuation_boundary | work_scope_update | error |
-    browser_session_state | steer_message_queued |
+    browser_session_state | steer_message_queued | steer_message_cancelled |
     rate_limit_snapshot | llm_first_byte | llm_attempt
 }
 
@@ -957,7 +957,7 @@ rule AggregateBoundLiveCarrierEnvelopeAllocated {
         message, state_change, token, message_updated, agent_done,
         conversation_update, product_conversation_lifecycle,
         continuation_boundary, work_scope_update, error,
-        browser_session_state, steer_message_queued,
+        browser_session_state, steer_message_queued, steer_message_cancelled,
         rate_limit_snapshot, llm_first_byte, llm_attempt
     }
 
@@ -980,7 +980,7 @@ rule AggregateBoundLiveCarrierEnvelopeAllocated {
         --
         -- Member-scoped carriers (`message`, `state_change`, `token`, `message_updated`,
         -- `agent_done`, `conversation_update`, `error`, `browser_session_state`,
-        -- `steer_message_queued`, `rate_limit_snapshot`, `llm_first_byte`,
+        -- `steer_message_queued`, `steer_message_cancelled`, `rate_limit_snapshot`, `llm_first_byte`,
         -- `llm_attempt`) carry the emitting member conversation id; aggregate-native
         -- carriers (`product_conversation_lifecycle`, `continuation_boundary`,
         -- `work_scope_update`) carry null there.
@@ -998,7 +998,7 @@ rule AggregateBoundMemberLiveCarrierClaimsRootSequence {
     requires: carrier_kind in {
         "state_change", "token", "message_updated", "agent_done",
         "conversation_update", "error", "browser_session_state",
-        "steer_message_queued", "rate_limit_snapshot", "llm_first_byte",
+        "steer_message_queued", "steer_message_cancelled", "rate_limit_snapshot", "llm_first_byte",
         "llm_attempt"
     }
     requires: member_sequence_id > 0
@@ -1228,6 +1228,19 @@ rule SteerMessageQueuedClaimsRootSequence {
     )
 }
 
+rule SteerMessageCancelledClaimsRootSequence {
+    when: AggregateBoundMemberEventProduced(conv_id, "steer_message_cancelled", payload_identity, seq)
+
+    requires: seq > 0
+
+    ensures: RootProjectedEventCommitted(
+        root_conversation_id: DurableRootOf(conv_id),
+        projected_kind: "steer_message_cancelled",
+        payload_identity: payload_identity,
+        root_sequence_id: seq
+    )
+}
+
 rule RateLimitSnapshotClaimsRootSequence {
     when: AggregateBoundMemberEventProduced(conv_id, "rate_limit_snapshot", payload_identity, seq)
 
@@ -1452,7 +1465,7 @@ invariant AggregateBoundLiveEnvelopeCoversClosedCarrierSet {
             message, state_change, token, message_updated, agent_done,
             conversation_update, product_conversation_lifecycle,
             continuation_boundary, error, browser_session_state,
-            steer_message_queued, rate_limit_snapshot, llm_first_byte,
+            steer_message_queued, steer_message_cancelled, rate_limit_snapshot, llm_first_byte,
             llm_attempt
         }
 }

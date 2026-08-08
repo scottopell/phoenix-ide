@@ -237,7 +237,7 @@ THE SYSTEM SHALL include in the init payload:
 - `pending_truncated`: whether the ring overflowed since the anchor
 - `last_sequence_id`: the same RootStreamLedger-derived root-stream watermark used by live delivery
 
-WHEN the server emits any aggregate-bound live SSE carrier (message, token, state_change, message_updated, agent_done, conversation_update, product_conversation_lifecycle, continuation_boundary, work_scope_update, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
+WHEN the server emits any aggregate-bound live SSE carrier (message, token, state_change, message_updated, agent_done, conversation_update, product_conversation_lifecycle, continuation_boundary, work_scope_update, error, browser_session_state, steer_message_queued, steer_message_cancelled, rate_limit_snapshot, llm_first_byte, llm_attempt)
 THE SYSTEM SHALL materialize one closed typed aggregate-bound live envelope for that carrier
 AND SHALL allocate or reuse one root-stream sequence_id from the RootStreamLedger before broadcast
 AND SHALL carry the root ProductConversation id plus that `root_sequence_id` on the live envelope
