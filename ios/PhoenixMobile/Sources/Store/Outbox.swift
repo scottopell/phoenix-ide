@@ -56,6 +56,7 @@ struct OutboxEntry: Codable, Identifiable, Equatable {
 final class Outbox {
     let conversationId: String
     private(set) var entries: [OutboxEntry] = []
+    private var suppressedMessageIds: Set<String> = []
 
     private var storeName: String { "outbox-\(conversationId)" }
 
@@ -69,7 +70,7 @@ final class Outbox {
     }
 
     var visibleEntries: [OutboxEntry] {
-        entries.filter(\.isVisible)
+        entries.filter { $0.isVisible && !suppressedMessageIds.contains($0.localId) }
     }
 
     var hasSendableEntries: Bool {
@@ -181,7 +182,15 @@ final class Outbox {
 
     func clear() {
         entries = []
+        suppressedMessageIds = []
         DiskStore.remove(name: storeName)
+    }
+
+    /// Hide a local bubble as soon as authoritative history reflects it.
+    /// This is deliberately memory-only: durable reconciliation still waits
+    /// until the matching conversation snapshot is safely on disk.
+    func suppress(authoritativeMessageIds: Set<String>) {
+        suppressedMessageIds.formUnion(authoritativeMessageIds)
     }
 
     /// AuthoritativeMessageReconcilesQueueEntry: any entry whose localId

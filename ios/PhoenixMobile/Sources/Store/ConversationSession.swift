@@ -52,6 +52,9 @@ final class ConversationSession {
     private var onHardDeleted: (String) -> Void
     private var viewIsActive = false
     private var replayFromPendingAnchor = false
+    /// Init's persisted-message anchor. Live messages above it may be eager
+    /// assistant output, so snapshot persistence excludes them until resync.
+    private var durableMessageSequenceCeiling: Int64 = 0
 
     private var snapshotName: String { "conv-\(conversationId)" }
 
@@ -86,6 +89,7 @@ final class ConversationSession {
         if let snap = DiskStore.load(Snapshot.self, name: snapshotName) {
             conversation = snap.conversation
             messages = snap.messages
+            durableMessageSequenceCeiling = snap.messages.map(\.sequence_id).max() ?? 0
             lastSequenceId = snap.lastSequenceId
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
@@ -181,7 +185,9 @@ final class ConversationSession {
         guard !isHardDeleted else { return false }
         return DiskStore.save(
             Snapshot(
-                conversation: conversation, messages: messages,
+                conversation: conversation,
+                messages: Self.durableMessages(
+                    messages, through: durableMessageSequenceCeiling),
                 lastSequenceId: lastSequenceId,
                 transcriptGeneration: transcriptGeneration,
                 syncedAt: snapshotSyncedAt),
@@ -329,7 +335,6 @@ final class ConversationSession {
             do {
                 let (bytes, _) = try await api.openStream(conversationId: conversationId)
                 connection = .live
-                retryDelay = 1
                 for try await event in Self.decodedEvents(from: bytes) {
                     if Task.isCancelled { return }
                     apply(event)
@@ -341,6 +346,10 @@ final class ConversationSession {
                 if case .certificatePinMismatch = error {
                     lastErrorToast = error.errorDescription
                     connection = .idle
+                    return
+                }
+                if error.isNotFound {
+                    handleHardDeletion()
                     return
                 }
             } catch {
@@ -370,6 +379,7 @@ final class ConversationSession {
         guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
+            retryDelay = 1
             let previousSequenceFloor = lastSequenceId
             let generationMatches = transcriptGeneration == snap.transcriptGeneration
             let mustReplayFromAnchor = replayFromPendingAnchor
@@ -387,6 +397,7 @@ final class ConversationSession {
                 coverage: snap.transcriptCoverage,
                 generationMatches: generationMatches)
             transcriptGeneration = snap.transcriptGeneration
+            durableMessageSequenceCeiling = snap.pendingAnchorSequenceId
             snapshotSyncedAt = Date()
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
@@ -403,6 +414,7 @@ final class ConversationSession {
             lastSequenceId = Self.replayFloor(
                 previous: previousSequenceFloor,
                 anchor: snap.pendingAnchorSequenceId,
+                serverTip: snap.lastSequenceId,
                 generationMatches: generationMatches,
                 restoredFromDisk: mustReplayFromAnchor)
             if !snap.pendingTruncated {
@@ -419,6 +431,7 @@ final class ConversationSession {
             // outbox prune must never become durable while the message
             // snapshot that justifies it is still memory-only — a crash
             // between the two writes would lose the user's text from both.
+            outbox.suppress(authoritativeMessageIds: Set(snap.messages.map(\.message_id)))
             if persistSnapshot() {
                 reconcileOutbox()
             }
@@ -439,6 +452,7 @@ final class ConversationSession {
         case .message(let seq, let message):
             guard applyIfNewer(seq) else { return }
             upsert(message)
+            outbox.suppress(authoritativeMessageIds: [message.message_id])
             if let createdAt = message.created_at,
                let messageDate = message.createdAtDate,
                var conversation,
@@ -486,12 +500,13 @@ final class ConversationSession {
             snapshotSyncedAt = Date()
             persistSnapshot()
 
-        case .stateChange(let seq, let state, let mode):
+        case .stateChange(let seq, let state, let mode, let stateUpdatedAt):
             guard applyIfNewer(seq) else { return }
             convState = state
             if let mode { presentationMode = mode }
             if var conversation {
                 conversation.state = state
+                if let stateUpdatedAt { conversation.state_updated_at = stateUpdatedAt }
                 if let mode {
                     conversation.presentation_mode = mode
                     conversation.requires_action = mode == "needs_action"
@@ -593,6 +608,7 @@ final class ConversationSession {
         isHardDeleted = true
         conversation = nil
         messages = []
+        durableMessageSequenceCeiling = 0
         convState = nil
         presentationMode = "done"
         agentWorking = false
@@ -703,18 +719,28 @@ final class ConversationSession {
     nonisolated static func replayFloor(
         previous: Int64,
         anchor: Int64,
+        serverTip: Int64,
         generationMatches: Bool,
         restoredFromDisk: Bool
     ) -> Int64 {
-        if restoredFromDisk || previous == 0 || !generationMatches {
+        if restoredFromDisk || previous == 0 || !generationMatches || serverTip < previous {
             return anchor
         }
         return max(previous, anchor)
     }
 
+    nonisolated static func durableMessages(
+        _ messages: [Message], through sequenceCeiling: Int64
+    ) -> [Message] {
+        messages.filter { $0.sequence_id <= sequenceCeiling }
+    }
+
     private func reconcileOutbox() {
         outbox.reconcile(
-            authoritativeMessageIds: Set(messages.map(\.message_id)))
+            authoritativeMessageIds: Set(
+                Self.durableMessages(
+                    messages, through: durableMessageSequenceCeiling
+                ).map(\.message_id)))
     }
 
     private func rebuildToolUseIndex() {

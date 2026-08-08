@@ -172,6 +172,7 @@ final class SSEParserTests: XCTestCase {
             ConversationSession.replayFloor(
                 previous: 50,
                 anchor: 40,
+                serverTip: 60,
                 generationMatches: true,
                 restoredFromDisk: true),
             40)
@@ -179,9 +180,21 @@ final class SSEParserTests: XCTestCase {
             ConversationSession.replayFloor(
                 previous: 50,
                 anchor: 40,
+                serverTip: 60,
                 generationMatches: true,
                 restoredFromDisk: false),
             50)
+    }
+
+    func testServerSequenceRegressionResetsReplayFloorToNewAnchor() {
+        XCTAssertEqual(
+            ConversationSession.replayFloor(
+                previous: 50,
+                anchor: 4,
+                serverTip: 10,
+                generationMatches: true,
+                restoredFromDisk: false),
+            4)
     }
 
     func testChatDecodingFailureRemainsRetryable() {
@@ -189,6 +202,31 @@ final class SSEParserTests: XCTestCase {
         XCTAssertTrue(error.isRetryableChatDeliveryFailure)
         XCTAssertFalse(
             APIError.http(status: 400, body: "rejected").isRetryableChatDeliveryFailure)
+        XCTAssertTrue(APIError.http(status: 404, body: "gone").isNotFound)
+        XCTAssertFalse(APIError.http(status: 500, body: "retry").isNotFound)
+    }
+
+    func testStateChangeRetainsServerTimestamp() {
+        let json = """
+        {
+          "sequence_id": 9,
+          "state": {"type": "idle"},
+          "presentation_mode": "idle",
+          "state_updated_at": "2026-08-08T12:34:56Z"
+        }
+        """
+        guard case .stateChange(_, _, _, let stateUpdatedAt) = PhoenixEvent.decode(
+            frame: SSEFrame(event: "state_change", data: json))
+        else { return XCTFail("expected a decoded state change") }
+        XCTAssertEqual(stateUpdatedAt, "2026-08-08T12:34:56Z")
+    }
+
+    func testSnapshotMessagesStopAtProvenDurableAnchor() {
+        let persisted = message(id: "persisted", sequence: 4, text: "saved")
+        let eager = message(id: "eager", sequence: 5, text: "not saved yet")
+        XCTAssertEqual(
+            ConversationSession.durableMessages([persisted, eager], through: 4),
+            [persisted])
     }
 
     func testPreserveCoverageKeepsGenerationMatchedTranscript() {

@@ -41,6 +41,11 @@ enum APIError: Error, LocalizedError {
             return false
         }
     }
+
+    var isNotFound: Bool {
+        if case .http(status: 404, body: _) = self { return true }
+        return false
+    }
 }
 
 /// Server trust handling for Phoenix's self-signed TLS posture (TLS.md):

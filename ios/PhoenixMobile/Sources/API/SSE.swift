@@ -75,7 +75,8 @@ enum PhoenixEvent: Sendable {
     case messageUpdated(
         seq: Int64, messageId: String, content: JSONValue?, displayData: JSONValue?,
         durationMs: Double?, transcriptGeneration: Int64?)
-    case stateChange(seq: Int64, state: JSONValue, presentationMode: String?)
+    case stateChange(
+        seq: Int64, state: JSONValue, presentationMode: String?, stateUpdatedAt: String?)
     case token(seq: Int64, text: String, requestId: String)
     case agentDone(seq: Int64)
     case conversationUpdate(seq: Int64, conversation: JSONValue)
@@ -186,7 +187,8 @@ enum PhoenixEvent: Sendable {
             return .stateChange(
                 seq: seq,
                 state: json["state"] ?? .null,
-                presentationMode: json["presentation_mode"]?.stringValue)
+                presentationMode: json["presentation_mode"]?.stringValue,
+                stateUpdatedAt: json["state_updated_at"]?.stringValue)
 
         case "token":
             guard let text = json["text"]?.stringValue,

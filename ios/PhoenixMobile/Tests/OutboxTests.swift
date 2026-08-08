@@ -164,6 +164,18 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
+    func testAuthoritativeHistorySuppressesDuplicateBeforeDurableReconciliation() {
+        freshDiskStore()
+        let outbox = Outbox(conversationId: "c1")
+        let entry = outbox.enqueue(text: "first")!
+        outbox.suppress(authoritativeMessageIds: [entry.localId])
+
+        XCTAssertTrue(outbox.visibleEntries.isEmpty)
+        XCTAssertEqual(outbox.entries[0].status, .pending)
+        XCTAssertEqual(Outbox(conversationId: "c1").visibleEntries.map(\.localId), [entry.localId])
+    }
+
+    @MainActor
     func testReconcileAppliesToSteeringQueuedEntries() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")

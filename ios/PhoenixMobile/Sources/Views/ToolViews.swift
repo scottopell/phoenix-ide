@@ -316,7 +316,7 @@ struct BashResultCard: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
-                    ScrollView(.horizontal) {
+                    ScrollView([.horizontal, .vertical]) {
                         Text(result.outputText)
                             .font(.caption.monospaced())
                             .textSelection(.enabled)
