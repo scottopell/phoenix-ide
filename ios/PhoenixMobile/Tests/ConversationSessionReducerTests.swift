@@ -14,7 +14,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             api: PhoenixAPI(
                 baseURL: URL(string: "https://phoenix.invalid")!,
                 password: nil,
-                allowSelfSigned: false),
+                allowSelfSigned: false)!,
             connectivity: ConnectivityMonitor(),
             onHardDeleted: onHardDeleted)
     }
@@ -45,7 +45,8 @@ final class ConversationSessionReducerTests: XCTestCase {
 
         session.receive(.messageUpdated(
             seq: 1, messageId: "m1", content: try json("[{\"type\":\"text\",\"text\":\"patched\"}]"),
-            displayData: nil, transcriptGeneration: 2))
+            displayData: try json("{\"status\":\"completed\"}"), durationMs: 321,
+            transcriptGeneration: 2))
         session.receive(.message(
             seq: 2,
             message: try message(
@@ -55,6 +56,8 @@ final class ConversationSessionReducerTests: XCTestCase {
             session.messages[0].content.arrayValue?.first?["text"]?.stringValue,
             "patched")
         XCTAssertEqual(session.conversation?.transcript_generation, 2)
+        XCTAssertEqual(session.messages[0].display_data?["status"]?.stringValue, "completed")
+        XCTAssertEqual(session.messages[0].display_data?["duration_ms"]?.numberValue, 321)
     }
 
     @MainActor
@@ -67,7 +70,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         session.receive(.messageUpdated(
             seq: 1, messageId: "m1",
             content: try json("[{\"type\":\"text\",\"text\":\"stale patch\"}]"),
-            displayData: nil, transcriptGeneration: nil))
+            displayData: nil, durationMs: nil, transcriptGeneration: nil))
 
         session.receive(.initSnapshot(.init(
             conversation: try conversation(), messages: [], agentWorking: false,

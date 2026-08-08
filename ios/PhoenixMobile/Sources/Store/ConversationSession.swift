@@ -70,6 +70,7 @@ final class ConversationSession {
     private struct PendingMessagePatch {
         var content: JSONValue?
         var displayData: JSONValue?
+        var durationMs: Double?
     }
 
     /// `message_updated` can precede its eager `message` during replay.
@@ -627,9 +628,10 @@ final class ConversationSession {
             }
             guard let idx = messages.firstIndex(where: { $0.message_id == messageId }) else {
                 var patch = pendingMessagePatches[messageId]
-                    ?? PendingMessagePatch(content: nil, displayData: nil)
+                    ?? PendingMessagePatch(content: nil, displayData: nil, durationMs: nil)
                 if let content, content != .null { patch.content = content }
                 if let displayData, displayData != .null { patch.displayData = displayData }
+                if let durationMs { patch.durationMs = durationMs }
                 pendingMessagePatches[messageId] = patch
                 return
             }
@@ -873,7 +875,15 @@ final class ConversationSession {
         var message = message
         if let patch = pendingMessagePatches.removeValue(forKey: message.message_id) {
             if let content = patch.content { message.content = content }
-            if let displayData = patch.displayData { message.display_data = displayData }
+            if let displayData = patch.displayData {
+                message.display_data = Self.mergeDisplayData(
+                    existing: message.display_data, patch: displayData)
+            }
+            if let durationMs = patch.durationMs {
+                message.display_data = Self.mergeDisplayData(
+                    existing: message.display_data,
+                    patch: .object(["duration_ms": .number(durationMs)]))
+            }
         }
         if let idx = messages.firstIndex(where: { $0.message_id == message.message_id }) {
             // Eager (in-flight) messages are later re-broadcast persisted
