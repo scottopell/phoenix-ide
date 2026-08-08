@@ -3,7 +3,7 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
-use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
+use super::assets::{get_index_response, serve_favicon, serve_service_worker, serve_static};
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
@@ -1108,8 +1108,8 @@ fn conv_requires_action(conv: &crate::db::Conversation) -> bool {
 
 /// Serve the SPA index.html for all client-side routes
 async fn serve_spa() -> impl IntoResponse {
-    match get_index_html() {
-        Some(content) => Html(content).into_response(),
+    match get_index_response() {
+        Some(response) => response,
         None => (
             StatusCode::NOT_FOUND,
             Html(
@@ -7605,8 +7605,8 @@ async fn serve_share_page(
             AppError::NotFound("Share link not found or has been revoked".to_string())
         })?;
 
-    match get_index_html() {
-        Some(content) => Ok(Html(content).into_response()),
+    match get_index_response() {
+        Some(response) => Ok(response),
         None => Ok((
             StatusCode::NOT_FOUND,
             Html(
