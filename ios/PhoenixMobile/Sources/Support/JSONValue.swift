@@ -3,7 +3,7 @@ import Foundation
 /// Generic JSON tree. Phoenix message `content`, conversation `state`, and
 /// SSE replay-ring entries are polymorphic on the wire; this type carries
 /// them losslessly and views interpret the shapes they understand.
-enum JSONValue: Codable, Equatable, Hashable {
+enum JSONValue: Codable, Equatable, Hashable, Sendable {
     case null
     case bool(Bool)
     case number(Double)

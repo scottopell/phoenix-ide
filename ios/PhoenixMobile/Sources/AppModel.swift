@@ -81,7 +81,10 @@ final class AppModel {
         guard let api else { return nil }
         if let existing = sessions[conversationId] { return existing }
         let session = ConversationSession(
-            conversationId: conversationId, api: api, connectivity: connectivity)
+            conversationId: conversationId, api: api, connectivity: connectivity,
+            onConversationUpdate: { [weak self] conversation in
+                self?.listStore.upsert(conversation)
+            })
         sessions[conversationId] = session
         return session
     }
@@ -106,7 +109,7 @@ final class AppModel {
     /// half of the offline queue. Sessions created here don't start an SSE
     /// stream; they exist to drain (their outbox reconciles on next open).
     private func drainPersistedOutboxes() {
-        guard api != nil else { return }
+        guard let api else { return }
         for name in DiskStore.names(withPrefix: "outbox-") {
             let conversationId = String(name.dropFirst("outbox-".count))
             guard !conversationId.isEmpty, sessions[conversationId] == nil else {
@@ -116,7 +119,12 @@ final class AppModel {
             guard let entries = DiskStore.load([OutboxEntry].self, name: name),
                   entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
             else { continue }
-            session(for: conversationId)?.drainOutbox()
+            // A launch sweep is not an opened conversation. Keep this
+            // short-lived session out of `sessions`, otherwise the next
+            // foreground pass starts a permanent SSE stream for it.
+            let drainSession = ConversationSession(
+                conversationId: conversationId, api: api, connectivity: connectivity)
+            drainSession.drainOutbox()
         }
     }
 

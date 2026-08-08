@@ -47,6 +47,7 @@ final class ConversationSession {
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
     private var retryDelay: TimeInterval = 1
+    private let onConversationUpdate: ((Conversation) -> Void)?
 
     private var snapshotName: String { "conv-\(conversationId)" }
 
@@ -54,12 +55,23 @@ final class ConversationSession {
         var conversation: Conversation?
         var messages: [Message]
         var lastSequenceId: Int64
+        /// Missing only in snapshots written before transcript generations
+        /// were part of the iOS cache; nil forces replacement on next init.
+        var transcriptGeneration: Int64?
     }
 
-    init(conversationId: String, api: PhoenixAPI, connectivity: ConnectivityMonitor) {
+    private var transcriptGeneration: Int64?
+
+    init(
+        conversationId: String,
+        api: PhoenixAPI,
+        connectivity: ConnectivityMonitor,
+        onConversationUpdate: ((Conversation) -> Void)? = nil
+    ) {
         self.conversationId = conversationId
         self.api = api
         self.connectivity = connectivity
+        self.onConversationUpdate = onConversationUpdate
         self.outbox = Outbox(conversationId: conversationId)
 
         // Cached snapshot renders immediately; the stream refreshes it.
@@ -67,7 +79,12 @@ final class ConversationSession {
             conversation = snap.conversation
             messages = snap.messages
             lastSequenceId = snap.lastSequenceId
+            transcriptGeneration = snap.transcriptGeneration
             rebuildToolUseIndex()
+            // A prior crash can leave the authoritative snapshot durable but
+            // the matching outbox row not yet pruned. Reconcile at load so the
+            // same user message never renders twice while offline.
+            reconcileOutbox()
         }
     }
 
@@ -117,11 +134,13 @@ final class ConversationSession {
         drainOutbox()
     }
 
-    private func persistSnapshot() {
+    @discardableResult
+    private func persistSnapshot() -> Bool {
         DiskStore.save(
             Snapshot(
                 conversation: conversation, messages: messages,
-                lastSequenceId: lastSequenceId),
+                lastSequenceId: lastSequenceId,
+                transcriptGeneration: transcriptGeneration),
             name: snapshotName)
     }
 
@@ -177,6 +196,9 @@ final class ConversationSession {
                     // its files were deleted.
                     guard !Task.isCancelled else { return }
                     outbox.markAccepted(entry.localId, steering: response.steering ?? false)
+                    if response.already_persisted == true {
+                        await reconcileAlreadyPersisted(entry.localId)
+                    }
                 } catch let error as APIError where error.isTransport {
                     // Offline or unreachable: stay pending. The next drain
                     // trigger (connectivity restore, reconnect, foreground)
@@ -210,6 +232,35 @@ final class ConversationSession {
 
     // MARK: - Stream lifecycle
 
+    /// URLSession.AsyncBytes is intentionally parsed in a detached producer.
+    /// ConversationSession is MainActor-isolated, so iterating and JSON-
+    /// decoding a multi-megabyte init here directly would freeze input and
+    /// scrolling. Only decoded events cross back to the reducer.
+    private nonisolated static func decodedEvents(
+        from bytes: URLSession.AsyncBytes
+    ) -> AsyncThrowingStream<PhoenixEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task.detached(priority: .utility) {
+                do {
+                    var parser = SSEParser()
+                    for try await byte in bytes {
+                        if Task.isCancelled { break }
+                        if let frame = parser.consume(byte),
+                           let event = PhoenixEvent.decode(frame: frame) {
+                            continuation.yield(event)
+                        }
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
+    }
+
     private func streamLoop() async {
         retryDelay = 1
         while !Task.isCancelled {
@@ -227,15 +278,9 @@ final class ConversationSession {
                 let (bytes, _) = try await api.openStream(conversationId: conversationId)
                 connection = .live
                 retryDelay = 1
-                // Every (re)connect is a full resync: init replaces the
-                // snapshot and replays the server's pending-events ring.
-                var parser = SSEParser()
-                for try await byte in bytes {
+                for try await event in Self.decodedEvents(from: bytes) {
                     if Task.isCancelled { return }
-                    if let frame = parser.consume(byte),
-                       let event = PhoenixEvent.decode(frame: frame) {
-                        apply(event)
-                    }
+                    apply(event)
                 }
                 // Server closed the stream (e.g. broadcast lag): reconnect
                 // promptly — the next init resyncs any missed state.
@@ -265,19 +310,32 @@ final class ConversationSession {
     private func apply(_ event: PhoenixEvent) {
         switch event {
         case .initSnapshot(let snap):
+            let previousSequenceFloor = lastSequenceId
+            let generationMatches = transcriptGeneration == snap.transcriptGeneration
             conversation = snap.conversation
+            conversation?.transcript_generation = snap.transcriptGeneration
             convState = snap.conversation.state
-            messages = snap.messages.sorted { $0.sequence_id < $1.sequence_id }
+            messages = Self.reconcileTranscript(
+                existing: messages,
+                incoming: snap.messages,
+                coverage: snap.transcriptCoverage,
+                generationMatches: generationMatches)
+            transcriptGeneration = snap.transcriptGeneration
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
-            streamingText = ""
-            streamingRequestId = nil
+            if previousSequenceFloor == 0 || !generationMatches
+                || !snap.agentWorking || snap.pendingTruncated {
+                streamingText = ""
+                streamingRequestId = nil
+            }
             // Replay the ring through the same reducer so an in-flight turn
             // (streaming text, tool phase) survives the reconnect. The
             // replay floor is the ring anchor — ring entries sit in
             // (anchor, last_sequence_id], so anchoring at the tip would
             // silently drop the whole replay.
-            lastSequenceId = snap.pendingAnchorSequenceId
+            lastSequenceId = previousSequenceFloor == 0 || !generationMatches
+                ? snap.pendingAnchorSequenceId
+                : max(previousSequenceFloor, snap.pendingAnchorSequenceId)
             if !snap.pendingTruncated {
                 for entry in snap.pendingEvents {
                     if let pending = PhoenixEvent.decode(pendingEntry: entry) {
@@ -287,12 +345,14 @@ final class ConversationSession {
             }
             lastSequenceId = max(lastSequenceId, snap.lastSequenceId)
             rebuildToolUseIndex()
+            onConversationUpdate?(snap.conversation)
             // Persist the authoritative snapshot BEFORE reconciling: the
             // outbox prune must never become durable while the message
             // snapshot that justifies it is still memory-only — a crash
             // between the two writes would lose the user's text from both.
-            persistSnapshot()
-            reconcileOutbox()
+            if persistSnapshot() {
+                reconcileOutbox()
+            }
             drainOutbox()
 
         default:
@@ -316,8 +376,9 @@ final class ConversationSession {
                 rebuildToolUseIndex()
             }
             // Snapshot before outbox prune — see the init branch.
-            persistSnapshot()
-            reconcileOutbox()
+            if persistSnapshot() {
+                reconcileOutbox()
+            }
 
         case .messageUpdated(let seq, let messageId, let content, let displayData):
             // Stale guard applies here too: a replayed update from before
@@ -368,8 +429,9 @@ final class ConversationSession {
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
             // Snapshot first — same ordering rule as the message branch.
-            persistSnapshot()
-            reconcileOutbox()
+            if persistSnapshot() {
+                reconcileOutbox()
+            }
             drainOutbox()
 
         case .conversationUpdate(let seq, let update):
@@ -386,6 +448,7 @@ final class ConversationSession {
                 if let v = update["slug"]?.stringValue { conv.slug = v }
                 conversation = conv
                 persistSnapshot()
+                onConversationUpdate?(conv)
             }
 
         case .steerMessageQueued(let seq, let messageId):
@@ -418,6 +481,66 @@ final class ConversationSession {
         } else {
             messages.append(message)
             messages.sort { $0.sequence_id < $1.sequence_id }
+        }
+    }
+
+    private func reconcileAlreadyPersisted(_ localId: String) async {
+        do {
+            let response = try await api.reconcileAcceptedMessages(
+                conversationId: conversationId, messageIds: [localId])
+            guard !Task.isCancelled,
+                  let result = response.entries.first(where: { $0.message_id == localId })
+            else { return }
+            switch result.status {
+            case .persisted:
+                guard let message = result.message else { return }
+                upsert(message)
+                lastSequenceId = max(lastSequenceId, message.sequence_id)
+                rebuildToolUseIndex()
+                if persistSnapshot() {
+                    reconcileOutbox()
+                }
+            case .steeringQueued:
+                outbox.markAccepted(localId, steering: true)
+            case .absent:
+                // The POST response and exact reconciliation disagree. Keep
+                // the accepted outbox row visible and force the live stream
+                // through a fresh authoritative init rather than guessing.
+                restartStreamForResync()
+            }
+        } catch {
+            if !Task.isCancelled {
+                restartStreamForResync()
+            }
+        }
+    }
+
+    private func restartStreamForResync() {
+        guard streamTask != nil else { return }
+        streamTask?.cancel()
+        streamTask = Task { await streamLoop() }
+    }
+
+    nonisolated static func reconcileTranscript(
+        existing: [Message],
+        incoming: [Message],
+        coverage: PhoenixEvent.InitSnapshot.TranscriptCoverage,
+        generationMatches: Bool
+    ) -> [Message] {
+        guard generationMatches else {
+            return incoming.sorted { $0.sequence_id < $1.sequence_id }
+        }
+        switch coverage {
+        case .complete:
+            return incoming.sorted { $0.sequence_id < $1.sequence_id }
+        case .preserve:
+            return existing.sorted { $0.sequence_id < $1.sequence_id }
+        case .tail:
+            var byId = Dictionary(uniqueKeysWithValues: existing.map { ($0.message_id, $0) })
+            for message in incoming {
+                byId[message.message_id] = message
+            }
+            return byId.values.sorted { $0.sequence_id < $1.sequence_id }
         }
     }
 

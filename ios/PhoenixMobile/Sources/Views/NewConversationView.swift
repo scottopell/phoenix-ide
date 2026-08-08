@@ -11,6 +11,7 @@ struct NewConversationView: View {
     @State private var firstMessage = ""
     @State private var modelIDs: [String] = []
     @State private var selectedModel: String?
+    @State private var serverDefaultModel: String?
     @State private var cwdStatus: CwdStatus = .unknown
     @State private var creating = false
     @State private var errorText: String?
@@ -49,9 +50,14 @@ struct NewConversationView: View {
                 if !modelIDs.isEmpty {
                     Section("Model") {
                         Picker("Model", selection: $selectedModel) {
-                            Text("Server default").tag(String?.none)
+                            if let serverDefaultModel {
+                                Text("Server default (\(serverDefaultModel))")
+                                    .tag(String?.some(serverDefaultModel))
+                            }
                             ForEach(modelIDs, id: \.self) { id in
-                                Text(id).tag(String?.some(id))
+                                if id != serverDefaultModel {
+                                    Text(id).tag(String?.some(id))
+                                }
                             }
                         }
                     }
@@ -75,6 +81,7 @@ struct NewConversationView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        .disabled(creating)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(creating ? "Creating…" : "Create") {
@@ -91,6 +98,8 @@ struct NewConversationView: View {
                 if let api = model.api,
                    let models = try? await api.models() {
                     modelIDs = models.modelIDs
+                    serverDefaultModel = models.default
+                    selectedModel = models.default ?? models.modelIDs.first
                 }
             }
         }
@@ -99,6 +108,7 @@ struct NewConversationView: View {
     private var canCreate: Bool {
         if creating { return false }
         if firstMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        guard selectedModel != nil else { return false }
         if case .valid = cwdStatus { return true }
         return false
     }
@@ -145,7 +155,7 @@ struct NewConversationView: View {
     }
 
     private func create() async {
-        guard let api = model.api else { return }
+        guard let api = model.api, let selectedModel else { return }
         creating = true
         defer { creating = false }
         errorText = nil

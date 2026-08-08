@@ -29,10 +29,16 @@ enum DiskStore {
         return try? JSONDecoder().decode(type, from: data)
     }
 
-    static func save<T: Encodable>(_ value: T, name: String) {
-        guard let data = try? JSONEncoder().encode(value) else { return }
+    @discardableResult
+    static func save<T: Encodable>(_ value: T, name: String) -> Bool {
+        guard let data = try? JSONEncoder().encode(value) else { return false }
         // Atomic write: a crash mid-write must not corrupt cached state.
-        try? data.write(to: url(for: name), options: .atomic)
+        do {
+            try data.write(to: url(for: name), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
     }
 
     static func remove(name: String) {

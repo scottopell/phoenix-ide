@@ -59,11 +59,14 @@ final class ServerTrustDelegate: NSObject, URLSessionDelegate {
             completionHandler(.useCredential, URLCredential(trust: trust))
             return
         }
-        guard allowSelfSigned, let fingerprint = Self.leafFingerprint(trust) else {
+        let space = challenge.protectionSpace
+        guard allowSelfSigned,
+              Self.isValidWhenPresentedChainIsTrusted(trust, host: space.host),
+              let fingerprint = Self.leafFingerprint(trust)
+        else {
             completionHandler(.performDefaultHandling, nil)
             return
         }
-        let space = challenge.protectionSpace
         switch CertPinStore.evaluate(host: space.host, port: space.port, fingerprint: fingerprint) {
         case .accept:
             completionHandler(.useCredential, URLCredential(trust: trust))
@@ -81,6 +84,28 @@ final class ServerTrustDelegate: NSObject, URLSessionDelegate {
         else { return nil }
         let der = SecCertificateCopyData(leaf) as Data
         return SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Re-evaluate the server-presented chain with its last certificate as a
+    /// local trust anchor. This isolates the intended private/self-signed-root
+    /// exception while retaining SSL hostname, validity-period, and key-usage
+    /// checks. An expired or wrong-host certificate therefore cannot become
+    /// trusted merely because the user enabled private-certificate support.
+    private static func isValidWhenPresentedChainIsTrusted(_ trust: SecTrust, host: String) -> Bool {
+        guard let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
+              let anchor = chain.last
+        else { return false }
+
+        var candidate: SecTrust?
+        let status = SecTrustCreateWithCertificates(
+            chain as CFArray,
+            SecPolicyCreateSSL(true, host as CFString),
+            &candidate)
+        guard status == errSecSuccess, let candidate else { return false }
+        guard SecTrustSetAnchorCertificates(candidate, [anchor] as CFArray) == errSecSuccess,
+              SecTrustSetAnchorCertificatesOnly(candidate, true) == errSecSuccess
+        else { return false }
+        return SecTrustEvaluateWithError(candidate, nil)
     }
 }
 
@@ -207,16 +232,25 @@ struct PhoenixAPI: Sendable {
             as: ChatResponse.self)
     }
 
-    func createConversation(cwd: String, text: String, model: String?, messageId: String)
+    func reconcileAcceptedMessages(conversationId: String, messageIds: [String]) async throws
+        -> ReconcileAcceptedMessagesResponse
+    {
+        try await post(
+            "api/conversations/\(conversationId)/messages/reconcile",
+            body: ["message_ids": messageIds],
+            as: ReconcileAcceptedMessagesResponse.self)
+    }
+
+    func createConversation(cwd: String, text: String, model: String, messageId: String)
         async throws -> Conversation
     {
-        var body: [String: Any] = [
+        let body: [String: Any] = [
             "cwd": cwd,
             "text": text,
+            "model": model,
             "images": [] as [[String: String]],
             "message_id": messageId,
         ]
-        if let model { body["model"] = model }
         return try await post("api/conversations/new", body: body, as: ConversationResponse.self)
             .conversation
     }

@@ -10,6 +10,17 @@ import XCTest
 // boundaries).
 final class SSEParserTests: XCTestCase {
 
+    private func message(id: String, sequence: Int64, text: String) -> Message {
+        Message(
+            message_id: id,
+            conversation_id: "c1",
+            sequence_id: sequence,
+            message_type: "user",
+            content: .string(text),
+            display_data: nil,
+            created_at: nil)
+    }
+
     /// Feed a raw stream through the byte-level parser, collecting frames.
     private func frames(from raw: String) -> [SSEFrame] {
         var parser = SSEParser()
@@ -105,5 +116,79 @@ final class SSEParserTests: XCTestCase {
         let out = frames(from: "id: 42\nretry: 1000\nevent: message\ndata: x\n\n")
         XCTAssertEqual(out.count, 1)
         XCTAssertEqual(out[0].data, "x")
+    }
+
+    func testInitDecodesTranscriptGenerationAndTailCoverage() {
+        let json = """
+        {
+          "conversation": {"id":"c1","slug":"one","transcript_generation":7},
+          "messages": [],
+          "agent_working": false,
+          "last_sequence_id": 12,
+          "pending_anchor_sequence_id": 12,
+          "pending_events": [],
+          "pending_truncated": false,
+          "transcript_generation": 7,
+          "transcript_coverage": "tail"
+        }
+        """
+        guard case .initSnapshot(let snapshot) = PhoenixEvent.decode(
+            frame: SSEFrame(event: "init", data: json))
+        else {
+            return XCTFail("expected a decoded init snapshot")
+        }
+        XCTAssertEqual(snapshot.transcriptGeneration, 7)
+        XCTAssertEqual(snapshot.transcriptCoverage, .tail)
+    }
+
+    func testTailInitMergesWithoutDroppingOlderCachedMessages() {
+        let older = message(id: "old", sequence: 1, text: "older")
+        let staleOverlap = message(id: "same", sequence: 2, text: "stale")
+        let freshOverlap = message(id: "same", sequence: 2, text: "fresh")
+        let latest = message(id: "new", sequence: 3, text: "latest")
+
+        let merged = ConversationSession.reconcileTranscript(
+            existing: [older, staleOverlap],
+            incoming: [freshOverlap, latest],
+            coverage: .tail,
+            generationMatches: true)
+
+        XCTAssertEqual(merged.map(\.message_id), ["old", "same", "new"])
+        XCTAssertEqual(merged[1].content, .string("fresh"))
+    }
+
+    func testGenerationChangeReplacesCachedTranscriptEvenForTailCoverage() {
+        let merged = ConversationSession.reconcileTranscript(
+            existing: [message(id: "stale", sequence: 1, text: "stale")],
+            incoming: [message(id: "fresh", sequence: 5, text: "fresh")],
+            coverage: .tail,
+            generationMatches: false)
+
+        XCTAssertEqual(merged.map(\.message_id), ["fresh"])
+    }
+
+    func testPreserveCoverageKeepsGenerationMatchedTranscript() {
+        let cached = message(id: "cached", sequence: 1, text: "cached")
+        let merged = ConversationSession.reconcileTranscript(
+            existing: [cached],
+            incoming: [],
+            coverage: .preserve,
+            generationMatches: true)
+        XCTAssertEqual(merged, [cached])
+    }
+
+    func testConversationDisplayTitlePrefersServerTitleBeforeDirectory() throws {
+        let data = Data(
+            "{\"id\":\"c1\",\"slug\":\"one\",\"title\":\"Readable title\",\"cwd\":\"/tmp/repo\"}"
+                .utf8)
+        let conversation = try JSONDecoder().decode(Conversation.self, from: data)
+        XCTAssertEqual(conversation.displayTitle, "Readable title")
+    }
+
+    func testChatResponseRetainsAlreadyPersistedSignal() throws {
+        let response = try JSONDecoder().decode(
+            ChatResponse.self,
+            from: Data("{\"queued\":false,\"already_persisted\":true}".utf8))
+        XCTAssertEqual(response.already_persisted, true)
     }
 }

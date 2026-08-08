@@ -3,7 +3,7 @@ import Foundation
 /// One server-sent event frame: the `event:` name plus the joined `data:`
 /// payload. Comment lines (`:` prefix — the server's keep-alives) never
 /// surface as frames.
-struct SSEFrame {
+struct SSEFrame: Sendable {
     var event: String
     var data: String
 }
@@ -11,7 +11,7 @@ struct SSEFrame {
 /// Incremental SSE frame parser. Byte-based rather than line-convenience
 /// APIs because frame boundaries are *empty* lines, which line sequences
 /// tend to swallow.
-struct SSEParser {
+struct SSEParser: Sendable {
     private var lineBuffer: [UInt8] = []
     private var eventName = ""
     private var dataLines: [String] = []
@@ -69,7 +69,7 @@ struct SSEParser {
 /// (See specs/sse_wire/sse_wire.allium for the full server contract.)
 /// Events the app doesn't render map to `.other` so the reducer can still
 /// advance its sequence floor.
-enum PhoenixEvent {
+enum PhoenixEvent: Sendable {
     case initSnapshot(InitSnapshot)
     case message(seq: Int64, message: Message)
     case messageUpdated(seq: Int64, messageId: String, content: JSONValue?, displayData: JSONValue?)
@@ -82,7 +82,13 @@ enum PhoenixEvent {
     case conversationBecameTerminal(seq: Int64)
     case other(type: String, seq: Int64?)
 
-    struct InitSnapshot {
+    struct InitSnapshot: Sendable {
+        enum TranscriptCoverage: String, Sendable {
+            case complete
+            case tail
+            case preserve
+        }
+
         var conversation: Conversation
         var messages: [Message]
         var agentWorking: Bool
@@ -97,6 +103,8 @@ enum PhoenixEvent {
         /// the snapshot lands so a reconnect mid-turn keeps the in-flight view.
         var pendingEvents: [JSONValue]
         var pendingTruncated: Bool
+        var transcriptGeneration: Int64
+        var transcriptCoverage: TranscriptCoverage
     }
 
     /// Decode from an SSE frame. `frame.event` carries the type name; the
@@ -131,6 +139,8 @@ enum PhoenixEvent {
                 var pending_anchor_sequence_id: Int64?
                 var pending_events: [JSONValue]?
                 var pending_truncated: Bool?
+                var transcript_generation: Int64?
+                var transcript_coverage: String?
             }
             guard let wire = try? JSONDecoder().decode(InitWire.self, from: rawData) else {
                 return nil
@@ -145,7 +155,11 @@ enum PhoenixEvent {
                     lastSequenceId: lastSeq,
                     pendingAnchorSequenceId: wire.pending_anchor_sequence_id ?? lastSeq,
                     pendingEvents: wire.pending_events ?? [],
-                    pendingTruncated: wire.pending_truncated ?? false))
+                    pendingTruncated: wire.pending_truncated ?? false,
+                    transcriptGeneration: wire.transcript_generation
+                        ?? wire.conversation.transcript_generation ?? 1,
+                    transcriptCoverage: InitSnapshot.TranscriptCoverage(
+                        rawValue: wire.transcript_coverage ?? "complete") ?? .complete))
 
         case "message":
             struct MessageWire: Codable {

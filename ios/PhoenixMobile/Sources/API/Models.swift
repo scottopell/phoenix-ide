@@ -4,9 +4,10 @@ import Foundation
 // (snake_case) so no key-mapping strategy is needed. Fields the app doesn't
 // consume are omitted — unknown keys are ignored by JSONDecoder.
 
-struct Conversation: Codable, Identifiable, Equatable, Hashable {
+struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     var id: String
     var slug: String
+    var title: String?
     var model: String?
     var cwd: String?
     var created_at: String?
@@ -26,6 +27,7 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable {
     var presentation_mode: String?
     /// Server-derived "user must act" flag paired with presentation_mode.
     var requires_action: Bool?
+    var transcript_generation: Int64?
 
     /// `state` is a discriminated union on the wire — either a bare string
     /// or `{ "type": "...", ... }`. Both shapes collapse to the type name.
@@ -34,9 +36,10 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable {
         return state?["type"]?.stringValue
     }
 
-    /// Short label for list rows: task title if set, else the tail of cwd.
+    /// Short label for list rows: task title, server title, then cwd tail.
     var displayTitle: String {
         if let title = task_title, !title.isEmpty { return title }
+        if let title, !title.isEmpty { return title }
         if let cwd, !cwd.isEmpty {
             return (cwd as NSString).lastPathComponent
         }
@@ -57,7 +60,7 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable {
     }
 }
 
-struct Message: Codable, Identifiable, Equatable {
+struct Message: Codable, Identifiable, Equatable, Sendable {
     var message_id: String
     var conversation_id: String?
     var sequence_id: Int64
@@ -73,7 +76,7 @@ struct Message: Codable, Identifiable, Equatable {
     }
 }
 
-struct ImagePayload: Codable, Equatable {
+struct ImagePayload: Codable, Equatable, Sendable {
     var data: String
     var media_type: String
 }
@@ -105,6 +108,27 @@ struct ChatResponse: Codable {
     /// Present and true when the conversation was busy and the message was
     /// accepted onto the steering queue instead of processed immediately.
     var steering: Bool?
+    /// True when this message id was persisted by an earlier request. The
+    /// duplicate POST produces no new SSE message, so the client must fetch
+    /// the authoritative row explicitly before pruning its outbox entry.
+    var already_persisted: Bool?
+}
+
+struct ReconcileAcceptedMessagesResponse: Codable {
+    var conversation_idle: Bool
+    var entries: [AcceptedMessageReconciliation]
+}
+
+struct AcceptedMessageReconciliation: Codable {
+    enum Status: String, Codable {
+        case persisted
+        case steeringQueued = "steering_queued"
+        case absent
+    }
+
+    var message_id: String
+    var status: Status
+    var message: Message?
 }
 
 struct CancelResponse: Codable {
