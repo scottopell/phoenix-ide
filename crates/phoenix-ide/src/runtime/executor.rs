@@ -15,9 +15,15 @@
 
 use super::traits::{LlmClient, StateStore, Storage, ToolExecutor};
 use super::{
-    SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
-    TaskApprovalHandoffRequest,
+    SseBroadcaster, SseEvent, SubAgentAdmissionFence, SubAgentCancelRequest, SubAgentSpawnRequest,
+    TaskApprovalHandoffData, TaskApprovalHandoffRequest,
 };
+
+struct SubAgentChannels {
+    spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
+    cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
+    admissions: Arc<SubAgentAdmissionFence>,
+}
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
@@ -1817,9 +1823,9 @@ where
     /// Channel to notify parent of sub-agent completion (sub-agent only)
     parent_event_tx: Option<mpsc::Sender<Event>>,
     /// Channel to request sub-agent spawning (parent only)
-    spawn_tx: Option<mpsc::Sender<SubAgentSpawnRequest>>,
-    /// Channel to request sub-agent cancellation (parent only)
-    cancel_tx: Option<mpsc::Sender<SubAgentCancelRequest>>,
+    /// Parent-side spawn/cancel capability and its shared child-identity admission fence.
+    sub_agent_channels: Option<Box<SubAgentChannels>>,
+
     handoff_tx: Option<mpsc::Sender<TaskApprovalHandoffRequest>>,
     /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`.
     /// Pre-allocated with capacity = sub-agent count when spawning (FM-6 prevention).
@@ -1995,8 +2001,7 @@ where
             retry_outcome_tx,
             retry_outcome_rx,
             parent_event_tx: None,
-            spawn_tx: None,
-            cancel_tx: None,
+            sub_agent_channels: None,
             handoff_tx: None,
             sub_agent_result_buffer: Vec::new(),
             sub_agent_round_gen: 0,
@@ -2129,8 +2134,21 @@ where
         spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
         cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
     ) -> Self {
-        self.spawn_tx = Some(spawn_tx);
-        self.cancel_tx = Some(cancel_tx);
+        self.sub_agent_channels = Some(Box::new(SubAgentChannels {
+            spawn_tx,
+            cancel_tx,
+            admissions: Arc::new(SubAgentAdmissionFence::default()),
+        }));
+        self
+    }
+
+    pub fn with_sub_agent_admission_fence(
+        mut self,
+        admissions: Arc<SubAgentAdmissionFence>,
+    ) -> Self {
+        if let Some(channels) = &mut self.sub_agent_channels {
+            channels.admissions = admissions;
+        }
         self
     }
 
@@ -3973,7 +3991,7 @@ where
         };
 
         // All specs validated; require a spawn channel before sending any.
-        let Some(spawn_tx) = &self.spawn_tx else {
+        let Some(channels) = &self.sub_agent_channels else {
             tracing::warn!("No spawn channel configured, cannot spawn sub-agents");
             let result = ToolResult::error(
                 tool_use_id.clone(),
@@ -3984,14 +4002,28 @@ where
                 result,
             }));
         };
+        let spawn_tx = &channels.spawn_tx;
+        let admissions = &channels.admissions;
 
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
-            spawned.push(PendingSubAgent {
-                agent_id: spec.agent_id.clone(),
+            let agent_id = spec.agent_id.clone();
+            if !Box::pin(admissions.queued(&agent_id)).await {
+                tracing::error!(%agent_id, "Duplicate sub-agent identity rejected by admission fence");
+                let result = ToolResult::error(
+                    tool_use_id.clone(),
+                    "Duplicate sub-agent identity".to_string(),
+                );
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id,
+                    result,
+                }));
+            }
+            let pending = PendingSubAgent {
+                agent_id: agent_id.clone(),
                 task: spec.task.clone(),
                 mode: spec.mode,
-            });
+            };
             let request = SubAgentSpawnRequest {
                 spec,
                 parent_conversation_id: self.context.conversation_id.clone(),
@@ -3999,6 +4031,7 @@ where
                 parent_turn_link: parent_turn_link.clone(),
             };
             if let Err(e) = spawn_tx.send(request).await {
+                Box::pin(admissions.queue_send_failed(&agent_id)).await;
                 tracing::error!(error = %e, "Failed to send spawn request");
                 let result = ToolResult::error(
                     tool_use_id.clone(),
@@ -4009,6 +4042,7 @@ where
                     result,
                 }));
             }
+            spawned.push(pending);
         }
 
         // Build success result
@@ -4853,7 +4887,8 @@ where
             Effect::CancelSubAgents { ids } => {
                 tracing::info!(?ids, "Cancelling sub-agents");
 
-                if let Some(cancel_tx) = &self.cancel_tx {
+                if let Some(channels) = &self.sub_agent_channels {
+                    let cancel_tx = &channels.cancel_tx;
                     let request = SubAgentCancelRequest {
                         ids,
                         parent_conversation_id: self.context.conversation_id.clone(),
@@ -4872,13 +4907,16 @@ where
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
 
                 if let Some(parent_tx) = &self.parent_event_tx {
+                    let agent_id = self.context.conversation_id.clone();
                     let event = Event::SubAgentResult {
-                        agent_id: self.context.conversation_id.clone(),
+                        agent_id: agent_id.clone(),
                         outcome,
                     };
                     if let Err(e) = parent_tx.send(event).await {
                         // Parent may have terminated - that's OK
                         tracing::warn!(error = %e, "Failed to notify parent (may have terminated)");
+                    } else if let Some(channels) = &self.sub_agent_channels {
+                        Box::pin(channels.admissions.terminal_result_sent(&agent_id)).await;
                     }
                 } else {
                     tracing::warn!("No parent channel configured for sub-agent");
@@ -5657,7 +5695,7 @@ where
                 .iter()
                 .any(|definition| definition.name == "spawn_agents");
             if advertised {
-                return self.handle_spawn_agents_tool(tool).await;
+                return Box::pin(self.handle_spawn_agents_tool(tool)).await;
             }
         }
 

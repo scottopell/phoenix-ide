@@ -169,7 +169,7 @@ impl Tool for SpawnAgentsTool {
     }
 
     fn description(&self) -> String {
-        "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the discovered named personas. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
+        "Spawn sub-agents to execute tasks in parallel. Each sub-agent has an independent conversation and returns its own result. Work sub-agents share the parent's writable worktree: sibling writes are not locked, and Phoenix does not merge child changes. Give parallel Work sub-agents disjoint assignments. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the discovered named personas. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -185,7 +185,7 @@ impl Tool for SpawnAgentsTool {
             "mode": {
                 "type": "string",
                 "enum": ["explore", "work"],
-                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model. Work: full tool suite, inherits the parent model, and may run in parallel with other Work sub-agents. Work mode requires a write-capable parent (Work, Branch, or Direct)."
+                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model. Work: full tool suite, inherits the parent model, and may run in parallel with other Work sub-agents in the parent's shared writable worktree. Sibling writes are not locked, Phoenix does not merge child changes, and parallel Work assignments should be disjoint. Work mode requires a write-capable parent (Work, Branch, or Direct)."
             },
             "model": {
                 "type": "string",
@@ -484,8 +484,18 @@ mod tests {
             .unwrap();
 
         assert!(tool.description().contains("tasks in parallel"));
+        assert!(tool
+            .description()
+            .contains("share the parent's writable worktree"));
+        assert!(tool.description().contains("writes are not locked"));
+        assert!(tool.description().contains("does not merge child changes"));
+        assert!(tool.description().contains("disjoint assignments"));
         assert!(tasks_guidance.contains("tasks to execute in parallel"));
         assert!(mode_guidance.contains("parallel with other Work sub-agents"));
+        assert!(mode_guidance.contains("shared writable worktree"));
+        assert!(mode_guidance.contains("writes are not locked"));
+        assert!(mode_guidance.contains("does not merge child changes"));
+        assert!(mode_guidance.contains("assignments should be disjoint"));
         assert!(mode_guidance.contains("Work, Branch, or Direct"));
     }
 

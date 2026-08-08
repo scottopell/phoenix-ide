@@ -144,6 +144,28 @@ rule WorkSubAgentRequiresWriteableParent {
         -- read-only sub-agents.
 }
 
+-- Cancellation is authoritative over queued spawn admission. A child identity
+-- terminalized before materialization cannot later create a runtime, execute
+-- tools, or emit a second parent result. If materialization wins first,
+-- cancellation is delivered to that one runtime and its normal result remains
+-- the parent fan-in event.
+rule CancelQueuedSubAgentBeforeMaterialization {
+    when: QueuedSubAgentCancellationRequested(parent, task)
+    requires: SpawnAdmissionQueued(task.agent_id)
+    ensures: SpawnAdmissionDenied(task.agent_id)
+    ensures: SubAgentReportsResult(parent,
+        result: cancelled_result_for(task.agent_id))
+}
+
+rule SuppressCancelledQueuedSpawn {
+    when: QueuedSubAgentSpawnDequeued(parent, task)
+    requires: SpawnAdmissionDenied(task.agent_id)
+    ensures: not SubAgentRuntimeCreated(task.agent_id)
+    ensures: not SubAgentToolsExecuted(task.agent_id)
+    ensures: not SubAgentReportsResult(parent,
+        result: any_additional_result_for(task.agent_id))
+}
+
 -- ===========================================================
 -- 3. MODEL VALIDATION (REQ-PROJ-008, REQ-SA-007)
 -- ===========================================================

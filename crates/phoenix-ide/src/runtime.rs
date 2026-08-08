@@ -117,6 +117,166 @@ pub struct SubAgentCancelRequest {
     pub parent_event_tx: mpsc::Sender<Event>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubAgentAdmissionState {
+    Queued,
+    Materializing,
+    CancelRequestedWhileMaterializing,
+    Running,
+    CancelledBeforeMaterialization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubAgentSpawnAdmission {
+    Materialize,
+    SuppressCancelled,
+    SuppressDuplicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubAgentCancelAdmission {
+    CancelRuntime,
+    TerminalizeQueued,
+    DeferredToMaterialization,
+    AlreadyTerminalized,
+    UnknownIdentity,
+}
+
+#[cfg(test)]
+impl SubAgentCancelAdmission {
+    const fn emits_parent_result(self) -> bool {
+        matches!(self, Self::TerminalizeQueued)
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SubAgentAdmissionFence {
+    states: AsyncMutex<HashMap<String, SubAgentAdmissionState>>,
+}
+
+impl SubAgentAdmissionFence {
+    async fn queued(&self, agent_id: &str) -> bool {
+        use std::collections::hash_map::Entry;
+
+        let mut states = self.states.lock().await;
+        match states.entry(agent_id.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(SubAgentAdmissionState::Queued);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    async fn begin_spawn(&self, agent_id: &str) -> SubAgentSpawnAdmission {
+        let mut states = self.states.lock().await;
+        match states.get(agent_id) {
+            Some(SubAgentAdmissionState::Queued) => {
+                states.insert(agent_id.to_string(), SubAgentAdmissionState::Materializing);
+                SubAgentSpawnAdmission::Materialize
+            }
+            Some(SubAgentAdmissionState::CancelledBeforeMaterialization) => {
+                states.remove(agent_id);
+                SubAgentSpawnAdmission::SuppressCancelled
+            }
+            _ => SubAgentSpawnAdmission::SuppressDuplicate,
+        }
+    }
+
+    async fn materialized(&self, agent_id: &str) -> bool {
+        let mut states = self.states.lock().await;
+        match states.get(agent_id) {
+            Some(SubAgentAdmissionState::Materializing) => {
+                states.insert(agent_id.to_string(), SubAgentAdmissionState::Running);
+                false
+            }
+            Some(SubAgentAdmissionState::CancelRequestedWhileMaterializing) => {
+                states.remove(agent_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn materialization_failed(&self, agent_id: &str) {
+        let mut states = self.states.lock().await;
+        if matches!(
+            states.get(agent_id),
+            Some(
+                SubAgentAdmissionState::Materializing
+                    | SubAgentAdmissionState::CancelRequestedWhileMaterializing
+            )
+        ) {
+            states.remove(agent_id);
+        }
+    }
+
+    async fn cancel(&self, agent_id: &str) -> SubAgentCancelAdmission {
+        use std::collections::hash_map::Entry;
+
+        let mut states = self.states.lock().await;
+        match states.entry(agent_id.to_string()) {
+            Entry::Vacant(_) => SubAgentCancelAdmission::UnknownIdentity,
+            Entry::Occupied(mut entry) => match entry.get() {
+                SubAgentAdmissionState::Queued => {
+                    entry.insert(SubAgentAdmissionState::CancelledBeforeMaterialization);
+                    SubAgentCancelAdmission::TerminalizeQueued
+                }
+                SubAgentAdmissionState::Materializing => {
+                    entry.insert(SubAgentAdmissionState::CancelRequestedWhileMaterializing);
+                    SubAgentCancelAdmission::DeferredToMaterialization
+                }
+                SubAgentAdmissionState::CancelRequestedWhileMaterializing
+                | SubAgentAdmissionState::CancelledBeforeMaterialization => {
+                    SubAgentCancelAdmission::AlreadyTerminalized
+                }
+                SubAgentAdmissionState::Running => {
+                    entry.remove();
+                    SubAgentCancelAdmission::CancelRuntime
+                }
+            },
+        }
+    }
+
+    async fn queue_send_failed(&self, agent_id: &str) {
+        let mut states = self.states.lock().await;
+        if matches!(
+            states.get(agent_id),
+            Some(
+                SubAgentAdmissionState::Queued
+                    | SubAgentAdmissionState::CancelledBeforeMaterialization
+            )
+        ) {
+            states.remove(agent_id);
+        }
+    }
+
+    async fn terminal_result_sent(&self, agent_id: &str) {
+        let mut states = self.states.lock().await;
+        if !matches!(
+            states.get(agent_id),
+            Some(SubAgentAdmissionState::CancelledBeforeMaterialization)
+        ) {
+            states.remove(agent_id);
+        }
+    }
+}
+
+async fn send_cancelled_before_materialization(
+    parent_event_tx: &mpsc::Sender<Event>,
+    agent_id: String,
+) {
+    let _ = parent_event_tx
+        .send(Event::SubAgentResult {
+            agent_id,
+            outcome: SubAgentOutcome::Failure {
+                error: "Sub-agent cancelled before materialization".to_string(),
+                error_kind: crate::db::ErrorKind::Cancelled,
+            },
+        })
+        .await;
+}
+
 /// Why a runtime was evicted. Passed to `evict_runtime` so the next
 /// `get_or_create` can describe the real cause in the auto-continue recovery
 /// message instead of always blaming a server restart (task 02710).
@@ -222,6 +382,9 @@ pub struct RuntimeManager {
     /// Channel for sub-agent cancel requests
     cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
+    /// Child-identity admission fence shared by queued spawn and cancellation.
+    /// Parent fan-in remains authoritative for pending/result state.
+    sub_agent_admissions: Arc<SubAgentAdmissionFence>,
     handoff_tx: mpsc::Sender<TaskApprovalHandoffRequest>,
     handoff_rx: RwLock<Option<mpsc::Receiver<TaskApprovalHandoffRequest>>>,
     /// Channel to the single serialized fork-resolution consumer. Every fork
@@ -1436,6 +1599,7 @@ impl RuntimeManager {
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
+            sub_agent_admissions: Arc::new(SubAgentAdmissionFence::default()),
             handoff_tx,
             handoff_rx: RwLock::new(Some(handoff_rx)),
             fork_cmd_tx,
@@ -2356,7 +2520,24 @@ impl RuntimeManager {
                 loop {
                     tokio::select! {
                         Some(req) = spawn_rx.recv() => {
-                            manager.handle_spawn_request(req).await;
+                            let agent_id = req.spec.agent_id.clone();
+                            match manager.sub_agent_admissions.begin_spawn(&agent_id).await {
+                                SubAgentSpawnAdmission::Materialize => {
+                                    if manager.handle_spawn_request(req).await {
+                                        if manager.sub_agent_admissions.materialized(&agent_id).await {
+                                            manager.cancel_materialized_sub_agent(&agent_id).await;
+                                        }
+                                    } else {
+                                        manager.sub_agent_admissions.materialization_failed(&agent_id).await;
+                                    }
+                                }
+                                SubAgentSpawnAdmission::SuppressCancelled => {
+                                    tracing::info!(%agent_id, "Suppressing cancelled queued sub-agent spawn");
+                                }
+                                SubAgentSpawnAdmission::SuppressDuplicate => {
+                                    tracing::warn!(%agent_id, "Suppressing duplicate sub-agent spawn request");
+                                }
+                            }
                         }
                         Some(req) = cancel_rx.recv() => {
                             manager.handle_cancel_request(req).await;
@@ -2400,7 +2581,7 @@ impl RuntimeManager {
 
     /// Handle a sub-agent spawn request
     #[allow(clippy::too_many_lines)]
-    async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
+    async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) -> bool {
         let SubAgentSpawnRequest {
             spec,
             parent_conversation_id,
@@ -2429,7 +2610,7 @@ impl RuntimeManager {
                         },
                     })
                     .await;
-                return;
+                return false;
             }
         };
 
@@ -2447,7 +2628,7 @@ impl RuntimeManager {
                         },
                     })
                     .await;
-                return;
+                return false;
             }
         }
 
@@ -2475,7 +2656,7 @@ impl RuntimeManager {
                         },
                     })
                     .await;
-                return;
+                return false;
             }
         };
 
@@ -2512,7 +2693,7 @@ impl RuntimeManager {
                         },
                     })
                     .await;
-                return;
+                return false;
             }
         };
 
@@ -2549,7 +2730,7 @@ impl RuntimeManager {
                     },
                 })
                 .await;
-            return;
+            return false;
         }
 
         // 3. Create sub-agent context with max_turns from spec (REQ-PROJ-008)
@@ -2642,6 +2823,7 @@ impl RuntimeManager {
         .with_parent(parent_event_tx.clone())
         .with_acknowledged_event_receiver(acknowledged_event_rx)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
+        .with_sub_agent_admission_fence(self.sub_agent_admissions.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
 
@@ -2733,6 +2915,23 @@ impl RuntimeManager {
                 );
             }
         });
+        true
+    }
+
+    async fn cancel_materialized_sub_agent(&self, agent_id: &str) {
+        let handle = self.runtimes.read().await.get(agent_id).cloned();
+        if let Some(handle) = handle {
+            tracing::info!(%agent_id, "Sending cancel to materialized sub-agent");
+            let _ = handle
+                .event_tx
+                .send(Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                })
+                .await;
+        } else {
+            tracing::warn!(%agent_id, "Materialized sub-agent runtime disappeared before cancellation");
+        }
     }
 
     /// Handle a sub-agent cancel request
@@ -2743,30 +2942,24 @@ impl RuntimeManager {
             parent_event_tx,
         } = req;
 
-        let runtimes = self.runtimes.read().await;
-
         for agent_id in ids {
-            if let Some(handle) = runtimes.get(&agent_id) {
-                tracing::info!(agent_id = %agent_id, "Sending cancel to sub-agent");
-                let _ = handle
-                    .event_tx
-                    .send(Event::UserCancel {
-                        reason: None,
-                        cause: crate::state_machine::event::CancelCause::UserRequested,
-                    })
-                    .await;
-            } else {
-                // Runtime not found - synthesize failure result
-                tracing::warn!(agent_id = %agent_id, "Sub-agent runtime not found, synthesizing failure");
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: "Sub-agent runtime not found".to_string(),
-                            error_kind: crate::db::ErrorKind::Cancelled,
-                        },
-                    })
-                    .await;
+            match self.sub_agent_admissions.cancel(&agent_id).await {
+                SubAgentCancelAdmission::CancelRuntime => {
+                    self.cancel_materialized_sub_agent(&agent_id).await;
+                }
+                SubAgentCancelAdmission::TerminalizeQueued => {
+                    tracing::info!(%agent_id, "Terminalizing queued sub-agent before materialization");
+                    send_cancelled_before_materialization(&parent_event_tx, agent_id).await;
+                }
+                SubAgentCancelAdmission::DeferredToMaterialization => {
+                    tracing::info!(%agent_id, "Deferring sub-agent cancellation until materialization completes");
+                }
+                SubAgentCancelAdmission::AlreadyTerminalized => {
+                    tracing::debug!(%agent_id, "Ignoring duplicate sub-agent cancellation");
+                }
+                SubAgentCancelAdmission::UnknownIdentity => {
+                    tracing::debug!(%agent_id, "Ignoring cancellation for unknown or finished sub-agent identity");
+                }
             }
         }
     }
@@ -3262,6 +3455,7 @@ impl RuntimeManager {
             .with_active_direct_turn(active_direct_turn)
             .with_steering_queue(steering_queue)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
+            .with_sub_agent_admission_fence(self.sub_agent_admissions.clone())
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
             .with_agent_catalog(agent_catalog);
@@ -4657,6 +4851,102 @@ mod broadcaster_tests {
             anchor + i64::try_from(events.len()).expect("ring length fits i64"),
             "with seq 11..17 in the ring, highest is 17"
         );
+    }
+}
+
+#[cfg(test)]
+mod sub_agent_admission_fence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_before_materialization_terminalizes_once_and_suppresses_spawn() {
+        let fence = SubAgentAdmissionFence::default();
+
+        assert!(fence.queued("child").await);
+        let cancellations = [fence.cancel("child").await, fence.cancel("child").await];
+        assert_eq!(
+            cancellations,
+            [
+                SubAgentCancelAdmission::TerminalizeQueued,
+                SubAgentCancelAdmission::AlreadyTerminalized,
+            ]
+        );
+        let (parent_event_tx, mut parent_event_rx) = mpsc::channel(2);
+        for cancellation in cancellations {
+            if cancellation.emits_parent_result() {
+                send_cancelled_before_materialization(&parent_event_tx, "child".to_string()).await;
+            }
+        }
+        let result = parent_event_rx
+            .try_recv()
+            .expect("queued cancellation must send one parent result");
+        assert!(matches!(
+            result,
+            Event::SubAgentResult { ref agent_id, .. } if agent_id == "child"
+        ));
+        assert!(
+            parent_event_rx.try_recv().is_err(),
+            "duplicate cancellation must not send a second parent result"
+        );
+        assert_eq!(
+            fence.begin_spawn("child").await,
+            SubAgentSpawnAdmission::SuppressCancelled
+        );
+        assert!(fence.states.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn materialization_before_cancellation_cancels_runtime_once() {
+        let fence = SubAgentAdmissionFence::default();
+
+        assert!(fence.queued("child").await);
+        assert_eq!(
+            fence.begin_spawn("child").await,
+            SubAgentSpawnAdmission::Materialize
+        );
+        assert!(!fence.materialized("child").await);
+        let cancellations = [fence.cancel("child").await, fence.cancel("child").await];
+        assert_eq!(
+            cancellations,
+            [
+                SubAgentCancelAdmission::CancelRuntime,
+                SubAgentCancelAdmission::UnknownIdentity,
+            ]
+        );
+        assert_eq!(
+            cancellations
+                .iter()
+                .filter(|admission| admission.emits_parent_result())
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_materialization_is_delivered_after_runtime_exists() {
+        let fence = SubAgentAdmissionFence::default();
+
+        assert!(fence.queued("child").await);
+        assert_eq!(
+            fence.begin_spawn("child").await,
+            SubAgentSpawnAdmission::Materialize
+        );
+        let cancellations = [fence.cancel("child").await, fence.cancel("child").await];
+        assert_eq!(
+            cancellations,
+            [
+                SubAgentCancelAdmission::DeferredToMaterialization,
+                SubAgentCancelAdmission::AlreadyTerminalized,
+            ]
+        );
+        assert_eq!(
+            cancellations
+                .iter()
+                .filter(|admission| admission.emits_parent_result())
+                .count(),
+            0
+        );
+        assert!(fence.materialized("child").await);
     }
 }
 
