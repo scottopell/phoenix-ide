@@ -38,6 +38,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
 | [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
 | [026](026_workscope-owned-lifecycle-unifies-conversation-handoffs.md) | Product conversation lifecycle is separate from WorkScope resource ownership | Accepted | REQ-BED-019, REQ-BED-028, REQ-BED-029, REQ-BED-030, REQ-PROJ-004, REQ-PROJ-015, REQ-PROJ-WS-001, REQ-WL-001, REQ-WL-002, REQ-PRA-000, REQ-CHN-008, REQ-GR-001 |
+| [027](027_work-subagents-share-a-concurrent-write-boundary.md) | Work sub-agents share a concurrent write boundary | Accepted | REQ-SA-001, REQ-PROJ-008, REQ-BED-018, `SubAgentSpecsResolved` |
 
 ## For agents: which decisions bind your task
 
@@ -68,6 +69,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 022, then 021 for chat-only UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
+| Specifying Work sub-agent concurrency or shared-worktree write admission | 027, then 026 for WorkScope ownership |
 
 ## Decision dependencies
 
@@ -100,7 +102,8 @@ ADR-000 (adopt spEARS v2 for new work)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
-      └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
+      ├── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
+      └── ADR-027 (Work sub-agents share a concurrent write boundary)
 ```
 
 ## Conventions

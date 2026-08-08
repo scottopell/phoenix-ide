@@ -8,7 +8,7 @@
 --        projects' worktree ownership.
 -- Includes:
 --   - SubAgentExecutionAuthority (read_only/write_capable) and parent-mode rules
---   - One-writer invariant (per-call AND across calls per parent)
+--   - Parallel read-only and write-capable sub-agent execution
 --   - cwd-scoping invariant for Work sub-agents (incl. task.cwd overrides)
 --   - system-root cwd rejection for every sub-agent mode
 --   - Explore-sub-agent working_dir derivation
@@ -18,8 +18,7 @@
 -- Excludes:
 --   - Core conversation state machine (see bedrock.allium):
 --       awaiting_sub_agents, cancelling_sub_agents, completed, failed,
---       fan-in, cancellation propagation, the OneWorkSubAgent
---       Conversation-level invariant, sub-agent terminal-tool semantics
+--       fan-in, cancellation propagation, sub-agent terminal-tool semantics
 --       (submit_result/submit_error must be sole tool in response),
 --       SpawnLimit, NoRecursiveSubAgents.
 --   - Worktree creation / branch lifecycle (see projects.allium).
@@ -145,36 +144,6 @@ rule WorkSubAgentRequiresWriteableParent {
         -- read-only sub-agents.
 }
 
--- One-writer-per-batch: a single `spawn_agents` call carries at most one
--- task with `execution_authority = write_capable`. Mixed batches with several Explore + one Work
--- are allowed.
-rule SpawnRejectedMultipleWorkInBatch {
-    when: SpawnAgentsToolInvoked(parent, tasks)
-    requires: work_task_count(tasks) > 1
-    ensures: SpawnAgentsRejected(parent,
-        reason: "Only one Work sub-agent can be spawned per call")
-}
-
--- One-writer-across-batches: the parent may have at most one Work
--- sub-agent running at any time. The executor tracks this in
--- `active_work_subagents`; a fresh batch that would push it above one is
--- rejected.
-rule SpawnRejectedWorkSubAgentAlreadyActive {
-    when: SpawnAgentsToolInvoked(parent, tasks)
-    requires: work_task_count(tasks) > 0
-    requires: active_work_subagents(parent) > 0
-    ensures: SpawnAgentsRejected(parent,
-        reason: "A Work sub-agent is already active for this parent")
-
-    @guidance
-        -- The active counter is incremented at the end of a successful
-        -- batch by `work_count_in_batch` and decremented when each
-        -- spawned Work sub-agent's terminal SubAgentResult drains in
-        -- `apply_transition_result`. Crash/restart does not persist the
-        -- counter: sub-agents do not survive server restart, so a fresh
-        -- runtime starts with active = 0 by construction.
-}
-
 -- ===========================================================
 -- 3. MODEL VALIDATION (REQ-PROJ-008, REQ-SA-007)
 -- ===========================================================
@@ -297,17 +266,16 @@ rule SpawnedSubAgentCwdAssignment {
 
 -- All per-task validations passed: build a SubAgentSpec for each task
 -- (defaults applied, model validated, cwd resolved) and hand it to
--- `RuntimeManager::handle_spawn_request`. The bedrock-level
--- `SpawnAgentsCompletes*` rule then drives the parent state transition.
+-- `RuntimeManager::handle_spawn_request`. Write-capable task count is not an
+-- admission condition: an eligible parent may spawn multiple write-capable
+-- children in one call or across multiple calls in the same tool round. The
+-- bedrock-level `SpawnAgentsCompletes*` rule then drives the parent transition.
 rule SubAgentSpecsResolved {
     when: SpawnAgentsToolInvoked(parent, tasks)
     requires: tasks.count >= 1
     requires: tasks.count <= config.max_sub_agents_per_spawn
     requires: parent.mode in { work, branch, direct }
         or not any_task_mode_is_work(tasks)
-    requires: work_task_count(tasks) <= 1
-    requires: work_task_count(tasks) = 0
-        or active_work_subagents(parent) = 0
     requires: not any_task_has_unknown_model(tasks)
     requires: not any_task_has_unknown_agent_type(tasks, parent.working_dir)
     requires: not any_task_effective_cwd_resolves_to_system_root(
@@ -318,8 +286,6 @@ rule SubAgentSpecsResolved {
     ensures: SubAgentSpecsCreated(parent, tasks)
     ensures: SpawnAgentsCompletes(parent,
         spawned_agents: pending_sub_agents_from(tasks))
-    ensures: active_work_subagents(parent)
-        = previous(active_work_subagents(parent)) + work_task_count(tasks)
 
     @guidance
         -- Per-task resolution (referenced as `resolve_*` helpers). When a task
@@ -444,18 +410,6 @@ rule SubAgentRegistryOnResume {
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
-
--- Restatement at the spawn layer of bedrock's `OneWorkSubAgent`
--- Conversation-level invariant. Bedrock states it as a structural
--- post-condition (`work_sub_agents.count <= 1`); subagents.allium
--- states it as the spawn-time *check* that maintains it.
---
--- "Running" = not yet terminal (completed / failed). The counter
--- `active_work_subagents(parent)` is the runtime realisation.
-invariant OneWorkSubAgentPerParent {
-    for p in Conversations:
-        active_work_subagents(p) <= 1
-}
 
 -- When the parent owns a worktree (Work or Branch mode), the effective
 -- cwd of any Work sub-agent it spawns is inside that worktree.

@@ -385,19 +385,19 @@ WHEN sub-agent is spawned by a Work conversation with Explore mode requested
 THE SYSTEM SHALL create the sub-agent in Explore mode (read-only)
 AND configure its working directory as the parent's worktree path
 
-WHEN sub-agent is spawned by a write-capable parent conversation with write capability requested
-THE SYSTEM SHALL create the sub-agent with write capability against the parent's attached `WorkScope`
-AND configure its working directory as the parent's worktree path
-AND enforce that only one Work sub-agent exists per parent at a time
+WHEN one or more sub-agents are spawned by a write-capable parent conversation with write capability requested
+THE SYSTEM SHALL create every requested sub-agent with write capability against the parent's attached `WorkScope`
+AND configure each sub-agent's working directory as the parent's worktree path
+AND allow the write-capable sub-agents to execute concurrently
 
 WHEN sub-agent is running
 THE SYSTEM SHALL NOT provide `propose_task` tool to sub-agents
 AND sub-agents SHALL NOT be able to change their own mode
 
 **Rationale:** Sub-agents operate under the parent's direction with a constrained
-tool set. Explore sub-agents are safe to run in parallel — they cannot write.
-Work sub-agents inherit the parent's worktree so they operate on the same codebase
-state; the one-at-a-time constraint maintains a single writer per worktree.
+tool set. Read-only sub-agents cannot write. Write-capable sub-agents inherit the
+parent's attached `WorkScope` and worktree so independent tasks can execute
+concurrently while retaining one shared write boundary.
 
 ---
 

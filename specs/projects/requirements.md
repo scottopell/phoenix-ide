@@ -245,13 +245,13 @@ AND return a descriptive error
 
 ### REQ-PROJ-008: Sub-Agent Capabilities Inherit the Parent Workspace Authority
 
-WHEN a Git-backed parent conversation spawns a sub-agent with write authority requested
-THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
-AND grant write access to that same worktree
-AND allow only one write-authority sub-agent per parent conversation at a time
-AND place the parent conversation in AwaitingSubAgentResult state for the duration
-AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
-AND SHALL attach the sub-agent to the parent's existing `WorkScope` and filesystem worktree instead
+WHEN a Git-backed parent conversation spawns one or more sub-agents with write authority requested
+THE SYSTEM SHALL configure each sub-agent's working directory as the parent's worktree
+AND grant each sub-agent write access to that same worktree
+AND allow the write-authority sub-agents to execute in parallel
+AND place the parent conversation in AwaitingSubAgents state until every sub-agent is terminal
+AND SHALL NOT provision a fresh detached-default-branch disposable worktree for those sub-agents
+AND SHALL attach every sub-agent to the parent's existing `WorkScope` and filesystem worktree instead
 
 WHEN a Git-backed parent conversation spawns a sub-agent with read-only authority requested
 THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
@@ -263,7 +263,7 @@ AND SHALL attach the sub-agent to the parent's existing `WorkScope` and filesyst
 WHEN a planning/read-only conversation spawns sub-agents
 THE SYSTEM SHALL configure those sub-agents with read-only authority
 
-**Rationale:** The important distinction is execution authority, not lifecycle naming. Phoenix must preserve the single-writer guarantee for one worktree while still allowing parallel read-only analysis.
+**Rationale:** The important distinction is execution authority, not lifecycle naming. Parallel write-capable children let the parent delegate independent implementation tasks without child worktrees or merge machinery; every child remains attached to the same WorkScope and filesystem write boundary.
 
 ---
 

@@ -593,8 +593,9 @@ rule WriteCapableSubAgentInheritsWorktree {
     ensures: SubAgentAttachedToSharedWorkScope(parent, sub_agent)
 
     @guidance
-        -- Sub-agents may attach to the same scope as their parent. They do not
-        -- acquire cleanup authority and do not cause separate teardown behaviour.
+        -- Multiple write-capable sub-agents may attach to the same scope and
+        -- worktree concurrently. They do not acquire cleanup authority and do
+        -- not cause separate teardown behaviour.
 }
 
 rule ReadOnlySubAgentDirectory {

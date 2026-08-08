@@ -7,11 +7,11 @@ tasks to parallel sub-agents so that complex operations complete faster and
 the agent can synthesize multiple perspectives without exhausting its own
 context window.
 
-> Detailed behaviour (states, transitions, invariants, mode rules,
-> one-writer constraint, cwd-scoping) lives in
+> Detailed behaviour (states, transitions, invariants, authority rules,
+> parallel execution, cwd-scoping) lives in
 > [`subagents.allium`](./subagents.allium) and
-> [`bedrock.allium`](../bedrock/bedrock.allium). This file records user
-> need, rationale, and per-requirement status only.
+> [`bedrock.allium`](../bedrock/bedrock.allium). This file records the
+> timeless user need and requirements.
 >
 > Named agents ([`../agents/`](../agents/requirements.md)) extend the spawn
 > path: a task may carry an `agent_type` that supplies the spawned sub-agent's
@@ -26,7 +26,11 @@ context window.
 
 WHEN LLM requests sub-agent spawn with one or more tasks
 THE SYSTEM SHALL create an independent conversation for each task
-AND execute all sub-agent conversations in parallel
+AND execute all sub-agent conversations in parallel regardless of authority
+
+WHEN an eligible parent requests multiple write-capable sub-agents
+THE SYSTEM SHALL allow the sub-agents to execute concurrently
+AND preserve each sub-agent as an independent pending child until its terminal result
 
 WHEN spawning sub-agents
 THE SYSTEM SHALL assign a mandatory time limit to each sub-agent
@@ -40,7 +44,9 @@ THE SYSTEM SHALL reject the call with an error
 exploration, and divide-and-conquer problem solving. Spawning sub-agents
 keeps the parent's context clean for synthesis. The default authority is
 read-only (cheap, safe) unless the LLM explicitly requests write capability
-against the parent's attached `WorkScope`.
+against the parent's attached `WorkScope`. Write-capable children share that
+environment, so the parent is responsible for assigning independent tasks whose
+writes can safely overlap.
 
 **Dependencies:** REQ-BED-008
 

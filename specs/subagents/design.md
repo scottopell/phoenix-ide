@@ -10,7 +10,7 @@ conversation.
 Isolation), REQ-PROJ-008 (Sub-Agent Mode + Resource Controls).
 
 > Detailed behaviour — states, transitions, invariants, mode rules,
-> one-writer constraint, cwd-scoping, model/turn defaulting — is normative
+> parallel execution, cwd-scoping, model/turn defaulting — is normative
 > in [`subagents.allium`](./subagents.allium) (spawn layer) and
 > [`bedrock.allium`](../bedrock/bedrock.allium) (state-machine layer).
 > This file keeps only the architectural overview, the rationale, and
@@ -46,7 +46,7 @@ Two layers cooperate:
 1. **Spawn layer** — `crates/phoenix-ide/src/tools/subagent.rs` (the
    `spawn_agents` / `submit_result` / `submit_error` tools) and
    `crates/phoenix-ide/src/runtime/executor.rs::handle_spawn_agents_tool`
-   (validation, defaulting, one-writer + cwd-scoping guards). Normative
+   (validation, defaulting, parallel Work admission, and cwd-scoping guards). Normative
    in `subagents.allium`.
 
 2. **State-machine layer** — `crates/phoenix-ide/src/state_machine/`
@@ -79,12 +79,12 @@ Two layers cooperate:
   rejected at spawn time. Sandbox support gates bash only: with support, the
   parent and spawned Explore sub-agents receive sandboxed bash; without support,
   both keep delegation with read/browser/submit tools and no bash.
-- **Work / Branch / Direct parent** → can spawn either mode; at most one
-  Work sub-agent active at a time per parent (one-writer invariant), and
-  per single `spawn_agents` call. Multiple Explore sub-agents in parallel
-  are unconstrained beyond the hard cap of 10 tasks per call.
+- **Work / Branch / Direct parent** → can spawn either mode. Multiple Work
+  and Explore sub-agents may run concurrently, including Work children from
+  multiple `spawn_agents` calls in one tool round. Each call has a hard cap
+  of 10 tasks.
 
-The mode-validation, one-writer, and cwd-scoping rules are normative in
+The mode-validation, parallel-execution, and cwd-scoping rules are normative in
 `subagents.allium` §§1–4.
 
 Every sub-agent mode inherits or accepts only a cwd that canonicalises to an
@@ -133,11 +133,6 @@ CREATE TABLE conversations (
         REFERENCES conversations(id) ON DELETE CASCADE
 );
 ```
-
-`active_work_subagents` (the one-writer counter) is held on the
-runtime executor and intentionally *not* persisted — sub-agents do
-not survive server restart, so the counter resets to 0 on restart
-by construction.
 
 ## Aggregated results format
 

@@ -235,7 +235,7 @@ pass can act on it without a format migration.
 | `agent_type` schema enum + stability | `agents.allium` (this spec) |
 | Persona composition in system prompt | `agents.allium` (this spec) |
 | Spawn validation incl. unknown `agent_type` | `subagents.allium` |
-| Mode/model/turn defaulting, cwd-scoping, one-writer | `subagents.allium` |
+| Mode/model/turn defaulting, cwd-scoping, parallel execution | `subagents.allium` |
 | Spawn lifecycle, fan-in, cancellation, timeout | `bedrock.allium` |
 
 `subagents.allium` gains `agent_type` on `SubAgentTask`, `agent_name`/`persona`

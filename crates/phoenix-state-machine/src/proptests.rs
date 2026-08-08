@@ -1878,66 +1878,73 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
     }
 }
 
-/// `SpawnAgentsComplete` accumulates agent IDs
+/// Work children spawned by separate tool calls accumulate into one fan-in set.
 #[test]
-fn test_spawn_agents_complete_accumulates_ids() {
-    let state = ConvState::ToolExecuting {
-        current_tool: ToolCall::new(
-            "spawn-1",
+fn parallel_work_subagents_accumulate_across_spawn_calls() {
+    let spawn_tool = |id: &str| {
+        ToolCall::new(
+            id,
             ToolInput::Unknown {
                 name: "spawn_agents".to_string(),
                 input: serde_json::json!({}),
             },
-        ),
-        remaining_tools: vec![ToolCall::new(
-            "t2",
-            ToolInput::from(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
-        )],
+        )
+    };
+    let pending = |id: &str| PendingSubAgent {
+        agent_id: id.to_string(),
+        task: format!("Task {id}"),
+        mode: SubAgentMode::Work,
+    };
+
+    let state = ConvState::ToolExecuting {
+        current_tool: spawn_tool("spawn-1"),
+        remaining_tools: vec![spawn_tool("spawn-2")],
         completed_results: vec![],
-        pending_sub_agents: vec![PendingSubAgent {
-            agent_id: "existing-agent".to_string(),
-            task: "Existing task".to_string(),
-            mode: SubAgentMode::Explore,
-        }],
-        assistant_message: AssistantMessage::default(),
+        pending_sub_agents: vec![],
+        assistant_message: assistant_message_for_tools(&["spawn-1", "spawn-2"]),
     };
 
-    let event = Event::SpawnAgentsComplete {
-        tool_use_id: "spawn-1".to_string(),
-        result: ToolResult::success("spawn-1".to_string(), "Spawned 2 agents".to_string()),
-        spawned: vec![
-            PendingSubAgent {
-                agent_id: "new-agent-1".to_string(),
-                task: "New task 1".to_string(),
-                mode: SubAgentMode::Explore,
-            },
-            PendingSubAgent {
-                agent_id: "new-agent-2".to_string(),
-                task: "New task 2".to_string(),
-                mode: SubAgentMode::Explore,
-            },
-        ],
+    let first = transition(
+        &state,
+        &test_context(),
+        Event::SpawnAgentsComplete {
+            tool_use_id: "spawn-1".to_string(),
+            result: ToolResult::success("spawn-1".to_string(), "Spawned agent 1".to_string()),
+            spawned: vec![pending("agent-1")],
+        },
+    )
+    .unwrap();
+
+    let ConvState::ToolExecuting {
+        pending_sub_agents,
+        current_tool,
+        ..
+    } = &first.new_state
+    else {
+        panic!("Expected ToolExecuting, got {:?}", first.new_state);
     };
+    assert_eq!(current_tool.id, "spawn-2");
+    assert_eq!(pending_sub_agents.len(), 1);
 
-    let result = transition(&state, &test_context(), event).unwrap();
+    let second = transition(
+        &first.new_state,
+        &test_context(),
+        Event::SpawnAgentsComplete {
+            tool_use_id: "spawn-2".to_string(),
+            result: ToolResult::success("spawn-2".to_string(), "Spawned agents 2-3".to_string()),
+            spawned: vec![pending("agent-2"), pending("agent-3")],
+        },
+    )
+    .unwrap();
 
-    // reason: only ToolExecuting is expected; every other ConvState variant is a
-    // failure, so an explicit list of the ~16 remaining variants would obscure intent.
-    #[allow(clippy::wildcard_enum_match_arm)]
-    match result.new_state {
-        ConvState::ToolExecuting {
-            pending_sub_agents,
-            current_tool,
-            ..
-        } => {
-            assert_eq!(current_tool.id, "t2");
-            assert_eq!(pending_sub_agents.len(), 3);
-            assert_eq!(pending_sub_agents[0].agent_id, "existing-agent");
-            assert_eq!(pending_sub_agents[1].agent_id, "new-agent-1");
-            assert_eq!(pending_sub_agents[2].agent_id, "new-agent-2");
-        }
-        _ => panic!("Expected ToolExecuting, got {:?}", result.new_state),
-    }
+    let ConvState::AwaitingSubAgents { pending, .. } = second.new_state else {
+        panic!("Expected AwaitingSubAgents, got {:?}", second.new_state);
+    };
+    assert_eq!(pending.len(), 3);
+    assert_eq!(pending[0].agent_id, "agent-1");
+    assert_eq!(pending[1].agent_id, "agent-2");
+    assert_eq!(pending[2].agent_id, "agent-3");
+    assert!(pending.iter().all(|agent| agent.mode == SubAgentMode::Work));
 }
 
 // Note: The old "No Duplicate Tool Persists" tests were removed because

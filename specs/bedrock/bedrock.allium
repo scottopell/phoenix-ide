@@ -285,7 +285,6 @@ entity Conversation {
 
     -- Relationships
     sub_agents: Conversation with parent = this
-    write_capable_sub_agents: sub_agents where execution_authority = write_capable
 
     -- Derived
     is_busy: core_status in { llm_requesting, executing_tools,
@@ -296,10 +295,6 @@ entity Conversation {
     context_warning: context_usage_ratio >= config.context_warning_threshold
     context_at_threshold: context_usage_ratio >= config.context_continuation_threshold
 
-    -- Entity-level invariants
-    invariant OneWorkSubAgent {
-        write_capable_sub_agents.count <= 1
-    }
 }
 
 -- Parent conversations: user-facing. Can propose tasks, recover from auth

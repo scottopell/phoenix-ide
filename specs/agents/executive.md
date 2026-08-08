@@ -75,8 +75,8 @@ the persona into `SubAgentSpec`).
 ## Cross-Spec References
 
 - `specs/subagents/` — owns the spawn lifecycle, mode/model/turn defaulting,
-  one-writer and cwd-scoping invariants, and (extended by this feature) the
-  unknown-`agent_type` rejection and persona threading.
+  parallel execution and cwd-scoping invariants, and (extended by this feature)
+  the unknown-`agent_type` rejection and persona threading.
 - `specs/bedrock/` — owns the conversation state machine that runs every
   sub-agent regardless of persona.
 - `specs/skills/` — the discovery and frontmatter pattern named agents mirror;

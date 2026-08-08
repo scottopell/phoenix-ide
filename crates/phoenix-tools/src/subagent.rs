@@ -185,7 +185,7 @@ impl Tool for SpawnAgentsTool {
             "mode": {
                 "type": "string",
                 "enum": ["explore", "work"],
-                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model. Work: full tool suite, inherits the parent model. Work mode requires the parent to be in Work mode."
+                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model. Work: full tool suite, inherits the parent model, and may run in parallel with other Work sub-agents. Work mode requires a write-capable parent (Work, Branch, or Direct)."
             },
             "model": {
                 "type": "string",
@@ -469,6 +469,24 @@ mod tests {
                 "spawn_agents schema guidance should not mention provider-specific alias {provider_specific_alias:?}: {guidance}"
             );
         }
+    }
+
+    #[test]
+    fn schema_advertises_parallel_work_for_write_capable_parents() {
+        let tool = SpawnAgentsTool::new();
+        let schema = tool.input_schema();
+        let mode_guidance = schema["properties"]["tasks"]["items"]["properties"]["mode"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        let tasks_guidance = schema["properties"]["tasks"]["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(tool.description().contains("tasks in parallel"));
+        assert!(tasks_guidance.contains("tasks to execute in parallel"));
+        assert!(mode_guidance.contains("parallel with other Work sub-agents"));
+        assert!(mode_guidance.contains("Work, Branch, or Direct"));
     }
 
     #[test]

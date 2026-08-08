@@ -12,10 +12,10 @@ when such requests are received. Top-level Explore always exposes `spawn_agents`
 process-wide sandbox support gates only whether Explore parents and spawned
 Explore sub-agents receive sandboxed bash. Without sandbox support, delegation
 still works with read/browser/submit tools and no bash. Work, Branch, and Direct
-parents can spawn either, with at
-most one Work sub-agent active at a time per parent (and per
-`spawn_agents` call). When the parent owns a worktree (Work or Branch
-mode), a Work sub-agent's effective cwd — including any `task.cwd`
+parents can spawn either mode, including multiple concurrent Work children in
+one `spawn_agents` call or across calls in the same tool round. Work children
+share the parent's writable environment. When the parent owns a worktree (Work
+or Branch mode), every Work sub-agent's effective cwd — including any `task.cwd`
 override — must stay inside that worktree; a Work sub-agent spawned
 from a Direct parent has no worktree to scope against, matching
 Direct's unscoped write semantics. Results are submitted via dedicated
@@ -41,8 +41,8 @@ only the architectural seams.
   function enforces this structurally.
 - **Spawn-layer** (`tools/subagent.rs` + `runtime/executor.rs::
   handle_spawn_agents_tool`) validates the call, applies defaults
-  (mode, model, max_turns, cwd, timeout), enforces the one-writer +
-  cwd-scoping invariants, then hands each task to
+  (mode, model, max_turns, cwd, timeout), validates write-capable parents and
+  cwd scoping without limiting Work-child count, then hands each task to
   `RuntimeManager::handle_spawn_request`. `runtime.rs` derives the
   sub-agent's `ConvMode` from the parent's mode and selects the
   per-mode tool registry (`for_subagent_explore` /
@@ -73,7 +73,7 @@ only the architectural seams.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-SA-001:** Parallel Task Execution | ✅ Complete | Mode/model/max-turns wired; max 10 tasks per call |
+| **REQ-SA-001:** Parallel Task Execution | ✅ Complete | Explore and Work children execute concurrently; mode/model/max-turns wired; max 10 tasks per call |
 | **REQ-SA-002:** Sub-Agent Isolation | ✅ Complete | Tool registries exclude `spawn_agents`, `ask_user_question`, `skill`, `propose_task`; sub-agents tagged `user_initiated = false` |
 | **REQ-SA-003:** Result Submission | ✅ Complete | `submit_result` / `submit_error`; terminal-tool-must-be-sole enforced structurally |
 | **REQ-SA-004:** Parent Fan-In | ✅ Complete | Bounded buffer; conservation invariant tested in proptests |

@@ -26,7 +26,7 @@ Phoenix persists mode-derived Git context through `cm_*` conversation columns re
 | **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Worktree paths remain conversation-derived under `.phoenix/worktrees/` |
 | **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd/plain markdown proposal sources are still supported and persisted |
 | **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete (legacy current reality) | Write authority remains mode-gated to Work / Branch |
-| **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ✅ Complete | Shipped sub-agent execution still inherits parent worktree/scope |
+| **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ✅ Complete | Multiple write-capable children may execute concurrently while inheriting the parent worktree and attached WorkScope; each child retains per-task cwd scoping |
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted |
 | **REQ-PROJ-010:** Abandon a Conversation | Moved | Legacy implementation lives under `work-lifecycle`; current user surface still uses `/abandon-task` |
 | **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | Moved | See `pr-association` / `work-lifecycle` |
