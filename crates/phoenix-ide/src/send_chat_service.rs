@@ -132,6 +132,14 @@ impl SendChatApplicationService {
             {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
+            if let Some(receipt) = self
+                .runtime
+                .lock_steering_acceptance_receipts()
+                .await
+                .get(&receipt_key)
+            {
+                validate_steering_receipt(receipt, &request_fingerprint)?;
+            }
             return Ok(SendChatOutcome::QueuedAsSteering);
         }
         if let Some(outcome) = lookup_persisted_message_replay(&self.db, &req).await? {
@@ -622,7 +630,7 @@ async fn insert_transient_steering_receipt(
                         .iter()
                         .any(|entry| entry.message_id == candidate.message_id)
                 });
-            if persisted || !queued {
+            if persisted || queued {
                 receipts.remove(&candidate);
             }
         }
@@ -780,13 +788,21 @@ fn replay_terminal_steering_receipt(
     receipt: &SteeringAcceptanceReceipt,
     request_fingerprint: &str,
 ) -> Result<SendChatOutcome, SendChatServiceError> {
-    if receipt.request_fingerprint != request_fingerprint {
-        return Err(SendChatServiceError::IdempotencyConflict);
-    }
+    validate_steering_receipt(receipt, request_fingerprint)?;
     Ok(SendChatOutcome::Rejected {
         message: "The accepted message was cancelled or failed before delivery.".to_string(),
         code: "turn_terminal",
     })
+}
+
+fn validate_steering_receipt(
+    receipt: &SteeringAcceptanceReceipt,
+    request_fingerprint: &str,
+) -> Result<(), SendChatServiceError> {
+    if receipt.request_fingerprint != request_fingerprint {
+        return Err(SendChatServiceError::IdempotencyConflict);
+    }
+    Ok(())
 }
 
 fn map_images(images: Vec<ImageAttachment>) -> Vec<ImageData> {
@@ -817,8 +833,8 @@ mod tests {
         active_turn_fences_direct_acceptance, lookup_durable_replay, map_conversation_load_error,
         map_direct_turn_accept_error, pending_queue_fences_direct_acceptance,
         persisted_skill_matches, queued_retry_matches, replay_terminal_steering_receipt,
-        should_enqueue_steering, submitted_identity_from_request, DurableReplayOutcome,
-        MessageExpansionPolicy, SendChatRequest, SendChatServiceError,
+        should_enqueue_steering, submitted_identity_from_request, validate_steering_receipt,
+        DurableReplayOutcome, MessageExpansionPolicy, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use phoenix_core::domain::db_schema::SkillContent;
@@ -1169,6 +1185,21 @@ mod tests {
         let changed_fingerprint = super::request_fingerprint(&changed).unwrap();
         assert!(matches!(
             replay_terminal_steering_receipt(&receipt, &changed_fingerprint),
+            Err(SendChatServiceError::IdempotencyConflict)
+        ));
+    }
+
+    #[test]
+    fn queued_steering_receipt_rejects_changed_expansion_policy() {
+        let req = request();
+        let receipt = crate::runtime::SteeringAcceptanceReceipt {
+            request_fingerprint: super::request_fingerprint(&req).unwrap(),
+        };
+        let mut changed = req;
+        changed.expansion_policy = MessageExpansionPolicy::LiteralText;
+
+        assert!(matches!(
+            validate_steering_receipt(&receipt, &super::request_fingerprint(&changed).unwrap()),
             Err(SendChatServiceError::IdempotencyConflict)
         ));
     }
