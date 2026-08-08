@@ -94,7 +94,8 @@ final class Outbox {
 
     static func hasVisibleEntries(conversationId: String) -> Bool {
         let name = "outbox-\(conversationId)"
-        return (DiskStore.load([OutboxEntry].self, name: name) ?? [])
+        return (DiskStore.loadVersioned(
+            [OutboxEntry].self, name: name, version: Self.schemaVersion) ?? [])
             .contains { $0.conversationId == conversationId && $0.isVisible }
     }
 
