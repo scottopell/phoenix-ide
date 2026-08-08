@@ -19,31 +19,53 @@ enum CertPinStore {
     private static let fingerprintKey = "phoenix.certPin.fingerprint"
     private static let mismatchAtKey = "phoenix.certPin.mismatchAt"
 
-    enum Decision {
+    enum Decision: Equatable {
         case accept
         case reject
     }
 
-    /// TOFU evaluation for a self-signed presentation.
-    static func evaluate(host: String, port: Int, fingerprint: String) -> Decision {
-        let defaults = UserDefaults.standard
-        let key = "\(host):\(port)"
-        let pinnedHost = defaults.string(forKey: hostKey)
-        let pinnedFingerprint = defaults.string(forKey: fingerprintKey)
+    enum ExistingPinDecision: Equatable {
+        case unpinned
+        case accept
+        case reject
+    }
 
-        guard pinnedHost == key, let pinnedFingerprint else {
+    static func evaluateExisting(
+        host: String, port: Int, fingerprint: String?,
+        defaults: UserDefaults = .standard
+    ) -> ExistingPinDecision {
+        let key = "\(host):\(port)"
+        guard defaults.string(forKey: hostKey) == key,
+              let pinnedFingerprint = defaults.string(forKey: fingerprintKey)
+        else { return .unpinned }
+
+        guard fingerprint == pinnedFingerprint else {
+            defaults.set(Date(), forKey: mismatchAtKey)
+            return .reject
+        }
+        defaults.removeObject(forKey: mismatchAtKey)
+        return .accept
+    }
+
+    /// TOFU evaluation for a self-signed presentation.
+    static func evaluate(
+        host: String, port: Int, fingerprint: String,
+        defaults: UserDefaults = .standard
+    ) -> Decision {
+        let key = "\(host):\(port)"
+        switch evaluateExisting(
+            host: host, port: port, fingerprint: fingerprint, defaults: defaults) {
+        case .accept:
+            return .accept
+        case .reject:
+            return .reject
+        case .unpinned:
             // First use (or a different server): pin and accept.
             defaults.set(key, forKey: hostKey)
             defaults.set(fingerprint, forKey: fingerprintKey)
             defaults.removeObject(forKey: mismatchAtKey)
             return .accept
         }
-        if pinnedFingerprint == fingerprint {
-            return .accept
-        }
-        // Certificate changed: fail closed and record it for Settings.
-        defaults.set(Date(), forKey: mismatchAtKey)
-        return .reject
     }
 
     /// The pinned server ("host:port") and a short fingerprint prefix for
@@ -60,13 +82,22 @@ enum CertPinStore {
     /// means recent connections are being rejected because the server's
     /// certificate changed.
     static var lastMismatchAt: Date? {
-        UserDefaults.standard.object(forKey: mismatchAtKey) as? Date
+        lastMismatchAt(in: .standard)
+    }
+
+    static func lastMismatchAt(in defaults: UserDefaults) -> Date? {
+        defaults.object(forKey: mismatchAtKey) as? Date
+    }
+
+    static func hasMismatch(host: String, port: Int) -> Bool {
+        let defaults = UserDefaults.standard
+        return defaults.string(forKey: hostKey) == "\(host):\(port)"
+            && defaults.object(forKey: mismatchAtKey) != nil
     }
 
     /// Explicit re-trust: forget the pin so the next connection pins the
     /// certificate the server presents then.
-    static func forget() {
-        let defaults = UserDefaults.standard
+    static func forget(defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: hostKey)
         defaults.removeObject(forKey: fingerprintKey)
         defaults.removeObject(forKey: mismatchAtKey)

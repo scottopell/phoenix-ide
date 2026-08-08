@@ -21,7 +21,9 @@ struct NewConversationView: View {
     @State private var validationTask: Task<Void, Never>?
     @State private var pendingAttempt: CreateAttempt?
 
-    private struct CreateAttempt: Equatable {
+    private static let pendingAttemptStoreName = "pending-conversation-creation"
+
+    private struct CreateAttempt: Codable, Equatable {
         let cwd: String
         let text: String
         let model: String
@@ -121,8 +123,12 @@ struct NewConversationView: View {
                 scheduleValidation(newValue)
             }
             .task {
+                restorePendingAttempt()
                 if !cwd.isEmpty { scheduleValidation(cwd) }
                 await loadModels()
+                if let pendingAttempt {
+                    selectedModel = pendingAttempt.model
+                }
             }
             .interactiveDismissDisabled(creating || pendingAttempt != nil)
         }
@@ -131,6 +137,7 @@ struct NewConversationView: View {
     private var canCreate: Bool {
         if creating { return false }
         if !model.connectivity.isOnline { return false }
+        if pendingAttempt != nil { return true }
         if firstMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
         guard !loadingModels, modelsError == nil,
               modelsAvailable, let selectedModel, modelIDs.contains(selectedModel) else {
@@ -193,6 +200,10 @@ struct NewConversationView: View {
                 text: firstMessage.trimmingCharacters(in: .whitespacesAndNewlines),
                 model: selectedModel,
                 messageId: UUID().uuidString.lowercased())
+            guard DiskStore.save(attempt, name: Self.pendingAttemptStoreName) else {
+                errorText = "Creation attempt could not be saved on this device. Free storage and try again."
+                return
+            }
             pendingAttempt = attempt
         }
         creating = true
@@ -205,13 +216,30 @@ struct NewConversationView: View {
                 model: attempt.model,
                 messageId: attempt.messageId)
             model.listStore.upsert(conversation)
+            clearPendingAttempt()
             dismiss()
         } catch {
             errorText = (error as? APIError)?.errorDescription ?? error.localizedDescription
             if (error as? APIError)?.isTransport != true {
-                pendingAttempt = nil
+                clearPendingAttempt()
             }
         }
+    }
+
+    private func restorePendingAttempt() {
+        guard pendingAttempt == nil,
+              let attempt = DiskStore.load(
+                CreateAttempt.self, name: Self.pendingAttemptStoreName)
+        else { return }
+        pendingAttempt = attempt
+        cwd = attempt.cwd
+        firstMessage = attempt.text
+        selectedModel = attempt.model
+    }
+
+    private func clearPendingAttempt() {
+        pendingAttempt = nil
+        DiskStore.remove(name: Self.pendingAttemptStoreName)
     }
 
     private func loadModels() async {

@@ -12,6 +12,7 @@ enum APIError: Error, LocalizedError {
     /// the server saw the request and rejected it.
     case http(status: Int, body: String)
     case decoding(underlying: Error)
+    case certificatePinMismatch
     case invalidURL
 
     var errorDescription: String? {
@@ -21,6 +22,8 @@ enum APIError: Error, LocalizedError {
             let detail = body.prefix(200)
             return detail.isEmpty ? "Server error (HTTP \(status))" : "HTTP \(status): \(detail)"
         case .decoding(let e): return "Unexpected server response: \(e.localizedDescription)"
+        case .certificatePinMismatch:
+            return "The server certificate changed. Re-trust it in Settings before reconnecting."
         case .invalidURL: return "Invalid server URL"
         }
     }
@@ -54,26 +57,41 @@ final class ServerTrustDelegate: NSObject, URLSessionDelegate {
             completionHandler(.performDefaultHandling, nil)
             return
         }
-        // Properly CA-signed certificates need no pinning.
+        let space = challenge.protectionSpace
+        let fingerprint = Self.leafFingerprint(trust)
+        let existingPin = CertPinStore.evaluateExisting(
+            host: space.host, port: space.port, fingerprint: fingerprint)
+
         if SecTrustEvaluateWithError(trust, nil) {
-            completionHandler(.useCredential, URLCredential(trust: trust))
+            if existingPin == .reject {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            } else {
+                completionHandler(.useCredential, URLCredential(trust: trust))
+            }
             return
         }
-        let space = challenge.protectionSpace
+
         guard allowSelfSigned,
               Self.isValidWhenPresentedChainIsTrusted(trust, host: space.host),
-              let fingerprint = Self.leafFingerprint(trust)
+              let fingerprint
         else {
             completionHandler(.performDefaultHandling, nil)
             return
         }
-        switch CertPinStore.evaluate(host: space.host, port: space.port, fingerprint: fingerprint) {
+        switch existingPin {
+        case .reject:
+            completionHandler(.cancelAuthenticationChallenge, nil)
         case .accept:
             completionHandler(.useCredential, URLCredential(trust: trust))
-        case .reject:
-            // Pin mismatch: fail closed. Settings shows the mismatch and
-            // offers an explicit "forget pin" re-trust path.
-            completionHandler(.cancelAuthenticationChallenge, nil)
+        case .unpinned:
+            switch CertPinStore.evaluate(
+                host: space.host, port: space.port, fingerprint: fingerprint)
+            {
+            case .accept:
+                completionHandler(.useCredential, URLCredential(trust: trust))
+            case .reject:
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            }
         }
     }
 
@@ -164,6 +182,9 @@ struct PhoenixAPI: Sendable {
         do {
             (data, response) = try await session.data(for: req)
         } catch {
+            if hasCertificatePinMismatch {
+                throw APIError.certificatePinMismatch
+            }
             throw APIError.transport(underlying: error)
         }
         guard let http = response as? HTTPURLResponse else {
@@ -179,6 +200,12 @@ struct PhoenixAPI: Sendable {
         } catch {
             throw APIError.decoding(underlying: error)
         }
+    }
+
+    private var hasCertificatePinMismatch: Bool {
+        guard let host = baseURL.host else { return false }
+        return CertPinStore.hasMismatch(
+            host: host, port: baseURL.port ?? (baseURL.scheme == "https" ? 443 : 80))
     }
 
     private func get<T: Decodable>(
@@ -293,6 +320,9 @@ struct PhoenixAPI: Sendable {
         do {
             (bytes, response) = try await streamSession.bytes(for: req)
         } catch {
+            if hasCertificatePinMismatch {
+                throw APIError.certificatePinMismatch
+            }
             throw APIError.transport(underlying: error)
         }
         guard let http = response as? HTTPURLResponse else {

@@ -179,6 +179,11 @@ final class Outbox {
         }
     }
 
+    func clear() {
+        entries = []
+        DiskStore.remove(name: storeName)
+    }
+
     /// AuthoritativeMessageReconcilesQueueEntry: any entry whose localId
     /// appears in server history is done — hide it and stop tracking.
     /// Applies to fresh sends, steering-queued sends, and rehydrated

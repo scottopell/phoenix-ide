@@ -95,6 +95,10 @@ final class AppModel {
             conversationId: conversationId, api: api, connectivity: connectivity,
             onConversationUpdate: { [weak self] conversation in
                 self?.listStore.upsert(conversation)
+            },
+            onHardDeleted: { [weak self] deletedId in
+                self?.sessions[deletedId] = nil
+                self?.listStore.remove(id: deletedId)
             })
         sessions[conversationId] = session
         return session

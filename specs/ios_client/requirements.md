@@ -121,6 +121,10 @@ WHEN a conversation is no longer open
 THE SYSTEM SHALL stop its live stream and reconnect loop
 AND retain delivery ownership for any queued messages
 
+WHEN a conversation hard-delete event arrives
+THE SYSTEM SHALL remove its transcript, snapshot, outbox, and list entry
+AND disable further interaction with the deleted conversation
+
 **Rationale:** Mirrors the web client's connection machine against the
 server contract in `specs/sse_wire/sse_wire.allium`; the init-as-resync
 design means the client never needs gap detection.
@@ -174,6 +178,10 @@ THE SYSTEM SHALL reject the connection
 AND surface the mismatch with an explicit re-trust affordance that forgets
 the pin (the next connection then re-pins)
 
+WHEN a certificate is already pinned for a host and port
+THE SYSTEM SHALL enforce that fingerprint even if a replacement certificate
+passes standard CA trust evaluation
+
 WHEN the user signs out
 THE SYSTEM SHALL forget the pin along with all other per-server state
 
@@ -195,8 +203,13 @@ AND allow choosing a model from the server's available models
 AND require connectivity (creation is not queued offline)
 
 WHEN conversation creation fails without an authoritative server response
-THE SYSTEM SHALL retain the attempt's immutable message id and inputs
+THE SYSTEM SHALL persist the attempt's immutable message id and inputs
 AND prevent dismissing the attempt until an idempotent retry resolves it
+
+WHEN conversation creation is rejected before a request can be sent because
+the pinned certificate changed
+THE SYSTEM SHALL resolve the retained attempt as a definitive failure
+AND allow the user to leave creation and use the certificate re-trust affordance
 
 **Rationale:** Creation requires server-side validation and id minting;
 queuing it offline would fabricate state the server may reject. The

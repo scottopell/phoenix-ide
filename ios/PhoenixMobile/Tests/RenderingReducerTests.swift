@@ -38,4 +38,25 @@ final class RenderingReducerTests: XCTestCase {
         XCTAssertNotNil(PhoenixAPI(baseURL: httpURL, password: nil, allowSelfSigned: true))
         XCTAssertNotNil(PhoenixAPI(baseURL: httpsURL, password: "secret", allowSelfSigned: true))
     }
+
+    func testExistingCertificatePinAppliesIndependentlyOfChainTrust() throws {
+        let suite = "phoenix-cert-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertEqual(
+            CertPinStore.evaluate(
+                host: "phoenix.local", port: 443, fingerprint: "leaf-a", defaults: defaults),
+            .accept)
+        XCTAssertEqual(
+            CertPinStore.evaluateExisting(
+                host: "phoenix.local", port: 443, fingerprint: "leaf-b", defaults: defaults),
+            .reject)
+        XCTAssertNotNil(CertPinStore.lastMismatchAt(in: defaults))
+        XCTAssertEqual(
+            CertPinStore.evaluateExisting(
+                host: "phoenix.local", port: 443, fingerprint: "leaf-a", defaults: defaults),
+            .accept)
+        XCTAssertNil(CertPinStore.lastMismatchAt(in: defaults))
+    }
 }

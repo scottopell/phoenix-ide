@@ -12,8 +12,15 @@ struct ConversationView: View {
         VStack(spacing: 0) {
             OfflineBanner()
             ConnectionStateBar(session: session)
-            messageList
-            ComposerView(session: session, draft: $draft)
+            if session.isHardDeleted {
+                ContentUnavailableView(
+                    "Conversation deleted",
+                    systemImage: "trash",
+                    description: Text("This conversation was deleted on the server."))
+            } else {
+                messageList
+                ComposerView(session: session, draft: $draft)
+            }
         }
         .navigationTitle(session.conversation?.displayTitle ?? "Conversation")
         .navigationBarTitleDisplayMode(.inline)

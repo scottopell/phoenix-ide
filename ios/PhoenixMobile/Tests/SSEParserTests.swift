@@ -209,4 +209,15 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(messageId, "tool-result")
         XCTAssertEqual(durationMs, 1234)
     }
+
+    func testHardDeletionRetainsConversationIdentity() {
+        let json = #"{"sequence_id":11,"conversation_id":"c1"}"#
+        guard case .conversationHardDeleted(let sequence, let conversationId) =
+            PhoenixEvent.decode(frame: SSEFrame(event: "conversation_hard_deleted", data: json))
+        else {
+            return XCTFail("expected a decoded hard-deletion event")
+        }
+        XCTAssertEqual(sequence, 11)
+        XCTAssertEqual(conversationId, "c1")
+    }
 }

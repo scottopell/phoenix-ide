@@ -82,6 +82,7 @@ enum PhoenixEvent: Sendable {
     case steerMessageQueued(seq: Int64, messageId: String)
     case errorEvent(seq: Int64, message: String)
     case conversationBecameTerminal(seq: Int64)
+    case conversationHardDeleted(seq: Int64, conversationId: String)
     case other(type: String, seq: Int64?)
 
     struct InitSnapshot: Sendable {
@@ -209,6 +210,10 @@ enum PhoenixEvent: Sendable {
 
         case "conversation_became_terminal":
             return .conversationBecameTerminal(seq: seq)
+
+        case "conversation_hard_deleted":
+            guard let conversationId = json["conversation_id"]?.stringValue else { return nil }
+            return .conversationHardDeleted(seq: seq, conversationId: conversationId)
 
         default:
             return .other(type: type, seq: seq)

@@ -30,6 +30,7 @@ final class ConversationSession {
     /// finalized message arrives or the turn ends.
     private(set) var streamingText = ""
     private(set) var lastErrorToast: String?
+    private(set) var isHardDeleted = false
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
     /// renderer. Rebuilt on message changes, not per render.
@@ -48,6 +49,7 @@ final class ConversationSession {
     private var inFlight: Set<String> = []
     private var retryDelay: TimeInterval = 1
     private let onConversationUpdate: ((Conversation) -> Void)?
+    private let onHardDeleted: (String) -> Void
     private var viewIsActive = false
 
     private var snapshotName: String { "conv-\(conversationId)" }
@@ -69,12 +71,14 @@ final class ConversationSession {
         conversationId: String,
         api: PhoenixAPI,
         connectivity: ConnectivityMonitor,
-        onConversationUpdate: ((Conversation) -> Void)? = nil
+        onConversationUpdate: ((Conversation) -> Void)? = nil,
+        onHardDeleted: @escaping (String) -> Void = { _ in }
     ) {
         self.conversationId = conversationId
         self.api = api
         self.connectivity = connectivity
         self.onConversationUpdate = onConversationUpdate
+        self.onHardDeleted = onHardDeleted
         self.outbox = Outbox(conversationId: conversationId)
 
         // Cached snapshot renders immediately; the stream refreshes it.
@@ -93,6 +97,7 @@ final class ConversationSession {
     }
 
     func start() {
+        guard !isHardDeleted else { return }
         viewIsActive = true
         if connectivityToken == nil {
             connectivityToken = connectivity.addRestoreObserver { [weak self] in
@@ -163,7 +168,8 @@ final class ConversationSession {
 
     @discardableResult
     private func persistSnapshot() -> Bool {
-        DiskStore.save(
+        guard !isHardDeleted else { return false }
+        return DiskStore.save(
             Snapshot(
                 conversation: conversation, messages: messages,
                 lastSequenceId: lastSequenceId,
@@ -179,6 +185,7 @@ final class ConversationSession {
     /// failed.
     @discardableResult
     func send(text: String) -> Bool {
+        guard !isHardDeleted else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         guard outbox.enqueue(text: trimmed) != nil else {
@@ -203,6 +210,7 @@ final class ConversationSession {
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
     func drainOutbox() {
+        guard !isHardDeleted else { return }
         guard drainTask == nil else { return }
         drainTask = Task {
             defer { drainTask = nil }
@@ -342,6 +350,7 @@ final class ConversationSession {
     // MARK: - Reducer
 
     private func apply(_ event: PhoenixEvent) {
+        guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
             let previousSequenceFloor = lastSequenceId
@@ -531,9 +540,40 @@ final class ConversationSession {
         case .conversationBecameTerminal(let seq):
             _ = applyIfNewer(seq)
 
+        case .conversationHardDeleted(let seq, let deletedConversationId):
+            guard deletedConversationId == conversationId, applyIfNewer(seq) else { return }
+            handleHardDeletion()
+
         case .other(_, let seq):
             if let seq { _ = applyIfNewer(seq) }
         }
+    }
+
+    private func handleHardDeletion() {
+        streamTask?.cancel()
+        streamTask = nil
+        drainTask?.cancel()
+        drainTask = nil
+        staleCheckTask?.cancel()
+        staleCheckTask = nil
+        if let token = connectivityToken {
+            connectivity.removeRestoreObserver(token)
+            connectivityToken = nil
+        }
+        inFlight.removeAll()
+        isHardDeleted = true
+        conversation = nil
+        messages = []
+        convState = nil
+        presentationMode = "done"
+        agentWorking = false
+        streamingText = ""
+        streamingRequestId = nil
+        toolUseIndex = [:]
+        connection = .idle
+        DiskStore.remove(name: snapshotName)
+        outbox.clear()
+        onHardDeleted(conversationId)
     }
 
     private func applyIfNewer(_ seq: Int64) -> Bool {
