@@ -5,9 +5,9 @@ import Observation
 /// authoritative server history. Implements the client-side delivery
 /// contract in specs/user_message_queue/user_message_queue.allium:
 /// `localId` doubles as the POST `message_id`, so retries are idempotent
-/// and reconciliation is an identity join against server history.
-struct OutboxEntry: Codable, Identifiable, Equatable {
-    enum Status: String, Codable {
+/// and reconciliation joins that submitted identity to server history.
+struct OutboxEntry: Codable, Identifiable, Equatable, Sendable {
+    enum Status: String, Codable, Sendable {
         /// Authored; awaiting send or awaiting reflection in server history.
         case pending
         /// The server definitively rejected the send; manual retry required.
@@ -46,6 +46,11 @@ struct OutboxEntry: Codable, Identifiable, Equatable {
     var isVisible: Bool {
         status != .reconciled && status != .dismissed
     }
+
+    func isReflected(in authoritativeMessageIds: Set<String>) -> Bool {
+        authoritativeMessageIds.contains(localId)
+            || authoritativeMessageIds.contains("\(conversationId):\(localId)")
+    }
 }
 
 /// Per-conversation persistent outbox. Entries survive app restarts and
@@ -54,6 +59,12 @@ struct OutboxEntry: Codable, Identifiable, Equatable {
 @MainActor
 @Observable
 final class Outbox {
+    enum StoredContents: Equatable {
+        case empty
+        case hasVisibleEntries
+        case inaccessible
+    }
+
     let conversationId: String
     private(set) var entries: [OutboxEntry] = []
     private var suppressedMessageIds: Set<String> = []
@@ -61,52 +72,129 @@ final class Outbox {
     /// Queued entries then exist in memory only — the UI warns that they
     /// won't survive an app restart. Cleared by the next successful write.
     private(set) var persistenceHealthy = true
+    private var storageWritable = true
+    private let writer: VersionedDiskWriter
+    private var latestPersistenceRevision = 0
+
+    /// v1 stores visible OutboxEntry values in a versioned envelope.
+    static let schemaVersion = 1
 
     private var storeName: String { "outbox-\(conversationId)" }
 
     init(conversationId: String) {
         self.conversationId = conversationId
+        self.writer = DiskStore.versionedWriter(
+            name: "outbox-\(conversationId)", version: Self.schemaVersion)
         // Rehydrate only entries tagged with this conversation — a foreign
         // entry can never reconcile here and must not render (spec rule
         // RehydrateQueueForConversationOnly).
-        let loaded = DiskStore.load([OutboxEntry].self, name: storeName) ?? []
-        entries = loaded.filter { $0.conversationId == conversationId && $0.isVisible }
+        switch DiskStore.loadVersionedResult(
+            [OutboxEntry].self, name: storeName, version: Self.schemaVersion)
+        {
+        case .missing:
+            entries = []
+        case .value(let loaded):
+            entries = loaded.filter { $0.conversationId == conversationId && $0.isVisible }
+        case .incompatible, .unreadable:
+            entries = []
+            persistenceHealthy = false
+            storageWritable = false
+        }
     }
 
     var visibleEntries: [OutboxEntry] {
-        entries.filter { $0.isVisible && !suppressedMessageIds.contains($0.localId) }
+        entries.filter { $0.isVisible && !$0.isReflected(in: suppressedMessageIds) }
     }
 
     var hasSendableEntries: Bool {
         entries.contains { $0.status == .pending && !$0.acceptedByServer }
     }
 
-    static func hasVisibleEntries(conversationId: String) -> Bool {
+    static func storedContents(conversationId: String) -> StoredContents {
         let name = "outbox-\(conversationId)"
-        return (DiskStore.load([OutboxEntry].self, name: name) ?? [])
-            .contains { $0.conversationId == conversationId && $0.isVisible }
+        switch DiskStore.loadVersionedResult(
+            [OutboxEntry].self, name: name, version: Self.schemaVersion)
+        {
+        case .missing:
+            return .empty
+        case .value(let entries):
+            return entries.contains {
+                $0.conversationId == conversationId && $0.isVisible
+            } ? .hasVisibleEntries : .empty
+        case .incompatible, .unreadable:
+            return .inaccessible
+        }
     }
 
     @discardableResult
-    private func persist() -> Bool {
-        // Terminal entries are pruned at persistence time; they carry no
-        // future obligation.
-        persistenceHealthy = DiskStore.save(entries.filter(\.isVisible), name: storeName)
-        return persistenceHealthy
+    private func persist() async -> Bool {
+        guard storageWritable else {
+            persistenceHealthy = false
+            return false
+        }
+        let revision = writer.reserveRevision()
+        latestPersistenceRevision = revision
+        let snapshot = entries.filter(\.isVisible)
+        let saved = await writer.save(snapshot, revision: revision)
+        if latestPersistenceRevision == revision {
+            persistenceHealthy = saved
+        }
+        return saved
+    }
+
+    private func persistEventually() {
+        guard storageWritable else {
+            persistenceHealthy = false
+            return
+        }
+        let revision = writer.reserveRevision()
+        latestPersistenceRevision = revision
+        let snapshot = entries.filter(\.isVisible)
+        Task {
+            let saved = await writer.save(snapshot, revision: revision)
+            guard latestPersistenceRevision == revision else { return }
+            persistenceHealthy = saved
+        }
     }
 
     /// Re-establish the enqueue-before-POST durability point immediately
-    /// before delivery. A prior write may have failed while storage was full;
-    /// no request leaves the device until the complete visible queue is on
-    /// disk again.
-    func prepareForDelivery() -> Bool {
-        persist()
+    /// before delivery. A transiently failed enqueue write can recover here;
+    /// a continuing failure keeps every entry unsendable.
+    func prepareForDelivery() async -> Bool {
+        await persist()
+    }
+
+    func flushPersistence() async -> Bool {
+        await persist()
+    }
+
+    private func invalidateForRemoval() -> Int {
+        entries.removeAll()
+        suppressedMessageIds.removeAll()
+        persistenceHealthy = true
+        storageWritable = false
+        let revision = writer.reserveRevision()
+        latestPersistenceRevision = revision
+        return revision
+    }
+
+    /// A hard-deleted conversation owns no remaining local delivery state.
+    func clear() {
+        let revision = invalidateForRemoval()
+        Task { await writer.remove(revision: revision) }
+    }
+
+    /// Invalidate every queued write and wait until the revision fence has
+    /// removed this store. Later-arriving older writes are rejected.
+    func clearAndWait() async {
+        let revision = invalidateForRemoval()
+        await writer.remove(revision: revision)
     }
 
     private func update(_ localId: String, _ mutate: (inout OutboxEntry) -> Void) {
         guard let idx = entries.firstIndex(where: { $0.localId == localId }) else { return }
         mutate(&entries[idx])
-        persist()
+        persistEventually()
     }
 
     // MARK: - Contract transitions
@@ -114,7 +202,7 @@ final class Outbox {
     /// EnqueueLocalMessage: the entry exists (and persists) before any POST
     /// is attempted, so navigation or connection loss cannot erase the
     /// user's words.
-    func enqueue(text: String, images: [ImagePayload] = []) -> OutboxEntry? {
+    func enqueue(text: String, images: [ImagePayload] = []) async -> OutboxEntry? {
         let entry = OutboxEntry(
             localId: UUID().uuidString.lowercased(),
             conversationId: conversationId,
@@ -127,10 +215,7 @@ final class Outbox {
             lastError: nil,
             attemptCount: 0)
         entries.append(entry)
-        guard persist() else {
-            entries.removeAll { $0.localId == entry.localId }
-            return nil
-        }
+        _ = await persist()
         return entry
     }
 
@@ -185,16 +270,10 @@ final class Outbox {
     }
 
     /// DismissLocalMessage.
-    func dismiss(_ localId: String) {
-        update(localId) { entry in
-            entry.status = .dismissed
-        }
-    }
-
-    func clear() {
-        entries = []
-        suppressedMessageIds = []
-        DiskStore.remove(name: storeName)
+    func dismiss(_ localId: String) async {
+        guard let idx = entries.firstIndex(where: { $0.localId == localId }) else { return }
+        entries[idx].status = .dismissed
+        _ = await persist()
     }
 
     /// Hide a local bubble as soon as authoritative history reflects it.
@@ -203,21 +282,20 @@ final class Outbox {
     func suppress(authoritativeMessageIds: Set<String>) {
         suppressedMessageIds.formUnion(authoritativeMessageIds)
     }
-
-    /// AuthoritativeMessageReconcilesQueueEntry: any entry whose localId
-    /// appears in server history is done — hide it and stop tracking.
+    /// AuthoritativeMessageReconcilesQueueEntry: an entry reflected by the
+    /// server's exact or conversation-scoped canonical identity is done.
     /// Applies to fresh sends, steering-queued sends, and rehydrated
     /// entries after an app restart alike.
     func reconcile(authoritativeMessageIds: Set<String>) {
         var changed = false
         for idx in entries.indices {
             let entry = entries[idx]
-            if entry.isVisible && authoritativeMessageIds.contains(entry.localId) {
+            if entry.isVisible && entry.isReflected(in: authoritativeMessageIds) {
                 entries[idx].status = .reconciled
                 changed = true
             }
         }
-        if changed { persist() }
+        if changed { persistEventually() }
     }
 
     /// AcceptedButCausallyProvenMissingBecomesRecoverable, approximated by
@@ -238,6 +316,6 @@ final class Outbox {
                 changed = true
             }
         }
-        if changed { persist() }
+        if changed { persistEventually() }
     }
 }

@@ -54,15 +54,29 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(parse(raw), .awaitingSubAgents(pendingCount: 3, completedCount: 1))
     }
 
-    func testAwaitingUserResponseCarriesQuestions() {
+    func testAwaitingUserResponseCarriesTypedQuestions() {
         let raw = """
         {"type":"awaiting_user_response",
-         "questions":[{"question":"Which db?","header":"DB","options":[],"multiSelect":false},
-                      {"question":"Which port?","header":"Port","options":[],"multiSelect":false}]}
+         "questions":[{"question":"Which db?","header":"DB",
+                       "options":[{"label":"sqlite","description":"file-backed"},
+                                  {"label":"postgres","description":""}],
+                       "multiSelect":false},
+                      {"question":"Which features?","header":"Feat","options":[],"multiSelect":true}]}
         """
         XCTAssertEqual(
             parse(raw),
-            .awaitingUserResponse(questionCount: 2, firstQuestion: "Which db?"))
+            .awaitingUserResponse(questions: [
+                UserQuestion(
+                    question: "Which db?", header: "DB",
+                    options: [
+                        .init(label: "sqlite", description: "file-backed"),
+                        .init(label: "postgres", description: ""),
+                    ],
+                    multiSelect: false),
+                UserQuestion(
+                    question: "Which features?", header: "Feat",
+                    options: [], multiSelect: true),
+            ]))
     }
 
     func testAwaitingTaskApprovalCarriesTitlePriorityPlan() {
@@ -94,6 +108,12 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(
             parse("{\"type\":\"error\",\"message\":\"rate limited\",\"error_kind\":\"llm_rate_limit\"}"),
             .error(message: "rate limited"))
+    }
+
+    func testCreationFailedCarriesServerError() {
+        XCTAssertEqual(
+            parse("{\"type\":\"creation_failed\",\"error\":\"worktree setup failed\"}"),
+            .creationFailed(message: "worktree setup failed"))
     }
 
     func testCancellingVariantsRemainStructurallyDistinct() {
@@ -206,7 +226,6 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(
             parse("{\"type\":\"error\"}"), .error(message: "Unknown error"))
     }
-
     func testDeliveryPolicyCoversChatArchiveAndSessionActions() {
         XCTAssertEqual(ClientOperation.chat.policy, .outboxed)
         XCTAssertEqual(ClientOperation.archive.policy, .onlineOnly)
@@ -242,5 +261,37 @@ final class ConversationStateTests: XCTestCase {
             presentationMode: "needs_action",
             typedState: .awaitingCommissionReviewApproval,
             cancelledCommissionApproval: true))
+    }
+
+    func testQuestionActionUnlocksWhenPromptIdentityChanges() {
+        let original = ConversationState.awaitingUserResponse(questions: [
+            UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
+        ])
+        let followUp = ConversationState.awaitingUserResponse(questions: [
+            UserQuestion(question: "Next?", header: "Two", options: [], multiSelect: false),
+        ])
+        let action = ConversationAction.respondToQuestions(answers: ["First?": "yes"])
+
+        XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
+            action: action, origin: original, current: original))
+        XCTAssertFalse(ConversationSession.actionStillAwaitsOriginalState(
+            action: action, origin: original, current: followUp))
+    }
+
+    func testChatEligibilityMatchesInteractiveStateFamilies() {
+        XCTAssertTrue(ConversationState.idle.acceptsChatMessage)
+        XCTAssertTrue(ConversationState.error(message: "retryable").acceptsChatMessage)
+        XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.awaitingUserResponse(questions: []).acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.awaitingTaskApproval(title: "", priority: "", plan: "")
+                .acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.contextExhausted(summary: nil).acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.handedOff(successorConversationId: nil).acceptsChatMessage)
+        XCTAssertFalse(ConversationState.terminal.acceptsChatMessage)
+        XCTAssertFalse(ConversationState.other(type: "provisioning").acceptsChatMessage)
     }
 }

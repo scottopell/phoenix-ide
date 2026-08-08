@@ -53,7 +53,6 @@ final class ConversationSession {
     private var drainTask: Task<Void, Never>?
     private var staleCheckTask: Task<Void, Never>?
     private var cancelNeedsAgentDoneFallback = false
-    private var actionOriginState: ConversationState?
     /// localIds with a POST in flight — prevents duplicate concurrent sends
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
@@ -63,13 +62,33 @@ final class ConversationSession {
     private var viewIsActive = false
     private var replayFromPendingAnchor = false
     private var streamBlockedUntilConfigurationChange = false
+    private let snapshotWriter: VersionedDiskWriter
+    private var latestSnapshotRevision = 0
+    private var pendingAuthoritativeSyncedAt: Date?
+    private var snapshotPersistenceEnabled = true
+    private var snapshotNeedsOutboxReconciliation = false
+    private var snapshotNeedsOutboxDrain = false
     /// Init's persisted-message anchor. Live messages above it may be eager
     /// assistant output, so snapshot persistence excludes them until resync.
     private var durableMessageSequenceCeiling: Int64 = 0
 
+    private struct PendingMessagePatch {
+        var content: JSONValue?
+        var displayData: JSONValue?
+        var durationMs: Double?
+    }
+
+    /// `message_updated` can precede its eager `message` during replay.
+    /// Retain the newest fields until the identity-bearing message arrives.
+    private var pendingMessagePatches: [String: PendingMessagePatch] = [:]
+
     private var snapshotName: String { "conv-\(conversationId)" }
 
-    private struct Snapshot: Codable {
+    /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
+    /// versioning rule). Additive-optional fields (syncedAt) need no bump.
+    private static let snapshotSchemaVersion = 1
+
+    private struct Snapshot: Codable, Sendable {
         var conversation: Conversation?
         var messages: [Message]
         var lastSequenceId: Int64
@@ -78,6 +97,15 @@ final class ConversationSession {
         var transcriptGeneration: Int64?
         /// Missing in snapshots written before cache freshness was tracked.
         var syncedAt: Date?
+    }
+
+    static func hasCachedSnapshot(conversationId: String) -> Bool {
+        guard let snapshot = DiskStore.loadVersioned(
+            Snapshot.self,
+            name: "conv-\(conversationId)",
+            version: snapshotSchemaVersion)
+        else { return false }
+        return snapshot.conversation != nil && snapshot.syncedAt != nil
     }
 
     private var transcriptGeneration: Int64?
@@ -96,9 +124,13 @@ final class ConversationSession {
         self.onConversationUpdate = onConversationUpdate
         self.onHardDeleted = onHardDeleted
         self.outbox = Outbox(conversationId: conversationId)
+        self.snapshotWriter = DiskStore.versionedWriter(
+            name: "conv-\(conversationId)", version: Self.snapshotSchemaVersion)
 
         // Cached snapshot renders immediately; the stream refreshes it.
-        if let snap = DiskStore.load(Snapshot.self, name: snapshotName) {
+        if let snap = DiskStore.loadVersioned(
+            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion)
+        {
             conversation = snap.conversation
             messages = snap.messages
             durableMessageSequenceCeiling = snap.messages.map(\.sequence_id).max() ?? 0
@@ -184,7 +216,9 @@ final class ConversationSession {
     }
 
     private func resumeLiveTasks() {
-        guard viewIsActive, !streamBlockedUntilConfigurationChange else { return }
+        guard viewIsActive, !isHardDeleted,
+              !streamBlockedUntilConfigurationChange
+        else { return }
         if streamTask == nil {
             streamTask = Task { await streamLoop() }
         }
@@ -196,11 +230,13 @@ final class ConversationSession {
     /// Called on scenePhase -> .active: the stream task was likely torn down
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {
+        guard !isHardDeleted else { return }
         resumeLiveTasks()
         drainOutbox()
     }
 
     private func connectivityRestored() {
+        guard !isHardDeleted else { return }
         if viewIsActive, !streamBlockedUntilConfigurationChange {
             // Wake the stream loop out of its backoff sleep by restarting it.
             streamTask?.cancel()
@@ -217,37 +253,99 @@ final class ConversationSession {
         connection = .offline
     }
 
+    private func snapshotForPersistence(authoritative: Bool) -> Snapshot {
+        let syncedAt: Date?
+        if authoritative {
+            let now = Date()
+            pendingAuthoritativeSyncedAt = now
+            syncedAt = now
+        } else {
+            syncedAt = pendingAuthoritativeSyncedAt ?? snapshotSyncedAt
+        }
+        return Snapshot(
+            conversation: conversation,
+            messages: Self.durableMessages(
+                messages, through: durableMessageSequenceCeiling),
+            lastSequenceId: lastSequenceId,
+            transcriptGeneration: transcriptGeneration,
+            syncedAt: syncedAt)
+    }
+
+    private func persistSnapshot(
+        authoritative: Bool = false,
+        reconcileOutboxOnSuccess: Bool = false,
+        drainOutboxAfter: Bool = false
+    ) {
+        guard !isHardDeleted, snapshotPersistenceEnabled else { return }
+        snapshotNeedsOutboxReconciliation =
+            snapshotNeedsOutboxReconciliation || reconcileOutboxOnSuccess
+        snapshotNeedsOutboxDrain = snapshotNeedsOutboxDrain || drainOutboxAfter
+        let snapshot = snapshotForPersistence(authoritative: authoritative)
+        let revision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = revision
+        Task { [weak self, snapshotWriter] in
+            let didSave = await snapshotWriter.save(snapshot, revision: revision)
+            self?.completeSnapshotPersistence(
+                snapshot, revision: revision, didSave: didSave)
+        }
+    }
+
     @discardableResult
-    private func persistSnapshot(authoritative: Bool = false) -> Bool {
-        guard !isHardDeleted else { return false }
-        let syncedAt = authoritative ? Date() : snapshotSyncedAt
-        let didSave = DiskStore.save(
-            Snapshot(
-                conversation: conversation,
-                messages: Self.durableMessages(
-                    messages, through: durableMessageSequenceCeiling),
-                lastSequenceId: lastSequenceId,
-                transcriptGeneration: transcriptGeneration,
-                syncedAt: syncedAt),
-            name: snapshotName)
-        if didSave, authoritative {
-            snapshotSyncedAt = syncedAt
+    private func completeSnapshotPersistence(
+        _ snapshot: Snapshot, revision: Int, didSave: Bool
+    ) -> Bool {
+        guard latestSnapshotRevision == revision, snapshotPersistenceEnabled,
+              !isHardDeleted
+        else { return false }
+        if didSave {
+            snapshotSyncedAt = snapshot.syncedAt
+            pendingAuthoritativeSyncedAt = nil
+            if snapshotNeedsOutboxReconciliation {
+                snapshotNeedsOutboxReconciliation = false
+                reconcileOutbox()
+            }
+        }
+        if snapshotNeedsOutboxDrain {
+            snapshotNeedsOutboxDrain = false
+            drainOutbox()
         }
         return didSave
+    }
+
+    @discardableResult
+    func flushSnapshotPersistence() async -> Bool {
+        guard !isHardDeleted, snapshotPersistenceEnabled else { return false }
+        let snapshot = snapshotForPersistence(authoritative: false)
+        let revision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = revision
+        let didSave = await snapshotWriter.save(snapshot, revision: revision)
+        return completeSnapshotPersistence(snapshot, revision: revision, didSave: didSave)
+    }
+
+    func clearCachedSnapshotAndWait() async {
+        snapshotPersistenceEnabled = false
+        snapshotNeedsOutboxReconciliation = false
+        snapshotNeedsOutboxDrain = false
+        let revision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = revision
+        await snapshotWriter.remove(revision: revision)
     }
 
     // MARK: - Sending
 
     /// Optimistic enqueue-then-send. The entry is persisted before the POST
     /// leaves the device; if the network is down the send is deferred, not
-    /// failed.
+    /// failed. Images ride the same outbox path as text — same durability,
+    /// same idempotent delivery.
     @discardableResult
-    func send(text: String) -> Bool {
+    func send(text: String, images: [ImagePayload] = []) async -> Bool {
         guard !isHardDeleted else { return false }
         guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, acceptsChatMessage else { return false }
-        guard outbox.enqueue(text: trimmed) != nil else {
+        guard (!trimmed.isEmpty || !images.isEmpty), acceptsChatMessage else {
+            return false
+        }
+        guard await outbox.enqueue(text: trimmed, images: images) != nil else {
             lastErrorToast = "Message could not be saved on this device. Free storage and try again."
             return false
         }
@@ -260,8 +358,8 @@ final class ConversationSession {
         drainOutbox()
     }
 
-    func dismissEntry(_ localId: String) {
-        outbox.dismiss(localId)
+    func dismissEntry(_ localId: String) async {
+        await outbox.dismiss(localId)
     }
 
     func beginArchiving() -> Bool {
@@ -279,15 +377,16 @@ final class ConversationSession {
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
     func drainOutbox() {
-        guard !isHardDeleted else { return }
-        guard drainTask == nil else { return }
+        guard drainTask == nil, !isHardDeleted else { return }
         drainTask = Task {
             defer { drainTask = nil }
             // Loop until no sendable entries remain, so a message enqueued
             // while a drain is already running is picked up by this pass
             // instead of waiting for the next trigger.
             while !Task.isCancelled {
-                guard outbox.prepareForDelivery() else { return }
+                // Never POST an entry whose durable copy is missing. This
+                // retries the persistence point on every delivery trigger.
+                guard await outbox.prepareForDelivery() else { return }
                 let sendable = outbox.entries.filter {
                     $0.status == .pending && !$0.acceptedByServer
                         && !inFlight.contains($0.localId)
@@ -329,13 +428,19 @@ final class ConversationSession {
     /// The action currently being executed, or nil. Views use this to
     /// disable controls and show progress — approval buttons especially
     /// must not double-fire.
-    private(set) var actionInFlight: ConversationAction?
+    private struct ActionAttempt {
+        let action: ConversationAction
+        let originState: ConversationState?
+        let token: UUID
+    }
+    private var actionAttempt: ActionAttempt?
+    var actionInFlight: ConversationAction? { actionAttempt?.action }
 
     /// Execute a session-scoped action per its declared delivery policy
     /// (ConversationAction). Online-only actions fail fast with a toast
     /// when offline — deliberately not queued, see the policy doc.
     func perform(_ action: ConversationAction) {
-        guard acceptsConversationActions, actionInFlight == nil else { return }
+        guard acceptsConversationActions, actionAttempt == nil else { return }
         switch ClientOperation.conversationAction(action).policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
@@ -349,8 +454,11 @@ final class ConversationSession {
            case .awaitingCommissionReviewApproval = typedState {
             cancelNeedsAgentDoneFallback = true
         }
-        actionInFlight = action
-        actionOriginState = typedState
+        let token = UUID()
+        actionAttempt = ActionAttempt(
+            action: action,
+            originState: typedState,
+            token: token)
         Task {
             do {
                 switch action {
@@ -366,13 +474,18 @@ final class ConversationSession {
                 case .provideTaskFeedback(let feedback):
                     try await api.sendTaskFeedback(
                         conversationId: conversationId, annotations: feedback.text)
+                case .respondToQuestions(let answers):
+                    try await api.respondToQuestion(
+                        conversationId: conversationId, answers: answers)
+                case .dismissQuestion:
+                    try await api.dismissQuestion(conversationId: conversationId)
                 }
             } catch {
+                guard actionAttempt?.token == token else { return }
                 if case .cancel = action {
                     cancelNeedsAgentDoneFallback = false
                 }
-                actionInFlight = nil
-                actionOriginState = nil
+                actionAttempt = nil
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
             }
@@ -432,19 +545,19 @@ final class ConversationSession {
                 connection = .live
                 for try await event in Self.decodedEvents(from: bytes) {
                     if Task.isCancelled { return }
-                    apply(event)
+                    receive(event)
                 }
                 // Server closed the stream (e.g. broadcast lag): reconnect
                 // promptly — the next init resyncs any missed state.
             } catch let error as APIError {
                 if Task.isCancelled { return }
+                if error.isNotFound {
+                    handleHardDeletion()
+                    return
+                }
                 if case .certificatePinMismatch = error {
                     lastErrorToast = error.errorDescription
                     connection = .idle
-                    return
-                }
-                if error.isNotFound {
-                    handleHardDeletion()
                     return
                 }
                 if error.isPermanentStreamAuthenticationFailure {
@@ -476,7 +589,7 @@ final class ConversationSession {
 
     // MARK: - Reducer
 
-    private func apply(_ event: PhoenixEvent) {
+    func receive(_ event: PhoenixEvent) {
         guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
@@ -514,6 +627,7 @@ final class ConversationSession {
                 streamingText = ""
                 streamingRequestId = nil
             }
+            pendingMessagePatches.removeAll()
             // Replay the ring through the same reducer so an in-flight turn
             // (streaming text, tool phase) survives the reconnect. The
             // replay floor is the ring anchor — ring entries sit in
@@ -542,10 +656,10 @@ final class ConversationSession {
             // snapshot that justifies it is still memory-only — a crash
             // between the two writes would lose the user's text from both.
             outbox.suppress(authoritativeMessageIds: Set(snap.messages.map(\.message_id)))
-            if persistSnapshot(authoritative: true) {
-                reconcileOutbox()
-            }
-            drainOutbox()
+            persistSnapshot(
+                authoritative: true,
+                reconcileOutboxOnSuccess: true,
+                drainOutboxAfter: true)
 
         default:
             applyLive(event)
@@ -557,7 +671,7 @@ final class ConversationSession {
     private func applyLive(_ event: PhoenixEvent) {
         switch event {
         case .initSnapshot:
-            return  // handled by apply()
+            return  // handled by receive()
 
         case .message(let seq, let message):
             guard applyIfNewer(seq) else { return }
@@ -580,9 +694,7 @@ final class ConversationSession {
                 rebuildToolUseIndex()
             }
             // Snapshot before outbox prune — see the init branch.
-            if persistSnapshot(authoritative: true) {
-                reconcileOutbox()
-            }
+            persistSnapshot(authoritative: true, reconcileOutboxOnSuccess: true)
 
         case .messageUpdated(
             let seq, let messageId, let content, let displayData, let durationMs,
@@ -590,8 +702,22 @@ final class ConversationSession {
             // Stale guard applies here too: a replayed update from before
             // the floor must not clobber content a newer update already set.
             guard applyIfNewer(seq) else { return }
+            if let updatedGeneration {
+                transcriptGeneration = updatedGeneration
+                conversation?.transcript_generation = updatedGeneration
+            }
             guard let idx = messages.firstIndex(where: { $0.message_id == messageId }) else {
-                return  // update for an unknown target is a silent no-op
+                var patch = pendingMessagePatches[messageId]
+                    ?? PendingMessagePatch(content: nil, displayData: nil, durationMs: nil)
+                if let content, content != .null { patch.content = content }
+                if let displayData, displayData != .null {
+                    patch.displayData = Self.mergeDisplayData(
+                        existing: patch.displayData,
+                        patch: displayData)
+                }
+                if let durationMs { patch.durationMs = durationMs }
+                pendingMessagePatches[messageId] = patch
+                return
             }
             if let content, content != .null { messages[idx].content = content }
             if let displayData, displayData != .null {
@@ -623,7 +749,6 @@ final class ConversationSession {
                     conversation.requires_action = mode == "needs_action"
                 }
                 self.conversation = conversation
-                snapshotSyncedAt = Date()
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conversation)
             }
@@ -674,9 +799,8 @@ final class ConversationSession {
                 typedState: typedState,
                 cancelledCommissionApproval: cancelNeedsAgentDoneFallback)
             cancelNeedsAgentDoneFallback = false
-            if case .cancel = actionInFlight {
-                actionInFlight = nil
-                actionOriginState = nil
+            if case .cancel = actionAttempt?.action {
+                actionAttempt = nil
             }
             if shouldMoveToIdle {
                 conversation?.state = .string("idle")
@@ -691,10 +815,10 @@ final class ConversationSession {
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
             // Snapshot first — same ordering rule as the message branch.
-            if persistSnapshot(authoritative: true) {
-                reconcileOutbox()
-            }
-            drainOutbox()
+            persistSnapshot(
+                authoritative: true,
+                reconcileOutboxOnSuccess: true,
+                drainOutboxAfter: true)
 
         case .conversationUpdate(let seq, let update):
             guard applyIfNewer(seq) else { return }
@@ -706,6 +830,7 @@ final class ConversationSession {
                 if let v = update["cwd"]?.stringValue { conv.cwd = v }
                 if let v = update["branch_name"]?.stringValue { conv.branch_name = v }
                 if let v = update["task_title"]?.stringValue { conv.task_title = v }
+                if let v = update["title"]?.stringValue { conv.title = v }
                 if let v = update["conv_mode_label"]?.stringValue { conv.conv_mode_label = v }
                 if let v = update["slug"]?.stringValue { conv.slug = v }
                 if let v = update["title"]?.stringValue { conv.title = v }
@@ -716,15 +841,14 @@ final class ConversationSession {
             }
 
         case .steerMessageQueued(let seq, let messageId):
-            _ = applyIfNewer(seq)
+            guard applyIfNewer(seq) else { return }
             outbox.markAccepted(messageId, steering: true)
 
         case .errorEvent(let seq, let message, let retryable):
             guard applyIfNewer(seq) else { return }
             lastErrorToast = message
-            if retryable, actionInFlight?.waitsForAuthoritativeStateChange == true {
-                actionInFlight = nil
-                actionOriginState = nil
+            if retryable, actionAttempt?.action.waitsForAuthoritativeStateChange == true {
+                actionAttempt = nil
             }
 
         case .conversationBecameTerminal(let seq):
@@ -740,6 +864,7 @@ final class ConversationSession {
     }
 
     private func handleHardDeletion() {
+        guard !isHardDeleted else { return }
         streamTask?.cancel()
         streamTask = nil
         drainTask?.cancel()
@@ -759,9 +884,19 @@ final class ConversationSession {
         agentWorking = false
         streamingText = ""
         streamingRequestId = nil
+        pendingMessagePatches.removeAll()
         toolUseIndex = [:]
+        actionAttempt = nil
         connection = .idle
+        snapshotPersistenceEnabled = false
+        snapshotNeedsOutboxReconciliation = false
+        snapshotNeedsOutboxDrain = false
+        let snapshotRemovalRevision = snapshotWriter.reserveRevision()
+        latestSnapshotRevision = snapshotRemovalRevision
         DiskStore.remove(name: snapshotName)
+        Task { [snapshotWriter] in
+            await snapshotWriter.remove(revision: snapshotRemovalRevision)
+        }
         outbox.clear()
         onHardDeleted(conversationId)
     }
@@ -801,16 +936,17 @@ final class ConversationSession {
     }
 
     private func clearResolvedActionIfStateAdvanced(currentState: ConversationState) {
-        guard let action = actionInFlight,
-              action.waitsForAuthoritativeStateChange
+        guard let attempt = actionAttempt,
+              attempt.action.waitsForAuthoritativeStateChange
         else {
             return
         }
-        guard !Self.actionStillAwaitsOriginalState(
-            action: action, origin: actionOriginState, current: currentState)
-        else { return }
-        actionInFlight = nil
-        actionOriginState = nil
+        guard Self.actionStillAwaitsOriginalState(
+            action: attempt.action, origin: attempt.originState, current: currentState)
+        else {
+            actionAttempt = nil
+            return
+        }
     }
 
     nonisolated static func actionStillAwaitsOriginalState(
@@ -821,12 +957,26 @@ final class ConversationSession {
         switch action {
         case .cancel:
             return current.isCancellable
-        case .dismissError, .approveTask, .rejectTask, .provideTaskFeedback:
+        case .dismissError, .approveTask, .rejectTask, .provideTaskFeedback,
+             .respondToQuestions, .dismissQuestion:
             return current == origin
         }
     }
 
     private func upsert(_ message: Message) {
+        var message = message
+        if let patch = pendingMessagePatches.removeValue(forKey: message.message_id) {
+            if let content = patch.content { message.content = content }
+            if let displayData = patch.displayData {
+                message.display_data = Self.mergeDisplayData(
+                    existing: message.display_data, patch: displayData)
+            }
+            if let durationMs = patch.durationMs {
+                message.display_data = Self.mergeDisplayData(
+                    existing: message.display_data,
+                    patch: .object(["duration_ms": .number(durationMs)]))
+            }
+        }
         if let idx = messages.firstIndex(where: { $0.message_id == message.message_id }) {
             // Eager (in-flight) messages are later re-broadcast persisted
             // with the same message_id; the second arrival refreshes fields.
@@ -852,9 +1002,7 @@ final class ConversationSession {
                     durableMessageSequenceCeiling, message.sequence_id)
                 lastSequenceId = max(lastSequenceId, message.sequence_id)
                 rebuildToolUseIndex()
-                if persistSnapshot(authoritative: true) {
-                    reconcileOutbox()
-                }
+                persistSnapshot(authoritative: true, reconcileOutboxOnSuccess: true)
             case .steeringQueued:
                 outbox.markAccepted(localId, steering: true)
             case .absent:

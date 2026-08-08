@@ -13,6 +13,7 @@ final class ConversationListStore {
     private(set) var lastError: String?
 
     private static let cacheName = "conversations"
+    private static let schemaVersion = 1
 
     private struct Cache: Codable {
         var conversations: [Conversation]
@@ -23,13 +24,17 @@ final class ConversationListStore {
     /// into its result so the refresh can still update unrelated rows.
     private var generation = 0
     private var refreshToken: UUID?
+    /// Changes on every list mutation, including non-destructive upserts.
+    /// Background fetches use this separately from foreground refresh merging.
+    private var externalMutationGeneration = 0
     /// Server-pushed rows received after the current full refresh began.
     private var upsertsDuringRefresh: [String: Conversation] = [:]
     /// Rows removed or archived after the current full refresh began.
     private var exclusionsDuringRefresh: Set<String> = []
 
     init() {
-        if let cache = DiskStore.load(Cache.self, name: Self.cacheName) {
+        if let cache = DiskStore.loadVersioned(
+            Cache.self, name: Self.cacheName, version: Self.schemaVersion) {
             conversations = cache.conversations
             lastRefreshed = cache.lastRefreshed
         }
@@ -37,6 +42,7 @@ final class ConversationListStore {
 
     func refresh(api: PhoenixAPI) async {
         guard refreshToken == nil else { return }
+        externalMutationGeneration += 1
         let token = UUID()
         refreshToken = token
         defer {
@@ -50,6 +56,7 @@ final class ConversationListStore {
         do {
             let fresh = try await api.listConversations()
             guard generation == startedGeneration else { return }
+            externalMutationGeneration += 1
             apply(Self.merging(
                 fresh,
                 preserving: upsertsDuringRefresh,
@@ -83,10 +90,34 @@ final class ConversationListStore {
         persistCache()
     }
 
+    /// Apply an externally fetched list (background attention check) so a
+    /// cold open renders fresher data. Skipped while a foreground refresh
+    /// is in flight; the generation guard semantics match refresh().
+    struct ExternalRefreshToken: Equatable {
+        fileprivate let generation: Int
+    }
+
+    func externalRefreshToken() -> ExternalRefreshToken {
+        ExternalRefreshToken(generation: externalMutationGeneration)
+    }
+
+    func canApplyExternal(startedAt token: ExternalRefreshToken) -> Bool {
+        !isRefreshing && token.generation == externalMutationGeneration
+    }
+
+    @discardableResult
+    func applyExternal(_ fresh: [Conversation], startedAt token: ExternalRefreshToken) -> Bool {
+        guard canApplyExternal(startedAt: token) else { return false }
+        apply(fresh)
+        lastError = nil
+        return true
+    }
+
     /// Merge a single updated conversation (e.g. after creation or an SSE
     /// update in an open session) without waiting for a full refresh.
     func upsert(_ conversation: Conversation) {
         if lastRefreshed == nil { lastRefreshed = Date() }
+        externalMutationGeneration += 1
         if conversation.archived == true {
             if isRefreshing {
                 upsertsDuringRefresh[conversation.id] = nil
@@ -117,6 +148,7 @@ final class ConversationListStore {
     }
 
     func remove(id: String) {
+        externalMutationGeneration += 1
         upsertsDuringRefresh[id] = nil
         if isRefreshing {
             exclusionsDuringRefresh.insert(id)
@@ -133,6 +165,7 @@ final class ConversationListStore {
     func reset() {
         generation += 1
         refreshToken = nil
+        externalMutationGeneration += 1
         upsertsDuringRefresh.removeAll()
         exclusionsDuringRefresh.removeAll()
         conversations = []
@@ -142,8 +175,9 @@ final class ConversationListStore {
 
     private func persistCache() {
         guard let lastRefreshed else { return }
-        DiskStore.save(
+        DiskStore.saveVersioned(
             Cache(conversations: conversations, lastRefreshed: lastRefreshed),
-            name: Self.cacheName)
+            name: Self.cacheName,
+            version: Self.schemaVersion)
     }
 }

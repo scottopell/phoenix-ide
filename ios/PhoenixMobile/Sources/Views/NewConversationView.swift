@@ -48,6 +48,7 @@ struct NewConversationView: View {
                             .autocorrectionDisabled()
                             .font(.body.monospaced())
                             .disabled(pendingAttempt != nil)
+                            .accessibilityIdentifier("newConversation.cwd")
                     }
                     if case .invalid(let reason) = cwdStatus {
                         Text(reason)
@@ -70,6 +71,7 @@ struct NewConversationView: View {
                             }
                         }
                         .disabled(pendingAttempt != nil)
+                        .accessibilityIdentifier("newConversation.model")
                     }
                 }
                 if !modelsAvailable {
@@ -95,6 +97,7 @@ struct NewConversationView: View {
                     TextField("What should the agent do?", text: $firstMessage, axis: .vertical)
                         .lineLimit(3...10)
                         .disabled(pendingAttempt != nil)
+                        .accessibilityIdentifier("newConversation.message")
                 }
 
                 if let errorText {
@@ -117,6 +120,7 @@ struct NewConversationView: View {
                         Task { await create() }
                     }
                     .disabled(!canCreate)
+                    .accessibilityIdentifier("newConversation.create")
                 }
             }
             .onChange(of: cwd) { _, newValue in

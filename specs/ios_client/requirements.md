@@ -36,6 +36,11 @@ WHEN the user submits a non-empty message
 THE SYSTEM SHALL persist a queue entry to disk before attempting delivery
 AND render the entry optimistically in the transcript with its queue status
 
+WHEN that persistence point fails
+THE SYSTEM SHALL keep the in-memory entry visible
+AND SHALL NOT attempt delivery until the full visible outbox is successfully persisted
+AND SHALL retry persistence on later delivery triggers
+
 WHEN delivery fails at the transport level (no route, timeout, connection reset)
 THE SYSTEM SHALL keep the entry queued
 AND retry automatically on the next delivery trigger
@@ -49,8 +54,9 @@ THE SYSTEM SHALL rehydrate only entries belonging to the viewed conversation
 
 The queue implements the client-side delivery contract of
 `specs/user_message_queue/user_message_queue.allium` (enqueue-before-POST,
-`message_id = localId`, reconciliation against authoritative history,
-union-without-duplicates rendering), with two platform deviations:
+`message_id = localId`, reconciliation against either an exact authoritative
+id or the server's conversation-scoped canonical id, union-without-duplicates
+rendering), with two platform deviations:
 
 1. Transport-level failures do not transition entries to `failed`; they
    remain `pending` for automatic redelivery. Mobile connectivity loss is
@@ -121,7 +127,12 @@ WHEN a conversation is no longer open
 THE SYSTEM SHALL stop its live stream and reconnect loop
 AND retain delivery ownership for any queued messages
 
+WHEN a message update arrives before its identity-bearing message event
+THE SYSTEM SHALL retain the update by message id
+AND apply it when the message arrives
+
 WHEN a conversation hard-delete event arrives
+OR a reconnect receives a definitive not-found response for that conversation
 THE SYSTEM SHALL remove its transcript, snapshot, outbox, and list entry
 AND disable further interaction with the deleted conversation
 
@@ -172,7 +183,12 @@ THE SYSTEM SHALL reject the new server configuration
 AND SHALL NOT commit its URL or in-memory credential
 
 WHEN the server presents a certificate that passes standard trust evaluation
-THE SYSTEM SHALL accept it without pinning
+AND no pin exists for that host and port
+THE SYSTEM SHALL accept it without creating a pin
+
+WHEN a pin exists for the host and port
+THE SYSTEM SHALL compare the presented leaf certificate before accepting it
+regardless of whether standard trust evaluation succeeds
 
 WHEN the server presents a self-signed certificate, the user has enabled the
 trust toggle, and no certificate is pinned for that host and port
@@ -255,6 +271,8 @@ THE SYSTEM SHALL parse the typed response envelope (success shapes tagged
 by `status`, error shapes tagged by `error` — see `specs/bash/`)
 AND show a one-glance outcome header (status, exit code or signal,
 duration, handle for in-flight ops) colored by outcome
+AND for tombstones use `final_cause` as the terminal outcome even when
+`signal_number` is absent
 AND show the output tail collapsed, with the full output expandable and a
 truncation notice when the server truncated
 AND degrade to the generic result card when the payload is not a parseable
@@ -290,6 +308,8 @@ detail area between transcript and composer:
   asked, task plan awaiting approval, context exhausted)
 - the error state renders an error card carrying the message and the
   dismiss action
+- any unhandled state whose presentation mode is error renders a visible
+  error card rather than disappearing
 
 WHEN the server state permits cancellation
 THE SYSTEM SHALL expose the cancel control, including while provisioning,
@@ -342,6 +362,11 @@ WHEN an online-only action is rejected by the server (e.g. dismissing a
 non-resumable error)
 THE SYSTEM SHALL surface the server's explanation
 
+WHEN an earlier action request completes after authoritative state has
+already cleared it and a newer action has begun
+THE SYSTEM SHALL ignore the earlier request's completion
+AND SHALL NOT unlock or overwrite the newer action
+
 WHEN archive is requested while the conversation has a visible outbox entry
 THE SYSTEM SHALL block archive until the user retries or discards that entry
 SO THAT archive cannot delete the only durable copy of user-authored text
@@ -349,6 +374,11 @@ SO THAT archive cannot delete the only durable copy of user-authored text
 WHEN an archive request is in flight
 THE SYSTEM SHALL disable new message submission for that conversation
 UNTIL archive fails or completes
+
+WHEN the conversation is in a state that rejects ordinary chat
+THE SYSTEM SHALL disable the composer
+AND SHALL continue allowing chat in working states where the server accepts
+the message as steering
 
 **Rationale:** Queuing an action against live server state fabricates a
 stale intent — an archive or cancel replayed minutes later can destroy
@@ -408,3 +438,173 @@ make away from the desk. The no-optimistic-state rule matters because
 approval is multi-client: the server 400s a decision on an
 already-decided plan, which surfaces as an explanatory error instead of a
 silent double-apply.
+
+---
+
+### REQ-IOS-014: Versioned Persistence
+
+WHEN a durable store (outbox, conversation snapshot, conversation list)
+is written
+THE SYSTEM SHALL wrap the payload in an envelope carrying a schema version
+
+WHEN loading a store whose version matches
+THE SYSTEM SHALL decode it directly
+
+WHEN loading an older version
+THE SYSTEM SHALL route through that store's migration hook
+
+WHEN loading a NEWER version (downgraded app)
+THE SYSTEM SHALL treat the file as absent rather than misparse it
+AND SHALL NOT delete it
+AND SHALL refuse to overwrite it until the user upgrades or explicitly
+clears the store
+
+WHEN a destructive action depends on an outbox being empty
+THE SYSTEM SHALL treat an unreadable or newer-version outbox as possibly non-empty
+AND SHALL refuse the action without modifying that store
+
+WHEN loading a pre-envelope legacy file
+THE SYSTEM SHALL decode the bare payload as version zero
+
+Changing any persisted struct requires either a version bump plus a
+migration branch, or a field-level note that the change is
+additive-optional (old files decode it as nil/default).
+
+**Rationale:** Without an envelope, any shape change makes old files
+undecodable and lenient decoding silently discards them — for the outbox
+that is queued-message loss, the exact failure the app exists to prevent.
+The version makes "old data" distinguishable from "corrupt data" and
+makes forgetting a migration a reviewable event instead of a silent wipe.
+
+---
+
+### REQ-IOS-015: Image Attachments
+
+WHEN a message or tool result carries typed image payloads
+THE SYSTEM SHALL render them inline (tool-result images render even while
+the output is collapsed)
+AND an undecodable image SHALL render a labeled placeholder, never nothing
+
+WHEN the user attaches photos to a message
+THE SYSTEM SHALL downscale to a bounded long edge and recompress before
+staging
+AND SHALL enforce a total encoded attachment budget below the chat route's
+request-body limit
+AND queue them through the same outbox entry as the text (same
+durability, same idempotent delivery)
+AND surface any photo that failed to load rather than dropping it from
+the send
+
+WHEN a queued entry carries images
+THE SYSTEM SHALL indicate the attachment count on the optimistic bubble
+
+**Rationale:** Images flow through one typed path in both directions
+(mirrors the web's single-source-of-truth rule for ToolContent.images).
+Client-side downscaling keeps multi-megapixel photos from bloating outbox
+files and chat POSTs; the visible-failure rules are the transcript-wide
+omission-is-data-loss principle applied to media.
+
+---
+
+### REQ-IOS-016: Question Answering
+
+WHEN a conversation is awaiting a user response
+THE SYSTEM SHALL render each question with its header, text, and options
+(with descriptions), honoring single- versus multi-select semantics
+AND offer a free-text "Other" answer per question
+AND offer dismissal (with confirmation) as the no-answer resolution
+
+WHEN the question payload is empty or contains no decodable questions
+THE SYSTEM SHALL still offer the online-only dismissal action
+
+WHEN encoding answers
+THE SYSTEM SHALL key them by question text, with a single-select answer
+being the chosen option label (or the trimmed Other text) and a
+multi-select answer joining chosen labels in declared option order with
+", ", appending trimmed Other text
+AND submission SHALL be disabled until every question has an answer
+AND a selection for a label absent from the current options SHALL not
+count as an answer
+
+WHEN a response is submitted
+THE SYSTEM SHALL follow the interactive-resolution rules of REQ-IOS-013:
+online-only, no optimistic state (the server's state change clears the
+card; concurrent resolution from another client surfaces as the server's
+conflict), controls disabled while offline or in flight, and drafts
+preserved until success
+
+WHEN an authoritative snapshot replaces an answered prompt with a different
+question payload
+THE SYSTEM SHALL treat it as a new decision and enable its controls
+AND SHALL discard selections and free text belonging to the previous prompt
+
+**Rationale:** A stalled agent is worth nothing until answered; this is
+the highest-value blocking state to resolve away from the desk. The
+encoding contract mirrors the web QuestionPanel so the server observes
+identical answer shapes from every client.
+
+---
+
+### REQ-IOS-017: Fleet Coordinator Access
+
+WHEN the user opens the Coordinator
+THE SYSTEM SHALL get-or-create it via the global coordinator endpoint and
+navigate to it as an ordinary conversation (standard transcript, caching,
+outbox, and actions apply unchanged)
+
+WHEN offline with a previously opened Coordinator
+THE SYSTEM SHALL open its cached transcript only when a compatible local
+snapshot exists for the remembered id, with
+new questions queueing through the outbox
+AND first-time opening SHALL require connectivity
+
+WHEN the Coordinator appears in the conversation list
+THE SYSTEM SHALL badge it distinctly
+
+WHEN the user opens list actions for the Coordinator
+THE SYSTEM SHALL NOT offer archive
+
+The remembered Coordinator id is per-server state and SHALL be cleared on
+sign-out or when the local cache is cleared.
+
+**Rationale:** The Coordinator is Phoenix's most mobile-shaped surface —
+one conversation that answers questions about the whole fleet. Because
+the server models it as an ordinary conversation, the client adds only an
+entry point; every offline guarantee is inherited rather than rebuilt.
+
+---
+
+### REQ-IOS-018: Advisory Background Nudges
+
+WHEN the user enables nudges (behind notification authorization)
+THE SYSTEM SHALL schedule opportunistic background refreshes
+AND on each run fetch the conversation list, fire one local notification
+per conversation that newly entered needs-action or error, or completed a
+working turn, and refresh the cached list
+
+WHEN a background nudge run reports completion
+THE SYSTEM SHALL have finished submitting its local notification requests
+
+WHEN the user disables nudges or signs out
+THE SYSTEM SHALL cancel pending refresh requests and prevent an earlier
+authorization request from re-enabling nudges
+
+WHEN diffing against the last-seen snapshot
+THE SYSTEM SHALL never notify for a conversation absent from the snapshot
+(first sight seeds silently)
+AND SHALL re-seed silently on every foreground refresh, so the user is
+never nudged about state they already saw
+
+WHEN a notification is tapped
+THE SYSTEM SHALL navigate to that conversation (cold launch included)
+
+WHILE the app is foregrounded
+THE SYSTEM SHALL suppress nudge banners
+
+Missed, delayed, or skipped background runs SHALL NOT affect correctness
+— the tier is advisory only, and no product behavior may come to depend
+on a run occurring.
+
+**Rationale:** Opportunistic refresh can provide useful advisory awareness
+without becoming part of the correctness model. iOS controls the refresh
+cadence (≥15 min, best-effort), so every nudge is explicitly non-authoritative.

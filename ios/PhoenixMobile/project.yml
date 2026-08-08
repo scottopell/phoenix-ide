@@ -36,6 +36,11 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: "Phoenix connects to your Phoenix server on the local network."
+        # AttentionMonitor uses background list fetches for local notifications.
+        UIBackgroundModes:
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.phoenix.mobile.refresh
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
@@ -46,6 +51,18 @@ targets:
     platform: iOS
     sources:
       - Tests
+    dependencies:
+      - target: PhoenixMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+
+  PhoenixMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
     dependencies:
       - target: PhoenixMobile
     settings:
@@ -67,3 +84,18 @@ schemes:
       config: Debug
       targets:
         - PhoenixMobileTests
+
+  # Opt-in live-server journey. Kept separate so normal CI and unit-test
+  # runs never depend on a running Phoenix instance.
+  PhoenixMobileUIQA:
+    build:
+      targets:
+        PhoenixMobile: all
+        PhoenixMobileUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - PhoenixMobileUITests
+      environmentVariables:
+        PHOENIX_UI_TEST_SERVER_URL: "$(PHOENIX_UI_TEST_SERVER_URL_VALUE)"
+        PHOENIX_UI_TEST_CWD: "$(PHOENIX_UI_TEST_CWD_VALUE)"

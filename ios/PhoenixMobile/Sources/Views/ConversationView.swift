@@ -12,42 +12,42 @@ struct ConversationView: View {
         VStack(spacing: 0) {
             OfflineBanner()
             ConnectionStateBar(session: session)
-            if session.isHardDeleted {
-                ContentUnavailableView(
-                    "Conversation deleted",
-                    systemImage: "trash",
-                    description: Text("This conversation was deleted on the server."))
-            } else {
-                TimelineView(.periodic(from: .now, by: 30)) { context in
-                    if let staleness = cacheAgeNote(at: context.date) {
-                        Text(staleness)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 2)
-                            .background(.thinMaterial)
-                    }
-                }
-                if !session.outbox.persistenceHealthy {
-                    Label(
-                        "Storage write failed — queued messages may not survive a restart",
-                        systemImage: "externaldrive.badge.exclamationmark")
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                if let staleness = cacheAgeNote(at: context.date) {
+                    Text(staleness)
                         .font(.caption2)
-                        .foregroundStyle(.white)
+                        .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 4)
-                        .background(.red.gradient)
+                        .padding(.vertical, 2)
+                        .background(.thinMaterial)
                 }
-                if isUncachedOffline {
-                    ContentUnavailableView {
-                        Label("Not cached on this device", systemImage: "icloud.slash")
-                    } description: {
-                        Text("Open this conversation once while connected to read it offline.")
-                    }
-                    .frame(maxHeight: .infinity)
-                } else {
-                    messageList
+            }
+            if !session.outbox.persistenceHealthy {
+                Label(
+                    "Storage write failed — queued messages may not survive a restart",
+                    systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.caption2)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                    .background(.red.gradient)
+            }
+            if session.isHardDeleted {
+                ContentUnavailableView {
+                    Label("Conversation deleted", systemImage: "trash")
+                } description: {
+                    Text("It was deleted from another Phoenix client.")
                 }
+                .frame(maxHeight: .infinity)
+            } else if isUncachedOffline {
+                ContentUnavailableView {
+                    Label("Not cached on this device", systemImage: "icloud.slash")
+                } description: {
+                    Text("Open this conversation once while connected to read it offline.")
+                }
+                .frame(maxHeight: .infinity)
+            } else {
+                messageList
                 StateDetailView(session: session)
                 ComposerView(session: session, draft: $draft)
             }
@@ -169,6 +169,8 @@ struct StreamingBubble: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: 40)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("message.streaming")
         .opacity(0.85)
     }
 }
@@ -183,6 +185,8 @@ struct OutboxSection: View {
         ForEach(session.outbox.visibleEntries) { entry in
             OutboxEntryView(entry: entry, session: session)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("message.outbox")
     }
 }
 
@@ -194,12 +198,22 @@ struct OutboxEntryView: View {
         VStack(alignment: .trailing, spacing: 3) {
             HStack {
                 Spacer(minLength: 40)
-                Text(entry.text)
-                    .font(.body)
-                    .padding(10)
-                    .background(bubbleColor)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .trailing, spacing: 4) {
+                    if !entry.text.isEmpty {
+                        Text(entry.text)
+                            .font(.body)
+                    }
+                    if !entry.images.isEmpty {
+                        Label(
+                            "\(entry.images.count) image\(entry.images.count == 1 ? "" : "s") attached",
+                            systemImage: "photo")
+                            .font(.caption2)
+                    }
+                }
+                .padding(10)
+                .background(bubbleColor)
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
             }
             statusLine
         }
@@ -236,7 +250,7 @@ struct OutboxEntryView: View {
                 Button("Retry") { session.retryEntry(entry.localId) }
                     .font(.caption.bold())
                 Button("Discard", role: .destructive) {
-                    session.dismissEntry(entry.localId)
+                    Task { await session.dismissEntry(entry.localId) }
                 }
                 .font(.caption)
             }

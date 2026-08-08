@@ -23,6 +23,7 @@ xcodegen generate
 open PhoenixMobile.xcodeproj
 ```
 
+
 Select your device or a simulator and run. There are no third-party
 package dependencies — first build works offline.
 
@@ -67,22 +68,49 @@ CI runs the same thing on a macOS runner for any change under `ios/`
 (`.github/workflows/ios.yml`) — the Linux-based `./dev.py check` lanes
 cannot cover Swift.
 
+The opt-in live-server UI journey has its own scheme so normal unit tests
+never depend on a running Phoenix instance. Start an auth-disabled dev server
+with `PHOENIX_ENABLE_MOCK_MODEL=1`, then run:
+
+```bash
+cd ios/PhoenixMobile
+xcodegen generate
+xcrun simctl boot 'iPhone 16' 2>/dev/null || true
+xcrun simctl bootstatus 'iPhone 16' -b
+xcrun simctl uninstall 'iPhone 16' com.phoenix.mobile 2>/dev/null || true
+xcodebuild test -project PhoenixMobile.xcodeproj -scheme PhoenixMobileUIQA \
+  -destination 'platform=iOS Simulator,name=iPhone 16' \
+  PHOENIX_UI_TEST_SERVER_URL_VALUE=https://127.0.0.1:<port> \
+  PHOENIX_UI_TEST_CWD_VALUE=/tmp
+```
+
+The uninstall only clears Phoenix from that simulator, making the first-run
+TLS setup deterministic on every run.
+
+The native UI test sends events directly to the Simulator through XCUITest;
+it does not take over the Mac's mouse or keyboard. It covers first-run
+self-signed TLS setup, explicit mock-model conversation creation, optimistic
+send reconciliation without duplicate bubbles, and cold-launch persistence.
+
 **The testing pattern:** pure components get *contract tests* — one test
-per rule of the contract they implement, named after that rule — and
-views stay untested. The two exemplars to mimic:
+per rule of the contract they implement, named after that rule. One focused
+XCUITest covers the highest-risk live UI journey; the remaining views stay
+outside the unit suite. Representative exemplars:
 
 - `Tests/SSEParserTests.swift` — contract: the SSE wire format.
 - `Tests/OutboxTests.swift` — contract: the delivery rules in
   `specs/user_message_queue/user_message_queue.allium` (+ REQ-IOS-002
   deviations). Persistence runs for real against a per-test temp
   directory via the `DiskStore.baseDirectory` seam.
+- `Tests/ConversationSessionReducerTests.swift` — event ordering, turn-close,
+  and hard-delete behavior at the session boundary.
+- `Tests/DiskStoreVersioningTests.swift` — upgrade/downgrade protection for
+  every durable store.
 
-When adding logic, keep it out of views and in a pure type so it can be
-tested this way. Next candidates, in value order: `PhoenixEvent` decoding
-(init snapshot + pending-events replay shapes), `BashResult` envelope
-parsing, and the `ConversationSession` reducer (sequence guard, init
-replay floor, dedup-by-message_id) — the reducer needs its API/SSE
-dependencies made injectable first.
+When adding logic, keep it out of views and in a pure type or an explicit
+session boundary so it can be tested this way. High-value remaining cases
+include broader `PhoenixEvent` init/pending-replay decoding and sequence-floor
+fuzzing.
 
 ## How offline works
 
@@ -111,7 +139,14 @@ PhoenixMobile/Sources/
     Keychain.swift          Password storage
     CertPinStore.swift      Trust-on-first-use certificate pin (self-signed TLS)
     ConnectivityMonitor.swift  NWPathMonitor -> offline banner + drain triggers
-    DiskStore.swift         Atomic JSON persistence (Application Support)
+    DiskStore.swift         Versioned atomic JSON persistence — read the
+                            versioning rule in its header before changing
+                            any persisted struct
+    ImageProcessing.swift   Picked photos -> bounded JPEG ImagePayload
+    AttentionMonitor.swift  STOPGAP nudge tier: BGAppRefresh list diff ->
+                            local notifications. Deleted (not extended)
+                            when server-side APNs lands (tasks/20004)
+    BackgroundRefresh.swift BGTaskScheduler plumbing for the stopgap tier
   API/
     Models.swift            Wire types (Conversation, Message, envelopes)
     PhoenixAPI.swift        REST client, Bearer auth, self-signed trust delegate
@@ -127,5 +162,8 @@ PhoenixMobile/Sources/
                             unknown tools fall back to the generic JSON cards
     StateViews.swift        Typed-state detail dispatch (working detail,
                             needs-action cards, error card + dismiss)
+    QuestionCard.swift      In-app question answering (single/multi select,
+                            Other text, dismiss) — TaskApprovalCard's sibling
+    AttachmentViews.swift   Base64 image rendering with visible decode
+                            fallback; strips for messages + tool results
 ```
-
