@@ -28,11 +28,7 @@ struct ConversationView: View {
             Text(session.lastErrorToast ?? "")
         }
         .onAppear { session.start() }
-        .onDisappear {
-            // Keep the session alive (AppModel owns it) so the outbox keeps
-            // draining, but flush a snapshot at navigation boundaries.
-            session.persistOnNavigate()
-        }
+        .onDisappear { session.closeView() }
     }
 
     private var messageList: some View {
@@ -79,6 +75,13 @@ struct ConnectionStateBar: View {
     let session: ConversationSession
 
     var body: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            content(at: context.date)
+        }
+    }
+
+    @ViewBuilder
+    private func content(at now: Date) -> some View {
         switch session.connection {
         case .live, .idle:
             EmptyView()
@@ -86,13 +89,17 @@ struct ConnectionStateBar: View {
             bar { Text("Connecting…") }
         case .offline:
             if let syncedAt = session.snapshotSyncedAt,
-               Date().timeIntervalSince(syncedAt) > 120 {
-                bar { Text(cacheAgeLabel(syncedAt)) }
+               now.timeIntervalSince(syncedAt) > 120 {
+                bar { Text(cacheAgeLabel(syncedAt, relativeTo: now)) }
             }
         case .waitingToRetry:
             if let syncedAt = session.snapshotSyncedAt,
-               Date().timeIntervalSince(syncedAt) > 120 {
-                bar { Text("Connection lost — reconnecting… · \(cacheAgeLabel(syncedAt))") }
+               now.timeIntervalSince(syncedAt) > 120 {
+                bar {
+                    Text(
+                        "Connection lost — reconnecting… · "
+                            + cacheAgeLabel(syncedAt, relativeTo: now))
+                }
             } else {
                 bar { Text("Connection lost — reconnecting…") }
             }
@@ -108,10 +115,10 @@ struct ConnectionStateBar: View {
             .background(.thinMaterial)
     }
 
-    private func cacheAgeLabel(_ date: Date) -> String {
+    private func cacheAgeLabel(_ date: Date, relativeTo now: Date) -> String {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
-        return "Conversation updated \(formatter.localizedString(for: date, relativeTo: Date()))"
+        return "Conversation updated \(formatter.localizedString(for: date, relativeTo: now))"
     }
 }
 

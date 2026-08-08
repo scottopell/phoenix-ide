@@ -73,6 +73,7 @@ AND treat any resend of the same entry as safe
 
 WHEN the same entry would be sent concurrently
 THE SYSTEM SHALL prevent overlapping in-flight sends of that entry
+WHETHER delivery is owned by an open conversation or a persisted-queue sweep
 
 **Rationale:** The server deduplicates on `message_id`, making at-least-once
 delivery converge to exactly-once. Aggressive retrying is then free of
@@ -116,6 +117,10 @@ WHEN the device reports no network path
 THE SYSTEM SHALL suspend reconnect attempts until the path returns rather
 than burning backoff cycles
 
+WHEN a conversation is no longer open
+THE SYSTEM SHALL stop its live stream and reconnect loop
+AND retain delivery ownership for any queued messages
+
 **Rationale:** Mirrors the web client's connection machine against the
 server contract in `specs/sse_wire/sse_wire.allium`; the init-as-resync
 design means the client never needs gap detection.
@@ -153,6 +158,7 @@ WHEN a server password is configured
 THE SYSTEM SHALL authenticate every request with `Authorization: Bearer
 <password>`
 AND store the password in the iOS Keychain
+AND reject server configurations that would send the password over plain HTTP
 
 WHEN the server presents a certificate that passes standard trust evaluation
 THE SYSTEM SHALL accept it without pinning
@@ -187,6 +193,10 @@ THE SYSTEM SHALL validate the working directory against the server with
 inline validity feedback
 AND allow choosing a model from the server's available models
 AND require connectivity (creation is not queued offline)
+
+WHEN conversation creation fails without an authoritative server response
+THE SYSTEM SHALL retain the attempt's immutable message id and inputs
+AND prevent dismissing the attempt until an idempotent retry resolves it
 
 **Rationale:** Creation requires server-side validation and id minting;
 queuing it offline would fabricate state the server may reject. The

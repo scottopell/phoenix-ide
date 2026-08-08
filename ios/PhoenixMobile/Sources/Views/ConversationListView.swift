@@ -77,11 +77,13 @@ struct ConversationListView: View {
             }
         } else {
             List {
-                if let stale = staleness {
-                    Text(stale)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .listRowSeparator(.hidden)
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    if let stale = staleness(at: context.date) {
+                        Text(stale)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .listRowSeparator(.hidden)
+                    }
                 }
                 ForEach(model.listStore.conversations) { conversation in
                     NavigationLink(value: conversation.id) {
@@ -97,13 +99,13 @@ struct ConversationListView: View {
     }
 
     /// Freshness note shown only when the cache is meaningfully stale.
-    private var staleness: String? {
+    private func staleness(at now: Date) -> String? {
         guard let refreshed = model.listStore.lastRefreshed else { return nil }
-        let age = Date().timeIntervalSince(refreshed)
+        let age = now.timeIntervalSince(refreshed)
         guard age > 120 else { return nil }
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
-        let rel = formatter.localizedString(for: refreshed, relativeTo: Date())
+        let rel = formatter.localizedString(for: refreshed, relativeTo: now)
         return "Updated \(rel)"
     }
 }

@@ -191,4 +191,22 @@ final class SSEParserTests: XCTestCase {
             from: Data("{\"queued\":false,\"already_persisted\":true}".utf8))
         XCTAssertEqual(response.already_persisted, true)
     }
+
+    func testMessageUpdateRetainsToolDuration() {
+        let json = """
+        {
+          "sequence_id": 9,
+          "message_id": "tool-result",
+          "duration_ms": 1234
+        }
+        """
+        guard case .messageUpdated(
+            let sequence, let messageId, _, _, let durationMs, _
+        ) = PhoenixEvent.decode(frame: SSEFrame(event: "message_updated", data: json)) else {
+            return XCTFail("expected a decoded message update")
+        }
+        XCTAssertEqual(sequence, 9)
+        XCTAssertEqual(messageId, "tool-result")
+        XCTAssertEqual(durationMs, 1234)
+    }
 }

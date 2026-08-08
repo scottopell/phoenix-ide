@@ -38,7 +38,7 @@ final class AppModel {
     }
 
     var isConfigured: Bool {
-        URL(string: serverURLString)?.host != nil
+        api != nil
     }
 
     // MARK: - Services
@@ -50,6 +50,10 @@ final class AppModel {
     /// Sessions for conversations the user has opened, kept alive so their
     /// outboxes continue draining while the user navigates elsewhere.
     private var sessions: [String: ConversationSession] = [:]
+    /// Short-lived delivery owners for persisted outboxes whose conversation
+    /// is not open. Retaining one per conversation serializes every trigger
+    /// through the session's single drain task.
+    private var drainSessions: [String: ConversationSession] = [:]
 
     init() {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
@@ -76,11 +80,17 @@ final class AppModel {
         // backed, so nothing is lost.
         for session in sessions.values { session.stop() }
         sessions.removeAll()
+        for session in drainSessions.values { session.stop() }
+        drainSessions.removeAll()
     }
 
     func session(for conversationId: String) -> ConversationSession? {
         guard let api else { return nil }
         if let existing = sessions[conversationId] { return existing }
+        // Transfer ownership from the background-only delivery session. Its
+        // outbox is disk-backed, so the newly opened session reloads the same
+        // authoritative queue after cancellation.
+        drainSessions.removeValue(forKey: conversationId)?.stop()
         let session = ConversationSession(
             conversationId: conversationId, api: api, connectivity: connectivity,
             onConversationUpdate: { [weak self] conversation in
@@ -120,11 +130,14 @@ final class AppModel {
             guard let entries = DiskStore.load([OutboxEntry].self, name: name),
                   entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
             else { continue }
-            // A launch sweep is not an opened conversation. Keep this
-            // short-lived session out of `sessions`, otherwise the next
-            // foreground pass starts a permanent SSE stream for it.
-            let drainSession = ConversationSession(
-                conversationId: conversationId, api: api, connectivity: connectivity)
+            let drainSession: ConversationSession
+            if let existing = drainSessions[conversationId] {
+                drainSession = existing
+            } else {
+                drainSession = ConversationSession(
+                    conversationId: conversationId, api: api, connectivity: connectivity)
+                drainSessions[conversationId] = drainSession
+            }
             drainSession.drainOutbox()
         }
     }
@@ -132,7 +145,7 @@ final class AppModel {
     func backgrounded() {
         // Streams die in the background anyway; stop them cleanly and
         // persist snapshots. Outboxes are already disk-backed.
-        for session in sessions.values { session.stop() }
+        for session in sessions.values { session.pauseForBackground() }
     }
 
     /// Sign-out also clears all cached data: conversations, the last-used
@@ -150,6 +163,8 @@ final class AppModel {
     func clearCache() {
         for session in sessions.values { session.stop() }
         sessions.removeAll()
+        for session in drainSessions.values { session.stop() }
+        drainSessions.removeAll()
         DiskStore.removeAll()
         listStore.reset()
     }

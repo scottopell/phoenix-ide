@@ -108,7 +108,7 @@ struct NewConversationView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
-                        .disabled(creating)
+                        .disabled(creating || pendingAttempt != nil)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(creating ? "Creating…" : "Create") {
@@ -124,6 +124,7 @@ struct NewConversationView: View {
                 if !cwd.isEmpty { scheduleValidation(cwd) }
                 await loadModels()
             }
+            .interactiveDismissDisabled(creating || pendingAttempt != nil)
         }
     }
 

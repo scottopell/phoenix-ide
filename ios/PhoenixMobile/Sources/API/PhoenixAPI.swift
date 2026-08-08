@@ -120,7 +120,10 @@ struct PhoenixAPI: Sendable {
     /// idle timeout covers gaps between events (the server keep-alives).
     private let streamSession: URLSession
 
-    init(baseURL: URL, password: String?, allowSelfSigned: Bool) {
+    init?(baseURL: URL, password: String?, allowSelfSigned: Bool) {
+        guard password?.isEmpty != false || baseURL.scheme?.lowercased() == "https" else {
+            return nil
+        }
         self.baseURL = baseURL
         self.password = password
 

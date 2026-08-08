@@ -29,4 +29,13 @@ final class RenderingReducerTests: XCTestCase {
         XCTAssertTrue(result.isFailure)
         XCTAssertEqual(result.headline, "killed")
     }
+
+    func testAuthenticatedAPIRequiresHTTPS() throws {
+        let httpURL = try XCTUnwrap(URL(string: "http://phoenix.local:8031"))
+        let httpsURL = try XCTUnwrap(URL(string: "https://phoenix.local:8031"))
+
+        XCTAssertNil(PhoenixAPI(baseURL: httpURL, password: "secret", allowSelfSigned: true))
+        XCTAssertNotNil(PhoenixAPI(baseURL: httpURL, password: nil, allowSelfSigned: true))
+        XCTAssertNotNil(PhoenixAPI(baseURL: httpsURL, password: "secret", allowSelfSigned: true))
+    }
 }

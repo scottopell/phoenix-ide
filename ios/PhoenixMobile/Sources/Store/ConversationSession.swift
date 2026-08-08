@@ -48,6 +48,7 @@ final class ConversationSession {
     private var inFlight: Set<String> = []
     private var retryDelay: TimeInterval = 1
     private let onConversationUpdate: ((Conversation) -> Void)?
+    private var viewIsActive = false
 
     private var snapshotName: String { "conv-\(conversationId)" }
 
@@ -92,48 +93,71 @@ final class ConversationSession {
     }
 
     func start() {
-        guard streamTask == nil else { return }
-        connectivityToken = connectivity.addRestoreObserver { [weak self] in
-            self?.connectivityRestored()
+        viewIsActive = true
+        if connectivityToken == nil {
+            connectivityToken = connectivity.addRestoreObserver { [weak self] in
+                self?.connectivityRestored()
+            }
         }
-        streamTask = Task { await streamLoop() }
-        staleCheckTask = Task { await staleCheckLoop() }
+        resumeLiveTasks()
     }
 
     func stop() {
-        streamTask?.cancel()
-        streamTask = nil
+        viewIsActive = false
+        pauseLiveTasks()
         drainTask?.cancel()
         drainTask = nil
-        staleCheckTask?.cancel()
-        staleCheckTask = nil
         if let token = connectivityToken {
             connectivity.removeRestoreObserver(token)
             connectivityToken = nil
         }
+    }
+
+    /// End the opened-view stream while retaining this session as the owner
+    /// of its disk-backed outbox.
+    func closeView() {
+        viewIsActive = false
+        pauseLiveTasks()
+    }
+
+    /// Background suspension preserves whether the view is open so a later
+    /// foreground transition resumes only that conversation's live stream.
+    func pauseForBackground() {
+        pauseLiveTasks()
+    }
+
+    private func pauseLiveTasks() {
+        streamTask?.cancel()
+        streamTask = nil
+        staleCheckTask?.cancel()
+        staleCheckTask = nil
         connection = .idle
         persistSnapshot()
     }
 
-    /// Flush cached state at a navigation boundary. The session itself stays
-    /// alive (AppModel owns it) so the outbox keeps draining off-screen.
-    func persistOnNavigate() {
-        persistSnapshot()
+    private func resumeLiveTasks() {
+        guard viewIsActive else { return }
+        if streamTask == nil {
+            streamTask = Task { await streamLoop() }
+        }
+        if staleCheckTask == nil {
+            staleCheckTask = Task { await staleCheckLoop() }
+        }
     }
 
     /// Called on scenePhase -> .active: the stream task was likely torn down
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {
-        if streamTask == nil {
-            start()
-        }
+        resumeLiveTasks()
         drainOutbox()
     }
 
     private func connectivityRestored() {
-        // Wake the stream loop out of its backoff sleep by restarting it.
-        streamTask?.cancel()
-        streamTask = Task { await streamLoop() }
+        if viewIsActive {
+            // Wake the stream loop out of its backoff sleep by restarting it.
+            streamTask?.cancel()
+            streamTask = Task { await streamLoop() }
+        }
         drainOutbox()
     }
 
@@ -397,7 +421,8 @@ final class ConversationSession {
             }
 
         case .messageUpdated(
-            let seq, let messageId, let content, let displayData, let updatedGeneration):
+            let seq, let messageId, let content, let displayData, let durationMs,
+            let updatedGeneration):
             // Stale guard applies here too: a replayed update from before
             // the floor must not clobber content a newer update already set.
             guard applyIfNewer(seq) else { return }
@@ -409,6 +434,11 @@ final class ConversationSession {
                 messages[idx].display_data = Self.mergeDisplayData(
                     existing: messages[idx].display_data,
                     patch: displayData)
+            }
+            if let durationMs {
+                messages[idx].display_data = Self.mergeDisplayData(
+                    existing: messages[idx].display_data,
+                    patch: .object(["duration_ms": .number(durationMs)]))
             }
             if let updatedGeneration {
                 transcriptGeneration = updatedGeneration
