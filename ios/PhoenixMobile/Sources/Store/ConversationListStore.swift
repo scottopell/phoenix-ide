@@ -42,6 +42,7 @@ final class ConversationListStore {
 
     func refresh(api: PhoenixAPI) async {
         guard refreshToken == nil else { return }
+        externalMutationGeneration += 1
         let token = UUID()
         refreshToken = token
         defer {
@@ -55,6 +56,7 @@ final class ConversationListStore {
         do {
             let fresh = try await api.listConversations()
             guard generation == startedGeneration else { return }
+            externalMutationGeneration += 1
             apply(Self.merging(
                 fresh,
                 preserving: upsertsDuringRefresh,

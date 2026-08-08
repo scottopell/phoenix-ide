@@ -528,6 +528,10 @@ card; concurrent resolution from another client surfaces as the server's
 conflict), controls disabled while offline or in flight, and drafts
 preserved until success
 
+WHEN an authoritative snapshot replaces an answered prompt with a different
+question payload
+THE SYSTEM SHALL treat it as a new decision and enable its controls
+
 **Rationale:** A stalled agent is worth nothing until answered; this is
 the highest-value blocking state to resolve away from the desk. The
 encoding contract mirrors the web QuestionPanel so the server observes

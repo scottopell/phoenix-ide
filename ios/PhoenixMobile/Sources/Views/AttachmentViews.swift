@@ -10,19 +10,40 @@ import SwiftUI
 /// One base64 image; renders a labeled placeholder when undecodable.
 struct Base64ImageView: View {
     let base64: String
+    @State private var decodedImage: UIImage?
+    @State private var decodingFinished = false
+
+    private struct DecodeResult: @unchecked Sendable {
+        let image: UIImage?
+    }
 
     var body: some View {
-        if let data = Data(base64Encoded: base64),
-           let image = UIImage(data: data)
-        {
-            Image(uiImage: image)
+        Group {
+            if let decodedImage {
+                Image(uiImage: decodedImage)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-        } else {
-            Label("image failed to decode", systemImage: "photo.badge.exclamationmark")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .padding(8)
+            } else if decodingFinished {
+                Label("image failed to decode", systemImage: "photo.badge.exclamationmark")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(8)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(8)
+            }
+        }
+        .task(id: base64) {
+            decodedImage = nil
+            decodingFinished = false
+            let result = await Task.detached(priority: .utility) {
+                let image = Data(base64Encoded: base64).flatMap { UIImage(data: $0) }
+                return DecodeResult(image: image)
+            }.value
+            guard !Task.isCancelled else { return }
+            decodedImage = result.image
+            decodingFinished = true
         }
     }
 }

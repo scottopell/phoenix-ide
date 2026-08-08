@@ -349,6 +349,7 @@ final class ConversationSession {
     /// disable controls and show progress — approval buttons especially
     /// must not double-fire.
     private(set) var actionInFlight: ConversationAction?
+    private var actionOriginState: ConversationState?
 
     /// Execute a session-scoped action per its declared delivery policy
     /// (ConversationAction). Online-only actions fail fast with a toast
@@ -364,6 +365,7 @@ final class ConversationSession {
         case .outboxed:
             break  // never blocked on connectivity by definition
         }
+        actionOriginState = action.waitsForAuthoritativeStateChange ? typedState : nil
         if case .cancel = action,
            case .awaitingCommissionReviewApproval = typedState {
             cancelNeedsAgentDoneFallback = true

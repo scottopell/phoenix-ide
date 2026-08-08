@@ -368,6 +368,7 @@ final class AppModel {
     }
 
     func clearCache() {
+        apiGeneration += 1
         for session in sessions.values { session.stop() }
         sessions.removeAll()
         for session in drainSessions.values { session.stop() }

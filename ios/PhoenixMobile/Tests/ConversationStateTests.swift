@@ -263,6 +263,21 @@ final class ConversationStateTests: XCTestCase {
             cancelledCommissionApproval: true))
     }
 
+    func testQuestionActionUnlocksWhenPromptIdentityChanges() {
+        let original = ConversationState.awaitingUserResponse(questions: [
+            UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
+        ])
+        let followUp = ConversationState.awaitingUserResponse(questions: [
+            UserQuestion(question: "Next?", header: "Two", options: [], multiSelect: false),
+        ])
+        let action = ConversationAction.respondToQuestions(answers: ["First?": "yes"])
+
+        XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
+            action: action, origin: original, current: original))
+        XCTAssertFalse(ConversationSession.actionStillAwaitsOriginalState(
+            action: action, origin: original, current: followUp))
+    }
+
     func testChatEligibilityMatchesInteractiveStateFamilies() {
         XCTAssertTrue(ConversationState.idle.acceptsChatMessage)
         XCTAssertTrue(ConversationState.error(message: "retryable").acceptsChatMessage)
