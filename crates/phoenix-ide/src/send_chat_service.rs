@@ -218,9 +218,15 @@ impl SendChatApplicationService {
             .get_steering_queue(&req.conversation_id)
             .await
             .map_err(map_conversation_load_error)?;
+        let repo = WorkflowRepository::new(self.db.pool().clone());
+        let active_direct_turn = repo
+            .load_active_runtime_turn(&ConversationAuthority(conversation.id.clone()))
+            .await
+            .map_err(|error| map_db_internal_error(&error))?;
         if should_enqueue_steering(&acceptability)
             || should_enqueue_steering(&acceptance_acceptability)
             || pending_queue_fences_direct_acceptance(&acceptance_state, !steering_queue.is_empty())
+            || active_turn_fences_direct_acceptance(&acceptance_state, active_direct_turn.is_some())
         {
             if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
                 return Ok(SendChatOutcome::Rejected {
@@ -280,7 +286,6 @@ impl SendChatApplicationService {
         let prepared_bytes = prepared_payload
             .to_exact_bytes()
             .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
-        let repo = WorkflowRepository::new(self.db.pool().clone());
         let client_key = ClientTurnKey::new(req.message_id.clone())
             .ok_or(SendChatServiceError::IdempotencyConflict)?;
         let step = match repo
@@ -408,6 +413,10 @@ fn should_enqueue_steering(acceptability: &Result<(), TransitionError>) -> bool 
 
 fn pending_queue_fences_direct_acceptance(state: &ConvState, queue_nonempty: bool) -> bool {
     queue_nonempty && matches!(state, ConvState::Idle)
+}
+
+fn active_turn_fences_direct_acceptance(state: &ConvState, active_turn: bool) -> bool {
+    active_turn && matches!(state, ConvState::Idle)
 }
 
 struct ExpandedDispatchMessage {
@@ -786,10 +795,11 @@ fn transition_code(err: &TransitionError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        lookup_durable_replay, map_conversation_load_error, map_direct_turn_accept_error,
-        pending_queue_fences_direct_acceptance, persisted_skill_matches, queued_retry_matches,
-        replay_steering_receipt, should_enqueue_steering, submitted_identity_from_request,
-        DurableReplayOutcome, MessageExpansionPolicy, SendChatRequest, SendChatServiceError,
+        active_turn_fences_direct_acceptance, lookup_durable_replay, map_conversation_load_error,
+        map_direct_turn_accept_error, pending_queue_fences_direct_acceptance,
+        persisted_skill_matches, queued_retry_matches, replay_steering_receipt,
+        should_enqueue_steering, submitted_identity_from_request, DurableReplayOutcome,
+        MessageExpansionPolicy, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use phoenix_core::domain::db_schema::SkillContent;
@@ -843,6 +853,26 @@ mod tests {
         assert!(should_enqueue_steering(&Err(
             crate::state_machine::TransitionError::AgentBusy
         )));
+    }
+
+    #[test]
+    fn active_direct_turn_fences_only_idle_direct_acceptance() {
+        assert!(active_turn_fences_direct_acceptance(
+            &crate::db::ConvState::Idle,
+            true,
+        ));
+        assert!(!active_turn_fences_direct_acceptance(
+            &crate::db::ConvState::Idle,
+            false,
+        ));
+        assert!(!active_turn_fences_direct_acceptance(
+            &crate::db::ConvState::Error {
+                message: "recoverable".to_string(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::Network,
+                resets_at: None,
+            },
+            true,
+        ));
     }
 
     fn prepared_payload(req: &SendChatRequest, delivery_text: &str) -> PreparedDirectTurnPayload {

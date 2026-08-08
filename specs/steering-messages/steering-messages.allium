@@ -436,7 +436,9 @@ surface SteeringQueueApi {
         -- observation through validation and durable acceptance. A busy send
         -- therefore reserves its place before slow payload work, and a non-empty
         -- durable steering queue prevents a later idle observation from routing
-        -- into direct-turn acceptance. The later request joins the steering queue,
+        -- into direct-turn acceptance. A durable direct-turn owner also fences an
+        -- idle observation until the accepted turn becomes visible as busy. The
+        -- later request joins the steering queue,
         -- covering the window where a steer was accepted while busy but reaches
         -- the executor after it became idle. The state is checked again before
         -- acceptance; terminal and interaction-blocked states reject rather than
