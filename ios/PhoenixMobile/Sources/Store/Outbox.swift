@@ -59,6 +59,12 @@ struct OutboxEntry: Codable, Identifiable, Equatable {
 @MainActor
 @Observable
 final class Outbox {
+    enum StoredContents: Equatable {
+        case empty
+        case hasVisibleEntries
+        case inaccessible
+    }
+
     let conversationId: String
     private(set) var entries: [OutboxEntry] = []
     private var suppressedMessageIds: Set<String> = []
@@ -66,6 +72,7 @@ final class Outbox {
     /// Queued entries then exist in memory only — the UI warns that they
     /// won't survive an app restart. Cleared by the next successful write.
     private(set) var persistenceHealthy = true
+    private var storageWritable = true
 
     /// Bump when OutboxEntry's persisted shape changes incompatibly, and
     /// add a migrate branch below (DiskStore versioning rule). v1 is the
@@ -79,9 +86,18 @@ final class Outbox {
         // Rehydrate only entries tagged with this conversation — a foreign
         // entry can never reconcile here and must not render (spec rule
         // RehydrateQueueForConversationOnly).
-        let loaded = DiskStore.loadVersioned(
-            [OutboxEntry].self, name: storeName, version: Self.schemaVersion) ?? []
-        entries = loaded.filter { $0.conversationId == conversationId && $0.isVisible }
+        switch DiskStore.loadVersionedResult(
+            [OutboxEntry].self, name: storeName, version: Self.schemaVersion)
+        {
+        case .missing:
+            entries = []
+        case .value(let loaded):
+            entries = loaded.filter { $0.conversationId == conversationId && $0.isVisible }
+        case .incompatible, .unreadable:
+            entries = []
+            persistenceHealthy = false
+            storageWritable = false
+        }
     }
 
     var visibleEntries: [OutboxEntry] {
@@ -92,15 +108,28 @@ final class Outbox {
         entries.contains { $0.status == .pending && !$0.acceptedByServer }
     }
 
-    static func hasVisibleEntries(conversationId: String) -> Bool {
+    static func storedContents(conversationId: String) -> StoredContents {
         let name = "outbox-\(conversationId)"
-        return (DiskStore.loadVersioned(
-            [OutboxEntry].self, name: name, version: Self.schemaVersion) ?? [])
-            .contains { $0.conversationId == conversationId && $0.isVisible }
+        switch DiskStore.loadVersionedResult(
+            [OutboxEntry].self, name: name, version: Self.schemaVersion)
+        {
+        case .missing:
+            return .empty
+        case .value(let entries):
+            return entries.contains {
+                $0.conversationId == conversationId && $0.isVisible
+            } ? .hasVisibleEntries : .empty
+        case .incompatible, .unreadable:
+            return .inaccessible
+        }
     }
 
     @discardableResult
     private func persist() -> Bool {
+        guard storageWritable else {
+            persistenceHealthy = false
+            return false
+        }
         // Terminal entries are pruned at persistence time; they carry no
         // future obligation.
         persistenceHealthy = DiskStore.saveVersioned(
@@ -120,6 +149,7 @@ final class Outbox {
         entries.removeAll()
         suppressedMessageIds.removeAll()
         persistenceHealthy = true
+        storageWritable = true
         DiskStore.remove(name: storeName)
     }
 
@@ -147,10 +177,7 @@ final class Outbox {
             lastError: nil,
             attemptCount: 0)
         entries.append(entry)
-        guard persist() else {
-            entries.removeAll { $0.localId == entry.localId }
-            return nil
-        }
+        persist()
         return entry
     }
 

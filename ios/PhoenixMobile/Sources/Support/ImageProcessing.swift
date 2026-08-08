@@ -7,6 +7,11 @@ import UIKit
 enum ImageProcessing {
     static let maxDimension: CGFloat = 1568
     static let compressionQuality: CGFloat = 0.7
+    static let maxTotalEncodedBytes = 20 * 1024 * 1024
+
+    static func encodedSize(of payloads: [ImagePayload]) -> Int {
+        payloads.reduce(0) { $0 + $1.data.utf8.count }
+    }
 
     /// nil when the data isn't a decodable image.
     static func payload(fromPickedData data: Data) -> ImagePayload? {

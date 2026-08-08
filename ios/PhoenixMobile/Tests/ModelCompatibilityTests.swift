@@ -12,4 +12,13 @@ final class ModelCompatibilityTests: XCTestCase {
         XCTAssertEqual(conversation.displayTitle, "legacy-conversation")
         XCTAssertEqual(conversation.displaySlug, "legacy-conversation")
     }
+
+    func testCoordinatorIdentityComesFromServerRuntimeRole() throws {
+        let conversation = try JSONDecoder().decode(
+            Conversation.self,
+            from: Data(
+                #"{"id":"fleet","slug":"fleet","runtime_role":"coordinator"}"#.utf8))
+
+        XCTAssertTrue(conversation.isCoordinator)
+    }
 }

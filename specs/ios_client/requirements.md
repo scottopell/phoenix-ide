@@ -132,6 +132,7 @@ THE SYSTEM SHALL retain the update by message id
 AND apply it when the message arrives
 
 WHEN a conversation hard-delete event arrives
+OR a reconnect receives a definitive not-found response for that conversation
 THE SYSTEM SHALL remove its transcript, snapshot, outbox, and list entry
 AND disable further interaction with the deleted conversation
 
@@ -453,6 +454,10 @@ AND SHALL NOT delete it
 AND SHALL refuse to overwrite it until the user upgrades or explicitly
 clears the store
 
+WHEN a destructive action depends on an outbox being empty
+THE SYSTEM SHALL treat an unreadable or newer-version outbox as possibly non-empty
+AND SHALL refuse the action without modifying that store
+
 WHEN loading a pre-envelope legacy file
 THE SYSTEM SHALL decode the bare payload as version zero
 
@@ -478,6 +483,8 @@ AND an undecodable image SHALL render a labeled placeholder, never nothing
 WHEN the user attaches photos to a message
 THE SYSTEM SHALL downscale to a bounded long edge and recompress before
 staging
+AND SHALL enforce a total encoded attachment budget below the chat route's
+request-body limit
 AND queue them through the same outbox entry as the text (same
 durability, same idempotent delivery)
 AND surface any photo that failed to load rather than dropping it from

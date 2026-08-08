@@ -72,10 +72,10 @@ final class OutboxTests: XCTestCase {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
         let entry = outbox.enqueue(text: "do not lose me")!
-        XCTAssertTrue(Outbox.hasVisibleEntries(conversationId: "c1"))
+        XCTAssertEqual(Outbox.storedContents(conversationId: "c1"), .hasVisibleEntries)
 
         outbox.dismiss(entry.localId)
-        XCTAssertFalse(Outbox.hasVisibleEntries(conversationId: "c1"))
+        XCTAssertEqual(Outbox.storedContents(conversationId: "c1"), .empty)
     }
 
     @MainActor
@@ -86,16 +86,29 @@ final class OutboxTests: XCTestCase {
         DiskStore.baseDirectory = blockedRoot
 
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "must be durable")
+        let entry = try XCTUnwrap(outbox.enqueue(text: "must be durable"))
         XCTAssertFalse(outbox.persistenceHealthy)
         XCTAssertFalse(outbox.prepareForDelivery(), "POST must stay blocked without a disk copy")
 
         XCTAssertFalse(outbox.prepareForDelivery())
-        XCTAssertTrue(outbox.entries.isEmpty)
+        XCTAssertEqual(outbox.entries.map(\.localId), [entry.localId])
         try FileManager.default.removeItem(at: blockedRoot)
         XCTAssertTrue(outbox.prepareForDelivery())
-        XCTAssertNil(entry)
-        XCTAssertTrue(Outbox(conversationId: "c1").visibleEntries.isEmpty)
+        XCTAssertEqual(
+            Outbox(conversationId: "c1").visibleEntries.map(\.localId),
+            [entry.localId])
+    }
+
+    @MainActor
+    func testArchiveGuardTreatsNewerOutboxAsInaccessible() throws {
+        let root = freshDiskStore()
+        let directory = root.appendingPathComponent("PhoenixMobile", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(#"{"schema_version":999,"payload":[]}"#.utf8).write(
+            to: directory.appendingPathComponent("outbox-c1.json"))
+
+        XCTAssertEqual(Outbox.storedContents(conversationId: "c1"), .inaccessible)
+        XCTAssertFalse(Outbox(conversationId: "c1").persistenceHealthy)
     }
     // MARK: - PostAccepted{AsSteeringQueued, AsPendingReflection}
 

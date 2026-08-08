@@ -91,7 +91,7 @@ final class AttentionMonitor {
     /// Background path: diff, notify, then seed. One notification per
     /// conversation, keyed by conversation id so a newer nudge replaces a
     /// stale one instead of stacking.
-    func checkAndNotify(_ conversations: [Conversation]) async {
+    func checkAndNotify(_ conversations: [Conversation]) {
         let events = Self.diff(previous: snapshot, current: conversations)
         seed(with: conversations)
         guard !events.isEmpty else { return }
@@ -116,7 +116,7 @@ final class AttentionMonitor {
                 identifier: "attention-\(event.conversationId)",
                 content: content,
                 trigger: nil)
-            try? await center.add(request)
+            center.add(request) { _ in }
         }
     }
 

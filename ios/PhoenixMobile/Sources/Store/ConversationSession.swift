@@ -462,6 +462,10 @@ final class ConversationSession {
                 // promptly — the next init resyncs any missed state.
             } catch let error as APIError {
                 if Task.isCancelled { return }
+                if error.isNotFound {
+                    handleHardDeletion()
+                    return
+                }
                 if case .certificatePinMismatch = error {
                     lastErrorToast = error.errorDescription
                     connection = .idle
@@ -775,6 +779,7 @@ final class ConversationSession {
     }
 
     private func handleHardDeletion() {
+        guard !isHardDeleted else { return }
         streamTask?.cancel()
         streamTask = nil
         drainTask?.cancel()

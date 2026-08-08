@@ -84,6 +84,13 @@ enum DiskStore {
         var schema_version: Int?
     }
 
+    enum VersionedLoad<T> {
+        case missing
+        case value(T)
+        case incompatible(storedVersion: Int)
+        case unreadable
+    }
+
     @discardableResult
     static func saveVersioned<T: Encodable>(_ value: T, name: String, version: Int) -> Bool {
         let destination = url(for: name)
@@ -116,27 +123,43 @@ enum DiskStore {
         _ type: T.Type, name: String, version: Int,
         migrate: ((_ storedVersion: Int, _ fileData: Data) -> T?)? = nil
     ) -> T? {
-        guard let data = try? Data(contentsOf: url(for: name)) else { return nil }
+        guard case .value(let value) = loadVersionedResult(
+            type, name: name, version: version, migrate: migrate)
+        else { return nil }
+        return value
+    }
+
+    static func loadVersionedResult<T: Decodable>(
+        _ type: T.Type, name: String, version: Int,
+        migrate: ((_ storedVersion: Int, _ fileData: Data) -> T?)? = nil
+    ) -> VersionedLoad<T> {
+        let source = url(for: name)
+        guard let data = try? Data(contentsOf: source) else {
+            return FileManager.default.fileExists(atPath: source.path) ? .unreadable : .missing
+        }
 
         if let stored = (try? JSONDecoder().decode(VersionProbe.self, from: data))?
             .schema_version
         {
             if stored == version {
-                return (try? JSONDecoder().decode(LoadEnvelope<T>.self, from: data))?.payload
+                guard let payload = try? JSONDecoder().decode(LoadEnvelope<T>.self, from: data)
+                    .payload
+                else { return .unreadable }
+                return .value(payload)
             }
             if stored > version {
-                // Written by a newer app; guessing at the shape risks
-                // corrupting it — treat as absent (never delete on load).
-                return nil
+                return .incompatible(storedVersion: stored)
             }
-            return migrate?(stored, data)
+            guard let migrated = migrate?(stored, data) else { return .unreadable }
+            return .value(migrated)
         }
 
         // Legacy pre-envelope file: the payload was stored bare.
         if let bare = try? JSONDecoder().decode(T.self, from: data) {
-            return bare
+            return .value(bare)
         }
-        return migrate?(0, data)
+        guard let migrated = migrate?(0, data) else { return .unreadable }
+        return .value(migrated)
     }
 
     /// Names (without extension) of stored files matching a prefix. Used to

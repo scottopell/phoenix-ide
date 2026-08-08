@@ -59,6 +59,7 @@ final class AppModel {
         password = Keychain.password(account: Self.passwordAccount) ?? ""
         trustSelfSigned = UserDefaults.standard.object(forKey: Self.trustSelfSignedKey) as? Bool ?? true
         rebuildAPI()
+        adoptCoordinatorIdentityFromList()
         _ = connectivity.addRestoreObserver { [weak self] in
             self?.drainPersistedOutboxes()
             Task { await self?.refreshList() }
@@ -128,6 +129,7 @@ final class AppModel {
         guard let api else { return }
         await listStore.refresh(api: api)
         if listStore.lastError == nil {
+            adoptCoordinatorIdentityFromList()
             // The user is looking at fresh data — nothing here should nudge
             // them later.
             attention.seed(with: listStore.conversations)
@@ -178,12 +180,13 @@ final class AppModel {
               backgroundNudgesEnabled,
               apiGeneration == startedGeneration
         else { return false }
-        await attention.checkAndNotify(fresh)
         guard !Task.isCancelled,
               backgroundNudgesEnabled,
-              apiGeneration == startedGeneration
+              apiGeneration == startedGeneration,
+              listStore.canApplyExternal(startedAt: listToken)
         else { return false }
-        _ = listStore.applyExternal(fresh, startedAt: listToken)
+        guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
+        attention.checkAndNotify(fresh)
         return true
     }
 
@@ -194,6 +197,14 @@ final class AppModel {
     /// Per-server state — cleared on sign-out.
     private(set) var coordinatorConversationId: String? =
         UserDefaults.standard.string(forKey: AppModel.coordinatorIdKey)
+
+    private func adoptCoordinatorIdentityFromList() {
+        guard let coordinator = listStore.conversations.first(where: \.isCoordinator) else {
+            return
+        }
+        coordinatorConversationId = coordinator.id
+        UserDefaults.standard.set(coordinator.id, forKey: Self.coordinatorIdKey)
+    }
 
     /// Resolve the Coordinator conversation to open. Online: get-or-create
     /// on the server (it's an ordinary conversation; everything downstream
@@ -235,7 +246,10 @@ final class AppModel {
     @discardableResult
     func archive(conversationId: String) async -> Bool {
         guard ClientOperation.archive.policy == .onlineOnly else { return false }
-        guard conversationId != coordinatorConversationId else {
+        let serverIdentifiesCoordinator = listStore.conversations.first {
+            $0.id == conversationId
+        }?.isCoordinator == true
+        guard conversationId != coordinatorConversationId, !serverIdentifiesCoordinator else {
             lastActionError = "The Coordinator is a permanent fleet conversation and can't be archived."
             return false
         }
@@ -243,10 +257,25 @@ final class AppModel {
             lastActionError = "Archiving needs a connection — it can't be queued."
             return false
         }
-        guard !Outbox.hasVisibleEntries(conversationId: conversationId),
-              let session = session(for: conversationId),
-              session.beginArchiving()
-        else {
+        let hasInMemoryMessages = sessions[conversationId]?.outbox.visibleEntries.isEmpty == false
+        guard !hasInMemoryMessages else {
+            lastActionError =
+                "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+            return false
+        }
+        switch Outbox.storedContents(conversationId: conversationId) {
+        case .empty:
+            break
+        case .hasVisibleEntries:
+            lastActionError =
+                "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+            return false
+        case .inaccessible:
+            lastActionError =
+                "This conversation's queued-message store can't be read by this app version. Upgrade or clear the cache before archiving."
+            return false
+        }
+        guard let session = session(for: conversationId), session.beginArchiving() else {
             lastActionError =
                 "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
             return false

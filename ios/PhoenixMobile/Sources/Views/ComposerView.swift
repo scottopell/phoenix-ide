@@ -137,6 +137,7 @@ struct ComposerView: View {
         attachmentError = nil
         var loaded: [ImagePayload] = []
         var failed = 0
+        var oversized = 0
         for item in items {
             guard !Task.isCancelled, generation == attachmentLoadGeneration else { return }
             guard attachments.count + loaded.count < Self.maxAttachments else { break }
@@ -144,16 +145,28 @@ struct ComposerView: View {
                let payload = await Task.detached(priority: .userInitiated, operation: {
                    ImageProcessing.payload(fromPickedData: data)
                }).value {
-                loaded.append(payload)
+                let proposed = attachments + loaded + [payload]
+                if ImageProcessing.encodedSize(of: proposed)
+                    <= ImageProcessing.maxTotalEncodedBytes {
+                    loaded.append(payload)
+                } else {
+                    oversized += 1
+                }
             } else {
                 failed += 1
             }
         }
         guard !Task.isCancelled, generation == attachmentLoadGeneration else { return }
         attachments.append(contentsOf: loaded)
-        if failed > 0 {
-            attachmentError = "Couldn't load \(failed) selected image\(failed == 1 ? "" : "s")."
+        var errors: [String] = []
+        if oversized > 0 {
+            errors.append(
+                "\(oversized) image\(oversized == 1 ? " was" : "s were") too large for one message")
         }
+        if failed > 0 {
+            errors.append("\(failed) image\(failed == 1 ? "" : "s") couldn't be loaded")
+        }
+        attachmentError = errors.isEmpty ? nil : errors.joined(separator: "; ") + "."
         pickerItems = []
         isLoadingAttachments = false
         attachmentLoadTask = nil

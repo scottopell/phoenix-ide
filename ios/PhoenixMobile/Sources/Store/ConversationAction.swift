@@ -28,7 +28,7 @@ enum ConversationAction: Equatable {
     /// Answer the agent's questions (awaiting_user_response). Answers are
     /// keyed by question text, encoded per QuestionAnswers.
     case respondToQuestions(answers: [String: String])
-    /// Dismiss the questions without answering; the agent proceeds.
+    /// Dismiss the questions without answering and return the conversation to idle.
     case dismissQuestion
 
     var waitsForAuthoritativeStateChange: Bool {

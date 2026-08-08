@@ -99,9 +99,13 @@ final class ConversationListStore {
         ExternalRefreshToken(generation: externalMutationGeneration)
     }
 
+    func canApplyExternal(startedAt token: ExternalRefreshToken) -> Bool {
+        !isRefreshing && token.generation == externalMutationGeneration
+    }
+
     @discardableResult
     func applyExternal(_ fresh: [Conversation], startedAt token: ExternalRefreshToken) -> Bool {
-        guard !isRefreshing, token.generation == externalMutationGeneration else { return false }
+        guard canApplyExternal(startedAt: token) else { return false }
         apply(fresh)
         lastError = nil
         return true

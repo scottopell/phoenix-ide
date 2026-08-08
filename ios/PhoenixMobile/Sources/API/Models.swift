@@ -28,6 +28,9 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable, Sendable {
     /// Server-derived "user must act" flag paired with presentation_mode.
     var requires_action: Bool?
     var transcript_generation: Int64?
+    var runtime_role: String?
+
+    var isCoordinator: Bool { runtime_role == "coordinator" }
 
     /// `state` is a discriminated union on the wire — either a bare string
     /// or `{ "type": "...", ... }`. Both shapes collapse to the type name.

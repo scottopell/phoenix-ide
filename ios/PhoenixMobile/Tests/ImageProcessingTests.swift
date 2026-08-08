@@ -54,4 +54,14 @@ final class ImageProcessingTests: XCTestCase {
         XCTAssertNil(ImageProcessing.payload(fromPickedData: Data("not an image".utf8)))
         XCTAssertNil(ImageProcessing.payload(fromPickedData: Data()))
     }
+
+    func testEncodedSizeBudgetCountsWirePayloadBytes() {
+        let payloads = [
+            ImagePayload(data: String(repeating: "a", count: 12), media_type: "image/jpeg"),
+            ImagePayload(data: String(repeating: "b", count: 30), media_type: "image/jpeg"),
+        ]
+
+        XCTAssertEqual(ImageProcessing.encodedSize(of: payloads), 42)
+        XCTAssertGreaterThan(ImageProcessing.maxTotalEncodedBytes, 42)
+    }
 }

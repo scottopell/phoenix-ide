@@ -129,14 +129,16 @@ struct ConversationListView: View {
                     }
                 }
                 ForEach(model.listStore.conversations) { conversation in
+                    let isCoordinator = conversation.isCoordinator
+                        || conversation.id == model.coordinatorConversationId
                     NavigationLink(value: conversation.id) {
                         ConversationRow(
                             conversation: conversation,
-                            isCoordinator: conversation.id == model.coordinatorConversationId)
+                            isCoordinator: isCoordinator)
                     }
                     .accessibilityIdentifier("conversationList.row.\(conversation.id)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if conversation.id != model.coordinatorConversationId {
+                        if !isCoordinator {
                             Button {
                                 Task { await model.archive(conversationId: conversation.id) }
                             } label: {
