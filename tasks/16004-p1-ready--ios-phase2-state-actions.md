@@ -11,10 +11,8 @@ Complete the native iOS conversation state and action policy layer on top of the
 
 ## Primary paths
 
-- `ios/PhoenixClient/App/`
-- `ios/PhoenixClient/Networking/`
-- `ios/PhoenixClient/Views/`
-- `ios/PhoenixClientTests/`
+- `ios/PhoenixMobile/Sources/`
+- `ios/PhoenixMobile/Tests/`
 - `specs/ios_client/`
 
 ## Acceptance

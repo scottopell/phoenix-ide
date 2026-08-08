@@ -164,6 +164,10 @@ THE SYSTEM SHALL authenticate every request with `Authorization: Bearer
 AND store the password in the iOS Keychain
 AND reject server configurations that would send the password over plain HTTP
 
+WHEN the password cannot be persisted in the iOS Keychain
+THE SYSTEM SHALL reject the new server configuration
+AND SHALL NOT commit its URL or in-memory credential
+
 WHEN the server presents a certificate that passes standard trust evaluation
 THE SYSTEM SHALL accept it without pinning
 
@@ -205,6 +209,9 @@ AND require connectivity (creation is not queued offline)
 WHEN conversation creation fails without an authoritative server response
 THE SYSTEM SHALL persist the attempt's immutable message id and inputs
 AND prevent dismissing the attempt until an idempotent retry resolves it
+
+A successful HTTP response whose conversation payload cannot be decoded
+SHALL be treated as lacking an authoritative creation result
 
 WHEN conversation creation is rejected before a request can be sent because
 the pinned certificate changed

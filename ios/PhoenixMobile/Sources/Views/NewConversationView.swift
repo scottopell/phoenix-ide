@@ -220,8 +220,13 @@ struct NewConversationView: View {
             dismiss()
         } catch {
             errorText = (error as? APIError)?.errorDescription ?? error.localizedDescription
-            if (error as? APIError)?.isTransport != true {
-                clearPendingAttempt()
+            if let apiError = error as? APIError {
+                switch apiError {
+                case .http, .certificatePinMismatch, .invalidURL:
+                    clearPendingAttempt()
+                case .transport, .decoding:
+                    break
+                }
             }
         }
     }

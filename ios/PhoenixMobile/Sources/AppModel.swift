@@ -23,12 +23,7 @@ final class AppModel {
         }
     }
 
-    var password: String {
-        didSet {
-            Keychain.setPassword(password, account: Self.passwordAccount)
-            rebuildAPI()
-        }
-    }
+    private(set) var password: String
 
     var trustSelfSigned: Bool {
         didSet {
@@ -82,6 +77,13 @@ final class AppModel {
         sessions.removeAll()
         for session in drainSessions.values { session.stop() }
         drainSessions.removeAll()
+    }
+
+    func configure(serverURL: String, password: String, trustSelfSigned: Bool) throws {
+        try Keychain.setPassword(password, account: Self.passwordAccount)
+        self.password = password
+        self.trustSelfSigned = trustSelfSigned
+        serverURLString = serverURL
     }
 
     func session(for conversationId: String) -> ConversationSession? {

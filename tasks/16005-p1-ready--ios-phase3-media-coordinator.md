@@ -11,12 +11,9 @@ Complete media, coordinator, and background lifecycle support for the native iOS
 
 ## Primary paths
 
-- `ios/PhoenixClient/App/`
-- `ios/PhoenixClient/Networking/`
-- `ios/PhoenixClient/Persistence/`
-- `ios/PhoenixClient/Views/`
-- `ios/PhoenixClientTests/`
-- `ios/PhoenixClientUITests/`
+- `ios/PhoenixMobile/Sources/`
+- `ios/PhoenixMobile/Tests/`
+- `ios/PhoenixMobile/UITests/`
 - `specs/ios_client/`
 
 ## Acceptance

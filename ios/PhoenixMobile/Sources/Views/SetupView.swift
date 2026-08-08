@@ -83,9 +83,10 @@ struct SetupView: View {
                     : "Incorrect password."
                 return
             }
-            model.trustSelfSigned = trustSelfSigned
-            model.password = passwordText
-            model.serverURLString = urlText
+            try model.configure(
+                serverURL: urlText,
+                password: passwordText,
+                trustSelfSigned: trustSelfSigned)
             await model.refreshList()
         } catch {
             errorText = (error as? APIError)?.errorDescription ?? error.localizedDescription

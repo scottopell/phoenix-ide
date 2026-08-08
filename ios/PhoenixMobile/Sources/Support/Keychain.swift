@@ -6,19 +6,34 @@ import Security
 enum Keychain {
     private static let service = "com.phoenix.mobile"
 
-    static func setPassword(_ password: String, account: String) {
+    struct StoreError: LocalizedError {
+        let status: OSStatus
+
+        var errorDescription: String? {
+            "Password could not be saved securely (Keychain status \(status))."
+        }
+    }
+
+    static func setPassword(_ password: String, account: String) throws {
         let data = Data(password.utf8)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        // Delete-then-add keeps this a single upsert path.
-        SecItemDelete(query as CFDictionary)
+        let values: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+        ]
+        let updateStatus = SecItemUpdate(query as CFDictionary, values as CFDictionary)
+        if updateStatus == errSecSuccess { return }
+        guard updateStatus == errSecItemNotFound else {
+            throw StoreError(status: updateStatus)
+        }
         var attributes = query
-        attributes[kSecValueData as String] = data
-        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(attributes as CFDictionary, nil)
+        values.forEach { attributes[$0.key] = $0.value }
+        let addStatus = SecItemAdd(attributes as CFDictionary, nil)
+        guard addStatus == errSecSuccess else { throw StoreError(status: addStatus) }
     }
 
     static func password(account: String) -> String? {

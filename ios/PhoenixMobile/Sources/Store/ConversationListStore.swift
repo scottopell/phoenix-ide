@@ -9,7 +9,7 @@ import Observation
 final class ConversationListStore {
     private(set) var conversations: [Conversation] = []
     private(set) var lastRefreshed: Date?
-    private(set) var isRefreshing = false
+    var isRefreshing: Bool { refreshToken != nil }
     private(set) var lastError: String?
 
     private static let cacheName = "conversations"
@@ -23,6 +23,7 @@ final class ConversationListStore {
     /// discards its response, so an in-flight fetch from the previous
     /// server cannot repopulate a just-cleared cache.
     private var generation = 0
+    private var refreshToken: UUID?
 
     init() {
         conversations = DiskStore.load([Conversation].self, name: Self.cacheName) ?? []
@@ -30,9 +31,12 @@ final class ConversationListStore {
     }
 
     func refresh(api: PhoenixAPI) async {
-        guard !isRefreshing else { return }
-        isRefreshing = true
-        defer { isRefreshing = false }
+        guard refreshToken == nil else { return }
+        let token = UUID()
+        refreshToken = token
+        defer {
+            if refreshToken == token { refreshToken = nil }
+        }
         let startedGeneration = generation
         do {
             let fresh = try await api.listConversations()
@@ -84,6 +88,7 @@ final class ConversationListStore {
     /// cleared cache with the previous server's data.
     func reset() {
         generation += 1
+        refreshToken = nil
         conversations = []
         lastRefreshed = nil
         lastError = nil
