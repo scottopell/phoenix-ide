@@ -60,6 +60,18 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "5.9"
 
+  PhoenixMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    dependencies:
+      - target: PhoenixMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+
 # Shared scheme so `xcodebuild test -scheme PhoenixMobile` works in CI
 # without anyone having opened Xcode first.
 schemes:
@@ -74,3 +86,15 @@ schemes:
       config: Debug
       targets:
         - PhoenixMobileTests
+
+  # Opt-in live-server journey. Kept separate so normal CI and unit-test
+  # runs never depend on a running Phoenix instance.
+  PhoenixMobileUIQA:
+    build:
+      targets:
+        PhoenixMobile: all
+        PhoenixMobileUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - PhoenixMobileUITests
