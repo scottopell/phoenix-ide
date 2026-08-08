@@ -131,9 +131,9 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
-    func testCanonicalAuthoritativeMessageReconcilesOptimisticEntry() throws {
+    func testCanonicalAuthoritativeMessageReconcilesOptimisticEntry() async throws {
         let session = makeSession()
-        let entry = session.outbox.enqueue(text: "sent once")!
+        let entry = await session.outbox.enqueue(text: "sent once")!
 
         session.receive(.initSnapshot(.init(
             conversation: try conversation(),

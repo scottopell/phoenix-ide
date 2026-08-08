@@ -14,6 +14,7 @@ struct ComposerView: View {
     @State private var isLoadingAttachments = false
     @State private var attachmentLoadGeneration = UUID()
     @State private var attachmentLoadTask: Task<Void, Never>?
+    @State private var isSubmitting = false
     @FocusState private var focused: Bool
 
     private static let maxAttachments = 4
@@ -101,6 +102,7 @@ struct ComposerView: View {
     private var canSend: Bool {
         session.acceptsChatMessage
             && !isLoadingAttachments
+            && !isSubmitting
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !attachments.isEmpty)
     }
@@ -174,10 +176,16 @@ struct ComposerView: View {
 
     private func send() {
         guard canSend else { return }
-        if session.send(text: draft, images: attachments) {
-            draft = ""
-            attachments = []
-            attachmentError = nil
+        let submittedDraft = draft
+        let submittedAttachments = attachments
+        isSubmitting = true
+        Task {
+            defer { isSubmitting = false }
+            if await session.send(text: submittedDraft, images: submittedAttachments) {
+                if draft == submittedDraft { draft = "" }
+                if attachments == submittedAttachments { attachments = [] }
+                attachmentError = nil
+            }
         }
     }
 

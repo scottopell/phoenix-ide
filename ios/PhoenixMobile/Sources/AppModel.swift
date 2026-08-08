@@ -276,6 +276,9 @@ final class AppModel {
                 "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
             return false
         }
+        if let session = sessions[conversationId] {
+            _ = await session.outbox.flushPersistence()
+        }
         switch Outbox.storedContents(conversationId: conversationId) {
         case .empty:
             break

@@ -45,10 +45,10 @@ final class OutboxTests: XCTestCase {
     // MARK: - EnqueueLocalMessage
 
     @MainActor
-    func testEnqueueCreatesPendingVisibleEntry() {
+    func testEnqueueCreatesPendingVisibleEntry() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")!
+        let entry = await outbox.enqueue(text: "hi")!
         XCTAssertEqual(entry.status, .pending)
         XCTAssertFalse(entry.acceptedByServer)
         XCTAssertTrue(entry.isVisible)
@@ -56,11 +56,11 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testEnqueuePersistsBeforeAnySendAttempt() {
+    func testEnqueuePersistsBeforeAnySendAttempt() async {
         // The entry must survive a "restart" (new instance) even though no
         // POST was ever attempted — enqueue itself is the durability point.
         freshDiskStore()
-        let entry = Outbox(conversationId: "c1").enqueue(text: "queued in a tunnel")!
+        let entry = await Outbox(conversationId: "c1").enqueue(text: "queued in a tunnel")!
         let rehydrated = Outbox(conversationId: "c1")
         XCTAssertEqual(rehydrated.visibleEntries.map(\.localId), [entry.localId])
         XCTAssertEqual(rehydrated.visibleEntries[0].text, "queued in a tunnel")
@@ -68,39 +68,44 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testArchiveGuardSeesPersistedVisibleEntries() {
+    func testArchiveGuardSeesPersistedVisibleEntries() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "do not lose me")!
+        let entry = await outbox.enqueue(text: "do not lose me")!
         XCTAssertEqual(Outbox.storedContents(conversationId: "c1"), .hasVisibleEntries)
 
         outbox.dismiss(entry.localId)
+        _ = await outbox.flushPersistence()
         XCTAssertEqual(Outbox.storedContents(conversationId: "c1"), .empty)
     }
 
     @MainActor
-    func testDeliveryRemainsBlockedUntilFailedEnqueueWriteRecovers() throws {
+    func testDeliveryRemainsBlockedUntilFailedEnqueueWriteRecovers() async throws {
         let blockedRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-outbox-blocked-\(UUID().uuidString)")
         try Data("not a directory".utf8).write(to: blockedRoot)
         DiskStore.baseDirectory = blockedRoot
 
         let outbox = Outbox(conversationId: "c1")
-        let entry = try XCTUnwrap(outbox.enqueue(text: "must be durable"))
+        let queuedEntry = await outbox.enqueue(text: "must be durable")
+        let entry = try XCTUnwrap(queuedEntry)
         XCTAssertFalse(outbox.persistenceHealthy)
-        XCTAssertFalse(outbox.prepareForDelivery(), "POST must stay blocked without a disk copy")
+        let firstPreparation = await outbox.prepareForDelivery()
+        XCTAssertFalse(firstPreparation, "POST must stay blocked without a disk copy")
 
-        XCTAssertFalse(outbox.prepareForDelivery())
+        let secondPreparation = await outbox.prepareForDelivery()
+        XCTAssertFalse(secondPreparation)
         XCTAssertEqual(outbox.entries.map(\.localId), [entry.localId])
         try FileManager.default.removeItem(at: blockedRoot)
-        XCTAssertTrue(outbox.prepareForDelivery())
+        let recoveredPreparation = await outbox.prepareForDelivery()
+        XCTAssertTrue(recoveredPreparation)
         XCTAssertEqual(
             Outbox(conversationId: "c1").visibleEntries.map(\.localId),
             [entry.localId])
     }
 
     @MainActor
-    func testArchiveGuardTreatsNewerOutboxAsInaccessible() throws {
+    func testArchiveGuardTreatsNewerOutboxAsInaccessible() async throws {
         let root = freshDiskStore()
         let directory = root.appendingPathComponent("PhoenixMobile", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -113,20 +118,20 @@ final class OutboxTests: XCTestCase {
     // MARK: - PostAccepted{AsSteeringQueued, AsPendingReflection}
 
     @MainActor
-    func testAcceptedSteeringBecomesSteeringQueued() {
+    func testAcceptedSteeringBecomesSteeringQueued() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")!
+        let entry = await outbox.enqueue(text: "hi")!
         outbox.markAccepted(entry.localId, steering: true)
         XCTAssertEqual(outbox.entries[0].status, .steeringQueued)
         XCTAssertTrue(outbox.entries[0].acceptedByServer)
     }
 
     @MainActor
-    func testAcceptedNonSteeringStaysPendingUntilReflected() {
+    func testAcceptedNonSteeringStaysPendingUntilReflected() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")!
+        let entry = await outbox.enqueue(text: "hi")!
         outbox.markAccepted(entry.localId, steering: false)
         XCTAssertEqual(outbox.entries[0].status, .pending)
         XCTAssertTrue(outbox.entries[0].acceptedByServer)
@@ -136,10 +141,10 @@ final class OutboxTests: XCTestCase {
     // MARK: - PostFailedIsRetryable / RetryFailedMessage / DismissLocalMessage
 
     @MainActor
-    func testServerRejectionMarksFailedWithError() {
+    func testServerRejectionMarksFailedWithError() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")!
+        let entry = await outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "HTTP 400: bad request")
         XCTAssertEqual(outbox.entries[0].status, .failed)
         XCTAssertEqual(outbox.entries[0].lastError, "HTTP 400: bad request")
@@ -147,10 +152,10 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testRetryReturnsFailedEntryToPending() {
+    func testRetryReturnsFailedEntryToPending() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")!
+        let entry = await outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "boom")
         outbox.retry(entry.localId)
         XCTAssertEqual(outbox.entries[0].status, .pending)
@@ -158,23 +163,24 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testRetryIsGuardedToRetryableStates() {
+    func testRetryIsGuardedToRetryableStates() async {
         // Spec precondition: retry applies to failed / recoverable only.
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")!
+        let entry = await outbox.enqueue(text: "hi")!
         outbox.markAccepted(entry.localId, steering: true)
         outbox.retry(entry.localId)
         XCTAssertEqual(outbox.entries[0].status, .steeringQueued, "retry must not touch steering_queued")
     }
 
     @MainActor
-    func testDismissHidesEntryAndPrunesOnRestart() {
+    func testDismissHidesEntryAndPrunesOnRestart() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")!
+        let entry = await outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "boom")
         outbox.dismiss(entry.localId)
+        _ = await outbox.flushPersistence()
         XCTAssertTrue(outbox.visibleEntries.isEmpty)
         // Terminal entries carry no future obligation — gone after restart.
         XCTAssertTrue(Outbox(conversationId: "c1").entries.isEmpty)
@@ -183,20 +189,20 @@ final class OutboxTests: XCTestCase {
     // MARK: - AuthoritativeMessageReconcilesQueueEntry
 
     @MainActor
-    func testReconcileHidesEntriesPresentInServerHistory() {
+    func testReconcileHidesEntriesPresentInServerHistory() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let a = outbox.enqueue(text: "first")!
-        let b = outbox.enqueue(text: "second")!
+        let a = await outbox.enqueue(text: "first")!
+        let b = await outbox.enqueue(text: "second")!
         outbox.reconcile(authoritativeMessageIds: [a.localId])
         XCTAssertEqual(outbox.visibleEntries.map(\.localId), [b.localId])
     }
 
     @MainActor
-    func testAuthoritativeHistorySuppressesDuplicateBeforeDurableReconciliation() {
+    func testAuthoritativeHistorySuppressesDuplicateBeforeDurableReconciliation() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "first")!
+        let entry = await outbox.enqueue(text: "first")!
         outbox.suppress(authoritativeMessageIds: [entry.localId])
 
         XCTAssertTrue(outbox.visibleEntries.isEmpty)
@@ -205,7 +211,7 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testReconcileRecognizesConversationScopedCanonicalMessageId() {
+    func testReconcileRecognizesConversationScopedCanonicalMessageId() async {
         freshDiskStore()
         let entry = makeEntry(
             conversationId: "c1", status: .recoverableInconsistency,
@@ -220,10 +226,10 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testCanonicalMessageIdFromAnotherConversationDoesNotReconcile() {
+    func testCanonicalMessageIdFromAnotherConversationDoesNotReconcile() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "scoped identity")!
+        let entry = await outbox.enqueue(text: "scoped identity")!
 
         outbox.reconcile(authoritativeMessageIds: ["c2:\(entry.localId)"])
 
@@ -231,21 +237,21 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testReconcileAppliesToSteeringQueuedEntries() {
+    func testReconcileAppliesToSteeringQueuedEntries() async {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "steer me")!
+        let entry = await outbox.enqueue(text: "steer me")!
         outbox.markAccepted(entry.localId, steering: true)
         outbox.reconcile(authoritativeMessageIds: [entry.localId])
         XCTAssertTrue(outbox.visibleEntries.isEmpty)
     }
 
     @MainActor
-    func testReconcileAppliesToRehydratedEntriesAfterRestart() {
+    func testReconcileAppliesToRehydratedEntriesAfterRestart() async {
         // Identity join must hold across app restarts: the persisted
         // localId is what matches the server's message_id.
         freshDiskStore()
-        let entry = Outbox(conversationId: "c1").enqueue(text: "hi")!
+        let entry = await Outbox(conversationId: "c1").enqueue(text: "hi")!
         let rehydrated = Outbox(conversationId: "c1")
         rehydrated.reconcile(authoritativeMessageIds: [entry.localId])
         XCTAssertTrue(rehydrated.visibleEntries.isEmpty)
@@ -254,7 +260,7 @@ final class OutboxTests: XCTestCase {
     // MARK: - RehydrateQueueForConversationOnly
 
     @MainActor
-    func testForeignConversationEntriesAreDroppedOnRehydration() {
+    func testForeignConversationEntriesAreDroppedOnRehydration() async {
         // An entry tagged with another conversation can never reconcile
         // here — it must be unrenderable, not a phantom pending bubble.
         freshDiskStore()
@@ -266,11 +272,11 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testQueuesAreScopedPerConversation() {
+    func testQueuesAreScopedPerConversation() async {
         freshDiskStore()
         let a = Outbox(conversationId: "a")
         let b = Outbox(conversationId: "b")
-        _ = a.enqueue(text: "for a")
+        _ = await a.enqueue(text: "for a")
         XCTAssertTrue(b.entries.isEmpty)
         XCTAssertTrue(Outbox(conversationId: "b").entries.isEmpty)
     }
@@ -278,7 +284,7 @@ final class OutboxTests: XCTestCase {
     // MARK: - AcceptedButCausallyProvenMissingBecomesRecoverable (time approximation)
 
     @MainActor
-    func testStaleAcceptedPendingEntrySurfacesAsRecoverable() {
+    func testStaleAcceptedPendingEntrySurfacesAsRecoverable() async {
         freshDiskStore()
         let stale = makeEntry(
             conversationId: "c1", status: .pending, acceptedByServer: true,
@@ -291,7 +297,7 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testStalenessWindowRunsFromAcceptanceNotComposition() {
+    func testStalenessWindowRunsFromAcceptanceNotComposition() async {
         // A message composed offline long ago but accepted just now must
         // get the full window before being flagged — otherwise every
         // subway-composed message briefly shows a false alarm on arrival.
@@ -307,7 +313,7 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testSteeringQueuedIsExemptFromStalenessSurfacing() {
+    func testSteeringQueuedIsExemptFromStalenessSurfacing() async {
         // A steering-queued entry legitimately waits out the current turn.
         freshDiskStore()
         let steering = makeEntry(
@@ -320,7 +326,7 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testUnacceptedPendingEntryIsExemptFromStalenessSurfacing() {
+    func testUnacceptedPendingEntryIsExemptFromStalenessSurfacing() async {
         // Never-accepted entries are simply waiting for connectivity;
         // they must stay quietly pending, not alarm the user.
         freshDiskStore()
@@ -334,12 +340,12 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testDismissedEntryIsNotResurrectedByLateAcceptOrFailure() {
+    func testDismissedEntryIsNotResurrectedByLateAcceptOrFailure() async {
         // A replayed steer_message_queued event or a POST that completes
         // after the user discarded the entry must not bring it back.
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")!
+        let entry = await outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "boom")
         outbox.dismiss(entry.localId)
         outbox.markAccepted(entry.localId, steering: true)
@@ -350,7 +356,7 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testRecoverableEntryCanBeRetriedOrDismissed() {
+    func testRecoverableEntryCanBeRetriedOrDismissed() async {
         freshDiskStore()
         let stale = makeEntry(
             conversationId: "c1", status: .recoverableInconsistency, acceptedByServer: true,

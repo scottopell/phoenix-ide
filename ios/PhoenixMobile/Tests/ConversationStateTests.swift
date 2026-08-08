@@ -288,7 +288,8 @@ final class ConversationStateTests: XCTestCase {
             ConversationState.awaitingTaskApproval(title: "", priority: "", plan: "")
                 .acceptsChatMessage)
         XCTAssertFalse(ConversationState.contextExhausted.acceptsChatMessage)
-        XCTAssertFalse(ConversationState.handedOff.acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.handedOff(successorConversationId: nil).acceptsChatMessage)
         XCTAssertFalse(ConversationState.terminal.acceptsChatMessage)
         XCTAssertFalse(ConversationState.other(type: "provisioning").acceptsChatMessage)
     }

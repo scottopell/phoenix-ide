@@ -1,5 +1,30 @@
 import Foundation
 
+/// Serial background writer for one versioned store. Revisions prevent an
+/// older suspended save from overwriting a newer snapshot.
+actor VersionedDiskWriter {
+    private let destination: URL
+    private let version: Int
+    private var latestRevision = 0
+
+    init(destination: URL, version: Int) {
+        self.destination = destination
+        self.version = version
+    }
+
+    func save<T: Encodable & Sendable>(_ value: T, revision: Int) -> Bool {
+        guard revision >= latestRevision else { return true }
+        latestRevision = revision
+        return DiskStore.writeVersioned(value, to: destination, version: version)
+    }
+
+    func remove(revision: Int) {
+        guard revision >= latestRevision else { return }
+        latestRevision = revision
+        try? FileManager.default.removeItem(at: destination)
+    }
+}
+
 /// Main-actor JSON persistence under Application Support. Versioned loads
 /// decode matching envelopes, delegate older payloads to the supplied
 /// migration, reject newer envelopes, and accept bare legacy payloads as v0.
@@ -72,7 +97,21 @@ enum DiskStore {
 
     @discardableResult
     static func saveVersioned<T: Encodable>(_ value: T, name: String, version: Int) -> Bool {
-        let destination = url(for: name)
+        writeVersioned(value, to: url(for: name), version: version)
+    }
+
+    nonisolated fileprivate static func writeVersioned<T: Encodable>(
+        _ value: T,
+        to destination: URL,
+        version: Int
+    ) -> Bool {
+        do {
+            try FileManager.default.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+        } catch {
+            return false
+        }
         if let existing = try? Data(contentsOf: destination),
            let stored = (try? JSONDecoder().decode(VersionProbe.self, from: existing))?
             .schema_version,
@@ -92,6 +131,10 @@ enum DiskStore {
         } catch {
             return false
         }
+    }
+
+    static func versionedWriter(name: String, version: Int) -> VersionedDiskWriter {
+        VersionedDiskWriter(destination: url(for: name), version: version)
     }
 
     /// Load a versioned store. `migrate` receives the stored version and

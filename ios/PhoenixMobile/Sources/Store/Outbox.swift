@@ -6,8 +6,8 @@ import Observation
 /// contract in specs/user_message_queue/user_message_queue.allium:
 /// `localId` doubles as the POST `message_id`, so retries are idempotent
 /// and reconciliation joins that submitted identity to server history.
-struct OutboxEntry: Codable, Identifiable, Equatable {
-    enum Status: String, Codable {
+struct OutboxEntry: Codable, Identifiable, Equatable, Sendable {
+    enum Status: String, Codable, Sendable {
         /// Authored; awaiting send or awaiting reflection in server history.
         case pending
         /// The server definitively rejected the send; manual retry required.
@@ -73,16 +73,18 @@ final class Outbox {
     /// won't survive an app restart. Cleared by the next successful write.
     private(set) var persistenceHealthy = true
     private var storageWritable = true
+    private let writer: VersionedDiskWriter
+    private var persistenceRevision = 0
 
-    /// Bump when OutboxEntry's persisted shape changes incompatibly, and
-    /// add a migrate branch below (DiskStore versioning rule). v1 is the
-    /// full current shape; pre-envelope legacy files load as bare payload.
+    /// v1 stores visible OutboxEntry values in a versioned envelope.
     static let schemaVersion = 1
 
     private var storeName: String { "outbox-\(conversationId)" }
 
     init(conversationId: String) {
         self.conversationId = conversationId
+        self.writer = DiskStore.versionedWriter(
+            name: "outbox-\(conversationId)", version: Self.schemaVersion)
         // Rehydrate only entries tagged with this conversation — a foreign
         // entry can never reconcile here and must not render (spec rule
         // RehydrateQueueForConversationOnly).
@@ -125,24 +127,45 @@ final class Outbox {
     }
 
     @discardableResult
-    private func persist() -> Bool {
+    private func persist() async -> Bool {
         guard storageWritable else {
             persistenceHealthy = false
             return false
         }
-        // Terminal entries are pruned at persistence time; they carry no
-        // future obligation.
-        persistenceHealthy = DiskStore.saveVersioned(
-            entries.filter(\.isVisible), name: storeName, version: Self.schemaVersion)
-        return persistenceHealthy
+        persistenceRevision += 1
+        let revision = persistenceRevision
+        let snapshot = entries.filter(\.isVisible)
+        let saved = await writer.save(snapshot, revision: revision)
+        if persistenceRevision == revision {
+            persistenceHealthy = saved
+        }
+        return saved
+    }
+
+    private func persistEventually() {
+        guard storageWritable else {
+            persistenceHealthy = false
+            return
+        }
+        persistenceRevision += 1
+        let revision = persistenceRevision
+        let snapshot = entries.filter(\.isVisible)
+        Task {
+            let saved = await writer.save(snapshot, revision: revision)
+            guard persistenceRevision == revision else { return }
+            persistenceHealthy = saved
+        }
     }
 
     /// Re-establish the enqueue-before-POST durability point immediately
     /// before delivery. A transiently failed enqueue write can recover here;
     /// a continuing failure keeps every entry unsendable.
-    func prepareForDelivery() -> Bool {
-        persist()
-        return persistenceHealthy
+    func prepareForDelivery() async -> Bool {
+        await persist()
+    }
+
+    func flushPersistence() async -> Bool {
+        await persist()
     }
 
     /// A hard-deleted conversation owns no remaining local delivery state.
@@ -151,13 +174,15 @@ final class Outbox {
         suppressedMessageIds.removeAll()
         persistenceHealthy = true
         storageWritable = true
-        DiskStore.remove(name: storeName)
+        persistenceRevision += 1
+        let revision = persistenceRevision
+        Task { await writer.remove(revision: revision) }
     }
 
     private func update(_ localId: String, _ mutate: (inout OutboxEntry) -> Void) {
         guard let idx = entries.firstIndex(where: { $0.localId == localId }) else { return }
         mutate(&entries[idx])
-        persist()
+        persistEventually()
     }
 
     // MARK: - Contract transitions
@@ -165,7 +190,7 @@ final class Outbox {
     /// EnqueueLocalMessage: the entry exists (and persists) before any POST
     /// is attempted, so navigation or connection loss cannot erase the
     /// user's words.
-    func enqueue(text: String, images: [ImagePayload] = []) -> OutboxEntry? {
+    func enqueue(text: String, images: [ImagePayload] = []) async -> OutboxEntry? {
         let entry = OutboxEntry(
             localId: UUID().uuidString.lowercased(),
             conversationId: conversationId,
@@ -178,7 +203,7 @@ final class Outbox {
             lastError: nil,
             attemptCount: 0)
         entries.append(entry)
-        persist()
+        _ = await persist()
         return entry
     }
 
@@ -258,7 +283,7 @@ final class Outbox {
                 changed = true
             }
         }
-        if changed { persist() }
+        if changed { persistEventually() }
     }
 
     /// AcceptedButCausallyProvenMissingBecomesRecoverable, approximated by
@@ -279,6 +304,6 @@ final class Outbox {
                 changed = true
             }
         }
-        if changed { persist() }
+        if changed { persistEventually() }
     }
 }

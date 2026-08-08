@@ -269,14 +269,14 @@ final class ConversationSession {
     /// failed. Images ride the same outbox path as text — same durability,
     /// same idempotent delivery.
     @discardableResult
-    func send(text: String, images: [ImagePayload] = []) -> Bool {
+    func send(text: String, images: [ImagePayload] = []) async -> Bool {
         guard !isHardDeleted else { return false }
         guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!trimmed.isEmpty || !images.isEmpty), acceptsChatMessage else {
             return false
         }
-        guard outbox.enqueue(text: trimmed, images: images) != nil else {
+        guard await outbox.enqueue(text: trimmed, images: images) != nil else {
             lastErrorToast = "Message could not be saved on this device. Free storage and try again."
             return false
         }
@@ -317,7 +317,7 @@ final class ConversationSession {
             while !Task.isCancelled {
                 // Never POST an entry whose durable copy is missing. This
                 // retries the persistence point on every delivery trigger.
-                guard outbox.prepareForDelivery() else { return }
+                guard await outbox.prepareForDelivery() else { return }
                 let sendable = outbox.entries.filter {
                     $0.status == .pending && !$0.acceptedByServer
                         && !inFlight.contains($0.localId)
