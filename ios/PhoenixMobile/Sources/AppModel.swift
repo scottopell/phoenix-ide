@@ -127,6 +127,7 @@ final class AppModel {
 
     func refreshList() async {
         guard let api else { return }
+        attentionEvidenceGeneration &+= 1
         await listStore.refresh(api: api)
         if listStore.lastError == nil {
             adoptCoordinatorIdentityFromList()
@@ -142,6 +143,7 @@ final class AppModel {
     private let notificationRouter = NotificationRouter()
     private static let nudgesEnabledKey = "phoenix.backgroundNudges"
     private var nudgePreferenceGeneration = 0
+    private var attentionEvidenceGeneration = 0
 
     private(set) var backgroundNudgesEnabled =
         UserDefaults.standard.bool(forKey: AppModel.nudgesEnabledKey)
@@ -179,6 +181,8 @@ final class AppModel {
     func runBackgroundAttentionCheck() async -> Bool {
         guard backgroundNudgesEnabled, let api else { return false }
         let startedGeneration = apiGeneration
+        let startedNudgeGeneration = nudgePreferenceGeneration
+        let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
         guard let fresh = try? await api.listConversations() else { return false }
         guard !Task.isCancelled,
@@ -191,7 +195,13 @@ final class AppModel {
               listStore.canApplyExternal(startedAt: listToken)
         else { return false }
         guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
-        return await attention.checkAndNotify(fresh)
+        return await attention.checkAndNotify(fresh) { [weak self] in
+            guard let self else { return false }
+            return self.backgroundNudgesEnabled
+                && self.apiGeneration == startedGeneration
+                && self.nudgePreferenceGeneration == startedNudgeGeneration
+                && self.attentionEvidenceGeneration == startedEvidenceGeneration
+        }
     }
 
     // MARK: - Coordinator
@@ -368,13 +378,13 @@ final class AppModel {
     /// Sign-out also clears all cached data: conversations, the last-used
     /// working directory, and the pinned certificate are per-server state
     /// and must not leak across a server/account switch.
-    func signOut() {
+    func signOut() async {
         nudgePreferenceGeneration &+= 1
         backgroundNudgesEnabled = false
         nudgeAuthorizationHint = nil
         UserDefaults.standard.removeObject(forKey: Self.nudgesEnabledKey)
         BackgroundRefresh.cancelPending()
-        clearCache()
+        await clearCache()
         pendingOpenConversationId = nil
         let notificationCenter = UNUserNotificationCenter.current()
         notificationCenter.removeAllDeliveredNotifications()
@@ -388,11 +398,12 @@ final class AppModel {
         serverURLString = ""
     }
 
-    func clearCache() {
+    func clearCache() async {
         apiGeneration += 1
-        for session in sessions.values { session.stop() }
+        let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
+        for session in ownedSessions { session.stop() }
+        for session in ownedSessions { await session.outbox.clearAndWait() }
         sessions.removeAll()
-        for session in drainSessions.values { session.stop() }
         drainSessions.removeAll()
         DiskStore.removeAll()
         listStore.reset()

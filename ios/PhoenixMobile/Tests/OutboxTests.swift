@@ -74,8 +74,7 @@ final class OutboxTests: XCTestCase {
         let entry = await outbox.enqueue(text: "do not lose me")!
         XCTAssertEqual(Outbox.storedContents(conversationId: "c1"), .hasVisibleEntries)
 
-        outbox.dismiss(entry.localId)
-        _ = await outbox.flushPersistence()
+        await outbox.dismiss(entry.localId)
         XCTAssertEqual(Outbox.storedContents(conversationId: "c1"), .empty)
     }
 
@@ -179,8 +178,7 @@ final class OutboxTests: XCTestCase {
         let outbox = Outbox(conversationId: "c1")
         let entry = await outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "boom")
-        outbox.dismiss(entry.localId)
-        _ = await outbox.flushPersistence()
+        await outbox.dismiss(entry.localId)
         XCTAssertTrue(outbox.visibleEntries.isEmpty)
         // Terminal entries carry no future obligation — gone after restart.
         XCTAssertTrue(Outbox(conversationId: "c1").entries.isEmpty)
@@ -359,12 +357,25 @@ final class OutboxTests: XCTestCase {
         let outbox = Outbox(conversationId: "c1")
         let entry = await outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "boom")
-        outbox.dismiss(entry.localId)
+        await outbox.dismiss(entry.localId)
         outbox.markAccepted(entry.localId, steering: true)
         XCTAssertEqual(outbox.entries[0].status, .dismissed)
         outbox.markFailed(entry.localId, error: "late failure")
         XCTAssertEqual(outbox.entries[0].status, .dismissed)
         XCTAssertTrue(outbox.visibleEntries.isEmpty)
+    }
+
+    @MainActor
+    func testClearAndWaitFencesQueuedWritesBeforeDirectoryRemoval() async {
+        freshDiskStore()
+        let outbox = Outbox(conversationId: "c1")
+        let entry = await outbox.enqueue(text: "must stay deleted")!
+        outbox.markFailed(entry.localId, error: "queued write")
+
+        await outbox.clearAndWait()
+        DiskStore.removeAll()
+
+        XCTAssertTrue(Outbox(conversationId: "c1").entries.isEmpty)
     }
 
     @MainActor

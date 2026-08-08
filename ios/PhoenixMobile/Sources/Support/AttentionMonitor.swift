@@ -28,7 +28,7 @@ final class AttentionMonitor {
         }
     }
 
-    /// DiskStore versioning rule applies (see DiskStore header).
+    /// v1 stores the latest mode and title for each known conversation.
     private static let schemaVersion = 1
     private static let storeName = "attention-snapshot"
 
@@ -91,17 +91,27 @@ final class AttentionMonitor {
     /// Background path: diff, notify, then seed. One notification per
     /// conversation, keyed by conversation id so a newer nudge replaces a
     /// stale one instead of stacking.
-    func checkAndNotify(_ conversations: [Conversation]) async -> Bool {
+    func checkAndNotify(
+        _ conversations: [Conversation], isCurrent: () -> Bool = { true }
+    ) async -> Bool {
         let events = Self.diff(previous: snapshot, current: conversations)
         guard !events.isEmpty else {
-            guard !Task.isCancelled else { return false }
+            guard !Task.isCancelled, isCurrent() else { return false }
             seed(with: conversations)
             return true
         }
 
         let center = UNUserNotificationCenter.current()
+        var submittedRequestIds: [String] = []
+        func removeSubmittedRequests() {
+            center.removeDeliveredNotifications(withIdentifiers: submittedRequestIds)
+            center.removePendingNotificationRequests(withIdentifiers: submittedRequestIds)
+        }
         for event in events {
-            guard !Task.isCancelled else { return false }
+            guard !Task.isCancelled, isCurrent() else {
+                removeSubmittedRequests()
+                return false
+            }
             let content = UNMutableNotificationContent()
             switch event {
             case .needsAction(_, let title):
@@ -122,13 +132,22 @@ final class AttentionMonitor {
                 trigger: nil)
             do {
                 try await center.add(request)
+                submittedRequestIds.append(request.identifier)
             } catch is CancellationError {
+                removeSubmittedRequests()
                 return false
             } catch {
                 continue
             }
+            guard !Task.isCancelled, isCurrent() else {
+                removeSubmittedRequests()
+                return false
+            }
         }
-        guard !Task.isCancelled else { return false }
+        guard !Task.isCancelled, isCurrent() else {
+            removeSubmittedRequests()
+            return false
+        }
         seed(with: conversations)
         return true
     }

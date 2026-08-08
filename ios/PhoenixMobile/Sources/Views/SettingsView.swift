@@ -121,15 +121,19 @@ struct SettingsView: View {
                 "Clear cached data? Unsent queued messages will be lost.",
                 isPresented: $confirmClearCache, titleVisibility: .visible
             ) {
-                Button("Clear cache", role: .destructive) { model.clearCache() }
+                Button("Clear cache", role: .destructive) {
+                    Task { await model.clearCache() }
+                }
             }
             .confirmationDialog(
                 "Sign out and forget this server?",
                 isPresented: $confirmSignOut, titleVisibility: .visible
             ) {
                 Button("Sign out", role: .destructive) {
-                    model.signOut()
-                    dismiss()
+                    Task {
+                        await model.signOut()
+                        dismiss()
+                    }
                 }
             }
             .confirmationDialog(

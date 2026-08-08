@@ -289,8 +289,8 @@ final class ConversationSession {
         drainOutbox()
     }
 
-    func dismissEntry(_ localId: String) {
-        outbox.dismiss(localId)
+    func dismissEntry(_ localId: String) async {
+        await outbox.dismiss(localId)
     }
 
     func beginArchiving() -> Bool {

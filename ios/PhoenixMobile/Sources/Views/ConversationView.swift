@@ -250,7 +250,7 @@ struct OutboxEntryView: View {
                 Button("Retry") { session.retryEntry(entry.localId) }
                     .font(.caption.bold())
                 Button("Discard", role: .destructive) {
-                    session.dismissEntry(entry.localId)
+                    Task { await session.dismissEntry(entry.localId) }
                 }
                 .font(.caption)
             }

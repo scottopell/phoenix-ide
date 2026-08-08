@@ -168,15 +168,26 @@ final class Outbox {
         await persist()
     }
 
-    /// A hard-deleted conversation owns no remaining local delivery state.
-    func clear() {
+    private func invalidateForRemoval() -> Int {
         entries.removeAll()
         suppressedMessageIds.removeAll()
         persistenceHealthy = true
-        storageWritable = true
+        storageWritable = false
         persistenceRevision += 1
-        let revision = persistenceRevision
+        return persistenceRevision
+    }
+
+    /// A hard-deleted conversation owns no remaining local delivery state.
+    func clear() {
+        let revision = invalidateForRemoval()
         Task { await writer.remove(revision: revision) }
+    }
+
+    /// Invalidate every queued write and wait until the revision fence has
+    /// removed this store. Later-arriving older writes are rejected.
+    func clearAndWait() async {
+        let revision = invalidateForRemoval()
+        await writer.remove(revision: revision)
     }
 
     private func update(_ localId: String, _ mutate: (inout OutboxEntry) -> Void) {
@@ -258,10 +269,10 @@ final class Outbox {
     }
 
     /// DismissLocalMessage.
-    func dismiss(_ localId: String) {
-        update(localId) { entry in
-            entry.status = .dismissed
-        }
+    func dismiss(_ localId: String) async {
+        guard let idx = entries.firstIndex(where: { $0.localId == localId }) else { return }
+        entries[idx].status = .dismissed
+        _ = await persist()
     }
 
     /// Hide a local bubble as soon as authoritative history reflects it.

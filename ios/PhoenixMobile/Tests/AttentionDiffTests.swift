@@ -113,4 +113,18 @@ final class AttentionDiffTests: XCTestCase {
         XCTAssertTrue(monitor.snapshot.isEmpty)
         XCTAssertTrue(AttentionMonitor().snapshot.isEmpty)
     }
+
+    @MainActor
+    func testSupersededBackgroundEvidenceDoesNotReplaceSnapshot() async {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-attention-tests-\(UUID().uuidString)")
+        let monitor = AttentionMonitor()
+        monitor.seed(with: [conv("c1", mode: "working")])
+
+        let completed = await monitor.checkAndNotify(
+            [conv("c1", mode: "idle")], isCurrent: { false })
+
+        XCTAssertFalse(completed)
+        XCTAssertEqual(monitor.snapshot, ["c1": entry("working")])
+    }
 }
