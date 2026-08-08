@@ -449,8 +449,12 @@ pub struct Conversation {
     pub conv_mode: ConvMode,
     #[serde(default)]
     pub runtime_role: RuntimeRole,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub work_scope_id: Option<WorkScopeId>,
+    #[serde(
+        default,
+        rename = "work_scope_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attached_work_scope_id: Option<WorkScopeId>,
     /// Desired base branch for Managed mode (set at creation, consumed at task approval).
     /// `#[serde(default)]` handles old DB rows that predate this column.
     #[serde(default)]
@@ -1951,7 +1955,7 @@ mod conversation_serde_tests {
                 next_taskmd_id_hint: None,
             },
             runtime_role: RuntimeRole::User,
-            work_scope_id: None,
+            attached_work_scope_id: None,
             desired_base_branch: None,
             message_count: 0,
             seed_parent_id: None,
@@ -1961,6 +1965,25 @@ mod conversation_serde_tests {
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }
+    }
+
+    #[test]
+    fn attached_work_scope_keeps_established_wire_key() {
+        let mut conversation = fixture(None);
+        conversation.attached_work_scope_id = Some(WorkScopeId::parse("scope-a").unwrap());
+
+        let json = serde_json::to_value(&conversation).unwrap();
+        assert_eq!(
+            json.get("work_scope_id"),
+            Some(&serde_json::json!("scope-a"))
+        );
+        assert!(json.get("attached_work_scope_id").is_none());
+
+        let parsed: Conversation = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            parsed.attached_work_scope_id,
+            conversation.attached_work_scope_id
+        );
     }
 
     /// REQ-BED-030 Phase 1: Conversation round-trips through serde with

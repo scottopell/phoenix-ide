@@ -79,6 +79,30 @@ export type { BashRingWindow } from './generated/BashRingWindow';
 export type { BashRingLine } from './generated/BashRingLine';
 import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
 
+export interface ConversationContentSearchHit {
+  conversation_id: string;
+  slug: string;
+  archived: boolean;
+  message_id: string;
+  message_type: string;
+  created_at: string;
+  snippet: string;
+  score: number;
+}
+
+export interface ConversationContentSearchResponse {
+  hits: ConversationContentSearchHit[];
+}
+
+export class ConversationSearchWarmingError extends Error {
+  readonly errorType = 'conversation_search_warming';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConversationSearchWarmingError';
+  }
+}
+
 export type { ModelEffort } from './generated/ModelEffort';
 import type { ModelEffort } from './generated/ModelEffort';
 import type { EffortSource } from './generated/EffortSource';
@@ -501,6 +525,7 @@ export type ConversationState =
   | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
   | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }
   | { type: 'awaiting_continuation'; attempt: number }
+  | { type: 'recoverable_continuation_failure'; message: string; error_kind: ErrorKind; operation_id: string; attempt: number }
   | { type: 'cancelling' }
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
@@ -523,7 +548,9 @@ export type ConversationState =
 
 /** Mirror of the backend `ConvState::allows_model_change`. */
 export function canChangeModelInState(state: ConversationState): boolean {
-  return state.type === 'idle' || state.type === 'error';
+  return state.type === 'idle'
+    || state.type === 'error'
+    || state.type === 'recoverable_continuation_failure';
 }
 
 /** A conversation in a terminal state can no longer act on its pending fork
@@ -554,6 +581,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'awaiting_commission_review_approval':
     case 'awaiting_user_response':
     case 'error':
+    case 'recoverable_continuation_failure':
     case 'awaiting_recovery':
     case 'provisioning':
       return false;
@@ -615,11 +643,9 @@ export interface Message {
   created_at: string;
 }
 
-export interface ConversationMetaResponse {
-  conversation: Conversation;
-  agent_working: boolean;
-  presentation_mode: string;
-  context_window_size: number;
+export interface ConversationRouteResponse {
+  id: string;
+  slug: string | null;
 }
 
 export interface ConversationMessageTombstone {
@@ -1610,20 +1636,20 @@ export const api = {
     return resp.json();
   },
 
-  async getConversationMeta(id: string): Promise<ConversationMetaResponse> {
-    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/meta`);
+  async getConversationRoute(id: string): Promise<ConversationRouteResponse> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/route`);
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
-      throw new Error('Failed to get conversation metadata');
+      throw new Error('Failed to resolve conversation route');
     }
     return resp.json();
   },
 
-  async getConversationMetaBySlug(slug: string): Promise<ConversationMetaResponse> {
-    const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/meta`);
+  async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {
+    const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/route`);
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
-      throw new Error('Failed to get conversation metadata');
+      throw new Error('Failed to resolve conversation route');
     }
     return resp.json();
   },
@@ -2108,6 +2134,26 @@ export const api = {
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to search files');
+    return resp.json();
+  },
+
+  async searchConversationContent(
+    query: string,
+    limit = 20,
+    signal?: AbortSignal,
+  ): Promise<ConversationContentSearchResponse> {
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    const resp = await fetch(
+      `/api/conversations/search?${params}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      if (body.error_type === 'conversation_search_warming') {
+        throw new ConversationSearchWarmingError(body.error ?? 'Conversation search is warming up');
+      }
+      throw new Error(body.error ?? 'Failed to search conversation content');
+    }
     return resp.json();
   },
 

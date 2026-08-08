@@ -194,7 +194,7 @@ The core event types a client must handle:
 | `agent_done` | Agent finished turn | `{ sequence_id }` |
 | `error` | User-facing error | `{ sequence_id, message, error }` |
 
-The complete set additionally includes `message_updated`, `llm_first_byte`, `llm_attempt`, `conversation_became_terminal`, `conversation_hard_deleted`, `conversation_update`, `browser_session_state`, `bash_tool_progress`, `steer_message_queued`, `steer_message_cancelled`, `rate_limit_snapshot`, and `work_scope_update` — enumerated authoritatively in `specs/sse_wire/`.
+The complete shipped set additionally includes `message_updated`, `llm_first_byte`, `llm_attempt`, `conversation_became_terminal`, `conversation_hard_deleted`, `conversation_update`, `browser_session_state`, `bash_tool_progress`, `steer_message_queued`, `steer_message_cancelled`, `rate_limit_snapshot`, and `work_scope_update` — enumerated authoritatively in `specs/sse_wire/`. The normative target additionally defines `product_conversation_lifecycle` and `continuation_boundary`. This legacy design doc is not normative; current lifecycle authority lives in `specs/api/requirements.md`, `specs/sse_wire/sse_wire.allium`, and `specs/bedrock/bedrock.allium`.
 
 #### Token Streaming Events
 

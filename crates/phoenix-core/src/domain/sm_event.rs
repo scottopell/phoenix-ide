@@ -2,6 +2,7 @@
 
 use crate::domain::db_schema::{ErrorKind, FileAttachment, ImageData, ToolResult};
 use crate::domain::skill_invocation::SkillInvocation;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,14 +506,26 @@ pub enum Event {
     // Context continuation events (REQ-BED-019 through REQ-BED-024)
     /// Continuation summary received from LLM
     ContinuationResponse {
+        operation_id: String,
         summary: String,
     },
     /// Continuation request failed after retries
     ContinuationFailed {
+        operation_id: String,
         error: String,
+        error_kind: ErrorKind,
+    },
+    /// Continuation request returned a typed error.
+    ContinuationError {
+        operation_id: String,
+        message: String,
+        error_kind: ErrorKind,
+        resets_at: Option<DateTime<Utc>>,
     },
     /// User manually triggered continuation (REQ-BED-023)
-    UserTriggerContinuation,
+    UserTriggerContinuation {
+        operation_id: String,
+    },
 
     // Task approval events (REQ-BED-028)
     /// User responded to a proposed task plan.
@@ -648,7 +661,8 @@ impl Event {
             Event::SubAgentResult { .. } => "SubAgentResult",
             Event::ContinuationResponse { .. } => "ContinuationResponse",
             Event::ContinuationFailed { .. } => "ContinuationFailed",
-            Event::UserTriggerContinuation => "UserTriggerContinuation",
+            Event::ContinuationError { .. } => "ContinuationError",
+            Event::UserTriggerContinuation { .. } => "UserTriggerContinuation",
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::CommissionReviewApprovalDecided { .. } => "CommissionReviewApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
@@ -739,12 +753,23 @@ pub enum CoreEvent {
         outcome: SubAgentOutcome,
     },
     ContinuationResponse {
+        operation_id: String,
         summary: String,
     },
     ContinuationFailed {
+        operation_id: String,
         error: String,
+        error_kind: ErrorKind,
     },
-    UserTriggerContinuation,
+    ContinuationError {
+        operation_id: String,
+        message: String,
+        error_kind: ErrorKind,
+        resets_at: Option<DateTime<Utc>>,
+    },
+    UserTriggerContinuation {
+        operation_id: String,
+    },
     /// Drained steering entries to be persisted as `UserMessage`s mid-conversation.
     /// Fired by the executor when transitioning into a state that is about to ask
     /// the LLM (entering `Idle`, or entering `LlmRequesting` from a tool round).
@@ -927,16 +952,37 @@ impl TryFrom<Event> for ParentEvent {
                     outcome,
                 }))
             }
-            Event::ContinuationResponse { summary } => {
-                Ok(ParentEvent::Core(CoreEvent::ContinuationResponse {
-                    summary,
+            Event::ContinuationResponse {
+                operation_id,
+                summary,
+            } => Ok(ParentEvent::Core(CoreEvent::ContinuationResponse {
+                operation_id,
+                summary,
+            })),
+            Event::ContinuationFailed {
+                operation_id,
+                error,
+                error_kind,
+            } => Ok(ParentEvent::Core(CoreEvent::ContinuationFailed {
+                operation_id,
+                error,
+                error_kind,
+            })),
+            Event::ContinuationError {
+                operation_id,
+                message,
+                error_kind,
+                resets_at,
+            } => Ok(ParentEvent::Core(CoreEvent::ContinuationError {
+                operation_id,
+                message,
+                error_kind,
+                resets_at,
+            })),
+            Event::UserTriggerContinuation { operation_id } => {
+                Ok(ParentEvent::Core(CoreEvent::UserTriggerContinuation {
+                    operation_id,
                 }))
-            }
-            Event::ContinuationFailed { error } => {
-                Ok(ParentEvent::Core(CoreEvent::ContinuationFailed { error }))
-            }
-            Event::UserTriggerContinuation => {
-                Ok(ParentEvent::Core(CoreEvent::UserTriggerContinuation))
             }
             Event::SteerDrainedUserMessages { entries } => {
                 Ok(ParentEvent::Core(CoreEvent::SteerDrainedUserMessages {
@@ -1091,16 +1137,37 @@ impl TryFrom<Event> for SubAgentEvent {
                     outcome,
                 }))
             }
-            Event::ContinuationResponse { summary } => {
-                Ok(SubAgentEvent::Core(CoreEvent::ContinuationResponse {
-                    summary,
+            Event::ContinuationResponse {
+                operation_id,
+                summary,
+            } => Ok(SubAgentEvent::Core(CoreEvent::ContinuationResponse {
+                operation_id,
+                summary,
+            })),
+            Event::ContinuationFailed {
+                operation_id,
+                error,
+                error_kind,
+            } => Ok(SubAgentEvent::Core(CoreEvent::ContinuationFailed {
+                operation_id,
+                error,
+                error_kind,
+            })),
+            Event::ContinuationError {
+                operation_id,
+                message,
+                error_kind,
+                resets_at,
+            } => Ok(SubAgentEvent::Core(CoreEvent::ContinuationError {
+                operation_id,
+                message,
+                error_kind,
+                resets_at,
+            })),
+            Event::UserTriggerContinuation { operation_id } => {
+                Ok(SubAgentEvent::Core(CoreEvent::UserTriggerContinuation {
+                    operation_id,
                 }))
-            }
-            Event::ContinuationFailed { error } => {
-                Ok(SubAgentEvent::Core(CoreEvent::ContinuationFailed { error }))
-            }
-            Event::UserTriggerContinuation => {
-                Ok(SubAgentEvent::Core(CoreEvent::UserTriggerContinuation))
             }
             // Sub-agent-only events
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
@@ -1150,7 +1217,8 @@ impl CoreEvent {
             CoreEvent::SubAgentResult { .. } => "SubAgentResult",
             CoreEvent::ContinuationResponse { .. } => "ContinuationResponse",
             CoreEvent::ContinuationFailed { .. } => "ContinuationFailed",
-            CoreEvent::UserTriggerContinuation => "UserTriggerContinuation",
+            CoreEvent::ContinuationError { .. } => "ContinuationError",
+            CoreEvent::UserTriggerContinuation { .. } => "UserTriggerContinuation",
             CoreEvent::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
         }
     }

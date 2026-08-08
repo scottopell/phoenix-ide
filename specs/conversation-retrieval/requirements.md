@@ -40,16 +40,43 @@ The user (and any consuming surface) must be able to answer:
 
 ### REQ-RET-001: Scope-Filtered Retrieval Primitive
 
-WHEN a caller requests retrieval with a query string, a scope, and a
-result limit `top_k`
+WHEN a caller requests retrieval with a query string, a scope, a result
+limit `top_k`, and a typed result policy
 THE SYSTEM SHALL return up to `top_k` message chunks drawn only from
-conversations admitted by the scope, ranked by relevance to the query
+conversations admitted by the scope and result policy, ranked by relevance
+to the query
 
 THE scope SHALL be one of:
 - `Conversations(ids)` — retrieval is restricted to messages whose
   conversation id is in the given set (the chain case)
 - `Global` — retrieval spans every conversation in the database (the
   application-wide case)
+- `GlobalExcluding(ids)` — retrieval spans every conversation except those
+  whose id is in the supplied set
+
+THE result policy SHALL select structurally:
+- whether all in-scope conversations or only user-visible top-level
+  conversations are eligible
+- whether every ranked message chunk or only the strongest chunk per
+  conversation is returned
+- whether every query token requires an exact lexical match or the final
+  content-bearing token may match by prefix
+
+WHEN user-visible top-level eligibility is selected
+THE SYSTEM SHALL include active and archived user-initiated top-level
+conversations
+AND SHALL exclude Coordinator, child/sub-agent, and archived
+`deletion_pending` conversations before ranking and limiting
+
+WHEN strongest-chunk-per-conversation grouping is selected
+THE SYSTEM SHALL perform grouping before applying `top_k`
+SO THAT repeated matches in one conversation cannot consume another
+matching conversation's place in the result set
+
+WHEN final-token-prefix matching is selected
+THE SYSTEM SHALL construct the prefix expression from normalized literal
+terms
+AND SHALL NOT interpret user input as retrieval-backend operators
 
 THE query SHALL be accepted as **natural language** (a user's question),
 and the primitive SHALL build whatever backend query that requires so
@@ -72,10 +99,10 @@ of REQ-RET-008, used by an agent after retrieval has pointed it at a
 conversation) is a distinct, non-ranked operation and is permitted —
 it, too, is scope-bound, but it is not a parallel retrieval strategy.
 
-**Rationale:** The scope parameter is the *only* axis that separates
-chain recall from application-wide recall. Making it a parameter of one
-primitive — rather than two parallel code paths — is what guarantees
-both surfaces answer with the same quality. Routing all *ranking*
+**Rationale:** The scope and typed result policy are the axes that specialize
+a retrieval request. Keeping them as parameters of one primitive — rather
+than separate ranking paths — guarantees every surface uses the same index
+and relevance backend. Routing all *ranking*
 through this entry point keeps relevance strategy in one place that can
 be improved (e.g. swapping the backend) once for everyone. Fetching a
 known conversation's content is not ranking and does not compete with
@@ -245,7 +272,7 @@ ships FTS5, so it adds no dependency, runs offline, and answers the
 lexical recall questions that dominate ("which file", "the auth bug",
 "what optimizations"). The interface seam is what lets a semantic
 backend be substituted as a pure swap — callers, having only ever seen
-`retrieve(query, scope, top_k)`, are unaffected. A vector backend sits
+`retrieve(request)`, are unaffected. A vector backend sits
 outside this contract because it requires an embedding provider (the
 Anthropic provider offers none) and a chunk-splitting strategy, neither
 of which this spec defines.
@@ -318,11 +345,27 @@ frozen list — e.g. "the members of chain root X," re-resolved at each
 tool call — so that membership changes during a run are reflected. What
 is fixed at construction is the *boundary the model cannot cross*, not
 necessarily a static set; liveness within that boundary is permitted and,
-for chain Q&A, required (see chains REQ-CHN-009).
+for unified-conversation transcript Q&A, required. The conversation scope is continuation-topology-based, not `WorkScope`-ownership-based: retrieval follows the live member set of one product conversation while successive execution rows may all have the same `WorkScope` attached. A conversation-scoped host binding SHALL exclude sibling derived conversations, follow-up conversations, and the global Coordinator unless the host explicitly constructs a different scope for them.
 
 WHEN a tool call names a conversation outside the bound scope (e.g. a
 read for a conversation not in the bound set)
 THE SYSTEM SHALL refuse it rather than serving out-of-scope content
+
+WHEN a host-bound conversation-read or retrieval tool targets a conversation whose source relation resolves to a deleted conversation
+THE SYSTEM SHALL return a typed unavailable-or-deleted-source outcome rather than silently omitting the relation or substituting a different conversation
+
+WHEN a host-bound conversation-read or retrieval tool resolves a source relation
+THE SYSTEM SHALL treat the source relation kind as a typed closed set that includes at least `approved_task` and `follow_up`
+AND SHALL preserve the recorded direction on the target conversation so the retrieved target can say which source conversation it points to
+AND SHALL treat that typed source relation as the only current provenance authority for source breadcrumbing and deleted-source reporting rather than consulting continuation topology or any legacy raw source-conversation-id field
+
+WHEN a reader presents predecessor/successor conversation relations
+THE SYSTEM SHALL derive those continuation relations directly from the authoritative `continued_in_conv_id` topology
+AND SHALL NOT persist a second continuation relation row or infer provenance from that topology
+
+WHEN the source conversation named by that relation has been permanently deleted
+THE SYSTEM SHALL preserve tombstone-grade source identity sufficient to distinguish a deleted source from an absent or never-recorded source
+AND SHALL return a typed deleted-source outcome that still identifies the deleted root and relation kind so surviving UI or retrieval consumers can render **Deleted source** rather than behaving as though no source existed
 
 WHEN the read-content tool is asked for a conversation whose full
 content would not safely fit a single tool result (chain members can be
@@ -341,15 +384,7 @@ offset), so one huge message cannot exceed the bound
 THE SYSTEM SHALL NOT return a single read result large enough to push
 the next bounded-loop model call past its context window
 
-**Rationale:** An agentic consumer (chains' read-only Q&A, or an
-application-wide Q&A surface) drives retrieval as a tool and iterates. If the
-model could choose its own scope, a chain Q&A agent could read
-conversations outside the chain — the scope would be a suggestion, not a
-boundary. Making the host fix the scope at tool-construction time makes
-the boundary structural: the same agent code becomes chain Q&A or global
-Q&A purely by which scope the host binds, and neither can escape its
-binding. This is the correct-by-construction form of "the model can dig
-as deep as it wants, but only within the conversations it was given."
+**Rationale:** An agentic consumer (the unified conversation page's read-only transcript Q&A, or an application-wide Q&A surface) drives retrieval as a tool and iterates. If the model could choose its own scope, a conversation Q&A agent could read conversations outside its host-bound transcript family — the scope would be a suggestion, not a boundary. Making the host fix the scope at tool-construction time makes the boundary structural: the same agent code becomes unified-conversation Q&A or global Q&A purely by which scope the host binds, and neither can escape its binding. This is the correct-by-construction form of "the model can dig as deep as it wants, but only within the conversations it was given."
 
 ---
 
@@ -380,8 +415,8 @@ first — lives in `executive.md`, not in these standing requirements.)
   diffs, PR feedback). This index covers conversation messages only.
 - **Relevance feedback / learning from which answers the user kept.**
   Not defined.
-- **Scopes beyond `Conversations` and `Global`.** `Project(id)` and
-  `Since(timestamp)` are natural extensions of the scope enum — they
-  would apply as additional in-query predicates (REQ-RET-007) with no
-  change to the primitive's shape — but this spec defines only the two
+- **Scopes beyond `Conversations`, `Global`, and `GlobalExcluding`.**
+  `Project(id)` and `Since(timestamp)` are natural extensions of the scope
+  enum — they would apply as additional in-query predicates (REQ-RET-007)
+  with no change to the primitive's shape — but this spec defines only the
   scopes its consumers require.

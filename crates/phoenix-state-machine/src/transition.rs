@@ -19,8 +19,8 @@ use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, 
 use super::state::{
     AssistantMessage, CommissionReviewApprovalAvailability, CommissionReviewApprovalOutcome,
     ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
-    RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult, SubAgentState,
-    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    RecoverableContinuationFailure, RecoveryKind, RecoveryResumeTarget, SubAgentOutcome,
+    SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -442,6 +442,7 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         // adding a new state forces a decision here.
         ConvState::AwaitingRecovery { .. }
         | ConvState::AwaitingContinuation { .. }
+        | ConvState::RecoverableContinuationFailure { .. }
         | ConvState::Provisioning { .. }
         | ConvState::CreationFailed { .. }
         | ConvState::CreationCancelled { .. }
@@ -772,7 +773,11 @@ pub fn transition_core(
         // Context Continuation (REQ-BED-019 through REQ-BED-024)
         (CoreState::AwaitingContinuation { .. }, CoreEvent::LlmError { .. })
         | (CoreState::AwaitingContinuation { .. }, CoreEvent::RetryTimeout { .. })
-        | (CoreState::Idle, CoreEvent::UserTriggerContinuation) => {
+        | (
+            CoreState::RecoverableContinuationFailure { .. },
+            CoreEvent::UserTriggerContinuation { .. },
+        )
+        | (CoreState::Idle, CoreEvent::UserTriggerContinuation { .. }) => {
             handle_core_continuation(state, event)
         }
 
@@ -787,7 +792,7 @@ pub fn transition_core(
         // intent ("summarize now") is either being served by the in-flight
         // path or no longer meaningful. Absorbing avoids the SSE-vs-click
         // race surfacing as an error to the user.
-        (state, CoreEvent::UserTriggerContinuation) => {
+        (state, CoreEvent::UserTriggerContinuation { .. }) => {
             tracing::debug!(
                 state = state.variant_name(),
                 "Absorbing stale UserTriggerContinuation"
@@ -1105,7 +1110,8 @@ fn handle_core_tool_complete(
         | CoreEvent::SubAgentResult { .. }
         | CoreEvent::ContinuationResponse { .. }
         | CoreEvent::ContinuationFailed { .. }
-        | CoreEvent::UserTriggerContinuation
+        | CoreEvent::ContinuationError { .. }
+        | CoreEvent::UserTriggerContinuation { .. }
         | CoreEvent::SteerDrainedUserMessages { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
@@ -1597,25 +1603,22 @@ fn handle_core_continuation(
     event: CoreEvent,
 ) -> Result<CoreTransitionResult, TransitionError> {
     match (state, event) {
-        // LlmError during continuation - retry
         (
-            CoreState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
-            },
+            CoreState::AwaitingContinuation { request },
             CoreEvent::LlmError {
                 ref error_kind,
                 resets_at,
                 ..
             },
-        ) if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
-            let new_attempt = attempt + 1;
+        ) if error_kind.is_auto_retryable() && request.attempt < MAX_RETRY_ATTEMPTS => {
+            let new_attempt = request.attempt + 1;
             let delay = retry_delay(new_attempt);
             let reason = error_kind_to_attempt_reason(error_kind);
+            let mut next_request = request.clone();
+            next_request.attempt = new_attempt;
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
-                rejected_tool_calls: rejected_tool_calls.clone(),
-                attempt: new_attempt,
+                request: next_request,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::ScheduleRetry {
@@ -1627,42 +1630,50 @@ fn handle_core_continuation(
             .with_effect(Effect::notify_state_change()))
         }
 
-        // RetryTimeout during continuation
         (
-            CoreState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
-            },
+            CoreState::AwaitingContinuation { request },
             CoreEvent::RetryTimeout {
                 attempt: timeout_attempt,
             },
-        ) if *attempt == timeout_attempt => {
-            Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
-                rejected_tool_calls: rejected_tool_calls.clone(),
-                attempt: *attempt,
-            })
+        ) if request.attempt == timeout_attempt => Ok(CoreTransitionResult::new(state.clone())
             .with_effect(Effect::RequestContinuation {
-                request: ContinuationSummaryRequest {
-                    rejected_tool_calls: rejected_tool_calls.clone(),
-                    attempt: *attempt,
-                },
-            }))
-        }
+                request: request.clone(),
+            })),
 
-        // UserTriggerContinuation from Idle (REQ-BED-023)
-        (CoreState::Idle, CoreEvent::UserTriggerContinuation) => {
-            Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
+        (CoreState::Idle, CoreEvent::UserTriggerContinuation { operation_id }) => {
+            let request = ContinuationSummaryRequest {
+                operation_id,
                 rejected_tool_calls: vec![],
                 attempt: 1,
+            };
+            Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
+                request: request.clone(),
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::RequestContinuation {
-                request: ContinuationSummaryRequest {
-                    rejected_tool_calls: vec![],
-                    attempt: 1,
-                },
-            }))
+            .with_effect(Effect::RequestContinuation { request }))
+        }
+
+        (
+            CoreState::RecoverableContinuationFailure { failure },
+            CoreEvent::UserTriggerContinuation { operation_id },
+        ) if failure.request.operation_id == operation_id => {
+            let mut request = failure.request.clone();
+            request.attempt += 1;
+            Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
+                request: request.clone(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change())
+            .with_effect(Effect::RequestContinuation { request }))
+        }
+
+        (
+            CoreState::RecoverableContinuationFailure { .. },
+            CoreEvent::UserTriggerContinuation { operation_id },
+        ) => {
+            tracing::debug!(%operation_id, "Absorbing stale UserTriggerContinuation for continuation failure");
+            Ok(CoreTransitionResult::new(state.clone()))
         }
 
         (state, event) => Err(TransitionError::InvalidTransition {
@@ -1718,6 +1729,8 @@ fn creation_provisioned_transition(
             | Effect::PersistHiddenSystemMarker { .. }
             | Effect::PersistSubAgentResults { .. }
             | Effect::RequestContinuation { .. }
+            | Effect::BeginContinuation { .. }
+            | Effect::ContinuationCommit { .. }
             | Effect::NotifyContextExhausted { .. }
             | Effect::ApproveTask { .. }
             | Effect::ApproveTaskFreshHandoff { .. }
@@ -1770,7 +1783,7 @@ pub fn transition_parent(
             ParentEvent::Core(
                 CoreEvent::UserMessage { .. }
                 | CoreEvent::AuthoritativeUserMessage { .. }
-                | CoreEvent::UserTriggerContinuation,
+                | CoreEvent::UserTriggerContinuation { .. },
             ),
         ) => Err(TransitionError::AwaitingTaskApproval),
 
@@ -1897,7 +1910,7 @@ pub fn transition_parent(
             ParentEvent::Core(
                 CoreEvent::UserMessage { .. }
                 | CoreEvent::AuthoritativeUserMessage { .. }
-                | CoreEvent::UserTriggerContinuation,
+                | CoreEvent::UserTriggerContinuation { .. },
             ),
         ) => Err(TransitionError::AwaitingUserResponse),
 
@@ -2091,15 +2104,34 @@ pub fn transition_parent(
             .with_effect(Effect::RequestLlm)),
             RecoveryResumeTarget::ContinuationSummary { request } => Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::AwaitingContinuation {
-                    rejected_tool_calls: request.rejected_tool_calls.clone(),
-                    attempt: request.attempt,
+                    request: request.clone(),
                 }))
                 .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestContinuation {
                     request: request.clone(),
                 }),
             ),
         },
+
+        (
+            ParentState::AwaitingRecovery {
+                error_kind,
+                resume: RecoveryResumeTarget::ContinuationSummary { request },
+                ..
+            },
+            ParentEvent::Parent(ParentOnlyEvent::CredentialHelperFailed { message }),
+        ) => Ok(ParentTransitionResult::new(ParentState::Core(
+            CoreState::RecoverableContinuationFailure {
+                failure: RecoverableContinuationFailure {
+                    request: request.clone(),
+                    error_kind: error_kind.clone(),
+                    message: message.clone(),
+                },
+            },
+        ))
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())),
 
         (
             ParentState::AwaitingRecovery { error_kind, .. },
@@ -2155,7 +2187,11 @@ pub fn transition_parent(
         // swallowed as a no-op for that state.
         // ============================================================
         (
-            ParentState::Core(CoreState::Idle | CoreState::Error { .. })
+            ParentState::Core(
+                CoreState::Idle
+                | CoreState::Error { .. }
+                | CoreState::RecoverableContinuationFailure { .. },
+            )
             | ParentState::ContextExhausted { .. },
             ParentEvent::Parent(ParentOnlyEvent::TaskResolved {
                 system_message,
@@ -2857,36 +2893,55 @@ pub fn transition_parent(
         // Parent-specific continuation transitions
         // ============================================================
         (
-            ParentState::Core(CoreState::AwaitingContinuation { .. }),
-            ParentEvent::Core(CoreEvent::ContinuationResponse { summary }),
-        ) => Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
-            summary: summary.clone(),
-        })
-        .with_effect(Effect::persist_continuation_message(&summary))
-        .with_effect(Effect::PersistState)
-        .with_effect(Effect::NotifyContextExhausted { summary })),
-
-        (
-            ParentState::Core(CoreState::AwaitingContinuation { .. }),
-            ParentEvent::Core(CoreEvent::ContinuationFailed { error }),
-        ) => {
-            let fallback = format!(
-                "Context limit reached. The continuation summary could not be generated: {error}. \
-                Please start a new conversation."
-            );
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
+            ParentEvent::Core(CoreEvent::ContinuationResponse {
+                operation_id,
+                summary,
+            }),
+        ) if request.operation_id == operation_id => {
             Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
-                summary: fallback.clone(),
+                summary: summary.clone(),
             })
-            .with_effect(Effect::persist_continuation_message(&fallback))
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
+            .with_effect(Effect::continuation_commit(request.clone(), &summary)))
         }
 
         (
-            ParentState::Core(CoreState::AwaitingContinuation {
-                rejected_tool_calls,
-                attempt,
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
+            ParentEvent::Core(CoreEvent::ContinuationResponse { operation_id, .. }),
+        ) => {
+            tracing::debug!(expected = %request.operation_id, actual = %operation_id, "Absorbing stale ContinuationResponse");
+            Ok(ParentTransitionResult::new(state.clone()))
+        }
+
+        (
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
+            ParentEvent::Core(CoreEvent::ContinuationFailed {
+                operation_id,
+                error,
+                error_kind,
             }),
+        ) if request.operation_id == operation_id => Ok(ParentTransitionResult::new(
+            ParentState::Core(CoreState::RecoverableContinuationFailure {
+                failure: crate::state::RecoverableContinuationFailure {
+                    request: request.clone(),
+                    error_kind,
+                    message: error,
+                },
+            }),
+        )
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())),
+
+        (
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
+            ParentEvent::Core(CoreEvent::ContinuationFailed { operation_id, .. }),
+        ) => {
+            tracing::debug!(expected = %request.operation_id, actual = %operation_id, "Absorbing stale ContinuationFailed");
+            Ok(ParentTransitionResult::new(state.clone()))
+        }
+
+        (
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
             ParentEvent::Core(CoreEvent::LlmError {
                 message,
                 error_kind,
@@ -2899,10 +2954,7 @@ pub fn transition_parent(
                 error_kind: error_kind.clone(),
                 recovery_kind: RecoveryKind::Credential,
                 resume: RecoveryResumeTarget::ContinuationSummary {
-                    request: ContinuationSummaryRequest {
-                        rejected_tool_calls: rejected_tool_calls.clone(),
-                        attempt: *attempt,
-                    },
+                    request: request.clone(),
                 },
             })
             .with_effect(Effect::PersistState)
@@ -2910,40 +2962,82 @@ pub fn transition_parent(
         }
 
         (
-            ParentState::Core(CoreState::AwaitingContinuation { .. }),
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
+            ParentEvent::Core(CoreEvent::ContinuationError {
+                operation_id,
+                error_kind,
+                resets_at,
+                ..
+            }),
+        ) if request.operation_id == operation_id
+            && error_kind.is_auto_retryable()
+            && request.attempt < MAX_RETRY_ATTEMPTS =>
+        {
+            let mut next_request = request.clone();
+            next_request.attempt += 1;
+            let attempt = next_request.attempt;
+            Ok(
+                ParentTransitionResult::new(ParentState::Core(CoreState::AwaitingContinuation {
+                    request: next_request,
+                }))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::ScheduleRetry {
+                    delay: retry_delay(attempt),
+                    attempt,
+                    reason: error_kind_to_attempt_reason(&error_kind),
+                    resets_at,
+                })
+                .with_effect(Effect::notify_state_change()),
+            )
+        }
+
+        (
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
+            ParentEvent::Core(CoreEvent::ContinuationError {
+                operation_id,
+                message,
+                error_kind,
+                ..
+            }),
+        ) if request.operation_id == operation_id => Ok(ParentTransitionResult::new(
+            ParentState::Core(CoreState::RecoverableContinuationFailure {
+                failure: crate::state::RecoverableContinuationFailure {
+                    request: request.clone(),
+                    error_kind,
+                    message,
+                },
+            }),
+        )
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())),
+
+        (
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
+            ParentEvent::Core(CoreEvent::ContinuationError { operation_id, .. }),
+        ) => {
+            tracing::debug!(expected = %request.operation_id, actual = %operation_id, "Absorbing stale ContinuationError");
+            Ok(ParentTransitionResult::new(state.clone()))
+        }
+
+        (
+            ParentState::Core(CoreState::AwaitingContinuation { request }),
             ParentEvent::Core(CoreEvent::LlmError {
                 ref message,
                 ref error_kind,
                 ..
             }),
-        ) if !error_kind.is_auto_retryable() || {
-            // Check if we're at/past max retries
-            match state {
-                ParentState::Core(CoreState::AwaitingContinuation { attempt, .. }) => {
-                    *attempt >= MAX_RETRY_ATTEMPTS
-                }
-                ParentState::Core(_)
-                | ParentState::AwaitingRecovery { .. }
-                | ParentState::AwaitingTaskApproval { .. }
-                | ParentState::AwaitingUserResponse { .. }
-                | ParentState::AwaitingCommissionReviewApproval { .. }
-                | ParentState::ContextExhausted { .. }
-                | ParentState::HandedOff { .. }
-                | ParentState::Terminal => false,
-            }
-        } =>
-        {
-            let message = message.clone();
-            let fallback = format!(
-                "Context limit reached. The continuation summary could not be generated: {message}. \
-                Please start a new conversation."
-            );
-            Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
-                summary: fallback.clone(),
-            })
-            .with_effect(Effect::persist_continuation_message(&fallback))
+        ) if !error_kind.is_auto_retryable() || request.attempt >= MAX_RETRY_ATTEMPTS => {
+            Ok(ParentTransitionResult::new(ParentState::Core(
+                CoreState::RecoverableContinuationFailure {
+                    failure: crate::state::RecoverableContinuationFailure {
+                        request: request.clone(),
+                        error_kind: error_kind.clone(),
+                        message: message.clone(),
+                    },
+                },
+            ))
             .with_effect(Effect::PersistState)
-            .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
+            .with_effect(Effect::notify_state_change()))
         }
 
         // Stale TaskApprovalDecided
@@ -3580,9 +3674,11 @@ fn handle_persist_outcome(
 /// Extract the current attempt number from state (for LLM error conversion).
 fn current_attempt(state: &ConvState) -> u32 {
     match state {
-        ConvState::LlmRequesting { attempt }
-        | ConvState::SeededLlmRequesting { attempt, .. }
-        | ConvState::AwaitingContinuation { attempt, .. } => *attempt,
+        ConvState::LlmRequesting { attempt } | ConvState::SeededLlmRequesting { attempt, .. } => {
+            *attempt
+        }
+        ConvState::AwaitingContinuation { request } => request.attempt,
+        ConvState::RecoverableContinuationFailure { failure } => failure.request.attempt,
         ConvState::Idle
         | ConvState::ToolExecuting { .. }
         | ConvState::CancellingTool { .. }
@@ -3648,25 +3744,24 @@ fn handle_context_exhaustion(
     match ctx.context_exhaustion_behavior {
         ContextExhaustionBehavior::ThresholdBasedContinuation => {
             // Normal conversation: trigger continuation flow
-            TransitionResult::new(ConvState::AwaitingContinuation {
-                rejected_tool_calls: tool_calls.clone(),
+            let request = ContinuationSummaryRequest {
+                operation_id: request_id.clone(),
+                rejected_tool_calls: tool_calls,
                 attempt: 1,
+            };
+            TransitionResult::new(ConvState::AwaitingContinuation {
+                request: request.clone(),
             })
-            .with_effect(Effect::persist_agent_message(
+            .with_effect(Effect::begin_continuation(
+                request.clone(),
                 blocks,
-                Some(usage_data),
+                usage_data,
                 ctx.execution_environment.working_dir(),
                 request_id,
                 final_attempt,
             ))
-            .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::RequestContinuation {
-                request: ContinuationSummaryRequest {
-                    rejected_tool_calls: tool_calls,
-                    attempt: 1,
-                },
-            })
+            .with_effect(Effect::RequestContinuation { request })
         }
         ContextExhaustionBehavior::IntentionallyUnhandled => {
             // REQ-BED-024: Sub-agent fails immediately
@@ -3969,8 +4064,11 @@ mod tests {
         let rejected_tool_calls = vec![test_tool_call("tool-1")];
         let result = transition(
             &ConvState::AwaitingContinuation {
-                rejected_tool_calls: rejected_tool_calls.clone(),
-                attempt: 1,
+                request: ContinuationSummaryRequest {
+                    operation_id: "continuation-auth-op".to_string(),
+                    rejected_tool_calls: rejected_tool_calls.clone(),
+                    attempt: 1,
+                },
             },
             &test_context(),
             Event::LlmError {
@@ -3991,6 +4089,7 @@ mod tests {
                             ContinuationSummaryRequest {
                                 rejected_tool_calls: carried,
                                 attempt: carried_attempt,
+                                ..
                             },
                     },
                 ..
@@ -4013,6 +4112,7 @@ mod tests {
             | ConvState::CreationCancelled { .. }
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }
+            | ConvState::RecoverableContinuationFailure { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -4046,6 +4146,7 @@ mod tests {
             recovery_kind: RecoveryKind::Credential,
             resume: RecoveryResumeTarget::ContinuationSummary {
                 request: ContinuationSummaryRequest {
+                    operation_id: "continuation-auth-op".to_string(),
                     rejected_tool_calls: rejected_tool_calls.clone(),
                     attempt: 2,
                 },
@@ -4056,7 +4157,7 @@ mod tests {
 
         assert!(matches!(
             result.new_state,
-            ConvState::AwaitingContinuation { attempt: 2, .. }
+            ConvState::AwaitingContinuation { request } if request.attempt == 2
         ));
         assert!(result.effects.iter().any(|effect| matches!(
             effect,
@@ -4064,6 +4165,7 @@ mod tests {
                 request: ContinuationSummaryRequest {
                     rejected_tool_calls: carried,
                     attempt: 2,
+                    ..
                 }
             } if *carried == rejected_tool_calls
         )));
@@ -4077,6 +4179,7 @@ mod tests {
             recovery_kind: RecoveryKind::Credential,
             resume: RecoveryResumeTarget::ContinuationSummary {
                 request: ContinuationSummaryRequest {
+                    operation_id: "continuation-auth-op".to_string(),
                     rejected_tool_calls: vec![test_tool_call("tool-1")],
                     attempt: 1,
                 },
@@ -4094,11 +4197,10 @@ mod tests {
 
         assert!(matches!(
             result.new_state,
-            ConvState::Error {
-                message,
-                error_kind: ErrorKind::Auth,
-                ..
-            } if message == "sign-in failed"
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.message == "sign-in failed"
+                    && failure.error_kind == ErrorKind::Auth
+                    && failure.request.operation_id == "continuation-auth-op"
         ));
         assert!(!result
             .effects
@@ -4116,11 +4218,14 @@ mod tests {
     }
 
     #[test]
-    fn non_auth_continuation_failure_still_persists_fallback_summary() {
+    fn non_auth_continuation_failure_remains_recoverable() {
         let result = transition(
             &ConvState::AwaitingContinuation {
-                rejected_tool_calls: vec![],
-                attempt: MAX_RETRY_ATTEMPTS,
+                request: ContinuationSummaryRequest {
+                    operation_id: "terminal-continuation-op".to_string(),
+                    rejected_tool_calls: vec![],
+                    attempt: MAX_RETRY_ATTEMPTS,
+                },
             },
             &test_context(),
             Event::LlmError {
@@ -4135,28 +4240,94 @@ mod tests {
 
         assert!(matches!(
             result.new_state,
-            ConvState::ContextExhausted { .. }
+            ConvState::RecoverableContinuationFailure { failure }
+                if failure.request.operation_id == "terminal-continuation-op"
+                    && failure.error_kind == ErrorKind::InvalidRequest
         ));
-        assert!(result
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::NotifyContextExhausted { .. })));
-        assert!(result.effects.iter().any(|effect| {
-            matches!(
-                effect,
-                Effect::PersistMessage {
-                    content: phoenix_core::domain::db_schema::MessageContent::Continuation { .. },
-                    ..
-                }
-            )
-        }));
+        assert!(result.effects.iter().all(|effect| !matches!(
+            effect,
+            Effect::NotifyContextExhausted { .. } | Effect::ContinuationCommit { .. }
+        )));
+    }
+
+    #[test]
+    fn continuation_capacity_failure_is_recoverable_and_retry_reuses_operation() {
+        let request = ContinuationSummaryRequest {
+            operation_id: "capacity-op".to_string(),
+            rejected_tool_calls: vec![test_tool_call("tool-1")],
+            attempt: MAX_RETRY_ATTEMPTS,
+        };
+        let failed = transition(
+            &ConvState::AwaitingContinuation {
+                request: request.clone(),
+            },
+            &test_context(),
+            Event::ContinuationError {
+                operation_id: request.operation_id.clone(),
+                message: "selected model is at capacity".to_string(),
+                error_kind: ErrorKind::ServerOverloaded,
+                resets_at: None,
+            },
+        )
+        .expect("capacity failure should remain recoverable");
+        assert!(matches!(
+            failed.new_state,
+            ConvState::RecoverableContinuationFailure { ref failure }
+                if failure.request == request
+                    && failure.error_kind == ErrorKind::ServerOverloaded
+        ));
+
+        let retried = transition(
+            &failed.new_state,
+            &test_context(),
+            Event::UserTriggerContinuation {
+                operation_id: request.operation_id.clone(),
+            },
+        )
+        .expect("explicit retry should resume the same operation");
+        assert!(matches!(
+            retried.new_state,
+            ConvState::AwaitingContinuation { ref request }
+                if request.operation_id == "capacity-op"
+                    && request.attempt == MAX_RETRY_ATTEMPTS + 1
+        ));
+        assert!(retried.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RequestContinuation { request }
+                if request.operation_id == "capacity-op"
+        )));
+    }
+
+    #[test]
+    fn stale_continuation_result_cannot_commit() {
+        let state = ConvState::AwaitingContinuation {
+            request: ContinuationSummaryRequest {
+                operation_id: "current-op".to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            },
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::ContinuationResponse {
+                operation_id: "stale-op".to_string(),
+                summary: "stale summary".to_string(),
+            },
+        )
+        .expect("stale result should be absorbed");
+        assert_eq!(result.new_state, state);
+        assert!(result.effects.is_empty());
     }
 
     #[test]
     fn parent_cancel_during_continuation_is_invalid_and_does_not_abort_llm() {
         let state = ConvState::AwaitingContinuation {
-            rejected_tool_calls: vec![],
-            attempt: 1,
+            request: ContinuationSummaryRequest {
+                operation_id: "cancel-continuation-op".to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            },
         };
 
         let err = transition(
@@ -5152,6 +5323,16 @@ mod tests {
         );
 
         // Should request continuation with rejected tools
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::BeginContinuation { request, message_id, .. }
+                if request.operation_id == "test-req-id" && message_id == "test-req-id"
+        )));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistMessage { .. } | Effect::PersistState)));
+
         assert!(
             result.effects.iter().any(|e| matches!(
                 e,
@@ -6195,7 +6376,9 @@ mod tests {
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &test_context(),
-            Event::UserTriggerContinuation,
+            Event::UserTriggerContinuation {
+                operation_id: "test-continuation-op".to_string(),
+            },
         )
         .expect("absorb, not error");
 
@@ -6226,8 +6409,14 @@ mod tests {
             assistant_message: AssistantMessage::default(),
         };
 
-        let result = transition(&state, &test_context(), Event::UserTriggerContinuation)
-            .expect("absorb, not error");
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserTriggerContinuation {
+                operation_id: "test-continuation-op".to_string(),
+            },
+        )
+        .expect("absorb, not error");
 
         assert!(matches!(result.new_state, ConvState::ToolExecuting { .. }));
         assert!(result.effects.is_empty());
@@ -6238,16 +6427,25 @@ mod tests {
         // Already summarizing — clicking again is a redundant intent, not
         // an invalid one.
         let state = ConvState::AwaitingContinuation {
-            rejected_tool_calls: vec![],
-            attempt: 1,
+            request: ContinuationSummaryRequest {
+                operation_id: "test-continuation-op".to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            },
         };
 
-        let result = transition(&state, &test_context(), Event::UserTriggerContinuation)
-            .expect("absorb, not error");
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserTriggerContinuation {
+                operation_id: "test-continuation-op".to_string(),
+            },
+        )
+        .expect("absorb, not error");
 
         assert!(matches!(
             result.new_state,
-            ConvState::AwaitingContinuation { attempt: 1, .. }
+            ConvState::AwaitingContinuation { request } if request.attempt == 1
         ));
         assert!(result.effects.is_empty());
     }
@@ -6286,14 +6484,16 @@ mod tests {
         let result = transition(
             &ConvState::Idle,
             &test_context(),
-            Event::UserTriggerContinuation,
+            Event::UserTriggerContinuation {
+                operation_id: "test-continuation-op".to_string(),
+            },
         )
         .expect("Idle path should succeed");
 
         assert!(
             matches!(
                 result.new_state,
-                ConvState::AwaitingContinuation { attempt: 1, .. }
+                ConvState::AwaitingContinuation { ref request } if request.attempt == 1
             ),
             "Idle + UserTriggerContinuation must enter AwaitingContinuation, got {:?}",
             result.new_state
@@ -7007,6 +7207,8 @@ mod tests {
                 | Effect::PersistHiddenSystemMarker { .. }
                 | Effect::PersistSubAgentResults { .. }
                 | Effect::RequestContinuation { .. }
+                | Effect::BeginContinuation { .. }
+                | Effect::ContinuationCommit { .. }
                 | Effect::NotifyContextExhausted { .. }
                 | Effect::ApproveTask { .. }
                 | Effect::ApproveTaskFreshHandoff { .. }

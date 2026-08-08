@@ -109,6 +109,7 @@ function canAcceptChatMessage(state: ConversationState): boolean {
       return true;
     case 'awaiting_llm':
     case 'awaiting_continuation':
+    case 'recoverable_continuation_failure':
     case 'cancelling':
     case 'awaiting_task_approval':
     case 'awaiting_commission_review_approval':

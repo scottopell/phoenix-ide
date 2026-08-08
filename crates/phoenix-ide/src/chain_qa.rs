@@ -17,7 +17,7 @@
 use crate::chain_runtime::{ChainRuntime, ChainRuntimeRegistry, ChainSseEvent};
 use crate::db::{
     ChainQaRow, Conversation, Database, DbError, Message, MessageContent, MessageRetriever,
-    MessageType, NewChainQa, RetrievalScope, RetrievedChunk,
+    MessageType, NewChainQa, RetrievalRequest, RetrievalScope, RetrievedChunk,
 };
 use chrono::Utc;
 use phoenix_llm::{
@@ -595,11 +595,11 @@ impl ChainQa {
                 }
                 match self
                     .retriever
-                    .retrieve(
+                    .retrieve(RetrievalRequest::natural_language(
                         query,
                         RetrievalScope::Conversations(member_ids.to_vec()),
                         SEARCH_TOP_K,
-                    )
+                    ))
                     .await
                 {
                     Ok(hits) if hits.is_empty() => (

@@ -4,6 +4,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
+import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
 
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
@@ -155,6 +156,14 @@ function LocationProbe() {
   return <output aria-label="Current route">{useLocation().pathname}</output>;
 }
 
+function deferredReleaseSnapshot() {
+  let resolve!: (snapshot: ReleaseUpdateSnapshot) => void;
+  const promise = new Promise<ReleaseUpdateSnapshot>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 function renderPage(info: DeploymentInfo, disk: DeploymentDiskInfo = deploymentDisk()) {
   apiMock.deploymentInfo.mockResolvedValue(info);
   apiMock.deploymentDiskInfo.mockResolvedValue(disk);
@@ -256,12 +265,14 @@ describe('AboutDeploymentPage disk usage health', () => {
     const restarted = deployment({
       build: { ...initial.build, version: '1.1.0', git_sha: 'def456' },
     });
+    const update = deferredReleaseSnapshot();
     apiMock.deploymentInfo
       .mockResolvedValueOnce(initial)
       .mockResolvedValueOnce(restarted);
     apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
     apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
-    apiMock.releaseUpdateSnapshot.mockResolvedValueOnce({
+    apiMock.releaseUpdateSnapshot.mockReturnValueOnce(update.promise);
+    const updateSnapshot: ReleaseUpdateSnapshot = {
       installation_ownership: { kind: 'development' },
       current_version: '1.1.0',
       current_git_sha: 'def456',
@@ -269,7 +280,7 @@ describe('AboutDeploymentPage disk usage health', () => {
       transaction: { kind: 'none' },
       authority: { kind: 'not_production' },
       sampled_at: '2026-06-01T00:00:04Z',
-    });
+    };
     render(
       <MemoryRouter>
         <AboutDeploymentPage />
@@ -277,6 +288,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     );
 
     expect(await screen.findByText('Version 0.1.0')).toBeInTheDocument();
+    await act(async () => { update.resolve(updateSnapshot); });
     expect(await screen.findByText('Version 1.1.0')).toBeInTheDocument();
     expect(screen.getByLabelText('Running git commit def456')).toBeInTheDocument();
     expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(2);
@@ -289,12 +301,14 @@ describe('AboutDeploymentPage disk usage health', () => {
     const managed = deployment({
       installation_ownership: { kind: 'systemd_managed' },
     });
+    const update = deferredReleaseSnapshot();
     apiMock.deploymentInfo
       .mockResolvedValueOnce(initial)
       .mockResolvedValueOnce(managed);
     apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
     apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
-    apiMock.releaseUpdateSnapshot.mockResolvedValueOnce({
+    apiMock.releaseUpdateSnapshot.mockReturnValueOnce(update.promise);
+    const updateSnapshot: ReleaseUpdateSnapshot = {
       installation_ownership: { kind: 'systemd_managed' },
       current_version: initial.build.version,
       current_git_sha: initial.build.git_sha,
@@ -302,7 +316,7 @@ describe('AboutDeploymentPage disk usage health', () => {
       transaction: { kind: 'none' },
       authority: { kind: 'allowed' },
       sampled_at: '2026-06-01T00:00:04Z',
-    });
+    };
     render(
       <MemoryRouter>
         <AboutDeploymentPage />
@@ -310,6 +324,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     );
 
     expect(await screen.findByText('Runtime manager is ambiguous')).toBeInTheDocument();
+    await act(async () => { update.resolve(updateSnapshot); });
     expect(await screen.findByText('Managed by systemd')).toBeInTheDocument();
     expect(apiMock.deploymentInfo).toHaveBeenCalledTimes(2);
   });

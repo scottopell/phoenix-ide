@@ -471,6 +471,7 @@ mod state_machine_props {
                     | ConvState::Terminal
                     | ConvState::Error { .. }
                     | ConvState::ContextExhausted { .. }
+                    | ConvState::RecoverableContinuationFailure { .. }
             )
         })
     }
@@ -576,7 +577,9 @@ mod random_walk {
                     system_message: random_string(rng, 15),
                     repo_root: "/tmp".to_string(),
                 },
-                _ => Event::UserTriggerContinuation,
+                _ => Event::UserTriggerContinuation {
+                    operation_id: "test-continuation-op".to_string(),
+                },
             },
 
             ConvState::LlmRequesting { attempt }
@@ -748,19 +751,22 @@ mod random_walk {
                 },
             },
 
-            ConvState::AwaitingContinuation { attempt, .. } => match rng.random_range(0..4) {
+            ConvState::AwaitingContinuation { request } => match rng.random_range(0..4) {
                 0 => Event::ContinuationResponse {
+                    operation_id: request.operation_id.clone(),
                     summary: random_string(rng, 30),
                 },
                 1 => Event::ContinuationFailed {
+                    operation_id: request.operation_id.clone(),
                     error: random_string(rng, 15),
+                    error_kind: phoenix_core::domain::db_schema::ErrorKind::ContextExhausted,
                 },
                 2 => {
                     let error_kind = random_error_kind(rng);
                     Event::LlmError {
                         message: random_string(rng, 15),
                         error_kind,
-                        attempt: *attempt,
+                        attempt: request.attempt,
                         recovery_in_progress: false,
                         resets_at: None,
                     }
@@ -770,6 +776,12 @@ mod random_walk {
                     cause: CancelCause::UserRequested,
                 },
             },
+
+            ConvState::RecoverableContinuationFailure { failure } => {
+                Event::UserTriggerContinuation {
+                    operation_id: failure.request.operation_id.clone(),
+                }
+            }
 
             ConvState::AwaitingTaskApproval { .. } => match rng.random_range(0..5) {
                 0 => Event::TaskApprovalDecided {
@@ -876,12 +888,17 @@ mod random_walk {
         //    alongside mode and cwd updates (execute_resolve_task).
         if old_state.variant_name() != new_state.variant_name() {
             let has_persist = effects.iter().any(|e| matches!(e, Effect::PersistState));
-            let has_resolve_task = effects
-                .iter()
-                .any(|e| matches!(e, Effect::ResolveTask { .. }));
+            let has_atomic_persist = effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    Effect::ResolveTask { .. }
+                        | Effect::BeginContinuation { .. }
+                        | Effect::ContinuationCommit { .. }
+                )
+            });
             assert!(
-                has_persist || has_resolve_task,
-                "State changed from {} to {} without PersistState or ResolveTask. Effects: {:?}",
+                has_persist || has_atomic_persist,
+                "State changed from {} to {} without PersistState or an atomic persistence effect. Effects: {:?}",
                 old_state.variant_name(),
                 new_state.variant_name(),
                 effects,

@@ -146,6 +146,7 @@ export function eventForState(state: ConversationState, conversation: Conversati
       if (conversation.continued_in_conv_id) return null;
       return { type: 'agent_error', title: 'Agent error', conversation };
     case 'error':
+    case 'recoverable_continuation_failure':
     case 'creation_failed':
       return { type: 'agent_error', title: 'Agent error', conversation };
     default:
@@ -157,7 +158,12 @@ export function eventForState(state: ConversationState, conversation: Conversati
 // catch-up paths dedupe against each other. Completions get no key — each
 // completion is independently notification-worthy.
 export function attentionKeyFor(event: PolicyNotificationEvent): string | null {
-  return event.type === 'agent_finished' ? null : `${event.conversation.id}:${event.type}`;
+  if (event.type === 'agent_finished') return null;
+  if (event.conversation.state?.type === 'recoverable_continuation_failure') {
+    const state = event.conversation.state;
+    return `${event.conversation.id}:${event.type}:${state.operation_id}:${state.attempt}`;
+  }
+  return `${event.conversation.id}:${event.type}`;
 }
 
 // Completions carry `updated_at` so a later completion for the same
@@ -244,7 +250,10 @@ function reduceConversationStateChanged(
   nextState: ConversationState,
 ): ReduceResult {
   if (isAgentWorking(nextState)) {
-    return { state: rememberBusyState(state, conversation, nextState, env.now), effects: [] };
+    const next = nextState.type === 'awaiting_continuation'
+      ? clearAttentionSeen(state, conversation.id)
+      : state;
+    return { state: rememberBusyState(next, conversation, nextState, env.now), effects: [] };
   }
 
   const stateEvent = eventForState(nextState, conversation);

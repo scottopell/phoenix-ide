@@ -306,7 +306,29 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_model_effort",
         sql: MIGRATION_058,
     },
+    Migration {
+        version: 59,
+        name: "add_conversation_state_kind_discriminator",
+        sql: MIGRATION_059,
+    },
+    Migration {
+        version: 60,
+        name: "enforce_conversation_state_kind_consistency",
+        sql: MIGRATION_060,
+    },
+    Migration {
+        version: 61,
+        name: "project_conversation_work_scope_attachments",
+        sql: MIGRATION_061,
+    },
 ];
+
+const MIGRATION_061: &str = r"
+CREATE VIEW IF NOT EXISTS conversation_work_scope_attachments AS
+SELECT id AS conversation_id, work_scope_id
+FROM conversations
+WHERE work_scope_id IS NOT NULL;
+";
 
 const MIGRATION_058: &str = r"
 ALTER TABLE conversations ADD COLUMN effort TEXT
@@ -353,6 +375,40 @@ BEFORE UPDATE OF effort_source, effort_level ON turn_usage
 WHEN ((NEW.effort_source IN ('explicit', 'native_known')) != (NEW.effort_level IS NOT NULL))
 BEGIN
     SELECT RAISE(ABORT, 'invalid turn usage effort shape');
+END;
+";
+
+const MIGRATION_059: &str = r"
+ALTER TABLE conversations ADD COLUMN state_kind TEXT NOT NULL DEFAULT 'idle'
+    CHECK (state_kind IN (
+        'idle', 'llm_requesting', 'tool_executing', 'cancelling_tool',
+        'awaiting_sub_agents', 'cancelling_sub_agents', 'error',
+        'awaiting_continuation', 'recoverable_continuation_failure',
+        'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response',
+        'awaiting_commission_review_approval', 'context_exhausted',
+        'handed_off', 'terminal', 'completed', 'failed', 'provisioning',
+        'creation_failed', 'creation_cancelled', 'seeded_llm_requesting'
+    ));
+
+UPDATE conversations
+SET state_kind = json_extract(state, '$.type');
+
+CREATE INDEX IF NOT EXISTS idx_conversations_state_kind ON conversations(state_kind);
+";
+
+const MIGRATION_060: &str = r"
+CREATE TRIGGER conversations_state_kind_insert
+BEFORE INSERT ON conversations
+WHEN json_extract(NEW.state, '$.type') IS NOT NEW.state_kind
+BEGIN
+    SELECT RAISE(ABORT, 'conversation state_kind must match state type');
+END;
+
+CREATE TRIGGER conversations_state_kind_update
+BEFORE UPDATE OF state, state_kind ON conversations
+WHEN json_extract(NEW.state, '$.type') IS NOT NEW.state_kind
+BEGIN
+    SELECT RAISE(ABORT, 'conversation state_kind must match state type');
 END;
 ";
 
@@ -2870,6 +2926,32 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         // column) and abort startup.
         let mut tx = pool.begin().await?;
 
+        if migration.version == 59 {
+            let state_kind_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'state_kind'
+                )",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if state_kind_exists {
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS idx_conversations_state_kind
+                     ON conversations(state_kind)",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+                    .bind(migration.version)
+                    .bind(migration.name)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                applied += 1;
+                continue;
+            }
+        }
+
         sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
 
         sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
@@ -3172,6 +3254,165 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    #[tokio::test]
+    async fn migration_061_projects_attachments_without_moving_scope_ownership() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE work_scopes (
+                 id TEXT PRIMARY KEY,
+                 worktree_path TEXT
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 work_scope_id TEXT REFERENCES work_scopes(id),
+                 continued_in_conv_id TEXT REFERENCES conversations(id)
+             );
+             CREATE TABLE bash_processes (
+                 handle TEXT PRIMARY KEY,
+                 work_scope_id TEXT NOT NULL REFERENCES work_scopes(id)
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO work_scopes (id, worktree_path) VALUES ('scope-a', '/repo/.phoenix/worktrees/a')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations (id, work_scope_id) VALUES ('root', 'scope-a'), ('next', 'scope-a')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'next' WHERE id = 'root'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO bash_processes (handle, work_scope_id) VALUES ('bash-1', 'scope-a')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 61).await;
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        let attachments: Vec<(String, String)> = sqlx::query_as(
+            "SELECT conversation_id, work_scope_id FROM conversation_work_scope_attachments ORDER BY conversation_id",
+        )
+        .fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            attachments,
+            vec![
+                ("next".to_string(), "scope-a".to_string()),
+                ("root".to_string(), "scope-a".to_string()),
+            ]
+        );
+        let successor: String =
+            sqlx::query_scalar("SELECT continued_in_conv_id FROM conversations WHERE id = 'root'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(successor, "next");
+        let scope: (String, String) =
+            sqlx::query_as("SELECT id, worktree_path FROM work_scopes WHERE id = 'scope-a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            scope,
+            (
+                "scope-a".to_string(),
+                "/repo/.phoenix/worktrees/a".to_string()
+            )
+        );
+        let bash_owner: String =
+            sqlx::query_scalar("SELECT work_scope_id FROM bash_processes WHERE handle = 'bash-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bash_owner, "scope-a");
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_060_rejects_mismatched_state_kind_writes() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        stamp_migrations_except(&pool, 60).await;
+        let applied = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(applied, 1);
+
+        let mismatch = sqlx::query(
+            "INSERT INTO conversations
+             (id, state, state_kind, cwd, user_initiated, state_updated_at, created_at, updated_at)
+             VALUES ('bad', '{\"type\":\"idle\"}', 'error', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatch.is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_059_adds_and_backfills_state_kind() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        sqlx::query("DROP INDEX IF EXISTS idx_conversations_state_kind")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE conversations DROP COLUMN state_kind")
+            .execute(&pool)
+            .await
+            .unwrap();
+        stamp_migrations_except(&pool, 59).await;
+
+        for (id, state_json) in [
+            ("idle", r#"{"type":"idle"}"#),
+            (
+                "awaiting-recovery",
+                r#"{"type":"awaiting_recovery","resume_target":{"kind":"resume"}}"#,
+            ),
+            (
+                "seeded",
+                r#"{"type":"seeded_llm_requesting","seed_message_id":"m1","attempt":1}"#,
+            ),
+            ("terminal", r#"{"type":"terminal"}"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO conversations (id, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, ?2, '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(state_json)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let applied = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(applied, 1);
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, state_kind FROM conversations ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("awaiting-recovery".into(), "awaiting_recovery".into()),
+                ("idle".into(), "idle".into()),
+                ("seeded".into(), "seeded_llm_requesting".into()),
+                ("terminal".into(), "terminal".into()),
+            ]
+        );
+
+        let indexed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_state_kind'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexed, 1);
     }
 
     #[tokio::test]

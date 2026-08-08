@@ -202,7 +202,7 @@ export interface InitPayload {
     *  applied unseen events contiguously across the missing gap. */
 
   pendingTruncated: boolean;
-  messageSnapshot?: 'full' | 'suffix';
+  transcriptCoverage: 'complete' | 'tail' | 'preserve';
 }
 
 // Task 02675: every wire-originated SSE action carries a `sequenceId` from
@@ -1206,6 +1206,21 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
   }
 }
 
+export function transcriptCoverageAfterInit(
+  atom: Pick<ConversationAtom, 'conversationId' | 'transcriptGeneration' | 'transcriptCoverage'>,
+  payload: InitPayload,
+): 'tail' | 'complete' {
+  const sameOwner = atom.conversationId === payload.conversation.id;
+  const sameGeneration = sameOwner
+    && atom.transcriptGeneration !== null
+    && atom.transcriptGeneration === payload.transcriptGeneration;
+  if (payload.transcriptCoverage === 'preserve' && sameGeneration) return atom.transcriptCoverage;
+  if (payload.transcriptCoverage === 'tail' && sameGeneration && atom.transcriptCoverage === 'complete') {
+    return 'complete';
+  }
+  return payload.transcriptCoverage === 'complete' ? 'complete' : 'tail';
+}
+
 export function conversationReducer(
   atom: ConversationAtom,
   action: SSEAction
@@ -1227,18 +1242,21 @@ export function conversationReducer(
       // append genuinely new); fresh-connect replaces entirely. See
       // `SseInitReconnectMerge` / `SseInitFreshConnect` in
       // `specs/conversation_atom/conversation_atom.allium`.
-      const knownGenerationMatches = atom.transcriptGeneration !== null
+      const ownsIncomingTranscript = atom.conversationId === p.conversation.id;
+      const knownGenerationMatches = ownsIncomingTranscript
+        && atom.transcriptGeneration !== null
         && atom.transcriptGeneration === p.transcriptGeneration;
-      const hadMessagesBeforeInit = atom.messages.length > 0;
       const generationChanged = atom.transcriptGeneration !== null && atom.transcriptGeneration !== p.transcriptGeneration;
-      const isFreshConnect = atom.lastAppliedEventSeq === 0 || generationChanged;
-      const snapshotIsSuffix = p.messageSnapshot === 'suffix';
-      const mergesMessageSuffix = snapshotIsSuffix && knownGenerationMatches;
-      const nextTranscriptCoverage: 'tail' | 'complete' = snapshotIsSuffix
-        ? (knownGenerationMatches && hadMessagesBeforeInit ? atom.transcriptCoverage : 'tail')
-        : 'complete';
+      const isFreshConnect = !ownsIncomingTranscript
+        || atom.lastAppliedEventSeq === 0
+        || generationChanged;
+      const preservesTranscript = p.transcriptCoverage === 'preserve' && knownGenerationMatches;
+      const mergesMessageSuffix = p.transcriptCoverage === 'tail' && knownGenerationMatches;
+      const nextTranscriptCoverage = transcriptCoverageAfterInit(atom, p);
       let mergedMessages: Message[];
-      if (mergesMessageSuffix) {
+      if (preservesTranscript) {
+        mergedMessages = atom.messages;
+      } else if (mergesMessageSuffix) {
         mergedMessages = mergeMessagesByIdentity(atom.messages, p.messages);
       } else {
         mergedMessages = [...p.messages].sort((left, right) => left.sequence_id - right.sequence_id);

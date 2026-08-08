@@ -163,6 +163,29 @@ pub struct ConversationListResponse {
     pub conversations: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ConversationSearchQuery {
+    pub q: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationSearchHit {
+    pub conversation_id: String,
+    pub slug: String,
+    pub archived: bool,
+    pub message_id: String,
+    pub message_type: String,
+    pub created_at: String,
+    pub snippet: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationSearchResponse {
+    pub hits: Vec<ConversationSearchHit>,
+}
+
 /// Response with a single conversation
 #[derive(Debug, Serialize)]
 pub struct ConversationResponse {
@@ -170,12 +193,9 @@ pub struct ConversationResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ConversationMetaResponse {
-    pub conversation: serde_json::Value,
-    pub agent_working: bool,
-    /// Presentation mode: `idle`, `working`, `needs_action`, `error`, `done`
-    pub presentation_mode: String,
-    pub context_window_size: u64,
+pub struct ConversationRouteResponse {
+    pub id: String,
+    pub slug: Option<String>,
 }
 
 /// Response with conversation and messages

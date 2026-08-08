@@ -43,20 +43,14 @@
 --   specs/conversation_atom/conversation_atom.allium — the reducer-side
 --       spec. On reconnect, init replays through the reducer via
 --       SseInitReconnectMerge. The "close → reconnect → open → init
---       merge" chain is load-bearing for 02679's bug recovery path.
---   tasks/02681 — this spec.
---   tasks/02679 — streaming-finalizes-then-disappears. The lag-close fix
---                 in commit 736b37d makes the "server closes → client
---                 reconnects → init resyncs" chain the recovery path.
---
+--       merge" chain is load-bearing for broadcast-lag recovery.
 -- Rationale: the reconnect lifecycle is the glue that turns sse_wire's
 --            LagCloseStream into conversation_atom's SseInitReconnectMerge.
 --            If a future change to connectionMachine.ts silently stops
 --            emitting OPEN_SSE after SSE_ERROR (e.g. a new terminal
 --            "reconnecting" state that forgets to schedule retry), the
---            lag-close fix degrades into exactly the silent-drop bug it
---            was built to prevent. Naming the chain here makes that
---            regression structural rather than behavioural.
+--            lag-close recovery degrades into a silent-drop bug. Naming the
+--            chain here makes that regression structural rather than behavioural.
 
 use "../sse_wire/sse_wire.allium" as sse_wire
 
@@ -219,7 +213,11 @@ rule ClientMounted {
         -- The CONNECT transition (connectionMachine.ts) emits
         -- effects=[OPEN_SSE]. The OPEN_SSE effect handler calls
         --   new EventSource(`/api/conversations/${convId}/stream`)
-        -- which triggers sse_wire's StreamOpened on the server and
+        -- The first open has no replay cursor. Subsequent OPEN_SSE effects add
+        -- `after_event_sequence` from the reducer's last applied event and pair
+        -- it with the reducer's transcript generation. No transcript-message
+        -- floor participates in reconnect correctness.
+        -- This triggers sse_wire's StreamOpened on the server and
         -- sets current_stream + creates the EventSource entity once
         -- the server-side SseStream is observable.
 }
@@ -433,6 +431,10 @@ rule SseErrorGoOfflineNoRetry {
 ------------------------------------------------------------
 
 -- Backoff timer elapsed: issue a fresh OPEN_SSE. Works from either
+-- The new stream request carries the client's last applied SSE event sequence
+-- and paired transcript generation so ReplayRing resumption can preserve the
+-- current transcript only when both sides prove the same generation.
+--
 -- reconnecting or offline (the latter because a scheduled timer can
 -- outlive a BROWSER_OFFLINE transition).
 rule RetryTimerFired {

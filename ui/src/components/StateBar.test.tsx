@@ -233,6 +233,8 @@ function makePrStatusHandle(prStatus: PrStatusResponse, selection: ReturnType<ty
   return {
     state: { status: 'ready' as const, prStatus: selection ? { ...prStatus, selection } : prStatus },
     refresh: vi.fn().mockResolvedValue(undefined),
+    refreshForSafety: vi.fn().mockResolvedValue(undefined),
+  refreshAfterMutation: vi.fn().mockResolvedValue(undefined),
     activeSelection: selection,
     activePrSummary: selection?.active_pr
       ? selection.associated_prs.find((pr) => pr.repo_owner === selection.active_pr?.pr.repo_owner
@@ -532,6 +534,22 @@ describe('StateBar PR badge', () => {
       </MemoryRouter>,
     );
 
+    expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          {...props}
+          convState={{
+            type: 'recoverable_continuation_failure',
+            message: 'Selected model is at capacity',
+            error_kind: 'server_overloaded',
+            operation_id: 'continuation-operation-1',
+            attempt: 1,
+          }}
+        />
+      </MemoryRouter>,
+    );
     expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
 
     rerender(

@@ -65,6 +65,8 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
       return {
         state: { status: 'ready', prStatus: mobileMixedBranchStatus },
         refresh: async () => mobileMixedBranchStatus,
+        refreshForSafety: async () => mobileMixedBranchStatus,
+        refreshAfterMutation: async () => mobileMixedBranchStatus,
         activeSelection: mobileMixedBranchSelection,
         activePrSummary: mobileMixedBranchPrs[1]!,
         ambiguous: false,
@@ -77,6 +79,8 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
     return {
       state: { status: 'ready', prStatus: status },
       refresh: async () => status,
+      refreshForSafety: async () => status,
+      refreshAfterMutation: async () => status,
       activeSelection: hasActivePr ? mobileMultiPrActiveSelection : mobileMultiPrSelection,
       activePrSummary: hasActivePr ? mobileMultiPrAssociatedPrs[1]! : null,
       ambiguous: !hasActivePr,

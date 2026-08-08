@@ -60,11 +60,15 @@ THE SYSTEM SHALL show its priority badge (`p0`..`p4`), task ID, slug, and — if
 
 ### REQ-TASKS-UI-003: Recognize My Current Task at a Glance
 
-WHEN this conversation is associated with a task (Work mode tracks one)
+WHEN this conversation is associated with a task that the task index resolves as current
 THE SYSTEM SHALL render that task row with a visual highlight and a "current" badge
 AND SHALL NOT render the → conversation arrow on it (it's already this conversation)
 
-**Rationale:** Work-mode conversations are scoped to one task by design. Visually anchoring "this is the one you're doing" prevents the very reasonable "wait, which one was I on?" scroll-back I'd otherwise do. Suppressing the → arrow on the current row is the small detail that says "you're already here."
+**Rationale:** Users still need to recognize the task most directly tied to the open
+conversation, even though conversations and tasks are not a 1:1 lifecycle pair. Visually
+anchoring "this is the one you're doing right now" prevents the very reasonable "wait,
+which one was I on?" scroll-back I'd otherwise do. Suppressing the → arrow on the current
+row is the small detail that says "you're already here."
 
 ---
 
@@ -120,7 +124,11 @@ THE SYSTEM SHALL render a "Go to conversation" link in the Details section
 WHEN I'm already viewing the associated conversation (REQ-TASKS-UI-003 currentTaskId match)
 THE SYSTEM SHALL NOT render the → button on the row (the "current" badge already says "you're here")
 
-**Rationale:** Tasks and conversations have a 1:1 mapping in Work mode. Bidirectional navigation makes the queue feel like a workspace rather than a static list. The → suppression on the current row prevents the user from clicking and confusingly arriving at the same place they already are.
+**Rationale:** Tasks and conversations still need bidirectional navigation even though
+neither owns the other's lifecycle. The queue feels like a workspace rather than a static
+list when I can move directly from a task to the conversation currently working from it and
+back again. The → suppression on the current row prevents the user from clicking and
+confusingly arriving at the same place they already are.
 
 ---
 

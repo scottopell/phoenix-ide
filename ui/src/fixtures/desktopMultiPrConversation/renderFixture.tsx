@@ -44,6 +44,8 @@ export function DesktopMultiPrConversationFixture({ scenario }: { scenario: Desk
   const handle = useMemo<ConversationPrStatusHandle>(() => ({
     state: { status: 'ready', prStatus: ambiguous ? mobileMultiPrStatus : mobileMultiPrActiveStatus },
     refresh: async () => ambiguous ? mobileMultiPrStatus : mobileMultiPrActiveStatus,
+    refreshForSafety: async () => ambiguous ? mobileMultiPrStatus : mobileMultiPrActiveStatus,
+    refreshAfterMutation: async () => ambiguous ? mobileMultiPrStatus : mobileMultiPrActiveStatus,
     activeSelection: ambiguous ? mobileMultiPrSelection : mobileMultiPrActiveSelection,
     activePrSummary: ambiguous ? null : mobileMultiPrAssociatedPrs[1]!,
     ambiguous,

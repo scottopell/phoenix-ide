@@ -94,6 +94,18 @@ value UIError {
     message: String
 }
 
+value ProductConversationLifecycle {
+    root_conversation_id: String
+    lifecycle: String
+}
+
+value ContinuationBoundary {
+    root_conversation_id: String
+    predecessor_conversation_id: String
+    successor_conversation_id: String
+    boundary_summary: String
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -102,12 +114,14 @@ value UIError {
 -- actions.
 entity ConversationAtom {
     conversationId: String?
+    productLifecycle: ProductConversationLifecycle?
+    continuationBoundaries: List<ContinuationBoundary>
     phase: Phase
     messages: List<Message>
     -- Server-authoritative persisted steering queue in FIFO order.
     steeringMessages: List<SteeringMessage>
     transcriptGeneration: Integer?
-    transcriptCoverage: String
+    transcriptCoverage: TranscriptCoverage
     lastSequenceId: Integer
     streamingBuffer: StreamingBuffer?
     uiError: UIError?
@@ -131,6 +145,12 @@ entity ConversationAtom {
     -- separates "fresh generation" from "stale OPEN_SSE closure".
     connectionEpoch: Integer?
 }
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum TranscriptCoverage { complete | tail }
 
 ------------------------------------------------------------
 -- Actor Declarations
@@ -181,7 +201,9 @@ rule WireActionStaleEpochDropped {
         -- atom.ts:256-280 (isStaleEpoch). Applies to:
         -- sse_init, sse_message, sse_message_updated, sse_state_change,
         -- sse_agent_done, sse_token, sse_conversation_update,
-        -- sse_browser_session_state, sse_error, connection_state.
+        -- sse_product_conversation_lifecycle, sse_continuation_boundary,
+        -- sse_work_scope_update, sse_browser_session_state, sse_error,
+        -- connection_state.
         -- Bypassed for: connection_opened (which carries the epoch as
         -- DATA, not as a stamp — the rule's monotonic check is the
         -- guard there), connection_reset (no epoch, mount-only),
@@ -210,7 +232,9 @@ rule SseInitFreshConnect {
     -- payload.pending_anchor_sequence_id (NOT payload.last_sequence_id)
     -- so the per-event rules below can apply each pending entry via
     -- their normal applyIfNewer guard.
-    ensures: atom.messages = reconcile_snapshot(atom.messages, payload.messages, payload.message_snapshot, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.messages = reconcile_transcript(atom.messages, payload.messages, payload.transcript_coverage, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.transcriptCoverage = coverage_after_init(atom.transcriptCoverage, payload.transcript_coverage, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.productLifecycle = payload.product_conversation_lifecycle
     ensures: atom.steeringMessages = without_delivered(payload.steering_messages, payload.messages)
     ensures: atom.phase = payload.phase
     ensures: atom.lastSequenceId = payload.pending_anchor_sequence_id
@@ -250,10 +274,12 @@ rule SseInitFreshConnect {
 }
 
 -- `init` on reconnect: reconcile messages according to the server-declared
--- snapshot mode, then apply pending events the same way SseInitFreshConnect
--- does. A suffix merges with generation-matched local messages; a full
--- snapshot replaces them. Pending replay restores the in-flight UI state
--- for the active turn (if any).
+-- transcript coverage, then apply pending events the same way
+-- SseInitFreshConnect does. `preserve` retains generation-matched local
+-- transcript and coverage; `tail` identity-merges a generation-matched newest
+-- suffix and remains tail-covered; `complete` replaces with the authoritative
+-- complete selection. Pending replay restores the in-flight UI state for the
+-- active turn (if any).
 --
 -- Unlike fresh-connect, the atom's pre-existing lastSequenceId may
 -- already be above the snapshot's pending_anchor. In that case the
@@ -277,7 +303,9 @@ rule SseInitReconnectMerge {
     -- because the cleared buffer cannot be rebuilt from already-
     -- observed tokens). Cleared when payload.phase is anything
     -- else, because the turn ended while disconnected.
-    ensures: atom.messages = reconcile_snapshot(atom.messages, payload.messages, payload.message_snapshot, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.messages = reconcile_transcript(atom.messages, payload.messages, payload.transcript_coverage, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.transcriptCoverage = coverage_after_init(atom.transcriptCoverage, payload.transcript_coverage, atom.transcriptGeneration, payload.transcript_generation)
+    ensures: atom.productLifecycle = payload.product_conversation_lifecycle
     ensures: atom.steeringMessages = without_delivered(payload.steering_messages, atom.messages)
     ensures: atom.phase = payload.phase
     ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase, payload.pending_truncated)
@@ -316,16 +344,17 @@ rule SseInitReconnectMerge {
         -- (at seqs above the new tip) append onto, producing a gapped
         -- and corrupted message. Truncated → fall back to DB-only.
         --
-        -- reconcile_snapshot(existing, incoming, mode, localGeneration,
-        --                    incomingGeneration):
-        --   if mode = suffix and localGeneration = incomingGeneration
+        -- reconcile_transcript(existing, incoming, coverage, localGeneration,
+        --                      incomingGeneration):
+        --   if coverage = preserve and generations match then existing
+        --   else if coverage = tail and generations match
         --     then merge incoming into existing by message_id/sequence_id
-        --     else replace existing with incoming
+        --   else replace existing with incoming
         --   sort the result by sequence_id
-        -- Full mode is server-authoritative even on reconnect: retaining
-        -- local-only rows would preserve stale transcript state after a
-        -- generation fallback. Suffix mode merges only when both sides prove
-        -- they describe the same transcript generation.
+        -- coverage_after_init preserves the atom's complete/tail value only
+        -- for generation-matched `preserve`; otherwise complete maps to
+        -- complete and tail maps to tail. Generation mismatch therefore
+        -- replaces local transcript state rather than retaining stale rows.
         --
         -- payload.pending_events: the ReplayRing contents at subscribe
         -- time. Carries events the server emitted since the last
@@ -560,6 +589,38 @@ rule LocalSteerMessageCancelledStaleConversation {
     ensures: atom = atom
 }
 
+-- `product_conversation_lifecycle` — authoritative Open/History lifecycle fact
+-- for the stable root subscriber. Applied through the same root-sequence replay
+-- guard as every other aggregate-bound event.
+rule SseProductConversationLifecycleApplied {
+    when: SseProductConversationLifecycleDispatched(atom, lifecycle_update, seq)
+
+    requires: seq > atom.lastSequenceId
+
+    ensures: atom.productLifecycle = lifecycle_update
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- The conversation page consumes this typed lifecycle carrier to keep
+        -- Open/History placement and any lifecycle-derived affordances in sync for
+        -- continuously connected clients and reconnecting clients alike. It replaces
+        -- any row-local terminal event consumer.
+}
+
+rule SseContinuationBoundaryApplied {
+    when: SseContinuationBoundaryDispatched(atom, boundary, seq)
+
+    requires: seq > atom.lastSequenceId
+    requires: boundary.root_conversation_id = atom.conversationId
+
+    ensures: atom.continuationBoundaries = upsert_boundary(atom.continuationBoundaries, boundary)
+    ensures: atom.lastSequenceId = seq
+
+    @guidance
+        -- The dispatcher registers the named continuation_boundary carrier and
+        -- applies the durable predecessor/successor join idempotently on live and
+        -- replay delivery. It does not infer continuation topology from lifecycle.
+}
 -- `sse_error` with a sequence_id (wire-originated) routes through
 -- applyIfNewer. A replayed error after the user dismissed it does NOT
 -- re-pop the toast (because applyIfNewer drops it as a replay).

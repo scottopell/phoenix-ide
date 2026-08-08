@@ -132,8 +132,14 @@ function makeInitPayload(convId: string, slug: string) {
       updated_at: '2024-01-01T00:00:00Z',
       message_count: 0,
       transcript_generation: 1,
+      archived: false,
+      browser_session_active: false,
+      terminal_uses_tmux: false,
+      worktree_path: '/tmp/worktree',
+      work_scope_key: 'worktree:/tmp/worktree',
+      conv_mode_label: 'Explore',
     },
-    message_snapshot: 'full',
+    transcript_coverage: 'complete',
     messages: [],
     steering_messages: [],
     agent_working: false,
@@ -185,57 +191,37 @@ describe('useConnection epoch stamping (task 08683)', () => {
     );
   });
 
-  it('uses the server snapshot mode when a requested suffix falls back to full', () => {
+  it('closes and schedules recovery when init identity differs from the route', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    const { result } = renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+    const stream = FakeEventSource.instances[0]!;
+
+    act(() => stream.emit('init', makeInitPayload('conv-B', 'slug-B')));
+
+    expect(stream.closed).toBe(true);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: 'sse_error' }));
+    expect(result.current.state).toBe('reconnecting');
+  });
+
+  it('uses the exact transcript coverage reported in init payloads', () => {
     const captured: SSEAction[] = [];
     const dispatch = (action: SSEAction) => captured.push(action);
 
     renderHook(() => useConnection({
       conversationId: 'conv-A',
       dispatch,
-      getInitialRequestMode: () => ({ kind: 'messages_after_floor', afterMessageFloor: 77, transcriptGeneration: 3 }),
     }));
 
     act(() => {
       FakeEventSource.instances[0]!.emit('init', {
         ...makeInitPayload('conv-A', 'slug-A'),
         transcript_generation: 4,
-        message_snapshot: 'full',
+        transcript_coverage: 'complete',
       });
     });
 
     const init = captured.find((action) => action.type === 'sse_init');
-    expect(init?.type === 'sse_init' ? init.payload.messageSnapshot : undefined).toBe('full');
-  });
-
-  it('uses demand-driven init query params before an event cursor exists', () => {
-    const dispatch = vi.fn<(a: SSEAction) => void>();
-
-    renderHook(() => useConnection({
-      conversationId: 'conv-A',
-      dispatch,
-      getInitialRequestMode: () => ({ kind: 'messages_after_floor', afterMessageFloor: 77, transcriptGeneration: 3 }),
-    }));
-
-    expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toMatch(
-      /^\/api\/conversations\/conv-A\/stream\?init_mode=messages_after_floor&after_message_floor=77&transcript_generation=3&open_id=[0-9a-f-]{36}$/,
-    );
-  });
-
-  it('prefers the replay cursor over demand-driven init params once live event ordering exists', () => {
-    const dispatch = vi.fn<(a: SSEAction) => void>();
-
-    renderHook(() => useConnection({
-      conversationId: 'conv-A',
-      dispatch,
-      getLastAppliedEventSeq: () => 42,
-      getInitialRequestMode: () => ({ kind: 'messages_after_floor', afterMessageFloor: 77, transcriptGeneration: 3 }),
-    }));
-
-    expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toMatch(
-      /^\/api\/conversations\/conv-A\/stream\?after_event_sequence=42&open_id=[0-9a-f-]{36}$/,
-    );
+    expect(init?.type === 'sse_init' ? init.payload.transcriptCoverage : undefined).toBe('complete');
   });
 
   it('reports one connected measurement correlated to the stream open ID', () => {

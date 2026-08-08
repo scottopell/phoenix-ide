@@ -36,6 +36,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [022](022_coordinator-uses-relational-evidence.md) | The Coordinator uses bounded relational evidence | Accepted | REQ-GR-001–005, REQ-GR-007–011A |
 | [023](023_projects-accept-taskmd-and-plain-markdown-briefs.md) | Projects accept taskmd files by default and plain markdown briefs through one task-source seam | Accepted | REQ-PROJ-003, REQ-PROJ-004, REQ-PROJ-006, REQ-PROJ-012, REQ-PROJ-033, REQ-PROJ-034, REQ-PROJ-037 |
 | [024](024_direct-turn-authority-is-partitioned-by-semantic-fact.md) | Direct-turn authority is partitioned by semantic fact | Accepted | REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014 |
+| [025](025_continuation-compaction-is-an-idempotent-durable-operation.md) | Continuation compaction is an idempotent durable operation | Accepted | REQ-BED-020 |
+| [026](026_workscope-owned-lifecycle-unifies-conversation-handoffs.md) | Product conversation lifecycle is separate from WorkScope resource ownership | Accepted | REQ-BED-019, REQ-BED-028, REQ-BED-029, REQ-BED-030, REQ-PROJ-004, REQ-PROJ-015, REQ-PROJ-WS-001, REQ-WL-001, REQ-WL-002, REQ-PRA-000, REQ-CHN-008, REQ-GR-001 |
 
 ## For agents: which decisions bind your task
 
@@ -58,12 +60,14 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying native macOS self-deployment, activation, or rollback | 010 |
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
+| Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 022, then 021 for chat-only UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
+| Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 
 ## Decision dependencies
 
@@ -91,9 +95,12 @@ ADR-000 (adopt spEARS v2 for new work)
           ├── ADR-019 (Runtime ownership requires positive evidence)
           └── ADR-020 (Durable-workflow core matches one scheduler authority and durable acknowledgement)
               └── ADR-024 (Direct-turn authority is partitioned by semantic fact)
+      └── ADR-025 (Continuation compaction is an idempotent durable operation)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
-      └── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
+      ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
+      ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
+      └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
 ```
 
 ## Conventions

@@ -37,6 +37,23 @@ class PhoenixError(Exception):
     pass
 
 
+def _state_kind(state: object) -> str:
+    if isinstance(state, dict):
+        value = state.get('type')
+        return value if isinstance(value, str) else 'unknown'
+    return state if isinstance(state, str) else 'unknown'
+
+
+def _state_error_message(state: object, fallback: str) -> str:
+    if not isinstance(state, dict):
+        return fallback
+    failure = state.get('failure')
+    if isinstance(failure, dict) and isinstance(failure.get('message'), str):
+        return failure['message']
+    message = state.get('message')
+    return message if isinstance(message, str) else fallback
+
+
 def _detect_api_url() -> str:
     """Detect API URL from environment or dev.py conventions.
 
@@ -284,6 +301,16 @@ class PhoenixClient:
                     if event.event == "init":
                         messages = data.get('messages', [])
                         conversation = data.get('conversation')
+                        state = conversation.get('state') if isinstance(conversation, dict) else None
+                        state_kind = _state_kind(state)
+                        if state_kind == 'recoverable_continuation_failure':
+                            raise PhoenixError(
+                                _state_error_message(state, 'Continuation summary failed')
+                            )
+                        if state_kind == 'error':
+                            raise PhoenixError(_state_error_message(state, 'Unknown error'))
+                        if state_kind == 'context_exhausted':
+                            return {'conversation': conversation, 'messages': messages}
 
                     elif event.event == "message":
                         msg = data.get('message')
@@ -292,16 +319,19 @@ class PhoenixClient:
 
                     elif event.event == "state_change":
                         state = data.get('state')
+                        state_kind = _state_kind(state)
                         display_state = data.get('display_state')
 
-                        if state == 'error':
-                            state_data = data.get('state_data', {})
-                            error_msg = state_data.get('message', 'Unknown error') if state_data else 'Unknown error'
-                            raise PhoenixError(error_msg)
+                        if state_kind == 'error':
+                            raise PhoenixError(_state_error_message(state, 'Unknown error'))
 
-                        if state == 'context_exhausted':
-                            state_data = data.get('state_data', {})
-                            summary = state_data.get('summary', '') if state_data else ''
+                        if state_kind == 'recoverable_continuation_failure':
+                            raise PhoenixError(
+                                _state_error_message(state, 'Continuation summary failed')
+                            )
+
+                        if state_kind == 'context_exhausted':
+                            summary = state.get('summary', '') if isinstance(state, dict) else ''
                             click.echo(f"Context exhausted: {summary}", err=True)
                             return {
                                 'conversation': conversation,
@@ -335,18 +365,17 @@ class PhoenixClient:
         while time.time() - start < timeout:
             data = self.get_messages(conv_id, last_sequence)
             state = data['conversation']['state']
+            state_kind = _state_kind(state)
 
-            # Handle state as either string or dict with type field
-            if isinstance(state, dict):
-                state = state.get('type', 'unknown')
-
-            if state == 'idle':
+            if state_kind == 'idle':
                 return self.get_messages(conv_id)
-            elif state == 'error':
-                state_data = data['conversation'].get('state_data', {})
-                error_msg = state_data.get('message', 'Unknown error') if state_data else 'Unknown error'
-                raise PhoenixError(error_msg)
-            elif state == 'context_exhausted':
+            elif state_kind == 'error':
+                raise PhoenixError(_state_error_message(state, 'Unknown error'))
+            elif state_kind == 'recoverable_continuation_failure':
+                raise PhoenixError(
+                    _state_error_message(state, 'Continuation summary failed')
+                )
+            elif state_kind == 'context_exhausted':
                 return self.get_messages(conv_id)
 
             # Update last_sequence for next poll

@@ -104,7 +104,7 @@ rule DiscoverAgentCatalog {
 --   name:        required String — agent identifier; the agent_type value
 --   description: required String — one-line description for the enum choice
 --   model:       optional String — default model id (resolved in subagents.allium)
---   mode:        optional String — default sub-agent mode: "explore" | "work"
+--   execution_authority: optional String — default sub-agent authority: "read_only" | "write_capable"
 --   tools:       optional List   — parsed and preserved, not consulted (REQ-AG-009)
 
 -- An agent file missing a required field registers no agent; discovery of the

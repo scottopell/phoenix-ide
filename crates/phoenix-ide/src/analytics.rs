@@ -450,6 +450,7 @@ fn terminal_status(conv: &Conversation) -> Option<String> {
         | crate::state_machine::ConvState::CancellingSubAgents { .. }
         | crate::state_machine::ConvState::AwaitingRecovery { .. }
         | crate::state_machine::ConvState::AwaitingContinuation { .. }
+        | crate::state_machine::ConvState::RecoverableContinuationFailure { .. }
         | crate::state_machine::ConvState::AwaitingTaskApproval { .. }
         | crate::state_machine::ConvState::AwaitingUserResponse { .. }
         | crate::state_machine::ConvState::AwaitingCommissionReviewApproval { .. } => None,
@@ -623,7 +624,9 @@ mod tests {
     #[test]
     fn session_last_seen_includes_message_activity_after_usage() {
         let root = Conversation {
-            work_scope_id: Some(crate::work_scope::WorkScopeId::parse("test-work").unwrap()),
+            attached_work_scope_id: Some(
+                crate::work_scope::WorkScopeId::parse("test-work").unwrap(),
+            ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: "root".to_string(),
             slug: Some("root".to_string()),

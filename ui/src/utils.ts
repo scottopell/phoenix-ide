@@ -54,7 +54,7 @@ export function formatShortDateTime(isoStr: string): string {
 
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
-    case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed': case 'creation_cancelled':
+    case 'idle': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed': case 'creation_cancelled':
     case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
@@ -71,7 +71,7 @@ export function canCancelConversationState(state: ConversationState): boolean {
     case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_commission_review_approval': case 'awaiting_recovery': case 'provisioning':
       return true;
-    case 'idle': case 'creation_failed': case 'creation_cancelled': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'creation_failed': case 'creation_cancelled': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_llm': case 'awaiting_continuation': case 'awaiting_user_response':
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return false;
@@ -83,7 +83,7 @@ export function isCancellingState(state: ConversationState): boolean {
   switch (state.type) {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
-    case 'idle': case 'provisioning': case 'creation_failed': case 'creation_cancelled': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'provisioning': case 'creation_failed': case 'creation_cancelled': case 'error': case 'recoverable_continuation_failure': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -155,6 +155,8 @@ export function getStateDescription(state: ConversationState): string {
       return 'awaiting your reply';
     case 'error':
       return 'error';
+    case 'recoverable_continuation_failure':
+      return 'continuation failed';
     case 'awaiting_recovery':
       return 'authenticating...';
     case 'context_exhausted':
@@ -324,6 +326,25 @@ export function parseConversationState(raw: unknown): ConversationState {
       };
     case 'context_exhausted':
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };
+    case 'recoverable_continuation_failure': {
+      const failure = obj['failure'];
+      if (!failure || typeof failure !== 'object' || Array.isArray(failure)) {
+        return serverError('Invalid recoverable continuation failure');
+      }
+      const value = failure as Record<string, unknown>;
+      return {
+        type: 'recoverable_continuation_failure',
+        message: stringOr(value['message'], 'Continuation summary generation failed'),
+        error_kind: stringOr(value['error_kind'], 'server_error') as ErrorKind,
+        operation_id: stringOr(
+          (value['request'] as Record<string, unknown> | undefined)?.['operation_id'],
+          'legacy-continuation-operation',
+        ),
+        attempt: typeof (value['request'] as Record<string, unknown> | undefined)?.['attempt'] === 'number'
+          ? (value['request'] as Record<string, unknown>)['attempt'] as number
+          : 1,
+      };
+    }
     case 'handed_off': {
       const successor = obj['successor_conv_id'];
       if (typeof successor !== 'string' || successor.trim() === '') {

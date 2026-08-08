@@ -199,7 +199,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - name: Upgrade corepack

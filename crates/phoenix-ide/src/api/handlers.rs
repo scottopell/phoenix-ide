@@ -26,19 +26,22 @@ use super::types::{
     CodeSearchResponse, ConflictErrorResponse, ContinueConversationRequest,
     ContinueConversationResponse, ContinueConversationStatus, ConversationListResponse,
     ConversationMessageRangeResponse, ConversationMessageSliceResponse,
-    ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
-    ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
-    DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
-    FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse, ListFilesResponse,
-    MkdirResponse, ModelsResponse, NotificationSettingsRequest, ProjectFileSearchQuery,
-    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, ReconcileAcceptedMessagesRequest,
-    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
-    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ConversationMessagesAroundResponse, ConversationResponse, ConversationRouteResponse,
+    ConversationSearchQuery, ConversationSearchResponse, ConversationWithMessagesResponse,
+    CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
+    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
+    FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
+    ReadFileResponse, ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse,
+    RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse,
+    SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse,
+    UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
-use crate::db::{ConvMode, ConversationUsage, DbError, ImageData, NotificationSettings};
+use crate::db::{
+    ConvMode, ConversationUsage, DbError, ImageData, NotificationSettings, RetrievalRequest,
+};
 use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
@@ -116,6 +119,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/preview/*filepath", get(serve_preview_file))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
+        .route("/api/conversations/search", get(search_conversations))
         .route(
             "/api/global/coordinator",
             get(get_existing_coordinator).post(ensure_coordinator),
@@ -143,7 +147,7 @@ pub fn create_router(state: AppState) -> Router {
             delete(stop_conversation_browser_session),
         )
         .route("/api/conversations/:id/slug", get(get_conversation_slug))
-        .route("/api/conversations/:id/meta", get(get_conversation_meta))
+        .route("/api/conversations/:id/route", get(get_conversation_route))
         .route(
             "/api/conversations/:id/messages/latest",
             get(get_conversation_messages_latest),
@@ -267,11 +271,11 @@ pub fn create_router(state: AppState) -> Router {
         // terminal renders results as click-to-run affordances.
         .route("/api/suggest", post(suggest_handler))
         // Slug resolution (REQ-API-007)
-        .route(
-            "/api/conversations/by-slug/:slug/meta",
-            get(get_by_slug_meta),
-        )
         .route("/api/conversations/by-slug/:slug", get(get_by_slug))
+        .route(
+            "/api/conversations/by-slug/:slug/route",
+            get(get_by_slug_route),
+        )
         // Phoenix Chains v1 (REQ-CHN-003 / 004 / 005 / 007)
         // Work-scope observability inventory (read-projection over the
         // bash/tmux/browser registries). `:scope_key` is a
@@ -791,7 +795,7 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
 fn conversation_resource_scope(
     conv: &crate::db::Conversation,
 ) -> crate::work_scope::ResourceScopeKey {
-    match conv.work_scope_id.clone() {
+    match conv.attached_work_scope_id.clone() {
         Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
         None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
             crate::work_scope::ResourceScopeKey::Coordinator
@@ -803,7 +807,7 @@ fn conversation_resource_scope(
 fn conversation_work_scope(
     conv: &crate::db::Conversation,
 ) -> Result<crate::work_scope::ResourceScopeKey, AppError> {
-    conv.work_scope_id
+    conv.attached_work_scope_id
         .clone()
         .map(crate::work_scope::ResourceScopeKey::Work)
         .ok_or_else(|| AppError::Forbidden("conversation has no work scope".to_string()))
@@ -827,7 +831,7 @@ async fn cached_pr_summary_for_conversation(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> Result<Option<crate::runtime::CachedPrSummary>, AppError> {
-    let Some(scope) = conv.work_scope_id.as_ref() else {
+    let Some(scope) = conv.attached_work_scope_id.as_ref() else {
         return Ok(None);
     };
     Ok(state
@@ -845,7 +849,7 @@ async fn cached_pr_summaries_for_conversations(
 ) -> Result<HashMap<String, crate::runtime::CachedPrSummary>, AppError> {
     let scopes: Vec<_> = conversations
         .iter()
-        .filter_map(|conv| conv.work_scope_id.clone())
+        .filter_map(|conv| conv.attached_work_scope_id.clone())
         .collect();
     let associations = state
         .runtime
@@ -1164,6 +1168,116 @@ async fn list_archived_conversations(
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
     }))
+}
+
+const DEFAULT_CONVERSATION_SEARCH_LIMIT: usize = 10;
+const MAX_CONVERSATION_SEARCH_LIMIT: usize = 20;
+
+fn clamp_conversation_search_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_CONVERSATION_SEARCH_LIMIT)
+        .clamp(1, MAX_CONVERSATION_SEARCH_LIMIT)
+}
+
+async fn search_conversations(
+    State(state): State<AppState>,
+    Query(query): Query<ConversationSearchQuery>,
+) -> Result<Json<ConversationSearchResponse>, AppError> {
+    let q = query.q.trim();
+    if q.is_empty() {
+        return Ok(Json(ConversationSearchResponse { hits: Vec::new() }));
+    }
+    if !state.message_retriever.index_reconciled() {
+        return Err(AppError::TypedBadRequest {
+            message:
+                "the global message index is still warming; try again after startup reconciliation completes"
+                    .to_string(),
+            error_type: "conversation_search_warming".to_string(),
+        });
+    }
+    let limit = clamp_conversation_search_limit(query.limit);
+    let hits = state
+        .message_retriever
+        .retrieve(RetrievalRequest::palette_conversation_search(q, limit))
+        .await
+        .map_err(|e| AppError::Internal(format!("search failed: {e}")))?;
+    let eligible_ids = state
+        .db
+        .list_conversation_search_ids()
+        .await
+        .map_err(|e| AppError::Internal(format!("search freshness scope failed: {e}")))?;
+    let fresh = state
+        .message_retriever
+        .is_fresh_for(&eligible_ids)
+        .await
+        .map_err(|e| AppError::Internal(format!("search freshness check failed: {e}")))?;
+    if !fresh {
+        return Err(AppError::TypedBadRequest {
+            message: "the global message index is catching up; try the search again".to_string(),
+            error_type: "conversation_search_warming".to_string(),
+        });
+    }
+    let conversation_ids: Vec<String> =
+        hits.iter().map(|hit| hit.conversation_id.clone()).collect();
+    let metadata = state
+        .db
+        .get_conversation_search_metadata(&conversation_ids)
+        .await
+        .map_err(|e| AppError::Internal(format!("search metadata lookup failed: {e}")))?;
+    let message_ids: Vec<String> = hits.iter().map(|hit| hit.message_id.clone()).collect();
+    let visible_message_ids = state
+        .db
+        .visible_retrieval_message_ids(&message_ids)
+        .await
+        .map_err(|e| AppError::Internal(format!("search visibility lookup failed: {e}")))?;
+    let current_generations = state
+        .db
+        .conversation_transcript_generations(&conversation_ids)
+        .await
+        .map_err(|e| AppError::Internal(format!("search generation lookup failed: {e}")))?;
+    let hits = hits
+        .into_iter()
+        .filter_map(|hit| {
+            if !visible_message_ids.contains(&hit.message_id) {
+                tracing::debug!(
+                    conversation_id = %hit.conversation_id,
+                    message_id = %hit.message_id,
+                    "conversation search hit omitted because its source message is hidden"
+                );
+                return None;
+            }
+            if current_generations.get(&hit.conversation_id)
+                != Some(&(hit.transcript_generation, hit.message_count))
+            {
+                tracing::debug!(
+                    conversation_id = %hit.conversation_id,
+                    message_id = %hit.message_id,
+                    "conversation search hit omitted because its transcript changed"
+                );
+                return None;
+            }
+            if let Some(metadata) = metadata.get(&hit.conversation_id) {
+                Some(super::types::ConversationSearchHit {
+                    conversation_id: hit.conversation_id,
+                    slug: metadata.slug.clone(),
+                    archived: metadata.archived,
+                    message_id: hit.message_id,
+                    message_type: hit.message_type.to_string(),
+                    created_at: hit.created_at.to_rfc3339(),
+                    snippet: hit.snippet,
+                    score: hit.score,
+                })
+            } else {
+                tracing::warn!(
+                    conversation_id = %hit.conversation_id,
+                    message_id = %hit.message_id,
+                    "conversation search hit omitted because conversation metadata was missing"
+                );
+                None
+            }
+        })
+        .collect();
+    Ok(Json(ConversationSearchResponse { hits }))
 }
 
 // ============================================================
@@ -2251,20 +2365,11 @@ struct GetConversationQuery {
     after_sequence: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum StreamInitMode {
-    Full,
-    MessagesAfterFloor,
-}
-
 #[derive(Debug, Deserialize, Default, Clone)]
 struct StreamConversationQuery {
     after_event_sequence: Option<i64>,
     #[allow(dead_code)]
     after_sequence: Option<i64>,
-    init_mode: Option<StreamInitMode>,
-    after_message_floor: Option<i64>,
     transcript_generation: Option<i64>,
     open_id: Option<uuid::Uuid>,
 }
@@ -2510,15 +2615,10 @@ async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamDbMessageSelection {
     Latest,
-    AfterFloor(i64),
     None,
 }
 
-impl StreamDbMessageSelection {
-    fn message_snapshot() -> crate::runtime::MessageSnapshotMode {
-        crate::runtime::MessageSnapshotMode::Suffix
-    }
-}
+type StreamTranscriptCoverage = crate::runtime::TranscriptCoverage;
 
 const STREAM_LAST_SEQUENCE_READ_FAILED: &str = "stream_last_sequence_read_failed";
 
@@ -2607,34 +2707,6 @@ async fn get_conversation(
     Ok(Json(ConversationWithMessagesResponse {
         conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
         messages: enriched_msgs,
-        agent_working: conversation.is_agent_working(),
-        presentation_mode: conv_presentation_mode(&conversation).to_string(),
-        context_window_size,
-    }))
-}
-
-async fn get_conversation_meta(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<ConversationMetaResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    let context_window_size = state
-        .runtime
-        .db()
-        .get_latest_usage_data(&conversation.id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .as_ref()
-        .map_or(0, crate::db::UsageData::context_window_used);
-
-    Ok(Json(ConversationMetaResponse {
-        conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         context_window_size,
@@ -3226,10 +3298,8 @@ async fn get_conversation_messages_around(
     )))
 }
 
-/// `GET /api/conversations/:id/slug` — minimal lookup that returns just the
-/// current slug. The full `get_conversation` payload includes every message
-/// in the conversation, which is wasteful when a caller only needs to
-/// resolve `agent_id` → slug for navigation (sub-agent links, task 08533).
+/// `GET /api/conversations/:id/slug` — compatibility lookup used by links that
+/// already have a conversation id and only need its current slug.
 async fn get_conversation_slug(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3242,6 +3312,24 @@ async fn get_conversation_slug(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "slug": conversation.slug })))
+}
+
+/// `GET /api/conversations/:id/route` — minimal bootstrap route lookup.
+async fn get_conversation_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationRouteResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    Ok(Json(ConversationRouteResponse {
+        id: conversation.id,
+        slug: conversation.slug,
+    }))
 }
 
 /// `GET /api/work-scope/:scope_key/inventory` — read-projection over the
@@ -3267,7 +3355,7 @@ async fn work_scope_actor(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let conversation_scope = conversation
-        .work_scope_id
+        .attached_work_scope_id
         .clone()
         .map(crate::work_scope::ResourceScopeKey::Work);
     if conversation_scope.as_ref() != Some(work_scope) {
@@ -3590,19 +3678,28 @@ fn db_message_selection_for_stream(
         return StreamDbMessageSelection::None;
     }
 
-    match (query.init_mode, query.after_message_floor) {
-        (Some(StreamInitMode::MessagesAfterFloor), Some(after_floor))
-            if query.transcript_generation == Some(transcript_generation)
-                && after_floor <= last_sequence_id =>
-        {
-            StreamDbMessageSelection::AfterFloor(after_floor)
-        }
-        _ => StreamDbMessageSelection::Latest,
-    }
+    StreamDbMessageSelection::Latest
 }
 
 fn stream_state_starts_runtime(state: &ConvState) -> bool {
     !state.is_terminal()
+}
+
+fn latest_stream_transcript_coverage(
+    messages: &[crate::db::Message],
+    server_message_tail: Option<i64>,
+    has_older_messages: bool,
+) -> StreamTranscriptCoverage {
+    let loaded_tail = messages.last().map(|message| message.sequence_id);
+    if has_older_messages || loaded_tail != server_message_tail {
+        crate::runtime::TranscriptCoverage::Tail
+    } else {
+        crate::runtime::TranscriptCoverage::Complete
+    }
+}
+
+fn preserved_stream_transcript_coverage() -> StreamTranscriptCoverage {
+    crate::runtime::TranscriptCoverage::Preserve
 }
 
 async fn read_stream_init_messages_with_tail(
@@ -3612,7 +3709,16 @@ async fn read_stream_init_messages_with_tail(
     cursor_replay_served: bool,
     attempt: usize,
     last_sequence_id: Result<i64, AppError>,
-) -> Result<(i64, StreamDbMessageSelection, Vec<crate::db::Message>), AppError> {
+) -> Result<
+    (
+        i64,
+        StreamDbMessageSelection,
+        Vec<crate::db::Message>,
+        Option<i64>,
+        StreamTranscriptCoverage,
+    ),
+    AppError,
+> {
     let last_sequence_id = last_sequence_id?;
     let mut db_message_selection = db_message_selection_for_stream(
         cursor_replay_served,
@@ -3626,13 +3732,21 @@ async fn read_stream_init_messages_with_tail(
     if attempt > 1 {
         db_message_selection = StreamDbMessageSelection::Latest;
     }
-    let messages = match db_message_selection {
-        StreamDbMessageSelection::None => Vec::new(),
+    let server_message_tail = get_server_message_tail(db, conversation_id).await?;
+    let (messages, transcript_coverage) = match db_message_selection {
+        StreamDbMessageSelection::None => (Vec::new(), preserved_stream_transcript_coverage()),
         StreamDbMessageSelection::Latest => {
             match get_latest_aligned_messages(db, conversation_id, DEFAULT_MESSAGE_HISTORY_LIMIT)
                 .await
             {
-                Ok((messages, _has_older_messages)) => messages,
+                Ok((messages, has_older_messages)) => {
+                    let coverage = latest_stream_transcript_coverage(
+                        &messages,
+                        server_message_tail,
+                        has_older_messages,
+                    );
+                    (messages, coverage)
+                }
                 Err(AppError::TypedBadRequest { error_type, .. })
                     if error_type == "message_slice_render_unit_ceiling_exceeded" =>
                 {
@@ -3641,19 +3755,25 @@ async fn read_stream_init_messages_with_tail(
                         limit = DEFAULT_MESSAGE_HISTORY_LIMIT,
                         "Using bounded unaligned SSE init because the current render unit exceeds the response ceiling"
                     );
-                    db.get_latest_messages(conversation_id, DEFAULT_MESSAGE_HISTORY_LIMIT)
+                    let messages = db
+                        .get_latest_messages(conversation_id, DEFAULT_MESSAGE_HISTORY_LIMIT)
                         .await
-                        .map_err(|e| AppError::Internal(e.to_string()))?
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    let coverage =
+                        latest_stream_transcript_coverage(&messages, server_message_tail, true);
+                    (messages, coverage)
                 }
                 Err(error) => return Err(error),
             }
         }
-        StreamDbMessageSelection::AfterFloor(after_floor) => db
-            .get_messages_after(conversation_id, after_floor)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?,
     };
-    Ok((last_sequence_id, db_message_selection, messages))
+    Ok((
+        last_sequence_id,
+        db_message_selection,
+        messages,
+        server_message_tail,
+        transcript_coverage,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3728,12 +3848,18 @@ async fn stream_conversation(
     })
     .await?;
     let conversation = stable.conversation;
-    let (last_sequence_id, db_message_selection, messages) = stable.value;
+    let (
+        last_sequence_id,
+        db_message_selection,
+        messages,
+        _server_message_tail,
+        transcript_coverage,
+    ) = stable.value;
     init_trace.record_ms("stream.transcript_read_ms", transcript_started.elapsed());
     init_trace.record_message_count(messages.len());
     let highest_message_seq = match db_message_selection {
         StreamDbMessageSelection::None => last_sequence_id,
-        StreamDbMessageSelection::Latest | StreamDbMessageSelection::AfterFloor(_) => {
+        StreamDbMessageSelection::Latest => {
             messages.iter().map(|m| m.sequence_id).max().unwrap_or(0)
         }
     };
@@ -3791,8 +3917,25 @@ async fn stream_conversation(
             .get_conversation_creation_job_for_conversation(&conversation.id)
             .await
         {
-            init_conversation.creation_prompt = Some(job.intent.text.clone());
-            init_conversation.creation_error = job.error;
+            let file_count = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_files(&job.id)
+                .await
+                .map(|files| files.len())
+                .unwrap_or(0);
+            let image_count = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_images(&job.id)
+                .await
+                .map(|images| images.len())
+                .unwrap_or(0);
+            init_conversation.creation_prompt = Some(creation_intent_display_text(
+                &job.intent,
+                image_count,
+                file_count,
+            ));
         }
     }
 
@@ -3804,12 +3947,18 @@ async fn stream_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     // Create init event with typed data -- serialization deferred to SSE layer
+    let transcript = match transcript_coverage {
+        crate::runtime::TranscriptCoverage::Complete => {
+            crate::runtime::InitTranscript::Complete(messages)
+        }
+        crate::runtime::TranscriptCoverage::Tail => crate::runtime::InitTranscript::Tail(messages),
+        crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
+    };
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
-        message_snapshot: StreamDbMessageSelection::message_snapshot(),
-        messages,
+        transcript,
         steering_messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -3859,6 +4008,8 @@ async fn send_chat(
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     let service = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
         state.runtime.clone(),
@@ -4170,8 +4321,8 @@ async fn cancel_conversation(
 }
 
 /// Upgrade a conversation's model (e.g., from 200k to 1M context).
-/// Allowed from `Idle` or `Error` -- cannot upgrade while an LLM request,
-/// tool execution, or other operation is in flight (see
+/// Allowed from `Idle`, `Error`, or `RecoverableContinuationFailure` -- cannot
+/// upgrade while an LLM request, tool execution, or other operation is in flight (see
 /// `ConvState::allows_model_change`).
 async fn upgrade_conversation_model(
     State(state): State<AppState>,
@@ -4179,6 +4330,9 @@ async fn upgrade_conversation_model(
     Json(req): Json<UpgradeModelRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     // Validate the target model exists
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
+
     if state.llm_registry.get(&req.model).is_none() {
         return Err(AppError::BadRequest(format!(
             "Unknown model '{}'. Available: {:?}",
@@ -4203,10 +4357,15 @@ async fn upgrade_conversation_model(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !conv.state.allows_model_change() {
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or_else(|| conv.state.clone());
+    if !effective_state.allows_model_change() {
         return Err(AppError::BadRequest(format!(
             "Cannot change model while conversation is {} -- finish or cancel the current operation first",
-            conv.state.variant_name()
+            effective_state.variant_name()
         )));
     }
 
@@ -4249,18 +4408,73 @@ async fn upgrade_conversation_model(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+fn continuation_operation_id(state: ConvState) -> String {
+    match state {
+        ConvState::RecoverableContinuationFailure { failure } => failure.request.operation_id,
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 /// Manually trigger context continuation (REQ-BED-023)
 async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission = admission.lock().await;
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if conversation.archived {
+        return Err(AppError::BadRequest(
+            "Cannot retry continuation for an archived conversation".to_string(),
+        ));
+    }
+    let effective_state = match state.runtime.effective_conversation_state(&id).await {
+        Some(runtime_state) => runtime_state,
+        None => {
+            state
+                .runtime
+                .db()
+                .get_conversation(&id)
+                .await
+                .map_err(|error| AppError::NotFound(error.to_string()))?
+                .state
+        }
+    };
+    let operation_id = continuation_operation_id(effective_state);
     state
         .runtime
-        .send_event(&id, Event::UserTriggerContinuation)
+        .admit_continuation_retry(&id, operation_id)
         .await
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+#[cfg(test)]
+mod continuation_operation_id_tests {
+    use super::*;
+
+    #[test]
+    fn retained_failure_reuses_durable_operation_id() {
+        let state = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: "durable-operation".to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+                error_kind: crate::db::ErrorKind::ServerError,
+                message: "failed".to_string(),
+            },
+        };
+
+        assert_eq!(continuation_operation_id(state), "durable-operation");
+    }
 }
 
 /// Cancel a specific queued steering message (task 01001).
@@ -4448,7 +4662,7 @@ async fn continue_conversation(
                 .map_err(|error| AppError::Internal(error.to_string()))?;
             let wake_repo =
                 crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
-            if parent.work_scope_id == new_conv.work_scope_id {
+            if parent.attached_work_scope_id == new_conv.attached_work_scope_id {
                 wake_repo
                     .transfer_active_for_continuation(
                         &id,
@@ -4508,7 +4722,7 @@ async fn continue_conversation(
                 .map_err(|error| AppError::Internal(error.to_string()))?;
             let wake_repo =
                 crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
-            if parent.work_scope_id == existing.work_scope_id {
+            if parent.attached_work_scope_id == existing.attached_work_scope_id {
                 wake_repo
                     .transfer_active_for_continuation(
                         &id,
@@ -4740,6 +4954,8 @@ async fn archive_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "archive").await?;
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     run_archive_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -4771,6 +4987,13 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
         .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if matches!(conv.state, ConvState::AwaitingContinuation { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot archive while a continuation summary is pending",
+            "cancel_first",
+        ))));
+    }
 
     if conv.state.is_busy() {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -4867,7 +5090,7 @@ async fn scope_still_owned_after_delete(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(conversations.into_iter().any(|candidate| {
-        candidate.id != id && crate::runtime::conversation_owns_work_scope(&candidate)
+        candidate.id != id && crate::runtime::conversation_attachment_retains_work_scope(&candidate)
     }))
 }
 
@@ -4921,7 +5144,7 @@ pub(super) async fn reopen_bash_after_failed_lifecycle_mutation(
     let Ok(persisted) = state.runtime.db().get_conversation(&conversation.id).await else {
         return;
     };
-    if !crate::runtime::conversation_owns_work_scope(&persisted) {
+    if !crate::runtime::conversation_attachment_retains_work_scope(&persisted) {
         return;
     }
     let Some(generation) = cleanup.bash_teardown_generation else {
@@ -5105,6 +5328,8 @@ async fn delete_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "delete").await?;
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     run_hard_delete_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -5162,6 +5387,12 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "Cannot hard-delete a busy conversation. Cancel the in-flight \
              operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+    if matches!(conv.state, ConvState::AwaitingContinuation { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot hard-delete while a continuation summary is pending",
             "cancel_first",
         ))));
     }
@@ -5232,7 +5463,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
 async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::db::Conversation) {
     use phoenix_core::domain::work_scope_inventory::{BrowserSessionLiveness, TmuxServerStatus};
 
-    let Some(scope_id) = deleted.work_scope_id.clone() else {
+    let Some(scope_id) = deleted.attached_work_scope_id.clone() else {
         return;
     };
     let scope = crate::work_scope::ResourceScopeKey::Work(scope_id.clone());
@@ -5377,7 +5608,7 @@ async fn cascade_project_target(
             {
                 conversations.push(conv.clone());
             }
-            crate::runtime::cleanup_branch_for_unowned_work_scope(
+            crate::runtime::cleanup_branch_for_unretained_work_scope(
                 std::path::Path::new(wt.as_str()),
                 &conversations,
             )
@@ -5716,10 +5947,10 @@ async fn suggest_handler(
 // Slug Resolution (REQ-API-007)
 // ============================================================
 
-async fn get_by_slug_meta(
+async fn get_by_slug_route(
     State(state): State<AppState>,
     Path(slug): Path<String>,
-) -> Result<Json<ConversationMetaResponse>, AppError> {
+) -> Result<Json<ConversationRouteResponse>, AppError> {
     let conversation = state
         .runtime
         .db()
@@ -5727,20 +5958,9 @@ async fn get_by_slug_meta(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let context_window_size = state
-        .runtime
-        .db()
-        .get_latest_usage_data(&conversation.id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .as_ref()
-        .map_or(0, crate::db::UsageData::context_window_used);
-
-    Ok(Json(ConversationMetaResponse {
-        conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
-        agent_working: conversation.is_agent_working(),
-        presentation_mode: conv_presentation_mode(&conversation).to_string(),
-        context_window_size,
+    Ok(Json(ConversationRouteResponse {
+        id: conversation.id,
+        slug: conversation.slug,
     }))
 }
 
@@ -7524,6 +7744,11 @@ async fn shared_sse_stream(
         .get_messages(&conversation_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+    let transcript_coverage = latest_stream_transcript_coverage(
+        &messages,
+        get_server_message_tail(state.runtime.db(), &conversation_id).await?,
+        false,
+    );
     let highest_message_seq = messages.iter().map(|m| m.sequence_id).max().unwrap_or(0);
     let init_seq = std::cmp::max(
         std::cmp::max(last_sequence_id, highest_pending_seq),
@@ -7547,12 +7772,18 @@ async fn shared_sse_stream(
         None
     };
 
+    let transcript = match transcript_coverage {
+        crate::runtime::TranscriptCoverage::Complete => {
+            crate::runtime::InitTranscript::Complete(messages)
+        }
+        crate::runtime::TranscriptCoverage::Tail => crate::runtime::InitTranscript::Tail(messages),
+        crate::runtime::TranscriptCoverage::Preserve => crate::runtime::InitTranscript::Preserve,
+    };
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
-        message_snapshot: crate::runtime::MessageSnapshotMode::Full,
-        messages,
+        transcript,
         // Pending steering input is not part of the published transcript.
         steering_messages: Vec::new(),
         agent_working: conversation.is_agent_working(),
@@ -8243,7 +8474,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 .get_conversation(id)
                 .await
                 .expect("get conversation")
-                .work_scope_id
+                .attached_work_scope_id
                 .expect("conversation has work scope"),
         )
     }
@@ -9466,17 +9697,20 @@ pub(crate) mod hard_delete_cascade_tests {
             other => panic!("expected typed bad request, got {other:?}"),
         }
 
-        let (_last_sequence_id, selection, stream_messages) = read_stream_init_messages_with_tail(
-            state.runtime.db(),
-            "conv-history-over-ceiling-turn",
-            &StreamConversationQuery::default(),
-            false,
-            1,
-            get_stream_last_sequence_id(state.runtime.db(), "conv-history-over-ceiling-turn").await,
-        )
-        .await
-        .expect("SSE init falls back to a bounded unaligned suffix");
+        let (_last_sequence_id, selection, stream_messages, _, coverage) =
+            read_stream_init_messages_with_tail(
+                state.runtime.db(),
+                "conv-history-over-ceiling-turn",
+                &StreamConversationQuery::default(),
+                false,
+                1,
+                get_stream_last_sequence_id(state.runtime.db(), "conv-history-over-ceiling-turn")
+                    .await,
+            )
+            .await
+            .expect("SSE init falls back to a bounded unaligned suffix");
         assert_eq!(selection, StreamDbMessageSelection::Latest);
+        assert_eq!(coverage, crate::runtime::TranscriptCoverage::Tail);
         assert_eq!(
             stream_messages.len(),
             usize::try_from(DEFAULT_MESSAGE_HISTORY_LIMIT).unwrap()
@@ -10025,8 +10259,6 @@ pub(crate) mod hard_delete_cascade_tests {
             &StreamConversationQuery {
                 after_event_sequence: Some(persisted.sequence_id + 1),
                 after_sequence: Some(999_999),
-                init_mode: None,
-                after_message_floor: None,
                 transcript_generation: None,
                 open_id: None,
             },
@@ -10048,11 +10280,66 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[test]
-    fn db_message_selection_advertises_bounded_suffix_snapshot_mode() {
-        assert!(matches!(
-            StreamDbMessageSelection::message_snapshot(),
-            crate::runtime::MessageSnapshotMode::Suffix
-        ));
+    fn transcript_coverage_reports_complete_for_empty_and_exact_tail_snapshots() {
+        let empty = latest_stream_transcript_coverage(&[], None, false);
+        assert_eq!(empty, crate::runtime::TranscriptCoverage::Complete);
+
+        let exact = latest_stream_transcript_coverage(
+            &[crate::db::Message {
+                message_id: "m1".to_string(),
+                conversation_id: "c".to_string(),
+                sequence_id: 1,
+                message_type: crate::db::MessageType::User,
+                content: crate::db::MessageContent::user("hi"),
+                created_at: chrono::Utc::now(),
+                display_data: None,
+                usage_data: None,
+            }],
+            Some(1),
+            false,
+        );
+        assert_eq!(exact, crate::runtime::TranscriptCoverage::Complete);
+    }
+
+    #[test]
+    fn transcript_coverage_reports_tail_for_short_long_and_oversized_fallback_snapshots() {
+        let short = latest_stream_transcript_coverage(
+            &[crate::db::Message {
+                message_id: "m1".to_string(),
+                conversation_id: "c".to_string(),
+                sequence_id: 2,
+                message_type: crate::db::MessageType::User,
+                content: crate::db::MessageContent::user("hi"),
+                created_at: chrono::Utc::now(),
+                display_data: None,
+                usage_data: None,
+            }],
+            Some(3),
+            false,
+        );
+        assert_eq!(short, crate::runtime::TranscriptCoverage::Tail);
+
+        let long = latest_stream_transcript_coverage(
+            &[crate::db::Message {
+                message_id: "m2".to_string(),
+                conversation_id: "c".to_string(),
+                sequence_id: 99,
+                message_type: crate::db::MessageType::User,
+                content: crate::db::MessageContent::user("hi"),
+                created_at: chrono::Utc::now(),
+                display_data: None,
+                usage_data: None,
+            }],
+            Some(99),
+            true,
+        );
+        assert_eq!(long, crate::runtime::TranscriptCoverage::Tail);
+    }
+
+    #[test]
+    fn cursor_replay_without_db_messages_preserves_existing_transcript_coverage() {
+        let preserved = preserved_stream_transcript_coverage();
+        assert_eq!(preserved, crate::runtime::TranscriptCoverage::Preserve);
     }
 
     #[test]
@@ -10063,8 +10350,6 @@ pub(crate) mod hard_delete_cascade_tests {
                 &StreamConversationQuery {
                     after_event_sequence: Some(10),
                     after_sequence: None,
-                    init_mode: None,
-                    after_message_floor: None,
                     transcript_generation: Some(1),
                     open_id: None,
                 },
@@ -10079,8 +10364,6 @@ pub(crate) mod hard_delete_cascade_tests {
                 &StreamConversationQuery {
                     after_event_sequence: Some(10),
                     after_sequence: None,
-                    init_mode: None,
-                    after_message_floor: None,
                     transcript_generation: None,
                     open_id: None,
                 },
@@ -10096,8 +10379,6 @@ pub(crate) mod hard_delete_cascade_tests {
                 &StreamConversationQuery {
                     after_event_sequence: Some(10),
                     after_sequence: None,
-                    init_mode: None,
-                    after_message_floor: None,
                     transcript_generation: Some(2),
                     open_id: None,
                 },
@@ -10113,8 +10394,6 @@ pub(crate) mod hard_delete_cascade_tests {
                 &StreamConversationQuery {
                     after_event_sequence: Some(9),
                     after_sequence: None,
-                    init_mode: None,
-                    after_message_floor: None,
                     transcript_generation: None,
                     open_id: None,
                 },
@@ -10129,8 +10408,6 @@ pub(crate) mod hard_delete_cascade_tests {
                 &StreamConversationQuery {
                     after_event_sequence: Some(10),
                     after_sequence: None,
-                    init_mode: None,
-                    after_message_floor: None,
                     transcript_generation: None,
                     open_id: None,
                 },
@@ -10302,8 +10579,6 @@ pub(crate) mod hard_delete_cascade_tests {
         let query = StreamConversationQuery {
             after_event_sequence: Some(2),
             after_sequence: None,
-            init_mode: None,
-            after_message_floor: None,
             transcript_generation: Some(1),
             open_id: None,
         };
@@ -10313,7 +10588,7 @@ pub(crate) mod hard_delete_cascade_tests {
             stable_transcript_read(state.runtime.db(), "stream-none-race", |db, id, attempt| {
                 let query = query.clone();
                 Box::pin(async move {
-                    let (_, selection, messages) = read_stream_init_messages_with_tail(
+                    let (_, selection, messages, _, _) = read_stream_init_messages_with_tail(
                         db,
                         id,
                         &query,
@@ -10339,137 +10614,6 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn stable_stream_read_keeps_latest_selection_after_after_floor_generation_race() {
-        let state = make_test_state().await;
-        state
-            .db
-            .create_conversation("stream-floor-race", "floor-race", "/tmp", true, None, None)
-            .await
-            .expect("create conversation");
-        for idx in 1..=3 {
-            state
-                .db
-                .add_message(
-                    &format!("stream-floor-race-msg-{idx}"),
-                    "stream-floor-race",
-                    &crate::db::MessageContent::user(format!("m{idx}")),
-                    None,
-                    None,
-                )
-                .await
-                .expect("add message");
-        }
-        let query = StreamConversationQuery {
-            after_event_sequence: None,
-            after_sequence: None,
-            init_mode: Some(StreamInitMode::MessagesAfterFloor),
-            after_message_floor: Some(2),
-            transcript_generation: Some(1),
-            open_id: None,
-        };
-
-        bump_generation_after_next_stable_read_value("stream-floor-race");
-        let stable = stable_transcript_read(
-            state.runtime.db(),
-            "stream-floor-race",
-            |db, id, attempt| {
-                let query = query.clone();
-                Box::pin(async move {
-                    let (_, selection, messages) = read_stream_init_messages_with_tail(
-                        db,
-                        id,
-                        &query,
-                        false,
-                        attempt,
-                        get_stream_last_sequence_id(db, id).await,
-                    )
-                    .await?;
-                    Ok((selection, messages))
-                })
-            },
-        )
-        .await
-        .expect("stable stream read");
-
-        let (selection, messages) = stable.value;
-        assert_eq!(stable.attempts, 2);
-        assert_eq!(stable.conversation.transcript_generation, 2);
-        assert_eq!(selection, StreamDbMessageSelection::Latest);
-        assert_eq!(
-            messages.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-    }
-
-    #[tokio::test]
-    async fn above_tail_after_floor_stream_selection_reads_latest_slice() {
-        let state = make_test_state().await;
-        state
-            .db
-            .create_conversation(
-                "stream-floor-above-tail",
-                "floor-above-tail",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
-            .await
-            .expect("create conversation");
-        for idx in 1..=3 {
-            state
-                .db
-                .add_message(
-                    &format!("stream-floor-above-tail-msg-{idx}"),
-                    "stream-floor-above-tail",
-                    &crate::db::MessageContent::user(format!("m{idx}")),
-                    None,
-                    None,
-                )
-                .await
-                .expect("add message");
-        }
-        let query = StreamConversationQuery {
-            after_event_sequence: None,
-            after_sequence: None,
-            init_mode: Some(StreamInitMode::MessagesAfterFloor),
-            after_message_floor: Some(99),
-            transcript_generation: Some(1),
-            open_id: None,
-        };
-
-        let stable = stable_transcript_read(
-            state.runtime.db(),
-            "stream-floor-above-tail",
-            |db, id, attempt| {
-                let query = query.clone();
-                Box::pin(async move {
-                    read_stream_init_messages_with_tail(
-                        db,
-                        id,
-                        &query,
-                        false,
-                        attempt,
-                        get_stream_last_sequence_id(db, id).await,
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        .expect("stable stream read");
-
-        let (last_sequence_id, selection, messages) = stable.value;
-        assert_eq!(stable.attempts, 1);
-        assert_eq!(last_sequence_id, 3);
-        assert_eq!(selection, StreamDbMessageSelection::Latest);
-        assert_eq!(
-            messages.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-    }
-
-    #[tokio::test]
     async fn latest_stream_selection_is_bounded_to_newest_messages() {
         let state = make_test_state().await;
         state
@@ -10491,19 +10635,22 @@ pub(crate) mod hard_delete_cascade_tests {
                 .expect("add message");
         }
 
-        let (last_sequence_id, selection, messages) = read_stream_init_messages_with_tail(
-            state.runtime.db(),
-            "stream-bounded-latest",
-            &StreamConversationQuery::default(),
-            false,
-            1,
-            get_stream_last_sequence_id(state.runtime.db(), "stream-bounded-latest").await,
-        )
-        .await
-        .expect("bounded stream read");
+        let (last_sequence_id, selection, messages, server_message_tail, coverage) =
+            read_stream_init_messages_with_tail(
+                state.runtime.db(),
+                "stream-bounded-latest",
+                &StreamConversationQuery::default(),
+                false,
+                1,
+                get_stream_last_sequence_id(state.runtime.db(), "stream-bounded-latest").await,
+            )
+            .await
+            .expect("bounded stream read");
 
         assert_eq!(last_sequence_id, DEFAULT_MESSAGE_HISTORY_LIMIT + 7);
         assert_eq!(selection, StreamDbMessageSelection::Latest);
+        assert_eq!(server_message_tail, Some(DEFAULT_MESSAGE_HISTORY_LIMIT + 7));
+        assert_eq!(coverage, crate::runtime::TranscriptCoverage::Tail);
         assert_eq!(
             messages.len(),
             usize::try_from(DEFAULT_MESSAGE_HISTORY_LIMIT).unwrap()
@@ -10548,8 +10695,6 @@ pub(crate) mod hard_delete_cascade_tests {
             &StreamConversationQuery {
                 after_event_sequence: Some(1),
                 after_sequence: None,
-                init_mode: Some(StreamInitMode::MessagesAfterFloor),
-                after_message_floor: Some(1),
                 transcript_generation: Some(1),
                 open_id: None,
             },
@@ -10572,74 +10717,6 @@ pub(crate) mod hard_delete_cascade_tests {
             }
             other => panic!("expected typed stream tail failure, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn demand_driven_stream_modes_select_db_messages_by_rest_floor() {
-        assert_eq!(
-            db_message_selection_for_stream(
-                false,
-                &StreamConversationQuery {
-                    after_event_sequence: None,
-                    after_sequence: None,
-                    init_mode: Some(StreamInitMode::MessagesAfterFloor),
-                    after_message_floor: Some(50),
-                    transcript_generation: Some(3),
-                    open_id: None,
-                },
-                75,
-                3,
-            ),
-            StreamDbMessageSelection::AfterFloor(50)
-        );
-        assert_eq!(
-            db_message_selection_for_stream(
-                false,
-                &StreamConversationQuery {
-                    after_event_sequence: None,
-                    after_sequence: None,
-                    init_mode: Some(StreamInitMode::MessagesAfterFloor),
-                    after_message_floor: Some(50),
-                    transcript_generation: Some(2),
-                    open_id: None,
-                },
-                75,
-                3,
-            ),
-            StreamDbMessageSelection::Latest
-        );
-        assert_eq!(
-            db_message_selection_for_stream(
-                false,
-                &StreamConversationQuery {
-                    after_event_sequence: None,
-                    after_sequence: None,
-                    init_mode: Some(StreamInitMode::MessagesAfterFloor),
-                    after_message_floor: Some(76),
-                    transcript_generation: Some(3),
-                    open_id: None,
-                },
-                75,
-                3,
-            ),
-            StreamDbMessageSelection::Latest
-        );
-        assert_eq!(
-            db_message_selection_for_stream(
-                false,
-                &StreamConversationQuery {
-                    after_event_sequence: None,
-                    after_sequence: None,
-                    init_mode: Some(StreamInitMode::MessagesAfterFloor),
-                    after_message_floor: None,
-                    transcript_generation: Some(3),
-                    open_id: None,
-                },
-                75,
-                3,
-            ),
-            StreamDbMessageSelection::Latest
-        );
     }
 
     #[tokio::test]
@@ -10681,7 +10758,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .get_conversation("c-cached-pr")
             .await
             .expect("conversation")
-            .work_scope_id
+            .attached_work_scope_id
             .expect("work scope id");
         state
             .db
@@ -10857,7 +10934,8 @@ pub(crate) mod hard_delete_cascade_tests {
             .get_conversation("conv-empty")
             .await
             .expect("conversation");
-        let scope = crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id.expect("scope"));
+        let scope =
+            crate::work_scope::ResourceScopeKey::Work(conv.attached_work_scope_id.expect("scope"));
         let Json(inv) = super::get_work_scope_inventory(
             State(state),
             Path(scope.stable_key()),
@@ -10974,7 +11052,8 @@ pub(crate) mod hard_delete_cascade_tests {
             .get_conversation("conv-no-browser")
             .await
             .expect("conversation");
-        let scope = crate::work_scope::ResourceScopeKey::Work(conv.work_scope_id.expect("scope"));
+        let scope =
+            crate::work_scope::ResourceScopeKey::Work(conv.attached_work_scope_id.expect("scope"));
 
         let Json(resp) = super::stop_work_scope_browser_session(
             State(state.clone()),
@@ -11024,7 +11103,9 @@ pub(crate) mod hard_delete_cascade_tests {
             )
             .await
             .expect("create actor conversation");
-        crate::work_scope::ResourceScopeKey::Work(actor.work_scope_id.expect("actor work scope"))
+        crate::work_scope::ResourceScopeKey::Work(
+            actor.attached_work_scope_id.expect("actor work scope"),
+        )
     }
 
     /// REQ-PINSP-001/002/003/004: a live handle's inspection reports identity
@@ -11489,8 +11570,11 @@ pub(crate) mod hard_delete_cascade_tests {
             .update_conversation_state(
                 "c-continuation",
                 &ConvState::AwaitingContinuation {
-                    rejected_tool_calls: vec![],
-                    attempt: 1,
+                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                        operation_id: "cancel-test-op".to_string(),
+                        rejected_tool_calls: vec![],
+                        attempt: 1,
+                    },
                 },
             )
             .await
@@ -11512,7 +11596,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("conversation still exists");
         assert!(matches!(
             conv.state,
-            ConvState::AwaitingContinuation { attempt: 1, .. }
+            ConvState::AwaitingContinuation { request } if request.attempt == 1
         ));
     }
 
@@ -14690,7 +14774,7 @@ mod wake_handler_tests {
             .get_conversation(conversation_id)
             .await
             .expect("load conversation")
-            .work_scope_id
+            .attached_work_scope_id
             .expect("ordinary conversation scope");
         let wake_scope =
             phoenix_workflow::wake_profile::WorkScopeIdentity(work_scope_id.as_str().to_string());
@@ -14773,6 +14857,540 @@ mod wake_handler_tests {
     }
 
     #[tokio::test]
+    async fn conversation_search_returns_typed_warming_error_before_reconcile() {
+        let state = make_test_state().await;
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=test")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["error_type"], "conversation_search_warming");
+    }
+
+    #[tokio::test]
+    async fn conversation_search_returns_warming_when_live_index_is_stale() {
+        let mut state = make_test_state().await;
+        seed_conversation(&state, "conv-stale-search").await;
+        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        retriever.reconcile().await.unwrap();
+        state.message_retriever = Arc::new(retriever);
+        state
+            .db
+            .add_message(
+                "m-unindexed-search",
+                "conv-stale-search",
+                &crate::db::MessageContent::user("newly committed search content"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?")
+            .bind("m-unindexed-search")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=absentterm")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["error_type"], "conversation_search_warming");
+    }
+
+    #[tokio::test]
+    async fn conversation_search_rejects_partial_results_when_live_index_is_stale() {
+        let mut state = make_test_state().await;
+        seed_conversation(&state, "conv-indexed-search").await;
+        seed_conversation(&state, "conv-stale-search").await;
+        state
+            .db
+            .add_message(
+                "m-indexed-search",
+                "conv-indexed-search",
+                &crate::db::MessageContent::user("shared searchable phrase"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        retriever.reconcile().await.unwrap();
+        state.message_retriever = Arc::new(retriever);
+        state
+            .db
+            .add_message(
+                "m-stale-search",
+                "conv-stale-search",
+                &crate::db::MessageContent::user("shared searchable phrase"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?")
+            .bind("m-stale-search")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=shared")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["error_type"], "conversation_search_warming");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn conversation_search_returns_best_hit_per_top_level_user_conversation() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("conv-root", "root", "/tmp/root", true, None, None)
+            .await
+            .expect("create root");
+        state
+            .db
+            .create_conversation("conv-arch", "arch", "/tmp/arch", true, None, None)
+            .await
+            .expect("create archived");
+        state
+            .db
+            .create_conversation(
+                "conv-child",
+                "child",
+                "/tmp/child",
+                true,
+                Some("conv-root"),
+                None,
+            )
+            .await
+            .expect("create child");
+        state
+            .db
+            .add_message(
+                "m-root-1",
+                "conv-root",
+                &crate::db::MessageContent::user("alphaomega one"),
+                None,
+                None,
+            )
+            .await
+            .expect("add root 1");
+        state
+            .db
+            .add_message(
+                "m-root-2",
+                "conv-root",
+                &crate::db::MessageContent::user("alphaomega two"),
+                None,
+                None,
+            )
+            .await
+            .expect("add root 2");
+        state
+            .db
+            .add_message(
+                "m-arch",
+                "conv-arch",
+                &crate::db::MessageContent::user("alphaomega archived"),
+                None,
+                None,
+            )
+            .await
+            .expect("add arch");
+        state
+            .db
+            .add_message(
+                "m-child",
+                "conv-child",
+                &crate::db::MessageContent::user("alphaomega child"),
+                None,
+                None,
+            )
+            .await
+            .expect("add child");
+        state
+            .db
+            .archive_conversation("conv-arch")
+            .await
+            .expect("archive");
+        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        retriever.reconcile().await.expect("reconcile");
+        let mut state = state;
+        state.message_retriever = std::sync::Arc::new(retriever);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=alphaomega")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = payload["hits"].as_array().expect("hits array");
+        assert_eq!(hits.len(), 2);
+        let root_hit = hits
+            .iter()
+            .find(|hit| hit["conversation_id"] == "conv-root")
+            .expect("root hit");
+        assert_eq!(root_hit["slug"], "root");
+        assert_eq!(root_hit["archived"], false);
+        let archived_hit = hits
+            .iter()
+            .find(|hit| hit["conversation_id"] == "conv-arch")
+            .expect("archived hit");
+        assert_eq!(archived_hit["slug"], "arch");
+        assert_eq!(archived_hit["archived"], true);
+        let conversation_ids: std::collections::HashSet<_> = hits
+            .iter()
+            .map(|hit| hit["conversation_id"].as_str().expect("conversation id"))
+            .collect();
+        assert!(conversation_ids.contains("conv-root"));
+        assert!(conversation_ids.contains("conv-arch"));
+        assert!(!conversation_ids.contains("conv-child"));
+    }
+
+    #[tokio::test]
+    async fn conversation_search_limit_is_clamped_server_side() {
+        let state = make_test_state().await;
+        for index in 0..25 {
+            let conversation_id = format!("conv-limit-{index}");
+            let slug = format!("limit-{index}");
+            state
+                .db
+                .create_conversation(&conversation_id, &slug, "/tmp/limit", true, None, None)
+                .await
+                .expect("create limit conv");
+            state
+                .db
+                .add_message(
+                    &format!("m-limit-{index}"),
+                    &conversation_id,
+                    &crate::db::MessageContent::user(format!("limitclamp unique{index}")),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add limit message");
+        }
+        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        retriever.reconcile().await.expect("reconcile");
+        let mut state = state;
+        state.message_retriever = std::sync::Arc::new(retriever);
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=limitclamp&limit=100")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["hits"].as_array().expect("hits array").len(), 20);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=limitclamp&limit=0")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["hits"].as_array().expect("hits array").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_search_does_not_starve_other_conversations_after_many_top_hits() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("conv-many", "many", "/tmp/many", true, None, None)
+            .await
+            .expect("create many");
+        state
+            .db
+            .create_conversation("conv-other", "other", "/tmp/other", true, None, None)
+            .await
+            .expect("create other");
+        for index in 0..12 {
+            state
+                .db
+                .add_message(
+                    &format!("m-many-{index}"),
+                    "conv-many",
+                    &crate::db::MessageContent::user(format!("palette-starve repeated {index}")),
+                    None,
+                    None,
+                )
+                .await
+                .expect("add many");
+        }
+        state
+            .db
+            .add_message(
+                "m-other",
+                "conv-other",
+                &crate::db::MessageContent::user("palette-starve survivor"),
+                None,
+                None,
+            )
+            .await
+            .expect("add other");
+        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        retriever.reconcile().await.expect("reconcile");
+        let mut state = state;
+        state.message_retriever = std::sync::Arc::new(retriever);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=palette-starve")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        let conversation_ids: std::collections::HashSet<_> = payload["hits"]
+            .as_array()
+            .expect("hits array")
+            .iter()
+            .map(|hit| hit["conversation_id"].as_str().expect("conversation id"))
+            .collect();
+        assert!(conversation_ids.contains("conv-many"));
+        assert!(conversation_ids.contains("conv-other"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn conversation_search_excludes_archived_deletion_pending_before_limit() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("conv-delete", "delete", "/tmp/delete", true, None, None)
+            .await
+            .expect("create delete");
+        state
+            .db
+            .create_conversation("conv-visible", "visible", "/tmp/visible", true, None, None)
+            .await
+            .expect("create visible");
+        state
+            .db
+            .add_message(
+                "m-delete",
+                "conv-delete",
+                &crate::db::MessageContent::user("deletepending hidden"),
+                None,
+                None,
+            )
+            .await
+            .expect("add delete");
+        state
+            .db
+            .add_message(
+                "m-visible",
+                "conv-visible",
+                &crate::db::MessageContent::user("deletepending shown"),
+                None,
+                None,
+            )
+            .await
+            .expect("add visible");
+        state
+            .db
+            .archive_conversation("conv-delete")
+            .await
+            .expect("archive delete");
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
+            .fetch_all(state.db.pool())
+            .await
+            .expect("creation job columns")
+            .into_iter()
+            .map(|row| row.get("name"))
+            .collect();
+        if columns.iter().any(|name| name == "status") {
+            sqlx::query(
+                "INSERT INTO conversation_creation_jobs (
+                    id, conversation_id, message_id, status, stage, attempt, generation,
+                    intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                    failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+                 ) VALUES (
+                    'job-delete-handler', 'conv-delete', NULL, 'deletion_pending', 'finalize', 0, 0,
+                    '{\"kind\":\"direct\",\"cwd\":\"/tmp/delete\",\"prompt\":\"x\",\"model\":null,\"images\":[],\"files\":[]}',
+                    NULL, '2026-01-01T00:00:00Z', NULL, NULL, NULL, NULL,
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                 )",
+            )
+            .execute(state.db.pool())
+            .await
+            .expect("insert deletion_pending job");
+        } else {
+            sqlx::query(
+                "INSERT INTO conversation_creation_jobs (
+                    id, conversation_id, message_id, phase, intent_json,
+                    error, accepted_at, provisioning_started_at, completed_at, failed_at,
+                    created_at, updated_at
+                 ) VALUES (
+                    'job-delete-handler', 'conv-delete', NULL, 'accepted',
+                    '{\"kind\":\"direct\",\"cwd\":\"/tmp/delete\",\"prompt\":\"x\",\"model\":null,\"images\":[],\"files\":[]}',
+                    'deletion_pending sentinel',
+                    '2026-01-01T00:00:00Z', NULL, NULL, NULL,
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                 )",
+            )
+            .execute(state.db.pool())
+            .await
+            .expect("insert deletion_pending job");
+            sqlx::query(
+                "ALTER TABLE conversation_creation_jobs RENAME TO conversation_creation_jobs_base",
+            )
+            .execute(state.db.pool())
+            .await
+            .expect("rename creation jobs table");
+            sqlx::query(
+                "CREATE VIEW conversation_creation_jobs AS
+                 SELECT id, conversation_id,
+                        CASE
+                            WHEN error = 'deletion_pending sentinel' THEN 'deletion_pending'
+                            ELSE phase
+                        END AS status
+                 FROM conversation_creation_jobs_base",
+            )
+            .execute(state.db.pool())
+            .await
+            .expect("create creation jobs view");
+        }
+        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        retriever.reconcile().await.expect("reconcile");
+        let mut state = state;
+        state.message_retriever = std::sync::Arc::new(retriever);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=deletepending")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = payload["hits"].as_array().expect("hits array");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["conversation_id"], "conv-visible");
+    }
+
+    #[tokio::test]
+    async fn conversation_search_prefix_matches_final_token() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("conv-prefix", "prefix", "/tmp/prefix", true, None, None)
+            .await
+            .expect("create prefix conv");
+        state
+            .db
+            .add_message(
+                "m-prefix",
+                "conv-prefix",
+                &crate::db::MessageContent::user("observed kangaroo"),
+                None,
+                None,
+            )
+            .await
+            .expect("add prefix message");
+        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        retriever.reconcile().await.expect("reconcile");
+        let mut state = state;
+        state.message_retriever = std::sync::Arc::new(retriever);
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/conversations/search?q=observed%20kang")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["hits"][0]["message_id"], "m-prefix");
+    }
+
+    #[tokio::test]
     async fn cancel_wake_conflicts_when_canonical_result_already_fired() {
         let state = make_test_state().await;
         seed_conversation(&state, "conv-fired").await;
@@ -14802,7 +15420,7 @@ mod wake_handler_tests {
                             .get_conversation("conv-fired")
                             .await
                             .expect("load conversation")
-                            .work_scope_id
+                            .attached_work_scope_id
                             .expect("ordinary conversation scope")
                             .as_str()
                             .to_string(),

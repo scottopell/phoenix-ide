@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, MessageSliceAlignmentError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -23,6 +23,7 @@ import {
   type RestoreBasis,
 } from '../conversation/historyExpansion';
 import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
+import { transcriptCoverageAfterInit } from '../conversation/atom';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
 import { messageCacheWrite } from '../conversation/messageCachePersistence';
 import {
@@ -156,37 +157,24 @@ async function getCachedConversationForRoute(routeSegment: string): Promise<Conv
     : await cacheDB.getConversationBySlug(routeSegment) ?? await cacheDB.getConversation(routeSegment);
 }
 
-async function getConversationForRoute(routeSegment: string) {
-  if (prefersConversationIdRoute(routeSegment)) {
-    try {
-      return await api.getConversation(routeSegment);
-    } catch (err) {
-      if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-      return api.getConversationBySlug(routeSegment);
-    }
-  }
-  try {
-    return await api.getConversationBySlug(routeSegment);
-  } catch (err) {
-    if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-    return api.getConversation(routeSegment);
-  }
+async function getConversationByResolvedId(route: ConversationRouteResponse) {
+  return api.getConversation(route.id);
 }
 
-async function getConversationMetaForRoute(routeSegment: string) {
+async function resolveConversationRoute(routeSegment: string) {
   if (prefersConversationIdRoute(routeSegment)) {
     try {
-      return await api.getConversationMeta(routeSegment);
+      return await api.getConversationRoute(routeSegment);
     } catch (err) {
       if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-      return api.getConversationMetaBySlug(routeSegment);
+      return api.getConversationRouteBySlug(routeSegment);
     }
   }
   try {
-    return await api.getConversationMetaBySlug(routeSegment);
+    return await api.getConversationRouteBySlug(routeSegment);
   } catch (err) {
     if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-    return api.getConversationMeta(routeSegment);
+    return api.getConversationRoute(routeSegment);
   }
 }
 
@@ -246,33 +234,6 @@ function latestMessageSequenceId(messages: { sequence_id: number }[]): number | 
   return messages.length > 0 ? messages[messages.length - 1]?.sequence_id ?? null : null;
 }
 
-function mergeConversationMessages<T extends { message_id: string; sequence_id: number }>(existing: T[], incoming: T[]): T[] {
-  const byMessageId = new Map<string, T>();
-  const bySequenceId = new Map<number, T>();
-
-  const upsert = (message: T) => {
-    const priorByMessageId = byMessageId.get(message.message_id);
-    if (priorByMessageId && priorByMessageId.sequence_id <= message.sequence_id) {
-      bySequenceId.delete(priorByMessageId.sequence_id);
-    }
-
-    const priorBySequenceId = bySequenceId.get(message.sequence_id);
-    if (priorBySequenceId && priorBySequenceId.message_id !== message.message_id) {
-      byMessageId.delete(priorBySequenceId.message_id);
-    }
-
-    if (!priorByMessageId || priorByMessageId.sequence_id <= message.sequence_id) {
-      byMessageId.set(message.message_id, message);
-      bySequenceId.set(message.sequence_id, message);
-    }
-  };
-
-  existing.forEach(upsert);
-  incoming.forEach(upsert);
-
-  return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
-}
-
 function ConversationPageContent({
   routePrefix,
   composerQuickAction,
@@ -302,14 +263,13 @@ function ConversationPageContent({
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
   const conversation = atom.conversation;
+  const [resolvedRouteConversationId, setResolvedRouteConversationId] = useState<string | null>(null);
   const [archiveStatusConfirmedConversationId, setArchiveStatusConfirmedConversationId] = useState<string | null>(null);
   const archiveStatusConfirmed =
     conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
   const serverArchived = conversation?.archived === true;
-  const cachedIsSafeOffline =
-    !navigator.onLine && conversation?.archived !== true && !archiveStatusConfirmed;
-  const isArchived = serverArchived || (!archiveStatusConfirmed && !cachedIsSafeOffline);
-  const confirmedLive = !!conversationId && (archiveStatusConfirmed || cachedIsSafeOffline) && !serverArchived;
+  const isArchived = serverArchived || !archiveStatusConfirmed;
+  const confirmedLive = !!conversationId && archiveStatusConfirmed && !serverArchived;
   const prStatusHandle = useConversationPrStatus({
     conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
@@ -526,6 +486,7 @@ function ConversationPageContent({
     setLastSlug(slug);
     // useState resets — React batches these into the same render.
     setError(null);
+    setResolvedRouteConversationId(null);
     setDeletingConversation(false);
     setShowFileBrowser(false);
     setShowMobileTerminal(false);
@@ -637,6 +598,8 @@ function ConversationPageContent({
 
   const atomRef = useRef(atom);
   atomRef.current = atom;
+  const locationRef = useRef(location);
+  locationRef.current = location;
   const conversationRouteIdentity = `${slug ?? ''}\u0000${conversationId ?? ''}`;
   const conversationRouteOwnerRef = useRef({ identity: conversationRouteIdentity, generation: 1 });
   if (conversationRouteOwnerRef.current.identity !== conversationRouteIdentity) {
@@ -669,15 +632,26 @@ function ConversationPageContent({
   }, [conversationId, atom.transcriptGeneration, atom.transcriptCoverage]);
 
   const connectionInfo = useConnection({
-    conversationId,
+    conversationId: navigator.onLine ? resolvedRouteConversationId ?? undefined : undefined,
     dispatch,
-    getLastAppliedEventSeq: () => eventCursorRef.current,
-    getInitialRequestMode: () => {
-      const latestLoadedMessageSeq = latestMessageSequenceId(atomRef.current.messages);
-      if (latestLoadedMessageSeq === null) return { kind: 'full' };
-      const transcriptGeneration = atomRef.current.transcriptGeneration;
-      if (transcriptGeneration === null) return { kind: 'full' };
-      return { kind: 'messages_after_floor', afterMessageFloor: latestLoadedMessageSeq, transcriptGeneration };
+    getLastAppliedEventSeq: () => atomRef.current.conversationId === resolvedRouteConversationId
+      ? eventCursorRef.current
+      : 0,
+    getTranscriptGeneration: () => atomRef.current.conversationId === resolvedRouteConversationId
+      ? atomRef.current.transcriptGeneration
+      : null,
+    onValidatedInit: (payload) => {
+      setArchiveStatusConfirmedConversationId(payload.conversation.id);
+      historyGenerationRef.current += 1;
+      dispatchHistoryExpansion({
+        type: 'view_changed',
+        view: {
+          conversationId: payload.conversation.id,
+          generation: historyGenerationRef.current,
+          transcriptGeneration: payload.transcriptGeneration,
+        },
+        hasEarlierHistory: transcriptCoverageAfterInit(atomRef.current, payload) === 'tail',
+      });
     },
   });
 
@@ -818,6 +792,7 @@ function ConversationPageContent({
 
     setError(null);
     setArchiveStatusConfirmedConversationId(null);
+    setResolvedRouteConversationId(null);
     historyGenerationRef.current += 1;
     dispatchHistoryExpansion({
       type: 'view_changed',
@@ -832,6 +807,19 @@ function ConversationPageContent({
     const hadAtomData = !!atomRef.current.conversationId;
 
     let cancelled = false;
+
+    const resolveAuthoritativeRoute = async () => {
+      const route = await resolveConversationRoute(slug);
+      if (cancelled) return;
+      setResolvedRouteConversationId(route.id);
+      if (route.slug && route.slug !== slug && routePrefix === '/c') {
+        navigate({
+          pathname: `/c/${route.slug}`,
+          search: locationRef.current.search,
+          hash: locationRef.current.hash,
+        }, { replace: true });
+      }
+    };
 
     const loadConversation = async () => {
       try {
@@ -857,204 +845,14 @@ function ConversationPageContent({
           }
         }
 
-        // Step 2: Fetch authoritative data from network
+        // Resolve the route before opening the stream. Cached data is provisional:
+        // it may paint immediately, but it never chooses the stream identity.
         if (navigator.onLine && !cancelled) {
-          const cachedConversationId = cached?.id ?? null;
-          const hasCachedMessages = cachedConversationId !== null && cachedMessages.length > 0;
-          const cachedReplicaMeta = cachedConversationId
-            ? await cacheDB.getReplicaMeta(cachedConversationId)
-            : null;
-          let metadata = await getConversationMetaForRoute(slug);
-          if (cancelled) return;
-          let metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? 1;
-          const cachedRowsTranscriptGeneration = cachedReplicaMeta?.transcriptGeneration ?? null;
-          const cacheGenerationMatchesMetadata = cachedRowsTranscriptGeneration !== null
-            && cachedRowsTranscriptGeneration === metadataTranscriptGeneration;
-
-          if (hasCachedMessages && cachedConversationId && cacheGenerationMatchesMetadata) {
-            try {
-              const snapshotStartedAtEventSeq = eventCursorRef.current;
-              const mergedTranscriptTail = latestMessageSequenceId(cachedMessages);
-              if (mergedTranscriptTail !== null) {
-                let contiguousTranscriptTail = mergedTranscriptTail;
-                let mergedMessages = cachedMessages;
-                let latestServerTail: number | null = null;
-                let latestTranscriptGeneration = cachedRowsTranscriptGeneration;
-
-                while (!cancelled) {
-                  const catchUp = await api.getConversationMessagesAfter(cachedConversationId, contiguousTranscriptTail, 200);
-                  latestServerTail = catchUp.server_message_tail;
-                  latestTranscriptGeneration = catchUp.transcript_generation;
-                  if (catchUp.messages.length > 0) {
-                    mergedMessages = mergeConversationMessages(mergedMessages, catchUp.messages);
-                    await cacheDB.putMessages(catchUp.messages);
-                  }
-                  if (catchUp.messages.length > 0) {
-                    const nextContiguousTail = catchUp.messages.at(-1)!.sequence_id;
-                    if (nextContiguousTail <= contiguousTranscriptTail) break;
-                    contiguousTranscriptTail = nextContiguousTail;
-                  }
-                  if (
-                    catchUp.messages.length === 0 ||
-                    latestServerTail === null ||
-                    contiguousTranscriptTail >= latestServerTail
-                  ) {
-                    break;
-                  }
-                }
-                if (cancelled) return;
-
-                const latestWindow = await api.getConversationMessagesLatest(cachedConversationId, 50);
-                latestServerTail = latestWindow.server_message_tail;
-                latestTranscriptGeneration = latestWindow.transcript_generation;
-                if (latestWindow.messages.length > 0) {
-                  mergedMessages = mergeConversationMessages(mergedMessages, latestWindow.messages);
-                  await cacheDB.putMessages(latestWindow.messages);
-                }
-                if (cancelled) return;
-
-                while (!cancelled && latestServerTail !== null && contiguousTranscriptTail < latestServerTail) {
-                  const catchUp = await api.getConversationMessagesAfter(
-                    cachedConversationId,
-                    contiguousTranscriptTail,
-                    200,
-                  );
-                  latestServerTail = catchUp.server_message_tail;
-                  latestTranscriptGeneration = catchUp.transcript_generation;
-                  if (catchUp.messages.length === 0) break;
-                  const nextContiguousTail = catchUp.messages.at(-1)!.sequence_id;
-                  if (nextContiguousTail <= contiguousTranscriptTail) break;
-                  mergedMessages = mergeConversationMessages(mergedMessages, catchUp.messages);
-                  await cacheDB.putMessages(catchUp.messages);
-                  contiguousTranscriptTail = nextContiguousTail;
-                }
-                if (cancelled) return;
-
-                await cacheDB.putReplicaMeta({
-                  conversationId: cachedConversationId,
-                  latestMessageSequenceId: contiguousTranscriptTail,
-                  latestEventSequenceId: null,
-                  transcriptGeneration: latestTranscriptGeneration,
-                  lastHydratedAt: new Date().toISOString(),
-                });
-
-                const authoritativeConversation = metadata.conversation;
-                if (authoritativeConversation.id !== cachedConversationId) {
-                  throw new Error('Cached conversation no longer owns the requested slug');
-                }
-                setArchiveStatusConfirmedConversationId(authoritativeConversation.id);
-                await cacheDB.putConversation(authoritativeConversation);
-
-                if (
-                  atomRef.current.conversationId === null
-                  || atomRef.current.conversationId === authoritativeConversation.id
-                ) {
-                  dispatchHistoryExpansion({
-                    type: 'view_changed',
-                    view: {
-                      conversationId: authoritativeConversation.id,
-                      generation: historyGenerationRef.current,
-                      transcriptGeneration: latestTranscriptGeneration,
-                    },
-                    hasEarlierHistory: latestWindow.has_older_messages,
-                  });
-                  dispatch({
-                    type: 'merge_conversation_data',
-                    conversationId: authoritativeConversation.id,
-                    conversation: authoritativeConversation,
-                    messages: mergedMessages,
-                    phase: authoritativeConversation.state
-                      ? parseConversationState(authoritativeConversation.state)
-                      : { type: 'idle' },
-                    contextWindow: { used: metadata.context_window_size || 0 },
-                    transcriptGeneration: latestTranscriptGeneration,
-                    transcriptCoverage: latestWindow.has_older_messages ? 'tail' : 'complete',
-                    eventCursorFloor: snapshotStartedAtEventSeq,
-                    snapshotStartedAtEventSeq,
-                  });
-                }
-                return;
-              }
-            } catch (err) {
-              if (!cancelled) {
-                console.warn('Incremental conversation catch-up failed; falling back to full fetch:', err);
-              }
-            }
-          }
-
           try {
-            const snapshotStartedAtEventSeq = eventCursorRef.current;
-            let latestWindow;
-            for (let attempt = 0; attempt < 3; attempt += 1) {
-              try {
-                latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
-              } catch (error) {
-                if (!(error instanceof MessageSliceAlignmentError)) throw error;
-                const full = await api.getConversation(metadata.conversation.id);
-                latestWindow = {
-                  messages: full.messages,
-                  has_older_messages: false,
-                  server_message_tail: latestMessageSequenceId(full.messages),
-                  transcript_generation: full.conversation.transcript_generation ?? metadata.conversation.transcript_generation ?? 1,
-                };
-              }
-              if (metadataTranscriptGeneration === latestWindow.transcript_generation) break;
-              if (attempt === 2) throw new Error('Conversation transcript kept changing while loading');
-              metadata = await getConversationMetaForRoute(slug);
-              metadataTranscriptGeneration = metadata.conversation.transcript_generation ?? 1;
-            }
-            if (!latestWindow) throw new Error('Failed to load conversation messages');
-            const result = { ...metadata, messages: latestWindow.messages };
-            if (!cancelled) {
-              dispatchHistoryExpansion({
-                type: 'view_changed',
-                view: {
-                  conversationId: result.conversation.id,
-                  generation: historyGenerationRef.current,
-                  transcriptGeneration: metadataTranscriptGeneration,
-                },
-                hasEarlierHistory: latestWindow.has_older_messages,
-              });
-              const replacesDifferentConversation = atomRef.current.conversationId !== null
-                && atomRef.current.conversationId !== result.conversation.id;
-              dispatch({
-                type: eventCursorRef.current > 0 && !replacesDifferentConversation ? 'merge_conversation_data' : 'set_initial_data',
-                reset: replacesDifferentConversation,
-                conversationId: result.conversation.id,
-                conversation: result.conversation,
-                messages: result.messages,
-                phase: result.conversation.state
-                  ? parseConversationState(result.conversation.state)
-                  : result.presentation_mode === 'working'
-                    ? { type: 'awaiting_llm' }
-                    : { type: 'idle' },
-                contextWindow: {
-                  used: result.context_window_size || 0,
-                },
-                transcriptGeneration: metadataTranscriptGeneration,
-                transcriptCoverage: latestWindow.has_older_messages ? 'tail' : 'complete',
-                eventCursorFloor: snapshotStartedAtEventSeq,
-                snapshotStartedAtEventSeq,
-              });
-              setArchiveStatusConfirmedConversationId(result.conversation.id);
-              await cacheDB.putConversation(result.conversation);
-              await cacheDB.putMessages(result.messages);
-              await cacheDB.putReplicaMeta({
-                conversationId: result.conversation.id,
-                latestMessageSequenceId: latestMessageSequenceId(result.messages),
-                latestEventSequenceId: null,
-                transcriptGeneration: metadataTranscriptGeneration,
-                lastHydratedAt: new Date().toISOString(),
-              });
-            }
-          } catch (err) {
-            if (!cancelled) {
-              if (!cached) {
-                setError(
-                  err instanceof Error ? err.message : 'Failed to load conversation'
-                );
-              }
-            }
+            await resolveAuthoritativeRoute();
+          } catch (routeError) {
+            if (!cached) throw routeError;
+            console.warn('Failed to resolve conversation route; keeping cached transcript provisional', routeError);
           }
         } else if (!cancelled && !cached) {
           setError('Conversation not found in cache and offline');
@@ -1067,12 +865,31 @@ function ConversationPageContent({
       }
     };
 
-    loadConversation();
+    const handleOnline = () => {
+      setResolvedRouteConversationId(null);
+      setArchiveStatusConfirmedConversationId(null);
+      setError(null);
+      const retryRouteResolution = async () => {
+        try {
+          await resolveAuthoritativeRoute();
+        } catch (err) {
+          if (cancelled) return;
+          console.warn('Failed to resolve conversation route after reconnect; retrying', err);
+          window.setTimeout(() => {
+            if (!cancelled) void retryRouteResolution();
+          }, 1_000);
+        }
+      };
+      void retryRouteResolution();
+    };
+    window.addEventListener('online', handleOnline);
+    void loadConversation();
 
     return () => {
       cancelled = true;
+      window.removeEventListener('online', handleOnline);
     };
-  }, [slug, navigate, dispatch, eventCursorRef]);
+  }, [slug, navigate, dispatch, eventCursorRef, routePrefix]);
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
@@ -1086,7 +903,8 @@ function ConversationPageContent({
 
     dispatchHistoryExpansion({ type: 'request_started', request });
     try {
-      const result = await getConversationForRoute(slug);
+      const route = await resolveConversationRoute(slug);
+      const result = await getConversationByResolvedId(route);
       const currentView = historyViewRef.current;
       const authoritativeTranscriptGeneration = atomRef.current.transcriptGeneration;
       const responseTranscriptGeneration = result.conversation.transcript_generation ?? 1;
@@ -1213,43 +1031,6 @@ function ConversationPageContent({
       result,
     });
   }, []);
-
-  useEffect(() => {
-    if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;
-    let cancelled = false;
-
-    const confirmArchiveStatus = async () => {
-      const snapshotStartedAtEventSeq = eventCursorRef.current;
-      try {
-        const result = await getConversationMetaForRoute(slug);
-        if (cancelled || result.conversation.id !== atomRef.current.conversationId) return;
-        dispatch({
-          type: 'merge_conversation_data',
-          conversationId: result.conversation.id,
-          conversation: result.conversation,
-          messages: [],
-          phase: result.conversation.state
-            ? parseConversationState(result.conversation.state)
-            : result.presentation_mode === 'working'
-              ? { type: 'awaiting_llm' }
-              : { type: 'idle' },
-          contextWindow: { used: result.context_window_size || 0 },
-          transcriptGeneration: atomRef.current.transcriptGeneration ?? result.conversation.transcript_generation ?? 1,
-          eventCursorFloor: snapshotStartedAtEventSeq,
-          snapshotStartedAtEventSeq,
-        });
-        setArchiveStatusConfirmedConversationId(result.conversation.id);
-        await cacheDB.putConversation(result.conversation);
-      } catch (err) {
-        if (!cancelled) console.warn('Failed to confirm archive status:', err);
-      }
-    };
-
-    void confirmArchiveStatus();
-    return () => {
-      cancelled = true;
-    };
-  }, [slug, conversationId, archiveStatusConfirmed, isConnected, dispatch, eventCursorRef]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {
@@ -1632,15 +1413,10 @@ function ConversationPageContent({
 
     try {
       await api.triggerContinuation(conversationId);
-      dispatch({
-        type: 'local_phase_change',
-        phase: { type: 'awaiting_continuation', attempt: 1 },
-        expectedConversationId: conversationId,
-      });
     } catch (err) {
-      console.error('Failed to trigger continuation:', err);
+      showError(err instanceof Error ? err.message : 'Failed to trigger continuation');
     }
-  }, [conversationId, isArchived, dispatch]);
+  }, [conversationId, isArchived, showError]);
 
   const handleUpgradeModel = useCallback(async (newModelId: string, effort?: import('../api').ModelEffort | null) => {
     if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
@@ -2096,6 +1872,16 @@ function ConversationPageContent({
           <section id="chat-view" className="view active">
             <div id="messages">
               <MessageListSkeleton count={4} />
+              {atom.uiError || connectionInfo.state === 'reconnecting' || connectionInfo.state === 'offline' ? (
+                <div className="error-state" role="alert">
+                  <p>{atom.uiError?.type === 'BackendError'
+                    ? atom.uiError.message
+                    : connectionInfo.state === 'offline'
+                      ? 'Offline — waiting to reconnect'
+                      : 'Connection failed — retrying'}</p>
+                  <button type="button" onClick={connectionInfo.retryNow}>Retry connection</button>
+                </div>
+              ) : null}
             </div>
           </section>
         </main>
@@ -2459,6 +2245,24 @@ function ConversationPageContent({
             {creationCancelledPrompt && (
               <pre className="context-exhausted-content">{creationCancelledPrompt}</pre>
             )}
+          </div>
+        </div>
+      )}
+      {convStateForChildren.type === 'recoverable_continuation_failure' && (
+        <div className="context-exhausted-banner context-exhausted-banner--expanded">
+          <div className="context-exhausted-summary">
+            <div className="error-body-title">Continuation summary failed</div>
+            <p>{convStateForChildren.message}</p>
+            <div className="context-exhausted-actions">
+              <button
+                type="button"
+                className="context-exhausted-continue"
+                disabled={isArchived}
+                onClick={() => void handleTriggerContinuation()}
+              >
+                Retry summary
+              </button>
+            </div>
           </div>
         </div>
       )}

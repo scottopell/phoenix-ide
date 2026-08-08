@@ -57,9 +57,11 @@ function reducer(state: InlineStreamState, action: InlineStreamAction): InlineSt
 }
 
 function transformInitData(raw: SseInitData): InitPayload {
-  const conversation = raw.project_name != null
-    ? { ...raw.conversation, project_name: raw.project_name }
-    : raw.conversation;
+  const conversation = {
+    ...raw.conversation,
+    presentation_mode: raw.presentation_mode,
+    ...(raw.project_name != null && { project_name: raw.project_name }),
+  };
   return {
     conversation,
     messages: raw.messages || [],
@@ -71,6 +73,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
+    transcriptCoverage: raw.transcript_coverage,
   };
 }
 
@@ -118,6 +121,7 @@ function snapshotPayload(conversation: Conversation, messages: Message[], contex
     pendingAnchorSequenceId: lastAppliedEventSeq,
     pendingEvents: [],
     pendingTruncated: false,
+    transcriptCoverage: 'complete',
   };
 }
 
@@ -152,6 +156,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
     let source: EventSource | null = null;
     let notFoundRetries = 0;
     let retryTimer: number | null = null;
+    let snapshotTranscriptGeneration: number | null = null;
 
     const closeSource = () => {
       if (source) {
@@ -169,7 +174,15 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         if (raw === null) return;
         const res = v.safeParse(SseInitDataSchema, raw);
         if (!res.success) return;
-        dispatch({ type: 'atom', atomAction: { type: 'sse_init', payload: transformInitData(res.output) } });
+        const payload = transformInitData(res.output);
+        if (payload.transcriptCoverage === 'tail'
+          && snapshotTranscriptGeneration !== null
+          && snapshotTranscriptGeneration !== payload.transcriptGeneration) {
+          closeSource();
+          loadSnapshot();
+          return;
+        }
+        dispatch({ type: 'atom', atomAction: { type: 'sse_init', payload } });
       });
 
       source.addEventListener('message', (event) => {
@@ -392,6 +405,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
       api.getConversation(conversationId)
         .then((data) => {
           if (cancelled) return;
+          snapshotTranscriptGeneration = data.conversation.transcript_generation ?? 1;
           dispatch({
             type: 'atom',
             atomAction: {

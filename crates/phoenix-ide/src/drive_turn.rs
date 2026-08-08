@@ -238,7 +238,7 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         .map_err(|error| DriveTurnError::Database(error.to_string()))?;
     let work_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
         conversation
-            .work_scope_id
+            .attached_work_scope_id
             .expect("persisted conversation has work scope"),
     );
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
@@ -499,6 +499,10 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
             error_kind: error_kind.clone(),
         }),
         ConvState::AwaitingRecovery { .. } => Some(StableOutcome::AwaitingRecovery),
+        ConvState::RecoverableContinuationFailure { failure } => Some(StableOutcome::Error {
+            message: failure.message.clone(),
+            error_kind: failure.error_kind.clone(),
+        }),
         ConvState::AwaitingTaskApproval { .. } => Some(StableOutcome::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Some(StableOutcome::AwaitingUserResponse),
         ConvState::AwaitingCommissionReviewApproval { .. } => {

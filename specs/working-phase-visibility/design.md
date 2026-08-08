@@ -282,6 +282,10 @@ llm_attempt      (llm-retry-visibility, sibling spec)
 ping             (server keep-alive, see "Server keep-alive observation")
 ```
 
+The normative aggregate target additionally requires explicit listeners for
+`product_conversation_lifecycle` and `continuation_boundary` when those wire
+carriers are implemented.
+
 A small `wrapHandler(eventName, fn)` helper in the SSE-client layer
 (one place, not duplicated per listener) is the recommended shape so
 the bump-then-delegate sequence cannot drift listener-by-listener. The

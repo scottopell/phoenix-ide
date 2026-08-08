@@ -12,8 +12,12 @@ WHEN client requests conversation list
 THE SYSTEM SHALL return active conversations ordered by last update
 AND include conversation ID, slug, working directory, state, and timestamps
 
-WHEN client requests archived conversations
-THE SYSTEM SHALL return archived conversations separately
+WHEN the client requests History conversations
+THE SYSTEM SHALL return closed conversations separately from Open conversations
+
+WHEN the server projects aggregate lifecycle to streaming clients
+THE SYSTEM SHALL use the product-conversation Open/History lifecycle carrier consistently as the authoritative stream/list lifecycle fact
+AND SHALL NOT require a separate row-local `conversation_became_terminal` event for reconnect or listing correctness
 
 **Rationale:** Users need to see and navigate their conversations.
 
@@ -41,16 +45,12 @@ THE SYSTEM SHALL return error without creating conversation
 
 ### REQ-API-003: Message Retrieval
 
-WHEN client requests conversation messages
+WHEN client requests complete conversation history for lazy expansion or deep-link navigation
 THE SYSTEM SHALL return all messages in sequence order
 AND include message type, content, timestamps, and display data
 AND include current conversation state and context window usage
 
-WHEN client specifies after_sequence parameter
-THE SYSTEM SHALL return only messages with sequence_id greater than specified
-AND include current state for reconnection sync
-
-**Rationale:** Full retrieval for initial load; partial retrieval for reconnection after SSE interruption.
+**Rationale:** SSE init owns initial metadata and the newest bounded transcript tail. REST retrieval remains available for older server-owned history when the reader or a deep link requires it; reconnect synchronization is owned by the SSE event cursor rather than transcript message floors.
 
 ---
 
@@ -77,8 +77,10 @@ AND return acknowledgment
 
 ### REQ-API-005: Real-time Streaming
 
-WHEN client connects to conversation SSE stream
-THE SYSTEM SHALL send init event with current state, agent_working status, and last_sequence_id
+WHEN client connects to conversation SSE stream without a replay cursor
+THE SYSTEM SHALL send an init event containing authoritative conversation metadata, current state, agent_working status, the newest bounded transcript tail, exact transcript coverage, and the last applied event sequence
+AND mark transcript coverage `complete` when the bounded selection contains the entire transcript
+AND mark transcript coverage `tail` when older persisted messages precede the bounded selection
 AND stream new messages as they are persisted
 AND stream state changes as they occur
 
@@ -86,8 +88,10 @@ WHEN LLM is generating a response
 THE SYSTEM SHALL stream token events to connected clients as text is produced
 AND include a request identifier so clients can correlate tokens with the in-flight request
 
-WHEN client connects with `after` query parameter
-THE SYSTEM SHALL include only messages with sequence_id > after in init event
+WHEN client reconnects with `after_event_sequence` and a matching transcript generation
+THE SYSTEM SHALL replay events after that event cursor
+AND MAY omit persisted transcript messages from init
+AND SHALL mark transcript coverage `preserve` when the client must retain its existing transcript coverage
 AND then stream new messages normally
 
 WHEN multiple clients connect to same conversation
@@ -104,7 +108,7 @@ THE SYSTEM SHALL include the in-flight assistant message (containing the LLM's t
 AND SHALL surface the current tool execution state via the state_change event delivered in init's pending_events
 SO THAT the user sees the active tool render in the main message list rather than a blank gap until the tool round completes
 
-**Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The `after` parameter enables seamless reconnection without a separate fetch request, eliminating race conditions. Reconnection correctness ensures dropped connections during long generations never leave users with stale or broken views. The in-flight-assistant-message coverage on reconnect closes the symmetric gap during tool execution: without it, a reconnect between "LLM finished, tool started" and "tool finished, checkpoint persisted" would blank out the assistant's message and the tool card.
+**Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The event cursor enables seamless reconnection without a separate fetch request, while transcript generation proves whether existing client coverage can be preserved. Exact coverage keeps lazy older-history loading correct. The in-flight-assistant-message coverage on reconnect closes the symmetric gap during tool execution: without it, a reconnect between "LLM finished, tool started" and "tool finished, checkpoint persisted" would blank out the assistant's message and the tool card.
 
 ---
 
@@ -135,44 +139,33 @@ THE SYSTEM SHALL include in state_data:
 
 ### REQ-API-006: Conversation Lifecycle
 
-WHEN client requests archive
-THE SYSTEM SHALL mark conversation as archived
-AND remove from active conversation list
-AND run the resource-cleanup cascade (REQ-BED-032) — releasing the
-    conversation's bash handles, tmux server (subject to scope-equality
-    preservation per REQ-TMUX-WS-002), worktree, and browser session
-    (subject to REQ-BROWSER-WS-002 preservation)
+WHEN the client requests Close conversation
+THE SYSTEM SHALL transition the conversation from Open to History through the explicit Close flow
+AND run the resource-cleanup cascade required by that Close flow
 
-THE SYSTEM SHALL NOT expose an `unarchive` operation. Archive is a
-terminal lifecycle transition; the row is preserved for retrospection
-but the conversation cannot resume in-place. The unified cleanup cascade
-reclaims a conversation's live resources, so a state in which "live
-resources reclaimed but row claims it can be resumed" is structurally
-incoherent — see REQ-BED-032 rationale.
+THE SYSTEM SHALL NOT expose `archive`, `unarchive`, `abandon`, or `mark_merged` as current ordinary lifecycle write operations
 
-WHEN client requests delete
-THE SYSTEM SHALL permanently remove conversation and all messages
-AND run the resource-cleanup cascade (REQ-BED-032)
+WHEN the client requests delete for a History conversation
+THE SYSTEM SHALL permanently remove the conversation and all messages
+AND run any remaining cleanup required for deletion
 
-WHEN client requests rename with new slug
-THE SYSTEM SHALL update slug if not already taken
+WHEN the client requests rename with a new slug
+THE SYSTEM SHALL update the slug if it is not already taken
 
-**Rationale:** Users manage conversation lifecycle and organization.
-Archive and delete share the same resource-release semantics; they
-differ only in whether the DB row (and message history) is preserved.
+**Rationale:** Users manage conversation lifecycle through Open, Close, History, and Delete permanently. The API should expose the same unified product model rather than preserving obsolete lifecycle verbs as current writes.
 
 ---
 
 ### REQ-API-007: Slug Resolution
 
-WHEN client requests conversation by slug
-THE SYSTEM SHALL resolve slug to conversation ID
-AND return conversation details with messages
+WHEN client resolves a conversation route by slug or ID
+THE SYSTEM SHALL return the authoritative conversation ID and canonical slug
+AND SHALL NOT duplicate conversation metadata or transcript content in the route response
 
 WHEN slug does not exist
 THE SYSTEM SHALL return 404 error
 
-**Rationale:** Human-readable URLs in browser improve usability over opaque IDs.
+**Rationale:** Human-readable URLs improve usability over opaque IDs. Narrow route resolution chooses the SSE stream identity while SSE init remains the single authoritative owner of initial metadata and transcript content.
 
 ---
 
@@ -212,12 +205,13 @@ AND apply appropriate cache headers
 
 ### REQ-API-012: Reconnect Replay Buffer
 
-WHEN the server emits a replayable non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, error, browser_session_state, steer_message_queued, steer_message_cancelled, rate_limit_snapshot, llm_first_byte, llm_attempt, work_scope_update)
-THE SYSTEM SHALL retain the event in a per-conversation in-memory ring buffer until the next persisted Message broadcast replaces it (anchor reset)
+WHEN the server emits a replayable non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, product_conversation_lifecycle, continuation_boundary, work_scope_update, error, browser_session_state, steer_message_queued, steer_message_cancelled, rate_limit_snapshot, conversation_hard_deleted, llm_first_byte, llm_attempt)
+THE SYSTEM SHALL retain the event in a root-keyed in-memory ring buffer until the next persisted transcript-anchor broadcast replaces it (anchor reset)
 
 WHEN the server emits an eager (non-persisted) assistant Message via the runtime's BroadcastAssistantMessage effect
-THE SYSTEM SHALL append the Message event to the ring buffer without resetting the anchor
-SO THAT a subscriber connecting before the corresponding persist_checkpoint completes still receives the in-flight assistant message
+THE SYSTEM SHALL request one root-stream sequence allocation from the RootStreamLedger for the enclosing ProductConversation
+AND SHALL append the Message event to the root-keyed ring buffer without resetting the anchor
+SO THAT a stable root subscriber connecting before the corresponding persist_checkpoint completes still receives the in-flight assistant message
 
 WHEN the ring buffer reaches its capacity (default 512 entries)
 THE SYSTEM SHALL discard all entries (clear the ring)
@@ -236,11 +230,22 @@ WHERE the metric is observability-only (the cap is enforced by entry count, not 
 AND the accessor (`replay_ring_bytes()`) is intended for periodic scraping (gauge collector / dashboard), NOT per-event tracking
 SO THAT pathological large-event-dominated rings can be detected before they become a memory issue, without making token streaming pay a `serde_json::to_vec` on every append
 
-WHEN a client subscribes to a conversation's SSE stream
+WHEN a client subscribes to a conversation's stable root SSE stream
 THE SYSTEM SHALL include in the init payload:
-- `pending_anchor_sequence_id`: the sequence_id of the last persisted Message (the ring's anchor)
-- `pending_events`: the ordered ring entries with sequence_ids strictly greater than the anchor
+- `pending_anchor_sequence_id`: the root aggregate envelope sequence_id of the last persisted transcript anchor carried on the stream
+- `pending_events`: the ordered root-keyed ring entries with root-stream sequence_ids strictly greater than the anchor
 - `pending_truncated`: whether the ring overflowed since the anchor
+- `last_sequence_id`: the same RootStreamLedger-derived root-stream watermark used by live delivery
+
+WHEN the server emits any aggregate-bound live SSE carrier (message, token, state_change, message_updated, agent_done, conversation_update, product_conversation_lifecycle, continuation_boundary, work_scope_update, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
+THE SYSTEM SHALL materialize one closed typed aggregate-bound live envelope for that carrier
+AND SHALL allocate or reuse one root-stream sequence_id from the RootStreamLedger before broadcast
+AND SHALL carry the root ProductConversation id plus that `root_sequence_id` on the live envelope
+AND SHALL include member conversation identity on carriers sourced from one transcript member rather than from the aggregate itself
+AND SHALL treat `work_scope_update` as aggregate-native, carrying the root ProductConversation id plus the inventory payload identity rather than any member-row owner
+AND SHALL append the same root-keyed envelope to replay and surface the same ledger watermark through init
+WHERE `init` is excluded because it is per-subscriber and `conversation_hard_deleted` is excluded because it is terminal and non-replayable
+SO THAT live delivery, replay, and init snapshots share one authoritative ordering space
 
 WHEN the server process restarts
 THE SYSTEM SHALL discard the ring buffer
