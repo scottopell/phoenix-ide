@@ -314,10 +314,10 @@ final class AppModel {
             try await api.archive(conversationId: conversationId)
             archived = true
             session.stop()
+            await session.clearCachedSnapshotAndWait()
+            await session.outbox.clearAndWait()
             sessions[conversationId] = nil
             listStore.remove(id: conversationId)
-            DiskStore.remove(name: "outbox-\(conversationId)")
-            DiskStore.remove(name: "conv-\(conversationId)")
             UNUserNotificationCenter.current().removeDeliveredNotifications(
                 withIdentifiers: ["attention-\(conversationId)"])
             return true

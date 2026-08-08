@@ -150,6 +150,20 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
+    func testSnapshotRemovalFencesPendingSaves() async throws {
+        let session = makeSession()
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(), messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+        session.stop()
+
+        await session.clearCachedSnapshotAndWait()
+
+        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+    }
+
+    @MainActor
     func testCanonicalAuthoritativeMessageReconcilesOptimisticEntry() async throws {
         let session = makeSession()
         let entry = await session.outbox.enqueue(text: "sent once")!
@@ -161,7 +175,13 @@ final class ConversationSessionReducerTests: XCTestCase {
                 content: "{\"text\":\"sent once\"}")],
             agentWorking: true, presentationMode: "working", lastSequenceId: 2,
             pendingAnchorSequenceId: 2, pendingEvents: [], pendingTruncated: false)))
+        session.receive(.stateChange(
+            seq: 3, state: .string("idle"), presentationMode: "idle",
+            stateUpdatedAt: nil))
+        let latestSnapshotSaved = await session.flushSnapshotPersistence()
 
+        XCTAssertTrue(latestSnapshotSaved)
         XCTAssertTrue(session.outbox.visibleEntries.isEmpty)
+        XCTAssertEqual(session.outbox.entries.first?.status, .reconciled)
     }
 }

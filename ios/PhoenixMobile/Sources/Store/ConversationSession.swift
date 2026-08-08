@@ -66,6 +66,8 @@ final class ConversationSession {
     private var latestSnapshotRevision = 0
     private var pendingAuthoritativeSyncedAt: Date?
     private var snapshotPersistenceEnabled = true
+    private var snapshotNeedsOutboxReconciliation = false
+    private var snapshotNeedsOutboxDrain = false
     /// Init's persisted-message anchor. Live messages above it may be eager
     /// assistant output, so snapshot persistence excludes them until resync.
     private var durableMessageSequenceCeiling: Int64 = 0
@@ -275,25 +277,39 @@ final class ConversationSession {
         drainOutboxAfter: Bool = false
     ) {
         guard !isHardDeleted, snapshotPersistenceEnabled else { return }
+        snapshotNeedsOutboxReconciliation =
+            snapshotNeedsOutboxReconciliation || reconcileOutboxOnSuccess
+        snapshotNeedsOutboxDrain = snapshotNeedsOutboxDrain || drainOutboxAfter
         let snapshot = snapshotForPersistence(authoritative: authoritative)
         let revision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = revision
         Task { [weak self, snapshotWriter] in
             let didSave = await snapshotWriter.save(snapshot, revision: revision)
-            guard let self, self.latestSnapshotRevision == revision,
-                  self.snapshotPersistenceEnabled, !self.isHardDeleted
-            else { return }
-            if didSave {
-                self.snapshotSyncedAt = snapshot.syncedAt
-                self.pendingAuthoritativeSyncedAt = nil
-                if reconcileOutboxOnSuccess {
-                    self.reconcileOutbox()
-                }
-            }
-            if drainOutboxAfter {
-                self.drainOutbox()
+            self?.completeSnapshotPersistence(
+                snapshot, revision: revision, didSave: didSave)
+        }
+    }
+
+    @discardableResult
+    private func completeSnapshotPersistence(
+        _ snapshot: Snapshot, revision: Int, didSave: Bool
+    ) -> Bool {
+        guard latestSnapshotRevision == revision, snapshotPersistenceEnabled,
+              !isHardDeleted
+        else { return false }
+        if didSave {
+            snapshotSyncedAt = snapshot.syncedAt
+            pendingAuthoritativeSyncedAt = nil
+            if snapshotNeedsOutboxReconciliation {
+                snapshotNeedsOutboxReconciliation = false
+                reconcileOutbox()
             }
         }
+        if snapshotNeedsOutboxDrain {
+            snapshotNeedsOutboxDrain = false
+            drainOutbox()
+        }
+        return didSave
     }
 
     @discardableResult
@@ -303,18 +319,13 @@ final class ConversationSession {
         let revision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = revision
         let didSave = await snapshotWriter.save(snapshot, revision: revision)
-        guard latestSnapshotRevision == revision, snapshotPersistenceEnabled,
-              !isHardDeleted
-        else { return false }
-        if didSave {
-            snapshotSyncedAt = snapshot.syncedAt
-            pendingAuthoritativeSyncedAt = nil
-        }
-        return didSave
+        return completeSnapshotPersistence(snapshot, revision: revision, didSave: didSave)
     }
 
     func clearCachedSnapshotAndWait() async {
         snapshotPersistenceEnabled = false
+        snapshotNeedsOutboxReconciliation = false
+        snapshotNeedsOutboxDrain = false
         let revision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = revision
         await snapshotWriter.remove(revision: revision)
@@ -878,6 +889,8 @@ final class ConversationSession {
         actionAttempt = nil
         connection = .idle
         snapshotPersistenceEnabled = false
+        snapshotNeedsOutboxReconciliation = false
+        snapshotNeedsOutboxDrain = false
         let snapshotRemovalRevision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = snapshotRemovalRevision
         DiskStore.remove(name: snapshotName)
