@@ -54,8 +54,9 @@ THE SYSTEM SHALL rehydrate only entries belonging to the viewed conversation
 
 The queue implements the client-side delivery contract of
 `specs/user_message_queue/user_message_queue.allium` (enqueue-before-POST,
-`message_id = localId`, reconciliation against authoritative history,
-union-without-duplicates rendering), with two platform deviations:
+`message_id = localId`, reconciliation against either an exact authoritative
+id or the server's conversation-scoped canonical id, union-without-duplicates
+rendering), with two platform deviations:
 
 1. Transport-level failures do not transition entries to `failed`; they
    remain `pending` for automatic redelivery. Mobile connectivity loss is

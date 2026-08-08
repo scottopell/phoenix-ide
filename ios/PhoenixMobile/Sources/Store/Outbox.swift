@@ -5,7 +5,7 @@ import Observation
 /// authoritative server history. Implements the client-side delivery
 /// contract in specs/user_message_queue/user_message_queue.allium:
 /// `localId` doubles as the POST `message_id`, so retries are idempotent
-/// and reconciliation is an identity join against server history.
+/// and reconciliation joins that submitted identity to server history.
 struct OutboxEntry: Codable, Identifiable, Equatable {
     enum Status: String, Codable {
         /// Authored; awaiting send or awaiting reflection in server history.
@@ -45,6 +45,11 @@ struct OutboxEntry: Codable, Identifiable, Equatable {
 
     var isVisible: Bool {
         status != .reconciled && status != .dismissed
+    }
+
+    func isReflected(in authoritativeMessageIds: Set<String>) -> Bool {
+        authoritativeMessageIds.contains(localId)
+            || authoritativeMessageIds.contains("\(conversationId):\(localId)")
     }
 }
 
@@ -193,15 +198,15 @@ final class Outbox {
         }
     }
 
-    /// AuthoritativeMessageReconcilesQueueEntry: any entry whose localId
-    /// appears in server history is done — hide it and stop tracking.
+    /// AuthoritativeMessageReconcilesQueueEntry: an entry reflected by the
+    /// server's exact or conversation-scoped canonical identity is done.
     /// Applies to fresh sends, steering-queued sends, and rehydrated
     /// entries after an app restart alike.
     func reconcile(authoritativeMessageIds: Set<String>) {
         var changed = false
         for idx in entries.indices {
             let entry = entries[idx]
-            if entry.isVisible && authoritativeMessageIds.contains(entry.localId) {
+            if entry.isVisible && entry.isReflected(in: authoritativeMessageIds) {
                 entries[idx].status = .reconciled
                 changed = true
             }

@@ -6,14 +6,13 @@
 -- Scope: the browser-local queue used to preserve user-authored messages
 --        until authoritative server history reflects them. This is the client
 --        bridge between POST /chat idempotency (`message_id = localId`), SSE
---        init/message delivery, offline retry, and steering queue display.
+--        init/message delivery, canonical server message identity, offline
+--        retry, and steering queue display.
 --
 -- Excludes: server execution state machine internals; SSE wire ordering (see
 --           specs/sse_wire/sse_wire.allium); ConversationAtom per-event reducer
 --           semantics (see specs/conversation_atom/conversation_atom.allium).
 --
--- Supersedes: tasks/02682-p3-ready--distill-user-message-queue-allium-spec.md.
-
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
@@ -92,6 +91,16 @@ enum QueueStatus {
     reconciled
     dismissed
 }
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- authoritative_message_matches_entry(message, entry)
+--   True when the authoritative message is the server reflection of the
+--   queue entry's submitted message id within the same conversation scope.
+--   The authoritative id may equal the submitted id or be its scoped
+--   canonical form.
 
 ------------------------------------------------------------
 -- Rules
@@ -192,17 +201,16 @@ rule AuthoritativeMessageReconcilesQueueEntry {
     when: ServerHistoryContains(msg, entry)
 
     requires: msg.scope = entry.scope
-    requires: msg.message_id = entry.local_id
+    requires: authoritative_message_matches_entry(msg, entry)
     requires: entry.status = pending or entry.status = steering_queued or entry.status = recoverable_inconsistency
 
     ensures: entry.status = reconciled
     ensures: entry.visible = false
 
     @guidance
-        -- Implementation: derivePendingMessages filters queue entries whose
-        -- `localId` appears in `atom.messages[*].message_id`; no imperative
-        -- markSent action is needed. This applies equally to rehydrated local
-        -- entries after page reload.
+        -- Reconciliation compares the submitted id with both exact
+        -- authoritative ids and the server's conversation-scoped canonical
+        -- ids. It applies equally to rehydrated entries after reload.
 }
 
 rule DerivePendingRender {
@@ -227,7 +235,7 @@ rule AcceptedButCausallyProvenMissingBecomesRecoverable {
 
     requires: entry.accepted_by_server = true
     requires: entry.status = pending or entry.status = steering_queued
-    requires: not AuthoritativeUserMessage{scope: entry.scope, message_id: entry.local_id}
+    requires: not AuthoritativeUserMessages.any(msg => authoritative_message_matches_entry(msg, entry))
 
     ensures: entry.status = recoverable_inconsistency
     ensures: RecoverableInconsistencyRender.created(entry: entry, surfaced: true)
@@ -245,7 +253,7 @@ rule SteeringQueuedDrainsOnAuthoritativeMessage {
 
     requires: entry.status = steering_queued
     requires: msg.scope = entry.scope
-    requires: msg.message_id = entry.local_id
+    requires: authoritative_message_matches_entry(msg, entry)
 
     ensures: entry.status = reconciled
     ensures: entry.visible = false
@@ -293,10 +301,7 @@ invariant RenderedUserMessagesAreUnionWithoutDuplicates {
     for entry in LocalQueueEntries:
         PendingRender{entry: entry} implies
             (entry.status = pending or entry.status = steering_queued)
-            and not AuthoritativeUserMessage{scope: entry.scope, message_id: entry.local_id}
-
-    for msg in AuthoritativeUserMessages:
-        no PendingRender{entry: LocalQueueEntry{scope: msg.scope, local_id: msg.message_id}}
+            and not AuthoritativeUserMessages.any(msg => authoritative_message_matches_entry(msg, entry))
 }
 
 invariant LocalStorageScopedByConversation {
@@ -307,6 +312,6 @@ invariant LocalStorageScopedByConversation {
 invariant AcceptedMessagesDoNotRemainSilentPendingForever {
     for entry in LocalQueueEntries:
         entry.accepted_by_server and (entry.status = pending or entry.status = steering_queued) implies
-            AuthoritativeUserMessage{scope: entry.scope, message_id: entry.local_id}
+            AuthoritativeUserMessages.any(msg => authoritative_message_matches_entry(msg, entry))
             or entry.status = recoverable_inconsistency
 }

@@ -29,10 +29,10 @@ final class ConversationSessionReducerTests: XCTestCase {
             from: Data("{\"id\":\"c1\",\"slug\":\"c1\",\"state\":\(state)}".utf8))
     }
 
-    private func message(id: String, content: String) throws -> Message {
+    private func message(id: String, type: String = "agent", content: String) throws -> Message {
         try JSONDecoder().decode(
             Message.self,
-            from: Data("{\"message_id\":\"\(id)\",\"sequence_id\":2,\"message_type\":\"agent\",\"content\":\(content)}".utf8))
+            from: Data("{\"message_id\":\"\(id)\",\"sequence_id\":2,\"message_type\":\"\(type)\",\"content\":\(content)}".utf8))
     }
 
     @MainActor
@@ -115,5 +115,21 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertNil(session.conversation)
         XCTAssertTrue(session.outbox.entries.isEmpty)
         XCTAssertEqual(deletedId, "c1")
+    }
+
+    @MainActor
+    func testCanonicalAuthoritativeMessageReconcilesOptimisticEntry() throws {
+        let session = makeSession()
+        let entry = session.outbox.enqueue(text: "sent once")
+
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(),
+            messages: [try message(
+                id: "c1:\(entry.localId)", type: "user",
+                content: "{\"text\":\"sent once\"}")],
+            agentWorking: true, presentationMode: "working", lastSequenceId: 2,
+            pendingAnchorSequenceId: 2, pendingEvents: [], pendingTruncated: false)))
+
+        XCTAssertTrue(session.outbox.visibleEntries.isEmpty)
     }
 }
