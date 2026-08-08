@@ -177,6 +177,7 @@ final class ConversationSession {
             // while a drain is already running is picked up by this pass
             // instead of waiting for the next trigger.
             while !Task.isCancelled {
+                guard outbox.prepareForDelivery() else { return }
                 let sendable = outbox.entries.filter {
                     $0.status == .pending && !$0.acceptedByServer
                         && !inFlight.contains($0.localId)

@@ -76,10 +76,19 @@ final class Outbox {
         entries.contains { $0.status == .pending && !$0.acceptedByServer }
     }
 
-    private func persist() {
+    @discardableResult
+    private func persist() -> Bool {
         // Terminal entries are pruned at persistence time; they carry no
         // future obligation.
-        DiskStore.save(entries.filter(\.isVisible), name: storeName)
+        return DiskStore.save(entries.filter(\.isVisible), name: storeName)
+    }
+
+    /// Re-establish the enqueue-before-POST durability point immediately
+    /// before delivery. A prior write may have failed while storage was full;
+    /// no request leaves the device until the complete visible queue is on
+    /// disk again.
+    func prepareForDelivery() -> Bool {
+        persist()
     }
 
     private func update(_ localId: String, _ mutate: (inout OutboxEntry) -> Void) {

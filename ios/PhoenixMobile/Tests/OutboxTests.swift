@@ -67,6 +67,19 @@ final class OutboxTests: XCTestCase {
         XCTAssertEqual(rehydrated.visibleEntries[0].status, .pending)
     }
 
+    @MainActor
+    func testDeliveryIsBlockedUntilQueueCanBePersisted() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-unwritable-store-\(UUID().uuidString)")
+        try Data("not a directory".utf8).write(to: file)
+        DiskStore.baseDirectory = file
+
+        let outbox = Outbox(conversationId: "c1")
+        _ = outbox.enqueue(text: "must stay local")
+
+        XCTAssertFalse(outbox.prepareForDelivery())
+    }
+
     // MARK: - PostAccepted{AsSteeringQueued, AsPendingReflection}
 
     @MainActor
