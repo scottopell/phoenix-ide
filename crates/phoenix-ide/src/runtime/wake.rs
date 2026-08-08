@@ -10,9 +10,9 @@ use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_db::workflow::wake::{
     MaterializePendingDeliveryMessageInput, MaterializePendingDeliveryMessageOutcome,
     WakeAdoptMaterializedPendingOutcome, WakeCancelIfUnresolvedInput, WakeCancellationOutcome,
-    WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationOutcome,
-    WakePendingDelivery, WakePendingGlobalCursor, WakeRegistrationOutcome, WakeRepository,
-    WakeTerminalEvidenceInput, WakeTerminalEvidenceOutcome,
+    WakeForgetIfUnresolvedInput, WakeObservationCandidateRow, WakeObservationLeaseWindow,
+    WakeObservationOutcome, WakePendingDelivery, WakePendingGlobalCursor, WakeRegistrationOutcome,
+    WakeRepository, WakeTerminalEvidenceInput, WakeTerminalEvidenceOutcome,
 };
 use phoenix_db::workflow::LocalAttemptAuthority;
 use phoenix_tools::bash::handle::{FinalCause, HandleState};
@@ -257,13 +257,17 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                         .saturating_add(LEASE_DURATION.as_secs())
                         .min(candidate.expires_at.0.saturating_add(1)),
                 );
+                let Some(lease_window) = self.clock.lease_window(now, LEASE_DURATION, claim_until)
+                else {
+                    next_wait = Duration::ZERO;
+                    continue;
+                };
                 match self
                     .repo
-                    .claim_observation_if_eligible(
+                    .claim_observation_with_lease_window(
                         candidate.workflow_id,
                         self.process_incarnation,
-                        now,
-                        claim_until,
+                        lease_window,
                     )
                     .await
                     .map_err(|e| e.to_string())?
@@ -537,6 +541,12 @@ fn duration_until(now: Timestamp, then: u64) -> Duration {
 
 pub(crate) trait WakeClock: Send + Sync + 'static {
     fn now(&self) -> Timestamp;
+    fn lease_window(
+        &self,
+        now: Timestamp,
+        duration: Duration,
+        latest_lease_until: LeaseExpiry,
+    ) -> Option<WakeObservationLeaseWindow>;
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
@@ -550,6 +560,15 @@ impl WakeClock for SystemClock {
                 .unwrap_or_default()
                 .as_secs(),
         )
+    }
+
+    fn lease_window(
+        &self,
+        now: Timestamp,
+        duration: Duration,
+        latest_lease_until: LeaseExpiry,
+    ) -> Option<WakeObservationLeaseWindow> {
+        WakeObservationLeaseWindow::database_timed(now, duration, latest_lease_until)
     }
 
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -773,6 +792,15 @@ mod tests {
             *self.now.lock().unwrap()
         }
 
+        fn lease_window(
+            &self,
+            now: Timestamp,
+            duration: Duration,
+            latest_lease_until: LeaseExpiry,
+        ) -> Option<WakeObservationLeaseWindow> {
+            WakeObservationLeaseWindow::new(now, duration, latest_lease_until)
+        }
+
         fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             if let Some(tx) = self.sleep_tx.lock().unwrap().take() {
                 let _ = tx.send(duration);
@@ -783,6 +811,7 @@ mod tests {
 
     struct MockInspector {
         outcomes: Mutex<HashMap<u64, VecDeque<InspectionOutcome>>>,
+        inspection_calls: AtomicUsize,
         cleanup_calls: AtomicUsize,
     }
 
@@ -794,6 +823,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 outcomes: Mutex::new(HashMap::new()),
+                inspection_calls: AtomicUsize::new(0),
                 cleanup_calls: AtomicUsize::new(0),
             }
         }
@@ -805,6 +835,10 @@ mod tests {
                 .entry(workflow_id)
                 .or_default()
                 .push_back(outcome);
+        }
+
+        fn inspection_calls(&self) -> usize {
+            self.inspection_calls.load(Ordering::SeqCst)
         }
 
         fn cleanup_calls(&self) -> usize {
@@ -827,6 +861,7 @@ mod tests {
             _authority: &'a LocalAttemptAuthority,
             _observation_time: Timestamp,
         ) -> Pin<Box<dyn Future<Output = Result<InspectionOutcome, String>> + Send + 'a>> {
+            self.inspection_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 Ok(self
                     .outcomes
@@ -983,11 +1018,12 @@ mod tests {
         );
         let worker = WakeWorker::new(
             repo.clone(),
-            inspector,
+            inspector.clone(),
             Arc::new(TestClock::new(10)),
             ProcessIncarnation(1),
         );
         worker.run_once().await.unwrap();
+        assert_eq!(inspector.inspection_calls(), 1);
         assert_eq!(pending_count(&repo).await, 1);
     }
 

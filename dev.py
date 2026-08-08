@@ -1937,7 +1937,7 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
         print(f"  Loaded dev overrides from {dev_env_file}")
     # Default to debug logging in dev, can be overridden via RUST_LOG env var
     if "RUST_LOG" not in env:
-        env["RUST_LOG"] = "phoenix_ide=debug,tower_http=debug"
+        env["RUST_LOG"] = "phoenix_ide=debug,phoenix_db::observability=info,tower_http=debug"
 
     # Fresh log per restart, then append: the binary's appender and this
     # redirect both open the file with O_APPEND, so their writes interleave

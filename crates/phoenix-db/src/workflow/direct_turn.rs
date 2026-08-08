@@ -1,4 +1,5 @@
 use super::WorkflowRepository;
+use crate::observability::{self, DbOperation, DbOutcome, RetryAccounting};
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
@@ -16,7 +17,8 @@ use phoenix_workflow::{
     TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep, TurnTerminal, Version,
     WorkflowId, WorkflowStatus,
 };
-use sqlx::Row;
+use sqlx::{Acquire, Row};
+use tracing::Instrument;
 
 use super::{
     CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, DeliveryResolutionDecision,
@@ -57,6 +59,92 @@ pub struct ClaimAuthoritativeTurnInput {
     pub process_incarnation: ProcessIncarnation,
     pub now: Timestamp,
     pub lease_until: LeaseExpiry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectTurnLeaseWindow {
+    initial_now: Timestamp,
+    limit: DirectTurnLeaseLimit,
+    commit_clock: super::LeaseCommitClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectTurnLeaseLimit {
+    Renewable(std::time::Duration),
+    HardDeadline(LeaseExpiry),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectTurnAttemptLease {
+    now: Timestamp,
+    lease_until: LeaseExpiry,
+    commit_clock: super::LeaseCommitClock,
+}
+
+impl DirectTurnLeaseWindow {
+    #[must_use]
+    pub fn renewable(initial_now: Timestamp, lease_duration: std::time::Duration) -> Option<Self> {
+        Self::with_limit_and_commit_clock(
+            initial_now,
+            DirectTurnLeaseLimit::Renewable(lease_duration),
+            super::LeaseCommitClock::Projected {
+                current: initial_now,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn hard_deadline(initial_now: Timestamp, deadline: LeaseExpiry) -> Option<Self> {
+        Self::with_limit_and_commit_clock(
+            initial_now,
+            DirectTurnLeaseLimit::HardDeadline(deadline),
+            super::LeaseCommitClock::Projected {
+                current: initial_now,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn database_timed(
+        initial_now: Timestamp,
+        lease_duration: std::time::Duration,
+    ) -> Option<Self> {
+        Self::with_limit_and_commit_clock(
+            initial_now,
+            DirectTurnLeaseLimit::Renewable(lease_duration),
+            super::LeaseCommitClock::SqliteWallClock,
+        )
+    }
+
+    fn with_limit_and_commit_clock(
+        initial_now: Timestamp,
+        limit: DirectTurnLeaseLimit,
+        commit_clock: super::LeaseCommitClock,
+    ) -> Option<Self> {
+        let window = Self {
+            initial_now,
+            limit,
+            commit_clock,
+        };
+        window.at_elapsed(std::time::Duration::ZERO).map(|_| window)
+    }
+
+    fn at_elapsed(self, elapsed: std::time::Duration) -> Option<DirectTurnAttemptLease> {
+        let now = Timestamp(self.initial_now.0.saturating_add(elapsed.as_secs()));
+        let lease_until = match self.limit {
+            DirectTurnLeaseLimit::Renewable(duration) => {
+                LeaseExpiry(now.0.saturating_add(duration.as_secs()))
+            }
+            DirectTurnLeaseLimit::HardDeadline(deadline) => deadline,
+        };
+        lease_until
+            .is_live_at(now)
+            .then_some(DirectTurnAttemptLease {
+                now,
+                lease_until,
+                commit_clock: self.commit_clock,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +288,36 @@ fn authority_event(
         authority.generation.0,
         authority.process_incarnation.0,
     )
+}
+
+fn ineligible_claim_result(canonical_turn: Option<DurableTurn>) -> ClaimAuthoritativeTurnResult {
+    ClaimAuthoritativeTurnResult {
+        outcome: ClaimOutcome::Ineligible,
+        authority: None,
+        attempt: None,
+        canonical_turn,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ClaimIdentity {
+    turn_id: TurnAuthorityId,
+    workflow_id: WorkflowId,
+    process_incarnation: ProcessIncarnation,
+}
+
+#[derive(Clone, Copy)]
+struct ClaimAttemptTiming {
+    lease: DirectTurnAttemptLease,
+    operation_started: std::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ClaimAttemptObservability<'a> {
+    operation: DbOperation,
+    attempt: u32,
+    operation_span: &'a tracing::Span,
+    max_attempts: u32,
 }
 
 impl WorkflowRepository {
@@ -403,101 +521,276 @@ impl WorkflowRepository {
         &self,
         input: &ClaimAuthoritativeTurnInput,
     ) -> DbResult<ClaimAuthoritativeTurnResult> {
-        let mut tx = self.begin_tx().await?;
-        let Some(canonical_turn) =
-            load_turn_for_workflow_tx(&self.pool, &mut tx.tx, input.turn_id, input.workflow_id)
-                .await?
+        let Some(lease_window) = DirectTurnLeaseWindow::hard_deadline(input.now, input.lease_until)
         else {
-            tx.rollback().await?;
-            return Ok(ClaimAuthoritativeTurnResult {
-                outcome: ClaimOutcome::Ineligible,
-                authority: None,
-                attempt: None,
-                canonical_turn: None,
-            });
+            return Ok(ineligible_claim_result(None));
         };
-        let Some(existing_live_attempt) =
-            load_live_attempt_tx(&mut tx.tx, input.workflow_id, DIRECT_TURN_EFFECT_ID).await?
-        else {
-            let attempt_id = next_attempt_id_tx(&mut tx).await?;
-            let result = tx
-                .begin_attempt(&super::BeginAttemptInput {
-                    workflow_id: input.workflow_id,
-                    effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
-                    attempt_id,
-                    process_incarnation: input.process_incarnation,
-                    now: input.now,
-                    lease_until: Some(input.lease_until),
-                })
-                .await?;
-            if result.outcome == ClaimOutcome::Started {
-                tx.commit().await?;
-            } else {
-                tx.rollback().await?;
+        self.claim_authoritative_turn_with_lease_window(
+            input.turn_id,
+            input.workflow_id,
+            input.process_incarnation,
+            lease_window,
+        )
+        .await
+    }
+
+    pub async fn claim_authoritative_turn_with_lease_window(
+        &self,
+        turn_id: TurnAuthorityId,
+        workflow_id: WorkflowId,
+        process_incarnation: ProcessIncarnation,
+        lease_window: DirectTurnLeaseWindow,
+    ) -> DbResult<ClaimAuthoritativeTurnResult> {
+        const MAX_ATTEMPTS: u32 = 5;
+        let operation = DbOperation::ClaimDirectTurn;
+        let operation_span = observability::operation_span(operation);
+        let operation_started = std::time::Instant::now();
+        let mut accounting = RetryAccounting::default();
+        loop {
+            let Some(attempt_lease) = lease_window.at_elapsed(operation_started.elapsed()) else {
+                observability::record_operation(
+                    &operation_span,
+                    DbOutcome::Ineligible,
+                    accounting,
+                    operation_started.elapsed(),
+                );
+                return Ok(ineligible_claim_result(None));
+            };
+            let attempt = accounting.start_attempt();
+            let identity = ClaimIdentity {
+                turn_id,
+                workflow_id,
+                process_incarnation,
+            };
+            let timing = ClaimAttemptTiming {
+                lease: attempt_lease,
+                operation_started,
+            };
+            let observability = ClaimAttemptObservability {
+                operation,
+                attempt,
+                operation_span: &operation_span,
+                max_attempts: MAX_ATTEMPTS,
+            };
+            let result = self
+                .claim_authoritative_turn_once(identity, timing, observability, &mut accounting)
+                .await;
+            match result {
+                Err(DbError::Sqlx(sqlx::Error::Database(error)))
+                    if super::is_sqlite_busy_retryable(error.as_ref())
+                        && attempt < MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => {
+                    let outcome = match &result {
+                        Ok(result) => DbOutcome::from(result.outcome),
+                        Err(DbError::Sqlx(error))
+                            if error
+                                .as_database_error()
+                                .is_some_and(super::is_sqlite_busy_retryable) =>
+                        {
+                            DbOutcome::RetryExhausted
+                        }
+                        Err(_) => DbOutcome::Failure,
+                    };
+                    observability::record_operation(
+                        &operation_span,
+                        outcome,
+                        accounting,
+                        operation_started.elapsed(),
+                    );
+                    return result;
+                }
             }
-            return Ok(ClaimAuthoritativeTurnResult {
-                outcome: result.outcome,
-                authority: result.authority,
-                attempt: result.attempt,
-                canonical_turn: Some(canonical_turn),
-            });
-        };
-        if let Some(lease_until) = existing_live_attempt
-            .lease
-            .as_ref()
-            .map(|lease| lease.lease_until)
-        {
-            if lease_until.is_live_at(input.now) {
+        }
+    }
+
+    async fn claim_authoritative_turn_once(
+        &self,
+        identity: ClaimIdentity,
+        timing: ClaimAttemptTiming,
+        observability: ClaimAttemptObservability<'_>,
+        accounting: &mut RetryAccounting,
+    ) -> DbResult<ClaimAuthoritativeTurnResult> {
+        let ClaimIdentity {
+            turn_id,
+            workflow_id,
+            process_incarnation,
+        } = identity;
+        let ClaimAttemptTiming {
+            lease: attempt_lease,
+            operation_started,
+        } = timing;
+        let ClaimAttemptObservability {
+            operation,
+            attempt,
+            operation_span,
+            max_attempts,
+        } = observability;
+        let mut connection = self
+            .acquire_observed(operation, attempt, max_attempts, accounting, operation_span)
+            .await?;
+        let span = observability::transaction_span(
+            operation,
+            super::DbBeginMode::Deferred,
+            attempt,
+            operation_span,
+        );
+        let started = std::time::Instant::now();
+        let result: DbResult<ClaimAuthoritativeTurnResult> = async {
+            let DirectTurnAttemptLease {
+                now,
+                lease_until,
+                commit_clock,
+            } = attempt_lease;
+            let mut tx = super::WorkflowTx::new(connection.begin().await?);
+            let Some(canonical_turn) =
+                load_turn_for_workflow_tx(&self.pool, &mut tx.tx, turn_id, workflow_id).await?
+            else {
                 tx.rollback().await?;
                 return Ok(ClaimAuthoritativeTurnResult {
-                    outcome: ClaimOutcome::AuthorityConflict,
+                    outcome: ClaimOutcome::Ineligible,
+                    authority: None,
+                    attempt: None,
+                    canonical_turn: None,
+                });
+            };
+            let Some(existing_live_attempt) =
+                load_live_attempt_tx(&mut tx.tx, workflow_id, DIRECT_TURN_EFFECT_ID).await?
+            else {
+                let attempt_id = next_attempt_id_tx(&mut tx).await?;
+                let result = tx
+                    .begin_attempt(&super::BeginAttemptInput {
+                        workflow_id,
+                        effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                        attempt_id,
+                        process_incarnation,
+                        now,
+                        lease_until: Some(lease_until),
+                    })
+                    .await?;
+                if result.outcome == ClaimOutcome::Started {
+                    if !super::lease_is_live_immediately_before_commit(
+                        &mut tx.tx,
+                        lease_until,
+                        commit_clock.at_elapsed(operation_started.elapsed()),
+                    )
+                    .await?
+                    {
+                        tx.rollback().await?;
+                        return Ok(ineligible_claim_result(Some(canonical_turn)));
+                    }
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                }
+                return Ok(ClaimAuthoritativeTurnResult {
+                    outcome: result.outcome,
+                    authority: result.authority,
+                    attempt: result.attempt,
+                    canonical_turn: Some(canonical_turn),
+                });
+            };
+            if let Some(lease_until) = existing_live_attempt
+                .lease
+                .as_ref()
+                .map(|lease| lease.lease_until)
+            {
+                if lease_until.is_live_at(now) {
+                    tx.rollback().await?;
+                    return Ok(ClaimAuthoritativeTurnResult {
+                        outcome: ClaimOutcome::AuthorityConflict,
+                        authority: None,
+                        attempt: None,
+                        canonical_turn: Some(canonical_turn),
+                    });
+                }
+            }
+            let expired = expire_direct_turn_lease_in_tx(
+                &mut tx,
+                &super::ExpireLeaseInput {
+                    workflow_id,
+                    effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                    attempt_id: existing_live_attempt.id,
+                    now,
+                },
+            )
+            .await?;
+            if expired != AuthorityOutcome::Authorized {
+                tx.rollback().await?;
+                return Ok(ClaimAuthoritativeTurnResult {
+                    outcome: ClaimOutcome::Ineligible,
                     authority: None,
                     attempt: None,
                     canonical_turn: Some(canonical_turn),
                 });
             }
-        }
-        let expired = expire_direct_turn_lease_in_tx(
-            &mut tx,
-            &super::ExpireLeaseInput {
-                workflow_id: input.workflow_id,
-                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
-                attempt_id: existing_live_attempt.id,
-                now: input.now,
-            },
-        )
-        .await?;
-        if expired != AuthorityOutcome::Authorized {
-            tx.rollback().await?;
-            return Ok(ClaimAuthoritativeTurnResult {
-                outcome: ClaimOutcome::Ineligible,
-                authority: None,
-                attempt: None,
+            let attempt_id = next_attempt_id_tx(&mut tx).await?;
+            let result = tx
+                .begin_attempt(&super::BeginAttemptInput {
+                    workflow_id,
+                    effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
+                    attempt_id,
+                    process_incarnation,
+                    now,
+                    lease_until: Some(lease_until),
+                })
+                .await?;
+            if result.outcome == ClaimOutcome::Started {
+                if !super::lease_is_live_immediately_before_commit(
+                    &mut tx.tx,
+                    lease_until,
+                    commit_clock.at_elapsed(operation_started.elapsed()),
+                )
+                .await?
+                {
+                    tx.rollback().await?;
+                    return Ok(ineligible_claim_result(Some(canonical_turn)));
+                }
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            Ok(ClaimAuthoritativeTurnResult {
+                outcome: result.outcome,
+                authority: result.authority,
+                attempt: result.attempt,
                 canonical_turn: Some(canonical_turn),
-            });
-        }
-        let attempt_id = next_attempt_id_tx(&mut tx).await?;
-        let result = tx
-            .begin_attempt(&super::BeginAttemptInput {
-                workflow_id: input.workflow_id,
-                effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
-                attempt_id,
-                process_incarnation: input.process_incarnation,
-                now: input.now,
-                lease_until: Some(input.lease_until),
             })
-            .await?;
-        if result.outcome == ClaimOutcome::Started {
-            tx.commit().await?;
-        } else {
-            tx.rollback().await?;
         }
-        Ok(ClaimAuthoritativeTurnResult {
-            outcome: result.outcome,
-            authority: result.authority,
-            attempt: result.attempt,
-            canonical_turn: Some(canonical_turn),
-        })
+        .instrument(span.clone())
+        .await;
+        let (outcome, sqlite) = match &result {
+            Ok(result) => (DbOutcome::from(result.outcome), None),
+            Err(DbError::Sqlx(error)) => {
+                let sqlite = observability::sqlite_class(error);
+                let outcome = if error
+                    .as_database_error()
+                    .is_some_and(super::is_sqlite_busy_retryable)
+                {
+                    if attempt < max_attempts {
+                        accounting.record_retry();
+                        DbOutcome::ContentionRetry
+                    } else {
+                        DbOutcome::RetryExhausted
+                    }
+                } else {
+                    DbOutcome::Failure
+                };
+                (outcome, sqlite)
+            }
+            Err(_) => (DbOutcome::Failure, None),
+        };
+        observability::record_transaction(
+            span,
+            operation,
+            outcome,
+            *accounting,
+            started.elapsed(),
+            sqlite,
+        );
+        result
     }
 
     pub async fn release_authoritative_turn_dispatch_failure(
@@ -2373,6 +2666,64 @@ fn map_constraint(error: sqlx::Error) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_turn_lease_window_refreshes_caps_and_rejects_exact_expiry() {
+        let window =
+            DirectTurnLeaseWindow::renewable(Timestamp(10), std::time::Duration::from_secs(30))
+                .expect("live window");
+        assert_eq!(
+            window.at_elapsed(std::time::Duration::from_secs(7)),
+            Some(DirectTurnAttemptLease {
+                now: Timestamp(17),
+                lease_until: LeaseExpiry(47),
+                commit_clock: super::super::LeaseCommitClock::Projected {
+                    current: Timestamp(10),
+                },
+            })
+        );
+
+        let capped = DirectTurnLeaseWindow::renewable(
+            Timestamp(u64::MAX - 10),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("window capped at timestamp maximum remains live");
+        assert_eq!(
+            capped.at_elapsed(std::time::Duration::from_secs(5)),
+            Some(DirectTurnAttemptLease {
+                now: Timestamp(u64::MAX - 5),
+                lease_until: LeaseExpiry(u64::MAX),
+                commit_clock: super::super::LeaseCommitClock::Projected {
+                    current: Timestamp(u64::MAX - 10),
+                },
+            })
+        );
+        assert_eq!(
+            capped.at_elapsed(std::time::Duration::from_secs(10)),
+            None,
+            "a lease is expired when now equals lease_until"
+        );
+        assert!(
+            DirectTurnLeaseWindow::renewable(Timestamp(10), std::time::Duration::ZERO).is_none()
+        );
+    }
+
+    #[test]
+    fn direct_turn_hard_deadline_does_not_slide_across_retries() {
+        let window = DirectTurnLeaseWindow::hard_deadline(Timestamp(10), LeaseExpiry(40))
+            .expect("live hard deadline");
+        assert_eq!(
+            window.at_elapsed(std::time::Duration::from_secs(5)),
+            Some(DirectTurnAttemptLease {
+                now: Timestamp(15),
+                lease_until: LeaseExpiry(40),
+                commit_clock: super::super::LeaseCommitClock::Projected {
+                    current: Timestamp(10),
+                },
+            })
+        );
+        assert_eq!(window.at_elapsed(std::time::Duration::from_secs(30)), None);
+    }
+
     use super::*;
     use crate::migrations::run_pending_migrations;
     use crate::workflow::wake::{WakeRegistrationOutcome, WakeRepository};
@@ -2510,6 +2861,121 @@ mod tests {
         };
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
         (turn_id, workflow_id)
+    }
+
+    #[tokio::test]
+    async fn expired_precommit_direct_turn_rolls_back_started_attempt() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "expired-precommit", 91).await;
+        let lease_window = DirectTurnLeaseWindow::with_limit_and_commit_clock(
+            Timestamp(10),
+            DirectTurnLeaseLimit::Renewable(std::time::Duration::from_secs(30)),
+            super::super::LeaseCommitClock::Projected {
+                current: Timestamp(40),
+            },
+        )
+        .unwrap();
+
+        let result = repo
+            .claim_authoritative_turn_with_lease_window(
+                turn_id,
+                workflow_id,
+                ProcessIncarnation(1),
+                lease_window,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ClaimOutcome::Ineligible);
+        assert!(result.authority.is_none());
+        assert!(result.attempt.is_none());
+        let durable_attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_attempts WHERE workflow_id = ?1")
+                .bind(i64::try_from(workflow_id.0).unwrap())
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(durable_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn repository_retry_persists_explicit_hard_deadline_without_sliding() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "explicit-hard-deadline", 92).await;
+        let lease_window = DirectTurnLeaseWindow::hard_deadline(Timestamp(10), LeaseExpiry(40))
+            .expect("live hard deadline");
+        let attempt_lease = lease_window
+            .at_elapsed(std::time::Duration::from_secs(5))
+            .expect("retry before deadline");
+        let operation = DbOperation::ClaimDirectTurn;
+        let operation_span = observability::operation_span(operation);
+        let operation_started = std::time::Instant::now();
+        let mut accounting = RetryAccounting::default();
+        let attempt = accounting.start_attempt();
+        let result = repo
+            .claim_authoritative_turn_once(
+                ClaimIdentity {
+                    turn_id,
+                    workflow_id,
+                    process_incarnation: ProcessIncarnation(1),
+                },
+                ClaimAttemptTiming {
+                    lease: attempt_lease,
+                    operation_started,
+                },
+                ClaimAttemptObservability {
+                    operation,
+                    attempt,
+                    operation_span: &operation_span,
+                    max_attempts: 5,
+                },
+                &mut accounting,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ClaimOutcome::Started);
+        assert_eq!(
+            result
+                .attempt
+                .and_then(|attempt| attempt.lease)
+                .map(|lease| lease.lease_until),
+            Some(LeaseExpiry(40))
+        );
+        let stored_lease: i64 = sqlx::query_scalar(
+            "SELECT lease_until FROM workflow_reclaimable_leases WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_lease, 40);
+    }
+
+    #[tokio::test]
+    async fn compatibility_claim_at_hard_deadline_creates_no_attempt() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "hard-deadline", 92).await;
+        let result = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(40),
+                lease_until: LeaseExpiry(40),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ClaimOutcome::Ineligible);
+        assert!(result.attempt.is_none());
+        let durable_attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_attempts WHERE workflow_id = ?1")
+                .bind(i64::try_from(workflow_id.0).unwrap())
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(durable_attempts, 0);
     }
 
     async fn workflow_status_version_generation_transition_count(

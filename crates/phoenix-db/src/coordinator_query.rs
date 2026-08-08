@@ -402,7 +402,7 @@ fn sqlite_diagnostic(
 }
 
 #[allow(clippy::too_many_lines)]
-fn sqlite_symbolic_code(code: c_int) -> &'static str {
+pub(crate) fn sqlite_symbolic_code(code: c_int) -> &'static str {
     match code {
         ffi::SQLITE_ERROR_MISSING_COLLSEQ => "SQLITE_ERROR_MISSING_COLLSEQ",
         ffi::SQLITE_ERROR_RETRY => "SQLITE_ERROR_RETRY",

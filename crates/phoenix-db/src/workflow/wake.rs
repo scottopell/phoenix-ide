@@ -8,6 +8,7 @@ use super::{
     LocalReceiptRecord, RecordObservationInput, RenewLeaseInput, WorkflowRepository,
     WorkflowSequenceName, WorkflowTx,
 };
+use crate::observability::{self, DbOperation, DbOutcome, RetryAccounting};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
@@ -25,12 +26,14 @@ use phoenix_workflow::{
     RuntimeAcceptanceStatus, Timestamp, TransitionId, Version, WorkflowId, WorkflowStatus,
 };
 use serde::Serialize;
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 #[cfg(test)]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex, OnceLock,
 };
+use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 #[cfg(test)]
 type FailpointKey = (u64, u64);
@@ -197,12 +200,82 @@ pub enum WakeObservationOutcome {
     Ineligible,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WakeObservationLease {
-    pub workflow_id: WorkflowId,
-    pub process_incarnation: ProcessIncarnation,
-    pub now: Timestamp,
-    pub lease_until: phoenix_workflow::LeaseExpiry,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeObservationLeaseWindow {
+    initial_now: Timestamp,
+    lease_duration: Duration,
+    latest_lease_until: phoenix_workflow::LeaseExpiry,
+    commit_clock: super::LeaseCommitClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WakeObservationAttemptLease {
+    now: Timestamp,
+    lease_until: phoenix_workflow::LeaseExpiry,
+    commit_clock: super::LeaseCommitClock,
+}
+
+impl WakeObservationLeaseWindow {
+    #[must_use]
+    pub fn new(
+        initial_now: Timestamp,
+        lease_duration: Duration,
+        latest_lease_until: phoenix_workflow::LeaseExpiry,
+    ) -> Option<Self> {
+        Self::with_commit_clock(
+            initial_now,
+            lease_duration,
+            latest_lease_until,
+            super::LeaseCommitClock::Projected {
+                current: initial_now,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn database_timed(
+        initial_now: Timestamp,
+        lease_duration: Duration,
+        latest_lease_until: phoenix_workflow::LeaseExpiry,
+    ) -> Option<Self> {
+        Self::with_commit_clock(
+            initial_now,
+            lease_duration,
+            latest_lease_until,
+            super::LeaseCommitClock::SqliteWallClock,
+        )
+    }
+
+    fn with_commit_clock(
+        initial_now: Timestamp,
+        lease_duration: Duration,
+        latest_lease_until: phoenix_workflow::LeaseExpiry,
+        commit_clock: super::LeaseCommitClock,
+    ) -> Option<Self> {
+        let window = Self {
+            initial_now,
+            lease_duration,
+            latest_lease_until,
+            commit_clock,
+        };
+        window.at_elapsed(Duration::ZERO).map(|_| window)
+    }
+
+    fn at_elapsed(self, elapsed: Duration) -> Option<WakeObservationAttemptLease> {
+        let now = Timestamp(self.initial_now.0.saturating_add(elapsed.as_secs()));
+        let lease_until = phoenix_workflow::LeaseExpiry(
+            now.0
+                .saturating_add(self.lease_duration.as_secs())
+                .min(self.latest_lease_until.0),
+        );
+        lease_until
+            .is_live_at(now)
+            .then_some(WakeObservationAttemptLease {
+                now,
+                lease_until,
+                commit_clock: self.commit_clock,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,36 +802,117 @@ impl WakeRepository {
         now: Timestamp,
         lease_until: phoenix_workflow::LeaseExpiry,
     ) -> DbResult<WakeObservationOutcome> {
-        for _ in 0..20 {
-            match self
+        let Some(lease_window) = WakeObservationLeaseWindow::new(
+            now,
+            Duration::from_secs(lease_until.0.saturating_sub(now.0)),
+            lease_until,
+        ) else {
+            return Ok(WakeObservationOutcome::Ineligible);
+        };
+        self.claim_observation_with_lease_window(workflow_id, process_incarnation, lease_window)
+            .await
+    }
+
+    pub async fn claim_observation_with_lease_window(
+        &self,
+        workflow_id: WorkflowId,
+        process_incarnation: ProcessIncarnation,
+        lease_window: WakeObservationLeaseWindow,
+    ) -> DbResult<WakeObservationOutcome> {
+        const MAX_ATTEMPTS: u32 = 21;
+        let operation = DbOperation::ClaimWakeObservation;
+        let operation_span = observability::operation_span(operation);
+        let operation_started = Instant::now();
+        let mut accounting = RetryAccounting::default();
+        loop {
+            let Some(attempt_lease) = lease_window.at_elapsed(operation_started.elapsed()) else {
+                observability::record_operation(
+                    &operation_span,
+                    DbOutcome::Ineligible,
+                    accounting,
+                    operation_started.elapsed(),
+                );
+                return Ok(WakeObservationOutcome::Ineligible);
+            };
+            let attempt = accounting.start_attempt();
+            let result = self
                 .claim_observation_if_eligible_once(
                     workflow_id,
                     process_incarnation,
-                    now,
-                    lease_until,
+                    attempt_lease,
+                    operation_started,
+                    operation,
+                    attempt,
+                    &operation_span,
+                    MAX_ATTEMPTS,
+                    &mut accounting,
                 )
-                .await
-            {
+                .await;
+            match result {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
+                    if super::is_sqlite_busy_retryable(error.as_ref())
+                        && attempt < MAX_ATTEMPTS =>
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
-                result => return result,
+                result => {
+                    let outcome = match &result {
+                        Ok(WakeObservationOutcome::Started { canonical }) => {
+                            DbOutcome::from(canonical.outcome)
+                        }
+                        Ok(WakeObservationOutcome::Busy { .. }) => DbOutcome::AuthorityConflict,
+                        Ok(WakeObservationOutcome::Ineligible) => DbOutcome::Ineligible,
+                        Err(DbError::Sqlx(error))
+                            if error
+                                .as_database_error()
+                                .is_some_and(super::is_sqlite_busy_retryable) =>
+                        {
+                            DbOutcome::RetryExhausted
+                        }
+                        Err(_) => DbOutcome::Failure,
+                    };
+                    observability::record_operation(
+                        &operation_span,
+                        outcome,
+                        accounting,
+                        operation_started.elapsed(),
+                    );
+                    return result;
+                }
             }
         }
-        self.claim_observation_if_eligible_once(workflow_id, process_incarnation, now, lease_until)
-            .await
     }
 
     async fn claim_observation_if_eligible_once(
         &self,
         workflow_id: WorkflowId,
         process_incarnation: ProcessIncarnation,
-        now: Timestamp,
-        lease_until: phoenix_workflow::LeaseExpiry,
+        attempt_lease: WakeObservationAttemptLease,
+        operation_started: Instant,
+        operation: DbOperation,
+        attempt: u32,
+        operation_span: &tracing::Span,
+        max_attempts: u32,
+        accounting: &mut RetryAccounting,
     ) -> DbResult<WakeObservationOutcome> {
-        let mut tx = self.workflow_repo.begin_tx().await?;
+        let WakeObservationAttemptLease {
+            now,
+            lease_until,
+            commit_clock,
+        } = attempt_lease;
+        let mut connection = self
+            .workflow_repo
+            .acquire_observed(operation, attempt, max_attempts, accounting, operation_span)
+            .await?;
+        let span = observability::transaction_span(
+            operation,
+            super::DbBeginMode::Deferred,
+            attempt,
+            operation_span,
+        );
+        let started = std::time::Instant::now();
+        let result: DbResult<WakeObservationOutcome> = async {
+            let mut tx = WorkflowTx::new(connection.begin().await?);
         let effect = sqlx::query(
             "SELECT status FROM workflow_effects WHERE workflow_id = ?1 AND effect_id = ?2",
         )
@@ -843,11 +997,20 @@ impl WakeRepository {
             .await?;
         match result.outcome {
             ClaimOutcome::Started => {
+                if !super::lease_is_live_immediately_before_commit(
+                    &mut tx.tx,
+                    lease_until,
+                    commit_clock.at_elapsed(operation_started.elapsed()),
+                )
+                .await?
+                {
+                    tx.rollback().await?;
+                    return Ok(WakeObservationOutcome::Ineligible);
+                }
                 tx.commit().await?;
                 Ok(WakeObservationOutcome::Started { canonical: result })
             }
             ClaimOutcome::AuthorityConflict => {
-                tx.rollback().await?;
                 let lease = sqlx::query_scalar::<_, i64>(
                     "SELECT l.lease_until
                      FROM workflow_attempts a
@@ -861,8 +1024,9 @@ impl WakeRepository {
                 )
                 .bind(to_i64(workflow_id.0, "workflow_id")?)
                 .bind(to_i64(REGISTRATION_EFFECT_ID.0, "effect_id")?)
-                .fetch_optional(&self.workflow_repo.pool)
+                .fetch_optional(&mut *tx.tx)
                 .await?;
+                tx.rollback().await?;
                 Ok(match lease {
                     Some(lease_until) => WakeObservationOutcome::Busy {
                         lease_until: phoenix_workflow::LeaseExpiry(to_u64(
@@ -878,6 +1042,43 @@ impl WakeRepository {
                 Ok(WakeObservationOutcome::Ineligible)
             }
         }
+        }
+        .instrument(span.clone())
+        .await;
+        let (outcome, sqlite) = match &result {
+            Ok(WakeObservationOutcome::Started { canonical }) => {
+                (DbOutcome::from(canonical.outcome), None)
+            }
+            Ok(WakeObservationOutcome::Busy { .. }) => (DbOutcome::AuthorityConflict, None),
+            Ok(WakeObservationOutcome::Ineligible) => (DbOutcome::Ineligible, None),
+            Err(DbError::Sqlx(error)) => {
+                let sqlite = observability::sqlite_class(error);
+                let outcome = if error
+                    .as_database_error()
+                    .is_some_and(super::is_sqlite_busy_retryable)
+                {
+                    if attempt < max_attempts {
+                        accounting.record_retry();
+                        DbOutcome::ContentionRetry
+                    } else {
+                        DbOutcome::RetryExhausted
+                    }
+                } else {
+                    DbOutcome::Failure
+                };
+                (outcome, sqlite)
+            }
+            Err(_) => (DbOutcome::Failure, None),
+        };
+        observability::record_transaction(
+            span,
+            operation,
+            outcome,
+            *accounting,
+            started.elapsed(),
+            sqlite,
+        );
+        result
     }
 
     pub async fn renew_observation_lease(
@@ -4645,6 +4846,61 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
 
+    #[test]
+    fn observation_lease_window_refreshes_each_attempt_and_caps_at_deadline() {
+        let window = WakeObservationLeaseWindow::new(
+            Timestamp(10),
+            Duration::from_secs(30),
+            phoenix_workflow::LeaseExpiry(100),
+        )
+        .expect("live window");
+
+        assert_eq!(
+            window.at_elapsed(Duration::from_secs(7)),
+            Some(WakeObservationAttemptLease {
+                now: Timestamp(17),
+                lease_until: phoenix_workflow::LeaseExpiry(47),
+                commit_clock: super::super::LeaseCommitClock::Projected {
+                    current: Timestamp(10),
+                },
+            })
+        );
+        assert_eq!(
+            window.at_elapsed(Duration::from_secs(75)),
+            Some(WakeObservationAttemptLease {
+                now: Timestamp(85),
+                lease_until: phoenix_workflow::LeaseExpiry(100),
+                commit_clock: super::super::LeaseCommitClock::Projected {
+                    current: Timestamp(10),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn observation_lease_window_cannot_produce_expired_success_input() {
+        assert!(WakeObservationLeaseWindow::new(
+            Timestamp(10),
+            Duration::ZERO,
+            phoenix_workflow::LeaseExpiry(100),
+        )
+        .is_none());
+        assert!(WakeObservationLeaseWindow::new(
+            Timestamp(10),
+            Duration::from_secs(30),
+            phoenix_workflow::LeaseExpiry(10),
+        )
+        .is_none());
+
+        let window = WakeObservationLeaseWindow::new(
+            Timestamp(10),
+            Duration::from_secs(30),
+            phoenix_workflow::LeaseExpiry(40),
+        )
+        .expect("initially live");
+        assert_eq!(window.at_elapsed(Duration::from_secs(30)), None);
+    }
+
     async fn setup_repo_schema(pool: &sqlx::SqlitePool) {
         sqlx::raw_sql(crate::ddl::SCHEMA)
             .execute(pool)
@@ -4793,6 +5049,31 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compatibility_claim_uses_the_callers_timestamp_domain() {
+        let (_dir, repo, _other) = open_repo_pair().await;
+        let workflow_id = WorkflowId(1);
+        let input = intent();
+        assert!(matches!(
+            repo.register_allocated(workflow_id, &input, "fp-1", Timestamp(10))
+                .await
+                .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+
+        assert!(matches!(
+            repo.claim_observation_if_eligible(
+                workflow_id,
+                ProcessIncarnation(1),
+                Timestamp(20),
+                phoenix_workflow::LeaseExpiry(30),
+            )
+            .await
+            .unwrap(),
+            WakeObservationOutcome::Started { .. }
+        ));
     }
 
     fn unwrap_started(outcome: super::WakeObservationOutcome) -> super::BeginAttemptResult {
@@ -8368,6 +8649,63 @@ mod tests {
         assert_eq!(link_owner, "conv-2");
         assert_eq!(message_owner, "conv-2");
         assert_eq!(locator_owner, "conv-2");
+    }
+
+    #[tokio::test]
+    async fn expired_precommit_observation_rolls_back_started_attempt_and_lease() {
+        let (_dir, repo, restarted) = open_repo_pair().await;
+        let workflow_id = next_test_workflow_id(&repo).await.unwrap();
+        assert!(matches!(
+            repo.register_allocated(
+                workflow_id,
+                &intent(),
+                "fp-expired-precommit",
+                Timestamp(10)
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let lease_window = WakeObservationLeaseWindow::with_commit_clock(
+            Timestamp(20),
+            Duration::from_secs(10),
+            phoenix_workflow::LeaseExpiry(30),
+            super::super::LeaseCommitClock::Projected {
+                current: Timestamp(30),
+            },
+        )
+        .expect("initially live lease window");
+
+        let outcome = repo
+            .claim_observation_with_lease_window(workflow_id, ProcessIncarnation(1), lease_window)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, WakeObservationOutcome::Ineligible);
+        let durable_attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_attempts WHERE workflow_id = ?1")
+                .bind(i64::try_from(workflow_id.0).unwrap())
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        let durable_leases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_reclaimable_leases WHERE workflow_id = ?1",
+        )
+        .bind(i64::try_from(workflow_id.0).unwrap())
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(durable_attempts, 0);
+        assert_eq!(durable_leases, 0);
+        assert_eq!(
+            restarted
+                .fetch_binding(workflow_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow_id,
+            workflow_id
+        );
     }
 
     #[tokio::test]

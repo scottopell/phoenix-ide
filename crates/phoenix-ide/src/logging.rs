@@ -161,6 +161,9 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "conversation.turn"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
+    ("phoenix_db::otel", "db.operation"),
+    ("phoenix_db::otel", "db.pool.acquire"),
+    ("phoenix_db::otel", "db.transaction"),
 ];
 
 fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
@@ -351,9 +354,11 @@ fn invalid_input<T>(message: impl Into<String>) -> std::io::Result<T> {
 
 /// Create a fresh `EnvFilter` from the environment. Used per-sink because
 /// `EnvFilter` does not implement Clone.
+const DEFAULT_ENV_FILTER: &str =
+    "phoenix_ide=debug,phoenix_db::observability=info,tower_http=debug";
+
 fn make_env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into())
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_ENV_FILTER.into())
 }
 
 /// Whether the stdout sink is enabled. Defaults on (unset); only explicit
@@ -407,6 +412,42 @@ mod tests {
 
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn default_filter_enables_only_the_db_observability_target() {
+        use tracing_subscriber::{layer::Context, prelude::*, Layer};
+
+        #[derive(Clone, Default)]
+        struct SeenEvents(std::sync::Arc<Mutex<Vec<(&'static str, tracing::Level)>>>);
+
+        impl<S> Layer<S> for SeenEvents
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let metadata = event.metadata();
+                self.0
+                    .lock()
+                    .expect("event capture lock")
+                    .push((metadata.target(), *metadata.level()));
+            }
+        }
+
+        let seen = SeenEvents::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(seen.clone().with_filter(EnvFilter::new(DEFAULT_ENV_FILTER)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "phoenix_db::observability", "expected");
+            tracing::debug!(target: "phoenix_db::observability", "too verbose");
+            tracing::info!(target: "phoenix_db", "unrelated info");
+            tracing::debug!(target: "phoenix_db", "unrelated debug");
+        });
+
+        assert_eq!(
+            *seen.0.lock().expect("event capture lock"),
+            [("phoenix_db::observability", tracing::Level::INFO)]
+        );
+    }
+
     #[allow(clippy::too_many_lines)]
     #[test]
     fn otel_filter_is_a_spans_only_allowlist() {
@@ -452,6 +493,63 @@ mod tests {
             drop(stream_init);
             drop(runtime_materialize);
             drop(browser_open);
+            let db_operation = tracing::info_span!(
+                target: "phoenix_db::otel",
+                "db.operation",
+                db.operation = "workflow.begin_attempt",
+                db.outcome = tracing::field::Empty,
+                db.attempt_count = tracing::field::Empty,
+                db.retry_count = tracing::field::Empty,
+                db.elapsed_ms = tracing::field::Empty,
+            );
+            let db_acquire = tracing::info_span!(
+                target: "phoenix_db::otel",
+                parent: &db_operation,
+                "db.pool.acquire",
+                db.operation = "workflow.begin_attempt",
+                db.attempt = 1_u64,
+                db.outcome = tracing::field::Empty,
+            );
+            db_acquire.record("db.outcome", "success");
+            drop(db_acquire);
+            let db_transaction = tracing::info_span!(
+                target: "phoenix_db::otel",
+                parent: &db_operation,
+                "db.transaction",
+                db.operation = "workflow.begin_attempt",
+                db.begin_mode = "deferred",
+                db.attempt = 1_u64,
+                db.outcome = tracing::field::Empty,
+                db.retry_count = tracing::field::Empty,
+            );
+            db_transaction.record("db.outcome", "contention_retry");
+            db_transaction.record("db.retry_count", 1_i64);
+            drop(db_transaction);
+            let db_acquire_retry = tracing::info_span!(
+                target: "phoenix_db::otel",
+                parent: &db_operation,
+                "db.pool.acquire",
+                db.operation = "workflow.begin_attempt",
+                db.attempt = 2_u64,
+                db.outcome = "success",
+            );
+            drop(db_acquire_retry);
+            let db_transaction_retry = tracing::info_span!(
+                target: "phoenix_db::otel",
+                parent: &db_operation,
+                "db.transaction",
+                db.operation = "workflow.begin_attempt",
+                db.begin_mode = "deferred",
+                db.attempt = 2_u64,
+                db.outcome = "success",
+                db.retry_count = 1_i64,
+            );
+            drop(db_transaction_retry);
+            db_operation.record("db.outcome", "success");
+            db_operation.record("db.attempt_count", 2_i64);
+            db_operation.record("db.retry_count", 1_i64);
+            db_operation.record("db.elapsed_ms", 12_i64);
+            drop(db_operation);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
                 "llm.request",
@@ -500,7 +598,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 6);
+        assert_eq!(spans.len(), 11);
         assert_eq!(
             spans
                 .iter()
@@ -512,10 +610,89 @@ mod tests {
                 "conversation.stream.init",
                 "conversation.runtime.materialize",
                 "browser.conversation_open",
+                "db.pool.acquire",
+                "db.transaction",
+                "db.pool.acquire",
+                "db.transaction",
+                "db.operation",
                 "llm.request"
             ]
         );
         assert!(spans.iter().all(|span| span.events.is_empty()));
+        let db_span = spans
+            .iter()
+            .find(|span| span.name == "db.transaction")
+            .expect("DB transaction span exported");
+        let db_attributes = format!("{:?}", db_span.attributes);
+        for required in ["workflow.begin_attempt", "deferred", "contention_retry"] {
+            assert!(
+                db_attributes.contains(required),
+                "missing DB attribute {required}"
+            );
+        }
+        let retries = db_span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.retry_count")
+            .expect("numeric retry count exported");
+        assert!(matches!(retries.value, opentelemetry::Value::I64(1)));
+        let db_acquire_span = spans
+            .iter()
+            .find(|span| span.name == "db.pool.acquire")
+            .expect("DB pool acquisition span exported");
+        let db_operation_span = spans
+            .iter()
+            .find(|span| span.name == "db.operation")
+            .expect("DB operation span exported");
+        let operation_attributes = format!("{:?}", db_operation_span.attributes);
+        for required in [
+            "success",
+            "db.attempt_count",
+            "db.retry_count",
+            "db.elapsed_ms",
+        ] {
+            assert!(
+                operation_attributes.contains(required),
+                "missing aggregate DB operation attribute {required}"
+            );
+        }
+        let phase_spans = spans
+            .iter()
+            .filter(|span| span.name == "db.pool.acquire" || span.name == "db.transaction");
+        for phase in phase_spans {
+            assert_eq!(
+                phase.parent_span_id,
+                db_operation_span.span_context.span_id()
+            );
+            assert!(
+                phase
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.key.as_str() == "db.attempt"),
+                "attempt belongs on each child phase span"
+            );
+        }
+        assert_eq!(
+            db_acquire_span.span_context.trace_id(),
+            db_operation_span.span_context.trace_id()
+        );
+        assert_eq!(
+            db_span.span_context.trace_id(),
+            db_operation_span.span_context.trace_id()
+        );
+        assert_eq!(
+            db_acquire_span.parent_span_id,
+            db_operation_span.span_context.span_id()
+        );
+        assert_eq!(
+            db_span.parent_span_id,
+            db_operation_span.span_context.span_id()
+        );
+        assert_ne!(
+            db_span.parent_span_id,
+            db_acquire_span.span_context.span_id(),
+            "transaction must not be nested under pool acquisition"
+        );
         let llm_span = spans
             .iter()
             .find(|span| span.name == "llm.request")

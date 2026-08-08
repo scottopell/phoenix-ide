@@ -5,6 +5,7 @@
 mod coordinator_query;
 mod ddl;
 mod migrations;
+mod observability;
 pub mod retrieval;
 pub mod workflow;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,

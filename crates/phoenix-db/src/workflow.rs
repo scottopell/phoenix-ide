@@ -4,6 +4,9 @@
     clippy::too_many_lines
 )]
 
+use crate::observability::{
+    self, DbBeginMode, DbOperation, DbOutcome, RetryAccounting, SqliteErrorClass,
+};
 use crate::{DbError, DbResult};
 use phoenix_workflow::{
     AttemptId, AttemptStatus, AuthorityOutcome, BarrierId, BarrierStatus, ClaimOutcome, CodecRef,
@@ -16,8 +19,10 @@ use phoenix_workflow::{
     SupportedCodecRegistry, SuppressionReason, Timestamp, TransitionId, Version, WorkflowBinding,
     WorkflowId, WorkflowStatus,
 };
-use sqlx::{error::DatabaseError, Row, SqlitePool};
+use sqlx::{error::DatabaseError, Acquire, Row, SqlitePool};
 use std::collections::BTreeSet;
+use std::time::Instant;
+use tracing::Instrument;
 
 pub mod direct_turn;
 pub mod wake;
@@ -424,6 +429,42 @@ impl WorkflowRepository {
         Ok(WorkflowTx::new(self.pool.begin().await?))
     }
 
+    pub(crate) async fn acquire_observed(
+        &self,
+        operation: DbOperation,
+        attempt: u32,
+        max_attempts: u32,
+        accounting: &mut RetryAccounting,
+        parent: &tracing::Span,
+    ) -> DbResult<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
+        let acquire_span = observability::acquisition_span(operation, attempt, parent);
+        let acquire_started = Instant::now();
+        let connection = self.pool.acquire().instrument(acquire_span.clone()).await;
+        let (outcome, sqlite) = match &connection {
+            Ok(_) => (DbOutcome::Success, None),
+            Err(error) => {
+                let sqlite = observability::sqlite_class(error);
+                let outcome = match retry_decision_for_sqlite_error(error, attempt, max_attempts) {
+                    RetryDecision::Retry => {
+                        accounting.record_retry();
+                        DbOutcome::ContentionRetry
+                    }
+                    RetryDecision::Exhausted => DbOutcome::RetryExhausted,
+                    RetryDecision::Fail => DbOutcome::Failure,
+                };
+                (outcome, sqlite)
+            }
+        };
+        observability::record_acquisition(
+            acquire_span,
+            operation,
+            acquire_started.elapsed(),
+            outcome,
+            sqlite,
+        );
+        connection.map_err(Into::into)
+    }
+
     pub(crate) async fn begin_immediate_tx(&self) -> DbResult<WorkflowTx<'_>> {
         Ok(WorkflowTx::new(
             self.pool.begin_with("BEGIN IMMEDIATE").await?,
@@ -452,6 +493,46 @@ fn external_binding_from_input(
 }
 
 type SqliteTx<'a> = Transaction<'a, Sqlite>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseCommitClock {
+    SqliteWallClock,
+    Projected { current: Timestamp },
+}
+
+impl LeaseCommitClock {
+    fn at_elapsed(self, elapsed: std::time::Duration) -> Self {
+        match self {
+            Self::SqliteWallClock => Self::SqliteWallClock,
+            Self::Projected { current } => Self::Projected {
+                current: Timestamp(current.0.saturating_add(elapsed.as_secs())),
+            },
+        }
+    }
+}
+
+pub(crate) async fn lease_is_live_immediately_before_commit(
+    tx: &mut SqliteTx<'_>,
+    lease_until: LeaseExpiry,
+    clock: LeaseCommitClock,
+) -> DbResult<bool> {
+    let lease_until = to_i64(lease_until.0, "lease_until")?;
+    match clock {
+        LeaseCommitClock::SqliteWallClock => Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT ?1 > unixepoch('now')",
+        )
+        .bind(lease_until)
+        .fetch_one(&mut **tx)
+        .await?),
+        LeaseCommitClock::Projected { current } => {
+            Ok(sqlx::query_scalar::<_, bool>("SELECT ?1 > ?2")
+                .bind(lease_until)
+                .bind(to_i64(current.0, "commit_now")?)
+                .fetch_one(&mut **tx)
+                .await?)
+        }
+    }
+}
 
 pub(crate) struct WorkflowTx<'a> {
     pub(crate) tx: SqliteTx<'a>,
@@ -801,9 +882,8 @@ impl<'a> WorkflowTx<'a> {
         match insert_attempt {
             Ok(_) => {}
             Err(sqlx::Error::Database(error))
-                if is_sqlite_busy_retryable(error.as_ref())
-                    || is_sqlite_unique_constraint(error.as_ref())
-                    || is_sqlite_primary_key_constraint(error.as_ref()) =>
+                if classify_attempt_insert_error_code(error.code().as_deref())
+                    == AttemptInsertErrorClass::AuthorityConflict =>
             {
                 return Ok(BeginAttemptResult {
                     outcome: ClaimOutcome::AuthorityConflict,
@@ -1238,22 +1318,71 @@ async fn insert_external_acceptance_binding_tx(
 const SQLITE_CONSTRAINT_UNIQUE: &str = "2067";
 const SQLITE_CONSTRAINT_PRIMARYKEY: &str = "1555";
 const SQLITE_BUSY: &str = "5";
+const SQLITE_BUSY_SNAPSHOT: &str = "517";
 const DIRECT_TURN_PROFILE_KIND: &str = "direct_turn";
 
-fn sqlite_error_code_is(error: &dyn DatabaseError, expected: &str) -> bool {
-    error.code().as_deref() == Some(expected)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptInsertErrorClass {
+    AuthorityConflict,
+    Contention,
+    Other,
+}
+
+fn classify_attempt_insert_error_code(code: Option<&str>) -> AttemptInsertErrorClass {
+    match code {
+        Some(SQLITE_CONSTRAINT_UNIQUE | SQLITE_CONSTRAINT_PRIMARYKEY) => {
+            AttemptInsertErrorClass::AuthorityConflict
+        }
+        Some(SQLITE_BUSY | SQLITE_BUSY_SNAPSHOT) => AttemptInsertErrorClass::Contention,
+        _ => AttemptInsertErrorClass::Other,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    Retry,
+    Exhausted,
+    Fail,
+}
+
+fn retry_decision_for_sqlite_code(
+    code: Option<&str>,
+    attempt: u32,
+    max_attempts: u32,
+) -> RetryDecision {
+    match (code, attempt < max_attempts) {
+        (Some(SQLITE_BUSY | SQLITE_BUSY_SNAPSHOT), true) => RetryDecision::Retry,
+        (Some(SQLITE_BUSY | SQLITE_BUSY_SNAPSHOT), false) => RetryDecision::Exhausted,
+        _ => RetryDecision::Fail,
+    }
+}
+
+fn retry_decision_for_sqlite_error(
+    error: &sqlx::Error,
+    attempt: u32,
+    max_attempts: u32,
+) -> RetryDecision {
+    retry_decision_for_sqlite_code(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        attempt,
+        max_attempts,
+    )
 }
 
 fn is_sqlite_unique_constraint(error: &dyn DatabaseError) -> bool {
-    sqlite_error_code_is(error, SQLITE_CONSTRAINT_UNIQUE)
+    error.code().as_deref() == Some(SQLITE_CONSTRAINT_UNIQUE)
 }
 
 fn is_sqlite_primary_key_constraint(error: &dyn DatabaseError) -> bool {
-    sqlite_error_code_is(error, SQLITE_CONSTRAINT_PRIMARYKEY)
+    error.code().as_deref() == Some(SQLITE_CONSTRAINT_PRIMARYKEY)
 }
 
 fn is_sqlite_busy_retryable(error: &dyn DatabaseError) -> bool {
-    sqlite_error_code_is(error, SQLITE_BUSY) || error.code().as_deref() == Some("517")
+    classify_attempt_insert_error_code(error.code().as_deref())
+        == AttemptInsertErrorClass::Contention
 }
 
 async fn workflow_profile_kind(
@@ -1606,32 +1735,147 @@ impl WorkflowRepository {
     }
 
     pub async fn begin_attempt(&self, input: &BeginAttemptInput) -> DbResult<BeginAttemptResult> {
-        for _ in 0..5 {
-            match self.begin_attempt_once(input).await {
+        const MAX_ATTEMPTS: u32 = 5;
+        let operation = DbOperation::BeginWorkflowAttempt;
+        let operation_span = observability::operation_span(operation);
+        let operation_started = Instant::now();
+        let mut accounting = RetryAccounting::default();
+
+        loop {
+            let attempt = accounting.start_attempt();
+            let mut connection = match self
+                .acquire_observed(
+                    operation,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    &mut accounting,
+                    &operation_span,
+                )
+                .await
+            {
+                Ok(connection) => connection,
+                Err(DbError::Sqlx(error))
+                    if retry_decision_for_sqlite_error(&error, attempt, MAX_ATTEMPTS)
+                        == RetryDecision::Retry =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    continue;
+                }
+                Err(error) => {
+                    let outcome = if matches!(
+                        &error,
+                        DbError::Sqlx(error)
+                            if retry_decision_for_sqlite_error(error, attempt, MAX_ATTEMPTS)
+                                == RetryDecision::Exhausted
+                    ) {
+                        DbOutcome::RetryExhausted
+                    } else {
+                        DbOutcome::Failure
+                    };
+                    observability::record_operation(
+                        &operation_span,
+                        outcome,
+                        accounting,
+                        operation_started.elapsed(),
+                    );
+                    return Err(error);
+                }
+            };
+            let span = observability::transaction_span(
+                operation,
+                DbBeginMode::Deferred,
+                attempt,
+                &operation_span,
+            );
+            let started = Instant::now();
+            let result = async {
+                let mut tx = WorkflowTx::new(connection.begin().await?);
+                let result = tx.begin_attempt(input).await?;
+                if result.outcome == ClaimOutcome::Started {
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                }
+                Ok(result)
+            }
+            .instrument(span.clone())
+            .await;
+
+            match result {
                 Err(DbError::Sqlx(sqlx::Error::Database(error)))
                     if is_sqlite_busy_retryable(error.as_ref()) =>
                 {
-                    std::thread::yield_now();
+                    let sqlite = SqliteErrorClass::from_database_error(error.as_ref());
+                    if attempt == MAX_ATTEMPTS {
+                        observability::record_transaction(
+                            span,
+                            operation,
+                            DbOutcome::RetryExhausted,
+                            accounting,
+                            started.elapsed(),
+                            sqlite,
+                        );
+                        observability::record_operation(
+                            &operation_span,
+                            DbOutcome::RetryExhausted,
+                            accounting,
+                            operation_started.elapsed(),
+                        );
+                        return Err(DbError::Sqlx(sqlx::Error::Database(error)));
+                    }
+                    accounting.record_retry();
+                    observability::record_transaction(
+                        span,
+                        operation,
+                        DbOutcome::ContentionRetry,
+                        accounting,
+                        started.elapsed(),
+                        sqlite,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
-                result => return result,
+                Ok(result) => {
+                    let outcome = DbOutcome::from(result.outcome);
+                    observability::record_transaction(
+                        span,
+                        operation,
+                        outcome,
+                        accounting,
+                        started.elapsed(),
+                        None,
+                    );
+                    observability::record_operation(
+                        &operation_span,
+                        outcome,
+                        accounting,
+                        operation_started.elapsed(),
+                    );
+                    return Ok(result);
+                }
+                Err(error) => {
+                    let sqlite = if let DbError::Sqlx(error) = &error {
+                        observability::sqlite_class(error)
+                    } else {
+                        None
+                    };
+                    observability::record_transaction(
+                        span,
+                        operation,
+                        DbOutcome::Failure,
+                        accounting,
+                        started.elapsed(),
+                        sqlite,
+                    );
+                    observability::record_operation(
+                        &operation_span,
+                        DbOutcome::Failure,
+                        accounting,
+                        operation_started.elapsed(),
+                    );
+                    return Err(error);
+                }
             }
         }
-        Ok(BeginAttemptResult {
-            outcome: ClaimOutcome::AuthorityConflict,
-            authority: None,
-            attempt: None,
-        })
-    }
-
-    async fn begin_attempt_once(&self, input: &BeginAttemptInput) -> DbResult<BeginAttemptResult> {
-        let mut tx = self.begin_tx().await?;
-        let result = tx.begin_attempt(input).await?;
-        if result.outcome == ClaimOutcome::Started {
-            tx.commit().await?;
-        } else {
-            tx.rollback().await?;
-        }
-        Ok(result)
     }
 
     pub async fn renew_lease_exact(&self, input: &RenewLeaseInput) -> DbResult<AuthorityOutcome> {
@@ -2696,6 +2940,58 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
 
+    #[test]
+    fn attempt_insert_error_classification_distinguishes_contention_from_uniqueness() {
+        assert_eq!(
+            classify_attempt_insert_error_code(Some(SQLITE_CONSTRAINT_UNIQUE)),
+            AttemptInsertErrorClass::AuthorityConflict
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(Some(SQLITE_CONSTRAINT_PRIMARYKEY)),
+            AttemptInsertErrorClass::AuthorityConflict
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(Some(SQLITE_BUSY)),
+            AttemptInsertErrorClass::Contention
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(Some(SQLITE_BUSY_SNAPSHOT)),
+            AttemptInsertErrorClass::Contention
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(Some("787")),
+            AttemptInsertErrorClass::Other
+        );
+        assert_eq!(
+            classify_attempt_insert_error_code(None),
+            AttemptInsertErrorClass::Other
+        );
+    }
+
+    #[test]
+    fn acquisition_error_retry_decision_honors_retryable_codes_and_budget() {
+        assert_eq!(
+            retry_decision_for_sqlite_code(Some(SQLITE_BUSY), 1, 5),
+            RetryDecision::Retry
+        );
+        assert_eq!(
+            retry_decision_for_sqlite_code(Some(SQLITE_BUSY_SNAPSHOT), 4, 5),
+            RetryDecision::Retry
+        );
+        assert_eq!(
+            retry_decision_for_sqlite_code(Some(SQLITE_BUSY_SNAPSHOT), 5, 5),
+            RetryDecision::Exhausted
+        );
+        assert_eq!(
+            retry_decision_for_sqlite_code(Some("787"), 1, 5),
+            RetryDecision::Fail
+        );
+        assert_eq!(
+            retry_decision_for_sqlite_code(None, 1, 5),
+            RetryDecision::Fail
+        );
+    }
+
     fn profile() -> ProfileRef {
         ProfileRef {
             profile_kind: "test".to_string(),
@@ -3517,5 +3813,44 @@ mod tests {
                 .next_eligible_at,
             Timestamp(20)
         );
+    }
+}
+
+#[cfg(test)]
+mod lease_commit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn projected_commit_liveness_is_strict_at_expiry() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+
+        assert!(lease_is_live_immediately_before_commit(
+            &mut tx,
+            LeaseExpiry(100),
+            LeaseCommitClock::Projected {
+                current: Timestamp(99),
+            },
+        )
+        .await
+        .unwrap());
+        assert!(!lease_is_live_immediately_before_commit(
+            &mut tx,
+            LeaseExpiry(100),
+            LeaseCommitClock::Projected {
+                current: Timestamp(100),
+            },
+        )
+        .await
+        .unwrap());
+        assert!(!lease_is_live_immediately_before_commit(
+            &mut tx,
+            LeaseExpiry(100),
+            LeaseCommitClock::Projected {
+                current: Timestamp(101),
+            },
+        )
+        .await
+        .unwrap());
     }
 }

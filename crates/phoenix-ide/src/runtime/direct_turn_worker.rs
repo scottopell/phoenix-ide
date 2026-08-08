@@ -6,11 +6,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
 use phoenix_db::workflow::{
-    ClaimAuthoritativeTurnInput, DirectTurnMaterializationEligibility, DiscoverableAcceptedTurn,
+    DirectTurnMaterializationEligibility, DiscoverableAcceptedTurn,
     PreflightDirectTurnMaterializationInput, ReleaseAuthoritativeTurnInput, WorkflowRepository,
 };
 use phoenix_db::LocalAttemptAuthority;
-use phoenix_workflow::{ClaimOutcome, LeaseExpiry, ProcessIncarnation, Timestamp};
+use phoenix_workflow::{ClaimOutcome, ProcessIncarnation, Timestamp};
 use tokio::sync::watch;
 
 use crate::runtime::RuntimeManager;
@@ -134,16 +134,17 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
         candidate: DiscoverableAcceptedTurn,
         now: Timestamp,
     ) -> Result<(), String> {
-        let lease_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
+        let Some(lease_window) = self.clock.lease_window(now, LEASE_DURATION) else {
+            return Ok(());
+        };
         let claim = self
             .repo
-            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
-                turn_id: candidate.turn_id,
-                workflow_id: candidate.workflow_id,
-                process_incarnation: self.process_incarnation,
-                now,
-                lease_until,
-            })
+            .claim_authoritative_turn_with_lease_window(
+                candidate.turn_id,
+                candidate.workflow_id,
+                self.process_incarnation,
+                lease_window,
+            )
             .await
             .map_err(|error| error.to_string())?;
         if claim.outcome != ClaimOutcome::Started {
@@ -290,6 +291,11 @@ impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
 
 pub(crate) trait DirectTurnClock: Send + Sync + 'static {
     fn now(&self) -> Timestamp;
+    fn lease_window(
+        &self,
+        now: Timestamp,
+        duration: Duration,
+    ) -> Option<phoenix_db::workflow::DirectTurnLeaseWindow>;
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
@@ -305,6 +311,14 @@ impl DirectTurnClock for SystemClock {
         )
     }
 
+    fn lease_window(
+        &self,
+        now: Timestamp,
+        duration: Duration,
+    ) -> Option<phoenix_db::workflow::DirectTurnLeaseWindow> {
+        phoenix_db::workflow::DirectTurnLeaseWindow::database_timed(now, duration)
+    }
+
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(tokio::time::sleep(duration))
     }
@@ -315,9 +329,10 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use phoenix_core::domain::sm_event::PreparedDirectTurnPayload;
+    use phoenix_db::workflow::ClaimAuthoritativeTurnInput;
     use phoenix_workflow::{
         AcceptedDisposition, CanonicalMessageId, ClientTurnKey, ConversationAuthority, EffectId,
-        PreparedTurn, TurnCommand, TurnOutcome,
+        LeaseExpiry, PreparedTurn, TurnCommand, TurnOutcome,
     };
     use std::sync::Mutex;
 
@@ -329,6 +344,14 @@ mod tests {
     impl DirectTurnClock for TestClock {
         fn now(&self) -> Timestamp {
             self.now
+        }
+
+        fn lease_window(
+            &self,
+            now: Timestamp,
+            duration: Duration,
+        ) -> Option<phoenix_db::workflow::DirectTurnLeaseWindow> {
+            phoenix_db::workflow::DirectTurnLeaseWindow::renewable(now, duration)
         }
 
         fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
