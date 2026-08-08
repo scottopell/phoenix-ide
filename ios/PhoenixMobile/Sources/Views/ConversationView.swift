@@ -18,13 +18,15 @@ struct ConversationView: View {
                     systemImage: "trash",
                     description: Text("This conversation was deleted on the server."))
             } else {
-                if let staleness = cacheAgeNote {
-                    Text(staleness)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 2)
-                        .background(.thinMaterial)
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    if let staleness = cacheAgeNote(at: context.date) {
+                        Text(staleness)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 2)
+                            .background(.thinMaterial)
+                    }
                 }
                 if !session.outbox.persistenceHealthy {
                     Label(
@@ -68,15 +70,15 @@ struct ConversationView: View {
 
     /// Cache-age note while disconnected (REQ-IOS-001): only shown when
     /// the snapshot is meaningfully stale, mirroring the list's threshold.
-    private var cacheAgeNote: String? {
+    private func cacheAgeNote(at now: Date) -> String? {
         guard !model.connectivity.isOnline,
               session.connection != .live,
-              let savedAt = session.snapshotSavedAt,
-              Date().timeIntervalSince(savedAt) > 120
+              let syncedAt = session.snapshotSyncedAt,
+              now.timeIntervalSince(syncedAt) > 120
         else { return nil }
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
-        let rel = formatter.localizedString(for: savedAt, relativeTo: Date())
+        let rel = formatter.localizedString(for: syncedAt, relativeTo: now)
         return "Cached \(rel)"
     }
 
@@ -138,10 +140,7 @@ struct ConnectionStateBar: View {
         case .connecting:
             bar { Text("Connecting…") }
         case .offline:
-            if let syncedAt = session.snapshotSyncedAt,
-               now.timeIntervalSince(syncedAt) > 120 {
-                bar { Text(cacheAgeLabel(syncedAt, relativeTo: now)) }
-            }
+            EmptyView()  // OfflineBanner and the conversation cache note cover this.
         case .waitingToRetry:
             if let syncedAt = session.snapshotSyncedAt,
                now.timeIntervalSince(syncedAt) > 120 {
@@ -165,11 +164,6 @@ struct ConnectionStateBar: View {
             .background(.thinMaterial)
     }
 
-    private func cacheAgeLabel(_ date: Date, relativeTo now: Date) -> String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return "Conversation updated \(formatter.localizedString(for: date, relativeTo: now))"
-    }
 }
 
 /// In-flight LLM text from token events.

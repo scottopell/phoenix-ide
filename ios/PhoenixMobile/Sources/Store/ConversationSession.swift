@@ -70,18 +70,12 @@ final class ConversationSession {
         /// Missing only in snapshots written before transcript generations
         /// were part of the iOS cache; nil forces replacement on next init.
         var transcriptGeneration: Int64?
+        /// Missing in snapshots written before cache freshness was tracked.
         var syncedAt: Date?
-        // Additive-optional: snapshots persisted before this field decode
-        // as nil (age simply unknown — no note shown).
-        var savedAt: Date?
     }
 
     private var transcriptGeneration: Int64?
     private(set) var snapshotSyncedAt: Date?
-
-    /// Time of the latest authoritative server data stored in the snapshot.
-    /// Local lifecycle flushes preserve it so old cache cannot appear fresh.
-    private(set) var snapshotSavedAt: Date?
 
     init(
         conversationId: String,
@@ -112,7 +106,6 @@ final class ConversationSession {
             // state_change events derive it — a snapshot taken mid-turn
             // must not open looking idle.
             agentWorking = presentationMode == "working"
-            snapshotSavedAt = snap.savedAt
             rebuildToolUseIndex()
             // A prior crash can leave the authoritative snapshot durable but
             // the matching outbox row not yet pruned. Reconcile at load so the
@@ -222,7 +215,7 @@ final class ConversationSession {
     @discardableResult
     private func persistSnapshot(authoritative: Bool = false) -> Bool {
         guard !isHardDeleted else { return false }
-        let savedAt = authoritative ? Date() : snapshotSavedAt
+        let syncedAt = authoritative ? Date() : snapshotSyncedAt
         let didSave = DiskStore.save(
             Snapshot(
                 conversation: conversation,
@@ -230,11 +223,10 @@ final class ConversationSession {
                     messages, through: durableMessageSequenceCeiling),
                 lastSequenceId: lastSequenceId,
                 transcriptGeneration: transcriptGeneration,
-                syncedAt: snapshotSyncedAt,
-                savedAt: savedAt),
+                syncedAt: syncedAt),
             name: snapshotName)
         if didSave, authoritative {
-            snapshotSavedAt = savedAt
+            snapshotSyncedAt = syncedAt
         }
         return didSave
     }
@@ -487,7 +479,6 @@ final class ConversationSession {
             durableMessageSequenceCeiling = Self.durableCeilingAfterInit(
                 anchor: snap.pendingAnchorSequenceId,
                 messages: snap.messages)
-            snapshotSyncedAt = Date()
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
             if mustReplayFromAnchor || previousSequenceFloor == 0 || !generationMatches
@@ -555,7 +546,6 @@ final class ConversationSession {
                 self.conversation = conversation
                 onConversationUpdate?(conversation)
             }
-            snapshotSyncedAt = Date()
             if message.message_type == "agent" {
                 streamingText = ""
                 streamingRequestId = nil
@@ -591,7 +581,6 @@ final class ConversationSession {
                 conversation?.transcript_generation = updatedGeneration
             }
             if messages[idx].message_type == "agent" { rebuildToolUseIndex() }
-            snapshotSyncedAt = Date()
             persistSnapshot(authoritative: true)
 
         case .stateChange(let seq, let state, let mode, let stateUpdatedAt):
