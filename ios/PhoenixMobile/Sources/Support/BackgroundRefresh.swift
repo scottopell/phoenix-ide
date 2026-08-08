@@ -23,12 +23,12 @@ enum BackgroundRefresh {
                 task.setTaskCompleted(success: false)
                 return
             }
-            // Re-arm first: the next window shouldn't depend on this run
-            // finishing cleanly.
-            scheduleNext()
             let work = Task { @MainActor in
                 let ok = await model.runBackgroundAttentionCheck()
                 task.setTaskCompleted(success: ok)
+                if model.backgroundNudgesEnabled {
+                    scheduleNext()
+                }
             }
             task.expirationHandler = {
                 work.cancel()
@@ -42,5 +42,9 @@ enum BackgroundRefresh {
         // Submit failures (simulator, duplicate pending request) are
         // non-fatal by design — see header.
         try? BGTaskScheduler.shared.submit(request)
+    }
+
+    static func cancelPending() {
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: taskIdentifier)
     }
 }

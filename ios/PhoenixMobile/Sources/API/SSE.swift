@@ -107,8 +107,8 @@ enum PhoenixEvent: Sendable {
         /// the snapshot lands so a reconnect mid-turn keeps the in-flight view.
         var pendingEvents: [JSONValue]
         var pendingTruncated: Bool
-        var transcriptGeneration: Int64
-        var transcriptCoverage: TranscriptCoverage
+        var transcriptGeneration: Int64 = 1
+        var transcriptCoverage: TranscriptCoverage = .complete
     }
 
     /// Decode from an SSE frame. `frame.event` carries the type name; the

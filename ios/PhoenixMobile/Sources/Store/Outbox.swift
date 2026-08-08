@@ -108,13 +108,12 @@ final class Outbox {
     }
 
     /// Re-establish the enqueue-before-POST durability point immediately
-    /// before delivery. A prior write may have failed while storage was full;
-    /// no request leaves the device until the complete visible queue is on
-    /// disk again.
+    /// before delivery. A transiently failed enqueue write can recover here;
+    /// a continuing failure keeps every entry unsendable.
     func prepareForDelivery() -> Bool {
         persist()
+        return persistenceHealthy
     }
-
     /// A hard-deleted conversation owns no remaining local delivery state.
     func clear() {
         entries.removeAll()

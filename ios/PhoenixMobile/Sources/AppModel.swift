@@ -43,6 +43,8 @@ final class AppModel {
     let connectivity = ConnectivityMonitor()
     let listStore = ConversationListStore()
     private(set) var api: PhoenixAPI?
+    /// Invalidates responses started with earlier server credentials or URL.
+    private var apiGeneration = 0
 
     /// Sessions for conversations the user has opened, kept alive so their
     /// outboxes continue draining while the user navigates elsewhere.
@@ -66,6 +68,7 @@ final class AppModel {
     }
 
     private func rebuildAPI() {
+        apiGeneration += 1
         guard let url = URL(string: serverURLString), url.host != nil else {
             api = nil
             return
@@ -159,6 +162,8 @@ final class AppModel {
         UserDefaults.standard.set(enabled, forKey: Self.nudgesEnabledKey)
         if enabled {
             BackgroundRefresh.scheduleNext()
+        } else {
+            BackgroundRefresh.cancelPending()
         }
     }
 
@@ -167,9 +172,17 @@ final class AppModel {
     /// next cold open is newer. Returns success for BGTask accounting.
     func runBackgroundAttentionCheck() async -> Bool {
         guard backgroundNudgesEnabled, let api else { return false }
+        let startedGeneration = apiGeneration
         guard let fresh = try? await api.listConversations() else { return false }
-        guard !Task.isCancelled else { return false }
+        guard !Task.isCancelled,
+              backgroundNudgesEnabled,
+              apiGeneration == startedGeneration
+        else { return false }
         await attention.checkAndNotify(fresh)
+        guard !Task.isCancelled,
+              backgroundNudgesEnabled,
+              apiGeneration == startedGeneration
+        else { return false }
         listStore.applyExternal(fresh)
         return true
     }
@@ -189,8 +202,12 @@ final class AppModel {
     /// questions then queues through the outbox like any conversation.
     func openCoordinator() async -> String? {
         if let api, connectivity.isOnline {
+            let startedGeneration = apiGeneration
             do {
                 let conversation = try await api.ensureCoordinator()
+                guard apiGeneration == startedGeneration, connectivity.isOnline else {
+                    return nil
+                }
                 coordinatorConversationId = conversation.id
                 UserDefaults.standard.set(conversation.id, forKey: Self.coordinatorIdKey)
                 listStore.upsert(conversation)
@@ -240,6 +257,8 @@ final class AppModel {
             listStore.remove(id: conversationId)
             DiskStore.remove(name: "outbox-\(conversationId)")
             DiskStore.remove(name: "conv-\(conversationId)")
+            UNUserNotificationCenter.current().removeDeliveredNotifications(
+                withIdentifiers: ["attention-\(conversationId)"])
             return true
         } catch {
             lastActionError = (error as? APIError)?.errorDescription
@@ -320,6 +339,8 @@ final class AppModel {
         drainSessions.removeAll()
         DiskStore.removeAll()
         listStore.reset()
+        UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
+        coordinatorConversationId = nil
     }
 }
 

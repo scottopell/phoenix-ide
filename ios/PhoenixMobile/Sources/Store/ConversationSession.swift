@@ -736,6 +736,7 @@ final class ConversationSession {
                 if let v = update["cwd"]?.stringValue { conv.cwd = v }
                 if let v = update["branch_name"]?.stringValue { conv.branch_name = v }
                 if let v = update["task_title"]?.stringValue { conv.task_title = v }
+                if let v = update["title"]?.stringValue { conv.title = v }
                 if let v = update["conv_mode_label"]?.stringValue { conv.conv_mode_label = v }
                 if let v = update["slug"]?.stringValue { conv.slug = v }
                 if let v = update["title"]?.stringValue { conv.title = v }

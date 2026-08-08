@@ -547,7 +547,7 @@ WHEN the user opens list actions for the Coordinator
 THE SYSTEM SHALL NOT offer archive
 
 The remembered Coordinator id is per-server state and SHALL be cleared on
-sign-out.
+sign-out or when the local cache is cleared.
 
 **Rationale:** The Coordinator is Phoenix's most mobile-shaped surface —
 one conversation that answers questions about the whole fleet. Because

@@ -11,6 +11,9 @@ struct ComposerView: View {
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var attachments: [ImagePayload] = []
     @State private var attachmentError: String?
+    @State private var isLoadingAttachments = false
+    @State private var attachmentLoadGeneration = UUID()
+    @State private var attachmentLoadTask: Task<Void, Never>?
     @FocusState private var focused: Bool
 
     private static let maxAttachments = 4
@@ -40,7 +43,7 @@ struct ComposerView: View {
                     Image(systemName: "photo.badge.plus")
                         .font(.title3)
                 }
-                .disabled(attachments.count >= Self.maxAttachments)
+                .disabled(attachments.count >= Self.maxAttachments || isLoadingAttachments)
 
                 TextField("Message", text: $draft, axis: .vertical)
                     .lineLimit(1...6)
@@ -80,12 +83,24 @@ struct ComposerView: View {
         .background(.bar)
         .onChange(of: pickerItems) { _, items in
             guard !items.isEmpty else { return }
-            Task { await loadPickedItems(items) }
+            attachmentLoadTask?.cancel()
+            let generation = UUID()
+            attachmentLoadGeneration = generation
+            isLoadingAttachments = true
+            attachmentLoadTask = Task {
+                await loadPickedItems(items, generation: generation)
+            }
+        }
+        .onDisappear {
+            attachmentLoadTask?.cancel()
+            attachmentLoadGeneration = UUID()
+            isLoadingAttachments = false
         }
     }
 
     private var canSend: Bool {
         session.acceptsChatMessage
+            && !isLoadingAttachments
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !attachments.isEmpty)
     }
@@ -118,27 +133,33 @@ struct ComposerView: View {
     /// stage them. Failures are surfaced, not swallowed — a photo that
     /// silently vanished from the send would be omission-as-data-loss in
     /// the other direction.
-    private func loadPickedItems(_ items: [PhotosPickerItem]) async {
+    private func loadPickedItems(_ items: [PhotosPickerItem], generation: UUID) async {
         attachmentError = nil
+        var loaded: [ImagePayload] = []
         var failed = 0
         for item in items {
-            guard attachments.count < Self.maxAttachments else { break }
+            guard !Task.isCancelled, generation == attachmentLoadGeneration else { return }
+            guard attachments.count + loaded.count < Self.maxAttachments else { break }
             if let data = try? await item.loadTransferable(type: Data.self),
                let payload = ImageProcessing.payload(fromPickedData: data)
             {
-                attachments.append(payload)
+                loaded.append(payload)
             } else {
                 failed += 1
             }
         }
+        guard !Task.isCancelled, generation == attachmentLoadGeneration else { return }
+        attachments.append(contentsOf: loaded)
         if failed > 0 {
             attachmentError = "Couldn't load \(failed) selected image\(failed == 1 ? "" : "s")."
         }
         pickerItems = []
+        isLoadingAttachments = false
+        attachmentLoadTask = nil
     }
 
     private func send() {
-        guard session.acceptsChatMessage else { return }
+        guard canSend else { return }
         if session.send(text: draft, images: attachments) {
             draft = ""
             attachments = []
