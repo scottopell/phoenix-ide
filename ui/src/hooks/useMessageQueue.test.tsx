@@ -27,8 +27,25 @@ describe('deriveDisplayedPendingMessages', () => {
 
     expect(displayed.map((message) => [message.localId, message.text])).toEqual([
       ['same-id', 'server copy'],
-      ['external-id', 'from coordinator'],
       ['local-only', 'waiting locally'],
+      ['external-id', 'from coordinator'],
+    ]);
+  });
+
+  it('keeps a later authoritative steer behind an earlier accepted direct send', () => {
+    const direct = queued('direct-a', { status: 'accepted', timestamp: 1 });
+    const steer = queued('steer-b', { status: 'steering_queued', timestamp: 2 });
+
+    const displayed = deriveDisplayedPendingMessages([direct, steer], [{
+      message_id: 'steer-b',
+      text: 'authoritative B',
+      images: [],
+      files: [],
+    }], false);
+
+    expect(displayed.map((message) => [message.localId, message.text])).toEqual([
+      ['direct-a', 'text-direct-a'],
+      ['steer-b', 'authoritative B'],
     ]);
   });
 

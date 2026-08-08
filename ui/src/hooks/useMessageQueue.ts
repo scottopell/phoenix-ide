@@ -68,23 +68,34 @@ export function derivePendingMessages(
 }
 
 /** Merge local optimistic bubbles with the authoritative server queue.
- * Server ownership wins by message id, so the same submission renders once. */
+ * Server ownership wins by message id, while the matching authoritative copy
+ * keeps the local admission position so a later steer cannot jump ahead of an
+ * earlier accepted direct send. Server-only entries retain their FIFO order. */
 export function deriveDisplayedPendingMessages(
   localPendingMessages: PendingUserMessage[],
   steeringMessages: QueuedSteeringMessage[],
   conversationArchived: boolean,
 ): PendingUserMessage[] {
   if (conversationArchived) return [];
-  const authoritativeIds = new Set(steeringMessages.map((message) => message.message_id));
+  const authoritativeById = new Map(
+    steeringMessages.map((message) => [message.message_id, message]),
+  );
+  const localIds = new Set(localPendingMessages.map((message) => message.localId));
+  const renderAuthoritative = (message: QueuedSteeringMessage): PendingUserMessage => ({
+    localId: message.message_id,
+    text: message.text,
+    images: message.images,
+    files: message.files,
+    status: 'steering_queued',
+  });
   return [
-    ...steeringMessages.map((message) => ({
-      localId: message.message_id,
-      text: message.text,
-      images: message.images,
-      files: message.files,
-      status: 'steering_queued' as const,
-    })),
-    ...localPendingMessages.filter((message) => !authoritativeIds.has(message.localId)),
+    ...localPendingMessages.map((message) => {
+      const authoritative = authoritativeById.get(message.localId);
+      return authoritative ? renderAuthoritative(authoritative) : message;
+    }),
+    ...steeringMessages
+      .filter((message) => !localIds.has(message.message_id))
+      .map(renderAuthoritative),
   ];
 }
 
