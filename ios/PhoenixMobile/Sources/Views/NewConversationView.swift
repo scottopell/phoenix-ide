@@ -13,15 +13,20 @@ struct NewConversationView: View {
     @State private var selectedModel: String?
     @State private var serverDefaultModel: String?
     @State private var modelsAvailable = true
+    @State private var loadingModels = false
+    @State private var modelsError: String?
     @State private var cwdStatus: CwdStatus = .unknown
     @State private var creating = false
     @State private var errorText: String?
     @State private var validationTask: Task<Void, Never>?
-    /// One id per draft, minted at sheet presentation and reused across
-    /// retries: if the create POST reaches the server but the response is
-    /// lost, retrying with the same message_id lets the server's duplicate
-    /// guard converge instead of creating a second conversation.
-    @State private var createMessageId = UUID().uuidString.lowercased()
+    @State private var pendingAttempt: CreateAttempt?
+
+    private struct CreateAttempt: Equatable {
+        let cwd: String
+        let text: String
+        let model: String
+        let messageId: String
+    }
 
     enum CwdStatus: Equatable {
         case unknown
@@ -40,6 +45,7 @@ struct NewConversationView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .font(.body.monospaced())
+                            .disabled(pendingAttempt != nil)
                     }
                     if case .invalid(let reason) = cwdStatus {
                         Text(reason)
@@ -61,6 +67,7 @@ struct NewConversationView: View {
                                 }
                             }
                         }
+                        .disabled(pendingAttempt != nil)
                     }
                 }
                 if !modelsAvailable {
@@ -70,10 +77,22 @@ struct NewConversationView: View {
                             .font(.callout)
                     }
                 }
+                if let modelsError {
+                    Section {
+                        Label(modelsError, systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .font(.callout)
+                        Button("Retry loading models") {
+                            Task { await loadModels() }
+                        }
+                        .disabled(loadingModels)
+                    }
+                }
 
                 Section("First message") {
                     TextField("What should the agent do?", text: $firstMessage, axis: .vertical)
                         .lineLimit(3...10)
+                        .disabled(pendingAttempt != nil)
                 }
 
                 if let errorText {
@@ -103,15 +122,7 @@ struct NewConversationView: View {
             }
             .task {
                 if !cwd.isEmpty { scheduleValidation(cwd) }
-                if let api = model.api,
-                   let models = try? await api.models() {
-                    modelIDs = models.modelIDs
-                    modelsAvailable = models.llm_configured ?? !models.modelIDs.isEmpty
-                    serverDefaultModel = models.default.flatMap {
-                        models.modelIDs.contains($0) ? $0 : nil
-                    }
-                    selectedModel = serverDefaultModel ?? models.modelIDs.first
-                }
+                await loadModels()
             }
         }
     }
@@ -119,7 +130,8 @@ struct NewConversationView: View {
     private var canCreate: Bool {
         if creating { return false }
         if firstMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
-        guard modelsAvailable, let selectedModel, modelIDs.contains(selectedModel) else {
+        guard !loadingModels, modelsError == nil,
+              modelsAvailable, let selectedModel, modelIDs.contains(selectedModel) else {
             return false
         }
         if case .valid = cwdStatus { return true }
@@ -168,20 +180,55 @@ struct NewConversationView: View {
     }
 
     private func create() async {
-        guard let api = model.api, let selectedModel else { return }
+        guard let api = model.api else { return }
+        let attempt: CreateAttempt
+        if let pendingAttempt {
+            attempt = pendingAttempt
+        } else {
+            guard let selectedModel else { return }
+            attempt = CreateAttempt(
+                cwd: cwd.trimmingCharacters(in: .whitespaces),
+                text: firstMessage.trimmingCharacters(in: .whitespacesAndNewlines),
+                model: selectedModel,
+                messageId: UUID().uuidString.lowercased())
+            pendingAttempt = attempt
+        }
         creating = true
         defer { creating = false }
         errorText = nil
         do {
             let conversation = try await api.createConversation(
-                cwd: cwd.trimmingCharacters(in: .whitespaces),
-                text: firstMessage.trimmingCharacters(in: .whitespacesAndNewlines),
-                model: selectedModel,
-                messageId: createMessageId)
+                cwd: attempt.cwd,
+                text: attempt.text,
+                model: attempt.model,
+                messageId: attempt.messageId)
             model.listStore.upsert(conversation)
             dismiss()
         } catch {
             errorText = (error as? APIError)?.errorDescription ?? error.localizedDescription
+            if (error as? APIError)?.isTransport != true {
+                pendingAttempt = nil
+            }
+        }
+    }
+
+    private func loadModels() async {
+        guard let api = model.api else { return }
+        loadingModels = true
+        modelsError = nil
+        defer { loadingModels = false }
+        do {
+            let models = try await api.models()
+            modelIDs = models.modelIDs
+            modelsAvailable = models.llm_configured ?? !models.modelIDs.isEmpty
+            serverDefaultModel = models.default.flatMap {
+                models.modelIDs.contains($0) ? $0 : nil
+            }
+            selectedModel = serverDefaultModel ?? models.modelIDs.first
+        } catch {
+            modelIDs = []
+            selectedModel = nil
+            modelsError = (error as? APIError)?.errorDescription ?? error.localizedDescription
         }
     }
 }

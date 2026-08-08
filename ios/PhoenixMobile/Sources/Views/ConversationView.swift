@@ -90,7 +90,12 @@ struct ConnectionStateBar: View {
                 bar { Text(cacheAgeLabel(syncedAt)) }
             }
         case .waitingToRetry:
-            bar { Text("Connection lost — reconnecting…") }
+            if let syncedAt = session.snapshotSyncedAt,
+               Date().timeIntervalSince(syncedAt) > 120 {
+                bar { Text("Connection lost — reconnecting… · \(cacheAgeLabel(syncedAt))") }
+            } else {
+                bar { Text("Connection lost — reconnecting…") }
+            }
         }
     }
 

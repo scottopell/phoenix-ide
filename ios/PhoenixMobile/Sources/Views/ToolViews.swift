@@ -183,6 +183,7 @@ struct BashResult {
     var label: String?
     var exitCode: Int?
     var signalNumber: Int?
+    var finalCause: String?
     var durationMs: Double?
     var waitedMs: Double?
     var truncatedBefore: Bool
@@ -203,6 +204,7 @@ struct BashResult {
         label = json["label"]?.stringValue
         exitCode = json["exit_code"]?.intValue
         signalNumber = json["signal_number"]?.intValue
+        finalCause = json["final_cause"]?.stringValue
         durationMs = json["duration_ms"]?.numberValue
         waitedMs = json["waited_ms"]?.numberValue
         truncatedBefore = json["truncated_before"]?.boolValue ?? false
@@ -223,7 +225,7 @@ struct BashResult {
     var isFailure: Bool {
         if errorId != nil { return true }
         if let exitCode, exitCode != 0 { return true }
-        if status == "killed" || signalNumber != nil { return true }
+        if status == "killed" || finalCause == "killed" || signalNumber != nil { return true }
         return false
     }
 
@@ -244,7 +246,7 @@ struct BashResult {
         case "still_running": parts.append("still running")
         case "kill_pending_kernel": parts.append("kill pending")
         case "tombstoned":
-            parts.append("finished")
+            parts.append(finalCause == "killed" ? "killed" : "finished")
             if let exitCode { parts.append("exit \(exitCode)") }
         case "waiter_panicked": parts.append("waiter panicked")
         default: parts.append(status ?? "?")

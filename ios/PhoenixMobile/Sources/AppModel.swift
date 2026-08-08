@@ -58,6 +58,7 @@ final class AppModel {
         rebuildAPI()
         _ = connectivity.addRestoreObserver { [weak self] in
             self?.drainPersistedOutboxes()
+            Task { await self?.refreshList() }
         }
     }
 

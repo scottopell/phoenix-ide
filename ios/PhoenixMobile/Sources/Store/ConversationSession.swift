@@ -324,6 +324,7 @@ final class ConversationSession {
             let generationMatches = transcriptGeneration == snap.transcriptGeneration
             conversation = snap.conversation
             conversation?.transcript_generation = snap.transcriptGeneration
+            conversation?.presentation_mode = snap.presentationMode
             convState = snap.conversation.state
             messages = Self.reconcileTranscript(
                 existing: messages,
@@ -356,7 +357,7 @@ final class ConversationSession {
             }
             lastSequenceId = max(lastSequenceId, snap.lastSequenceId)
             rebuildToolUseIndex()
-            onConversationUpdate?(snap.conversation)
+            if let conversation { onConversationUpdate?(conversation) }
             // Persist the authoritative snapshot BEFORE reconciling: the
             // outbox prune must never become durable while the message
             // snapshot that justifies it is still memory-only — a crash
@@ -401,7 +402,11 @@ final class ConversationSession {
                 return  // update for an unknown target is a silent no-op
             }
             if let content, content != .null { messages[idx].content = content }
-            if let displayData, displayData != .null { messages[idx].display_data = displayData }
+            if let displayData, displayData != .null {
+                messages[idx].display_data = Self.mergeDisplayData(
+                    existing: messages[idx].display_data,
+                    patch: displayData)
+            }
             if let updatedGeneration {
                 transcriptGeneration = updatedGeneration
                 conversation?.transcript_generation = updatedGeneration
@@ -414,6 +419,14 @@ final class ConversationSession {
             guard applyIfNewer(seq) else { return }
             convState = state
             if let mode { presentationMode = mode }
+            if var conversation {
+                conversation.state = state
+                if let mode { conversation.presentation_mode = mode }
+                self.conversation = conversation
+                snapshotSyncedAt = Date()
+                persistSnapshot()
+                onConversationUpdate?(conversation)
+            }
             if let mode {
                 // The server's presentation_mode (idle | working |
                 // needs_action | error | done) is authoritative and covers
@@ -491,6 +504,24 @@ final class ConversationSession {
         guard seq > lastSequenceId else { return false }
         lastSequenceId = seq
         return true
+    }
+
+    nonisolated static func mergeDisplayData(existing: JSONValue?, patch: JSONValue) -> JSONValue {
+        guard case .object(var merged) = existing,
+              case .object(let patchObject) = patch
+        else { return patch }
+
+        for (key, value) in patchObject {
+            if key == "tool_starts",
+               case .object(var starts) = merged[key],
+               case .object(let newStarts) = value {
+                starts.merge(newStarts) { _, latest in latest }
+                merged[key] = .object(starts)
+            } else {
+                merged[key] = value
+            }
+        }
+        return .object(merged)
     }
 
     private func upsert(_ message: Message) {
